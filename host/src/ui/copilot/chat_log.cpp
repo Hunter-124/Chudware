@@ -699,9 +699,39 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 }
 
 
+// Empty-state hero for a brand-new/blank conversation. Without it the composer's grey
+// placeholder is the only affordance — the log reads as a broken blank panel. One centered
+// title + one hint line; the hint left-aligns and wraps when the panel is too narrow to
+// center it on a single line.
+static void drawEmptyChatHero(const ui::Fonts& fonts, float logW) {
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const char* title = "Start a new session";
+    const char* hint  = "Ask a question about this model, or describe what you want to build.";
+
+    ImGui::Dummy(ImVec2(0, 28.0f * sc));
+    ImGui::PushFont(fonts.h2 ? fonts.h2 : fonts.medium);
+    const float tw = ImGui::CalcTextSize(title).x;
+    if (tw < logW) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (logW - tw) * 0.5f);
+    ImGui::TextColored(surf.textPrimary, "%s", title);
+    ImGui::PopFont();
+
+    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    const float hw = ImGui::CalcTextSize(hint).x;
+    if (hw < logW) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (logW - hw) * 0.5f);
+        ImGui::TextUnformatted(hint);
+    } else {
+        ImGui::TextWrapped("%s", hint);
+    }
+    ImGui::PopStyleColor();
+}
+
 void drawChatLogWindowed(AppState& st) {
     ui::Fonts& fonts = st.fonts;
     const float logW    = ImGui::GetContentRegionAvail().x;
+    if (st.chat.empty()) { drawEmptyChatHero(fonts, logW); return; }
     const float viewTop = ImGui::GetScrollY();
     const float viewBot = viewTop + ImGui::GetWindowSize().y;
     const float slack   = ImGui::GetWindowSize().y;   // one extra viewport of buffer each side

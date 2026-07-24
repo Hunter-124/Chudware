@@ -354,12 +354,26 @@ struct DocSession {
 // ---------------- worker job ----------------
 struct AgentEvent;  // defined later (richer chat model)
 
+// JobState is intrinsically non-copyable (std::mutex + std::atomic members) — it MUST always be
+// held by std::shared_ptr<JobState> (never copied/moved). AppState::runs keys one JobState per
+// conversation id, so a run is bound to its owning conversation for its entire lifetime.
 struct JobState {
     std::atomic<bool> running{false};
     std::atomic<bool> ready{false};
+    // The user hit Stop on THIS run specifically. UI-terminal: aiTurnActive() honors it
+    // immediately for the VIEWED conversation; the drain uses it to discard this run's result
+    // instead of applying it. Scoped per-run so stopping one conversation's turn never touches
+    // another conversation's still-streaming run.
+    std::atomic<bool> stopRequested{false};
     std::mutex mtx;
     int kind = JOB_BUILD;
     std::string stl, info, error;
+    // The conversation + doc key this run is bound to (set at launch by launchAgentRunV2 /
+    // launchMissionRun). Every streamed event and the final result are routed to THIS
+    // conversation by id — never by scanning whichever conversation happens to be on screen —
+    // so closing/switching a document tab or switching sessions never drops or misdelivers it.
+    std::string convId;
+    std::string docKey;
     // Active agent_run_v2 / mission run_id (from run_started event or result). Used by
     // requestStopRun → agent_cancel so Stop aborts the in-flight provider call.
     std::string runId;
@@ -639,13 +653,27 @@ struct ChatMsg {
 // GL thread from the event-drain loop. No-op for events it doesn't recognize.
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data);
 
-// One copilot conversation = its own tab. The ACTIVE conversation's live messages stay in
-// AppState::chat (so every existing st.chat user keeps working unchanged); an INACTIVE
-// conversation parks its messages here. Switching tabs swaps chat <-> msgs. Persisted per
-// document to %APPDATA%/Chudware/chat_history.json so conversations survive restarts.
+// Resolve the LIVE message vector a conversation's ChatMsgs currently live in: AppState::chat if
+// convId is the currently VIEWED conversation, else that resident Conversation's parked msgs.
+// nullptr if convId names no resident conversation (should not normally happen — every
+// conversation stays resident for the app's lifetime once created). Used by the event drain /
+// completion handling (app.cpp, engine_events.cpp) to route a run's output to ITS OWN bound
+// conversation by id, never by scanning whichever conversation happens to be on screen.
+std::vector<ChatMsg>* conversationMsgs(AppState& st, const std::string& convId);
+
+// One copilot conversation = its own tab. RESIDENT: every conversation loaded this process stays
+// in AppState::conversations for the app's lifetime, tagged with the document key it belongs to
+// (docKey) — switching/closing a document tab never destroys or reloads a conversation out from
+// under an in-flight run. The ACTIVE (currently viewed) conversation's live messages stay in
+// AppState::chat (so every existing st.chat user keeps working unchanged); every OTHER resident
+// conversation parks its messages here, whether idle or still streaming in the background.
+// Persisted per document to %APPDATA%/Chudware/chat_history.json so conversations survive
+// restarts; each docKey's group is written/loaded independently (see conversations.cpp).
 struct Conversation {
     std::string id;
     std::string title;             // shown on the tab; defaults to "Chat N", renamed to 1st prompt
+    std::string docKey;            // the document this session belongs to (Sessions list scope +
+                                   // chat_history.json partition key); set once at creation.
     std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
     int lastContextTokens = 0;     // per-session context meter (input tokens from last model call)
     std::vector<std::string> queuedPrompts;  // queued while this session's turn was active
@@ -1264,13 +1292,36 @@ struct AppState {
     std::string startupPhase;
 
     // ---- job + chat model ----
-    JobState job;
+    // Keyed run registry: one JobState per conversation id, so N conversations can each have
+    // their own turn in flight simultaneously. A run is bound to its owning conversation at
+    // launch (JobState::convId/docKey) and stays bound for its whole lifetime — the drain routes
+    // every streamed event and the final result by that id, never by scanning whichever
+    // conversation happens to be visible. JobState is non-copyable, so it is always held by
+    // shared_ptr; see runFor/activeRun/runIfExists/anyRunActive/convRunning below (defined in
+    // core/app_state.cpp).
+    std::unordered_map<std::string, std::shared_ptr<JobState>> runs;
+    // Get-or-create the run slot for a conversation id (creates an idle JobState on first use).
+    std::shared_ptr<JobState> runFor(const std::string& convId);
+    // runFor(activeConvId()) — the run the CURRENTLY VIEWED conversation acts on (Send/Stop).
+    std::shared_ptr<JobState> activeRun();
+    // nullptr if no run slot exists yet for convId (never creates one) — for read-only checks.
+    JobState* runIfExists(const std::string& convId);
+    // True if ANY conversation's run has running==true — for doc-mutation/global gates (undo,
+    // file open/save, provider switch) that must never race ANY in-flight run, not just the
+    // viewed one's.
+    bool anyRunActive() const;
+    // True if THAT SPECIFIC conversation's run is running — for Send/Stop/busy UI scoped to
+    // whichever conversation is on screen, so an unrelated background run never blocks it.
+    bool convRunning(const std::string& convId) const;
+    // The id of the currently viewed conversation, or "" if none (activeConv invalid).
+    std::string activeConvId() const;
     std::vector<char> code{std::vector<char>(64 * 1024, 0)};
     std::vector<char> prompt{std::vector<char>(2048, 0)};
-    std::vector<ChatMsg> chat;                 // the ACTIVE conversation's live messages
-    std::vector<Conversation> conversations;   // all conversation tabs (active's msgs live in `chat`)
+    std::vector<ChatMsg> chat;                 // the ACTIVE (viewed) conversation's live messages
+    std::vector<Conversation> conversations;   // ALL resident sessions across every doc key visited
+                                               // this process (active's msgs live in `chat`)
     int activeConv = -1;                       // index into conversations; -1 = uninitialized
-    std::string chatDocKey;                    // doc key that conversations/chat currently belong to
+    std::string chatDocKey;                    // docKey of the currently VIEWED conversation
     int convCounter = 0;                       // monotonic id source (no Date/random needed)
     std::vector<char> helpQuestion{std::vector<char>(2048, 0)};
     std::string helpLastQuestion;
@@ -1556,7 +1607,11 @@ struct AppState {
     ui::ActivityPanel* activityPanel = nullptr;  // owned by run_gui (W1-B: typed)
     // Live status line for the v2 orchestrator run, shown in the chat area
     std::string agentV2Status;              // e.g. "PLAN > planner attempt 1..."
-    bool agentV2Running = false;            // a v2 run is in flight (blocks concurrent runs)
+    bool agentV2Running = false;            // a v2 (job-based) run is in flight somewhere —
+                                             // global/cosmetic (viewport badge, Activity panel,
+                                             // doc-mutation guards); NOT a concurrency lock. See
+                                             // AppState::anyRunActive()/convRunning() for the real
+                                             // per-conversation/global run-state checks.
     // Chat-triggered accurate (OpenFOAM) CFD: launched on the SimClient channel (non-blocking) and
     // fulfilled by ui::pollChatOpenFoam each frame (it can't use the serialised st.rpc for a
     // minutes-long solve). chatCfdVel/Aoa carry the parsed condition for the result message.
@@ -1570,11 +1625,8 @@ struct AppState {
     // --- end C22b ---
 
     // ---- Stop + message queue (modern agentic composer) ----
-    // stopRequested: the user hit Stop on an in-flight JOB run. The worker can't be interrupted
-    // mid-RPC, so the background thread finishes, but the GL-thread drain (app.cpp) DISCARDS the
-    // result instead of applying it (no chat/doc/tab updates). UI-terminal for aiTurnActive
-    // (composer reverts to send immediately). Cleared by the drain OR on the next submitTurn.
-    bool stopRequested = false;
+    // Stop is per-run now (JobState::stopRequested) so stopping the VIEWED conversation's turn
+    // never touches another conversation's still-streaming run. See AppState::activeRun().
     // queuedPrompts: messages the user sent WHILE a turn was active (Claude-Code-style queue).
     // Drained one-at-a-time by the composer once the assistant is free again.
     std::vector<std::string> queuedPrompts;

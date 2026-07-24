@@ -34,6 +34,19 @@ void scopeClassColor(int scopeClass, float out[4]) {
     out[3] = 1.0f;
 }
 
+// Resolve the live message vector for a conversation id — see core/app_state.h for the
+// contract. Global scope (not ui::) to match its app_state.h declaration, exactly like
+// scopeClassColor above.
+std::vector<ChatMsg>* conversationMsgs(AppState& st, const std::string& convId) {
+    if (convId.empty()) return nullptr;
+    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size() &&
+        st.conversations[st.activeConv].id == convId)
+        return &st.chat;
+    for (auto& c : st.conversations)
+        if (c.id == convId) return &c.msgs;
+    return nullptr;
+}
+
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include <fcntl.h>
 #include <unistd.h>
@@ -303,15 +316,17 @@ std::string convDocKey(AppState& st) {
 
 std::string newConvId(AppState& st) { return "c" + std::to_string(++st.convCounter); }
 
-// Guarantee at least one (active) conversation exists, adopting whatever is already in st.chat.
+// Guarantee the CURRENTLY VIEWED conversation exists, adopting whatever is already in st.chat.
+// Additive: never clears other resident conversations (other doc keys, or idle same-doc
+// siblings) — those stay resident regardless of what the active view needs right now.
 void ensureConversations(AppState& st) {
     if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) return;
-    st.conversations.clear();
     Conversation c;
     c.id = newConvId(st);
     c.title = "Chat 1";
+    c.docKey = st.chatDocKey.empty() ? convDocKey(st) : st.chatDocKey;
     st.conversations.push_back(std::move(c));
-    st.activeConv = 0;  // st.chat remains the active buffer
+    st.activeConv = (int)st.conversations.size() - 1;  // st.chat remains the active buffer
 }
 
 // Serialize PlanState for chat_history.json — shape matches parsePlanState().
@@ -342,9 +357,14 @@ static nlohmann::json planStateToJson(const PlanState& ps) {
     return j;
 }
 
+// Persist EVERY resident conversation, grouped by its OWN docKey — never just the currently
+// viewed one. A background conversation on a different document keeps mutating independently
+// of what's on screen (that's the whole point of the fix), so its progress must be just as
+// durable; starving it of persistence just because it isn't in view would reintroduce data loss
+// under a different name. Backward compatible: each docKey's on-disk shape (active index local
+// to that key + its conversations array) is byte-identical to the single-key format.
 void persistChatHistory(AppState& st) {
-    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
-    if (st.chatDocKey.empty()) return;
+    if (st.conversations.empty()) return;
     namespace fs = std::filesystem;
     const std::string path = chatHistoryPath();
     nlohmann::json root = nlohmann::json::object();
@@ -383,8 +403,24 @@ void persistChatHistory(AppState& st) {
         } catch (...) {
         }
     }
-    nlohmann::json convs = nlohmann::json::array();
+    // Group resident conversations by their OWN docKey (first-seen order for determinism) —
+    // not just st.chatDocKey — so a background conversation's progress is written too.
+    std::vector<std::string> orderedKeys;
+    std::unordered_map<std::string, std::vector<int>> byKey;
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
+        const std::string& k = st.conversations[i].docKey;
+        if (k.empty()) continue;  // defensive: every resident conversation should be tagged
+        auto ins = byKey.try_emplace(k);
+        if (ins.second) orderedKeys.push_back(k);
+        ins.first->second.push_back(i);
+    }
+    for (const std::string& key : orderedKeys) {
+    const std::vector<int>& groupIdxs = byKey[key];
+    nlohmann::json convs = nlohmann::json::array();
+    int localActive = 0;
+    for (int gi = 0; gi < (int)groupIdxs.size(); ++gi) {
+        const int i = groupIdxs[gi];
+        if (i == st.activeConv) localActive = gi;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
         nlohmann::json jm = nlohmann::json::array();
         for (const auto& m : msgs) {
@@ -506,10 +542,12 @@ void persistChatHistory(AppState& st) {
         if (!qp.empty()) convObj["queued_prompts"] = qp;
         convs.push_back(std::move(convObj));
     }
-    // Load-modify-write: only replace this doc key; every other key stays intact.
-    root[st.chatDocKey] = {{"active", st.activeConv}, {"conversations", convs}};
+    // Load-modify-write: only replace THIS doc key; every other key on disk stays intact.
+    root[key] = {{"active", localActive}, {"conversations", convs}};
+    }  // end for (key : orderedKeys)
     // Rekey migration cleanup: drop the pre-autosave doc:<id> key once the entry lives at file:.
-    if (!s_chatKeyToErase.empty() && s_chatKeyToErase != st.chatDocKey) {
+    // Never erase a key we just wrote a group under (byKey.count guards that).
+    if (!s_chatKeyToErase.empty() && !byKey.count(s_chatKeyToErase)) {
         root.erase(s_chatKeyToErase);
         s_chatKeyToErase.clear();
     }
@@ -520,9 +558,11 @@ void persistChatHistory(AppState& st) {
         if (!atomicWriteFileDurable(path, root.dump(1))) return;
         appstatePersistSync();  // WASM: flush IDBFS; no-op on desktop
 #ifdef __EMSCRIPTEN__
-        // Also push this key to the shared workspace store (async; never block UI thread).
-        if (root.contains(st.chatDocKey) && root[st.chatDocKey].is_object())
-            wasmPutSharedChat(st.chatDocKey, root[st.chatDocKey]);
+        // Push every written key to the shared workspace store (async; never blocks UI) — not
+        // just the viewed one, so a background conversation's progress reaches other clients too.
+        for (const std::string& key : orderedKeys)
+            if (root.contains(key) && root[key].is_object())
+                wasmPutSharedChat(key, root[key]);
 #endif
     } catch (...) {
     }
@@ -668,15 +708,26 @@ void pollChatOpenFoam(AppState& st) {
     st.statusKind = err.empty() ? 0 : 2;
 }
 
-// Apply one chat_history.json entry object into st.conversations/chat.
-static void applyChatEntry(AppState& st, const nlohmann::json& e) {
-    freeChatTextures(st.chat);
-    st.chat.clear();
-    st.conversations.clear();
+// Load one chat_history.json docKey entry `e` into the resident set, tagging every loaded
+// Conversation with `key` and APPENDING to st.conversations — every OTHER resident docKey,
+// including one with a live background run, is left completely untouched. Idempotent for
+// `key`: any existing resident entries already tagged `key` are replaced in place first (the
+// WASM shared-store merge path is the only caller that can re-invoke this for an
+// already-resident key; the normal load path never reaches here for one — see
+// loadChatHistoryForKey's residency check below).
+static void applyChatEntry(AppState& st, const std::string& key, const nlohmann::json& e) {
+    for (int i = (int)st.conversations.size() - 1; i >= 0; --i) {
+        if (st.conversations[i].docKey != key) continue;
+        if (i == st.activeConv) freeChatTextures(st.chat);
+        freeChatTextures(st.conversations[i].msgs);
+        st.conversations.erase(st.conversations.begin() + i);
+    }
+    const int base = (int)st.conversations.size();
     for (const auto& jc : e.value("conversations", nlohmann::json::array())) {
         Conversation c;
         c.id = jc.value("id", newConvId(st));
         c.title = jc.value("title", std::string("Chat"));
+        c.docKey = key;
         c.scopeClass = jc.value("scope", -1);  // legacy sessions omit the key
         c.archived = jc.value("archived", false);
         for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
@@ -731,13 +782,15 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
                     cm.activity.push_back(std::move(artRow));
                 }
             }
-            // Crash recovery: a turn persisted as still-running never got a result — the app
-            // died mid-run. Never resume it as "running" (the worker is gone), but don't let it
-            // masquerade as a completed answer either: flag it partial and say so.
+            // Crash recovery: a turn persisted as still-running never got a result. This docKey
+            // was NOT already resident (guaranteed by the caller — see loadChatHistoryForKey),
+            // so a "run":true marker here can ONLY be a leftover from a run that died with a
+            // PREVIOUS process — never a live navigation, which now keeps a running conversation
+            // resident (parked, still streaming) instead of reloading it from disk over itself.
             if (!cm.fromUser && m.value("run", false)) {
                 cm.resultPartial = true;
-                const char* note = "(Interrupted \xe2\x80\x94 the app closed while this run was "
-                                   "in progress. Nothing after this point was saved.)";
+                const char* note = "(Interrupted \xe2\x80\x94 the app was closed while this run "
+                                   "was still in progress. Nothing after this point was saved.)";
                 if (cm.text.empty()) cm.text = note;
                 else if (cm.text.find("Interrupted \xe2\x80\x94") == std::string::npos)
                     cm.text += std::string("\n\n") + note;
@@ -752,10 +805,18 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
         }
         st.conversations.push_back(std::move(c));
     }
-    if (st.conversations.empty()) { st.activeConv = -1; ensureConversations(st); return; }
+    if ((int)st.conversations.size() == base) {
+        // Empty (or absent) on-disk conversations array — seed one blank session.
+        Conversation c;
+        c.id = newConvId(st);
+        c.title = "Chat 1";
+        c.docKey = key;
+        st.conversations.push_back(std::move(c));
+    }
     int act = e.value("active", 0);
-    if (act < 0 || act >= (int)st.conversations.size()) act = 0;
-    st.activeConv = act;
+    const int groupSize = (int)st.conversations.size() - base;
+    if (act < 0 || act >= groupSize) act = 0;
+    st.activeConv = base + act;
     {
         // Restore the active session's saved agent-execution DAG into the live store.
         const auto& convsJson = e.value("conversations", nlohmann::json::array());
@@ -763,19 +824,46 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
             convsJson[act].contains("agent_dag"))
             ui::agentDagFromJson(convsJson[act]["agent_dag"]);
     }
-    st.chat = std::move(st.conversations[act].msgs);
-    st.lastContextTokens = st.conversations[act].lastContextTokens;
-    st.queuedPrompts = std::move(st.conversations[act].queuedPrompts);
-    st.conversations[act].msgs.clear();
-    st.conversations[act].queuedPrompts.clear();
+    st.chat = std::move(st.conversations[st.activeConv].msgs);
+    st.lastContextTokens = st.conversations[st.activeConv].lastContextTokens;
+    st.queuedPrompts = std::move(st.conversations[st.activeConv].queuedPrompts);
+    st.conversations[st.activeConv].msgs.clear();
+    st.conversations[st.activeConv].queuedPrompts.clear();
 }
 
+// Defined below (file-local): swaps the newly-selected conversation's parked msgs/draft back
+// into the live st.chat view. Forward-declared here for loadChatHistoryForKey's resident path.
+static void restoreActiveConversation(AppState& st);
 
-// Replace conversations/chat with the saved set for `key` (or a fresh empty chat if none).
-// migrateFrom: on miss for `key`, adopt migrateFrom's entry (file or still-in-memory) so an
-// autosave rekey (doc:<id> -> file:<path>) never clears the visible conversation list.
+
+// Select the resident conversation set for `key` as the active view. RESIDENT-FIRST: reuses an
+// already-loaded session for this key (whether idle or still streaming in the background)
+// instead of ever re-reading disk over it — a fresh disk snapshot would stomp live in-memory
+// state, including a running turn. Loads + appends fresh sessions from disk only on the FIRST
+// touch of `key` this process; never destructively replaces st.conversations, so every other
+// resident doc key (including one with its own live run) is left completely untouched.
+// migrateFrom: on a miss for `key` with nothing resident either, adopt migrateFrom's entry
+// (resident preferred, else disk) so an autosave rekey (doc:<id> -> file:<path>) never clears
+// the visible conversation list.
 void loadChatHistoryForKey(AppState& st, const std::string& key,
                                   const std::string& migrateFrom) {
+    // Park whatever's currently the active view before switching away from it (mirrors
+    // switchConversation's own park step) — harmless no-op if nothing is active yet.
+    parkActiveConversation(st);
+
+    // Selects the LAST resident entry tagged `k` (most recently appended) as the new active
+    // view. Returns false (no-op) if nothing is resident for `k` yet.
+    auto selectResident = [&](const std::string& k) -> bool {
+        int found = -1;
+        for (int i = 0; i < (int)st.conversations.size(); ++i)
+            if (st.conversations[i].docKey == k) found = i;
+        if (found < 0) return false;
+        st.activeConv = found;
+        restoreActiveConversation(st);
+        return true;
+    };
+    if (selectResident(key)) return;
+
     nlohmann::json root = nlohmann::json::object();
     {
         std::ifstream in(chatHistoryPath());
@@ -785,37 +873,37 @@ void loadChatHistoryForKey(AppState& st, const std::string& key,
         return root.is_object() && root.contains(k) && root[k].is_object();
     };
     if (hasEntry(key)) {
-        applyChatEntry(st, root[key]);
+        applyChatEntry(st, key, root[key]);
         restorePromptDraft(st);
         return;
     }
-    // Rekey migration: new key empty, but old key has history (disk or live memory).
+    // Rekey migration: `key` has no disk history yet, but the old key does (resident or disk).
     if (!migrateFrom.empty() && migrateFrom != key) {
-        if (hasEntry(migrateFrom)) {
-            applyChatEntry(st, root[migrateFrom]);
+        if (selectResident(migrateFrom)) {
+            // Re-tag the now-selected group onto the NEW key so persistChatHistory writes it
+            // there from now on.
+            for (auto& c : st.conversations)
+                if (c.docKey == migrateFrom) c.docKey = key;
             s_chatKeyToErase = migrateFrom;  // drop old key on next persist under new key
             restorePromptDraft(st);
             return;
         }
-        // In-memory still holds the outgoing doc's conversations (persist just wrote them
-        // under migrateFrom). Keep them bound to the new key instead of clearing.
-        if (!st.conversations.empty() && st.activeConv >= 0) {
+        if (hasEntry(migrateFrom)) {
+            applyChatEntry(st, key, root[migrateFrom]);  // load the OLD key's data, tag it NEW
             s_chatKeyToErase = migrateFrom;
             restorePromptDraft(st);
             return;
         }
     }
-    if (st.conversations.empty() && st.activeConv < 0) {
-        ensureConversations(st);  // first init: adopt current st.chat (welcome) as conversation 1
-    } else {
-        freeChatTextures(st.chat);  // switching to a different doc with no history: fresh chat
-        st.chat.clear();
-        st.lastContextTokens = 0;
-        st.queuedPrompts.clear();
-        st.conversations.clear();
-        st.activeConv = -1;
-        ensureConversations(st);
-    }
+    // First-ever touch of this key: nothing resident, nothing on disk. Start a fresh session
+    // (st.chat/lastContextTokens/queuedPrompts are already clear — parkActiveConversation above
+    // either moved the outgoing content into its own slot or was a no-op with nothing active).
+    Conversation c;
+    c.id = newConvId(st);
+    c.title = "Chat 1";
+    c.docKey = key;
+    st.conversations.push_back(std::move(c));
+    st.activeConv = (int)st.conversations.size() - 1;
     restorePromptDraft(st);
 }
 
@@ -943,7 +1031,7 @@ static void wasmApplySharedChatPending(AppState& st) {
         // Still reload current if server filled a key we only had in-memory empty.
         if (!curKey.empty() && local.contains(curKey) && local[curKey].is_object()) {
             const std::string nowDump = local[curKey].dump();
-            if (nowDump != prevDump) applyChatEntry(st, local[curKey]);
+            if (nowDump != prevDump) applyChatEntry(st, curKey, local[curKey]);
         }
         return;
     }
@@ -958,12 +1046,14 @@ static void wasmApplySharedChatPending(AppState& st) {
 
     if (!curKey.empty() && local.contains(curKey) && local[curKey].is_object()) {
         const std::string nowDump = local[curKey].dump();
-        if (nowDump != prevDump) applyChatEntry(st, local[curKey]);
+        if (nowDump != prevDump) applyChatEntry(st, curKey, local[curKey]);
     }
 }
 #endif
 
-// Detect a document change and swap the chat history accordingly (called each frame).
+// Detect a document change and select the right resident conversation set accordingly (called
+// each frame). RESIDENT: never destructively drops the outgoing conversation set — a running
+// turn keeps streaming into it in the background regardless of which document is on screen.
 void syncChatToDoc(AppState& st) {
 #ifdef __EMSCRIPTEN__
     wasmKickSharedChatFetch();       // once: async GET full shared store
@@ -974,9 +1064,12 @@ void syncChatToDoc(AppState& st) {
     std::string key = convDocKey(st);
     if (key == st.chatDocKey) { ensureConversations(st); return; }
     const std::string prev = st.chatDocKey;
-    if (!prev.empty()) persistChatHistory(st);  // save the outgoing doc's conversations
-    loadChatHistoryForKey(st, key, prev);       // migrate prev -> key when autosave rekeys
+    if (!prev.empty()) persistChatHistory(st);  // durability: flush the outgoing view first
+    // Set BEFORE loadChatHistoryForKey — restorePromptDraft/promptDraftKey (called from inside
+    // it) key off st.chatDocKey, so it must already reflect the NEW view by the time they run.
     st.chatDocKey = key;
+    loadChatHistoryForKey(st, key, prev);  // resident-first: reuses (never discards) an
+                                           // already-loaded session, incl. one still running
     // Migration wrote history under migrateFrom only; mirror it to the new key immediately
     // and drop the old key (s_chatKeyToErase) so a crash doesn't orphan the conversation.
     if (!s_chatKeyToErase.empty())
@@ -1019,16 +1112,18 @@ static void restoreActiveConversation(AppState& st) {
     restorePromptDraft(st);
 }
 
-static bool conversationRunning(const Conversation& c) {
-    for (auto it = c.msgs.rbegin(); it != c.msgs.rend(); ++it)
-        if (!it->fromUser && it->running) return true;
-    return false;
-}
-
+// True if the CURRENTLY VIEWED conversation's own turn is active — resolved from its JobState
+// (st.runs) for job-based runs, plus a fallback scan of st.chat's own trailing message for
+// one-shot RPC turns (agent_ask_v2 / agent_simulate_v1) that never touch a JobState at all.
+// Never an ambient scan of an unrelated conversation, so a background run never makes the
+// viewed (idle) conversation look busy.
 bool activeConversationRunning(AppState& st) {
-    if (aiTurnActive(st)) return true;
-    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
-        return conversationRunning(st.conversations[st.activeConv]);
+    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return false;
+    if (st.convRunning(st.conversations[st.activeConv].id)) return true;
+    if (!st.chat.empty()) {
+        const ChatMsg& b = st.chat.back();
+        if (!b.fromUser && b.running) return true;
+    }
     return false;
 }
 
@@ -1038,6 +1133,7 @@ void newConversation(AppState& st) {
     Conversation c;
     c.id = newConvId(st);
     c.title = "Chat " + std::to_string((int)st.conversations.size() + 1);
+    c.docKey = st.chatDocKey;
     st.conversations.push_back(std::move(c));
     st.activeConv = (int)st.conversations.size() - 1;
     st.showSessionsPicker = false;
@@ -1050,6 +1146,9 @@ void switchConversation(AppState& st, int idx) {
     if (idx == st.activeConv || idx < 0 || idx >= (int)st.conversations.size()) return;
     parkActiveConversation(st);  // force-saves draft + parks chat (incl. running msgs)
     st.activeConv = idx;
+    st.chatDocKey = st.conversations[idx].docKey;  // keep the invariant: chatDocKey == viewed
+                                                   // conversation's docKey, even if a future
+                                                   // caller passes a cross-doc-key index
     restoreActiveConversation(st);  // restores chat + draft for target
     st.showSessionsPicker = false;
     // Force disk so both sessions' msgs + drafts survive kill mid-switch.
@@ -1059,6 +1158,7 @@ void switchConversation(AppState& st, int idx) {
 void closeConversation(AppState& st, int idx) {
     if (idx < 0 || idx >= (int)st.conversations.size()) return;
     bool closingActive = (idx == st.activeConv);
+    const std::string closedDocKey = st.conversations[idx].docKey;
     if (closingActive) {
         // Persist leaving session's draft before wiping composer.
         savePromptDraft(st, /*force=*/true);
@@ -1093,41 +1193,46 @@ void closeConversation(AppState& st, int idx) {
         }
     }
     st.conversations.erase(st.conversations.begin() + idx);
-    if (st.conversations.empty()) {
-        st.activeConv = -1;
-        ensureConversations(st);
-        restoreActiveConversation(st);
+    if (!closingActive) {
+        if (idx < st.activeConv) --st.activeConv;
         persistChatHistory(st);
         return;
     }
-    if (closingActive) {
-        int na = std::min(idx, (int)st.conversations.size() - 1);
-        st.activeConv = na;
-        restoreActiveConversation(st);
-    } else if (idx < st.activeConv) {
-        st.activeConv--;
+    // Prefer another session already resident for the SAME document — closing your last chat
+    // for THIS document must never silently jump the view to an unrelated document's chat.
+    int target = -1;
+    for (int j = 0; j < (int)st.conversations.size(); ++j)
+        if (st.conversations[j].docKey == closedDocKey) { target = j; break; }
+    if (target < 0) {
+        st.activeConv = -1;
+        ensureConversations(st);   // fresh blank session, tagged with the current docKey
+    } else {
+        st.activeConv = target;
     }
+    restoreActiveConversation(st);
     persistChatHistory(st);
 }
 
 // Archive (or unarchive) a session in place: unlike closeConversation, the transcript and
 // all history stay — the session just drops out of the default Sessions list until "Show
-// archived" is toggled on. Archiving the ACTIVE session hops to the nearest non-archived one
-// (preferring later indices, matching closeConversation's "next" bias); if none are left,
-// starts a fresh session so the composer never lands on a hidden conversation.
+// archived" is toggled on. Archiving the ACTIVE session hops to the nearest non-archived
+// session FOR THE SAME DOCUMENT (preferring later indices, matching closeConversation's "next"
+// bias) — never an unrelated document's session; if none are left, starts a fresh session so
+// the composer never lands on a hidden conversation.
 void archiveConversation(AppState& st, int idx, bool archived) {
     if (idx < 0 || idx >= (int)st.conversations.size()) return;
     if (st.conversations[idx].archived == archived) return;
     st.conversations[idx].archived = archived;
     if (archived && idx == st.activeConv) {
+        const std::string dk = st.conversations[idx].docKey;
         int target = -1;
         for (int j = idx + 1; j < (int)st.conversations.size(); ++j)
-            if (!st.conversations[j].archived) { target = j; break; }
+            if (!st.conversations[j].archived && st.conversations[j].docKey == dk) { target = j; break; }
         if (target < 0)
             for (int j = idx - 1; j >= 0; --j)
-                if (!st.conversations[j].archived) { target = j; break; }
+                if (!st.conversations[j].archived && st.conversations[j].docKey == dk) { target = j; break; }
         if (target < 0)
-            newConversation(st);   // every session archived — land somewhere visible
+            newConversation(st);   // every session for this document archived — land somewhere visible
         else
             switchConversation(st, target);
     }

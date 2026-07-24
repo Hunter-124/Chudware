@@ -1011,14 +1011,14 @@ void ScenarioRunner::tick(AppState& st) {
                     st.agentV2 = true;
                     st.agentV2Running = true;
                     activityPanel.clearLive();
-                    launchAgentRunV2(st.worker, st.job, req, st.docMirror.docId());
+                    launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, req, st.docMirror.docId());
                     std::printf("activity: agent_run_v2 launched: %s\n", req.c_str());
                     std::fflush(stdout);
                     actWaitFrames = 0; ++actStep; break;
                 }
                 case 2: {  // Wait for run to finish
                     ++actWaitFrames;
-                    if (!st.job.running.load() || actWaitFrames > 1800) {
+                    if (!st.convRunning(st.activeConvId()) || actWaitFrames > 1800) {
                         std::printf("activity: run done (frames=%d)\n", actWaitFrames);
                         std::fflush(stdout);
                         actSettle = kSettle * 2; ++actStep;

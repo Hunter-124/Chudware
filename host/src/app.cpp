@@ -3748,175 +3748,200 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     static int s_lastPreviewRev = 0;
     static std::string s_lastPreviewDocId;
 
-    // Drain streamed agent progress into the active (running) assistant message
-    // so the conversation updates live, iteration by iteration (texture loads
-    // stay on this thread).
-    {
+    // Drain streamed agent progress into the running assistant message of the
+    // conversation that OWNS each run, so every conversation updates live,
+    // iteration by iteration (texture loads stay on this thread). Runs are
+    // keyed by conversation id: a background conversation's run streams into
+    // its own (parked) transcript and never into whatever is on screen.
+    for (auto &[runConvId, runPtr] : st.runs) {
+      if (!runPtr)
+        continue;
+      JobState &job = *runPtr;
       std::vector<AgentEvent> evs;
       {
-        std::lock_guard<std::mutex> lk(st.job.evMtx);
-        if (!st.job.events.empty())
-          evs.swap(st.job.events);
+        std::lock_guard<std::mutex> lk(job.evMtx);
+        if (!job.events.empty())
+          evs.swap(job.events);
       }
       // The user stopped this run — drop its streamed events so the (finalized)
       // chat message and status line don't flicker with live progress while the
       // worker winds down.
-      if (st.stopRequested)
+      if (job.stopRequested.load())
         evs.clear();
-      if (!evs.empty()) {
-        ChatMsg *active = nullptr;
-        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+      if (evs.empty())
+        continue;
+      std::vector<ChatMsg> *msgs = conversationMsgs(st, runConvId);
+      ChatMsg *active = nullptr;
+      if (msgs) {
+        for (auto it = msgs->rbegin(); it != msgs->rend(); ++it)
           if (!it->fromUser && it->running) {
             active = &(*it);
             break;
           }
-        for (auto &e : evs) {
-          // --- C22b: route orchestrator events to the ActivityPanel ---
-          if (e.kind.rfind("orch_", 0) == 0) {
-            std::string orchKind = e.kind.substr(5); // strip "orch_"
-            try {
-              nlohmann::json data = nlohmann::json::parse(e.text);
-              if (st.activityPanel) {
-                auto *ap = st.activityPanel;
-                ap->onEvent(orchKind, data);
-              }
-              // Phase 2 (M9/M10): feed the live Agent Workflow DAG store.
-              // Ungated — it must capture agent.* span events even when no chat
-              // bubble is active (a subagent branch can outlive the trunk
-              // turn). GL-thread only; the store is a plain static in
-              // ai_workspace.cpp.
-              ui::feedAgentDagEvent(orchKind, data);
-              ui::activeWorkFeedEvent(orchKind, data);
-              // Fold the event into the running turn's inline activity timeline
-              // so the conversation transparently shows what the AI is
-              // doing/thinking.
-              if (active)
-                feedTurnActivity(*active, orchKind, data);
-              // Context meter: reset at run start; track the peak context
-              // estimate across calls. C++ agent_output always has tokens:null,
-              // so prefer agent_call.context_tokens_est (the real per-call
-              // size).
-              if (orchKind == "run_started") {
+      }
+      // Viewport, status line and the live-preview trackers are singular app
+      // state: only a run whose document is the one on screen may touch them.
+      // A background run still streams into its own bubble above.
+      const bool isViewedDoc =
+          !job.docKey.empty() && job.docKey == st.chatDocKey;
+      for (auto &e : evs) {
+        // --- C22b: route orchestrator events to the ActivityPanel ---
+        if (e.kind.rfind("orch_", 0) == 0) {
+          std::string orchKind = e.kind.substr(5); // strip "orch_"
+          try {
+            nlohmann::json data = nlohmann::json::parse(e.text);
+            if (st.activityPanel) {
+              auto *ap = st.activityPanel;
+              ap->onEvent(orchKind, data);
+            }
+            // Phase 2 (M9/M10): feed the live Agent Workflow DAG store.
+            // Ungated — it must capture agent.* span events even when no chat
+            // bubble is active (a subagent branch can outlive the trunk
+            // turn). GL-thread only; the store is a plain static in
+            // ai_workspace.cpp.
+            ui::feedAgentDagEvent(orchKind, data);
+            ui::activeWorkFeedEvent(orchKind, data);
+            // Fold the event into the running turn's inline activity timeline
+            // so the conversation transparently shows what the AI is
+            // doing/thinking.
+            if (active)
+              feedTurnActivity(*active, orchKind, data);
+            // Context meter: reset at run start; track the peak context
+            // estimate across calls. C++ agent_output always has tokens:null,
+            // so prefer agent_call.context_tokens_est (the real per-call
+            // size). Viewed doc only — the meter and the preview trackers
+            // describe the document the user is looking at.
+            if (orchKind == "run_started") {
+              if (isViewedDoc) {
                 st.lastContextTokens = 0;
                 s_lastPreviewRev = 0;
                 s_lastPreviewDocId.clear();
-              } else if (orchKind == "agent_call") {
-                int est = 0;
-                if (data.contains("context_tokens_est") &&
-                    data["context_tokens_est"].is_number_integer())
-                  est = data["context_tokens_est"].get<int>();
-                if (est <= 0)
-                  est = data.value("context_tokens_est", 0);
-                if (est > 0)
-                  st.lastContextTokens = std::max(st.lastContextTokens, est);
-              } else if (orchKind == "agent_output" &&
-                         data.contains("tokens") &&
-                         data["tokens"].is_object()) {
-                int in = data["tokens"].value("in", 0);
-                if (in > 0)
-                  st.lastContextTokens = in;
-              } else if (orchKind == "part_named") {
-                // Naming stage: stash the AI-chosen part name for the
-                // run-finish path (title refresh + auto-save). Result part_name
-                // is a backup.
-                std::string pn = data.value("name", std::string());
-                if (!pn.empty()) {
-                  std::lock_guard<std::mutex> lk(st.job.mtx);
-                  st.job.partName = std::move(pn);
-                }
-              } else if (orchKind == "run_note") {
-                // Agent self-persistence (file-first create / milestone re-save
-                // / memory-stage rename) happens in-daemon, so the host's
-                // doc_save PLM hook never sees it. Record those saves into
-                // project history here — plmAutoRecordSave self-gates (worker
-                // up, auto_commit on, path inside the PLM project folder) and
-                // is async/non-blocking.
-                const std::string note = data.value("note", std::string());
-                if (note == "file_created" || note == "milestone_saved" ||
-                    note == "file_renamed") {
-                  const std::string p = data.value("path", std::string());
-                  if (!p.empty())
-                    ui::plmAutoRecordSave(st, p);
-                }
-              } else if (orchKind == "doc.preview") {
-                // Live viewport preview: agent successfully applied ops.
-                // data = {doc_id, revision, aicm_path}. Monotonic rev guard +
-                // mid-edit skip (same gate as engine_events doc.changed).
-                const std::string prevDocId =
-                    data.value("doc_id", std::string());
-                const int prevRev = data.value("revision", 0);
-                const std::string aicm = data.value("aicm_path", std::string());
-                if (prevDocId != s_lastPreviewDocId) {
-                  s_lastPreviewDocId = prevDocId;
-                  s_lastPreviewRev = 0;
-                }
-                const bool midEdit =
-                    (st.sketchMode && st.sketchMode->active()) ||
-                    (st.propertyManager && st.propertyManager->active());
-                // Match the run's target: active DocMirror doc (launch always
-                // targets the then-active doc; switching away must not
-                // clobber).
-                if (!midEdit && !prevDocId.empty() &&
-                    prevDocId == st.docMirror.docId() &&
-                    prevRev > s_lastPreviewRev && !aicm.empty()) {
-                  s_lastPreviewRev = prevRev;
-                  st.loadDocMeshAsync(aicm);
-                  st.livePhase =
-                      "Building\xe2\x80\xa6 rev " + std::to_string(prevRev);
-                  if (active)
-                    active->liveStatus = st.livePhase;
-                }
               }
-            } catch (...) {
+            } else if (orchKind == "agent_call") {
+              int est = 0;
+              if (data.contains("context_tokens_est") &&
+                  data["context_tokens_est"].is_number_integer())
+                est = data["context_tokens_est"].get<int>();
+              if (est <= 0)
+                est = data.value("context_tokens_est", 0);
+              if (est > 0 && isViewedDoc)
+                st.lastContextTokens = std::max(st.lastContextTokens, est);
+            } else if (orchKind == "agent_output" &&
+                       data.contains("tokens") &&
+                       data["tokens"].is_object()) {
+              int in = data["tokens"].value("in", 0);
+              if (in > 0 && isViewedDoc)
+                st.lastContextTokens = in;
+            } else if (orchKind == "part_named") {
+              // Naming stage: stash the AI-chosen part name for the
+              // run-finish path (title refresh + auto-save). Result part_name
+              // is a backup. Per-run data — correct for a background run too.
+              std::string pn = data.value("name", std::string());
+              if (!pn.empty()) {
+                std::lock_guard<std::mutex> lk(job.mtx);
+                job.partName = std::move(pn);
+              }
+            } else if (orchKind == "run_note") {
+              // Agent self-persistence (file-first create / milestone re-save
+              // / memory-stage rename) happens in-daemon, so the host's
+              // doc_save PLM hook never sees it. Record those saves into
+              // project history here — plmAutoRecordSave self-gates (worker
+              // up, auto_commit on, path inside the PLM project folder) and
+              // is async/non-blocking. Ungated: PLM history is per-document
+              // bookkeeping, not viewport state.
+              const std::string note = data.value("note", std::string());
+              if (note == "file_created" || note == "milestone_saved" ||
+                  note == "file_renamed") {
+                const std::string p = data.value("path", std::string());
+                if (!p.empty())
+                  ui::plmAutoRecordSave(st, p);
+              }
+            } else if (orchKind == "doc.preview") {
+              // Live viewport preview: agent successfully applied ops.
+              // data = {doc_id, revision, aicm_path}. Monotonic rev guard +
+              // mid-edit skip (same gate as engine_events doc.changed). The
+              // prevDocId == docMirror.docId() test below is the real view
+              // gate here — a background run's doc is never the active mirror.
+              const std::string prevDocId =
+                  data.value("doc_id", std::string());
+              const int prevRev = data.value("revision", 0);
+              const std::string aicm = data.value("aicm_path", std::string());
+              if (prevDocId != s_lastPreviewDocId) {
+                s_lastPreviewDocId = prevDocId;
+                s_lastPreviewRev = 0;
+              }
+              const bool midEdit =
+                  (st.sketchMode && st.sketchMode->active()) ||
+                  (st.propertyManager && st.propertyManager->active());
+              // Match the run's target: active DocMirror doc (launch always
+              // targets the then-active doc; switching away must not
+              // clobber).
+              if (!midEdit && !prevDocId.empty() &&
+                  prevDocId == st.docMirror.docId() &&
+                  prevRev > s_lastPreviewRev && !aicm.empty()) {
+                s_lastPreviewRev = prevRev;
+                st.loadDocMeshAsync(aicm);
+                st.livePhase =
+                    "Building\xe2\x80\xa6 rev " + std::to_string(prevRev);
+                if (active)
+                  active->liveStatus = st.livePhase;
+              }
             }
-            // Also update the compact status line in the chat
-            if (!e.notes.empty()) {
-              st.agentV2Status = e.notes;
-              if (active)
-                active->liveStatus = e.notes;
-            }
-            continue; // don't process as legacy event
+          } catch (...) {
           }
-          // --- end C22b ---
-          if (e.kind == "status") {
+          // Also update the compact status line in the chat
+          if (!e.notes.empty()) {
+            if (isViewedDoc)
+              st.agentV2Status = e.notes;
+            if (active)
+              active->liveStatus = e.notes;
+          }
+          continue; // don't process as legacy event
+        }
+        // --- end C22b ---
+        if (e.kind == "status") {
+          if (isViewedDoc)
             st.livePhase = e.text;
-            if (active)
-              active->liveStatus = e.text;
-          } else if (e.kind == "plan") {
-            if (active)
-              active->plan = e.plan;
+          if (active)
+            active->liveStatus = e.text;
+        } else if (e.kind == "plan") {
+          if (active)
+            active->plan = e.plan;
+          if (isViewedDoc)
             st.livePhase = "Build plan ready - writing the CAD code...";
-          } else if (e.kind == "iteration") {
-            if (active) {
-              AgentStep *st2 = nullptr;
-              for (auto &s : active->steps)
-                if (s.index == e.index) {
-                  st2 = &s;
-                  break;
-                }
-              if (!st2) {
-                active->steps.emplace_back();
-                st2 = &active->steps.back();
+        } else if (e.kind == "iteration") {
+          if (active) {
+            AgentStep *st2 = nullptr;
+            for (auto &s : active->steps)
+              if (s.index == e.index) {
+                st2 = &s;
+                break;
               }
-              st2->index = e.index;
-              st2->ok = e.ok;
-              st2->done = e.done;
-              st2->notes = e.notes;
-              st2->thinking = e.thinking;
-              st2->code = e.code;
-              st2->diff = e.diff;
-              st2->dims = e.dims;
-              st2->error = e.error;
-              st2->contactSheet = e.contactSheet;
-              st2->stdoutText = e.stdoutText;
-              st2->isAssembly = e.isAssembly;
-              st2->parts = e.parts;
-              st2->fit = e.fit;
-              active->liveStatus.clear();
+            if (!st2) {
+              active->steps.emplace_back();
+              st2 = &active->steps.back();
             }
-            // Live preview: show each successful build in the viewport the
-            // moment it lands, color-coded per part for assemblies (we're on
-            // the GL thread).
+            st2->index = e.index;
+            st2->ok = e.ok;
+            st2->done = e.done;
+            st2->notes = e.notes;
+            st2->thinking = e.thinking;
+            st2->code = e.code;
+            st2->diff = e.diff;
+            st2->dims = e.dims;
+            st2->error = e.error;
+            st2->contactSheet = e.contactSheet;
+            st2->stdoutText = e.stdoutText;
+            st2->isAssembly = e.isAssembly;
+            st2->parts = e.parts;
+            st2->fit = e.fit;
+            active->liveStatus.clear();
+          }
+          // Live preview: show each successful build in the viewport the
+          // moment it lands, color-coded per part for assemblies (we're on
+          // the GL thread). Viewed doc only — a background run must never
+          // repaint the mesh someone else is looking at.
+          if (isViewedDoc) {
             if (e.ok && !e.stlPath.empty()) {
               st.asmStl = e.stlPath;
               st.asmParts = e.isAssembly ? e.parts : std::vector<PartInfo>{};
@@ -3936,35 +3961,56 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       }
     }
 
-    if (st.job.ready.exchange(false)) {
-      std::lock_guard<std::mutex> lk(st.job.mtx);
-      st.livePhase.clear();
-      st.agentV2Status.clear();
-      if (st.stopRequested || st.job.stopReason == "cancelled") {
+    // A finished run belongs to ITS conversation. Walk every run slot and route
+    // each completed run's final text / plan gate / error card into the
+    // conversation it was launched from. Viewport, tab and status-bar state is
+    // singular, so only a run whose document is the one on screen may touch it.
+    for (auto &[runConvId, runPtr] : st.runs) {
+      if (!runPtr || !runPtr->ready.exchange(false))
+        continue;
+      JobState &job = *runPtr;
+      std::lock_guard<std::mutex> lk(job.mtx);
+      const bool isViewedDoc =
+          !job.docKey.empty() && job.docKey == st.chatDocKey;
+      std::vector<ChatMsg> *msgsPtr = conversationMsgs(st, runConvId);
+      // The status line is viewport-singular — a background run must never
+      // repaint it for the document the user is actually looking at.
+      auto setStatus = [&](const char *text, int kind) {
+        if (!isViewedDoc)
+          return;
+        st.status = text;
+        st.statusKind = kind;
+      };
+      if (isViewedDoc) {
+        st.livePhase.clear();
+        st.agentV2Status.clear();
+      }
+      if (job.stopRequested.load() || job.stopReason == "cancelled") {
         // The user stopped this run (or engine returned cancel_result after
         // agent_cancel). Discard quietly: leave the chat message as the Stop
         // handler finalized it, and skip the doc rebuild/resync and any new-tab
         // adoption. Do NOT resurrect an error card.
-        st.stopRequested = false;
-        st.agentV2Running = false;
-        st.status = "Stopped.";
-        st.statusKind = 1;
+        job.stopRequested = false;
+        st.agentV2Running = st.anyRunActive();
+        setStatus("Stopped.", 1);
         // Ensure any still-running assistant bubble is settled as Stopped (not
         // error).
-        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
-          if (!it->fromUser && it->running) {
-            it->running = false;
-            it->liveStatus = "Stopped";
-            it->errKind = ERR_NONE;
-            break;
+        if (msgsPtr) {
+          for (auto it = msgsPtr->rbegin(); it != msgsPtr->rend(); ++it) {
+            if (!it->fromUser && it->running) {
+              it->running = false;
+              it->liveStatus = "Stopped";
+              it->errKind = ERR_NONE;
+              break;
+            }
           }
         }
         // NOTE: job.mtx is already held by `lk` above — re-locking here
         // self-deadlocked the GL thread (or aborted via EDEADLK) the moment a
         // stopped run actually returned status=cancelled.
-        st.job.runId.clear();
-        st.job.error.clear();
-        st.job.errorDetail.clear();
+        job.runId.clear();
+        job.error.clear();
+        job.errorDetail.clear();
         st.addLog("[..] run result discarded (stopped by user)");
       } else {
         // --- C22b: if this was a v2 run, resync the DocMirror tree + reload
@@ -3980,42 +4026,46 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         // was untouched, so we skip the doc_rebuild-on-current-doc below for
         // this case.
         const bool openedNewDoc =
-            wasV2 && !st.job.createdDocPath.empty() && st.job.error.empty();
-        if (openedNewDoc) {
-          st.requestOpenPath = st.job.createdDocPath;
+            wasV2 && !job.createdDocPath.empty() && job.error.empty();
+        if (openedNewDoc && isViewedDoc) {
+          st.requestOpenPath = job.createdDocPath;
           st.addLog("[v2] assembly built -> opening as new tab: " +
-                    st.job.createdDocPath);
+                    job.createdDocPath);
         }
         // W17: the run built a 2D drawing — adopt it as a Drawing tab (the
         // active part was NOT mutated, so we skip the doc_rebuild below).
         const bool madeDrawing =
-            wasV2 && !st.job.drawingDocId.empty() && st.job.error.empty();
-        if (madeDrawing) {
-          st.adoptDrawingTab(st.job.drawingDocId, st.job.drawingName,
-                             st.job.drawingSourceId);
+            wasV2 && !job.drawingDocId.empty() && job.error.empty();
+        if (madeDrawing && isViewedDoc) {
+          st.adoptDrawingTab(job.drawingDocId, job.drawingName,
+                             job.drawingSourceId);
           st.addLog("[v2] drawing built -> opened drawing tab " +
-                    st.job.drawingDocId);
-          st.job.drawingDocId.clear();
+                    job.drawingDocId);
+          job.drawingDocId.clear();
         }
         // CAM fast-path: the run built a machining job from the current part.
         // Load it into the Manufacture workspace panel and switch to it (the
         // active part doc was NOT mutated, so the doc_rebuild below is skipped
         // — same as drawing).
         const bool madeCam =
-            wasV2 && !st.job.camDocId.empty() && st.job.error.empty();
-        if (madeCam) {
-          ui::camLoadJob(st, st.job.camDocId);
+            wasV2 && !job.camDocId.empty() && job.error.empty();
+        if (madeCam && isViewedDoc) {
+          ui::camLoadJob(st, job.camDocId);
           st.showRibbon = true;
           st.ribbonTab = AppState::RT_Manufacture;
           st.addLog("[v2] CAM job built -> opened Manufacture workspace " +
-                    st.job.camDocId);
-          st.job.camDocId.clear();
+                    job.camDocId);
+          job.camDocId.clear();
         }
-        if (st.agentV2Running) {
-          st.agentV2Running = false;
+        // Ground truth, ungated: another conversation may still be working, and
+        // a background run finishing must not lie about that either way.
+        st.agentV2Running = st.anyRunActive();
+        // Everything below mutates singular viewport / tab / auto-save state,
+        // so it only runs when this run's document is the one on screen.
+        if (isViewedDoc) {
           // plan_ready mutates nothing — skip doc_activate / mesh reload.
-          if (!st.job.planReady && !openedNewDoc && !madeDrawing && !madeCam &&
-              st.docMirror.hasDoc() && st.job.error.empty()) {
+          if (!job.planReady && !openedNewDoc && !madeDrawing && !madeCam &&
+              st.docMirror.hasDoc() && job.error.empty()) {
             // C39: a forced rebuild can take tens of seconds on a heavy doc —
             // the old sync call froze the window right after the agent
             // finished. Queue async; the callback (a later frame's drain, GL
@@ -4025,7 +4075,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // previews already landed the final revision, mesh is current —
             // skip the sticky "Refreshing model..." pill (still resync the
             // tree).
-            const int finalRev = st.job.finalRevision;
+            const int finalRev = job.finalRevision;
             const bool meshAlreadyCurrent =
                 s_lastPreviewRev > 0 &&
                 s_lastPreviewDocId == st.docMirror.docId() && finalRev > 0 &&
@@ -4096,9 +4146,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           // that into the tab and persist so displayTitle() / Feature Manager /
           // viewport all agree.
           if (!openedNewDoc && !madeDrawing && !madeCam &&
-              st.docMirror.hasDoc() && st.job.error.empty() &&
-              !st.job.partName.empty() && st.job.finalRevision > 0) {
-            const std::string partName = st.job.partName;
+              st.docMirror.hasDoc() && job.error.empty() &&
+              !job.partName.empty() && job.finalRevision > 0) {
+            const std::string partName = job.partName;
             // Optimistic title so the strip updates even before async resync
             // lands.
             if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
@@ -4113,10 +4163,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // duplicate <name>_2.step+ next to the agent's <name>.step+. Still
             // goes through featureTreeSaveDocToPath so the tab path / dirty
             // clear / recents / PLM auto-record all fire as usual.
-            if (!st.job.savedPath.empty()) {
+            if (!job.savedPath.empty()) {
               st.addLog("[v2] saving named part onto agent-persisted path -> " +
-                        st.job.savedPath);
-              ui::featureTreeSaveDocToPath(st, st.job.savedPath,
+                        job.savedPath);
+              ui::featureTreeSaveDocToPath(st, job.savedPath,
                                            /*requireNonEmpty=*/true);
             } else {
               // Sanitize to a filesystem-safe stem (match drawing export
@@ -4197,19 +4247,18 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         // --- end C22b ---
         std::string assistant;
         int assistantErr = ERR_NONE;
-        if (!st.job.error.empty() && st.job.errorIsCad) {
+        if (!job.error.empty() && job.errorIsCad) {
           // The CAD script didn't build. That's normal territory for an AI
           // design loop (it usually self-corrects mid-run) — report it calmly,
           // details on demand, and don't dress a modeling problem up as an app
           // crash.
-          std::string cause = errSummary(st.job.error);
-          st.status = "Build didn't converge";
-          st.statusKind = 1;
+          std::string cause = errSummary(job.error);
+          setStatus("Build didn't converge", 1);
           st.addLog("[cad] " + cause);
           assistantErr = ERR_CAD;
-          if (st.job.kind == JOB_BUILD) {
+          if (job.kind == JOB_BUILD) {
             st.buildErrSummary = cause;
-            st.buildErrFull = st.job.error;
+            st.buildErrFull = job.error;
           } else {
             assistant =
                 "I couldn't get this design to build cleanly - the CAD code "
@@ -4220,16 +4269,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 "not an app problem. Try rephrasing or simplifying the request "
                 "(each iteration's Error details has the full trace).";
           }
-        } else if (!st.job.error.empty()) {
-          st.status = "System error";
-          st.statusKind = 2;
+        } else if (!job.error.empty()) {
+          setStatus("System error", 2);
           // Prefer the structured provider detail when present (longer, more
           // actionable).
           std::string full =
-              !st.job.errorDetail.empty() ? st.job.errorDetail : st.job.error;
-          if (!st.job.stopReason.empty() &&
-              full.find(st.job.stopReason) == std::string::npos)
-            full = st.job.stopReason + " — " + full;
+              !job.errorDetail.empty() ? job.errorDetail : job.error;
+          if (!job.stopReason.empty() &&
+              full.find(job.stopReason) == std::string::npos)
+            full = job.stopReason + " — " + full;
           std::string e = full.substr(0, 400);
           st.addLog("[err] " + e);
           st.toast(ui::ToastLevel::Error,
@@ -4271,73 +4319,70 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               }
             }
           }
-        } else if (!st.job.stl.empty()) {
+        } else if (!job.stl.empty()) {
           Mesh m;
           std::string e;
-          if (loadBinarySTL(st.job.stl, m, e)) {
+          if (loadBinarySTL(job.stl, m, e)) {
             renderer.setMesh(m);
-            st.status = "Done";
-            st.statusKind = 0;
-            st.modelInfo = st.job.info;
+            setStatus("Done", 0);
+            st.modelInfo = job.info;
             st.buildErrSummary.clear();
-            st.addLog("[ok] built  " + st.job.info);
+            st.addLog("[ok] built  " + job.info);
             // Refresh the parts panel for the new model (cleared for single
             // parts so the panel disappears), then re-load assemblies
             // color-coded per part.
-            st.asmStl = st.job.stl;
-            st.asmParts = st.job.parts;
-            st.asmFit = st.job.fit;
+            st.asmStl = job.stl;
+            st.asmParts = job.parts;
+            st.asmFit = job.fit;
             st.selectedPart = -1;
-            if (st.job.isAssembly)
+            if (job.isAssembly)
               st.showPartMesh(-1);
-            if (st.job.isAssembly && st.job.fit.present) {
-              assistant = "Done - " + st.job.info + ".\n" +
-                          (st.job.fit.ok ? "Fit OK - " : "Fit issue - ") +
-                          st.job.fit.summary +
+            if (job.isAssembly && job.fit.present) {
+              assistant = "Done - " + job.info + ".\n" +
+                          (job.fit.ok ? "Fit OK - " : "Fit issue - ") +
+                          job.fit.summary +
                           "\nSee the Viewport (parts list + fit readout). Ask "
                           "for a tweak and I'll revise.";
-              st.addLog((st.job.fit.ok ? "[ok] fit: " : "[err] fit: ") +
-                        st.job.fit.summary);
+              st.addLog((job.fit.ok ? "[ok] fit: " : "[err] fit: ") +
+                        job.fit.summary);
             } else {
               assistant =
-                  "Done - " + st.job.info +
+                  "Done - " + job.info +
                   ".\nSee the Viewport. Ask for a tweak and I'll revise.";
             }
-            if ((st.job.kind == JOB_DESIGN || st.job.kind == JOB_CHAT) &&
-                !st.job.converged)
+            if ((job.kind == JOB_DESIGN || job.kind == JOB_CHAT) &&
+                !job.converged)
               assistant +=
                   "\n(Stopped at the iteration cap - say \"keep going\" "
                   "and I'll keep refining this same design.)";
           } else {
-            st.status = "STL load failed";
-            st.statusKind = 2;
+            setStatus("STL load failed", 2);
             st.addLog("[err] " + e);
             assistant = "Built it, but couldn't load the mesh: " + e;
             assistantErr = ERR_SYSTEM;
           }
-        } else if (wasV2 && st.job.planReady && st.job.error.empty()) {
+        } else if (wasV2 && job.planReady && job.error.empty()) {
           // User-facing plan gate (manual Plan / advisor escalate
           // needs_user_decision). Agent-decided plans never land here — they
           // execute after in-core advisor OK.
-          const bool escalate = (st.job.stopReason == "needs_user_decision");
-          st.status = escalate ? "Plan needs your decision"
-                               : "Plan ready — need edits, or start execution?";
-          st.statusKind = 0;
-          if (!st.job.missionVerdict.empty())
-            assistant = st.job.missionVerdict;
-        } else if (wasV2 && st.job.isMission && st.job.missionPartial &&
-                   st.job.error.empty()) {
+          const bool escalate = (job.stopReason == "needs_user_decision");
+          setStatus(escalate ? "Plan needs your decision"
+                             : "Plan ready — need edits, or start execution?",
+                    0);
+          if (!job.missionVerdict.empty())
+            assistant = job.missionVerdict;
+        } else if (wasV2 && job.isMission && job.missionPartial &&
+                   job.error.empty()) {
           // status=="partial": some tasks built, at least one failed. Geometry
           // is real — keep the doc, show warning-accent card (NOT error, NOT
           // full done).
-          st.status = "Partially complete";
-          st.statusKind = 1; // warning
-          int n = st.job.missionTasksCompleted;
-          int m = st.job.missionTasksTotal > 0
-                      ? st.job.missionTasksTotal
-                      : (n + st.job.missionTasksFailed);
-          std::string reason = !st.job.errorDetail.empty() ? st.job.errorDetail
-                                                           : st.job.stopReason;
+          setStatus("Partially complete", 1); // warning
+          int n = job.missionTasksCompleted;
+          int m = job.missionTasksTotal > 0
+                      ? job.missionTasksTotal
+                      : (n + job.missionTasksFailed);
+          std::string reason = !job.errorDetail.empty() ? job.errorDetail
+                                                           : job.stopReason;
           if (reason.empty())
             reason = "unknown";
           char head[320];
@@ -4353,36 +4398,34 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           // Prefer composed head as the card body; append mission verdict if it
           // adds more.
           assistant = head;
-          if (!st.job.missionVerdict.empty() &&
-              st.job.missionVerdict.find("Partially complete") ==
+          if (!job.missionVerdict.empty() &&
+              job.missionVerdict.find("Partially complete") ==
                   std::string::npos) {
             assistant += "\n\n";
-            assistant += st.job.missionVerdict;
-          } else if (!st.job.missionVerdict.empty() &&
-                     st.job.missionVerdict != assistant) {
+            assistant += job.missionVerdict;
+          } else if (!job.missionVerdict.empty() &&
+                     job.missionVerdict != assistant) {
             // missionVerdict already has the head-shaped text — use it.
-            assistant = st.job.missionVerdict;
+            assistant = job.missionVerdict;
           }
           assistantErr = ERR_PARTIAL;
           st.addLog(std::string("[mission] partial: ") + head);
-        } else if (wasV2 && st.job.isMission &&
-                   !st.job.missionVerdict.empty() && st.job.error.empty()) {
+        } else if (wasV2 && job.isMission &&
+                   !job.missionVerdict.empty() && job.error.empty()) {
           // Mission run: the report/verdict prose IS the assistant's reply (it
           // already narrates what was built + the analysis conclusion). The
           // assembly tab / doc rebuild were handled above; we just surface the
           // verdict as the bubble text.
-          st.status = "Done";
-          st.statusKind = 0;
-          assistant = st.job.missionVerdict;
-        } else if (wasV2 && st.job.error.empty()) {
+          setStatus("Done", 0);
+          assistant = job.missionVerdict;
+        } else if (wasV2 && job.error.empty()) {
           // C40: a v2 orchestrator run has no job.stl — the doc itself was
           // built. Without this branch the assistant bubble finished EMPTY (the
           // run looked dead even when it succeeded). Summarize from the run
           // result; the tree/viewport refresh lands via the async doc_rebuild
           // above.
-          if (st.job.converged) {
-            st.status = "Done";
-            st.statusKind = 0;
+          if (job.converged) {
+            setStatus("Done", 0);
             if (openedNewDoc)
               assistant =
                   "Done - I built each part as its own editable document and "
@@ -4397,20 +4440,19 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                           "or edit any feature directly (double-click / "
                           "right-click it).";
           } else {
-            st.status = "Stopped early";
-            st.statusKind = 1;
+            setStatus("Stopped early", 1);
             assistantErr = ERR_CAD;
             // Prefer errorDetail (provider HTTP body / auth message) so the
             // card never falls back to "unknown reason" when stopReason was
             // dropped.
             std::string why =
-                !st.job.errorDetail.empty()
-                    ? st.job.errorDetail
-                    : (st.job.stopReason.empty() ? "unknown reason"
-                                                 : st.job.stopReason);
-            if (!st.job.stopReason.empty() && !st.job.errorDetail.empty() &&
-                st.job.stopReason != st.job.errorDetail)
-              why = st.job.stopReason + " — " + st.job.errorDetail;
+                !job.errorDetail.empty()
+                    ? job.errorDetail
+                    : (job.stopReason.empty() ? "unknown reason"
+                                                 : job.stopReason);
+            if (!job.stopReason.empty() && !job.errorDetail.empty() &&
+                job.stopReason != job.errorDetail)
+              why = job.stopReason + " — " + job.errorDetail;
             assistant = "I stopped before fully finishing (" + why +
                         "). Whatever was built "
                         "so far is in the FeatureManager tree - check the "
@@ -4418,24 +4460,26 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                         "for the step-by-step log, or rephrase and try again.";
           }
         }
-        if (st.job.kind == JOB_DESIGN || st.job.kind == JOB_CHAT) {
+        if (job.kind == JOB_DESIGN || job.kind == JOB_CHAT) {
           ChatMsg *active = nullptr;
-          for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-            if (!it->fromUser && it->running) {
-              active = &(*it);
-              break;
-            }
+          if (msgsPtr) {
+            for (auto it = msgsPtr->rbegin(); it != msgsPtr->rend(); ++it)
+              if (!it->fromUser && it->running) {
+                active = &(*it);
+                break;
+              }
+          }
           if (active) {
             active->running = false;
             active->liveStatus.clear();
             active->errKind = assistantErr;
             active->resultPartial =
-                st.job.missionPartial && (assistantErr == ERR_PARTIAL);
+                job.missionPartial && (assistantErr == ERR_PARTIAL);
             // User-facing plan gate only (manual Plan / needs_user_decision).
-            if (st.job.planReady && assistantErr == ERR_NONE) {
+            if (job.planReady && assistantErr == ERR_NONE) {
               active->planApprovePending = true;
               if (active->planApproveRequest.empty()) {
-                for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
+                for (auto it = msgsPtr->rbegin(); it != msgsPtr->rend(); ++it) {
                   if (it->fromUser && !it->text.empty()) {
                     active->planApproveRequest = it->text;
                     break;
@@ -4444,9 +4488,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               }
               // Seed plan section + execution_style + escalate reason from
               // payload.
-              if (!st.job.planReadyJson.empty()) {
+              if (!job.planReadyJson.empty()) {
                 try {
-                  auto stash = nlohmann::json::parse(st.job.planReadyJson);
+                  auto stash = nlohmann::json::parse(job.planReadyJson);
                   if (stash.contains("execution_style") &&
                       stash["execution_style"].is_string())
                     active->planExecutionStyle =
@@ -4482,13 +4526,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 }
               }
               if (active->planExecutionStyle.empty() &&
-                  !st.job.stopReason.empty()) {
+                  !job.stopReason.empty()) {
                 // Soft default: manual Plan mode often resumes as agent.
-                if (st.job.stopReason == "plan_only" ||
-                    st.job.stopReason == "awaiting_plan_approval")
+                if (job.stopReason == "plan_only" ||
+                    job.stopReason == "awaiting_plan_approval")
                   active->planExecutionStyle = "agent";
               }
-            } else if (!st.job.planReady && active->planApprovePending) {
+            } else if (!job.planReady && active->planApprovePending) {
               // Run finished without a user gate — drop any leftover draft flag
               // (e.g. Plan mode that failed before plan_ready).
               active->planApprovePending = false;
@@ -4507,19 +4551,17 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               active->text = assistant;
             }
             // else: leave active->text as-is (streamed deltas or empty)
-          } else if (!assistant.empty() && !st.job.planReady) {
-            ChatMsg m;
-            m.text = assistant;
-            m.errKind = assistantErr;
-            m.resultPartial = (assistantErr == ERR_PARTIAL);
-            st.chat.push_back(m);
           }
+          // No misdelivery fallback: when this run's OWN conversation has no
+          // running bubble left, the answer has nowhere legitimate to land.
+          // Appending it to whatever conversation happens to be visible is
+          // exactly the cross-conversation delivery bug this routing kills.
         }
         // Persist finished transcript so reopen/switch keeps assistant text +
         // artifacts.
         ui::persistChatHistory(st);
       } // end else (run not stopped by the user)
-    }
+    } // end per-run finished-result routing
 
     // C16 tree shot: run the doc smoke once the worker is ready (fires the
     // first time workerStarted is true after a wantTree shot). Synchronous
@@ -5113,7 +5155,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // dark.
     ensureFrameTheme();
 
-    bool busy = st.job.running.load();
+    // Global "something is running" signal for the status bar, viewport panel
+    // and Settings modal — deliberately ANY run, not just the viewed one.
+    bool busy = st.anyRunActive();
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
@@ -5157,7 +5201,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     //     those cases as a second gate.
     {
       const bool canDoc =
-          st.workerStarted && !st.job.running.load() && !st.agentV2Running;
+          st.workerStarted && !st.anyRunActive() && !st.agentV2Running;
       const bool textFocus = io.WantTextInput;
       const bool inSketchNow = st.sketchMode->active();
       bool ecadFocused = false;
@@ -5299,7 +5343,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         st.requestSaveAs || st.requestSaveAll ||
         !st.requestExportFormat.empty()) {
       const bool fileReady =
-          st.workerStarted && !st.job.running.load() && !st.agentV2Running;
+          st.workerStarted && !st.anyRunActive() && !st.agentV2Running;
       if (!fileReady) {
         // Drop save/export/recent requests (need a doc); keep open requests
         // pending until ready.
@@ -5615,8 +5659,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // ---------- status bar ----------
     ui::drawStatusBar(st, vp, statusH, busy, hostFlags);
 
-    bool canRun = st.workerStarted && !busy;
-
     // ---------- panels (pinned glass columns + floating dialogs over the
     // full-width 3D) ---- The SolidWorks-faithful tabbed LEFT column (Explorer
     // / FeatureManager / PropertyManager / Configurations). drawLeftPane routes
@@ -5759,8 +5801,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // where the full-body AI hub (drawAiWorkspace, below) hosts its own
     // expanded chat on the same st.chat state — drawing both would double the
     // conversation panel.
-    if (ws != WS::AI && !webActive)
-      ui::drawAIPanel(st, busy, canRun);
+    if (ws != WS::AI && !webActive) {
+      // Copilot busy/enabled are PER CONVERSATION: a run in some other
+      // conversation must never lock the composer of the one on screen.
+      const bool chatBusy = st.convRunning(st.activeConvId());
+      ui::drawAIPanel(st, chatBusy, st.workerStarted && !chatBusy);
+    }
     // Autosave safety net: the debounced chat_history flush used to live ONLY inside
     // drawAIPanel / the AI workspace, so it stopped entirely whenever the Copilot column
     // wasn't drawn (View > hide Copilot, the Web overlay, or an ImGui-clipped window). A long

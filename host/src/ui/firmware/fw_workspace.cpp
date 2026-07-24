@@ -1428,7 +1428,7 @@ static void drawCopilotPane(AppState& st, float w) {
 
     fwSectionHeader("ai_panel", "AI Copilot");
 
-    const bool busy = st.job.running.load();
+    const bool busy = st.convRunning(st.activeConvId());
     const bool canRun = st.workerStarted && !busy;
 
     // Same one-frame-lag composer-height trick the docked Copilot / AI workspace use, so the

@@ -1,6 +1,8 @@
 // core/agent/omp_bridge_client.cpp — see omp_bridge_client.h. POSIX fork+pipe child talking
 // newline-delimited JSON-RPC to `bun run vendor/omp/bridge/src/bridge.ts`, structurally mirrored
-// on core/hostd/worker_bridge.cpp (the existing Python-worker stdio bridge pattern).
+// on core/hostd/worker_bridge.cpp (the existing Python-worker stdio bridge pattern), but with a
+// background reader thread multiplexing responses instead of serializing request/response pairs
+// behind one lock — see the design note at the top of omp_bridge_client.h.
 #include "agent/omp_bridge_client.h"
 #include "agent/providers.h"  // provider_cancel_flag() — abort in-flight bridge complete() on Stop
 
@@ -39,9 +41,11 @@ bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& 
 
 #else  // !_WIN32
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <thread>
+#include <vector>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -152,6 +156,56 @@ void ensureBridgeDeps(const std::string& vendorOmpDir, const std::string& bunExe
     waitpid(pid, &status, 0);
 }
 
+// Blocking single-line reader used only by the background reader thread: pumps `fd` (this
+// generation's child stdout, non-blocking) into `buf` until a full line is available, `fd`
+// hits EOF/error, or `pid` is confirmed reaped. Not a class member — it needs nothing from
+// `this`, and keeping it free keeps the per-generation read buffer a stack local instead of a
+// shared field (only one thread — the reader — ever touches it).
+bool readerReadLine(int fd, pid_t pid, std::string& buf, std::string& line) {
+    for (;;) {
+        size_t nl = buf.find('\n');
+        if (nl != std::string::npos) {
+            line = buf.substr(0, nl);
+            buf.erase(0, nl + 1);
+            return true;
+        }
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = ::poll(&pfd, 1, 2);  // 2 ms tick — matches worker_bridge.cpp / worker_client.cpp
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (pr == 0) {
+            int status = 0;
+            pid_t r = waitpid(pid, &status, WNOHANG);
+            if (r == pid || (r < 0 && errno == ECHILD)) {
+                // Child exited — drain whatever is already sitting in the pipe once more
+                // before declaring EOF (a final response may have raced the exit).
+                char chunk[4096];
+                ssize_t got = ::read(fd, chunk, sizeof(chunk));
+                if (got > 0) {
+                    buf.append(chunk, (size_t)got);
+                    continue;
+                }
+                return false;
+            }
+            continue;
+        }
+        char chunk[4096];
+        ssize_t got = ::read(fd, chunk, sizeof(chunk));
+        if (got > 0) {
+            buf.append(chunk, (size_t)got);
+        } else if (got == 0) {
+            return false;  // EOF
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            return false;
+        }
+    }
+}
+
 }  // namespace
 
 std::atomic<bool> OmpBridgeClient::created_{false};
@@ -169,43 +223,31 @@ void OmpBridgeClient::shutdownIfCreated() {
 OmpBridgeClient::~OmpBridgeClient() { stop(); }
 
 void OmpBridgeClient::stop() {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (!running_ && process_ < 0 && childStdinWr_ < 0 && childStdoutRd_ < 0 &&
+            !reader_.joinable())
+            return;
+        // bridge.ts exits on stdin EOF — its `for await (const line of rl)` loop simply ends
+        // and main() returns — so unlike worker_bridge's Python worker there is no explicit
+        // shutdown method to write first; closing the write end is the whole signal. The
+        // reader thread notices the resulting stdout EOF and finishes the teardown (reap(),
+        // which also fails any outstanding callers) itself.
+        if (childStdinWr_ >= 0) {
+            ::close(childStdinWr_);
+            childStdinWr_ = -1;
+        }
+    }
+    if (reader_.joinable()) reader_.join();
+    // Safety net: if the reader thread never got to run for this generation (e.g. the child
+    // died between spawn() and its first read), finish the teardown here.
     std::lock_guard<std::mutex> lk(mtx_);
-    if (!running_ && process_ < 0 && childStdinWr_ < 0 && childStdoutRd_ < 0) return;
-    // bridge.ts exits on stdin EOF — its `for await (const line of rl)` loop simply ends and
-    // main() returns — so unlike worker_bridge's Python worker there is no explicit shutdown
-    // method to write first; closing the write end is the whole signal.
-    if (childStdinWr_ >= 0) {
-        ::close(childStdinWr_);
-        childStdinWr_ = -1;
-    }
-    if (process_ >= 0) {
-        bool reaped = false;
-        for (int i = 0; i < 200; ++i) {
-            int status = 0;
-            pid_t r = waitpid(process_, &status, WNOHANG);
-            if (r == process_ || (r < 0 && errno == ECHILD)) {
-                reaped = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        if (!reaped) {
-            ::kill(process_, SIGTERM);
-            waitpid(process_, nullptr, 0);
-        }
-        process_ = -1;
-    }
-    if (childStdoutRd_ >= 0) {
-        ::close(childStdoutRd_);
-        childStdoutRd_ = -1;
-    }
-    readBuf_.clear();
-    running_ = false;
+    if (running_) reap();
 }
 
 void OmpBridgeClient::reap() {
-    // Caller holds mtx_. Tear down without the graceful-EOF wait (child already dead or the
-    // pipe is broken).
+    // Caller holds mtx_. Tear down without the graceful-EOF wait (child already dead, or the
+    // pipe is broken, or stop() already closed stdin and is waiting on the reader thread).
     if (childStdinWr_ >= 0) {
         ::close(childStdinWr_);
         childStdinWr_ = -1;
@@ -226,8 +268,10 @@ void OmpBridgeClient::reap() {
         }
         process_ = -1;
     }
-    readBuf_.clear();
     running_ = false;
+    // Whoever noticed the child is dead (a caller's failed write, or the reader thread's own
+    // EOF detection) is the single place that guarantees no in-flight call() is left hanging.
+    failAllPending("omp bridge subprocess exited");
 }
 
 bool OmpBridgeClient::resolvePaths(std::string& err) {
@@ -301,7 +345,6 @@ bool OmpBridgeClient::spawn(std::string& err) {
     process_ = pid;
     childStdoutRd_ = outPipe[0];
     childStdinWr_ = inPipe[1];
-    readBuf_.clear();
     running_ = true;
     return true;
 }
@@ -323,171 +366,200 @@ bool OmpBridgeClient::writeLine(const std::string& line) {
     return true;
 }
 
-bool OmpBridgeClient::readLine(std::string& line, int timeoutMs) {
-    auto start = std::chrono::steady_clock::now();
-    for (;;) {
-        size_t nl = readBuf_.find('\n');
-        if (nl != std::string::npos) {
-            line = readBuf_.substr(0, nl);
-            readBuf_.erase(0, nl + 1);
-            return true;
-        }
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - start)
-                           .count();
-        if ((int)elapsed > timeoutMs) return false;
-        // Cooperative cancel: agent_cancel flips the run's provider cancel flag. The bridge
-        // complete() is a blocking round-trip (up to 300s) that the native curl xfer-abort path
-        // can't reach — without this, Stop couldn't interrupt an in-flight LLM call routed through
-        // the bun sidecar (the "stopped but still working" hang). Bail out within one 2ms tick;
-        // callOnce maps this to err="cancelled" and call() reaps the child so the orphaned request
-        // dies with it (can't block the next run on the sequential stdio channel).
-        {
-            const std::atomic<bool>* cf = provider_cancel_flag();
-            if (cf && cf->load(std::memory_order_acquire)) return false;
-        }
+bool OmpBridgeClient::ensureRunning(std::string& err) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (running_) return true;
+    // Previous generation's reader (if any) has already exited by the time running_ went
+    // false — reap() only flips it under this same mtx_, and only the reader thread or a
+    // caller holding mtx_ ever calls reap(). Join it so exactly one reader thread ever exists
+    // per child, then hand the new generation's fds to a fresh one.
+    if (reader_.joinable()) reader_.join();
+    if (!spawn(err)) return false;
+    reader_ = std::thread(&OmpBridgeClient::readerLoop, this, childStdoutRd_, process_);
+    return true;
+}
 
-        struct pollfd pfd;
-        pfd.fd = childStdoutRd_;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        int pr = ::poll(&pfd, 1, 2);  // 2 ms tick — matches worker_bridge.cpp / worker_client.cpp
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (pr == 0) {
-            int status = 0;
-            pid_t r = (process_ >= 0) ? waitpid(process_, &status, WNOHANG) : -1;
-            if (r == process_ || (r < 0 && errno == ECHILD)) {
-                process_ = -1;
-                char chunk[4096];
-                ssize_t got = ::read(childStdoutRd_, chunk, sizeof(chunk));
-                if (got > 0) {
-                    readBuf_.append(chunk, (size_t)got);
-                    continue;
-                }
-                return false;  // EOF / dead child, buffer drained
+void OmpBridgeClient::readerLoop(int fd, pid_t pid) {
+    std::string buf;
+    std::string line;
+    for (;;) {
+        if (!readerReadLine(fd, pid, buf, line)) {
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                // Only reap if this is still the live generation (nobody else — e.g. a
+                // caller's failed write on the same generation — already did it).
+                if (running_ && process_ == pid) reap();
             }
-            continue;
+            return;
         }
-        char chunk[4096];
-        ssize_t got = ::read(childStdoutRd_, chunk, sizeof(chunk));
-        if (got > 0) {
-            readBuf_.append(chunk, (size_t)got);
-        } else if (got == 0) {
-            return false;  // EOF
-        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-            return false;
+        if (line.empty()) continue;
+        dispatchResponse(line);
+    }
+}
+
+void OmpBridgeClient::dispatchResponse(const std::string& line) {
+    json j;
+    try {
+        j = json::parse(line);
+    } catch (...) {
+        return;  // ignore non-JSON noise (should not happen — stdout is response-only)
+    }
+    if (!j.contains("id") || j["id"].is_null()) return;
+    int64_t rid = -1;
+    try {
+        rid = j["id"].get<int64_t>();
+    } catch (...) {
+        return;
+    }
+
+    std::shared_ptr<Pending> p;
+    {
+        std::lock_guard<std::mutex> lk(pendingMtx_);
+        auto it = pending_.find(rid);
+        if (it == pending_.end()) return;  // unknown/expired id (timed out/cancelled) — drop
+        p = it->second;
+        pending_.erase(it);
+    }
+
+    std::lock_guard<std::mutex> plk(p->mtx);
+    if (j.value("ok", false)) {
+        p->ok = true;
+        p->result = j.value("result", json::object());
+    } else {
+        // ok:false — bridge.ts always sends a structured {message,status?} object, but
+        // tolerate a bare string too (defensive, mirrors worker_bridge.cpp's same fallback).
+        p->ok = false;
+        const auto it = j.find("error");
+        if (it != j.end() && it->is_object()) {
+            p->result = *it;
+            p->err = it->value("message", std::string("omp bridge rpc error"));
+        } else {
+            p->result = json::object();
+            p->err = (it != j.end() && it->is_string()) ? it->get<std::string>()
+                                                          : std::string("unknown omp bridge rpc error");
         }
+    }
+    p->done = true;
+    p->cv.notify_all();
+}
+
+void OmpBridgeClient::failAllPending(const std::string& reason) {
+    std::vector<std::shared_ptr<Pending>> victims;
+    {
+        std::lock_guard<std::mutex> lk(pendingMtx_);
+        victims.reserve(pending_.size());
+        for (auto& kv : pending_) victims.push_back(kv.second);
+        pending_.clear();
+    }
+    for (auto& p : victims) {
+        std::lock_guard<std::mutex> plk(p->mtx);
+        if (p->done) continue;  // already satisfied concurrently — don't clobber a real result
+        p->ok = false;
+        p->err = reason;
+        p->result = json::object();
+        p->done = true;
+        p->cv.notify_all();
     }
 }
 
 bool OmpBridgeClient::callOnce(const std::string& method, const json& params, json& result,
-                               std::string& err, int timeoutMs) {
-    if (!running_) {
-        if (!spawn(err)) return false;
+                               std::string& err, int timeoutMs, bool& childDead) {
+    childDead = false;
+    if (!ensureRunning(err)) {
+        childDead = true;
+        return false;
     }
 
-    const int id = nextId_++;
+    const int64_t id = nextId_.fetch_add(1, std::memory_order_relaxed);
+    auto pending = std::make_shared<Pending>();
+    {
+        std::lock_guard<std::mutex> lk(pendingMtx_);
+        pending_[id] = pending;
+    }
+    auto deregister = [this, id] {
+        std::lock_guard<std::mutex> lk(pendingMtx_);
+        pending_.erase(id);
+    };
+
     json req = {{"id", id}, {"method", method}, {"params", params}};
     const std::string line = req.dump() + "\n";
-    if (!writeLine(line)) {
-        err = "write failed";
-        return false;
+    {
+        // Serialize only the write of this one line — never held across the wait below, so
+        // other threads' writes (and their subsequent waits) proceed independently.
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (!running_ || !writeLine(line)) {
+            if (running_) reap();  // dead child: fails every outstanding Pending, including ours
+            deregister();          // no-op if reap()'s failAllPending already removed us
+            err = "write failed";
+            childDead = true;
+            return false;
+        }
     }
 
+    std::unique_lock<std::mutex> plk(pending->mtx);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     for (;;) {
-        std::string resp;
-        if (!readLine(resp, timeoutMs)) {
-            {
-                const std::atomic<bool>* cf = provider_cancel_flag();
-                if (cf && cf->load(std::memory_order_acquire)) {
-                    err = "cancelled";
-                    return false;
-                }
-            }
-            // Distinguish child death (EOF / reaped) from a live slow call so the outer retry
-            // only respawns on a dead child.
-            if (process_ < 0 || childStdoutRd_ < 0) {
-                err = "closed waiting for response";
-            } else {
-                int status = 0;
-                pid_t r = waitpid(process_, &status, WNOHANG);
-                if (r == process_ || (r < 0 && errno == ECHILD)) {
-                    process_ = -1;
-                    err = "closed waiting for response";
-                } else {
-                    err = "timeout waiting for response";
-                }
-            }
+        if (pending->done) break;
+        // Cooperative cancel: agent_cancel flips the run's provider cancel flag. The bridge
+        // complete() is a blocking round-trip (up to 300s) that the native curl xfer-abort path
+        // can't reach — without this, Stop couldn't interrupt an in-flight LLM call routed
+        // through the bun sidecar. Unlike the old serialized channel, cancelling here does NOT
+        // kill the subprocess (that would abort every OTHER concurrently in-flight chat's
+        // request too) — it just stops this caller from waiting; the eventual late response is
+        // dropped by dispatchResponse's "unknown id" path once we deregister below.
+        const std::atomic<bool>* cf = provider_cancel_flag();
+        if (cf && cf->load(std::memory_order_acquire)) {
+            plk.unlock();
+            deregister();
+            err = "cancelled";
             return false;
         }
-        if (resp.empty()) continue;
-        json j;
-        try {
-            j = json::parse(resp);
-        } catch (...) {
-            continue;  // ignore non-JSON noise (should not happen — stdout is response-only)
-        }
-        if (!j.contains("id") || j["id"].is_null()) continue;
-        int rid = -1;
-        try {
-            rid = j["id"].get<int>();
-        } catch (...) {
-            continue;
-        }
-        if (rid != id) continue;
-
-        if (j.value("ok", false)) {
-            result = j.value("result", json::object());
-            return true;
-        }
-        // ok:false — bridge.ts always sends a structured {message,status?} object, but tolerate
-        // a bare string too (defensive, mirrors worker_bridge.cpp's same fallback).
-        const auto it = j.find("error");
-        if (it != j.end() && it->is_object()) {
-            result = *it;
-            err = it->value("message", std::string("omp bridge rpc error"));
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            plk.unlock();
+            deregister();
+            err = "timeout waiting for response";
             return false;
         }
-        err = (it != j.end() && it->is_string()) ? it->get<std::string>()
-                                                 : std::string("unknown omp bridge rpc error");
-        result = json::object();
-        return false;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        const auto tick = std::min<std::chrono::milliseconds>(std::chrono::milliseconds(50), remaining);
+        pending->cv.wait_for(plk, tick);
     }
+
+    const bool ok = pending->ok;
+    err = pending->err;
+    result = pending->result;
+    if (!ok) {
+        // Distinguish "the whole transport died" (worth a respawn+retry) from a normal
+        // ok:false method-level RPC error (final) using reap()'s/callOnce's own fail strings.
+        childDead = (err == "omp bridge subprocess exited") || (err == "write failed");
+    }
+    return ok;
 }
 
 bool OmpBridgeClient::call(const std::string& method, const json& params, json& result,
                            std::string& err, int timeoutMs) {
-    // Serialize the single stdio channel. Only this mutex is held — never a broader agent-run
-    // lock — so other threads (if any) keep making progress.
-    std::lock_guard<std::mutex> lk(mtx_);
     result = json::object();
     err.clear();
     if (timeoutMs <= 0) timeoutMs = 120000;
 
-    // Child died (write fail/EOF) -> reap + respawn once, then fail. Timeouts and method-level
-    // errors do NOT respawn.
+    // Child died (write fail/subprocess exit) -> reap + respawn once (inside the next
+    // callOnce's ensureRunning), then fail. Timeouts, cancellation, and method-level errors do
+    // NOT respawn — they're final for this call.
     for (int attempt = 0; attempt < 2; ++attempt) {
         std::string attemptErr;
-        if (callOnce(method, params, result, attemptErr, timeoutMs)) return true;
+        bool childDead = false;
+        if (callOnce(method, params, result, attemptErr, timeoutMs, childDead)) return true;
 
-        const bool childDead =
-            attemptErr == "write failed" || attemptErr == "closed waiting for response";
         // Method-level errors (ok:false with a structured {message,status} object) are final.
         const bool methodError = result.is_object() && result.contains("message");
         if (methodError || !childDead) {
             err = std::move(attemptErr);
-            // Cancelled mid-call: kill the child so its orphaned in-flight provider request is
-            // aborted (not left running to block the next call on this serialized channel).
-            if (err == "cancelled") reap();
             return false;
         }
-        reap();
         err = std::move(attemptErr);
         if (attempt == 1) return false;
-        // loop: respawn inside next callOnce
+        // loop: ensureRunning() respawns inside the next callOnce attempt.
     }
     return false;
 }

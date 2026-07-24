@@ -787,7 +787,7 @@ struct FilMenuDrawer {
         ImGui::Separator();
         // Repair/install runtime
         if (ImGui::MenuItem("Repair / install runtime", nullptr, false,
-                            !st.setupRunning.load() && !st.job.running.load()))
+                            !st.setupRunning.load() && !st.anyRunActive()))
             st.startSetup(true);
         ImGui::Separator();
         if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(win, 1);

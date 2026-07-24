@@ -334,7 +334,7 @@ void DesignTablePanel::draw(AppState& st) {
                        (int)names_.size(), names_.size() == 1 ? "" : "s",
                        (int)columns_.size(), columns_.size() == 1 ? "" : "s");
 
-    const bool busy = st.job.running.load() || st.agentV2Running;
+    const bool busy = st.anyRunActive() || st.agentV2Running;
 
     // ---- toolbar: Add Config / Delete / Activate / Add Column ----
     if (busy) ImGui::BeginDisabled();

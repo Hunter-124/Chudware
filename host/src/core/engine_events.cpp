@@ -248,6 +248,34 @@ void handleOwnHoldExpired(AppState& st, const std::string& docId) {
     }
 }
 
+// Daemon mode multiplexes EVERY run this client owns onto ONE `agent.event` push channel
+// (hostd's sendAgentEvent is per-client, not per-run), so a streamed event is meaningless
+// without its run_id. Resolve the JobState that owns it:
+//   1. exact match against a run that already knows its run_id;
+//   2. else bind the SOLE freshly-launched run still awaiting its first event, stamping the
+//      id onto it so every later event takes path 1;
+//   3. else nullptr — zero candidates, or ambiguity we must not guess through: dropping the
+//      event is strictly better than cross-contaminating a concurrent conversation.
+JobState* runForEvent(AppState& st, const std::string& runId) {
+    if (runId.empty()) return nullptr;
+    JobState* unbound = nullptr;
+    int unboundCount = 0;
+    for (auto& kv : st.runs) {
+        JobState* run = kv.second.get();
+        if (!run) continue;
+        std::lock_guard<std::mutex> jlk(run->mtx);
+        if (run->runId == runId) return run;
+        if (run->running.load() && run->runId.empty()) { unbound = run; ++unboundCount; }
+    }
+    if (unboundCount != 1) return nullptr;  // nobody to bind, or ambiguous — drop
+    std::lock_guard<std::mutex> jlk(unbound->mtx);
+    // The launcher may have stamped a runId between our scan and this lock; if it did and it
+    // isn't ours, this event belongs to a run we haven't seen yet.
+    if (!unbound->runId.empty()) return unbound->runId == runId ? unbound : nullptr;
+    unbound->runId = runId;
+    return unbound;
+}
+
 void handleEvent(AppState& st, const json& evt) {
     const std::string name = evt.value("event", std::string());
     const json& d = evt.contains("data") && evt["data"].is_object() ? evt["data"]
@@ -255,11 +283,14 @@ void handleEvent(AppState& st, const json& evt) {
     const std::string docId = d.value("doc_id", std::string());
 
     // Live agent-run streaming (daemon mode): hostd pushes each emitted run event as
-    // {"event":"agent.event","data":<ev>}. Route it into the active job's event queue with the
-    // same "orch_" prefix launchAgentRunV2's in-proc onEvent uses, so the app.cpp drain renders
-    // the timeline LIVE (classifier decision, stages, assistant_delta, model I/O) instead of a
+    // {"event":"agent.event","data":<ev>}. Route it into the OWNING run's event queue (matched
+    // by run_id — every event carries one, including run_started) with the same "orch_" prefix
+    // launchAgentRunV2's in-proc onEvent uses, so the app.cpp drain renders that conversation's
+    // timeline LIVE (classifier decision, stages, assistant_delta, model I/O) instead of a
     // frozen "Classifying request…" box until the batched result.
     if (name == "agent.event") {
+        JobState* job = runForEvent(st, d.value("run_id", std::string()));
+        if (!job) return;  // unknown or ambiguous run — never guess a target conversation
         AgentEvent e;
         const std::string origKind = d.value("kind", std::string());
         e.kind = "orch_" + origKind;
@@ -276,9 +307,9 @@ void handleEvent(AppState& st, const json& evt) {
             if (ed.empty()) ed = d.value("error", std::string());
             if (ed.empty()) ed = d.value("error_human", std::string());
             if (!sr.empty() || !ed.empty()) {
-                std::lock_guard<std::mutex> jlk(st.job.mtx);
-                if (!sr.empty() && st.job.stopReason.empty()) st.job.stopReason = sr;
-                if (!ed.empty() && st.job.errorDetail.empty()) st.job.errorDetail = ed;
+                std::lock_guard<std::mutex> jlk(job->mtx);
+                if (!sr.empty() && job->stopReason.empty()) job->stopReason = sr;
+                if (!ed.empty() && job->errorDetail.empty()) job->errorDetail = ed;
             }
         } else if (origKind == "provider_call") {
             const std::string prov = d.value("provider", std::string());
@@ -319,8 +350,8 @@ void handleEvent(AppState& st, const json& evt) {
             else e.notes = "Sub-run";
         }
         {
-            std::lock_guard<std::mutex> lk(st.job.evMtx);
-            st.job.events.push_back(std::move(e));
+            std::lock_guard<std::mutex> lk(job->evMtx);
+            job->events.push_back(std::move(e));
         }
         return;
     }

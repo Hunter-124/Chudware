@@ -297,8 +297,8 @@ void launchDesignRun(AppState& st, const std::string& request,
     st.agentV2 = true;
     if (st.activityPanel)
         st.activityPanel->clearLive();
-    launchAgentRunV2(st.worker, st.job, request, st.docMirror.docId(),
-                     st.ribbonTab == AppState::RT_Manufacture, payload);
+    launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, request,
+                     st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture, payload);
 }
 
 // Launch the MISSION orchestrator for a multi-capability request (e.g. "model X, then run CFD and
@@ -362,7 +362,8 @@ void launchMissionRunChat(AppState& st, const std::string& request, bool needFre
         opts["corporate_mode"] = st.settings.corporateMode;
         payload["options"] = std::move(opts);
     }
-    launchMissionRun(st.worker, st.job, request, st.docMirror.docId(), payload);
+    launchMissionRun(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, request,
+                     st.docMirror.docId(), payload);
 }
 
 // The inline clarify card: build-critical questions (interaction contract kinds).
@@ -477,7 +478,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     }
 
     auto needIdle = [&]() -> bool {
-        if (aiTurnActive(st) || st.job.running.load()) {
+        if (aiTurnActive(st) || st.anyRunActive()) {
             st.toast(ui::ToastLevel::Warn, "Wait for the current turn to finish.");
             return false;
         }
@@ -775,7 +776,7 @@ static std::string buildTurnChatContext(const AppState& st, size_t maxMsgs = 8,
 void submitTurn(AppState& st, const std::string& text) {
     if (text.empty()) return;
     // A fresh turn always clears a lingering stop latch (e.g. worker never drained after cancel).
-    st.stopRequested = false;
+    st.activeRun()->stopRequested = false;
     // Slash commands: /compact /shake /handoff /btw /prewalk — pure host+RPC, no agent turn.
     if (tryHandleSlashCommand(st, text)) return;
     // Persist the active provider/model to config.json BEFORE launching any run. The C++ core
@@ -916,7 +917,7 @@ void submitTurn(AppState& st, const std::string& text) {
 
     // MISSION intent: Agent mode only.
     auto looksLikeMission = [&]() -> bool {
-        if (!agentMode || st.agentV2Running) return false;
+        if (!agentMode || st.convRunning(st.activeConvId())) return false;
         bool buildVerb = has("make ") || has("model ") || has("build ") || has("design ") ||
                          has("create ") || has("generate ") || has("give me");
         bool analyzeVerb = has("cfd") || has("wind tunnel") || has("windtunnel") ||
@@ -937,7 +938,7 @@ void submitTurn(AppState& st, const std::string& text) {
     // CFD/sim: Agent/Ask only — Plan/Swarm/Edit must not be hijacked.
     auto looksLikeSim = [&]() -> bool {
         if (!(agentMode || askMode)) return false;
-        if (!st.docMirror.hasDoc() || st.agentV2Running) return false;
+        if (!st.docMirror.hasDoc() || st.convRunning(st.activeConvId())) return false;
         if (has("cfd") || has("wind tunnel") || has("windtunnel") || has("aerodynam") ||
             has("drag") || has("downforce"))
             return true;
@@ -1032,8 +1033,8 @@ void submitTurn(AppState& st, const std::string& text) {
                                {"corporate_mode", st.settings.corporateMode},
                                {"scope", buildEditScope()}};
         extra["options"] = std::move(opts);
-        launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
-                         st.ribbonTab == AppState::RT_Manufacture, extra);
+        launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, sendText,
+                         st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture, extra);
         return;
     }
 
@@ -1041,7 +1042,7 @@ void submitTurn(AppState& st, const std::string& text) {
         // Build/change intent in Ask → auto-promote to Agent (never dead-end with
         // "switch modes"). Eng. Firm is NEVER auto-invoked from this path.
         if (buildIntent || changeIntent) {
-            if (st.agentV2Running) {
+            if (st.convRunning(st.activeConvId())) {
                 if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
                     st.chat.back().running = false;
                     st.chat.back().text = "A design/edit run is still in progress - "
@@ -1077,7 +1078,8 @@ void submitTurn(AppState& st, const std::string& text) {
                                        {"corporate_mode", st.settings.corporateMode},
                                        {"scope", buildEditScope()}};
                 extra["options"] = std::move(opts);
-                launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
+                launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey,
+                                 sendText, st.docMirror.docId(),
                                  st.ribbonTab == AppState::RT_Manufacture, extra);
                 return;
             }
@@ -1090,7 +1092,7 @@ void submitTurn(AppState& st, const std::string& text) {
             return;
         }
         // Genuine questions stay on agent_ask_v2.
-        if (st.agentV2Running) {
+        if (st.convRunning(st.activeConvId())) {
             if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
                 st.chat.back().running = false;
                 st.chat.back().text = "A design/edit run is still in progress - "
@@ -1230,8 +1232,8 @@ void submitTurn(AppState& st, const std::string& text) {
                 return;
             }
         }
-        launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
-                         st.ribbonTab == AppState::RT_Manufacture, extra);
+        launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, sendText,
+                         st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture, extra);
         return;
     }
 
@@ -1247,7 +1249,7 @@ void submitTurn(AppState& st, const std::string& text) {
         }
         // Pure question (no build/change) → agent_ask_v2 so Agent auto-invokes Ask.
         if (questionIntent && !(hasFeatures && changeIntent)) {
-            if (st.agentV2Running) {
+            if (st.convRunning(st.activeConvId())) {
                 if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
                     st.chat.back().running = false;
                     st.chat.back().text = "A design/edit run is still in progress - "
@@ -1316,8 +1318,9 @@ void submitTurn(AppState& st, const std::string& text) {
                                    {"corporate_mode", st.settings.corporateMode},
                                    {"scope", buildEditScope()}};
             extra["options"] = std::move(opts);
-            launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
-                             st.ribbonTab == AppState::RT_Manufacture, extra);
+            launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, sendText,
+                             st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture,
+                             extra);
             return;
         }
     }
@@ -1613,12 +1616,13 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     // Busy forging glyph — centered in the gap between the mode dropdown and the
     // context meter. Hidden the instant Stop is pressed (aiTurnActive honors
     // stopRequested) so the animation never keeps playing after a stop.
-    // Note: `busy` is job.running and can lag past Stop — always gate on stopRequested.
+    // Note: `busy` is job.running and can lag past Stop — always gate on the run's stopRequested.
     // Use `tmx` (mode chip screen rect captured above) — GetItemRectMax after the
     // popup is no longer the mode button.
     {
-        const bool forging = !st.stopRequested &&
-                             (busy || st.agentV2Running || activeConversationRunning(st));
+        auto* forgeRun = st.runIfExists(st.activeConvId());
+        const bool forging = !(forgeRun && forgeRun->stopRequested.load()) &&
+                             (busy || activeConversationRunning(st));
         const float meterRoomFull = ImGui::GetContentRegionAvail().x;
         const float meterW = measureContextMeter(st, meterRoomFull);
         const float rowRightScreen = ImGui::GetWindowPos().x + ImGui::GetContentRegionMax().x;
@@ -2137,11 +2141,14 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
 // async ask/sim calls (which set the back message running without a job), and any streaming
 // message. Drives the composer's send<->stop swap and the message queue.
 // stopRequested is UI-terminal: once the user hits Stop we soft-finalize the bubble and must
-// immediately leave the streaming chrome (stop button + forging animation). job.running may
+// immediately leave the streaming chrome (stop button + forging animation). run->running may
 // stay true until the worker unwinds — the drain discards that stale result and clears the flag.
+// Everything here is scoped to the VIEWED conversation: a background run in another conversation
+// must never make the visible composer look busy.
 bool aiTurnActive(AppState& st) {
-    if (st.stopRequested) return false;
-    if (st.job.running.load() || st.agentV2Running) return true;
+    auto* run = st.runIfExists(st.activeConvId());
+    if (run && run->stopRequested.load()) return false;
+    if (run && run->running.load()) return true;
     if (!st.chat.empty()) {
         const ChatMsg& b = st.chat.back();
         if (!b.fromUser && b.running) return true;
@@ -2263,19 +2270,25 @@ static void finalizeStoppedTurnActivity(ChatMsg& m) {
 }
 
 static void requestStopRun(AppState& st) {
+    // Stop only ever acts on the VIEWED conversation's run — a background run in another
+    // conversation keeps streaming (that is the point of per-conversation runs).
+    auto* run = st.runIfExists(st.activeConvId());
+    if (!run) return;
     // Capture run_id before we clear flags.
     std::string runId;
     {
-        std::lock_guard<std::mutex> lk(st.job.mtx);
-        runId = st.job.runId;
+        std::lock_guard<std::mutex> lk(run->mtx);
+        runId = run->runId;
     }
     // Fire agent_cancel on the persistent control channel so we never block the GL thread
     // behind the worker mutex / daemon socket (callAgentCancel bypasses callMtx_ / uses a
     // side socket) — and never create a thread per click (WASM pthread-pool exhaustion
     // blocked thread creation on the main thread = frozen page).
-    // Empty run_id still dispatches: core agent_cancel with empty id cancels ALL live runs
-    // (covers Stop before run_started lands, which previously left hostd 1 in-flight).
-    if (st.workerStarted && (st.job.running.load() || st.agentV2Running || !runId.empty())) {
+    // Empty run_id still dispatches when THIS run is live: core agent_cancel with an empty id
+    // cancels ALL live runs (covers Stop before run_started lands, which previously left hostd
+    // 1 in-flight). That is exactly why the gate must be this run's own state — a global
+    // "something is running" flag would fire an empty cancel that kills other conversations.
+    if (st.workerStarted && (run->running.load() || !runId.empty())) {
         try {
             agentControlDispatch(st, runId, /*steer=*/"");
         } catch (...) {
@@ -2284,8 +2297,7 @@ static void requestStopRun(AppState& st) {
     }
     // Only a job-based run produces a result the drain must discard. Async ask/sim runs land via
     // their own callbacks, which look for a *running* message — clearing it below makes them no-op.
-    if (st.job.running.load() || st.job.ready.load()) st.stopRequested = true;
-    st.agentV2Running = false;
+    if (run->running.load() || run->ready.load()) run->stopRequested = true;
     st.livePhase.clear();
     st.agentV2Status.clear();
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
@@ -2309,6 +2321,9 @@ static void requestStopRun(AppState& st) {
             m.running = false;
             finalizeStoppedTurnActivity(m);
         }
+    // Cosmetic global flag: other conversations may still be running, so recompute it instead
+    // of forcing it false.
+    st.agentV2Running = st.anyRunActive();
     st.status = "Stopped.";
     st.statusKind = 1;
     st.addLog("[..] stop requested by user");
@@ -2355,9 +2370,12 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
         const float h = sz * 0.18f;
         dl->AddRectFilled(ImVec2(c.x - h, c.y - h), ImVec2(c.x + h, c.y + h),
                           ImGui::ColorConvertFloat4ToU32(stopInk), 1.5f * sc);
-        if (hov)
-            ImGui::SetTooltip(st.stopRequested ? "Stopping\xE2\x80\xA6 (finishing current step)"
-                                               : "Stop the current run");
+        if (hov) {
+            auto* stopping = st.runIfExists(st.activeConvId());
+            ImGui::SetTooltip(stopping && stopping->stopRequested.load()
+                                  ? "Stopping\xE2\x80\xA6 (finishing current step)"
+                                  : "Stop the current run");
+        }
         if (clicked) stopReq = true;
     } else {
         const ImVec4 accC(pal.accent[0], pal.accent[1], pal.accent[2], 1);
@@ -2431,9 +2449,11 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
 
     // Drain the message queue: once the assistant is free, auto-send the next queued message
     // (Claude-Code-style). Done before computing `active` so the new turn shows as running now.
-    // Also require !job.running: after Stop, aiTurnActive is false (stopRequested terminal) but
-    // the cancelled job may still be unwinding — don't launch a queued turn on top of it.
-    if (!aiTurnActive(st) && !st.job.running.load() && !st.queuedPrompts.empty() && canRun) {
+    // Also require the viewed conversation's run to be idle: after Stop, aiTurnActive is false
+    // (stopRequested terminal) but the cancelled run may still be unwinding — don't launch a
+    // queued turn on top of it. Another conversation's run is irrelevant here.
+    if (!aiTurnActive(st) && !st.convRunning(st.activeConvId()) && !st.queuedPrompts.empty() &&
+        canRun) {
         std::string next = st.queuedPrompts.front();
         st.queuedPrompts.erase(st.queuedPrompts.begin());
         // Queued sends never commit a staged edit (stage should already be cleared).
@@ -2654,8 +2674,9 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             if (st.prompt[0]) {
                 std::string runId;
                 {
-                    std::lock_guard<std::mutex> lk(st.job.mtx);
-                    runId = st.job.runId;
+                    auto steerRun = st.activeRun();
+                    std::lock_guard<std::mutex> lk(steerRun->mtx);
+                    runId = steerRun->runId;
                 }
                 const std::string text = flattenComposer(st.prompt.data());
                 if (!runId.empty() && st.workerStarted) {

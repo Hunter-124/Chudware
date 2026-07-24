@@ -896,6 +896,40 @@ void freeChatTextures(std::vector<ChatMsg>& chat) {
             if (s.thumb.id) { glDeleteTextures(1, &s.thumb.id); s.thumb.id = 0; }
 }
 
+// ---------------- job/run registry (per-conversation JobState slots) ----------------
+// See core/app_state.h for the contract. JobState is non-copyable — every slot is created
+// once (default-constructed shared_ptr<JobState>) and mutated in place for the conversation's
+// entire lifetime, so a run launched against it keeps a valid, stable target even if `runs`
+// rehashes on a later insert.
+std::shared_ptr<JobState> AppState::runFor(const std::string& convId) {
+    auto& slot = runs[convId];        // unordered_map::operator[] default-constructs on miss
+    if (!slot) slot = std::make_shared<JobState>();
+    return slot;
+}
+
+std::shared_ptr<JobState> AppState::activeRun() { return runFor(activeConvId()); }
+
+JobState* AppState::runIfExists(const std::string& convId) {
+    auto it = runs.find(convId);
+    return (it == runs.end() || !it->second) ? nullptr : it->second.get();
+}
+
+bool AppState::anyRunActive() const {
+    for (const auto& kv : runs)
+        if (kv.second && kv.second->running.load()) return true;
+    return false;
+}
+
+bool AppState::convRunning(const std::string& convId) const {
+    auto it = runs.find(convId);
+    return it != runs.end() && it->second && it->second->running.load();
+}
+
+std::string AppState::activeConvId() const {
+    if (activeConv < 0 || activeConv >= (int)conversations.size()) return std::string();
+    return conversations[activeConv].id;
+}
+
 // ---------------- AppState methods (formerly run_gui lambdas) ----------------
 void AppState::addLog(const std::string& s) {
     {

@@ -980,7 +980,7 @@ static std::string s_docPath;
 // Returns true if at least one feature's bundle was captured into st.clipboard.
 static bool copyFeatureToClipboard(AppState& st, const std::vector<std::string>& fids) {
     if (fids.empty() || !st.docMirror.hasDoc() || !st.workerStarted) return false;
-    if (st.job.running.load()) return false;   // same canDoc gate the tree mutations use
+    if (st.anyRunActive()) return false;   // same canDoc gate the tree mutations use
     std::vector<nlohmann::json> bundles;
     bool prevSuppress = st.suppressTabDirty;
     st.suppressTabDirty = true;   // copy is read-only — don't dirty the tab on the phantom rev bump
@@ -1053,7 +1053,7 @@ bool featurePasteSelection(AppState& st) {
     if (st.clipboard.kind != AppState::Clipboard::Kind::Feature ||
         st.clipboard.payloads.empty())
         return false;
-    if (!st.docMirror.hasDoc() || !st.workerStarted || st.job.running.load()) return false;
+    if (!st.docMirror.hasDoc() || !st.workerStarted || st.anyRunActive()) return false;
     nlohmann::json ops = nlohmann::json::array();
     for (const auto& bundle : st.clipboard.payloads)
         ops.push_back({{"op", "paste_feature"}, {"bundle", bundle}});
@@ -1069,7 +1069,7 @@ bool featurePasteSelection(AppState& st) {
 // surfaces an engine block (a downstream feature depends on this one) as a warning toast and leaves
 // the tree unchanged. No-op (false) without a live, idle doc or an eligible selection.
 bool featureDeleteSelection(AppState& st) {
-    if (!st.docMirror.hasDoc() || !st.workerStarted || st.job.running.load()) return false;
+    if (!st.docMirror.hasDoc() || !st.workerStarted || st.anyRunActive()) return false;
     auto fids = featureCopySet(st);   // full multi-select if the primary is in it, else the primary
     if (fids.empty()) return false;
     nlohmann::json ops = nlohmann::json::array();
@@ -3682,7 +3682,7 @@ static bool fm_icontains(const char* hay, const char* needle) {
 // Open / Save / Undo / Redo) that replaces the old wide text-button strip at the panel bottom.
 static void drawFeatureManagerTopStrip(AppState& st) {
     const auto& pal = fmPalette();
-    bool canDoc = st.workerStarted && !st.job.running.load();
+    bool canDoc = st.workerStarted && !st.anyRunActive();
     const float S = ui::uiScale;
 
     // W5C: the old tree/Properties/Configurations stub tabs were removed here — they were visual
@@ -3832,10 +3832,10 @@ void drawFeatureTreeBody(AppState& st,
     if (tree.is_object()) docName = jfld(tree, "name");
     if (docName.empty()) docName = "Part1";
 
-    // C37-E (item 2): the SAME guard the top toolbar uses (st.workerStarted && !st.job.running).
+    // C37-E (item 2): the SAME guard the top toolbar uses (st.workerStarted && !st.anyRunActive()).
     // Every mutating tree interaction — context menu, drag-reorder, Ctrl+Up/Down, rollback drag —
     // is gated on this so no op fires while an agent run is in flight.
-    bool canDocTree = st.workerStarted && !st.job.running.load();
+    bool canDocTree = st.workerStarted && !st.anyRunActive();
 
     {
         // Filename / References / Features are three INDEPENDENT collapsible sections (Hunter):

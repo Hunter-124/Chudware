@@ -5806,7 +5806,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
                         dimText("Repair the local CAD engine runtime.");
                         {
-                            const bool canSetup = !st.setupRunning.load() && !st.job.running.load();
+                            const bool canSetup = !st.setupRunning.load() && !st.anyRunActive();
                             if (!canSetup) ImGui::BeginDisabled();
                             if (ImGui::Button("Repair / install runtime", ImVec2(220.0f * sc, 0)))
                                 st.startSetup(true);

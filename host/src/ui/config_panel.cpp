@@ -133,7 +133,7 @@ void ConfigPanel::drawBody(AppState& st) {
     ImGui::TextColored(dimCol, "(%d)", (int)names_.size());
 
     // ---- toolbar: Add / Delete / Activate ----
-    const bool busy = st.job.running.load() || st.agentV2Running;
+    const bool busy = st.anyRunActive() || st.agentV2Running;
     if (busy) ImGui::BeginDisabled();
     if (ImGui::Button("Add...")) {
         addPromptOpen_ = true;

@@ -1697,7 +1697,7 @@ static bool makeContextRefFromPick(AppState& st, const render::PickHit& h,
         const bool isFace = h.kind == render::PickKind::Face;
         out.kind = isFace ? "face" : "edge";
         std::string sel;
-        if (st.workerStarted && st.docMirror.hasDoc() && !st.job.running.load()) {
+        if (st.workerStarted && st.docMirror.hasDoc() && !st.anyRunActive()) {
             std::string err;
             const char* k = isFace ? "face" : "edge";
             if (docIsAssembly(st)) {

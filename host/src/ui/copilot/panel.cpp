@@ -182,7 +182,10 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
         const float* statusCol = pal.accentMid;  const char* statusTip = "Idle";
         if (st.statusKind == 2) { statusCol = pal.statusErr; statusTip = "Error"; }
-        else if (busy || st.agentV2Running || activeConversationRunning(st)) {
+        // Per-conversation: `busy` is convRunning(activeConv) and activeConversationRunning
+        // covers one-shot RPC turns. The global agentV2Running is deliberately NOT OR'd in —
+        // it would light this dot for an idle session whenever ANY other session is running.
+        else if (busy || activeConversationRunning(st)) {
             statusCol = pal.accent; statusTip = "Running";
         }
         const ImVec4 statusTint(statusCol[0], statusCol[1], statusCol[2], 1.0f);
@@ -273,6 +276,26 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), rowTop + rowH));
 }
 
+// The "running" pill drawn just after a session row's title. Shared by the current-doc
+// Sessions rows and the "Other sessions" (background, other-document) rows so both read
+// identically. `x` is the left edge of the pill in screen space.
+static void drawSessionRunningBadge(ImDrawList* dl, const ui::AdaptiveSurface& surf,
+                                    float x, float titleY, float titleH, float sc) {
+    const char* badge = "running";
+    const ImVec2 bsz = ImGui::CalcTextSize(badge);
+    const float by0 = titleY + (titleH - bsz.y) * 0.5f - 1.0f * sc;
+    const float bx1 = x + bsz.x + 8.0f * sc;
+    const float by1 = by0 + bsz.y + 2.0f * sc;
+    ImVec4 acc = semanticOnGlass(ui::palette.accent, surf);
+    acc.w = 0.22f;
+    dl->AddRectFilled(ImVec2(x, by0), ImVec2(bx1, by1),
+                      ImGui::ColorConvertFloat4ToU32(acc), 4.0f * sc);
+    ImVec4 accInk = semanticOnGlass(ui::palette.accent, surf);
+    accInk.w = 1.0f;
+    dl->AddText(ImVec2(x + 4.0f * sc, by0 + 1.0f * sc),
+                ImGui::ColorConvertFloat4ToU32(accInk), badge);
+}
+
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
 void drawSessionsPanel(AppState& st, bool busy) {
     const float sc = ui::uiScale;
@@ -318,16 +341,19 @@ void drawSessionsPanel(AppState& st, bool busy) {
     const float rowH  = padY * 2.0f + titleH + 2.0f * sc + subH;
     const float trashSz = ImGui::GetFrameHeight();
     bool anyRowShown = false;
+    int shownIdx = 0;              // per-document row number for the untitled-chat fallback
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
         Conversation& c = st.conversations[i];
+        // st.conversations is a flat, resident, cross-docKey array (background runs stay
+        // alive across document switches) — scope this list to the document on screen.
+        if (c.docKey != st.chatDocKey) continue;
         if (c.archived != s_showArchived) continue;
         anyRowShown = true;
-        std::string title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
+        ++shownIdx;
+        std::string title = c.title.empty() ? ("Chat " + std::to_string(shownIdx)) : c.title;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
-        bool running = false;
-        for (auto it = msgs.rbegin(); it != msgs.rend(); ++it)
-            if (!it->fromUser && it->running) { running = true; break; }
-        if (i == st.activeConv && aiTurnActive(st)) running = true;
+        // Truthful per-session state: this conversation's own run, not a global flag.
+        const bool running = st.convRunning(c.id);
         bool active = (i == st.activeConv);
 
         char sub[96];
@@ -402,23 +428,10 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const float titleY = rowMin.y + padY;
         ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
         dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, title.c_str());
-        if (running) {
-            const float tw = ImGui::CalcTextSize(title.c_str()).x;
-            const char* badge = "running";
-            const ImVec2 bsz = ImGui::CalcTextSize(badge);
-            const float bx0 = rowMin.x + padX + tw + 8.0f * sc;
-            const float by0 = titleY + (titleH - bsz.y) * 0.5f - 1.0f * sc;
-            const float bx1 = bx0 + bsz.x + 8.0f * sc;
-            const float by1 = by0 + bsz.y + 2.0f * sc;
-            ImVec4 acc = semanticOnGlass(ui::palette.accent, surf);
-            acc.w = 0.22f;
-            dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
-                              ImGui::ColorConvertFloat4ToU32(acc), 4.0f * sc);
-            ImVec4 accInk = semanticOnGlass(ui::palette.accent, surf);
-            accInk.w = 1.0f;
-            dl->AddText(ImVec2(bx0 + 4.0f * sc, by0 + 1.0f * sc),
-                        ImGui::ColorConvertFloat4ToU32(accInk), badge);
-        }
+        if (running)
+            drawSessionRunningBadge(dl, surf,
+                                    rowMin.x + padX + ImGui::CalcTextSize(title.c_str()).x + 8.0f * sc,
+                                    titleY, titleH, sc);
 
         dl->AddText(ImVec2(rowMin.x + padX, titleY + titleH + 2.0f * sc),
                     ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub);
@@ -610,6 +623,15 @@ void drawSessionsPanel(AppState& st, bool busy) {
             const float titleY = rowMin.y + padY;
             ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
             dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, o.label.c_str());
+            // Disk JSON can't say "running now" — cross-reference the resident conversation
+            // set, which keeps background runs from other document keys alive in-process.
+            bool otherRunning = false;
+            for (const Conversation& rc : st.conversations)
+                if (rc.docKey == o.key && st.convRunning(rc.id)) { otherRunning = true; break; }
+            if (otherRunning)
+                drawSessionRunningBadge(dl, surf,
+                                        rowMin.x + padX + ImGui::CalcTextSize(o.label.c_str()).x + 8.0f * sc,
+                                        titleY, titleH, sc);
             char sub[160];
             if (!o.snippet.empty())
                 std::snprintf(sub, sizeof(sub), "%s", o.snippet.c_str());

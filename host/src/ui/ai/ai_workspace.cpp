@@ -1478,7 +1478,7 @@ static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float li
 //   0 = node titles only · 1 = + detail lines · 2 = + actor/latency, counts, full text.
 static void drawAgentHubView(AppState& st) {
     const float S = ui::uiScale;
-    const bool  busy = st.job.running.load();
+    const bool  busy = st.convRunning(st.activeConvId());
     const int   verbosity = aiUiVerbosity();
 
     pollSubagentList(st);   // registry snapshot + auto-pop (throttled, single in-flight)
@@ -2070,7 +2070,7 @@ static void drawViewPane(AppState& st, bool busy) {
 
 void drawAiWorkspace(AppState& st) {
     const float S      = ui::uiScale;
-    const bool  busy   = st.job.running.load();
+    const bool  busy   = st.convRunning(st.activeConvId());
     const bool  canRun = st.workerStarted && !busy;
 
     // Keep model discovery + the doc-bound conversation set fresh even when the docked

@@ -3948,12 +3948,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             break;
           }
         }
-        {
-          std::lock_guard<std::mutex> jlk(st.job.mtx);
-          st.job.runId.clear();
-          st.job.error.clear();
-          st.job.errorDetail.clear();
-        }
+        // NOTE: job.mtx is already held by `lk` above — re-locking here
+        // self-deadlocked the GL thread (or aborted via EDEADLK) the moment a
+        // stopped run actually returned status=cancelled.
+        st.job.runId.clear();
+        st.job.error.clear();
+        st.job.errorDetail.clear();
         st.addLog("[..] run result discarded (stopped by user)");
       } else {
         // --- C22b: if this was a v2 run, resync the DocMirror tree + reload

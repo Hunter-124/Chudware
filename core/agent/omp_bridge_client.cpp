@@ -2,6 +2,7 @@
 // newline-delimited JSON-RPC to `bun run vendor/omp/bridge/src/bridge.ts`, structurally mirrored
 // on core/hostd/worker_bridge.cpp (the existing Python-worker stdio bridge pattern).
 #include "agent/omp_bridge_client.h"
+#include "agent/providers.h"  // provider_cancel_flag() — abort in-flight bridge complete() on Stop
 
 #include <cstdlib>
 #include <cstring>
@@ -335,6 +336,16 @@ bool OmpBridgeClient::readLine(std::string& line, int timeoutMs) {
                            std::chrono::steady_clock::now() - start)
                            .count();
         if ((int)elapsed > timeoutMs) return false;
+        // Cooperative cancel: agent_cancel flips the run's provider cancel flag. The bridge
+        // complete() is a blocking round-trip (up to 300s) that the native curl xfer-abort path
+        // can't reach — without this, Stop couldn't interrupt an in-flight LLM call routed through
+        // the bun sidecar (the "stopped but still working" hang). Bail out within one 2ms tick;
+        // callOnce maps this to err="cancelled" and call() reaps the child so the orphaned request
+        // dies with it (can't block the next run on the sequential stdio channel).
+        {
+            const std::atomic<bool>* cf = provider_cancel_flag();
+            if (cf && cf->load(std::memory_order_acquire)) return false;
+        }
 
         struct pollfd pfd;
         pfd.fd = childStdoutRd_;
@@ -389,6 +400,13 @@ bool OmpBridgeClient::callOnce(const std::string& method, const json& params, js
     for (;;) {
         std::string resp;
         if (!readLine(resp, timeoutMs)) {
+            {
+                const std::atomic<bool>* cf = provider_cancel_flag();
+                if (cf && cf->load(std::memory_order_acquire)) {
+                    err = "cancelled";
+                    return false;
+                }
+            }
             // Distinguish child death (EOF / reaped) from a live slow call so the outer retry
             // only respawns on a dead child.
             if (process_ < 0 || childStdoutRd_ < 0) {
@@ -461,6 +479,9 @@ bool OmpBridgeClient::call(const std::string& method, const json& params, json& 
         const bool methodError = result.is_object() && result.contains("message");
         if (methodError || !childDead) {
             err = std::move(attemptErr);
+            // Cancelled mid-call: kill the child so its orphaned in-flight provider request is
+            // aborted (not left running to block the next call on this serialized channel).
+            if (err == "cancelled") reap();
             return false;
         }
         reap();

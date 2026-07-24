@@ -187,9 +187,18 @@ class TestModeToolAllowlists:
     def test_agent_unrestricted(self):
         assert cmt.tools_for_mode("agent") is None
         assert cmt.apply_mode_tools("agent", None) is None
-        # With a role allowlist, agent keeps the role set intact.
+        # With a role allowlist, agent unions in the main-agent file-handling
+        # floor (SHARED_DEFAULT_TOOLS | AGENT_DEFAULT_TOOLS) on top of the
+        # role card's own tools — a narrowing role card must not lose
+        # fs_write/fs_edit/fs_list/run_shell/research_fetch_page.
         out = cmt.apply_mode_tools("agent", ["add_features", "new_part", "delegate"])
-        assert out == ["add_features", "delegate", "new_part"]
+        assert out == sorted(
+            {"add_features", "new_part", "delegate"}
+            | cmt.SHARED_DEFAULT_TOOLS
+            | cmt.AGENT_DEFAULT_TOOLS
+        )
+        for tool in ("fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"):
+            assert tool in out, (tool, out)
 
     def test_swarm_unrestricted_or_unions_extras(self):
         assert cmt.tools_for_mode("swarm") is None
@@ -198,6 +207,8 @@ class TestModeToolAllowlists:
         assert "add_features" in out
         assert "delegate" in out
         assert "corporate_activate" in out
+        for tool in ("fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"):
+            assert tool in out, (tool, out)
 
     def test_apply_intersects_role_with_ask_plus_shared(self):
         role = ["describe_part", "add_features", "new_part", "measure_part"]

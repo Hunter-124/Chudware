@@ -72,6 +72,8 @@ assignments:
   # 2D/3D split roles.
   sketch2d:               [cheap_local, strong]
   model3d:                [cheap_local, strong]
+  # Project-admin linear surface (file/PLM organizing — needs solid tool use).
+  project_organizer:      [strong, cheap_local]
   default:                [cheap_local, strong]
 
 approval_policy:

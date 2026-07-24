@@ -85,6 +85,8 @@ class TaskClass(str, Enum):
       CAM_PROGRAM         part + machining / toolpaths (C5)
       MODIFICATION        modify an existing part / design change (C6)
       ANALYSIS            FEA / CFD / simulation-primary (C3 FEA leg)
+      PROJECT_ADMIN       file-org / cleanup / PLM / rename / archive — NOT a
+                          geometry build; routes to a linear organizer turn
       UNKNOWN             unclassified; router falls back to tier default
     """
     SIMPLE_PART = "simple_part"
@@ -94,6 +96,7 @@ class TaskClass(str, Enum):
     CAM_PROGRAM = "cam_program"
     MODIFICATION = "modification"
     ANALYSIS = "analysis"
+    PROJECT_ADMIN = "project_admin"
     UNKNOWN = "unknown"
 
 
@@ -105,11 +108,29 @@ class TaskClass(str, Enum):
 # patterns. First match wins; UNKNOWN is the fallback. matched_label is embedded in the
 # RouterResult.reason so the Routing card can show *why* the class was chosen.
 _RULES: list[tuple[str, TaskClass, str]] = [
+    # Project/file-org admin (highest priority — must win BEFORE the assembly
+    # rule below, which otherwise hijacks "rename GA to general assembly" via
+    # its bare 'assembl' match). This is NOT a geometry build: file cleanup,
+    # PLM registration, renames/moves of files/folders/documents, archiving.
+    # 'rename'/'move' alone are too broad (a build turn can legitimately
+    # "rename a feature" or "move a hole") so they only fire paired with a
+    # file/folder/document/project noun nearby — bare admin verbs (clean up,
+    # organize, tidy, deprecate, archive) and PLM/vault/version-control nouns
+    # fire on their own since no geometry request phrases them that way.
+    (r"\b(clean.?up|organi[sz]e\w*|tidy\w*|deprecat\w*|archiv\w*|folders?\b|"
+     r"director(?:y|ies)\b|version\s+control|vault\b|plm\b|"
+     r"put(?:\s+\S+){0,3}\s+into\s+plm)\b"
+     r"|\bmove\b(?:\s+\S+){0,10}\s+(files?|folders?|documents?|projects?)\b"
+     r"|\brename\b(?:\s+\S+){0,10}\s+(files?|folders?|documents?|projects?|parts?)\b",
+     TaskClass.PROJECT_ADMIN, "project-admin/file-org terms"),
     # CAM / machining (highest priority — "mill a bracket" is CAM, not SIMPLE_PART)
     (r"\b(cam|toolpath|g.?code|gcode|nc\b|machining|mill|turn|lathe|cutting|zero.?gouge)\b",
      TaskClass.CAM_PROGRAM, "CAM/machining terms"),
-    # Assembly / multi-body
-    (r"\b(assembl|hinge|mate|joint|two.part|multi.?part|snap.fit|moving part)\b",
+    # Assembly / multi-body. assembl\w* is prefix-anchored (\b at start only,
+    # like modif\w*/retrofit\w* below) — a bare "assembl" literal never
+    # matches "assembly"/"assembled" (the trailing \b fails mid-word), so it
+    # was dead weight; \w* lets it actually catch the word family.
+    (r"\b(assembl\w*|hinge|mate|joint|two.part|multi.?part|snap.fit|moving part)\b",
      TaskClass.ASSEMBLY, "assembly/mate terms"),
     # Enclosure / shell / housing
     (r"\b(enclosure|housing|shell|clamshell|snap.?lid|lid|cover|box|case)\b",
@@ -168,6 +189,7 @@ _ALT_PAD_ORDER: tuple[TaskClass, ...] = (
     TaskClass.CAM_PROGRAM,
     TaskClass.MODIFICATION,
     TaskClass.ANALYSIS,
+    TaskClass.PROJECT_ADMIN,
     TaskClass.UNKNOWN,
 )
 
@@ -180,6 +202,7 @@ _ALT_PAD_REASON: dict[TaskClass, str] = {
     TaskClass.CAM_PROGRAM: "no CAM/machining cues",
     TaskClass.MODIFICATION: "no modification cues",
     TaskClass.ANALYSIS: "no simulation/analysis cues",
+    TaskClass.PROJECT_ADMIN: "no file-org/PLM-admin cues",
     TaskClass.UNKNOWN: "would leave request unclassified",
 }
 
@@ -335,6 +358,33 @@ def _normalize_tier(tier: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Execution structure — which classes skip the build swarm
+# ---------------------------------------------------------------------------
+
+# Every TaskClass not listed here routes to the normal 8-phase BUILD swarm
+# (intake -> planner -> modeler -> reviewer -> fixer, compiled as an
+# ``aicad.dag/1`` graph by services.dag.mission_template). A task class listed
+# here is NOT a geometry build at all — routing it into the swarm hands the
+# model geometry-only role tools and it fabricates a dummy part instead of
+# doing the (file/PLM/etc.) work the user actually asked for. ``role`` is the
+# services/agent/roles/<role>.yaml card to run as a single linear tool-calling
+# turn (services.agent.agent_turn — no dag/swarm compilation).
+_CLASS_STRUCTURE: dict[TaskClass, tuple[str, str | None]] = {
+    TaskClass.PROJECT_ADMIN: ("linear", "project_organizer"),
+}
+
+
+def structure_for_class(task_class: TaskClass) -> tuple[str, str | None]:
+    """Return ``(structure, role)`` execution routing for *task_class*.
+
+    ``structure`` is ``"dag"`` (the default build swarm, ``role`` is ``None`` —
+    the mission's own role assignment applies) or ``"linear"`` (a single
+    agent_turn() tool-calling turn against the named *role* card).
+    """
+    return _CLASS_STRUCTURE.get(task_class, ("dag", None))
+
+
+# ---------------------------------------------------------------------------
 # Router result
 # ---------------------------------------------------------------------------
 
@@ -348,6 +398,10 @@ class RouterResult:
     request_snippet: str = ""     # first 120 chars of request for transparency logs
     # Other plausible classes (excl. chosen) for Routing-card expand UI.
     alternatives: list[dict[str, str]] = field(default_factory=list)
+    # "dag" (default build swarm) or "linear" (single agent_turn tool-calling
+    # turn against *role*, no swarm/dag compilation) — see structure_for_class.
+    structure: str = "dag"
+    role: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -358,6 +412,8 @@ class RouterResult:
             "reason": self.reason,
             "request_snippet": self.request_snippet,
             "alternatives": list(self.alternatives),
+            "structure": self.structure,
+            "role": self.role,
         }
 
 
@@ -383,7 +439,8 @@ def route(request: str, tier: str, *,
             force MAXIMUM scaffold; autopilot (C) keeps eco/tier default.
 
     Returns:
-        RouterResult with task_class, scaffold_level, tier, reason, and alternatives.
+        RouterResult with task_class, scaffold_level, tier, reason, structure,
+        role, and alternatives.
     """
     cls, class_why = classify_task_detailed(request)
     level, reason = best_scaffold_for_class(cls, tier, tuning=tuning)
@@ -411,6 +468,7 @@ def route(request: str, tier: str, *,
         except Exception:  # noqa: BLE001
             pass
     alternatives = collect_class_alternatives(request, cls)
+    structure, exec_role = structure_for_class(cls)
     return RouterResult(
         task_class=cls,
         scaffold_level=level,
@@ -418,4 +476,6 @@ def route(request: str, tier: str, *,
         reason=reason,
         request_snippet=request[:120],
         alternatives=alternatives,
+        structure=structure,
+        role=exec_role,
     )

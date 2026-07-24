@@ -39,6 +39,9 @@ ALLOWLIST = {
     "services/agent/providers/codex_sub_provider.py",
     "services/agent/providers/anthropic_sub_provider.py",
     "services/agent/providers/cursor_sub_provider.py",
+    # Vendored OMP provider registry: subscription-auth (Claude OAuth) is a
+    # sanctioned sign-in path through the OMP sidecar (§4.4).
+    "vendor/omp/packages/ai/src/registry/oauth/anthropic.ts",
 }
 SCAN_EXT = {".py", ".cpp", ".h", ".hpp", ".ps1", ".js", ".ts", ".json", ".toml", ".cfg"}
 

@@ -74,6 +74,10 @@ std::optional<CopilotModes> CopilotModes::load(const std::string& explicit_path)
         !read_set(mt, "edit", cm.edit_tools))
         return std::nullopt;
     cm.default_mode = j.value("default_mode", std::string("agent"));
+    // Optional keys (older contracts may omit): absent -> empty set, mirroring
+    // Python's ``_CONTRACT.get(key, ())`` fallback in copilot_mode_tools.py.
+    read_set(j, "agent_default_tools", cm.agent_defaults);
+    read_set(j, "subagent_default_tools", cm.subagent_defaults);
     if (cm.default_mode.empty() || !cm.modes.count(cm.default_mode)) return std::nullopt;
     return cm;
 }
@@ -96,10 +100,14 @@ std::optional<std::vector<std::string>> copilot_apply_mode_tools(
     if (m == "swarm") {
         if (role_set.empty()) return std::nullopt;
         role_set.insert(cm.swarm_extras.begin(), cm.swarm_extras.end());
+        role_set.insert(cm.shared_defaults.begin(), cm.shared_defaults.end());
+        role_set.insert(cm.agent_defaults.begin(), cm.agent_defaults.end());
         return std::vector<std::string>(role_set.begin(), role_set.end());
     }
     if (m == "agent") {
         if (role_set.empty()) return std::nullopt;
+        role_set.insert(cm.shared_defaults.begin(), cm.shared_defaults.end());
+        role_set.insert(cm.agent_defaults.begin(), cm.agent_defaults.end());
         return std::vector<std::string>(role_set.begin(), role_set.end());
     }
 

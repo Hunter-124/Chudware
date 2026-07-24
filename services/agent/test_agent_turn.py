@@ -46,8 +46,11 @@ def test_turn_dispatches_tool_then_finishes():
 
 
 def test_turn_denies_out_of_allowlist_tool():
+    # add_features is on no default floor (shared/agent/subagent), so it must
+    # still be denied when the caller's allowlist omits it. (export_part moved
+    # onto shared_default_tools, which now survives agent-mode narrowing.)
     provider = _ScriptedProvider([
-        '```json\n{"tool": "export_part", "args": {}}\n```',
+        '```json\n{"tool": "add_features", "args": {}}\n```',
         '```json\n{"done": true, "handoff": {}}\n```',
     ])
     called = []
@@ -59,8 +62,8 @@ def test_turn_denies_out_of_allowlist_tool():
     res = agent_turn.run_turn("do it", provider,
                               allowed_tools=["measure_part"],
                               tool_dispatch=_dispatch)
-    # export_part was never dispatched (not in allowlist).
-    assert "export_part" not in called
+    # add_features was never dispatched (not in allowlist, not on a floor).
+    assert "add_features" not in called
     assert any(c.get("error") for c in res.result["calls"])
 
 

@@ -23,6 +23,7 @@ from services.agent.pipeline.workflow_router import (
     classify_task_detailed,
     best_scaffold_for_class,
     route,
+    structure_for_class,
     _inject_tuning_results,
     _clear_tuning_cache,
 )
@@ -341,3 +342,51 @@ class TestRoute:
         })
         r = route("simple bracket", "local-24k")
         assert r.scaffold_level == ScaffoldLevel.ECO
+
+
+# ---------------------------------------------------------------------------
+# PROJECT_ADMIN (file-org / cleanup / PLM) — must preempt the assembly rule
+# ---------------------------------------------------------------------------
+
+class TestProjectAdmin:
+    """Regression coverage for the misrouted "organize my files" bug: a
+    cleanup/PLM request that happens to mention a CAD document name like
+    "general assembly" must classify PROJECT_ADMIN, not ASSEMBLY — and a
+    genuine geometry-build request must still classify ASSEMBLY."""
+
+    def test_cleanup_plm_transcript_classifies_project_admin(self):
+        transcript = (
+            "I want you to look at all documents... clean up & put into PLM... "
+            "clean up file system... deprecated folders... move unrelated to "
+            "/documents/AI-CAD... init PLM... rename GA to general assembly"
+        )
+        assert classify_task(transcript) == TaskClass.PROJECT_ADMIN
+
+    def test_geometry_build_still_classifies_assembly(self):
+        assert classify_task("model a bracket assembly with two mates") == TaskClass.ASSEMBLY
+
+    def test_project_admin_routes_to_linear_organizer_turn(self):
+        assert structure_for_class(TaskClass.PROJECT_ADMIN) == ("linear", "project_organizer")
+
+    def test_build_classes_stay_on_dag_structure(self):
+        assert structure_for_class(TaskClass.ASSEMBLY) == ("dag", None)
+        assert structure_for_class(TaskClass.SIMPLE_PART) == ("dag", None)
+
+    def test_route_end_to_end_reports_linear_structure(self):
+        transcript = (
+            "clean up the file system, put everything into PLM, and rename GA "
+            "to general assembly"
+        )
+        r = route(transcript, "local-24k", tuning={})
+        assert r.task_class == TaskClass.PROJECT_ADMIN
+        assert r.structure == "linear"
+        assert r.role == "project_organizer"
+        d = r.to_dict()
+        assert d["structure"] == "linear"
+        assert d["role"] == "project_organizer"
+
+    def test_route_build_request_keeps_dag_structure(self):
+        r = route("model a bracket assembly with two mates", "local-24k", tuning={})
+        assert r.task_class == TaskClass.ASSEMBLY
+        assert r.structure == "dag"
+        assert r.role is None

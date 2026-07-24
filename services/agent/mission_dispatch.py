@@ -733,6 +733,16 @@ class MissionDispatch:
                 except Exception:  # noqa: BLE001
                     system_prompt = card.system_prompt
             allowed = card.concrete_tools if card is not None else None
+            if allowed is not None:
+                # T-file-floor: every DAG-node/subagent gets file-handling by
+                # default even when the role card narrows the list.
+                try:
+                    from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                        SUBAGENT_DEFAULT_TOOLS,
+                    )
+                    allowed = sorted(set(allowed) | SUBAGENT_DEFAULT_TOOLS)
+                except Exception:  # noqa: BLE001 — floor union is best-effort
+                    pass
             # Always expose coordination board tools to sub-agents so they can
             # claim/release resources and post progress without clobbering peers.
             _COORD_TOOLS = (
@@ -1070,6 +1080,15 @@ class MissionDispatch:
                 )
                 if mode_allowed is not None:
                     allowed = list(mode_allowed)
+                    # Mode narrowing (e.g. ask/plan) can drop the subagent file
+                    # floor union'd above — reapply it so DAG nodes keep it.
+                    try:
+                        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                            SUBAGENT_DEFAULT_TOOLS,
+                        )
+                        allowed = sorted(set(allowed) | SUBAGENT_DEFAULT_TOOLS)
+                    except Exception:  # noqa: BLE001 — floor union is best-effort
+                        pass
                     # Re-render tools_text against the narrowed set (+ category menu).
                     if allowed:
                         try:
@@ -1976,3 +1995,178 @@ def _normalize_questions(raw: Any) -> list[dict]:
             continue
         out.append(q)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Router-driven dispatch (workflow_router structure=="linear")
+# ---------------------------------------------------------------------------
+#
+# workflow_router.route() classifies a raw request into a TaskClass and, via
+# structure_for_class(), an execution *structure*: "dag" (the default 8-phase
+# intake->spec->build->verify->deliver swarm, compiled by
+# services.dag.mission_template.build_mission_graph) or "linear" (a single
+# services.agent.agent_turn.run_turn against one role's card — no swarm/dag
+# compilation at all). PROJECT_ADMIN (file-org/cleanup/PLM requests) is the
+# first "linear" class: routing it into the geometry BUILD swarm hands the
+# model geometry-only role tools and it fabricates a dummy part instead of
+# doing the file/PLM work the user actually asked for (4 live runs — see
+# ~/.local/share/AI-CAD/chat_history.json).
+#
+# route_request() is the entry a mission caller should run BEFORE compiling a
+# manifest/DAG: "dag" classes get back the router decision so the caller
+# proceeds with the EXISTING manifest -> build_mission_graph -> dag_run flow
+# unchanged; "linear" classes run to completion right here via
+# run_linear_role_turn(), reusing agent_turn.run_turn — the same single-turn
+# machinery MissionDispatch._run_subagent uses for sub-agent spawns — instead
+# of a new executor.
+
+# A file-org/PLM cleanup pass touches MANY files in ONE turn (fs_list -> N x
+# fs_write/fs_edit/run_shell -> N x plm_item_add -> plm_checkpoint). A DAG
+# node's per-node budget tops out at 12 (BUILD-role floor 8, see
+# MissionDispatch._run_subagent's derived cap 4-12) because a DAG node only
+# ever handles ONE deliverable; a linear organizer turn handles the WHOLE
+# project in one turn, so it needs more headroom than any single DAG node
+# ever gets.
+LINEAR_ROLE_MAX_TOOL_CALLS = 30
+
+
+def run_linear_role_turn(
+    request: str,
+    role: str,
+    provider: Any,
+    *,
+    on_event: Optional[Callable[..., None]] = None,
+    run_id: str | None = None,
+    ledger: Any | None = None,
+    mission_dispatch: MissionDispatch | None = None,
+    capability: Any | None = None,
+    max_tool_calls: int | None = None,
+    tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
+) -> dict[str, Any]:
+    """Run ONE bounded ``agent_turn.run_turn`` against *role*'s card.
+
+    The linear-structure executor for ``workflow_router.RouterResult.structure
+    == "linear"``: no manifest, no DAG compilation, no delegation-tree /
+    approval-chain machinery (this IS the top-level turn, not a spawned
+    sub-agent) — just the role's card + the same file-handling floor every
+    DAG-node/sub-agent gets (``copilot_mode_tools.SUBAGENT_DEFAULT_TOOLS``),
+    streamed through *on_event* the same way a normal run is so the GUI chat
+    renders it.
+    """
+    from services.agent import agent_turn as _at
+    from services.agent.roles import load_role
+    from services.agent.copilot_mode_tools import SUBAGENT_DEFAULT_TOOLS
+
+    card = load_role(role)
+    allowed = sorted(set(card.concrete_tools) | SUBAGENT_DEFAULT_TOOLS)
+
+    system_prompt = card.system_prompt
+    try:
+        from services.agent.prompt_tiers import (  # noqa: PLC0415
+            assemble_system_for_capability,
+            letter_from_capability,
+        )
+        system_prompt = assemble_system_for_capability(
+            card.system_prompt, letter_from_capability(capability))
+    except Exception:  # noqa: BLE001
+        system_prompt = card.system_prompt
+
+    tools_text = None
+    try:
+        from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
+        tools_text, _meta = render_tools_block(
+            allowed, resolver=_at.resolver_for(mission_dispatch))
+    except Exception:  # noqa: BLE001 — schema render is best-effort
+        tools_text = None
+
+    result = _at.run_turn(
+        request, provider, name=role, actor=role,
+        system_prompt=system_prompt,
+        allowed_tools=allowed,
+        tools_text=tools_text,
+        max_tool_calls=max_tool_calls or LINEAR_ROLE_MAX_TOOL_CALLS,
+        ledger=ledger,
+        mission_dispatch=mission_dispatch,
+        tool_dispatch=tool_dispatch,
+        on_event=on_event,
+        run_id=run_id,
+        capability=capability,
+    )
+    return {
+        "success": result.success,
+        "stop_reason": result.stop_reason,
+        "result": result.result,
+        "role": role,
+        "allowed_tools": allowed,
+    }
+
+
+def route_request(
+    request: str,
+    tier: str,
+    provider: Any,
+    *,
+    on_event: Optional[Callable[..., None]] = None,
+    run_id: str | None = None,
+    ledger: Any | None = None,
+    mission_dispatch: MissionDispatch | None = None,
+    capability: Any | None = None,
+    max_tool_calls: int | None = None,
+    tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
+    tuning: dict | None = None,
+) -> dict[str, Any]:
+    """Classify *request* via ``workflow_router.route`` and dispatch it.
+
+    ``structure == "linear"``: runs ONE ``agent_turn.run_turn`` against the
+    router's ``role`` right here (``run_linear_role_turn``) — no manifest, no
+    DAG/swarm compilation.
+
+    ``structure == "dag"`` (every class not in ``workflow_router.
+    _CLASS_STRUCTURE`` — the normal geometry-build path): this function does
+    NOT itself compile the mission graph (that stays
+    ``services.dag.mission_template.build_mission_graph``, reached via
+    ``mission_start``/``dag_run``, unchanged) — it returns the router decision
+    so the caller proceeds with the existing manifest/DAG flow.
+
+    Emits ``agent.classification`` (contracts/agent_events.md) via *on_event*
+    exactly once, BEFORE dispatch, mirroring the C++ live path's Routing card
+    (core/agent/run.cpp) so the GUI renders the same card for this path too.
+    """
+    from services.agent.pipeline import workflow_router
+
+    route = workflow_router.route(request, tier, tuning=tuning, capability=capability)
+
+    if on_event is not None:
+        try:
+            from services.agent import agent_events as _ae  # noqa: PLC0415
+            _kind, _payload = _ae.classification_event(
+                run_id or "mission",
+                task_class=route.task_class,
+                scaffold_level=route.scaffold_level,
+                tier=tier,
+                reason=route.reason,
+                request_snippet=request[:120],
+                alternatives=route.alternatives,
+            )
+            _ae.emit_event(_kind, _payload, live=on_event, journal=None)
+        except Exception:  # noqa: BLE001 — telemetry must never block dispatch
+            pass
+
+    if route.structure != "linear" or not route.role:
+        return {"ok": True, "structure": "dag",
+                "task_class": route.task_class.value, "route": route.to_dict()}
+
+    turn = run_linear_role_turn(
+        request, route.role, provider,
+        on_event=on_event, run_id=run_id, ledger=ledger,
+        mission_dispatch=mission_dispatch, capability=capability,
+        max_tool_calls=max_tool_calls, tool_dispatch=tool_dispatch,
+    )
+    return {
+        "ok": True,
+        "structure": "linear",
+        "task_class": route.task_class.value,
+        "role": route.role,
+        "route": route.to_dict(),
+        "turn": turn,
+    }

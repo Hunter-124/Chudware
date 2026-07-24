@@ -55,7 +55,10 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               # General-purpose filesystem read tools (fs_tools.py, family "files"): none
               # match a read prefix, so classify explicitly. fs_write/fs_edit/run_shell
               # stay unclassified -> RISK_WRITE.
-              "fs_read", "fs_list", "fs_glob", "fs_grep"}
+              "fs_read", "fs_list", "fs_glob", "fs_grep",
+              # Research tools (research_tools.py): read-only lookups, not mutators —
+              # no "research_" prefix in _READ_PREFIXES so classify explicitly.
+              "research_web_search", "research_fetch_page"}
 
 # Explicit overrides for names the classifier would mislabel. name -> risk.
 _RISK_OVERRIDES: dict[str, str] = {

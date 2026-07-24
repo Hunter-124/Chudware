@@ -39,6 +39,11 @@ TEST_CASE("contract file loads and is self-consistent") {
     CHECK(cm->shared_defaults.count("new_part"));
     CHECK(cm->shared_defaults.count("enable_tools"));
     CHECK(cm->shared_defaults.count("list_tool_categories"));
+    // T-file-floor: agent_default_tools / subagent_default_tools parity.
+    CHECK(cm->agent_defaults == std::set<std::string>(
+        {"fs_edit", "fs_list", "fs_write", "research_fetch_page", "run_shell"}));
+    CHECK(cm->subagent_defaults == std::set<std::string>(
+        {"fs_edit", "fs_glob", "fs_grep", "fs_list", "fs_read", "fs_write"}));
 }
 
 TEST_CASE("normalize_mode mirrors Python (absent/unknown -> agent)") {
@@ -78,6 +83,14 @@ TEST_CASE("mode x tool verdict matrix (no role card)") {
         {"run_fea_static",        true, true, true, false, false},
         {"inspect_part",          true, true, true, true, false},
         {"dag_run",               true, false, true, false, false},
+        // T-file-floor: agent_default_tools main-agent floor. No role card
+        // here, so agent/swarm are unrestricted (None) regardless.
+        {"fs_write",               true, false, true, false, false},
+        {"fs_edit",                true, false, true, false, false},
+        {"fs_list",                true, false, true, false, false},
+        {"run_shell",              true, false, true, false, false},
+        // research_fetch_page is already in ask/plan/edit mode_tools directly.
+        {"research_fetch_page",    true, true, true, true, true},
     };
     for (const auto& r : rows) {
         CAPTURE(r.tool);
@@ -101,16 +114,32 @@ TEST_CASE("agent/swarm unrestricted without a role card; role card applies") {
     REQUIRE(cm.has_value());
     CHECK_FALSE(copilot_apply_mode_tools(*cm, "agent").has_value());
     CHECK_FALSE(copilot_apply_mode_tools(*cm, "swarm").has_value());
-    // Agent keeps the role set intact (sorted).
+    // T-file-floor: agent unions the main-agent file-handling floor
+    // (shared_defaults + agent_defaults) onto a narrowing role card, not
+    // just the role card's own tools — fs_write/fs_edit/fs_list/run_shell/
+    // research_fetch_page must survive the narrowing.
     auto agent_role = copilot_apply_mode_tools(*cm, "agent", {"add_features", "new_part", "delegate"});
     REQUIRE(agent_role.has_value());
-    CHECK(*agent_role == std::vector<std::string>({"add_features", "delegate", "new_part"}));
-    // Swarm unions the corporate/delegate extras onto the role set.
+    auto agent_has = [&](const char* t) {
+        return std::find(agent_role->begin(), agent_role->end(), t) != agent_role->end();
+    };
+    CHECK(agent_has("add_features"));
+    CHECK(agent_has("new_part"));
+    CHECK(agent_has("delegate"));
+    for (const char* t : {"fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"})
+        CHECK(agent_has(t));
+    // Swarm unions the corporate/delegate extras AND the same file-handling
+    // floor onto the role set.
     auto swarm_role = copilot_apply_mode_tools(*cm, "swarm", {"add_features"});
     REQUIRE(swarm_role.has_value());
-    CHECK(std::find(swarm_role->begin(), swarm_role->end(), "add_features") != swarm_role->end());
-    CHECK(std::find(swarm_role->begin(), swarm_role->end(), "delegate") != swarm_role->end());
-    CHECK(std::find(swarm_role->begin(), swarm_role->end(), "corporate_activate") != swarm_role->end());
+    auto swarm_has = [&](const char* t) {
+        return std::find(swarm_role->begin(), swarm_role->end(), t) != swarm_role->end();
+    };
+    CHECK(swarm_has("add_features"));
+    CHECK(swarm_has("delegate"));
+    CHECK(swarm_has("corporate_activate"));
+    for (const char* t : {"fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"})
+        CHECK(swarm_has(t));
 }
 
 TEST_CASE("plan strips mutators from a role card; shared floor re-adds doc lifecycle") {
@@ -143,6 +172,22 @@ TEST_CASE("ask intersects a role card, strips mutators, keeps the shared floor")
     CHECK(has("measure_part"));
     CHECK_FALSE(has("add_features"));
     CHECK(has("new_part"));  // shared floor
+}
+
+TEST_CASE("ask/plan do not gain the agent-only file-handling floor") {
+    // T-file-floor: fs_write/fs_edit/fs_list/run_shell are the main-agent
+    // (agent/swarm-only) floor; ask/plan keep only the read-only shared
+    // floor and must never gain them, narrowing role card or not.
+    auto cm = CopilotModes::load();
+    REQUIRE(cm.has_value());
+    auto ask_out = copilot_apply_mode_tools(*cm, "ask", {"describe_part"});
+    auto plan_out = copilot_apply_mode_tools(*cm, "plan", {"describe_part"});
+    REQUIRE(ask_out.has_value());
+    REQUIRE(plan_out.has_value());
+    for (const char* t : {"fs_write", "fs_edit", "fs_list", "run_shell"}) {
+        CHECK(std::find(ask_out->begin(), ask_out->end(), t) == ask_out->end());
+        CHECK(std::find(plan_out->begin(), plan_out->end(), t) == plan_out->end());
+    }
 }
 
 TEST_CASE("plan_only forces plan semantics under agent mode") {

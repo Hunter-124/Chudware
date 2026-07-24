@@ -397,16 +397,22 @@ class RoleCard:
         refusal instead of running.
 
         Unions in :data:`copilot_mode_tools.SHARED_DEFAULT_TOOLS` (research_web_search,
-        ask_user, doc lifecycle, fs_read/fs_glob/fs_grep, …) — the copilot-mode layer
-        already treats that floor as always-available, but ``set_policy`` is the actual
-        dispatch gate and previously only saw a role's own ``tool_allowlist``. Without
-        this union, any role card that doesn't explicitly list e.g. research_web_search
-        would have it offered by the mode layer yet REFUSED at dispatch — a silent
-        floor/enforcement mismatch, not an intentional restriction.
+        ask_user, doc lifecycle, fs_read/fs_glob/fs_grep, …) and
+        :data:`copilot_mode_tools.AGENT_DEFAULT_TOOLS` (fs_write/fs_edit/fs_list/
+        run_shell/research_fetch_page, the main-agent file-handling floor) — the
+        copilot-mode layer already treats these floors as always-available, but
+        ``set_policy`` is the actual dispatch gate and previously only saw a role's
+        own ``tool_allowlist``. Without this union, any role card that doesn't
+        explicitly list e.g. research_web_search or fs_write would have it offered
+        by the mode layer yet REFUSED at dispatch — a silent floor/enforcement
+        mismatch, not an intentional restriction.
         """
-        from services.agent.copilot_mode_tools import SHARED_DEFAULT_TOOLS  # noqa: PLC0415
+        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+            AGENT_DEFAULT_TOOLS,
+            SHARED_DEFAULT_TOOLS,
+        )
 
-        tokens = list(dict.fromkeys([*self.allow_tokens, *SHARED_DEFAULT_TOOLS]))
+        tokens = list(dict.fromkeys([*self.allow_tokens, *SHARED_DEFAULT_TOOLS, *AGENT_DEFAULT_TOOLS]))
         registry.set_policy(allow=tokens)
         return tokens
 

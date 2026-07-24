@@ -47,6 +47,15 @@ _MATRIX = [
     ("run_fea_static",                  True, True, True, False, False),
     ("inspect_part",                    True, True, True, True, False),
     ("dag_run",                         True, False, True, False, False),
+    # T-file-floor: agent_default_tools main-agent floor. Absent from ask/
+    # plan mode_tools and shared_default_tools -> unrestricted agent/swarm
+    # only (no role card here, so both are None-unrestricted regardless).
+    ("fs_write",                        True, False, True, False, False),
+    ("fs_edit",                         True, False, True, False, False),
+    ("fs_list",                         True, False, True, False, False),
+    ("run_shell",                       True, False, True, False, False),
+    # research_fetch_page is already in ask/plan/edit mode_tools directly.
+    ("research_fetch_page",             True, True, True, True, True),
 ]
 
 _MODES = ("agent", "plan", "swarm", "edit", "ask")
@@ -63,6 +72,8 @@ class TestContractDataIsWhatTheModuleExposes:
         assert cmt._MUTATING_TOOLS == frozenset(contract["mutating_tools"])
         assert cmt._EDIT_DENIED == frozenset(contract["edit_denied"])
         assert cmt.SWARM_EXTRA_TOOLS == frozenset(contract["swarm_extra_tools"])
+        assert cmt.AGENT_DEFAULT_TOOLS == frozenset(contract["agent_default_tools"])
+        assert cmt.SUBAGENT_DEFAULT_TOOLS == frozenset(contract["subagent_default_tools"])
         assert set(contract["unrestricted_modes"]) == {"agent", "swarm"}
 
     def test_schema_tag(self, contract):
@@ -84,15 +95,28 @@ class TestRoleCardSemantics:
         assert cmt.apply_mode_tools("swarm", None) is None
 
     def test_agent_keeps_role_set(self):
-        assert cmt.apply_mode_tools("agent", ["add_features", "new_part", "delegate"]) == [
-            "add_features", "delegate", "new_part",
-        ]
+        # T-file-floor: agent/swarm now union the main-agent file-handling
+        # floor (SHARED_DEFAULT_TOOLS | AGENT_DEFAULT_TOOLS) onto a narrowing
+        # role card, not just the role card's own tools.
+        out = cmt.apply_mode_tools("agent", ["add_features", "new_part", "delegate"])
+        assert out == sorted(
+            {"add_features", "new_part", "delegate"}
+            | cmt.SHARED_DEFAULT_TOOLS
+            | cmt.AGENT_DEFAULT_TOOLS
+        )
+
+    def test_agent_narrowed_role_card_gains_file_handling_floor(self):
+        out = cmt.apply_mode_tools("agent", ["add_features"])
+        for tool in ("fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"):
+            assert tool in out, (tool, out)
 
     def test_swarm_unions_extras(self):
         out = cmt.apply_mode_tools("swarm", ["add_features"])
         assert "add_features" in out
         assert "delegate" in out
         assert "corporate_activate" in out
+        for tool in ("fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"):
+            assert tool in out, (tool, out)
 
     def test_plan_strips_mutators_keeps_shared_floor(self):
         out = cmt.apply_mode_tools(
@@ -116,6 +140,16 @@ class TestRoleCardSemantics:
         assert "measure_part" in out
         assert "add_features" not in out
         assert "new_part" in out  # shared floor
+
+    def test_ask_plan_do_not_gain_agent_default_floor(self):
+        # T-file-floor: fs_write/fs_edit/fs_list/run_shell are the main-agent
+        # (agent/swarm-only) floor; ask/plan keep only the read-only shared
+        # floor and must never gain them, narrowing role card or not.
+        ask_out = cmt.apply_mode_tools("ask", ["describe_part"])
+        plan_out = cmt.apply_mode_tools("plan", ["describe_part"])
+        for tool in ("fs_write", "fs_edit", "fs_list", "run_shell"):
+            assert tool not in ask_out, (tool, ask_out)
+            assert tool not in plan_out, (tool, plan_out)
 
     def test_plan_only_forces_plan_semantics(self):
         out = cmt.apply_mode_tools(

@@ -34,6 +34,15 @@ struct CopilotModes {
     std::set<std::string> mutating_tools;   // deny set: plan role-cards + ask
     std::set<std::string> edit_denied;      // extra deny set: edit
     std::set<std::string> swarm_extras;     // unioned onto swarm role-cards
+    // Always-on MAIN-agent loadout (file handling, shell, web fetch) unioned
+    // onto the advertised list AND dispatch policy for unrestricted modes
+    // (agent/swarm) even when a role card narrows the tool list. Absent key
+    // in the contract -> stays empty (mirrors Python's dict.get(key, ())).
+    std::set<std::string> agent_defaults;
+    // File-handling floor unioned onto every DAG-node/subagent role loadout
+    // (parsed for parity; no C++ subagent-dispatch layer consumes it today —
+    // run.cpp has no role-card tool-narrowing call site to union it into).
+    std::set<std::string> subagent_defaults;
 
     // Load and parse the contract JSON. std::nullopt when the file is missing
     // or malformed — callers fall back to their pre-contract behavior.

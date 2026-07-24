@@ -880,47 +880,6 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // Resume after Plan approve: execute the approved plan (do not stop at plan_ready).
     if (has_approved_plan) plan_only = false;
 
-    // Deterministic complexity router: a Solo request (one simple/standard part)
-    // skips the LLM planner and runs as a single model loop; Standard/Complex keep
-    // the plan stage. Honour an explicit override in options["complexity"].
-    ComplexityVerdict cx = classify_complexity(request);
-    DomainVerdict dom = classify_domain(request);
-    if (options.contains("complexity") && options["complexity"].is_string()) {
-        const std::string forced = options["complexity"].get<std::string>();
-        if (forced == "solo") cx = {Complexity::Solo, "forced by options"};
-        else if (forced == "standard") cx = {Complexity::Standard, "forced by options"};
-        else if (forced == "complex") cx = {Complexity::Complex, "forced by options"};
-    }
-    // A Solo build skips the planner unless the host explicitly wants a plan
-    // (plan_only / approved plan / swarm-forced structure).
-    // Edit mode: same Solo default (no plan); Standard/Complex keep the plan stage.
-    const bool solo_skip_plan =
-        cx.level == Complexity::Solo && !plan_only && !has_approved_plan && !corporate_force;
-
-    // execution_style: decide BEFORE drafting. recommend_structure → edit|swarm;
-    // explicit mode swarm/eng_firm overrides. eng_firm is never auto-recommended.
-    // Company structure is opt-in via options.corporate_mode / agent.corporate_mode
-    // (Settings → AI → Behavior); default off so Agent never auto-invokes company.
-    const bool cross_discipline =
-        (dom.domain == Domain::Ecad || dom.domain == Domain::Cam ||
-         dom.domain == Domain::Simulation);
-    const bool allow_company = options.value("corporate_mode", false) ||
-                               options.value("allow_company", false);
-    ExecStructure rec_struct =
-        recommend_structure(cx.level, cross_discipline, allow_company);
-    std::string execution_style = execution_style_from_structure(structure_label(rec_struct));
-    if (copilot_mode == "swarm" || execute_as == "swarm")
-        execution_style = "swarm";
-    else if (copilot_mode == "eng_firm" || execute_as == "eng_firm")
-        execution_style = "eng_firm";
-    else if (copilot_mode == "edit")
-        execution_style = "edit";
-    // options.execution_style explicit override (host resume / tests).
-    if (options.contains("execution_style") && options["execution_style"].is_string()) {
-        const std::string es = options["execution_style"].get<std::string>();
-        if (es == "edit" || es == "swarm" || es == "eng_firm") execution_style = es;
-    }
-
     // Nested sub-run depth (delegate / swarm unit). Cap at 2.
     const int run_depth = options.value("run_depth", 0);
     const bool is_sub_run = options.value("is_sub_run", false) || run_depth > 0;
@@ -1184,6 +1143,52 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     state.request = request;
     state.doc_id = doc_id;
     state.revision = tree0.value("revision", 0);
+    // Complexity/domain classification + derived locals (rec_struct, execution_style,
+    // solo_skip_plan) are computed here rather than near the top of run_design(): the
+    // online top-level pre-flight branch above returns before ever reading them, so
+    // computing them earlier was dead work on that path. Only the offline/sub-run/
+    // swarm fall-through below reads these values.
+    // Deterministic complexity router: a Solo request (one simple/standard part)
+    // skips the LLM planner and runs as a single model loop; Standard/Complex keep
+    // the plan stage. Honour an explicit override in options["complexity"].
+    ComplexityVerdict cx = classify_complexity(request);
+    DomainVerdict dom = classify_domain(request);
+    if (options.contains("complexity") && options["complexity"].is_string()) {
+        const std::string forced = options["complexity"].get<std::string>();
+        if (forced == "solo") cx = {Complexity::Solo, "forced by options"};
+        else if (forced == "standard") cx = {Complexity::Standard, "forced by options"};
+        else if (forced == "complex") cx = {Complexity::Complex, "forced by options"};
+    }
+    // A Solo build skips the planner unless the host explicitly wants a plan
+    // (plan_only / approved plan / swarm-forced structure).
+    // Edit mode: same Solo default (no plan); Standard/Complex keep the plan stage.
+    const bool solo_skip_plan =
+        cx.level == Complexity::Solo && !plan_only && !has_approved_plan && !corporate_force;
+
+    // execution_style: decide BEFORE drafting. recommend_structure → edit|swarm;
+    // explicit mode swarm/eng_firm overrides. eng_firm is never auto-recommended.
+    // Company structure is opt-in via options.corporate_mode / agent.corporate_mode
+    // (Settings → AI → Behavior); default off so Agent never auto-invokes company.
+    const bool cross_discipline =
+        (dom.domain == Domain::Ecad || dom.domain == Domain::Cam ||
+         dom.domain == Domain::Simulation);
+    const bool allow_company = options.value("corporate_mode", false) ||
+                               options.value("allow_company", false);
+    ExecStructure rec_struct =
+        recommend_structure(cx.level, cross_discipline, allow_company);
+    std::string execution_style = execution_style_from_structure(structure_label(rec_struct));
+    if (copilot_mode == "swarm" || execute_as == "swarm")
+        execution_style = "swarm";
+    else if (copilot_mode == "eng_firm" || execute_as == "eng_firm")
+        execution_style = "eng_firm";
+    else if (copilot_mode == "edit")
+        execution_style = "edit";
+    // options.execution_style explicit override (host resume / tests).
+    if (options.contains("execution_style") && options["execution_style"].is_string()) {
+        const std::string es = options["execution_style"].get<std::string>();
+        if (es == "edit" || es == "swarm" || es == "eng_firm") execution_style = es;
+    }
+
     state.complexity = cx.level;
     state.complexity_set = true;
     state.domain = dom.domain;

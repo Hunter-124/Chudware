@@ -252,6 +252,7 @@ def _expand_token(token: str) -> set[str]:
             return set()
         try:
             from services.mcp import tool_registry as _tr  # noqa: PLC0415 — lazy
+            _tr.warm_catalog()
             cat = _tr.catalog() or {}
         except Exception:  # noqa: BLE001 — catalog optional at import/test time
             return set()

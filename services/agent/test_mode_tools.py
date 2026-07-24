@@ -187,18 +187,21 @@ class TestModeToolAllowlists:
     def test_agent_unrestricted(self):
         assert cmt.tools_for_mode("agent") is None
         assert cmt.apply_mode_tools("agent", None) is None
-        # With a role allowlist, agent unions in the main-agent file-handling
-        # floor (SHARED_DEFAULT_TOOLS | AGENT_DEFAULT_TOOLS) on top of the
-        # role card's own tools — a narrowing role card must not lose
-        # fs_write/fs_edit/fs_list/run_shell/research_fetch_page.
+        # T-lean-floor: with a role allowlist, agent unions in the main-agent
+        # file-handling floor (AGENT_DEFAULT_TOOLS only — NOT
+        # SHARED_DEFAULT_TOOLS, which is for ask/plan/edit/swarm) on top of
+        # the role card's own tools — a narrowing role card must not lose
+        # fs_write/fs_edit/fs_list/run_shell/research_fetch_page, but CAD
+        # document-lifecycle tools stay behind enable_tools instead.
         out = cmt.apply_mode_tools("agent", ["add_features", "new_part", "delegate"])
         assert out == sorted(
-            {"add_features", "new_part", "delegate"}
-            | cmt.SHARED_DEFAULT_TOOLS
-            | cmt.AGENT_DEFAULT_TOOLS
+            {"add_features", "new_part", "delegate"} | cmt.AGENT_DEFAULT_TOOLS
         )
         for tool in ("fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"):
             assert tool in out, (tool, out)
+        for tool in ("close_part", "save_part", "measure_part", "cad_guide", "advise",
+                     "import_part", "export_part"):
+            assert tool not in out, (tool, out)
 
     def test_swarm_unrestricted_or_unions_extras(self):
         assert cmt.tools_for_mode("swarm") is None

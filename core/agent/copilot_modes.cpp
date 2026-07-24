@@ -106,7 +106,10 @@ std::optional<std::vector<std::string>> copilot_apply_mode_tools(
     }
     if (m == "agent") {
         if (role_set.empty()) return std::nullopt;
-        role_set.insert(cm.shared_defaults.begin(), cm.shared_defaults.end());
+        // Agent mode floors with agent_defaults (main-agent fs/shell/web floor)
+        // only — shared_defaults (CAD document-lifecycle tools) is NOT unioned
+        // here; those packs are pulled on demand via enable_tools. (ask/plan/
+        // edit/swarm still get shared_defaults — see below.)
         role_set.insert(cm.agent_defaults.begin(), cm.agent_defaults.end());
         return std::vector<std::string>(role_set.begin(), role_set.end());
     }

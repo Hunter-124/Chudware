@@ -95,15 +95,25 @@ class TestRoleCardSemantics:
         assert cmt.apply_mode_tools("swarm", None) is None
 
     def test_agent_keeps_role_set(self):
-        # T-file-floor: agent/swarm now union the main-agent file-handling
-        # floor (SHARED_DEFAULT_TOOLS | AGENT_DEFAULT_TOOLS) onto a narrowing
-        # role card, not just the role card's own tools.
+        # T-lean-floor: agent mode floors with AGENT_DEFAULT_TOOLS (the
+        # main-agent fs/shell/web floor) only — SHARED_DEFAULT_TOOLS (CAD
+        # document-lifecycle tools) is NOT unioned onto agent-mode role
+        # cards; those packs are pulled on demand via enable_tools.
         out = cmt.apply_mode_tools("agent", ["add_features", "new_part", "delegate"])
         assert out == sorted(
-            {"add_features", "new_part", "delegate"}
-            | cmt.SHARED_DEFAULT_TOOLS
-            | cmt.AGENT_DEFAULT_TOOLS
+            {"add_features", "new_part", "delegate"} | cmt.AGENT_DEFAULT_TOOLS
         )
+
+    def test_agent_role_card_no_longer_gains_shared_default_floor(self):
+        # T-lean-floor: CAD document-lifecycle tools (SHARED_DEFAULT_TOOLS)
+        # must NOT leak onto an agent-mode role card that doesn't request
+        # them; they stay reachable via enable_tools/family packs instead.
+        out = cmt.apply_mode_tools("agent", ["add_features"])
+        for tool in (
+            "close_part", "new_part", "save_part", "measure_part",
+            "cad_guide", "advise", "import_part", "export_part",
+        ):
+            assert tool not in out, (tool, out)
 
     def test_agent_narrowed_role_card_gains_file_handling_floor(self):
         out = cmt.apply_mode_tools("agent", ["add_features"])

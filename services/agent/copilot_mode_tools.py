@@ -162,7 +162,11 @@ def apply_mode_tools(
     if m == "agent":
         if not role_set:
             return None
-        return sorted(role_set | SHARED_DEFAULT_TOOLS | AGENT_DEFAULT_TOOLS)
+        # Agent mode floors with AGENT_DEFAULT_TOOLS (the main-agent fs/shell/web
+        # floor) only — SHARED_DEFAULT_TOOLS (CAD document-lifecycle tools) is
+        # NOT unioned here; those packs are pulled on demand via enable_tools.
+        # (ask/plan/edit/swarm still get SHARED_DEFAULT_TOOLS — see below.)
+        return sorted(role_set | AGENT_DEFAULT_TOOLS)
 
     # Plan: open like agent minus geometry commit mutators (add_features etc.),
     # then floor with SHARED_DEFAULT_TOOLS so make/save/open/close stay.

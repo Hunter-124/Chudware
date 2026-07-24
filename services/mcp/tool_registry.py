@@ -89,6 +89,30 @@ def catalog() -> dict[str, dict]:
     return _CATALOG
 
 
+_WARMED = False
+
+
+def warm_catalog() -> None:
+    """Best-effort, memoized: trigger server.py's module-level family registrations.
+
+    ``_CATALOG`` above is populated only as an import side-effect of
+    ``services/mcp/server.py`` (its module-level ``register_*_tools(_reg.view(mcp,
+    "<family>"))`` calls). The live GUI worker process never imports server.py, so
+    without this, ``family:X`` resolution (roles.py ``concrete_tools``,
+    tool_categories._expand_token) always sees an empty/near-empty catalog. Callers
+    that resolve families from the catalog should call this first; it is a no-op
+    after the first call and never raises.
+    """
+    global _WARMED
+    if _WARMED:
+        return
+    _WARMED = True
+    try:
+        import mcp_server.server  # noqa: F401 — side-effect: populates _CATALOG via its module-level _reg.view registrations
+    except Exception:  # noqa: BLE001 — best-effort; a heavy/failed import must never break role loading
+        pass
+
+
 def clear_catalog() -> None:
     """Reset the catalog (tests), then re-record always-on meta-tools."""
     _CATALOG.clear()

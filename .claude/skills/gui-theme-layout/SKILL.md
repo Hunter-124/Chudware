@@ -19,6 +19,7 @@ modals. What individual panels *contain* belongs to their own specialist skills.
 | `host/src/ui/settings_modal.cpp` | Settings dialog (theme toggle, AI provider, units, glass knobs) |
 | `host/src/ui/file_dialog.cpp`, `equations_dialog.cpp`, `profiler_window.cpp` | App-level modals |
 | `host/src/ui/toast.cpp`, `cursors.cpp` | Notifications, cursor set |
+| `host/src/ui/provider_usage.h/.cpp` | THE subscription_accounts / subscription_usage poller — Settings Accounts and the composer usage rings both read it. Never add a second poller |
 
 ## The theme system
 
@@ -43,6 +44,33 @@ modals. What individual panels *contain* belongs to their own specialist skills.
 - "Reset layout" → `resetOverlayColumns()` restores default widths.
 - Frame-loop draw order lives in `run_gui()` in `host/src/app.cpp` (integrator-owned):
   title bar → left pane tabs → viewport → console → status bar → ribbon dispatch → modals.
+
+## Shared scroll + gauge primitives (do not re-roll these)
+
+- **Pill scrollbar.** `ui::drawWindowPillScrollbarV(surf)` (ui_theme) replaces ImGui's default
+  bar for the current child. The child MUST carry `ImGuiWindowFlags_NoScrollbar`, and the call
+  goes immediately before `EndChild()`. Every scrolling child in the copilot column, the AI
+  workspace and the FeatureManager uses it — a default grey ImGui bar anywhere is a bug.
+- **Circular gauge.** `ui::drawFractionRing(dl, center, radius, thickness, frac, track, arc)` is
+  the one "how much of a budget is used" shape: composer context window, composer provider
+  rate-limit rings (5H/7D), Settings Accounts usage, plan/metrics badges. Compact badges use
+  `radius = GetFrameHeight() * 0.30–0.34f`, `thickness = metrics::stroke(2)`.
+- **Copilot menu tokens.** `ui::metrics::cpMenu*` (gutter / rowPadX / rowPadY / rowGap /
+  rowRound / chipRound / sectionGap / headGap / labelGap / ctlGap) plus the
+  `cpMenuHeader/cpMenuSection/cpMenuLabel/cpMenuHint` chrome in `ui/copilot/ui_common.cpp`.
+  Every copilot menu, chat bubble and AI-workspace row sizes from these. New literals there
+  are what made the five header views read as five unrelated screens.
+- **Trap — logical dp vs pixels.** `glassPanel`, `glassRowBackground` and `coloredRowWash` take
+  a LOGICAL dp radius and scale it internally; `metrics::cpMenuRowRound()` already returns
+  PIXELS. Passing the token straight in double-scales it. Convert back (`token / uiScale`) or
+  pass the bare dp number.
+- **Trap — `ImGuiChildFlags_None` kills WindowPadding.** imgui.cpp only applies
+  `style.WindowPadding` to a child that has `ImGuiChildFlags_AlwaysUseWindowPadding` or a
+  border. A pushed `WindowPadding` on a plain child is silently a no-op — which is how the
+  Settings tab bodies ended up flush with each section inventing its own indent.
+- **Trap — draw-list text is not clipped by its card.** `dl->AddText` for user-supplied strings
+  (session titles, snippets, artifact names) must be ellipsized against the row's real width or
+  it runs out past the panel edge.
 
 ## Build & verify
 

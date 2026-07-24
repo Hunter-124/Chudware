@@ -23,7 +23,7 @@ the frame loop in `host/src/app.cpp`.
 | **ECAD** | `host/src/ui/ecad/ecad_panel.cpp/.h`, `ecad_canvas.cpp/.h`, `ecad_mirror.cpp/.h` | Schematic/PCB 2D canvas editor; schemas in `contracts/ecad/` |
 | **PLM** | `host/src/ui/plm/plm_workspace.cpp`, `plm_pages.cpp`, `plm_hub.h` | Versioning, releases, document control; `contracts/plm.md` |
 | **Reverse Eng.** | `host/src/ui/reveng/reveng_workspace.cpp`, `webcam_capture.cpp`, `dim_review.cpp` | Photo capture, dimension confirm, reconstruction; `contracts/reveng.md`; splat view lives in `host/src/render/` (gui-viewport) |
-| **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h`, `host/src/ui/activity_panel.cpp`, `host/src/ui/legacy_chat.cpp` (Copilot Settings: Agents/Prompts/Skills/**Context**/Permissions/Providers) | Agent run tree, role-prompt editor, live progress; Context Injection tab edits `aicad.trigger/1` via `triggers_*` RPCs; events per `contracts/agent_events.md` |
+| **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h` + `ai/{plan_board,docs_panel,active_work,metrics_view}.cpp`, `host/src/ui/activity_panel.cpp`, and `host/src/ui/copilot/` (the chat impl the workspace embeds via the reuse hooks at the bottom of `copilot/copilot.h`; the old `legacy_chat.cpp` monolith is GONE — see the module map in `copilot/copilot_internal.h`) | Agent run tree, role-prompt editor, live progress; Context Injection tab edits `aicad.trigger/1` via `triggers_*` RPCs; events per `contracts/agent_events.md` |
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
 | **Simulation** | `host/src/ui/sim_manager.cpp`, `host/src/ui/evaluate_dialogs.cpp` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …) |
 | **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
@@ -49,6 +49,13 @@ gains a major new flow).
   `WorkerClient::sendRpc()` (`contracts/worker_rpc.md`).
 - Colors via `ui_theme` only; icons from `contracts/icons.md`; glass containers via the
   helpers in `host/src/ui_theme.h` (see gui-theme-layout for the visual system).
+- Scrolling children use the app's pill scrollbar, never ImGui's default: give the child
+  `ImGuiWindowFlags_NoScrollbar` and call `ui::drawWindowPillScrollbarV(surf)` right before
+  `EndChild()`. Streaming logs stick to the bottom via `ui::chatLogStickToBottom("<region id>")`
+  (a unique id per surface — two surfaces sharing one id fight over the flag).
+- Row/card gutters, corners and gaps come from `ui::metrics::cpMenu*`; compact
+  "fraction of a budget" readouts use `ui::drawFractionRing`. See gui-theme-layout for both,
+  including the logical-dp-vs-pixels double-scale trap.
 - Contracts are append-only; schema changes are orchestrator-level decisions.
 
 ## Build & verify

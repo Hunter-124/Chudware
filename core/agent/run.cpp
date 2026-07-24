@@ -645,7 +645,8 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     };
 
     const json req = {{"id", 1}, {"method", "agent_admin_turn"},
-                      {"params", json{{"request", request}, {"run_id", run_id}}}};
+                      {"params", json{{"request", request}, {"run_id", run_id},
+                                      {"role", "general_agent"}}}};
     const std::string line = req.dump() + "\n";
     bool wrote = true;
     {
@@ -939,15 +940,16 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // it now actually runs (project_organizer role turn via the python worker) instead of
     // just telling the user to do it manually. Sub-runs are exempt: their request text is
     // a parent-authored task, already vetted.
-    if (!is_sub_run && is_admin_request(request)) {
-        const std::string why = capability_request_reason(request);
+    if (!is_sub_run && is_general_work_request(request)) {
+        std::string why = capability_request_reason(request);
+        if (why.empty()) why = "general work (no geometry-build cues)";
         const std::string human =
-            "That's project and file management, not a modeling task. I build geometry, "
-            "so running this here would have produced a part full of meaningless "
-            "features. Nothing was built, nothing was moved, no file was touched.\n\n"
-            "Use the PLM tab for version control, releases and deprecating parts, and "
-            "the file explorer for reorganizing folders.";
-        events.emit("task_route", json{{"domain", "admin"},
+            "That's general/project work, not a geometry build — so I didn't run "
+            "the modeling pipeline on it. I tried to hand it to the general-work "
+            "agent but couldn't reach it (offline or the worker is unavailable), "
+            "so nothing was changed. Try again once a provider is configured, or "
+            "use the PLM tab / file explorer directly.";
+        events.emit("task_route", json{{"domain", "general"},
                                        {"reason", why},
                                        {"tool_classes", json::array()},
                                        {"context_sheets", json::array()}});
@@ -967,9 +969,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // Offline runs never attempt the worker bridge — same refusal as before.
         if (offline) return blocked_response();
 
-        // Execute instead of refuse: hand the request to a bounded
-        // project_organizer role turn (fs/plm/shell tools) over the python
-        // worker's agent_admin_turn RPC (services/agent/worker_rpc.py). Any
+        // Execute instead of refuse: hand the request to a bounded general_agent
+        // role turn (fs/plm/shell + on-demand modeling/sketch/sim/... tool packs
+        // via enable_tools) over the python worker's agent_admin_turn RPC
+        // (services/agent/worker_rpc.py). Any
         // failure to reach/complete it (worker unavailable, spawn failure,
         // timeout, the worker's OWN offline check, ...) falls back to the
         // EXACT same blocked response as before — never a crash, never a
@@ -977,7 +980,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         json turn;
         std::string worker_err;
         if (!call_admin_worker_turn(request, run_id, events, turn, worker_err)) {
-            events.emit("run_note", json{{"note", "admin worker turn unavailable"},
+            events.emit("run_note", json{{"note", "general-work worker turn unavailable"},
                                          {"reason", worker_err}});
             return blocked_response();
         }
@@ -985,7 +988,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         const bool turn_ok = turn.value("success", false);
         const std::string stop_reason = turn.value("stop_reason", std::string("unknown"));
         const std::string status = turn_ok ? "completed" : "failed";
-        const std::string role = turn.value("role", std::string("project_organizer"));
+        const std::string role = turn.value("role", std::string("general_agent"));
         events.emit("run_finished", json{{"status", status},
                                          {"stop_reason", stop_reason},
                                          {"role", role}});

@@ -390,3 +390,17 @@ class TestProjectAdmin:
         assert r.task_class == TaskClass.ASSEMBLY
         assert r.structure == "dag"
         assert r.role is None
+
+    def test_general_work_and_unknown_default_to_general_agent(self):
+        # Inverted default: anything that is not a geometry-build class runs the
+        # free linear general_agent lane — never the multi-step build swarm.
+        assert structure_for_class(TaskClass.GENERAL_WORK) == ("linear", "general_agent")
+        assert structure_for_class(TaskClass.UNKNOWN) == ("linear", "general_agent")
+
+    def test_route_basic_work_runs_general_agent_lane(self):
+        r = route("list my documents and summarize the readme", "local-24k", tuning={})
+        assert r.structure == "linear"
+        assert r.role == "general_agent"
+        d = r.to_dict()
+        assert d["structure"] == "linear"
+        assert d["role"] == "general_agent"

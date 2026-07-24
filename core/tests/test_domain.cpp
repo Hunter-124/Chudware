@@ -194,3 +194,21 @@ TEST_CASE("design brief that mentions PLM is not demoted to admin") {
     CHECK_FALSE(chudware::agent::is_admin_request(brief));
     CHECK(classify_domain(brief).domain == Domain::Modeling);
 }
+
+// Inverted default (2026-07): general work is the landing zone. A request runs the
+// free linear general lane unless it carries positive geometry-build cues (or a
+// geometry-producing capability with no file/PLM cue).
+TEST_CASE("general work is the default lane unless it's a clear geometry build") {
+    using chudware::agent::is_general_work_request;
+    // Basic file / PLM / assistant work → general (no multi-step modeling plan).
+    CHECK(is_general_work_request("clean up some files on my disk"));
+    CHECK(is_general_work_request("list my documents and summarize the readme"));
+    CHECK(is_general_work_request("measure the bore diameter"));
+    // A file/organize cue keeps it general even when it names a geometry surface.
+    CHECK(is_general_work_request("organize the parts library"));
+    // Clear geometry builds opt INTO the modeling pipeline.
+    CHECK_FALSE(is_general_work_request("model a mounting bracket"));
+    CHECK_FALSE(is_general_work_request("design a two-part hinge assembly"));
+    CHECK_FALSE(is_general_work_request("download a model from McMaster"));
+    CHECK_FALSE(is_general_work_request("design a mounting bracket, then check it into PLM"));
+}

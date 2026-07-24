@@ -87,6 +87,9 @@ class TaskClass(str, Enum):
       ANALYSIS            FEA / CFD / simulation-primary (C3 FEA leg)
       PROJECT_ADMIN       file-org / cleanup / PLM / rename / archive — NOT a
                           geometry build; routes to a linear organizer turn
+      GENERAL_WORK        general/basic-assistant work (files, search, summarize,
+                          PLM-lite) — the DEFAULT lane; a free linear general_agent
+                          turn, never a multi-step modeling plan
       UNKNOWN             unclassified; router falls back to tier default
     """
     SIMPLE_PART = "simple_part"
@@ -97,6 +100,7 @@ class TaskClass(str, Enum):
     MODIFICATION = "modification"
     ANALYSIS = "analysis"
     PROJECT_ADMIN = "project_admin"
+    GENERAL_WORK = "general_work"
     UNKNOWN = "unknown"
 
 
@@ -151,6 +155,16 @@ _RULES: list[tuple[str, TaskClass, str]] = [
     # Simple single feature: bracket, block, plate, rib with few constraints
     (r"\b(bracket|mounting|plate|slab|block|rib|gusset|simple|basic)\b",
      TaskClass.SIMPLE_PART, "simple-part terms"),
+    # General work / basic-assistant tasks that are NOT a geometry build: file &
+    # disk operations, search/list/summarize/read, backups. Positioned AFTER the
+    # geometry rules so "open the bracket" still builds; a bare "clean up the
+    # files on my disk" / "list my documents" lands here and runs the free linear
+    # general_agent lane (no multi-step modeling plan). Anything still unmatched
+    # falls to UNKNOWN, which ALSO routes to general_agent.
+    (r"\b(files?\b|on\s+(?:my\s+)?disk|search\s+(?:for|the|my)|find\s+(?:the|my|all)|"
+     r"list\s+(?:the|my|all)|show\s+me|summar[iy]\w+|explain\b|read\s+the|help\s+me\b|"
+     r"sort\s+(?:the|out)|back\s?up)\b",
+     TaskClass.GENERAL_WORK, "general-work/file/assistant terms"),
     # In-product capability surfaces (parts library / McMaster / measure / RE / drawing)
     # — classify so the Routing card is honest even when scaffold falls back to tier default.
     (r"\b(mcmaster|parts?\s+library|standard\s+parts?|catalog\s+part|vendor\s+(cad|part)|grabcad|off-?the-?shelf|download\s+(a\s+)?model|import\s+(a\s+)?model)\b",
@@ -190,6 +204,7 @@ _ALT_PAD_ORDER: tuple[TaskClass, ...] = (
     TaskClass.MODIFICATION,
     TaskClass.ANALYSIS,
     TaskClass.PROJECT_ADMIN,
+    TaskClass.GENERAL_WORK,
     TaskClass.UNKNOWN,
 )
 
@@ -203,6 +218,7 @@ _ALT_PAD_REASON: dict[TaskClass, str] = {
     TaskClass.MODIFICATION: "no modification cues",
     TaskClass.ANALYSIS: "no simulation/analysis cues",
     TaskClass.PROJECT_ADMIN: "no file-org/PLM-admin cues",
+    TaskClass.GENERAL_WORK: "no general-work/file cues",
     TaskClass.UNKNOWN: "would leave request unclassified",
 }
 
@@ -361,14 +377,27 @@ def _normalize_tier(tier: str) -> str:
 # Execution structure — which classes skip the build swarm
 # ---------------------------------------------------------------------------
 
-# Every TaskClass not listed here routes to the normal 8-phase BUILD swarm
+# Geometry-BUILD task classes run the deterministic 8-phase build swarm
 # (intake -> planner -> modeler -> reviewer -> fixer, compiled as an
-# ``aicad.dag/1`` graph by services.dag.mission_template). A task class listed
-# here is NOT a geometry build at all — routing it into the swarm hands the
-# model geometry-only role tools and it fabricates a dummy part instead of
-# doing the (file/PLM/etc.) work the user actually asked for. ``role`` is the
-# services/agent/roles/<role>.yaml card to run as a single linear tool-calling
-# turn (services.agent.agent_turn — no dag/swarm compilation).
+# ``aicad.dag/1`` graph by services.dag.mission_template). EVERYTHING ELSE is
+# GENERAL WORK: file/PLM/research/basic-assistant asks that must NOT be forced
+# into a multi-step modeling plan. They run as ONE free linear agent_turn against
+# a role card (services.agent.agent_turn — no dag/swarm compilation) that starts
+# with the file/shell/plm floor and can pull modeling/sketch/sim/... tool packs
+# on demand via enable_tools. Inverted default (2026-07): general work is the
+# landing zone; only positive geometry-build cues opt into the swarm.
+_GEOMETRY_BUILD_CLASSES: frozenset[TaskClass] = frozenset({
+    TaskClass.SIMPLE_PART,
+    TaskClass.MULTI_FEATURE_PART,
+    TaskClass.ASSEMBLY,
+    TaskClass.ENCLOSURE,
+    TaskClass.CAM_PROGRAM,
+    TaskClass.MODIFICATION,
+    TaskClass.ANALYSIS,
+})
+
+# Explicit per-class linear routing (role card to run). Classes not here and not
+# in _GEOMETRY_BUILD_CLASSES fall to the general_agent default lane.
 _CLASS_STRUCTURE: dict[TaskClass, tuple[str, str | None]] = {
     TaskClass.PROJECT_ADMIN: ("linear", "project_organizer"),
 }
@@ -377,11 +406,20 @@ _CLASS_STRUCTURE: dict[TaskClass, tuple[str, str | None]] = {
 def structure_for_class(task_class: TaskClass) -> tuple[str, str | None]:
     """Return ``(structure, role)`` execution routing for *task_class*.
 
-    ``structure`` is ``"dag"`` (the default build swarm, ``role`` is ``None`` —
-    the mission's own role assignment applies) or ``"linear"`` (a single
-    agent_turn() tool-calling turn against the named *role* card).
+    ``structure`` is ``"dag"`` (the deterministic build swarm; ``role`` is
+    ``None`` — the mission's own role assignment applies) or ``"linear"`` (a
+    single agent_turn() tool-calling turn against the named *role* card).
+
+    Inverted default: a geometry-build class runs the swarm; every other class
+    (GENERAL_WORK, UNKNOWN, capability labels, …) runs the linear
+    ``general_agent`` lane so basic work never gets a multi-step modeling plan.
     """
-    return _CLASS_STRUCTURE.get(task_class, ("dag", None))
+    explicit = _CLASS_STRUCTURE.get(task_class)
+    if explicit is not None:
+        return explicit
+    if task_class in _GEOMETRY_BUILD_CLASSES:
+        return ("dag", None)
+    return ("linear", "general_agent")
 
 
 # ---------------------------------------------------------------------------

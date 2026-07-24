@@ -65,6 +65,16 @@ CapabilityKind capability_kind(const std::string& request);
 // control) rather than by build-a-part cues. Deterministic, no LLM.
 bool is_admin_request(const std::string& request);
 
+// True when the request is NOT a clear geometry build — i.e. general work the
+// agent should run as ONE free linear turn (file/disk/PLM/research/basic-assistant
+// tasks) instead of forcing it through the multi-step modeling pipeline. Inverted
+// default (2026-07): general work is the landing zone; a request opts INTO the
+// pipeline only with positive build cues ("model/design/make a …", part nouns) or
+// a geometry-producing capability (parts-library fetch, CAM, drawing, …). Any
+// file/PLM/organize cue keeps it general even when it name-drops a part.
+// Deterministic, no LLM.
+bool is_general_work_request(const std::string& request);
+
 // The SCOPED tool/capability classes for a domain — coarse capability tags a host
 // maps to a concrete tool allowlist (keeps a modeling agent from loading CAM/ECAD
 // tools). Always includes the domain's own class plus universally-safe read tags.

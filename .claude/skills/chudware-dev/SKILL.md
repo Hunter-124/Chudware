@@ -130,10 +130,20 @@ judgment).
   every DAG node/subagent). Wired in `copilot_mode_tools.py` + `roles.py` +
   `mission_dispatch.py` + C++ `copilot_modes.cpp`; parity tests both sides. Rare CAD
   families stay behind `enable_tools`/`list_tool_categories` — don't bloat the floors.
-- **Project-admin route:** file-org/PLM asks classify `TaskClass.PROJECT_ADMIN`
-  (`workflow_router.py`, ahead of the assembly rule) → linear `project_organizer` role
-  turn; the C++ live path (`run.cpp` admin pre-flight) EXECUTES via the
-  `agent_admin_turn` worker RPC instead of refusing (offline ⇒ old blocked reply).
+- **Routing / execution structure (inverted default 2026-07):** general work is
+  the landing zone, NOT modeling. `workflow_router.structure_for_class` sends only
+  the geometry-BUILD classes (`_GEOMETRY_BUILD_CLASSES`: simple/multi-feature part,
+  assembly, enclosure, modification, CAM, analysis) to the `("dag", None)` build
+  swarm; `PROJECT_ADMIN` → linear `project_organizer`; EVERYTHING else
+  (`GENERAL_WORK`, `UNKNOWN`, capability labels) → linear `general_agent`. The
+  `general_agent` role card (`roles/general_agent.yaml`) starts with the
+  fs/shell/plm floor + `enable_tools`/`list_tool_categories`, so it sees the tool
+  CATEGORY packs (workspaces) and pulls modeling/sketch/sim/… on demand instead of
+  being flooded — one free linear turn, never a multi-step plan for basic work.
+  C++ live path: `domain.is_general_work_request` (general unless positive build
+  cues or a geometry capability with no file/PLM cue) gates `run.cpp`'s pre-flight,
+  which EXECUTES via the `agent_admin_turn` worker RPC running `general_agent`
+  (pass `role` to override, e.g. project_organizer). Offline ⇒ blocked reply.
 - **Sidecar shutdown:** OMP bun bridge + python worker bridge spawn with
   setpgid+PDEATHSIG+close_range; hostd's clean-shutdown tail calls
   `WorkerBridge::shutdownIfCreated()` and the `chudware_agent_sidecars_shutdown` C-ABI

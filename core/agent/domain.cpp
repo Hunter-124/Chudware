@@ -358,6 +358,22 @@ bool is_admin_request(const std::string& request) {
     return admin_n >= 3 && admin_n > build_cue_count(r);
 }
 
+bool is_general_work_request(const std::string& request) {
+    const std::string r = lower(request);
+    // Explicit build verbs/part nouns ("model a …", "bracket", "shaft", …) are a
+    // clear geometry request — run the modeling pipeline.
+    if (build_cue_count(r) > 0) return false;
+    // Any file/disk/PLM/organize cue keeps it general even when it name-drops a
+    // part ("organize the parts library", "clean up the bracket exports").
+    if (admin_cue_count(r) > 0) return true;
+    // No build cue and no admin cue: a geometry-PRODUCING capability (parts-library
+    // fetch, CAM, drawing, …) still opts into the pipeline; a non-geometry
+    // capability (measure/PLM/BOM) or nothing at all is general work.
+    if (capability_kind(request) == CapabilityKind::Geometry) return false;
+    // Default lane: general work runs as one free linear turn.
+    return true;
+}
+
 std::vector<std::string> tool_classes_for_domain(Domain d) {
     // Every agent gets the safe read/inspect + doc-query core; the domain adds its
     // own mutating class(es). "sourcing" is added where standard parts are relevant.

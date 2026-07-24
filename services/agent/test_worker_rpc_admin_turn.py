@@ -8,9 +8,11 @@ administration request):
   * offline mode (``config.get_provider`` raising ``OfflineModeError``) surfaces
     as a clean ``ok: False`` envelope — never an exception — so the C++ caller's
     "any failure -> fall back to the blocked response" contract holds.
-  * a reachable provider runs ONE ``project_organizer`` turn via
+  * a reachable provider runs ONE linear role turn via
     ``mission_dispatch.run_linear_role_turn`` and streams events through the
-    ``_emit`` callback (worker_main.py's per-request event sink).
+    ``_emit`` callback (worker_main.py's per-request event sink). The default
+    role is ``general_agent`` (the inverted-default general lane); an explicit
+    ``role`` param runs a specialized card (e.g. project_organizer).
 
 Scripted provider only (T-mega24-style), no model/network/port.
 Run: pytest services/agent/test_worker_rpc_admin_turn.py -q
@@ -77,12 +79,13 @@ class _OneToolProvider:
         return self._replies.pop(0) if self._replies else "done, nothing else to do."
 
 
-def test_agent_admin_turn_runs_project_organizer_turn_and_streams_events(monkeypatch):
+def test_agent_admin_turn_runs_general_agent_by_default_and_streams_events(monkeypatch):
     """A tool-calling turn (not just a bare no-code finish) exercises the SAME
     ``agent.tool_call`` event emission a real fs_edit/fs_list/run_shell step
     would — proving events flow through ``_emit`` for the C++ caller to relay,
     without needing the full MCP tool registry wired up in a unit test (the
-    scripted tool need not actually resolve)."""
+    scripted tool need not actually resolve). No role param -> the default
+    general_agent lane."""
     provider = _OneToolProvider([
         '```json\n{"tool": "fs_list", "args": {"path": "."}}\n```',
         "Listed the project root; nothing needs reorganizing.",
@@ -91,17 +94,41 @@ def test_agent_admin_turn_runs_project_organizer_turn_and_streams_events(monkeyp
 
     events: list[dict] = []
     out = worker_rpc._agent_admin_turn(
-        {"request": "clean up the folders and track it in PLM", "run_id": "r_admin_1"},
+        {"request": "list my documents and tidy the folder", "run_id": "r_gen_1"},
         events.append,
     )
     assert out["ok"] is True
     turn = out["turn"]
-    assert turn["role"] == "project_organizer"
+    assert turn["role"] == "general_agent"
     assert "fs_edit" in turn["allowed_tools"] and "fs_list" in turn["allowed_tools"]
     assert provider.calls == 2
     # The scripted fs_list call streamed as an agent.tool_call event through _emit
-    # (worker_main.py tags/relays these; run.cpp's admin branch relays them onward).
+    # (worker_main.py tags/relays these; run.cpp's pre-flight branch relays onward).
     assert events, "expected at least one streamed event for the tool call"
     assert all("kind" in e for e in events)
     assert any(e["kind"] == "agent.tool_call" and e.get("tool_name") == "fs_list"
                for e in events)
+
+
+def test_agent_admin_turn_honors_explicit_role(monkeypatch):
+    """An explicit ``role`` param runs that specialized linear card instead of the
+    general_agent default (back-compat for the project_organizer admin path)."""
+    provider = _OneToolProvider([
+        '```json\n{"tool": "fs_list", "args": {"path": "."}}\n```',
+        "Organized the project files.",
+    ])
+    captured = {"role": None}
+
+    def _capture_provider(*_a, **k):
+        captured["role"] = k.get("role")
+        return provider
+
+    monkeypatch.setattr(agent_config, "get_provider", _capture_provider)
+    out = worker_rpc._agent_admin_turn(
+        {"request": "clean up the folders and track it in PLM",
+         "role": "project_organizer"},
+        lambda data: None,
+    )
+    assert out["ok"] is True
+    assert captured["role"] == "project_organizer"
+    assert out["turn"]["role"] == "project_organizer"

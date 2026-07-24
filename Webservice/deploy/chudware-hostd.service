@@ -20,12 +20,15 @@ Environment=CHUDWARE_HOSTD_LINGER_SECS=86400
 Environment=CHUDWARE_PROMPTS_DIR=@PROMPTS@
 # Python worker bridge (hostd/worker_bridge.cpp): engine-unknown methods
 # (plm_*, git_*, ai_roles_*, provider accounts — the whole PLM + Settings
-# surface) are forwarded to a lazily-spawned `python -m engine.worker`
-# subprocess. CHUDWARE_PYTHON = runtime venv interpreter; CHUDWARE_REPO = repo
-# root used as the worker CWD so `import services`/`engine_oracle` resolve.
-# These defaults match worker_bridge.cpp's built-in fallbacks; stamped
-# explicitly so the unit is self-documenting and overridable.
-Environment=CHUDWARE_PYTHON=%h/.local/share/Chudware/runtime/venv/bin/python
+# surface) are forwarded to a lazily-spawned `python -m services.worker_main`
+# subprocess. CHUDWARE_PYTHON, if set, is used verbatim with NO fallback —
+# worker_bridge.cpp's built-in logic (try the Chudware runtime venv, else
+# fall back to a system python3) only runs when this var is UNSET. Do not
+# stamp it here "for documentation": that pins every host to a runtime venv
+# that install_webd.sh never provisions, hard-failing subscription/provider
+# RPCs with "Python runtime not found" the moment someone actually reads
+# this comment and takes it literally. Leave unset; CHUDWARE_REPO still
+# needs stamping so `import services` resolves without a source-tree CWD.
 Environment=CHUDWARE_REPO=%h/Repositories/CAD
 # always — shared webd must come back after clean exits too (binary replace
 # during install_webd without --restart, unexpected idle-exit, etc.). systemctl

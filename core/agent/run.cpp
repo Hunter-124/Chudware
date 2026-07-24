@@ -928,27 +928,31 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     RunEvents events(run_id, emit);
 
-    // ---- PRE-FLIGHT: route project/file/PLM admin work to a real turn, not the ----
-    // ---- geometry pipeline (or refuse it, if nothing can execute it) ----
-    // Deterministic, LLM-independent detection. A request dominated by project/file/PLM
-    // administration cues ("clean up the folders, move the unrelated .step files out,
-    // deprecate the old parts, track it in PLM") has no geometry in it. Historically it
-    // fell through to the default Modeling domain and the planner turned each admin step
-    // into an extruded plate. Caught here — before the FILE-FIRST doc save — so no
-    // document, no feature and no file is created by the modeling pipeline for it.
-    // Offline / worker-unreachable degrades to a blocked refusal (see below); otherwise
-    // it now actually runs (project_organizer role turn via the python worker) instead of
-    // just telling the user to do it manually. Sub-runs are exempt: their request text is
-    // a parent-authored task, already vetted.
-    if (!is_sub_run && is_general_work_request(request)) {
+    // ---- PRE-FLIGHT: general agent is the ENTRY; the model decides to escalate ----
+    // No deterministic keyword classifier decides the execution structure anymore.
+    // Every top-level ONLINE run is handed to ONE free general_agent turn (fs/shell/
+    // plm floor + on-demand modeling/sketch/sim/... packs via enable_tools, plus
+    // delegate / mission_start to reach the build swarm). The agent itself decides
+    // whether the request is basic work it finishes inline or a geometry build it
+    // escalates — instead of a regex forcing everything through the modeling pipeline
+    // (which turned each admin step into an extruded plate). is_general_work_request
+    // survives only as an ADVISORY label for the Routing card, never a gate.
+    //
+    // OFFLINE is the one exception: the python worker turn needs a provider, so an
+    // offline top-level run keeps the old deterministic split — general work is
+    // blocked (nothing can run it), and an offline-safe local modeling run falls
+    // through to the C++ pipeline below. Sub-runs are exempt everywhere: their
+    // request text is a parent-authored task (a delegated build step), already vetted.
+    if (!is_sub_run && (!offline || is_general_work_request(request))) {
+        const bool looks_general = is_general_work_request(request);
         std::string why = capability_request_reason(request);
-        if (why.empty()) why = "general work (no geometry-build cues)";
+        if (why.empty())
+            why = looks_general ? "general work (agent will finish it or escalate)"
+                                : "possible build (agent will decide whether to escalate)";
         const std::string human =
-            "That's general/project work, not a geometry build — so I didn't run "
-            "the modeling pipeline on it. I tried to hand it to the general-work "
-            "agent but couldn't reach it (offline or the worker is unavailable), "
-            "so nothing was changed. Try again once a provider is configured, or "
-            "use the PLM tab / file explorer directly.";
+            "I handed this to the general agent, but couldn't reach it (offline or the "
+            "worker is unavailable), so nothing was changed. Try again once a provider "
+            "is configured, or use the PLM tab / file explorer directly.";
         events.emit("task_route", json{{"domain", "general"},
                                        {"reason", why},
                                        {"tool_classes", json::array()},

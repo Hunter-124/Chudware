@@ -130,20 +130,24 @@ judgment).
   every DAG node/subagent). Wired in `copilot_mode_tools.py` + `roles.py` +
   `mission_dispatch.py` + C++ `copilot_modes.cpp`; parity tests both sides. Rare CAD
   families stay behind `enable_tools`/`list_tool_categories` — don't bloat the floors.
-- **Routing / execution structure (inverted default 2026-07):** general work is
-  the landing zone, NOT modeling. `workflow_router.structure_for_class` sends only
-  the geometry-BUILD classes (`_GEOMETRY_BUILD_CLASSES`: simple/multi-feature part,
-  assembly, enclosure, modification, CAM, analysis) to the `("dag", None)` build
-  swarm; `PROJECT_ADMIN` → linear `project_organizer`; EVERYTHING else
-  (`GENERAL_WORK`, `UNKNOWN`, capability labels) → linear `general_agent`. The
-  `general_agent` role card (`roles/general_agent.yaml`) starts with the
-  fs/shell/plm floor + `enable_tools`/`list_tool_categories`, so it sees the tool
-  CATEGORY packs (workspaces) and pulls modeling/sketch/sim/… on demand instead of
-  being flooded — one free linear turn, never a multi-step plan for basic work.
-  C++ live path: `domain.is_general_work_request` (general unless positive build
-  cues or a geometry capability with no file/PLM cue) gates `run.cpp`'s pre-flight,
-  which EXECUTES via the `agent_admin_turn` worker RPC running `general_agent`
-  (pass `role` to override, e.g. project_organizer). Offline ⇒ blocked reply.
+- **Routing / execution structure (model-driven 2026-07):** there is NO
+  deterministic keyword/regex classifier deciding execution structure. The
+  `general_agent` role (`roles/general_agent.yaml`) is the UNIVERSAL entry: every
+  request runs ONE free linear turn, and the MODEL decides whether to finish
+  inline, `delegate` a scoped build, or `mission_start` the full build swarm. It
+  starts with the fs/shell/plm floor + `enable_tools`/`list_tool_categories` +
+  `delegate`/`mission_start`, so it sees the tool CATEGORY packs (workspaces) and
+  pulls modeling/sketch/sim/… on demand (verified: `enable_tools(['modeling'])`
+  unlocks `new_part` mid-turn) — never a multi-step plan forced onto basic work.
+  Python path: `mission_dispatch.route_request` always runs `general_agent`;
+  `workflow_router.route`/`classify_task`/`structure_for_class` survive ONLY as
+  advisory Routing-card telemetry (`agent.classification`), never a gate. C++ live
+  path (the single in-app agent entry per `loop.py`): `run.cpp`'s pre-flight hands
+  every ONLINE top-level run to the `general_agent` turn via the `agent_admin_turn`
+  worker RPC (pass `role` to override, e.g. project_organizer). OFFLINE is the lone
+  exception — it keeps the deterministic split (`domain.is_general_work_request`):
+  general work blocked (no provider), offline-safe local modeling falls through to
+  the C++ pipeline. Explicit mission mode (`run_mission`) still runs the swarm.
 - **Sidecar shutdown:** OMP bun bridge + python worker bridge spawn with
   setpgid+PDEATHSIG+close_range; hostd's clean-shutdown tail calls
   `WorkerBridge::shutdownIfCreated()` and the `chudware_agent_sidecars_shutdown` C-ABI

@@ -9,15 +9,12 @@ tool_allowlist:
   - tool: enable_tools
   - tool: list_tool_categories
   - tool: delegate
+  - tool: mission_start
   - tool: workspace_status
   - tool: describe_project
   - tool: list_parts
   - tool: research_web_search
-  - tool: plm_open
-  - tool: plm_status
-  - tool: plm_item_add
-  - tool: plm_checkpoint
-  - tool: plm_save
+  - family: plm
 context_recipe:
   ledger_tokens: 400
   describers: []
@@ -69,6 +66,22 @@ system_prompt: |
   So if the user genuinely wants geometry ("...and add a 5mm fillet"), pull the
   modeling pack and do it — you have access to everything, just not all at once.
   Only enable what the current step needs.
+
+  BUILDING GEOMETRY — YOU DECIDE WHEN TO ESCALATE
+  You are the entry point for EVERY request, including ones that turn out to need
+  CAD geometry. Nothing is pre-routed into a modeling pipeline — that call is
+  yours. Match the effort to the job:
+  - A quick single feature / simple part ("add a 5mm fillet", "a 100×50×5 plate"):
+    enable_tools(["modeling", "sketch"]) and build it inline, right here.
+  - A self-contained part or sub-build you can hand off cleanly: delegate it to a
+    specialist build role (feature_modeler for a part, assembly_fit_engineer for
+    an assembly) with a precise task.
+  - A full multi-part deliverable / true assembly that warrants the deterministic
+    build swarm: mission_start(request=...) to plan the mission DAG, then follow
+    its hint to execute. Reserve this for genuinely large builds — do not wrap a
+    one-feature edit in a mission.
+  When in doubt, prefer the lightest path that finishes the job; escalate only
+  when the work genuinely needs it.
 
   THE LOOP
   1. ORIENT. Inventory before acting: fs_list/fs_glob the paths involved,

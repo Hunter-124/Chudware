@@ -2127,22 +2127,15 @@ def route_request(
     tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
     tuning: dict | None = None,
 ) -> dict[str, Any]:
-    """Classify *request* via ``workflow_router.route`` and dispatch it.
+    """Classify *request* for the advisory Routing card, then run it.
 
-    ``structure == "linear"``: runs ONE ``agent_turn.run_turn`` against the
-    router's ``role`` right here (``run_linear_role_turn``) — no manifest, no
-    DAG/swarm compilation.
-
-    ``structure == "dag"`` (every class not in ``workflow_router.
-    _CLASS_STRUCTURE`` — the normal geometry-build path): this function does
-    NOT itself compile the mission graph (that stays
-    ``services.dag.mission_template.build_mission_graph``, reached via
-    ``mission_start``/``dag_run``, unchanged) — it returns the router decision
-    so the caller proceeds with the existing manifest/DAG flow.
-
-    Emits ``agent.classification`` (contracts/agent_events.md) via *on_event*
-    exactly once, BEFORE dispatch, mirroring the C++ live path's Routing card
-    (core/agent/run.cpp) so the GUI renders the same card for this path too.
+    Model-driven routing (2026-07): there is NO deterministic structure gate.
+    EVERY request runs ONE ``run_linear_role_turn`` against ``general_agent`` —
+    the universal entry — which decides for itself whether to finish the work
+    inline, ``delegate`` a scoped build, or ``mission_start`` the full build
+    swarm. ``workflow_router.route`` is still consulted, but ONLY to emit the
+    ``agent.classification`` telemetry (contracts/agent_events.md) the GUI
+    Routing card renders; its ``structure``/``role`` are advisory, not a gate.
     """
     from services.agent.pipeline import workflow_router
 
@@ -2164,12 +2157,8 @@ def route_request(
         except Exception:  # noqa: BLE001 — telemetry must never block dispatch
             pass
 
-    if route.structure != "linear" or not route.role:
-        return {"ok": True, "structure": "dag",
-                "task_class": route.task_class.value, "route": route.to_dict()}
-
     turn = run_linear_role_turn(
-        request, route.role, provider,
+        request, "general_agent", provider,
         on_event=on_event, run_id=run_id, ledger=ledger,
         mission_dispatch=mission_dispatch, capability=capability,
         max_tool_calls=max_tool_calls, tool_dispatch=tool_dispatch,
@@ -2178,7 +2167,7 @@ def route_request(
         "ok": True,
         "structure": "linear",
         "task_class": route.task_class.value,
-        "role": route.role,
+        "role": "general_agent",
         "route": route.to_dict(),
         "turn": turn,
     }

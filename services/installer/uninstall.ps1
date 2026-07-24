@@ -1,4 +1,4 @@
-# Chudware uninstaller. Unregisters the MCP server and removes app + runtime.
+﻿# Chudware uninstaller. Unregisters the MCP server and removes app + runtime.
 #
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-InstallDir <dir>] [-KeepRuntime]
 param(

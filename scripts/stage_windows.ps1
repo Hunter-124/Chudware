@@ -1,4 +1,4 @@
-# Stage Windows engine + host into dist\Chudware
+﻿# Stage Windows engine + host into dist\Chudware
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\stage_windows.ps1
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")

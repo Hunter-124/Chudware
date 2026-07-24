@@ -1,4 +1,4 @@
-# Chudware installer. Lays down the payload, provisions the runtime into %APPDATA%\Chudware,
+﻿# Chudware installer. Lays down the payload, provisions the runtime into %APPDATA%\Chudware,
 # and registers the MCP server with Claude. Run from the unpacked release folder.
 #
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-InstallDir <dir>] [-NoRegister]

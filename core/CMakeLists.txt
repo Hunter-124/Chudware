@@ -144,6 +144,7 @@ add_library(chudware_prof STATIC
   prof/tree.cpp)
 target_include_directories(chudware_prof PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_prof PUBLIC nlohmann_json::nlohmann_json)
+find_package(Threads REQUIRED)
 if(WIN32)
   target_link_libraries(chudware_prof PUBLIC dbghelp)
 else()
@@ -151,7 +152,6 @@ else()
   # the sampler/drain run on a std::thread and the handler uses pthread_sigmask, so the POSIX
   # threads lib is required too. PUBLIC so both land on every consumer's final link line
   # (libchudware.so + test_prof).
-  find_package(Threads REQUIRED)
   target_link_libraries(chudware_prof PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 set_property(TARGET chudware_prof PROPERTY
@@ -370,6 +370,10 @@ add_library(chudware_firmware STATIC
   firmware/firmware_rpc.cpp)
 target_include_directories(chudware_firmware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_firmware PUBLIC nlohmann_json::nlohmann_json chudware_ecad)
+if(MSVC)
+  # MSVC only defines M_PI et al. in <cmath> when _USE_MATH_DEFINES is set (firmware/scenario.cpp).
+  target_compile_definitions(chudware_firmware PUBLIC _USE_MATH_DEFINES)
+endif()
 
 add_executable(test_firmware tests/test_firmware.cpp)
 target_include_directories(test_firmware PRIVATE ${doctest_SOURCE_DIR})
@@ -933,6 +937,10 @@ add_library(chudware_piping STATIC
   piping/solve.cpp)
 target_include_directories(chudware_piping PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_piping PUBLIC nlohmann_json::nlohmann_json)
+if(MSVC)
+  # MSVC only defines M_PI et al. in <cmath> when _USE_MATH_DEFINES is set.
+  target_compile_definitions(chudware_piping PUBLIC _USE_MATH_DEFINES)
+endif()
 
 add_library(chudware_hydraulic STATIC
   hydraulic/bom.cpp
@@ -942,6 +950,9 @@ add_library(chudware_hydraulic STATIC
   hydraulic/solve.cpp)
 target_include_directories(chudware_hydraulic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_hydraulic PUBLIC chudware_piping nlohmann_json::nlohmann_json)
+if(MSVC)
+  target_compile_definitions(chudware_hydraulic PUBLIC _USE_MATH_DEFINES)
+endif()
 
 add_executable(test_piping tests/test_piping.cpp)
 target_include_directories(test_piping PRIVATE ${doctest_SOURCE_DIR})

@@ -184,9 +184,9 @@ TEST_CASE("eval_interference: members filter shrinks the pairwise set") {
           doctest::Approx(4000.0).epsilon(1e-2));
 
     // Far body alone with one overlap partner is not needed; filtering to C alone is empty.
-    json far = doc_eval_interference(b.id, json{{"members", json::array({n2})}});
-    CHECK(far["parts"].size() == 1);
-    CHECK(far["interferences"].empty());
+    json c_only = doc_eval_interference(b.id, json{{"members", json::array({n2})}});
+    CHECK(c_only["parts"].size() == 1);
+    CHECK(c_only["interferences"].empty());
 }
 
 // (2) box + boss + engulfing cut -> doc_eval_feature_overlap must report a boss_swallowed

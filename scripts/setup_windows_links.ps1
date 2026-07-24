@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Make the repo's compat symlinks work on Windows by replacing them with directory junctions.
 

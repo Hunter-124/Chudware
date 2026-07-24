@@ -1,4 +1,4 @@
-# One-shot Windows full build: OCCT core + host GUI + stage + lite MCP.
+﻿# One-shot Windows full build: OCCT core + host GUI + stage + lite MCP.
 # Requires VS 2022/2026 C++ tools (vcvars64) + Ninja on PATH (or WinGet Links).
 #
 # Usage:

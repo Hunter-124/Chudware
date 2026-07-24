@@ -16,6 +16,23 @@
 using namespace chudware::sourcing;
 using nlohmann::json;
 
+// Portable env helpers (MSVC has no POSIX setenv/unsetenv; matches the
+// _putenv_s convention used across the other core/tests/*.cpp files).
+static void test_setenv(const char* k, const char* v) {
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+static void test_unsetenv(const char* k) {
+#ifdef _WIN32
+    _putenv_s(k, "");
+#else
+    unsetenv(k);
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Fixture assembly tree + board (shared by the rollup / pricing suites).
 // ---------------------------------------------------------------------------
@@ -331,8 +348,8 @@ struct FakeHttp {
 };
 
 TEST_CASE("nexar provider maps a GraphQL supply hit into a priced VendorPart") {
-    setenv("NEXAR_CLIENT_ID", "cid", 1);
-    setenv("NEXAR_CLIENT_SECRET", "cs", 1);
+    test_setenv("NEXAR_CLIENT_ID", "cid");
+    test_setenv("NEXAR_CLIENT_SECRET", "cs");
     auto fake = std::make_shared<FakeHttp>();
     fake->responses.push_back({200, R"({"access_token":"tok123"})", ""});
     fake->responses.push_back({200, R"({"data":{"supSearchMpn":{"results":[{"part":{"mpn":"NE555P","manufacturer":{"name":"Texas Instruments"},"bestDatasheet":{"url":"http://x/ds.pdf"},"sellers":[{"company":{"name":"Digi-Key"},"offers":[{"inventoryLevel":1500,"moq":1,"factoryLeadDays":7,"prices":[{"price":0.55,"quantity":1,"currency":"USD"},{"price":0.42,"quantity":100,"currency":"USD"}]},{"inventoryLevel":0,"prices":[{"price":0.60,"quantity":1}]}]}]}}]}}})", ""});
@@ -359,12 +376,12 @@ TEST_CASE("nexar provider maps a GraphQL supply hit into a priced VendorPart") {
     REQUIRE(fake->urls.size() == 2);
     CHECK(fake->urls[0] == "https://identity.nexar.com/connect/token");
     CHECK(fake->urls[1] == "https://api.nexar.com/graphql");
-    unsetenv("NEXAR_CLIENT_ID");
-    unsetenv("NEXAR_CLIENT_SECRET");
+    test_unsetenv("NEXAR_CLIENT_ID");
+    test_unsetenv("NEXAR_CLIENT_SECRET");
 }
 
 TEST_CASE("mouser provider parses $-prices and stock strings") {
-    setenv("MOUSER_API_KEY", "mk", 1);
+    test_setenv("MOUSER_API_KEY", "mk");
     auto fake = std::make_shared<FakeHttp>();
     fake->responses.push_back({200, R"({"SearchResults":{"Parts":[{
         "Manufacturer":"TI","ManufacturerPartNumber":"LM358","Description":"Op Amp",
@@ -387,12 +404,12 @@ TEST_CASE("mouser provider parses $-prices and stock strings") {
     CHECK(rec["lead_time_days"] == 7);
     REQUIRE(fake->urls.size() == 1);
     CHECK(fake->urls[0].find("apiKey=mk") != std::string::npos);
-    unsetenv("MOUSER_API_KEY");
+    test_unsetenv("MOUSER_API_KEY");
 }
 
 TEST_CASE("digikey provider maps v4 keyword search into a VendorPart") {
-    setenv("DIGIKEY_CLIENT_ID", "did", 1);
-    setenv("DIGIKEY_CLIENT_SECRET", "ds", 1);
+    test_setenv("DIGIKEY_CLIENT_ID", "did");
+    test_setenv("DIGIKEY_CLIENT_SECRET", "ds");
     auto fake = std::make_shared<FakeHttp>();
     fake->responses.push_back({200, R"({"access_token":"dtok"})", ""});
     fake->responses.push_back({200, R"({"Products":[{
@@ -415,8 +432,8 @@ TEST_CASE("digikey provider maps v4 keyword search into a VendorPart") {
     CHECK(rec["stock"] == 5000);
     CHECK(rec["moq"] == 1);
     CHECK(rec["lead_time_days"] == 56);  // 8 weeks * 7
-    unsetenv("DIGIKEY_CLIENT_ID");
-    unsetenv("DIGIKEY_CLIENT_SECRET");
+    test_unsetenv("DIGIKEY_CLIENT_ID");
+    test_unsetenv("DIGIKEY_CLIENT_SECRET");
 }
 
 TEST_CASE("pricing chain fails closed with no credentials (§0)") {
@@ -424,7 +441,7 @@ TEST_CASE("pricing chain fails closed with no credentials (§0)") {
     // empty scratch config: every provider declines -> null (unknown).
     for (const char* v : {"NEXAR_CLIENT_ID", "NEXAR_CLIENT_SECRET", "DIGIKEY_CLIENT_ID",
                           "DIGIKEY_CLIENT_SECRET", "MOUSER_API_KEY"})
-        unsetenv(v);
+        test_unsetenv(v);
     CHECK(fetch_price("NE555P", Seams{}).is_null());
     // Even with a transport, keyless providers decline before any network call.
     auto fake = std::make_shared<FakeHttp>();
@@ -478,7 +495,7 @@ TEST_CASE("request_quote: keyless degrades (§0), never a network call") {
 }
 
 TEST_CASE("request_quote: xometry hit normalizes into a §4 QuoteResult") {
-    setenv("XOMETRY_API_KEY", "xk", 1);
+    test_setenv("XOMETRY_API_KEY", "xk");
     auto fake = std::make_shared<FakeHttp>();
     fake->responses.push_back({200, R"({"unit_price":12.5,"quote_id":"q1","lead_time_days":5})", ""});
     Seams s;
@@ -496,7 +513,7 @@ TEST_CASE("request_quote: xometry hit normalizes into a §4 QuoteResult") {
     CHECK(r["quote_id"] == "q1");
     REQUIRE(fake->urls.size() == 1);
     CHECK(fake->urls[0] == "https://api.xometry.com/v1/quote");
-    unsetenv("XOMETRY_API_KEY");
+    test_unsetenv("XOMETRY_API_KEY");
 }
 
 // ---------------------------------------------------------------------------
@@ -574,13 +591,13 @@ int main(int argc, char** argv) {
     std::error_code ec;
     std::filesystem::remove_all(scratch, ec);
     std::filesystem::create_directories(scratch, ec);
-    setenv("XDG_DATA_HOME", scratch.c_str(), 1);
+    test_setenv("XDG_DATA_HOME", scratch.c_str());
     // Guard against a developer's live keys leaking into the fail-closed tests.
     for (const char* v :
          {"NEXAR_CLIENT_ID", "NEXAR_CLIENT_SECRET", "DIGIKEY_CLIENT_ID",
           "DIGIKEY_CLIENT_SECRET", "MOUSER_API_KEY", "XOMETRY_API_KEY", "JLCPCB_APP_ID",
           "JLCPCB_ACCESS_KEY", "JLCPCB_SECRET_KEY", "COMMODITIES_API_KEY"})
-        unsetenv(v);
+        test_unsetenv(v);
     doctest::Context ctx(argc, argv);
     return ctx.run();
 }

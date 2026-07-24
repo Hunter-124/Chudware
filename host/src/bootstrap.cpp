@@ -2,8 +2,8 @@
 
 #ifdef _WIN32
 
-#include <bcrypt.h>
 #include <windows.h>
+#include <bcrypt.h>
 
 #include <array>
 #include <cstdio>

@@ -1,4 +1,4 @@
-# Download + extract the CEF minimal binary distribution for Windows x64
+﻿# Download + extract the CEF minimal binary distribution for Windows x64
 # (Chromium 149 — matches services/browser/stealth.py cookie interop).
 #
 # Usage (from repo root):

@@ -18,8 +18,11 @@ module is the *Python* seam used by ``project_memory.py`` / ``compaction.py``
 """
 from __future__ import annotations
 
+import atexit
+import ctypes
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -100,6 +103,27 @@ def _resolve_repo_root() -> str:
     return f"{home}/Repositories/CAD" if home else "."
 
 
+def _preexec_die_with_parent() -> None:
+    """POSIX-only ``preexec_fn``: runs in the forked bridge child, after
+    fork() but before exec(). Detaches into its own process group and asks
+    the kernel to SIGKILL the child if this process (its parent) dies without
+    reaping it — belt-and-suspenders against orphaned bridge processes when
+    the parent is killed outright (e.g. SIGKILL, crash) rather than exiting
+    cleanly. ``PR_SET_PDEATHSIG`` is Linux-only; anything else (missing
+    prctl, non-Linux libc) is swallowed so the child still spawns.
+    """
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    except (OSError, AttributeError):
+        pass
+
+
 def _resolve_bridge_script() -> str:
     return _env_or("CHUDWARE_OMP_BRIDGE", str(_bridge_marker(_resolve_repo_root())))
 
@@ -157,6 +181,7 @@ class OmpBridgeClient:
                 stderr=None,  # bridge.ts logs [omp-bridge] lines to stderr; leave inherited
                 text=True,
                 bufsize=1,
+                preexec_fn=_preexec_die_with_parent if os.name == "posix" else None,
             )
         except OSError as exc:
             raise BridgeUnavailable(
@@ -266,14 +291,23 @@ class OmpBridgeClient:
 
 _singleton_lock = threading.Lock()
 _singleton: OmpBridgeClient | None = None
+_atexit_registered = False
 
 
 def get_client() -> OmpBridgeClient:
-    """Process-wide singleton :class:`OmpBridgeClient`."""
-    global _singleton
+    """Process-wide singleton :class:`OmpBridgeClient`.
+
+    Registers :func:`shutdown` with :mod:`atexit` exactly once, the first
+    time the singleton is created, so a Python-hosted bridge child is reaped
+    on interpreter exit even if no caller explicitly calls :func:`shutdown`.
+    """
+    global _singleton, _atexit_registered
     with _singleton_lock:
         if _singleton is None:
             _singleton = OmpBridgeClient()
+            if not _atexit_registered:
+                atexit.register(shutdown)
+                _atexit_registered = True
         return _singleton
 
 

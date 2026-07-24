@@ -131,6 +131,9 @@ if (auto bid = reinterpret_cast<const char* (*)(void)>(dlsym(h, "chudware_build_
 // Optional streaming export (older engines predate it): resolved best-effort, no-op if absent.
 set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
     dlsym(h, "chudware_set_event_sink"));
+// Optional sidecar-shutdown export (older engines predate it): resolved best-effort, no-op if
+// absent — hostd's clean-shutdown tail tolerates missing sidecars support entirely.
+shutdown_sidecars_ = reinterpret_cast<void (*)(void)>(dlsym(h, "chudware_agent_sidecars_shutdown"));
 loaded_ = true;
 // One-shot startup diagnostic: which lib actually serves in-proc agent runs.
 std::fprintf(stderr,
@@ -230,6 +233,9 @@ return true;
     // Optional streaming export (older engines predate it): resolved best-effort.
     set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
         GetProcAddress(h, "chudware_set_event_sink"));
+    // Optional sidecar-shutdown export (older engines predate it): resolved best-effort.
+    shutdown_sidecars_ = reinterpret_cast<void (*)(void)>(
+        GetProcAddress(h, "chudware_agent_sidecars_shutdown"));
     loaded_ = true;
     return true;
 #endif
@@ -272,6 +278,12 @@ void CppCore::setEventSink(void (*cb)(const char* event_json, void* ud), void* u
 bool CppCore::hasEventSink() {
     std::string e;
     return ensureLoaded(e) && set_event_sink_ != nullptr;
+}
+
+void CppCore::shutdownSidecars() {
+    // Deliberately does NOT call ensureLoaded() — never lazily loads the engine just to shut
+    // sidecars down. Callers (hostd's clean-shutdown tail) already gate on available().
+    if (loaded_ && shutdown_sidecars_) shutdown_sidecars_();
 }
 
 CppCore& cpp_core() {

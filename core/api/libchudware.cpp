@@ -577,6 +577,17 @@ CHUDWARE_API const char* chudware_build_id(void) { return CHUDWARE_HOSTD_BUILD_I
 
 CHUDWARE_API void chudware_free(char* s) { std::free(s); }
 
+// See core/api/libchudware.h — hostd's clean-shutdown tail (core/hostd/main.cpp) has no other
+// way to reach the OmpBridgeClient singleton, which lives entirely inside this DLL.
+// shutdownIfCreated() is itself idempotent and never spawns a bridge just to stop it.
+CHUDWARE_API void chudware_agent_sidecars_shutdown(void) {
+    try {
+        chudware::agent::OmpBridgeClient::shutdownIfCreated();
+    } catch (...) {
+        // Never throw across the C ABI boundary.
+    }
+}
+
 // Live event streaming: bridge the flat C callback to the core's thread-local run-event sink
 // (agent::set_stream_event_sink). Called on the host/daemon dispatch thread right before an
 // agent_* chudware_call so run events surface AS THEY HAPPEN; cleared (cb=NULL) right after.

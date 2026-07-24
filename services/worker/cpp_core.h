@@ -53,6 +53,14 @@ public:
     // Callers use this to decide whether live events will fire (else fall back to batched).
     bool hasEventSink();
 
+    // Best-effort, idempotent shutdown of sidecar processes owned by the loaded engine
+    // (currently the OmpBridgeClient bun bridge; core/agent/omp_bridge_client.h). No-op when
+    // the engine was never loaded or predates the chudware_agent_sidecars_shutdown export
+    // (resolved best-effort, like chudware_build_id/chudware_set_event_sink above). Callers
+    // (hostd's clean-shutdown tail) should still gate on available() first — this never
+    // lazily loads the engine just to shut sidecars down.
+    void shutdownSidecars();
+
 private:
     std::mutex mtx_;
     bool tried_ = false;
@@ -65,6 +73,7 @@ private:
     void (*free_)(char*) = nullptr;
     const char* (*abi_fn_)(void) = nullptr;
     void (*set_event_sink_)(void (*)(const char*, void*), void*) = nullptr;  // optional export
+    void (*shutdown_sidecars_)(void) = nullptr;  // optional export
 };
 
 // Process-wide singleton. The diagnostic seam is dev-only and gated behind an env

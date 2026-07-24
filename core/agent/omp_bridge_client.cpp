@@ -11,14 +11,21 @@
 namespace chudware {
 namespace agent {
 
+std::atomic<bool> OmpBridgeClient::created_{false};
+
 OmpBridgeClient& OmpBridgeClient::instance() {
     static OmpBridgeClient inst;
+    created_.store(true, std::memory_order_relaxed);
     return inst;
 }
 
 OmpBridgeClient::~OmpBridgeClient() = default;
 
 void OmpBridgeClient::stop() {}
+
+void OmpBridgeClient::shutdownIfCreated() {
+    if (created_.load(std::memory_order_relaxed)) instance().stop();
+}
 
 bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& /*params*/,
                            nlohmann::json& /*result*/, std::string& err, int /*timeoutMs*/) {
@@ -39,6 +46,7 @@ bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& 
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -145,9 +153,16 @@ void ensureBridgeDeps(const std::string& vendorOmpDir, const std::string& bunExe
 
 }  // namespace
 
+std::atomic<bool> OmpBridgeClient::created_{false};
+
 OmpBridgeClient& OmpBridgeClient::instance() {
     static OmpBridgeClient inst;
+    created_.store(true, std::memory_order_relaxed);
     return inst;
+}
+
+void OmpBridgeClient::shutdownIfCreated() {
+    if (created_.load(std::memory_order_relaxed)) instance().stop();
 }
 
 OmpBridgeClient::~OmpBridgeClient() { stop(); }
@@ -243,6 +258,7 @@ bool OmpBridgeClient::spawn(std::string& err) {
         return false;
     }
 
+    const pid_t parentPid = ::getpid();
     pid_t pid = fork();
     if (pid < 0) {
         err = std::string("fork failed: ") + std::strerror(errno);
@@ -253,19 +269,31 @@ bool OmpBridgeClient::spawn(std::string& err) {
         return false;
     }
     if (pid == 0) {
-        // Child: stdin <- inPipe[0], stdout -> outPipe[1]; stderr stays connected (bridge.ts
-        // logs its own [omp-bridge] lines there — never mixed into the response stream).
+        // Child: async-signal-safe orphan-proofing first (mirrors child_supervisor.cpp:310-315
+        // in spirit).
+        ::setpgid(0, 0);
+        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+        // Race guard: if hostd died between fork and prctl, PDEATHSIG never fires — re-check
+        // the parent is still us.
+        if (::getppid() != parentPid) _exit(1);
+        // stdin <- inPipe[0], stdout -> outPipe[1]; stderr stays connected (bridge.ts logs its
+        // own [omp-bridge] lines there — never mixed into the response stream).
         dup2(inPipe[0], STDIN_FILENO);
         dup2(outPipe[1], STDOUT_FILENO);
         ::close(inPipe[0]);
         ::close(inPipe[1]);
         ::close(outPipe[0]);
         ::close(outPipe[1]);
+        // Close every other inherited fd (hostd's listen/client sockets etc.) so they never
+        // leak into the bun child.
+        ::close_range(3, ~0U, 0);
         execlp(bunExe_.c_str(), bunExe_.c_str(), "run", bridgeScript_.c_str(), (char*)nullptr);
         _exit(127);
     }
 
-    // Parent keeps our ends, closes the child's.
+    // Parent mirrors the child's setpgid (whoever runs first wins; both same), then keeps our
+    // ends and closes the child's.
+    ::setpgid(pid, pid);
     ::close(inPipe[0]);
     ::close(outPipe[1]);
     fcntl(outPipe[0], F_SETFL, O_NONBLOCK);

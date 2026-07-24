@@ -10,14 +10,21 @@
 
 namespace hostd {
 
+std::atomic<bool> WorkerBridge::created_{false};
+
 WorkerBridge& WorkerBridge::instance() {
     static WorkerBridge inst;
+    created_.store(true, std::memory_order_relaxed);
     return inst;
 }
 
 WorkerBridge::~WorkerBridge() = default;
 
 void WorkerBridge::stop() {}
+
+void WorkerBridge::shutdownIfCreated() {
+    if (created_.load(std::memory_order_relaxed)) instance().stop();
+}
 
 bool WorkerBridge::call(const std::string& /*method*/, const nlohmann::json& /*params*/,
                         nlohmann::json& /*result*/, std::string& err, int /*timeoutMs*/) {
@@ -37,6 +44,7 @@ bool WorkerBridge::call(const std::string& /*method*/, const nlohmann::json& /*p
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -63,9 +71,16 @@ bool fileExists(const std::string& p) {
 
 }  // namespace
 
+std::atomic<bool> WorkerBridge::created_{false};
+
 WorkerBridge& WorkerBridge::instance() {
     static WorkerBridge inst;
+    created_.store(true, std::memory_order_relaxed);
     return inst;
+}
+
+void WorkerBridge::shutdownIfCreated() {
+    if (created_.load(std::memory_order_relaxed)) instance().stop();
 }
 
 WorkerBridge::~WorkerBridge() { stop(); }
@@ -179,6 +194,7 @@ bool WorkerBridge::spawn(std::string& err) {
         return false;
     }
 
+    const pid_t parentPid = ::getpid();
     pid_t pid = fork();
     if (pid < 0) {
         err = std::string("fork failed: ") + std::strerror(errno);
@@ -189,13 +205,23 @@ bool WorkerBridge::spawn(std::string& err) {
         return false;
     }
     if (pid == 0) {
-        // Child: stdin <- inPipe[0], stdout -> outPipe[1]; stderr stays (hostd log/console).
+        // Child: async-signal-safe orphan-proofing first (mirrors child_supervisor.cpp:310-315
+        // in spirit).
+        ::setpgid(0, 0);
+        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+        // Race guard: if hostd died between fork and prctl, PDEATHSIG never fires — re-check
+        // the parent is still us.
+        if (::getppid() != parentPid) _exit(1);
+        // stdin <- inPipe[0], stdout -> outPipe[1]; stderr stays (hostd log/console).
         dup2(inPipe[0], STDIN_FILENO);
         dup2(outPipe[1], STDOUT_FILENO);
         ::close(inPipe[0]);
         ::close(inPipe[1]);
         ::close(outPipe[0]);
         ::close(outPipe[1]);
+        // Close every other inherited fd (hostd's listen/client sockets etc.) so they never
+        // leak into the python worker child.
+        ::close_range(3, ~0U, 0);
         if (!repo_.empty() && chdir(repo_.c_str()) != 0) {
             // Fall through; exec from current cwd. Worker import may still fail clearly.
         }
@@ -204,7 +230,9 @@ bool WorkerBridge::spawn(std::string& err) {
         _exit(127);
     }
 
-    // Parent keeps our ends, closes the child's.
+    // Parent mirrors the child's setpgid (whoever runs first wins; both same), then keeps our
+    // ends and closes the child's.
+    ::setpgid(pid, pid);
     ::close(inPipe[0]);
     ::close(outPipe[1]);
     fcntl(outPipe[0], F_SETFL, O_NONBLOCK);

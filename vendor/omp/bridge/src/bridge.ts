@@ -287,6 +287,25 @@ async function dispatch(method: string, params: Json): Promise<Json> {
 
 async function main(): Promise<void> {
 	log(`[omp-bridge] ready (bun ${globalThis.Bun?.version ?? "?"})`);
+
+	// Exit immediately on the standard termination signals — the consumer (CAD
+	// C++ core / Python service) may send SIGTERM to reap us; don't linger.
+	process.on("SIGTERM", () => process.exit(0));
+	process.on("SIGINT", () => process.exit(0));
+
+	// Parent-death watchdog: if our parent dies without signaling us (e.g. it's
+	// killed with SIGKILL, or crashes), we get reparented to init (ppid becomes
+	// 1 on Linux). Poll for that every 5s and exit rather than leak an orphaned
+	// bridge process. unref() so this timer never keeps the event loop alive on
+	// its own — stdin EOF (below) is still the primary exit path.
+	const watchdog = setInterval(() => {
+		if (process.ppid === 1) {
+			log("[omp-bridge] parent process gone (reparented to init); exiting");
+			process.exit(0);
+		}
+	}, 5000);
+	watchdog.unref();
+
 	const rl = createInterface({ input: process.stdin });
 	for await (const line of rl) {
 		const trimmed = line.trim();

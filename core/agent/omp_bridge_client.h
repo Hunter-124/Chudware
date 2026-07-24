@@ -18,6 +18,7 @@
 // bridge does not yet have a CreateProcess-based child transport.
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <string>
 
@@ -47,6 +48,11 @@ public:
 
     // Best-effort shutdown of the child (idempotent). Called from ~OmpBridgeClient.
     void stop();
+
+    // Stops the singleton's child WITHOUT constructing it if instance() was never called —
+    // safe to call unconditionally from hostd's clean-shutdown tail after server.run()
+    // returns (does NOT lazily spin up a bridge process just to shut it down).
+    static void shutdownIfCreated();
 
 private:
     OmpBridgeClient() = default;
@@ -83,6 +89,10 @@ private:
 #endif
 
     std::mutex mtx_;
+
+    // Set true the first time instance() runs; lets shutdownIfCreated() avoid constructing
+    // the function-local static singleton just to no-op stop() on it.
+    static std::atomic<bool> created_;
 };
 
 }  // namespace agent

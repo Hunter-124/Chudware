@@ -340,6 +340,7 @@ if(EMSCRIPTEN)
     "SHELL:-sASSERTIONS=1"
     "SHELL:-sSTACK_OVERFLOW_CHECK=1"
     "SHELL:-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
+    "SHELL:-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
     "SHELL:--shell-file=${CMAKE_CURRENT_SOURCE_DIR}/wasm/shell.html"
     "SHELL:--js-library=${CMAKE_CURRENT_SOURCE_DIR}/wasm/chudware_web_dialogs.js"
     "SHELL:--preload-file=${_WASM_ASSETS}/fonts@/assets/fonts"

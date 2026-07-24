@@ -124,6 +124,20 @@ judgment).
 - **agent_turn edits:** standing mega-24 offline planning-node repro gate
   (`FINAL_OFFLINE_OK` / `services/agent/test_mega24_fixes.py`) plus mega regression suites
   before any live mission spend.
+- **Tool floors (2026-07-23):** `contracts/copilot_modes.json` `agent_default_tools`
+  (fs_write/fs_edit/fs_list/run_shell/research_fetch_page — main-agent floor, survives
+  role-card narrowing in agent/swarm) and `subagent_default_tools` (full fs family for
+  every DAG node/subagent). Wired in `copilot_mode_tools.py` + `roles.py` +
+  `mission_dispatch.py` + C++ `copilot_modes.cpp`; parity tests both sides. Rare CAD
+  families stay behind `enable_tools`/`list_tool_categories` — don't bloat the floors.
+- **Project-admin route:** file-org/PLM asks classify `TaskClass.PROJECT_ADMIN`
+  (`workflow_router.py`, ahead of the assembly rule) → linear `project_organizer` role
+  turn; the C++ live path (`run.cpp` admin pre-flight) EXECUTES via the
+  `agent_admin_turn` worker RPC instead of refusing (offline ⇒ old blocked reply).
+- **Sidecar shutdown:** OMP bun bridge + python worker bridge spawn with
+  setpgid+PDEATHSIG+close_range; hostd's clean-shutdown tail calls
+  `WorkerBridge::shutdownIfCreated()` and the `chudware_agent_sidecars_shutdown` C-ABI
+  (dlsym, missing-symbol tolerant). Keep new sidecars on this pattern.
 
 ## Commit / push template
 

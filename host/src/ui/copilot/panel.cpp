@@ -36,6 +36,11 @@ static bool s_cpCollapsed = false;
 // Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");
 // defined below with the picker helpers, hosted by the header Settings button.
 
+// Clip a label to a pixel width with a real ellipsis, UTF-8 safe (defined with the Artifacts
+// presentation helpers below; declared here because the Sessions rows above need it too —
+// draw-list text is not clipped by its card, so every user-supplied string gets measured).
+static std::string artiEllipsize(const std::string& s, float maxW);
+
 // Aggregate task/plan progress (done/total) from the active conversation's most recent
 // assistant turn. DETERMINISTIC: statuses come from engine stage/mission events, not the
 // model claiming completion (no cheating). Excludes subagent/objective rows.
@@ -74,7 +79,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float padX = 6.0f * sc;
         const float tw = ImGui::CalcTextSize(label).x;
         const float contentW = (icon.valid ? iconSz + iconGap : 0.0f) + tw;
-        return contentW + padX * 2.0f;
+        // Common minimum width so row 1's tasks chip and row 2's Chat/Sessions/Settings line up
+        // as COLUMNS instead of five ragged pills sized only by their label length.
+        return std::max(contentW + padX * 2.0f, ui::metrics::px(58.0f));
     };
     const float chatW = measureBtn("Chat", "ai_panel");
     const float sessW = measureBtn("Sessions", "history");
@@ -123,7 +130,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const ImVec2 b1(c0.x + chevSz, c0.y + chevSz);
         // Shared collapse-chip recipe (must match FM ##lp_collapse):
         // rest wash 0.32 / hover 0.50, textPrimary glyph, 1.85px stroke.
-        ui::glassRowBackground(wdl, c0, b1, 7.0f, false, cHover,
+        // glassRowBackground takes LOGICAL dp (it scales internally) — un-scale the shared chip
+        // token so the chevron chip carries the same corner as every other copilot-menu pill.
+        ui::glassRowBackground(wdl, c0, b1, ui::metrics::cpMenuChipRound() / sc, false, cHover,
                                cHover ? 0.50f : 0.32f);
         const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(chatSurf().textPrimary);
         const ImVec2 cc(c0.x + chevSz * 0.5f, c0.y + chevSz * 0.5f);
@@ -274,6 +283,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
                                        : "AI settings — provider, model, privacy.");
 
     ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), rowTop + rowH));
+    // Breathing room between row 2 and the Separator drawAIPanel emits right after — the two were
+    // flush, which read as the buttons sitting ON the rule. ItemSpacing.y is 0 here, so this is exact.
+    ImGui::Dummy(ImVec2(0, ui::metrics::px(4.0f)));
 }
 
 // The "running" pill drawn just after a session row's title. Shared by the current-doc
@@ -289,7 +301,7 @@ static void drawSessionRunningBadge(ImDrawList* dl, const ui::AdaptiveSurface& s
     ImVec4 acc = semanticOnGlass(ui::palette.accent, surf);
     acc.w = 0.22f;
     dl->AddRectFilled(ImVec2(x, by0), ImVec2(bx1, by1),
-                      ImGui::ColorConvertFloat4ToU32(acc), 4.0f * sc);
+                      ImGui::ColorConvertFloat4ToU32(acc), ui::metrics::cpMenuChipRound());
     ImVec4 accInk = semanticOnGlass(ui::palette.accent, surf);
     accInk.w = 1.0f;
     dl->AddText(ImVec2(x + 4.0f * sc, by0 + 1.0f * sc),
@@ -304,37 +316,53 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
     ensureConversations(st);
 
-    // New-session button spans the full tab width. Return to chat via the header Chat button
-    // (Sessions stays labeled "Sessions" — no "< Chat" rename that reflows the header).
+    // One title treatment for every copilot menu (ui_common cpMenu*). Sessions used to bury its
+    // subtitle in a paragraph BELOW the new-session button, which is a big part of why the four
+    // header views read as four unrelated screens.
+    ui::cpMenuHeader(st.fonts, "Sessions",
+                     "Running sessions keep working in the background.");
+
+    // New-session is the one PRIMARY action in the copilot menus, so it uses the accent
+    // primaryButton rather than the theme's default slab (which rendered as a flat dark block
+    // that read as a disabled panel over the light glass). Return to chat via the header Chat
+    // button (Sessions stays labeled "Sessions" — no "< Chat" rename that reflows the header).
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button("+ New session", ImVec2(-1, 0))) {
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+    if (primaryButton("+ New session", ImVec2(-1, 0))) {
         newConversation(st);
         st.prompt[0] = 0;
         st.showAISettingsOverlay = false;
         st.showSessionsPicker = false;  // land in the new chat, not stuck on the list
     }
+    ImGui::PopStyleVar();
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextWrapped("Running sessions keep working in the background.");
-    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
 
     static bool s_showArchived = false;
+    // Checkbox ink must come from the glass surface like every other label in this menu: the
+    // theme's default text tone is tuned for opaque panels and vanished against the bright
+    // viewport backdrop showing through the copilot column.
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     ImGui::Checkbox("Show archived", &s_showArchived);
+    ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(s_showArchived
             ? "Showing archived sessions only. Uncheck to return to your active list."
             : "Archived sessions are hidden from this list \xe2\x80\x94 check to review or "
               "restore them. Archiving keeps the full transcript (unlike Delete).");
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
 
     const ImGuiStyle& style = ImGui::GetStyle();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float padX = 10.0f * sc;
-    const float padY = 8.0f * sc;
-    const float rowGap = 4.0f * sc;
+    // Row shape/rhythm from the shared copilot-menu tokens, so session rows, artifact cards and
+    // task rows carry ONE corner, ONE inner padding and ONE gap.
+    const float padX     = ui::metrics::cpMenuRowPadX();
+    const float padY     = ui::metrics::cpMenuRowPadY();
+    const float rowGap   = ui::metrics::cpMenuRowGap();
+    const float rowRnd   = ui::metrics::cpMenuRowRound();   // already DPI-scaled: direct draw calls
+    const float rowRndDp = rowRnd / sc;                     // glassRowBackground scales internally
     const float fh = ImGui::GetFontSize();
     const float titleH = fh;
     const float subH  = fh * 0.92f;
@@ -387,7 +415,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         }
 
         float wash = active ? 0.55f : (rowHov ? 0.44f : 0.34f);
-        ui::glassRowBackground(dl, rowMin, rowMax, 8.0f * sc, (i % 2) == 1, active, wash);
+        ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, (i % 2) == 1, active, wash);
 
         // Scope color-code: once the model has assessed the session (first routing event),
         // tint the row with a 3px left-edge bar + subtle wash + a tiny class chip on the
@@ -400,12 +428,12 @@ void drawSessionsPanel(AppState& st, bool busy) {
             ImVec4 barCol = scopeCol;
             barCol.w = 0.95f;
             dl->AddRectFilled(rowMin, ImVec2(rowMin.x + barW, rowMax.y),
-                              ImGui::ColorConvertFloat4ToU32(barCol), 8.0f * sc,
+                              ImGui::ColorConvertFloat4ToU32(barCol), rowRnd,
                               ImDrawFlags_RoundCornersLeft);
             ImVec4 washCol = scopeCol;
             washCol.w = active ? 0.10f : 0.07f;
             dl->AddRectFilled(rowMin, rowMax, ImGui::ColorConvertFloat4ToU32(washCol),
-                              8.0f * sc);
+                              rowRnd);
 
             const char* scopeLbl = c.scopeClass == 0 ? "trivial" : c.scopeClass == 1 ? "standard"
                                  : c.scopeClass == 2 ? "complex" : "epic";
@@ -418,23 +446,33 @@ void drawSessionsPanel(AppState& st, bool busy) {
             ImVec4 chipBg = scopeCol;
             chipBg.w = 0.16f;
             dl->AddRectFilled(ImVec2(cx0, cy0), ImVec2(cx1, cy1),
-                              ImGui::ColorConvertFloat4ToU32(chipBg), 4.0f * sc);
+                              ImGui::ColorConvertFloat4ToU32(chipBg),
+                              ui::metrics::cpMenuChipRound());
             ImVec4 chipInk = scopeCol;
             chipInk.w = 1.0f;
             dl->AddText(ImVec2(cx0 + 4.0f * sc, cy0 + 1.0f * sc),
                         ImGui::ColorConvertFloat4ToU32(chipInk), scopeLbl);
         }
 
+        // Titles and snippets are user text of arbitrary length and are painted straight onto
+        // the draw list, which does NOT clip to the row — a long snippet used to run out past
+        // the card, under the scrollbar and off the column edge. Clip both to the room they
+        // actually have (title also yields the action-button zone) with a real ellipsis.
         const float titleY = rowMin.y + padY;
+        const float textMaxW = std::max(ui::metrics::px(24.0f), rowW - padX * 2.0f - actionsW);
+        const std::string titleShown = artiEllipsize(title, textMaxW);
         ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
-        dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, title.c_str());
+        dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, titleShown.c_str());
         if (running)
             drawSessionRunningBadge(dl, surf,
-                                    rowMin.x + padX + ImGui::CalcTextSize(title.c_str()).x + 8.0f * sc,
+                                    rowMin.x + padX +
+                                        ImGui::CalcTextSize(titleShown.c_str()).x + 8.0f * sc,
                                     titleY, titleH, sc);
 
         dl->AddText(ImVec2(rowMin.x + padX, titleY + titleH + 2.0f * sc),
-                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub);
+                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
+                    artiEllipsize(sub, std::max(ui::metrics::px(24.0f),
+                                                rowW - padX * 2.0f)).c_str());
 
         bool doDel = false;
         bool doArchiveToggle = false;
@@ -468,12 +506,9 @@ void drawSessionsPanel(AppState& st, bool busy) {
         if (doArchiveToggle) { archiveConversation(st, i, !c.archived); break; }
     }
     if (!anyRowShown) {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextWrapped("%s", s_showArchived
-            ? "No archived sessions."
-            : "No active sessions yet. Start one above.");
-        ImGui::PopStyleColor();
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+        // Same tone and indent as every other "nothing here yet" line in the copilot menus.
+        ui::cpMenuHint(s_showArchived ? "No archived sessions."
+                                      : "No active sessions yet. Start one above.");
     }
 
     // ---- Other sessions: orphaned keys in chat_history.json (not the active doc) ----
@@ -531,19 +566,24 @@ void drawSessionsPanel(AppState& st, bool busy) {
         }
     }
     if (!others.empty()) {
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(2)));
-        // Header: "Other sessions" + inline Clear all (click-again confirm).
+        // Group chrome from the SHARED cpMenuSection (section gap + dim label + hairline) rather
+        // than a hand-rolled header, so this group is literally the same widget as the Artifacts
+        // sections.
         {
             static double s_clearOtherUntil = 0.0;
             const double now = ImGui::GetTime();
             if (s_clearOtherUntil > 0.0 && now > s_clearOtherUntil) s_clearOtherUntil = 0.0;
             const bool clearPend = s_clearOtherUntil > 0.0;
 
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Other sessions");
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
+            const float secY0 = ImGui::GetCursorPosY();
+            ui::cpMenuSection("Other sessions", (int)others.size());
+            const float secY1 = ImGui::GetCursorPosY();
+            // The click-again "Clear all" belongs ON the section's label line. cpMenuSection emits
+            // Dummy(sectionGap) and then the label, so that row starts exactly one item spacing
+            // below where we began — rewind there, draw right-aligned, then restore the section's
+            // cursor so the rows below keep its rhythm.
+            ImGui::SetCursorPosY(secY0 + ui::metrics::cpMenuSectionGap()
+                                 + ImGui::GetStyle().ItemSpacing.y);
             {
                 const char* clearLbl = clearPend ? "Confirm?" : "Clear all";
                 const float clearW = ImGui::CalcTextSize(clearLbl).x
@@ -597,8 +637,8 @@ void drawSessionsPanel(AppState& st, bool busy) {
                 ImGui::PopStyleColor(4);
                 ImGui::PopStyleVar();
             }
+            ImGui::SetCursorPosY(secY1);
         }
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
         for (int oi = 0; oi < (int)others.size(); ++oi) {
             const OtherSess& o = others[oi];
             ImGui::PushID(10000 + oi);
@@ -619,10 +659,14 @@ void drawSessionsPanel(AppState& st, bool busy) {
                 st.showAISettingsOverlay = false;
             }
             float wash = rowHov ? 0.42f : 0.22f;
-            ui::glassRowBackground(dl, rowMin, rowMax, 8.0f * sc, (oi % 2) == 1, false, wash);
+            ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, (oi % 2) == 1, false, wash);
             const float titleY = rowMin.y + padY;
+            // Same clip rule as the active-doc rows: draw-list text does not respect the card.
+            const float oTextMaxW =
+                std::max(ui::metrics::px(24.0f), rowW - padX * 2.0f - trashSz);
+            const std::string oLabelShown = artiEllipsize(o.label, oTextMaxW);
             ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
-            dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, o.label.c_str());
+            dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, oLabelShown.c_str());
             // Disk JSON can't say "running now" — cross-reference the resident conversation
             // set, which keeps background runs from other document keys alive in-process.
             bool otherRunning = false;
@@ -630,7 +674,8 @@ void drawSessionsPanel(AppState& st, bool busy) {
                 if (rc.docKey == o.key && st.convRunning(rc.id)) { otherRunning = true; break; }
             if (otherRunning)
                 drawSessionRunningBadge(dl, surf,
-                                        rowMin.x + padX + ImGui::CalcTextSize(o.label.c_str()).x + 8.0f * sc,
+                                        rowMin.x + padX +
+                                            ImGui::CalcTextSize(oLabelShown.c_str()).x + 8.0f * sc,
                                         titleY, titleH, sc);
             char sub[160];
             if (!o.snippet.empty())
@@ -640,7 +685,9 @@ void drawSessionsPanel(AppState& st, bool busy) {
             else
                 std::snprintf(sub, sizeof(sub), "%d sessions", o.nConvs);
             dl->AddText(ImVec2(rowMin.x + padX, titleY + titleH + 2.0f * sc),
-                        ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub);
+                        ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
+                        artiEllipsize(sub, std::max(ui::metrics::px(24.0f),
+                                                    rowW - padX * 2.0f)).c_str());
 
             // Per-row delete — same trash affordance as active-doc conversations.
             bool doDel = false;
@@ -679,7 +726,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
     // If we're browsing a held foreign key, offer a one-click return to the live doc.
     if (!s_chatKeyHold.empty()) {
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
         if (ImGui::Button("Back to current document", ImVec2(-1, 0))) {
             if (!st.chatDocKey.empty()) persistChatHistory(st);
             s_chatKeyHold.clear();
@@ -695,7 +742,6 @@ void drawSessionsPanel(AppState& st, bool busy) {
 // active conversation's most recent turn (statuses from engine events, not the model).
 static void drawTaskListPanel(AppState& st, bool busy) {
     (void)busy;
-    const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const PlanState* ps = nullptr;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
@@ -704,20 +750,22 @@ static void drawTaskListPanel(AppState& st, bool busy) {
         }
     int done = 0, total = 0;
     copilotTaskProgress(st, done, total);
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::TextUnformatted(ps && !ps->title.empty() ? ps->title.c_str() : "Task list");
-    ImGui::PopStyleColor();
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::Text("%d of %d complete", done, total);
-    if (ps && !ps->summary.empty()) ImGui::TextWrapped("%s", ps->summary.c_str());
-    ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 4 * sc));
+    char progress[48];
+    std::snprintf(progress, sizeof(progress), "%d of %d complete", done, total);
+    ui::cpMenuHeader(st.fonts,
+                     ps && !ps->title.empty() ? ps->title.c_str() : "Task list", progress);
+    if (ps && !ps->summary.empty()) {
+        ui::cpMenuHint(ps->summary.c_str());
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+    }
     if (!ps) {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextWrapped("No task list yet — start a build and the agent's plan appears here.");
-        ImGui::PopStyleColor();
+        ui::cpMenuHint("No task list yet \xe2\x80\x94 start a build and the agent's plan appears here.");
         return;
     }
+    // Fixed glyph column: TextWrapped after a SameLine wraps back to the LINE start, which pushed
+    // continuation lines under the [x] marker. Indent the title past a MEASURED glyph column
+    // instead, so a multi-line task title stays one aligned text block.
+    const float glyphW = ImGui::CalcTextSize("[~]").x + ui::metrics::px(6.0f);
     for (const auto& pi : ps->items) {
         if (pi.kind == "subagent") continue;
         const bool ok = (pi.status == "done" || pi.status == "pass");
@@ -727,13 +775,17 @@ static void drawTaskListPanel(AppState& st, bool busy) {
         ImVec4 gc = surf.textSecondary;
         if (ok) { gc = semanticOnGlass(ui::palette.accent, surf); gc.w = 1.0f; }
         else if (fail) { gc = semanticOnGlass(ui::palette.statusErr, surf); gc.w = 1.0f; }
+        const float rowY = ImGui::GetCursorPosY();
         ImGui::PushStyleColor(ImGuiCol_Text, gc);
         ImGui::TextUnformatted(glyph);
         ImGui::PopStyleColor();
-        ImGui::SameLine();
+        ImGui::SetCursorPosY(rowY);            // back onto the glyph's own line
+        ImGui::Indent(glyphW);
         ImGui::PushStyleColor(ImGuiCol_Text, ok ? surf.textSecondary : surf.textPrimary);
         ImGui::TextWrapped("%s", pi.title.empty() ? "(task)" : pi.title.c_str());
         ImGui::PopStyleColor();
+        ImGui::Unindent(glyphW);
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     }
 }
 
@@ -742,33 +794,21 @@ static void drawTaskListPanel(AppState& st, bool busy) {
 // size goes through ui::metrics::px so the tab scales with DPI like the rest of the app, and
 // every tone comes from the adaptive glass surface (chatSurf) — no hardcoded colors.
 
-// Group header: one consistent tone, rhythm and optional count for EVERY Artifacts section,
-// closed by a hairline rule so the group below reads as belonging to it.
+// Group header: delegates to the SHARED copilot-menu section chrome so an Artifacts group and the
+// Sessions "Other sessions" group are the same widget. This tab's call sites pass 0 to mean "no
+// count" (the Plan group), which maps onto cpMenuSection's -1 sentinel.
 static void artiSectionHeader(const ui::AdaptiveSurface& surf, const char* label, int count) {
-    ImGui::Dummy(ImVec2(0, ui::metrics::px(8.0f)));
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    if (count > 0) ImGui::Text("%s  %d", label, count);
-    else           ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-    const float rowW = ImGui::GetContentRegionAvail().x;
-    const ImVec2 p   = ImGui::GetCursorScreenPos();
-    ImVec4 rule = surf.textTertiary; rule.w *= 0.35f;
-    ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y + ui::metrics::px(2.0f)),
-                                        ImVec2(p.x + rowW, p.y + ui::metrics::px(2.0f)),
-                                        ImGui::ColorConvertFloat4ToU32(rule),
-                                        ui::metrics::stroke(1.0f));
-    ImGui::Dummy(ImVec2(0, ui::metrics::px(5.0f)));
+    (void)surf;   // tone now comes from cpMenuSection's own chatSurf() lookup
+    ui::cpMenuSection(label, count > 0 ? count : -1);
 }
 
-// Styled empty state: dimmed, indented to the section body, and INFORMATIVE (says what will
-// appear here) instead of a bare "(none)".
+// Styled empty state: the SHARED menu hint tone (cpMenuHint), indented to the section body, and
+// INFORMATIVE (says what will appear here) instead of a bare "(none)".
 static void artiEmptyState(const ui::AdaptiveSurface& surf, const char* msg) {
-    const float ind = ui::metrics::px(10.0f);
+    (void)surf;   // tone now comes from cpMenuHint
+    const float ind = ui::metrics::cpMenuRowPadX();
     ImGui::Indent(ind);
-    ImVec4 c = surf.textTertiary; c.w *= 0.85f;
-    ImGui::PushStyleColor(ImGuiCol_Text, c);
-    ImGui::TextWrapped("%s", msg);
-    ImGui::PopStyleColor();
+    ui::cpMenuHint(msg);
     ImGui::Unindent(ind);
 }
 
@@ -803,9 +843,9 @@ static void artiRow(AppState& st, const std::string& label, const std::string& t
     const float S = ui::uiScale;
     const bool hasFolder = !path.empty();
 
-    const float padX  = ui::metrics::px(8.0f);
-    const float padY  = ui::metrics::px(6.0f);
-    const float rnd   = ui::metrics::px(6.0f);
+    const float padX  = ui::metrics::cpMenuRowPadX();
+    const float padY  = ui::metrics::cpMenuRowPadY();
+    const float rnd   = ui::metrics::cpMenuRowRound();
     const float rowW  = ImGui::GetContentRegionAvail().x;
     const float nameH = ImGui::GetTextLineHeight();
     const float btnH  = ImGui::GetFrameHeight();
@@ -851,16 +891,15 @@ static void artiRow(AppState& st, const std::string& label, const std::string& t
     // Advance past the card + a small gap before the next one.
     ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + cardH));
     ImGui::Dummy(ImVec2(rowW, 0));
-    ImGui::Dummy(ImVec2(0, ui::metrics::px(4.0f)));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
 }
 
 // Session Artifacts panel — subagents, the plan, and session documents for this session.
 static void drawArtifactsPanel(AppState& st, bool busy) {
     (void)busy;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::TextUnformatted("Session Artifacts");
-    ImGui::PopStyleColor();
+    ui::cpMenuHeader(st.fonts, "Session Artifacts",
+                     "Subagents, plan and documents for this session.");
 
     // ---- Subagents (from plan_state subagent rows + agent.spawn activity) ----
     // Collected first so the section header can carry a count; the data selection is unchanged.
@@ -1131,10 +1170,16 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         }
         if (std::strcmp(cpView, "sessions") == 0) {
             st.showSessionsPicker = true;
-            st.showAISettingsOverlay = false;
+            st.showAISettingsOverlay = st.showTaskList = st.showArtifacts = false;
         } else if (std::strcmp(cpView, "settings") == 0) {
             st.showAISettingsOverlay = true;
-            st.showSessionsPicker = false;
+            st.showSessionsPicker = st.showTaskList = st.showArtifacts = false;
+        } else if (std::strcmp(cpView, "tasks") == 0) {
+            st.showTaskList = true;
+            st.showSessionsPicker = st.showAISettingsOverlay = st.showArtifacts = false;
+        } else if (std::strcmp(cpView, "artifacts") == 0) {
+            st.showArtifacts = true;
+            st.showSessionsPicker = st.showAISettingsOverlay = st.showTaskList = false;
         }
     }
 
@@ -1179,10 +1224,33 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         float chatH = ImGui::GetContentRegionAvail().y - reserve;
         if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
 
+        // ONE SCROLL REGION PER VIEW. All five views used to share the id "chatlog", so ImGui kept
+        // ONE scroll state for them: opening Sessions after scrolling the chat log landed mid-list,
+        // and the settings view (which nested a second scroll child inside this one) never engaged
+        // the pane's pill scrollbar or top fade at all. A distinct id per view gives each its own
+        // ImGui window, its own scroll state, and the SAME custom scrollbar.
+        const char* viewId = st.showAISettingsOverlay ? "cp_settings"
+                           : st.showTaskList          ? "cp_tasks"
+                           : st.showArtifacts         ? "cp_artifacts"
+                           : st.showSessionsPicker    ? "cp_sessions"
+                                                      : "cp_chat";
+        // These are string literals — the SAME object every frame — so a pointer compare IS the
+        // "view changed this frame" test, with no per-frame strcmp.
+        static const char* s_lastViewId = nullptr;
+        const bool viewChanged = (s_lastViewId != viewId);
+        s_lastViewId = viewId;
+
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-        // Slim chat-log gutters so bubbles/cards use the column width.
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(3.0f * ui::uiScale, 2.0f * ui::uiScale));
-        ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None,
+        // Chat keeps the tight gutter (bubbles/cards need the column width); the MENU views get the
+        // shared cpMenuGutter so Sessions/Tasks/Artifacts/Settings all start on one left edge.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            overlayOpen
+                                ? ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(4.0f))
+                                : ImVec2(3.0f * ui::uiScale, 2.0f * ui::uiScale));
+        // Never open a menu mid-scroll. SetNextWindowScroll (not SetScrollY) so the reset lands on
+        // THIS frame instead of flashing one frame at the previous view's offset; -1 leaves X alone.
+        if (viewChanged) ImGui::SetNextWindowScroll(ImVec2(-1.0f, 0.0f));
+        ImGui::BeginChild(viewId, ImVec2(0, chatH), ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoScrollbar);
         if (st.showAISettingsOverlay) {
             drawAISettingsBody(st, busy);
@@ -1196,7 +1264,9 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back
             chatLogStickToBottom("copilot.panel");
         }
-        const bool  logScrolled = !overlayOpen && ImGui::GetScrollY() > 0.5f;
+        // The top fade is a SCROLL AFFORDANCE, not chat decoration: every scrolled view gets it, so
+        // a scrolled menu never looks like it simply starts mid-content.
+        const bool  logScrolled = ImGui::GetScrollY() > 0.5f;
         const ImVec2 logP0 = ImGui::GetWindowPos();
         const float  logVisW = ImGui::GetWindowSize().x;
         ui::drawWindowPillScrollbarV(chatSurf());
@@ -1207,7 +1277,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             const ImVec2 keep = ImGui::GetCursorPos();
             const float fadeH = ImGui::GetTextLineHeight() + ui::metrics::px(6.0f);
             ImGui::SetCursorScreenPos(logP0);
-            ImGui::BeginChild("##chatlog_fade", ImVec2(logVisW, fadeH), ImGuiChildFlags_None,
+            ImGui::BeginChild("##cp_view_fade", ImVec2(logVisW, fadeH), ImGuiChildFlags_None,
                               ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoScrollbar |
                               ImGuiWindowFlags_NoScrollWithMouse);
             const ui::AdaptiveSurface& fsurf = chatSurf();
@@ -1220,7 +1290,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             ImGui::EndChild();
             ImGui::SetCursorPos(keep);
         }
-        ImGui::PopStyleVar();   // chatlog WindowPadding
+        ImGui::PopStyleVar();   // per-view WindowPadding
         ImGui::PopStyleColor();
 
         // Composer is hidden under the header overlays (sessions / settings / tasks / artifacts).

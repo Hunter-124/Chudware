@@ -8,65 +8,155 @@
 
 namespace ui {
 
+namespace {
+
+// ---- agent_list_models probe scheduling ----------------------------------------------------
+// FREEZE FIX — do not regress: probing a DOWN endpoint burns ~5s in a curl connect-fail INSIDE
+// the worker while it holds WorkerClient::callMtx_, so any SYNC worker call from the GL thread
+// (CAM/ECAD panels on workspace switch) parks behind it and the app looks hard-frozen. At the
+// old flat 5s cadence the worker was busy-failing ~100% of the time. Two rules keep that bounded
+// now that more than one endpoint is probed:
+//   * cooldowns are PER PROVIDER (5s after a success, 60s after a failure) — a dead local server
+//     must not suppress the cloud probe, nor an unkeyed cloud provider the local one;
+//   * at most ONE agent_list_models is in flight process-wide, so the worker never queues two
+//     connect-fails back to back. The per-provider cooldowns make the probes alternate rather
+//     than stack: whichever is off cooldown when the slot frees up goes next.
+struct ProbeTiming {
+    double last = -1e9;     // ImGui::GetTime() when this provider's probe was DISPATCHED
+    bool failed = false;    // last completed probe failed -> 60s backoff
+    bool inFlight = false;  // this provider's probe is outstanding
+};
+// GL-thread only: written from refreshModelAvailability and from the AsyncRpc completion, which
+// core::AsyncRpc runs on the GL thread inside drain().
+std::unordered_map<int, ProbeTiming> s_probeTiming;
+
+bool anyProbeInFlight() {
+    for (const auto& kv : s_probeTiming)
+        if (kv.second.inFlight) return true;
+    return false;
+}
+
+// The wire provider string agent_list_models understands for a ui::ProviderIndex. The C++
+// handler (core/api/libchudware.cpp) branches on exactly "openai" | "llamacpp" | "xai" |
+// "gemini" | "anthropic" and answers {"ok":false,"error":"unknown provider"} for anything else,
+// so the slots with no branch return nullptr and are NEVER probed: Cursor and Kimi Code are
+// subscription-proxied with no list endpoint here, and ZenMux is bridge-routed (its catalog
+// arrives via refreshBridgeModelCatalog / agent_models_list). Probing them would only paint a
+// bogus "unknown provider" into providerModels and make the provider look broken.
+const char* listModelsWireProvider(int provider) {
+    switch (provider) {
+        case ui::PROV_ANTHROPIC:   return "anthropic";
+        case ui::PROV_OPENAI:      return "openai";
+        case ui::PROV_GEMINI:      return "gemini";
+        case ui::PROV_XAI:         return "xai";
+        case ui::PROV_CLOUDCOMPAT: return "openai";    // OpenAI-compatible API + a cloud base_url
+        case ui::PROV_LOCAL:       return "openai";    // local OpenAI-compatible server
+        case ui::PROV_LLAMACPP:    return "llamacpp";  // served by the PROV_LOCAL probe below
+        default:                   return nullptr;     // PROV_CURSOR / PROV_KIMISUB / PROV_ZENMUX
+    }
+}
+
+}  // namespace
+
+// Defined below (they need the WASM-safe JSON accessors / the key buffers declared further down).
+static void parseProbeRows(int provider, const nlohmann::json& result, ProviderModels& pm);
+static char* providerKeyBuf(Settings& s, int provider);
+
 void refreshModelAvailability(AppState& st, bool force) {
-    // Discover models on the LOCAL endpoint regardless of which provider is currently active, so
-    // local models always show up in the picker WITHOUT the user first switching the Provider
-    // dropdown to "Local". Previously this early-returned whenever a cloud provider (OpenRouter /
-    // DashScope / ...) was active — st.settings.baseUrl is then a remote URL — which is exactly why
-    // local models were invisible until the user "poked around in settings" and selected Local.
-    auto isLoopback = [](const char* u) {
-        std::string s = u ? u : "";
-        return s.find("localhost") != std::string::npos ||
-               s.find("127.0.0.1") != std::string::npos ||
-               s.find("0.0.0.0") != std::string::npos || s.find("[::1]") != std::string::npos;
-    };
-    // When the active base_url IS loopback, probe it (honors a custom local port). Otherwise a cloud
-    // provider is active, so its base_url isn't the local one — fall back to the default LM Studio
-    // endpoint so local discovery still happens. (A non-default local port is only auto-found while
-    // the Local provider is the active one; the default covers the common case.)
-    bool activeLoopback = isLoopback(st.settings.baseUrl);
-    std::string localUrl = activeLoopback ? std::string(st.settings.baseUrl)
-                                          : std::string("http://localhost:1234/v1");
-    std::string localKey = activeLoopback ? std::string(st.settings.apiKey) : std::string();
-    static double lastProbe = -1e9;
-    // Failure backoff (freeze fix): when the local endpoint is DOWN, each probe burns ~5s in a
-    // curl connect-fail INSIDE the worker, holding the WorkerClient mutex. At the old flat 5s
-    // cadence the worker was busy-failing near-100% of the time, so any SYNC worker.call from
-    // the GL thread (CAM/ECAD panels on workspace switch) blocked behind it — the app appeared
-    // hard-frozen and had to be force-killed. Back off to 60s after a failed probe (force — the
-    // user clicking refresh in the picker — still bypasses); a success restores the 5s cadence.
-    static bool lastProbeFailed = false;
-    const double cooldown = lastProbeFailed ? 60.0 : 5.0;
-    double now = ImGui::GetTime();
-    if (!force && (st.modelProbeInFlight.load() || (now - lastProbe) < cooldown)) return;
-    lastProbe = now;
-    st.modelProbeInFlight.store(true);
-    nlohmann::json p = {{"provider", "openai"},
-                        {"base_url", localUrl},
-                        {"api_key", localKey}};
-    st.rpc.call("agent_list_models", p, [&st](const core::RpcResult& r) {
-        ProviderModels pm;
-        pm.checked = true;
-        if (r.ok && r.result.is_object()) {
-            pm.ok = r.result.value("ok", false);
-            pm.error = r.result.value("error", std::string());
-            if (r.result.contains("models") && r.result["models"].is_array())
-                for (const auto& m : r.result["models"])
-                    if (m.is_string()) pm.models.push_back(m.get<std::string>());
-            // LM Studio reports which models are actually loaded (vs merely downloaded); when
-            // present, the picker shows only those. Absent => every listed model is available.
-            pm.loadedKnown = r.result.value("loaded_known", false);
-            if (r.result.contains("loaded") && r.result["loaded"].is_array())
-                for (const auto& m : r.result["loaded"])
-                    if (m.is_string()) pm.loaded.push_back(m.get<std::string>());
-        } else {
-            pm.error = r.err.empty() ? "core unavailable" : r.err;
+    // One async agent_list_models round-trip. `slots` are the providerModels entries its answer
+    // fills (the local endpoint feeds PROV_LOCAL and PROV_LLAMACPP — one endpoint family).
+    // Borrowed pointers, not strings: this runs EVERY frame from three call sites, so nothing is
+    // allocated until a probe actually clears the gates below.
+    // Returns false when the probe was skipped (no C++ branch / already in flight / on cooldown).
+    auto dispatch = [&st, force](int provider, const char* baseUrl, const char* apiKey,
+                                 std::initializer_list<int> slots) -> bool {
+        const char* wire = listModelsWireProvider(provider);
+        if (!wire) return false;
+        ProbeTiming& t = s_probeTiming[provider];
+        if (t.inFlight) return false;               // never two probes for the same provider
+        if (anyProbeInFlight()) {
+            // Freeze guard: one worker probe at a time. A FORCED refresh must not be swallowed
+            // by an unrelated in-flight probe — clear the cooldown so the next frame dispatches.
+            if (force) { t.last = -1e9; t.failed = false; }
+            return false;
         }
-        lastProbeFailed = !pm.ok;   // drives the 60s down-endpoint backoff above
-        st.providerModels[ui::PROV_LOCAL] = pm;
-        st.providerModels[ui::PROV_LLAMACPP] = pm;  // same local endpoint family
-        st.modelProbeInFlight.store(false);
-    }, 12000);
+        const double now = ImGui::GetTime();
+        if (!force && (now - t.last) < (t.failed ? 60.0 : 5.0)) return false;
+        t.last = now;
+        t.inFlight = true;
+        st.modelProbeInFlight.store(true);
+        nlohmann::json p = {{"provider", wire},
+                            {"base_url", baseUrl ? baseUrl : ""},
+                            {"api_key", apiKey ? apiKey : ""}};
+        st.rpc.call("agent_list_models", std::move(p),
+                    [&st, provider, slots = std::vector<int>(slots)](const core::RpcResult& r) {
+            ProviderModels pm;
+            pm.checked = true;
+            if (r.ok && r.result.is_object()) {
+                pm.ok = r.result.value("ok", false);
+                pm.error = r.result.value("error", std::string());
+                if (r.result.contains("models") && r.result["models"].is_array())
+                    for (const auto& m : r.result["models"])
+                        if (m.is_string()) pm.models.push_back(m.get<std::string>());
+                parseProbeRows(provider, r.result, pm);   // richer model_rows metadata
+                // LM Studio reports which models are actually loaded (vs merely downloaded); when
+                // present, the picker shows only those. Absent => every listed model is available.
+                pm.loadedKnown = r.result.value("loaded_known", false);
+                if (r.result.contains("loaded") && r.result["loaded"].is_array())
+                    for (const auto& m : r.result["loaded"])
+                        if (m.is_string()) pm.loaded.push_back(m.get<std::string>());
+            } else {
+                pm.error = r.err.empty() ? "core unavailable" : r.err;
+            }
+            ProbeTiming& done = s_probeTiming[provider];
+            done.inFlight = false;
+            done.failed = !pm.ok;   // drives THIS provider's 60s backoff above
+            for (size_t i = 0; i < slots.size(); ++i) {
+                const int slot = slots[i];
+                if (slot < 0 || slot >= ui::PROV_COUNT) continue;
+                if (i + 1 == slots.size()) st.providerModels[slot] = std::move(pm);
+                else st.providerModels[slot] = pm;
+            }
+            st.modelProbeInFlight.store(anyProbeInFlight());
+        }, 12000);
+        return true;
+    };
+
+    Settings& s = st.settings;
+    // (1) The ACTIVE provider when it is a cloud one. Cloud lists are LIVE (the backend asks the
+    // provider's /v1/models, through the OMP bridge when the credential is an OAuth/subscription
+    // token), which is what makes a brand-new release appear in the picker with no code change.
+    // Send that provider's OWN credential, and its base_url only where one is meaningful: the
+    // cloud-compat slot's URL picks the service (OpenRouter / DashScope / DeepSeek / Moonshot),
+    // while Anthropic / OpenAI / Gemini / xAI each have a fixed endpoint the backend defaults to
+    // and st.settings.baseUrl may still hold a stale local URL from a previous provider. An EMPTY
+    // api_key is the NORMAL, supported case for Anthropic subscription users: their OAuth token
+    // lives in the bridge auth db and the C++ branch resolves it from there.
+    if (ui::providerIsCloud(s.provider))
+        dispatch(s.provider,
+                 s.provider == ui::PROV_CLOUDCOMPAT ? s.baseUrl : "",
+                 providerKeyBuf(s, s.provider), {s.provider});
+
+    // (2) The LOCAL endpoint, regardless of which provider is active, so local models always show
+    // up in the picker WITHOUT the user first switching the Provider dropdown to "Local".
+    // Previously this early-returned whenever a cloud provider (OpenRouter / DashScope / ...) was
+    // active — st.settings.baseUrl is then a remote URL — which is exactly why local models were
+    // invisible until the user "poked around in settings" and selected Local.
+    auto isLoopback = [](const char* u) {
+        std::string v = u ? u : "";
+        return v.find("localhost") != std::string::npos ||
+               v.find("127.0.0.1") != std::string::npos ||
+               v.find("0.0.0.0") != std::string::npos || v.find("[::1]") != std::string::npos;
+    };
+    // When the active base_url IS loopback, probe it (honors a custom local port). Otherwise a
+    // cloud provider is active, so its base_url isn't the local one — fall back to the default LM
+    // Studio endpoint so local discovery still happens. (A non-default local port is only
+    // auto-found while the Local provider is the active one; the default covers the common case.)
+    const bool activeLoopback = isLoopback(s.baseUrl);
+    dispatch(ui::PROV_LOCAL,
+             activeLoopback ? s.baseUrl : "http://localhost:1234/v1",
+             activeLoopback ? s.apiKey : "",
+             {ui::PROV_LOCAL, ui::PROV_LLAMACPP});
 }
 
 
@@ -106,11 +196,61 @@ static bool jsonOptBool(const nlohmann::json& obj, const char* key, bool dflt = 
     if (it == obj.end() || it->is_null()) return dflt;
     return it->is_boolean() ? it->get<bool>() : dflt;
 }
+static int jsonOptInt(const nlohmann::json& obj, const char* key, int dflt = 0) {
+    if (!obj.is_object()) return dflt;
+    auto it = obj.find(key);
+    if (it == obj.end() || it->is_null()) return dflt;
+    return it->is_number() ? (int)it->get<double>() : dflt;
+}
 static nlohmann::json jsonOptObj(const nlohmann::json& obj, const char* key) {
     if (!obj.is_object()) return nlohmann::json::object();
     auto it = obj.find(key);
     if (it == obj.end() || !it->is_object()) return nlohmann::json::object();
     return *it;
+}
+
+// agent_list_models `model_rows` -> ProviderModels::rows, ORDER PRESERVED: cloud list endpoints
+// answer newest-first, so keeping their order is what puts a just-released model at the TOP of
+// the picker. Rows carry the capability metadata the static catalog can only guess at (context /
+// max_output / vision / tools / reasoning_efforts / auto_source). Id-less rows are dropped, and
+// duplicates are collapsed so a merged bridge+direct list can't show one model twice.
+static void parseProbeRows(int provider, const nlohmann::json& result, ProviderModels& pm) {
+    if (!result.is_object()) return;
+    auto rows = result.find("model_rows");
+    if (rows == result.end() || !rows->is_array()) return;
+    std::set<std::string> seen;
+    pm.rows.reserve(rows->size());
+    for (const auto& row : *rows) {
+        if (!row.is_object()) continue;
+        std::string id = jsonOptStr(row, "id");
+        if (id.empty() || !seen.insert(id).second) continue;
+        std::vector<std::string> efforts;
+        auto ef = row.find("reasoning_efforts");
+        if (ef != row.end() && ef->is_array())
+            for (const auto& e : *ef)
+                if (e.is_string()) efforts.push_back(e.get<std::string>());
+        pm.rows.push_back(ui::modelInfoFromProbe(
+            provider, id, jsonOptStr(row, "label"), jsonOptInt(row, "context"),
+            jsonOptInt(row, "max_output"), jsonOptBool(row, "vision", false),
+            jsonOptBool(row, "tools", true), efforts, jsonOptStr(row, "auto_source")));
+    }
+}
+
+// The model rows the picker should show for ONE provider (copilot.h). Live probe rows win when
+// this provider's agent_list_models answered — that is the whole point of the probe: a model
+// released after this build ships still appears, in the API's newest-first order. Anything else
+// (probe never ran, unreachable, unkeyed, or answered with flat ids only) falls back to the
+// static builtinModels() catalog filtered to the provider. Local/llama.cpp are NOT routed here:
+// they keep their own flat `models` + loaded-vs-downloaded path.
+std::vector<ModelInfo> providerPickerModels(AppState& st, int provider) {
+    std::vector<ModelInfo> out;
+    if (provider >= 0 && provider < ui::PROV_COUNT && ui::providerIsCloud(provider)) {
+        const ProviderModels& pm = st.providerModels[provider];
+        if (pm.checked && pm.ok && !pm.rows.empty()) return pm.rows;
+    }
+    for (const auto& m : ui::builtinModels())
+        if (m.provider == provider) out.push_back(m);
+    return out;
 }
 
 // Shared AI settings, split by section so Settings can glass-group them.
@@ -173,6 +313,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             std::strncpy(s.model, "x-ai/grok-4.5-free", sizeof(s.model) - 1);
             s.vision = true;
         }
+        // Populate the newly selected provider's list NOW rather than at the next timer tick:
+        // force skips that provider's cooldown. Still fully async — no worker call blocks here.
+        refreshModelAvailability(st, true);
     }
 
     ImGui::Dummy(ImVec2(0, 4 * S));
@@ -208,10 +351,12 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##cloudmodel", s.model, sizeof(s.model))) changed = true;
     } else if (cloud) {
-        // Known-good model list for this provider, plus the current value if it's custom.
+        // This provider's LIVE list when its probe answered (newest first — a Claude release
+        // that postdates this build shows up at the top with no catalog edit), else the
+        // known-good static catalog. `avail` must outlive the combo: ids/labels point into it.
+        const std::vector<ui::ModelInfo> avail = ui::providerPickerModels(st, s.provider);
         std::vector<const char*> ids, labels;
-        for (const auto& m : ui::builtinModels())
-            if (m.provider == s.provider) { ids.push_back(m.id.c_str()); labels.push_back(m.label.c_str()); }
+        for (const auto& m : avail) { ids.push_back(m.id.c_str()); labels.push_back(m.label.c_str()); }
         int cur = -1;
         for (size_t i = 0; i < ids.size(); ++i)
             if (s.model[0] && std::strcmp(ids[i], s.model) == 0) cur = (int)i;
@@ -703,7 +848,7 @@ void saveMaxSubagentDepth(int depth) {
 
 void drawAISettingsBody(AppState& st, bool busy) {
     Settings& s = st.settings;
-    const float S = ui::uiScale;
+    const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     bool changed = false;
     (void)busy;
@@ -713,101 +858,156 @@ void drawAISettingsBody(AppState& st, bool busy) {
         return;
     }
 
+    // NO nested BeginChild here. The pane host owns the ONE scroll region this view renders into
+    // and paints its pill scrollbar + top fade for it; the old "##ai_ov_body" child swallowed all
+    // of the body's overflow, so the host's bar never engaged and the view simply ended mid-air
+    // with the deep links unreachable. The host also owns the horizontal gutter (cpMenuGutter
+    // window padding), so everything below is full-width (-1) with no self-indent.
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.0f), ui::metrics::U(0.85f)));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ui::metrics::U(1.5f), ui::metrics::U(0.75f)));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
-    ImGui::PushFont(st.fonts.medium);
-    ImGui::TextUnformatted("Quick settings");
-    ImGui::PopFont();
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextWrapped("Session knobs. Full providers, roles, and prompts live in Settings.");
-    ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.0f)));
+    cpMenuHeader(st.fonts, "Quick settings",
+                 "Session knobs. Full providers, roles and prompts live in Settings.");
 
-    ImGui::BeginChild("##ai_ov_body", ImVec2(0, 0), ImGuiChildFlags_None);
+    // Fields sit on adaptive GLASS, not on ImGui's opaque dark FrameBg: with the default frame the
+    // combo/slider VALUES rendered near-invisible (dark ink on a dark frame over a bright
+    // viewport). Derive the frame from the surface ink, exactly like the composer toolbar chips.
+    const ImVec4 fieldBg (surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.08f);
+    const ImVec4 fieldHov(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.14f);
+    const ImVec4 fieldAct(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.18f);
+    // A combo POPUP is an opaque themed window, not glass — its ink must contrast with popupBg,
+    // not with the viewport backdrop (the glass tone can land dark-on-dark in there).
+    const ImVec4 popBg(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]);
+    auto pushField = [&]() {
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, fieldBg);
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, fieldHov);
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, fieldAct);
+        ImGui::PushStyleColor(ImGuiCol_Button, fieldBg);        // combo caret well == frame
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, fieldHov);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, fieldAct);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+        ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, ui::metrics::cpMenuChipRound());
+    };
+    auto popField = []() { ImGui::PopStyleVar(2); ImGui::PopStyleColor(7); };
+    // The ONE vertical gap this body owns: control -> next label. No ad-hoc Dummy() stacks, so the
+    // groups here share the rhythm of the Sessions / Tasks / Artifacts menus.
+    auto ctlGap = []() { ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap())); };
+
+    cpMenuSection("Autonomy");
+    static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
+    auto prefCombo = [&](const char* label, const char* id, int* pref) {
+        const int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
+        cpMenuLabel(label);
+        ImGui::SetNextItemWidth(-1);
+        pushField();
+        // BeginCombo rather than Combo so the popup rows can carry their own ink (see popBg).
+        if (ImGui::BeginCombo(id, kPrefLabels[v])) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::maxContrastTextOn(popBg));
+            for (int i = 0; i < 4; ++i) {
+                if (ImGui::Selectable(kPrefLabels[i], i == v)) {
+                    *pref = i;
+                    if (pref == &s.planPreference) s.planMode = (i != 0);
+                    changed = true;
+                }
+            }
+            ImGui::PopStyleColor();
+            ImGui::EndCombo();
+        }
+        popField();
+        ctlGap();
+    };
+    prefCombo("Plan preference", "##q_plan_pref", &s.planPreference);
+    prefCombo("Subagent preference", "##q_sub_pref", &s.subagentPreference);
+    prefCombo("Advisor preference", "##q_adv_pref", &s.advisorPreference);
+    pushField();
+    if (ImGui::Checkbox("Proactive advisor", &s.proactiveAdvisor)) changed = true;
+    popField();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Opt-in mid-run guidance on failures. Cheap notes by default; "
+            "rare short advisor call only on severe streaks.");
+
+    cpMenuSection("Session");
+    pushField();
+    if (ImGui::Checkbox("Vision (send screenshots)", &s.vision)) changed = true;
+    if (ImGui::Checkbox("Offline mode (local only)", &s.offlineMode)) changed = true;
+    ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
+    popField();
+
+    cpMenuSection("Limits");
+    // Both limit sliders get the SAME chrome (rounding, full width, unit inside the value): the
+    // cap used to render as a left-edge grab and the nesting one as a centred filled pill purely
+    // because their ranges and formats differed. 0 passes stays the "agent decides" sentinel and
+    // spells itself out rather than showing a bare 0.
+    cpMenuLabel("Refine-pass cap");
+    ImGui::SetNextItemWidth(-1);
+    pushField();
+    int iters = s.maxIters;
+    if (ImGui::SliderInt("##q_miters", &iters, 0, 64, iters == 0 ? "automatic" : "%d passes")) {
+        s.maxIters = (iters < 0) ? 0 : iters;
+        changed = true;
+    }
+    popField();
+    ctlGap();
+
+    static int s_maxDepth = -1;
+    if (s_maxDepth < 0) s_maxDepth = loadMaxSubagentDepth();
+    cpMenuLabel("Max subagent nesting");
+    ImGui::SetNextItemWidth(-1);
+    pushField();
+    int depth = s_maxDepth;
+    if (ImGui::SliderInt("##q_depth", &depth, 0, 4, "%d levels")) {
+        if (depth < 0) depth = 0;
+        if (depth > 4) depth = 4;
+        s_maxDepth = depth;
+        saveMaxSubagentDepth(depth);
+    }
+    popField();
+
+    cpMenuSection("Memory");
+    pushField();
+    if (ImGui::Checkbox("Project memory", &s.memoryEnabled)) changed = true;
+    popField();
+    if (s.memoryEnabled) {
+        ctlGap();
+        cpMenuLabel("Memory token budget");
+        ImGui::SetNextItemWidth(-1);
+        pushField();
+        if (ImGui::SliderInt("##q_membudget", &s.memoryTokenBudget, 100, 2000, "%d tokens"))
+            changed = true;
+        popField();
+    }
+
+    cpMenuSection("Full settings");
     {
-        static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
-        auto prefCombo = [&](const char* label, const char* id, int* pref) {
-            int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
-            ImGui::TextUnformatted(label);
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::Combo(id, &v, kPrefLabels, 4)) {
-                *pref = v;
-                if (pref == &s.planPreference) s.planMode = (v != 0);
-                changed = true;
+        // One row of three equal chips instead of three stacked full-width buttons — the stack
+        // read as another form field group rather than as navigation out of the pane.
+        const float gap = ui::metrics::cpMenuRowGap();
+        const float chipW = std::max(ui::metrics::px(48.0f),
+                                     (ImGui::GetContentRegionAvail().x - 2.0f * gap) / 3.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+        ImGui::PushStyleColor(ImGuiCol_Button, fieldBg);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, fieldHov);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, fieldAct);
+        auto deepLink = [&](const char* label, int tab) {
+            if (ImGui::Button(label, ImVec2(chipW, 0.0f))) {
+                st.openSettings = true;
+                st.openSettingsTab = tab;
+                st.showAISettingsOverlay = false;
             }
         };
-        prefCombo("Plan preference", "##q_plan_pref", &s.planPreference);
-        prefCombo("Subagent preference", "##q_sub_pref", &s.subagentPreference);
-        prefCombo("Advisor preference", "##q_adv_pref", &s.advisorPreference);
-        if (ImGui::Checkbox("Proactive advisor", &s.proactiveAdvisor)) changed = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Opt-in mid-run guidance on failures. Cheap notes by default; "
-                "rare short advisor call only on severe streaks.");
-
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(1.0f)));
-        ImGui::Separator();
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
-
-        if (ImGui::Checkbox("Vision (send screenshots)", &s.vision)) changed = true;
-        if (ImGui::Checkbox("Offline mode (local only)", &s.offlineMode)) changed = true;
-        ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
-
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.75f)));
-        ImGui::TextUnformatted("Refine-pass cap");
-        ImGui::SetNextItemWidth(-1);
-        int iters = s.maxIters;
-        if (ImGui::SliderInt("##q_miters", &iters, 0, 64, iters == 0 ? "automatic" : "%d")) {
-            s.maxIters = (iters < 0) ? 0 : iters;
-            changed = true;
-        }
-
-        static int s_maxDepth = -1;
-        if (s_maxDepth < 0) s_maxDepth = loadMaxSubagentDepth();
-        ImGui::TextUnformatted("Max subagent nesting");
-        ImGui::SetNextItemWidth(-1);
-        int depth = s_maxDepth;
-        if (ImGui::SliderInt("##q_depth", &depth, 0, 4, "%d")) {
-            if (depth < 0) depth = 0;
-            if (depth > 4) depth = 4;
-            s_maxDepth = depth;
-            saveMaxSubagentDepth(depth);
-        }
-
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.75f)));
-        if (ImGui::Checkbox("Project memory", &s.memoryEnabled)) changed = true;
-        if (s.memoryEnabled) {
-            ImGui::TextUnformatted("Memory token budget");
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::SliderInt("##q_membudget", &s.memoryTokenBudget, 100, 2000, "%d"))
-                changed = true;
-        }
-
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(1.25f)));
-        ImGui::Separator();
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextUnformatted("Open full Settings");
-        ImGui::PopStyleColor();
-        if (ImGui::Button("AI##q_open_ai", ImVec2(-1, 0))) {
-            st.openSettings = true;
-            st.openSettingsTab = 2;
-            st.showAISettingsOverlay = false;
-        }
-        if (ImGui::Button("Providers##q_open_prov", ImVec2(-1, 0))) {
-            st.openSettings = true;
-            st.openSettingsTab = 3;
-            st.showAISettingsOverlay = false;
-        }
-        if (ImGui::Button("Prompts##q_open_prompts", ImVec2(-1, 0))) {
-            st.openSettings = true;
-            st.openSettingsTab = 2;  // AI (Prompts absorbed)
-            st.showAISettingsOverlay = false;
-        }
+        deepLink("AI##q_open_ai", 2);
+        ImGui::SameLine(0.0f, gap);
+        deepLink("Providers##q_open_prov", 3);
+        ImGui::SameLine(0.0f, gap);
+        deepLink("Prompts##q_open_prompts", 2);   // AI tab (Prompts absorbed)
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar();
     }
-    ImGui::EndChild();
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
+    cpMenuHint("Opens the full Settings window.");
 
     if (changed) saveSettings(s);
 
@@ -969,6 +1169,22 @@ static void pollSubConnected(AppState& st) {
 // so its models can be selected? Public (copilot.h) so Settings role pickers share it.
 bool providerUsable(AppState& st, int provider) {
     pollSubConnected(st);
+    // A SUCCESSFUL live probe is proof of a working credential — and for a subscription/OAuth
+    // user it is the ONLY proof, because their token lives in the OMP bridge auth db rather than
+    // in a local key buffer or subscription_auth. agent_list_models reports ok=true in exactly
+    // that case (see the anthropic branch in libchudware.cpp); keying availability off the local
+    // key alone is what hid Anthropic from those users. Limited to providers whose list endpoint
+    // REQUIRES auth — OpenRouter/DashScope serve /models publicly, so a cloud-compat probe would
+    // prove nothing, and local/llama.cpp already resolve through providerModels below.
+    switch (provider) {
+        case ui::PROV_ANTHROPIC:
+        case ui::PROV_OPENAI:
+        case ui::PROV_GEMINI:
+        case ui::PROV_XAI:
+            if (st.providerModels[provider].ok) return true;
+            break;
+        default: break;
+    }
     switch (provider) {
         case ui::PROV_GEMINI:
             return st.settings.geminiKey[0] != 0 || s_subConn.hostGemini;
@@ -1671,18 +1887,25 @@ void drawModelDropdown(AppState& st, bool busy) {
             }
         }
     } else {
-        // Bridge down / older core (empty catalog): fall back to the hardcoded builtin cloud list so
-        // the picker still works. Gated on provider category + usable credential + search.
-        for (const auto& m : ui::builtinModels()) {
-            if (catOff(ui::providerCatKey(m.provider))) continue;
-            if (!providerUsable(st, m.provider) ||
-                !matchq(m.label, providerShort(m.provider), m.id)) continue;
-            if (modelHidden(st, m.id)) continue;
-            ++shown;
-            if (modelRow(st, m.provider, m.id, m.label, true, uid++)) {
-                st.settings.provider = m.provider;
-                std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
-                picked = true;
+        // Bridge down / older core (empty catalog): fall back to the per-provider list so the
+        // picker still works. Walk the builtin catalog only for its provider ORDER — the first
+        // row of each provider block emits that provider's whole list via providerPickerModels,
+        // which prefers the LIVE agent_list_models rows (newest first) over the static ones.
+        // Gated on provider category + usable credential + search, as before.
+        std::set<int> emittedProv;
+        for (const auto& b : ui::builtinModels()) {
+            if (!emittedProv.insert(b.provider).second) continue;
+            if (catOff(ui::providerCatKey(b.provider))) continue;
+            if (!providerUsable(st, b.provider)) continue;
+            for (const auto& m : ui::providerPickerModels(st, b.provider)) {
+                if (!matchq(m.label, providerShort(m.provider), m.id)) continue;
+                if (modelHidden(st, m.id)) continue;
+                ++shown;
+                if (modelRow(st, m.provider, m.id, m.label, true, uid++)) {
+                    st.settings.provider = m.provider;
+                    std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
+                    picked = true;
+                }
             }
         }
     }

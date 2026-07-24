@@ -34,6 +34,8 @@
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
 #include "widgets/interwebz.h"  // Skills/Context two-column editors
 #include "ui/provider_logos.h"  // ui::drawProviderLogo/providerBrandColor (Providers list badges)
+#include "provider_usage.h"  // ui::UsageAccount/UsageWindow + THE subscription_* poller
+#include "metrics.h"  // ui::metrics::px/stroke — DPI-scaled Settings gutter + usage rings
 
 
 // ---- C22b prompt editor state ----
@@ -174,16 +176,39 @@ static void settingsGlassSectionEnd() {
 }
 
 // Sticky Settings tabs: tab bar stays put; only the body child scrolls.
+// ImGuiChildFlags_AlwaysUseWindowPadding is REQUIRED: a child created with _None ignores
+// WindowPadding entirely, so the padding pushed here used to be a no-op and every tab drew
+// flush against the modal edge — which is exactly why each section grew its own ad-hoc indent.
+// One gutter lives here now. ScrollbarSize is pinned to the app value so the reserved
+// right-hand gutter is identical on every tab; ImGui subtracts it from GetContentRegionAvail()
+// once the bar exists, so -1 / 0-width controls stop sliding underneath it.
 static void settingsTabBodyBegin(const char* id, bool scroll = true) {
-    const float sc = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 8.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::px(14.0f), ui::metrics::px(10.0f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, ui::metrics::px(12.0f));
     ImGuiWindowFlags flags = scroll ? ImGuiWindowFlags_None
                                     : (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_None, flags);
+    ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding, flags);
 }
 static void settingsTabBodyEnd() {
     ImGui::EndChild();
-    ImGui::PopStyleVar(1);  // WindowPadding
+    ImGui::PopStyleVar(2);  // ScrollbarSize, WindowPadding
+}
+
+// AI sub-tabs whose bodies own their own scrolling (Skills / Context) must zero the PARENT
+// tab-body scroll exactly once — on the frame the sub-tab becomes active. Doing it every frame
+// (the old behavior) hard-pins the parent, so the wheel over those tabs was silently eaten.
+// Only the SELECTED sub-tab's body runs, so "previously-active index" plus a frame-gap test
+// covers both switching between two reporting sub-tabs and coming back from one that doesn't
+// report (Harness/Roles/…) or from a whole different Settings tab.
+static int s_aiSubTabPrev  = -1;     // sub-tab index whose body last drew
+static int s_aiSubTabFrame = -100;   // frame it drew on
+static bool aiSubTabJustEntered(int idx) {
+    const int frame = ImGui::GetFrameCount();
+    const bool entered = (s_aiSubTabPrev != idx) || (frame - s_aiSubTabFrame) > 1;
+    s_aiSubTabPrev  = idx;
+    s_aiSubTabFrame = frame;
+    return entered;
 }
 
 
@@ -207,49 +232,25 @@ static void applyThemeNow(AppState& st, bool light) {
             ui::palette.viewportBottom[2]);
 }
 // ---- Subscription accounts (Settings → Providers → Accounts) ----------------
-// Consumes subscription_accounts / subscription_switch / subscription_login /
-// subscription_logout / subscription_usage. Polls subscription_status for
-// device-code UX fields. Usage is optional per contracts/providers.md §4.5 —
-// absent fields degrade to a dim "usage unavailable" row.
-struct SubUsageWindow {
-    std::string window;       // e.g. "5h", "7d"
-    std::string label;        // display label
-    float usedFraction = 0.f; // 0..1
-    bool hasFraction = false; // null means status-only; never render it as 0%
-    std::string resetsAt;     // iso8601
-    std::string status;       // ok|warn|blocked|unknown
-};
-struct SubAccountRow {
-    std::string provider;
-    std::string accountId;
-    std::string label;       // email / label fallback
-    std::string displayName; // optional §4.5
-    std::string plan;        // optional §4.5 plan chip
-    bool active = false;
-    bool connected = false;
-    bool hasUsage = false;   // true when usage array present (may be empty)
-    std::vector<SubUsageWindow> usage;
-};
-struct SubLoginProgress {
-    bool inProgress = false;
-    bool browserOpened = false;
-    std::string userCode;
-    std::string verifyUrl;
-    std::string stage;
-    std::string lastError;
-};
-struct SubAccountsUi {
-    std::vector<SubAccountRow> rows;
-    std::map<std::string, SubLoginProgress> login;  // by provider friendly id
-    double lastAccountsPoll = -1e9;
-    double lastUsagePoll = -1e9;
-    bool accountsPollInFlight = false;
-    bool usagePollInFlight = false;
-    bool usageRpcMissing = false;  // unknown_method → stop polling, dim degrade
-    int  lastDrawnFrame = -100;    // edge-detect section open for forced usage poll
-    std::string lastError;
-};
-static SubAccountsUi s_subAccts;
+// Drives subscription_switch / subscription_login / subscription_logout. The model, the
+// parsing and the subscription_accounts/subscription_status/subscription_usage polls live in
+// ui/provider_usage.h: the Copilot composer draws the SAME windows as rings, and a second
+// poller here would double the RPC traffic and drift out of sync. Only presentation is local.
+// Usage stays optional per contracts/providers.md §4.5 — absent fields degrade to a dim
+// "usage unavailable" row.
+
+// Which frame this section last drew — a pure UI concern (it edge-detects "section became
+// visible" to force one usage poll), so it stays here rather than in the shared poll state.
+static int s_usageLastDrawnFrame = -100;
+
+// Optimistic overlays. providerUsageAccounts() is shared read-only state, so a switch or a
+// sign-out can no longer be applied to a row in place. These hold the user's click until the
+// forced refetch lands — without them the radio snaps back / the signed-out row reappears for
+// the length of one RPC round trip, which reads as "the click did nothing".
+static std::string s_pendingActiveProv;   // provider whose selection is mid-switch
+static std::string s_pendingActiveId;     // account_id the user picked
+static std::string s_pendingSignOutKey;   // "<provider>\n<account_id>" being removed
+
 // CEF add-account disabled — device/browser Python flow (xai_sub_provider)
 // handles multi-account storage+rotation. Leave oauth_capture compiled but dormant.
 static constexpr bool kXaiUseCef = false;
@@ -257,8 +258,7 @@ static constexpr bool kXaiUseCef = false;
 static const char* kSubProviders[] = {"xai", "claude", "codex", "cursor", "kimi"};
 static const char* kSubProviderLabels[] = {
     "xAI Grok", "Claude", "ChatGPT / Codex", "Cursor", "Kimi Code"};
-// 5-minute usage poll while the Accounts section is visible (§4.5).
-static constexpr double kUsagePollIntervalSec = 5.0 * 60.0;
+// Brisk accounts refresh while this (visible) management section owns the poll.
 static constexpr double kAccountsPollIntervalSec = 1.5;
 
 static std::string optionalJsonString(const nlohmann::json& obj, const char* key) {
@@ -291,46 +291,6 @@ static const nlohmann::json* optionalJsonArr(const nlohmann::json& obj, const ch
     return &(*it);
 }
 
-
-// Parse optional usage array from an account / usage-row object.
-static void parseUsageWindows(const nlohmann::json& src, SubAccountRow& row) {
-    row.usage.clear();
-    row.hasUsage = false;
-    auto it = src.find("usage");
-    if (it == src.end() || !it->is_array()) return;
-    row.hasUsage = true;
-    for (const auto& u : *it) {
-        if (!u.is_object()) continue;
-        SubUsageWindow w;
-        w.window = optionalJsonString(u, "window");
-        w.label  = optionalJsonString(u, "label");
-        if (w.label.empty()) w.label = w.window.empty() ? "Usage" : w.window;
-        if (u.contains("used_fraction") && u["used_fraction"].is_number()) {
-            w.usedFraction = (float)std::clamp(u["used_fraction"].get<double>(), 0.0, 1.0);
-            w.hasFraction = true;
-        }
-        w.resetsAt = optionalJsonString(u, "resets_at");
-        w.status   = optionalJsonString(u, "status");
-        if (w.status.empty()) w.status = "unknown";
-        row.usage.push_back(std::move(w));
-    }
-}
-
-// Fill optional identity fields from an accounts/status row (absent = unknown).
-// label holds email or a human label only — never the raw account_id (display shortens that).
-static void parseAccountIdentity(const nlohmann::json& a, SubAccountRow& row) {
-    row.displayName = optionalJsonString(a, "display_name");
-    row.plan        = optionalJsonString(a, "plan");
-    // Prefer explicit email, then label. Account id is a last-resort display path only.
-    row.label = optionalJsonString(a, "email");
-    if (row.label.empty()) row.label = optionalJsonString(a, "label");
-    // If backend stuffed the raw account_id into label/display_name, clear so the
-    // display path can short-id it instead of showing a full UUID as the title.
-    if (!row.label.empty() && row.label == row.accountId) row.label.clear();
-    if (!row.displayName.empty() && row.displayName == row.accountId) row.displayName.clear();
-    parseUsageWindows(a, row);
-}
-
 // Shorten a long account id / UUID for the primary label (never a full 36-char UUID).
 static std::string shortAccountId(const std::string& id) {
     if (id.empty()) return "(account)";
@@ -339,90 +299,10 @@ static std::string shortAccountId(const std::string& id) {
 }
 
 // Primary row label: display_name → email/label → shortened account id.
-static std::string accountPrimaryLabel(const SubAccountRow& row) {
+static std::string accountPrimaryLabel(const ui::UsageAccount& row) {
     if (!row.displayName.empty()) return row.displayName;
     if (!row.label.empty()) return row.label;
     return shortAccountId(row.accountId);
-}
-
-// Merge usage rows from subscription_usage into existing account rows by
-// (provider, account_id). Accounts poll is the source of truth for membership.
-static void mergeUsageRows(const nlohmann::json& rows) {
-    if (!rows.is_array()) return;
-    for (const auto& r : rows) {
-        if (!r.is_object()) continue;
-        const std::string prov = optionalJsonString(r, "provider");
-        const std::string aid  = optionalJsonString(r, "account_id");
-        for (auto& row : s_subAccts.rows) {
-            if (row.provider != prov) continue;
-            if (!aid.empty() && row.accountId != aid) continue;
-            if (r.contains("display_name") && r["display_name"].is_string()) {
-                const std::string dn = r["display_name"].get<std::string>();
-                if (!dn.empty() && dn != row.accountId) row.displayName = dn;
-            }
-            if (r.contains("email") && r["email"].is_string()) {
-                const std::string em = r["email"].get<std::string>();
-                if (!em.empty() && em != row.accountId) row.label = em;
-            } else if (r.contains("label") && r["label"].is_string()) {
-                const std::string lb = r["label"].get<std::string>();
-                if (!lb.empty() && lb != row.accountId && row.label.empty())
-                    row.label = lb;
-            }
-            if (r.contains("plan") && r["plan"].is_string()) {
-                const std::string pl = r["plan"].get<std::string>();
-                if (!pl.empty()) row.plan = pl;
-            }
-            parseUsageWindows(r, row);
-            if (aid.empty()) break;  // no account_id: first matching provider only
-        }
-    }
-}
-
-// Human countdown from an ISO-8601 timestamp ("resets in 2h 14m"). Empty on parse fail.
-static std::string formatResetCountdown(const std::string& iso) {
-    if (iso.empty()) return {};
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
-    if (std::sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 6)
-        return {};
-    std::tm tm{};
-    tm.tm_year = y - 1900;
-    tm.tm_mon  = mo - 1;
-    tm.tm_mday = d;
-    tm.tm_hour = h;
-    tm.tm_min  = mi;
-    tm.tm_sec  = s;
-#if defined(_WIN32)
-    const time_t target = _mkgmtime(&tm);
-#else
-    const time_t target = timegm(&tm);
-#endif
-    if (target == (time_t)-1) return {};
-    const time_t now = std::time(nullptr);
-    long long delta = (long long)(target - now);
-    if (delta <= 0) return "resets soon";
-    const long long days = delta / 86400;
-    delta %= 86400;
-    const long long hours = delta / 3600;
-    delta %= 3600;
-    const long long mins = delta / 60;
-    char buf[64];
-    if (days > 0)
-        std::snprintf(buf, sizeof(buf), "resets in %lldd %lldh", days, hours);
-    else if (hours > 0)
-        std::snprintf(buf, sizeof(buf), "resets in %lldh %lldm", hours, mins);
-    else
-        std::snprintf(buf, sizeof(buf), "resets in %lldm", mins);
-    return buf;
-}
-
-static const float* usageStatusColor(const std::string& status, float frac) {
-    if (status == "blocked") return ui::palette.statusErr;
-    if (status == "warn")    return ui::palette.statusWarn;
-    if (status == "ok")      return ui::palette.statusOk;
-    // unknown / empty: derive from fraction thresholds (matches context meter).
-    if (frac >= 0.95f) return ui::palette.statusErr;
-    if (frac >= 0.75f) return ui::palette.statusWarn;
-    return ui::palette.statusOk;
 }
 
 // Small plan pill (chipBg fill + accent border/text). No-op when plan empty.
@@ -445,8 +325,10 @@ static void drawPlanChip(const std::string& plan, float sc) {
     ImGui::Dummy(ImVec2(wd, h));
 }
 
-// One usage window: label + fraction bar + reset countdown, colored by status.
-static void drawUsageWindow(const SubUsageWindow& w, float sc) {
+// One usage window: circular gauge + label over "NN%  resets in …". The ring is the shared
+// ui::drawFractionRing primitive, so this readout and the composer's usage indicators are
+// literally the same shape — the old flat rectangular bar read as an unrelated widget.
+static void drawUsageWindow(const ui::UsageWindow& w, float sc) {
     if (!w.hasFraction) {
         const char* detail = "usage unavailable";
         if (w.status == "needs_login") detail = "sign in required";
@@ -456,169 +338,39 @@ static void drawUsageWindow(const SubUsageWindow& w, float sc) {
         ImGui::PopStyleColor();
         return;
     }
-    const auto& pal = ui::palette;
-    const float* role = usageStatusColor(w.status, w.usedFraction);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(role[0], role[1], role[2], 1.0f));
-    ImGui::TextUnformatted(w.label.c_str());
-    ImGui::PopStyleColor();
+    const float* role = ui::usageStatusColor(w.status, w.usedFraction);
+    const ImU32 roleU = ImGui::ColorConvertFloat4ToU32(ImVec4(role[0], role[1], role[2], 1.0f));
 
-    const std::string countdown = formatResetCountdown(w.resetsAt);
-    char pctBuf[32];
-    std::snprintf(pctBuf, sizeof(pctBuf), "%.0f%%", w.usedFraction * 100.0f);
-
-    // Bar + percent + countdown on one row.
-    const float barH = 6.0f * sc;
-    const float barW = ImGui::GetContentRegionAvail().x;
-    char right[96];
+    const std::string countdown = ui::usageResetCountdown(w.resetsAt);
+    char sub[96];
     if (!countdown.empty())
-        std::snprintf(right, sizeof(right), "%s  %s", pctBuf, countdown.c_str());
+        std::snprintf(sub, sizeof(sub), "%.0f%%  %s", w.usedFraction * 100.0f, countdown.c_str());
     else
-        std::snprintf(right, sizeof(right), "%s", pctBuf);
-    const float rightW = ImGui::CalcTextSize(right).x + 8.0f * sc;
-    const float trackW = std::max(40.0f * sc, barW - rightW);
+        std::snprintf(sub, sizeof(sub), "%.0f%%", w.usedFraction * 100.0f);
 
-    ImVec2 p = ImGui::GetCursorScreenPos();
+    // Ring left, two stacked lines right, both centred against the ring. Sizing the row from
+    // the taller of the two keeps consecutive windows on an even rhythm whether or not a
+    // countdown is present.
+    const float thick   = ui::metrics::stroke(3.0f);
+    const float radius  = ImGui::GetFrameHeight() * 0.42f;
+    const float ringBox = radius * 2.0f + thick;
+    const float lineH   = ImGui::GetTextLineHeight();
+    const float lineGap = 2.0f * sc;
+    const float textH   = lineH * 2.0f + lineGap;
+    const float rowH    = ImMax(ringBox, textH);
+
+    const ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float by0 = p.y + (ImGui::GetTextLineHeight() - barH) * 0.5f;
-    const float by1 = by0 + barH;
-    dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + trackW, by1),
-                      ui::Palette::toU32(pal.accentSoft), 2.0f * sc);
-    if (w.usedFraction > 0.f) {
-        dl->AddRectFilled(ImVec2(p.x, by0),
-                          ImVec2(p.x + trackW * w.usedFraction, by1),
-                          ImGui::ColorConvertFloat4ToU32(
-                              ImVec4(role[0], role[1], role[2], 0.95f)),
-                          2.0f * sc);
-    }
-    ImGui::Dummy(ImVec2(trackW, ImGui::GetTextLineHeight()));
-    ImGui::SameLine(0, 6.0f * sc);
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-    ImGui::TextUnformatted(right);
-    ImGui::PopStyleColor();
-}
+    ui::drawFractionRing(dl, ImVec2(p.x + ringBox * 0.5f, p.y + rowH * 0.5f),
+                         radius, thick, w.usedFraction,
+                         ui::Palette::toU32(ui::palette.accentSoft), roleU);
 
-static void pollSubscriptionUsage(AppState& st, bool force) {
-    if (s_subAccts.usageRpcMissing) return;
-    const double now = ImGui::GetTime();
-    if (!force && (now - s_subAccts.lastUsagePoll) < kUsagePollIntervalSec) return;
-    if (s_subAccts.usagePollInFlight) return;
-    s_subAccts.lastUsagePoll = now;
-    s_subAccts.usagePollInFlight = true;
-    st.rpc.call("subscription_usage", nlohmann::json::object(),
-                [](const core::RpcResult& r) {
-        s_subAccts.usagePollInFlight = false;
-        if (!r.ok) {
-            // unknown_method / worker down — keep last usage; mark missing once so we
-            // stop hammering and the UI stays on the dim "usage unavailable" path.
-            const std::string& err = r.err;
-            if (err.find("unknown_method") != std::string::npos ||
-                err.find("unknown method") != std::string::npos ||
-                err.find("not found") != std::string::npos) {
-                s_subAccts.usageRpcMissing = true;
-            }
-            return;
-        }
-        if (!r.result.is_object()) return;
-        if (optionalJsonBool(r.result, "ok", true) == false) {
-            // Soft failure (e.g. 429 / provider outage) — leave prior usage alone.
-            return;
-        }
-        if (const auto* rows = optionalJsonArr(r.result, "rows")) mergeUsageRows(*rows);
-    });
-}
-
-static void pollSubscriptionAccounts(AppState& st, bool force) {
-    const double now = ImGui::GetTime();
-    if (!force && (now - s_subAccts.lastAccountsPoll) < kAccountsPollIntervalSec) return;
-    if (s_subAccts.accountsPollInFlight) return;
-    s_subAccts.lastAccountsPoll = now;
-    s_subAccts.accountsPollInFlight = true;
-    st.rpc.call("subscription_accounts", nlohmann::json::object(),
-                [](const core::RpcResult& r) {
-        s_subAccts.accountsPollInFlight = false;
-        if (!r.ok || !r.result.is_object()) {
-            // RPC missing / worker down — keep last list; surface once.
-            if (!r.ok && s_subAccts.lastError.empty())
-                s_subAccts.lastError = r.err.empty() ? "subscription_accounts unavailable"
-                                                     : r.err;
-            return;
-        }
-        if (optionalJsonBool(r.result, "ok", true) == false) {
-            auto reason = optionalJsonString(r.result, "reason");
-            s_subAccts.lastError = reason.empty() ? "accounts failed" : reason;
-            return;
-        }
-        s_subAccts.lastError.clear();
-        // Preserve prior usage while rebuilding the membership list (usage poll
-        // re-merges; accounts rows may already carry optional usage fields).
-        std::map<std::string, SubAccountRow> prevByKey;
-        for (const auto& prev : s_subAccts.rows) {
-            prevByKey[prev.provider + "\n" + prev.accountId] = prev;
-        }
-        s_subAccts.rows.clear();
-        const auto* arr = optionalJsonArr(r.result, "accounts");
-        if (!arr) return;
-        for (const auto& a : *arr) {
-            if (!a.is_object()) continue;
-            SubAccountRow row;
-            row.provider  = optionalJsonString(a, "provider");
-            row.accountId = optionalJsonString(a, "account_id");
-            row.active    = optionalJsonBool(a, "active", false);
-            row.connected = optionalJsonBool(a, "connected", true);
-            parseAccountIdentity(a, row);
-            // If this accounts payload lacked usage, keep the last merged usage.
-            if (!row.hasUsage) {
-                auto it = prevByKey.find(row.provider + "\n" + row.accountId);
-                if (it != prevByKey.end() && it->second.hasUsage) {
-                    row.hasUsage = true;
-                    row.usage = it->second.usage;
-                    if (row.displayName.empty()) row.displayName = it->second.displayName;
-                    if (row.plan.empty())        row.plan = it->second.plan;
-                }
-            }
-            s_subAccts.rows.push_back(std::move(row));
-        }
-    });
-    // Also poll status for live login progress (device code etc.).
-    st.rpc.call("subscription_status", nlohmann::json::object(),
-                [](const core::RpcResult& r) {
-        if (!r.ok || !r.result.is_object()) return;
-        auto providers = optionalJsonObj(r.result, "providers");
-        if (!providers.is_object()) return;
-        for (auto it = providers.begin(); it != providers.end(); ++it) {
-            if (!it.value().is_object()) continue;
-            SubLoginProgress& p = s_subAccts.login[it.key()];
-            const auto& x = it.value();
-            const bool wasInProgress = p.inProgress;
-            p.inProgress = optionalJsonBool(x, "login_in_progress", false);
-            p.browserOpened = optionalJsonBool(x, "browser_opened", false);
-            p.userCode = optionalJsonString(x, "user_code");
-            p.verifyUrl = optionalJsonString(x, "verification_url");
-            if (p.verifyUrl.empty())
-                p.verifyUrl = optionalJsonString(x, "verification_uri");
-            // Prefer the complete device URL (code embedded). Bare /oauth2/device
-            // without user_code bounces signed-out browsers to the generic X
-            // "tweets with Grok" login instead of the approve form.
-            if (!p.userCode.empty() &&
-                (p.verifyUrl.empty() ||
-                 p.verifyUrl.find("user_code=") == std::string::npos)) {
-                const std::string base = p.verifyUrl.empty()
-                    ? "https://accounts.x.ai/oauth2/device"
-                    : p.verifyUrl;
-                const char sep = (base.find('?') == std::string::npos) ? '?' : '&';
-                p.verifyUrl = base + sep + "user_code=" + p.userCode;
-            }
-            p.stage = optionalJsonString(x, "login_stage");
-            p.lastError = optionalJsonString(x, "last_error");
-            if (wasInProgress && !p.inProgress) {
-                // The start RPC completes immediately; status is the completion edge.
-                // Force both rows and usage now instead of waiting for their normal TTLs.
-                s_subAccts.lastAccountsPoll = -1e9;
-                s_subAccts.lastUsagePoll = -1e9;
-            }
-        }
-    });
+    const float textX = p.x + ringBox + 8.0f * sc;
+    const float textY = p.y + (rowH - textH) * 0.5f;
+    dl->AddText(ImVec2(textX, textY), roleU, w.label.c_str());
+    dl->AddText(ImVec2(textX, textY + lineH + lineGap),
+                ui::Palette::toU32(ui::palette.textDim), sub);
+    ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, rowH));
 }
 
 static void drawSubscriptionAccounts(AppState& st, float sc) {
@@ -628,18 +380,33 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
     // Edge-detect section open (frame gap) → force a usage poll; while visible,
     // refresh every 5 min per contracts/providers.md §4.5.
     const int frame = ImGui::GetFrameCount();
-    const bool justOpened = (frame - s_subAccts.lastDrawnFrame) > 1;
-    s_subAccts.lastDrawnFrame = frame;
-    pollSubscriptionAccounts(st, false);
-    pollSubscriptionUsage(st, justOpened);
+    const bool justOpened = (frame - s_usageLastDrawnFrame) > 1;
+    s_usageLastDrawnFrame = frame;
+    ui::providerUsagePollAccounts(st, kAccountsPollIntervalSec, false);
+    ui::providerUsagePollUsage(st, justOpened);
+
+    // Retire the optimistic overlays as soon as the refetched rows agree with them (or the
+    // row vanished entirely — a rejected switch against a revoked account).
+    if (!s_pendingActiveProv.empty() || !s_pendingSignOutKey.empty()) {
+        bool activeSeen = false, signOutSeen = false;
+        for (const auto& r : ui::providerUsageAccounts()) {
+            if (r.provider == s_pendingActiveProv && r.accountId == s_pendingActiveId) {
+                activeSeen = true;
+                if (r.active) { s_pendingActiveProv.clear(); s_pendingActiveId.clear(); }
+            }
+            if (r.provider + "\n" + r.accountId == s_pendingSignOutKey) signOutSeen = true;
+        }
+        if (!activeSeen) { s_pendingActiveProv.clear(); s_pendingActiveId.clear(); }
+        if (!signOutSeen) s_pendingSignOutKey.clear();
+    }
 
     // In-app xAI OAuth modal (CEF). Draw every frame so the approve page keeps
     // receiving frames/input even if Accounts scrolls out of view.
     ui::oauthCapture().draw(st, sc);
 
-    if (!s_subAccts.lastError.empty()) {
+    if (!ui::providerUsageError().empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
-        ImGui::TextWrapped("%s", s_subAccts.lastError.c_str());
+        ImGui::TextWrapped("%s", ui::providerUsageError().c_str());
         ImGui::PopStyleColor();
     }
 
@@ -653,16 +420,23 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
         ImGui::TextUnformatted(plabel);
         ImGui::PopStyleColor();
 
-        // Rows for this provider.
+        // Rows for this provider. The list is shared read-only state owned by
+        // provider_usage.h, so nothing below mutates a row: clicks go out as RPCs and land on
+        // the forced refetch, with the pending overlays covering the round trip.
         bool any = false;
-        for (size_t i = 0; i < s_subAccts.rows.size(); ++i) {
-            SubAccountRow& row = s_subAccts.rows[i];
+        const std::vector<ui::UsageAccount>& accts = ui::providerUsageAccounts();
+        for (size_t i = 0; i < accts.size(); ++i) {
+            const ui::UsageAccount& row = accts[i];
             if (row.provider != prov) continue;
+            const std::string rowKey = row.provider + "\n" + row.accountId;
+            if (rowKey == s_pendingSignOutKey) continue;  // logout in flight — already gone
             any = true;
             ImGui::PushID((int)i);
 
             // ---- identity row: radio | display_name/email | plan chip | Sign out ----
-            bool active = row.active;
+            // A pending switch on this provider owns the dot until the refetch confirms it.
+            const bool pendingHere = (s_pendingActiveProv == row.provider);
+            const bool active = pendingHere ? (row.accountId == s_pendingActiveId) : row.active;
             // Radio alone (empty label) — text drawn beside so we can chip + sign-out.
             if (ImGui::RadioButton("##active", active)) {
                 if (!active) {
@@ -675,16 +449,14 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                         if (!r.ok || rejected) {
                             auto reason = rejected
                                 ? optionalJsonString(r.result, "reason") : r.err;
-                            s_subAccts.lastError =
-                                reason.empty() ? "account switch failed" : reason;
+                            ui::providerUsageSetError(
+                                reason.empty() ? "account switch failed" : reason);
                         }
-                        s_subAccts.lastAccountsPoll = -1e9;  // force refresh/rollback
-                        s_subAccts.lastUsagePoll = -1e9;
+                        ui::providerUsageInvalidate();  // force refresh/rollback
                     });
-                    // Optimistic local flip (seamless — no restart).
-                    for (auto& r2 : s_subAccts.rows)
-                        if (r2.provider == prov) r2.active = false;
-                    s_subAccts.rows[i].active = true;
+                    // Seamless — no restart. Overlay holds the dot until the refetch lands.
+                    s_pendingActiveProv = row.provider;
+                    s_pendingActiveId   = row.accountId;
                 }
             }
             ImGui::SameLine(0, 8.0f * sc);
@@ -768,13 +540,14 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     if (!r.ok || rejected) {
                         auto reason = rejected
                             ? optionalJsonString(r.result, "reason") : r.err;
-                        s_subAccts.lastError =
-                            reason.empty() ? "sign out failed" : reason;
+                        ui::providerUsageSetError(
+                            reason.empty() ? "sign out failed" : reason);
                     }
-                    s_subAccts.lastAccountsPoll = -1e9;
-                    s_subAccts.lastUsagePoll = -1e9;
+                    ui::providerUsageInvalidate();
                 });
-                s_subAccts.rows.erase(s_subAccts.rows.begin() + (long)i);
+                // The row cannot be erased (shared, read-only) — hide it until the forced
+                // refetch drops it for real, which also retires this overlay.
+                s_pendingSignOutKey = rowKey;
                 ImGui::PopID();
                 break;
             }
@@ -814,9 +587,12 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     ImGui::PopID();
                 }
             } else {
-                // Degrade: fields absent or RPC not yet registered.
+                // Degrade: fields absent, or the worker latched subscription_usage as unknown
+                // (provider_usage.h then stops polling) — say which, don't fake a 0% ring.
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-                ImGui::TextUnformatted("usage unavailable");
+                ImGui::TextUnformatted(ui::providerUsageRpcMissing()
+                                           ? "usage not reported by this runtime"
+                                           : "usage unavailable");
                 ImGui::PopStyleColor();
             }
             ImGui::Unindent(ImGui::GetFrameHeight() + gap);
@@ -832,7 +608,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
         // Live login progress for this provider (device-code UX).
         // When the in-app CEF modal owns the xAI flow, suppress the inline
         // external-browser progress (modal shows code + page instead).
-        SubLoginProgress& prog = s_subAccts.login[prov];
+        ui::UsageLoginProgress& prog = ui::providerUsageLogin()[prov];
         const bool cefOwnsXai = (std::string(prov) == "xai") && kXaiUseCef && ui::oauthCapture().active();
         if (cefOwnsXai) {
             // Modal owns the flow; Python status still drives prog via the normal
@@ -858,7 +634,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     if (ImGui::SmallButton(copyId))
                         ImGui::SetClipboardText(prog.userCode.c_str());
                 }
-                // Always surface a code-bearing URL for xAI (see pollSubscriptionAccounts).
+                // Always surface a code-bearing URL for xAI (see provider_usage.cpp).
                 std::string fallbackUrl = prog.verifyUrl;
                 if (fallbackUrl.empty() && std::string(prov) == "xai") {
                     fallbackUrl = "https://accounts.x.ai/oauth2/device";
@@ -891,9 +667,9 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                 prog.browserOpened = false;
                 prog.stage.clear();
                 prog.lastError.clear();
-                s_subAccts.lastAccountsPoll = -1e9;
+                ui::providerUsageInvalidate();
             }
-            pollSubscriptionAccounts(st, true);
+            ui::providerUsagePollAccounts(st, kAccountsPollIntervalSec, true);
         } else {
             // First account vs multi-account: label makes "already signed in" obvious.
             // T-RF12: on the web (WASM) build the token store + OAuth flows live in the
@@ -931,7 +707,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     if (isXai)
                         p["device"] = true;
                     st.rpc.call("subscription_login", p, [prov](const core::RpcResult& r) {
-                        SubLoginProgress& pr = s_subAccts.login[prov];
+                        ui::UsageLoginProgress& pr = ui::providerUsageLogin()[prov];
                         if (!r.ok) {
                             pr.inProgress = false;
                             pr.lastError = r.err.empty() ? "login failed" : r.err;
@@ -942,8 +718,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                             pr.lastError = reason.empty() ? "login failed" : reason;
                             if (!hint.empty()) pr.lastError += " \xe2\x80\x94 " + hint;
                         }
-                        s_subAccts.lastAccountsPoll = -1e9;
-                        s_subAccts.lastUsagePoll = -1e9;
+                        ui::providerUsageInvalidate();
                     });
                 }
             }
@@ -1011,7 +786,7 @@ struct OmpProvDetail {
     std::string origin;
     std::string error;
     std::vector<OmpAccountRow> accounts;
-    std::vector<SubUsageWindow> usage;
+    std::vector<ui::UsageWindow> usage;
     std::vector<std::string> usageNotes;
 };
 struct OmpOAuthFlow {
@@ -1190,7 +965,7 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
             if (const auto* wins = optionalJsonArr(usage, "windows")) {
                 for (const auto& w : *wins) {
                     if (!w.is_object()) continue;
-                    SubUsageWindow sw;
+                    ui::UsageWindow sw;
                     sw.window = optionalJsonString(w, "id");
                     sw.label = optionalJsonString(w, "label");
                     if (sw.label.empty()) sw.label = optionalJsonString(w, "windowLabel");
@@ -1836,7 +1611,10 @@ static void drawOmpProviderManager(AppState& st) {
             ImGui::EndCombo();
         }
     } else {
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * sc, 6.0f * sc));
+        // Both halves of the split view share one inner padding — they used to run 8/6 on the
+        // left and 0/0 on the right, which made the two panes read as different widgets.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
         ImGui::BeginChild("##omp_prov_list", ImVec2(220.0f * sc, paneH),
                           ImGuiChildFlags_Borders);
         for (const auto* rp : filteredRows) {
@@ -1887,8 +1665,10 @@ static void drawOmpProviderManager(AppState& st) {
         ImGui::SameLine(0, 8.0f * sc);
     }
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##omp_prov_detail", ImVec2(0, paneH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
+    ImGui::BeginChild("##omp_prov_detail", ImVec2(0, paneH),
+                      ImGuiChildFlags_AlwaysUseWindowPadding);
     drawOmpProviderDetail(st, sc);
     ImGui::EndChild();
     ImGui::PopStyleVar();
@@ -2158,12 +1938,19 @@ static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly
         e.label = label;
         out.push_back(std::move(e));
     };
-    // Built-in cloud catalog (Gemini / Anthropic / OpenAI / xAI / Cursor / Kimi Code).
-    for (const auto& m : ui::builtinModels()) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s",
-                      ui::providerLabel(m.provider), m.label.c_str());
-        add(m.provider, m.id, buf);
+    // Cloud catalog (Gemini / Anthropic / OpenAI / xAI / Cursor / Kimi Code), in built-in
+    // provider order — but each provider's rows come from its LIVE agent_list_models probe when
+    // one succeeded (ui::providerPickerModels), so a model released after this build is
+    // role-assignable without a catalog edit. The static catalog is the per-provider fallback.
+    std::set<int> emittedProv;
+    for (const auto& b : ui::builtinModels()) {
+        if (!emittedProv.insert(b.provider).second) continue;
+        for (const auto& m : ui::providerPickerModels(st, b.provider)) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s",
+                          ui::providerLabel(m.provider), m.label.c_str());
+            add(m.provider, m.id, buf);
+        }
     }
     // Cloud presets: OpenRouter/Alibaba/DeepSeek need cloud key (local or host-shared);
     // Moonshot needs moonshot key (local or host-shared).
@@ -5185,8 +4972,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::PushStyleColor(ImGuiCol_ChildBg,
                             ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
                                    ui::palette.panelBg[2], 1));
+                        // List and editor are one split view: same border, same inner padding.
+                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
                         ImGui::BeginChild("##rolelist", ImVec2(listW, promptsH),
-                                          ImGuiChildFlags_Border);
+                                          ImGuiChildFlags_Borders);
                         if (s_promptRecs.empty() && s_promptsLoaded) {
                             dimText("No role prompts returned.");
                         }
@@ -5211,12 +5001,12 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 ImGui::SetTooltip("Override the agent system prompt (advanced)");
                         }
                         ImGui::EndChild();
-                        ImGui::PopStyleColor();
+                        ImGui::PopStyleColor();  // ChildBg (list only — editor stays transparent)
 
                         ImGui::SameLine();
 
                         ImGui::BeginChild("##roleeditor", ImVec2(0, promptsH),
-                                          ImGuiChildFlags_None);
+                                          ImGuiChildFlags_Borders);
                         if (s_selectedRole >= sysIdx) {
                             ImGui::PushFont(st.fonts.medium);
                             ImGui::TextUnformatted("System prompt override");
@@ -5295,19 +5085,21 @@ void drawSettingsModal(AppState& st, bool busy) {
                             dimText("Select a role on the left to edit its prompt.");
                         }
                         ImGui::EndChild();
+                        ImGui::PopStyleVar();  // WindowPadding shared by both panes
                         ImGui::EndTabItem();
                     }
 
 
                     if (ImGui::BeginTabItem("Skills", nullptr, subFlags(3))) {
-                        // Fill-height editors: pin parent scroll so only the catalog/editor scroll.
-                        ImGui::SetScrollY(0.0f);
+                        // Fill-height editors own their scrolling: zero the parent ONCE on
+                        // entry, never every frame (that ate the wheel on this tab).
+                        if (aiSubTabJustEntered(3)) ImGui::SetScrollY(0.0f);
                         drawSettingsSkillsTab(st, sc);
                         ImGui::EndTabItem();
                     }
 
                     if (ImGui::BeginTabItem("Context", nullptr, subFlags(4))) {
-                        ImGui::SetScrollY(0.0f);
+                        if (aiSubTabJustEntered(4)) ImGui::SetScrollY(0.0f);
                         drawSettingsContextTab(st, sc);
                         ImGui::EndTabItem();
                     }
@@ -5522,7 +5314,17 @@ void drawSettingsModal(AppState& st, bool busy) {
                         };
                         static const char* kRevengTools[] = {
                             "reverse_engineer","compare_parts","convert_face_to_sketch",
-                            "measure_from_photo","start_capture_session"
+                            "project_into_sketch",
+                            "list_reveng_sessions","get_reveng_session","get_reveng_coverage",
+                            "get_reveng_deviation","describe_reveng_result","reveng_status",
+                            "list_reveng_dims",
+                            "reveng_start_session","reveng_add_images","reveng_add_video",
+                            "reveng_ingest_datasheet","reveng_set_scale","reveng_reconstruct",
+                            "reveng_single_photo","reveng_fit_primitives",
+                            "reveng_build_parametric","reveng_attach_result",
+                            "reveng_print_scale_mat","reveng_make_part_from_library",
+                            "reveng_research_source",
+                            "import_scan_mesh","export_reveng_bundle"
                         };
                         static const char* kPlmTools[] = {
                             "plm_init","plm_open","plm_checkpoint","plm_release",

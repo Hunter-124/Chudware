@@ -12,6 +12,7 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"
+#include "ui/metrics.h"           // cpMenu* rhythm tokens / px / stroke
 #include "ui/copilot/copilot.h"   // BridgeModelMeta / bridgeModelMeta
 
 namespace ui {
@@ -36,16 +37,42 @@ std::string fmtTok(long long t) {
 
 // Same visual grammar as the other DAG-pane views: bold label + a thin accent underline.
 void secHeader(const char* label) {
-    const float S = ui::uiScale;
     ImGui::TextUnformatted(label);
     ImVec2 p0 = ImGui::GetItemRectMin();
     ImVec2 p1 = ImGui::GetItemRectMax();
+    const float rule = ui::metrics::stroke(1.0f);
     ImGui::GetWindowDrawList()->AddLine(
-        ImVec2(p0.x, p1.y + 1.0f * S), ImVec2(p1.x, p1.y + 1.0f * S),
+        ImVec2(p0.x, p1.y + rule), ImVec2(p1.x, p1.y + rule),
         ImGui::ColorConvertFloat4ToU32(
             ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.60f)),
-        1.0f * S);
-    ImGui::Spacing();
+        rule);
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
+}
+
+// Arc tone for a "share of a budget" ring — the SAME ladder the Copilot composer's
+// context-window meter uses (<50% ok, <85% warn, else err) so one colour means one thing.
+ImU32 fracArcCol(float frac) {
+    return frac < 0.50f ? Palette::toU32(palette.statusOk)
+         : frac < 0.85f ? Palette::toU32(palette.statusWarn)
+                        : Palette::toU32(palette.statusErr);
+}
+
+// Compact "how full is this" badge: the shared circular gauge (ui::drawFractionRing) plus the
+// value beside it. Replaces the per-view rectangular mini-bars — every compact fraction
+// readout in the app is now the same circle.
+void fractionBadge(const AdaptiveSurface& surf, float frac, const char* text) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float  r  = ImGui::GetFrameHeight() * 0.34f;
+    const ImVec2 p  = ImGui::GetCursorScreenPos();
+    const float  lh = ImGui::GetTextLineHeight();
+    ImVec4 track = surf.textTertiary;
+    track.w = 0.35f;
+    drawFractionRing(dl, ImVec2(p.x + r, p.y + lh * 0.5f), r,
+                     ui::metrics::stroke(2.0f), frac,
+                     ImGui::ColorConvertFloat4ToU32(track), fracArcCol(frac));
+    ImGui::Dummy(ImVec2(r * 2.0f, lh));
+    ImGui::SameLine(0, ui::metrics::cpMenuLabelGap());
+    ImGui::TextUnformatted(text);
 }
 
 struct ModelSpend {
@@ -66,6 +93,14 @@ struct SessionSpend {
 
 void drawMetricsView(AppState& st) {
     const float S = ui::uiScale;
+
+    // Same adaptive surface the host pane (drawViewPane) resolves — idempotent per frame, and
+    // it gives the fraction rings a track tone that matches the glass they sit on.
+    const ImVec2 paneMin = ImGui::GetWindowPos();
+    const ImRect paneRect(paneMin, ImVec2(paneMin.x + ImGui::GetWindowSize().x,
+                                          paneMin.y + ImGui::GetWindowSize().y));
+    const AdaptiveSurface& surf =
+        adaptivePanel(panelId("ai_ws_view_glass"), paneRect, GlassGroup::Global);
 
     // ---- aggregate every priced (completed, model-stamped) assistant turn across every
     // session — active (st.chat) + parked (Conversation::msgs) — pricing with the cached
@@ -166,7 +201,7 @@ void drawMetricsView(AppState& st) {
         stat("Priced turns", std::to_string(totalTurns));
         ImGui::EndTable();
     }
-    ImGui::Dummy(ImVec2(0, 10.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
     // ---- per-model breakdown ----
     secHeader("Spend by model");
@@ -190,11 +225,13 @@ void drawMetricsView(AppState& st) {
             ImGui::TableNextColumn();
             ImGui::Text("%s / %s", fmtTok(mrow.tin).c_str(), fmtTok(mrow.tout).c_str());
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(fmtUsd(mrow.usd).c_str());
+            // Share of total spend as the shared circular gauge, not a mini-bar.
+            fractionBadge(surf, totalUsd > 0.0 ? (float)(mrow.usd / totalUsd) : 0.0f,
+                          fmtUsd(mrow.usd).c_str());
         }
         ImGui::EndTable();
     }
-    ImGui::Dummy(ImVec2(0, 10.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
     // ---- per-session breakdown ----
     secHeader("Spend by session");
@@ -222,11 +259,12 @@ void drawMetricsView(AppState& st) {
             ImGui::TableNextColumn();
             ImGui::Text("%s / %s", fmtTok(srow.tin).c_str(), fmtTok(srow.tout).c_str());
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(fmtUsd(srow.usd).c_str());
+            fractionBadge(surf, totalUsd > 0.0 ? (float)(srow.usd / totalUsd) : 0.0f,
+                          fmtUsd(srow.usd).c_str());
         }
         ImGui::EndTable();
     }
-    ImGui::Dummy(ImVec2(0, 10.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(palette.textDisabled[0], palette.textDisabled[1], palette.textDisabled[2], 1.0f));

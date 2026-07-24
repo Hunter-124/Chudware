@@ -12,8 +12,12 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& stepSurf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, stepSurf);
-    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    // Shared card inset: without it the card inherits the pane's tight 3/2 window padding and
+    // its text sits flush against the glass edge, unlike the prose/user bubbles above it.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##stepcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
@@ -92,6 +96,7 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
         drawCodeBox("##err_v", s.error, fonts.mono, ui::metrics::px(200.0f));
     ImGui::PopStyleColor();
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##stepcard WindowPadding
     endGlassBubble(gb);
 }
 
@@ -211,7 +216,7 @@ static bool isThinkingItem(const ActivityItem& a) {
 static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool showThinking,
                               bool laterDone, bool turnRunning = false) {
     const float sc = ui::uiScale;
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
 
     if (!showThinking) {
         ImGui::PushFont(fonts.body);
@@ -243,6 +248,8 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     }
     const bool hasDetail = !replyBody.empty() || !sentBody.empty();
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##thinkblk", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -277,6 +284,7 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##thinkblk WindowPadding
     ImRect thinkRect = endGlassBubble(gb);
     const std::string thinkCopy = chatActivityCopyText(a);
     chatCopyContext(thinkRect, "##think_copy", thinkCopy);
@@ -303,8 +311,10 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
     const bool planLike = hasWord(a.stage, "plan") || hasWord(a.title, "planning") ||
                           hasWord(a.title, "planner");
 
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##actcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -452,12 +462,13 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
 
     ImGui::PopStyleColor();   // base ink
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##actcard WindowPadding
     ImRect cardRect = endGlassBubble(gb);
 
     // ---- error frame: a red border around the whole card ----
     if (fail) {
         ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
-                                            8.0f * sc, 0, ui::metrics::stroke(1.5f));
+                                            ui::metrics::rounding(8.0f), 0, ui::metrics::stroke(1.5f));
     }
     {
         const std::string copyTxt = chatActivityCopyText(a);
@@ -475,7 +486,7 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
 static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 1 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     ui::IconUV iv = ui::getIcon("bookmark", 20);
     if (iv.valid) {
         float gz = ImGui::GetTextLineHeight() * 0.85f;
@@ -521,7 +532,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
                            bool turnRunning = false) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     // Ops-JSON Output box OR plain prose Output — never hide behind the "show thinking" switch.
     const bool isOpsJson = (a.stage == "stream:out" && a.opsCount > 0) ||
                            (a.title.find("Building ops") != std::string::npos);
@@ -540,6 +551,8 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
                                                  : (a.expanded || a.streaming ||
                                                     (turnRunning && !isOutput)));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##thoughtbox", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(fonts.body);
@@ -600,6 +613,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         ImGui::PopStyleColor();
     }
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##thoughtbox WindowPadding
     ImRect thoughtRect = endGlassBubble(gb);
     const std::string thoughtCopy = chatActivityCopyText(a);
     chatCopyContext(thoughtRect, "##thought_copy", thoughtCopy);
@@ -724,8 +738,10 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool fail = a.status == "fail";
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##toolrow", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -866,11 +882,12 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
         }
     }
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##toolrow WindowPadding
     ImRect rowRect = endGlassBubble(gb);
     if (fail)
         ImGui::GetWindowDrawList()->AddRect(rowRect.Min, rowRect.Max,
                                             ui::Palette::toU32(pal.statusErr),
-                                            8.0f * sc, 0, ui::metrics::stroke(1.5f));
+                                            ui::metrics::rounding(8.0f), 0, ui::metrics::stroke(1.5f));
     {
         const std::string toolCopy = chatActivityCopyText(a);
         chatCopyContext(rowRect, "##tool_copy", toolCopy);
@@ -891,7 +908,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
             if (a.status == "running") a.status = "done";
         }
     }
-    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     for (size_t i = 0; i < m.activity.size(); ++i) {
         ActivityItem& a = m.activity[i];
         // Hidden meta row carrying stop_reason / error_detail — never drawn as a card.

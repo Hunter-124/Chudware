@@ -1185,4 +1185,24 @@ void drawWindowPillScrollbarV(const AdaptiveSurface& surf) {
                    /*vertical=*/true, hov, surf);
 }
 
+// Circular fraction gauge (see ui_theme.h). Pure draw: a full track ring plus an arc that
+// sweeps clockwise from 12 o'clock for `frac` of the circle. Segment count scales with the
+// radius so a 7px composer ring and a 20px settings ring are both smooth without overdrawing.
+void drawFractionRing(ImDrawList* dl, const ImVec2& center, float radius, float thickness,
+                      float frac, ImU32 trackCol, ImU32 arcCol) {
+    if (!dl || radius <= 0.0f) return;
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    const float t = thickness < 1.0f ? 1.0f : thickness;
+    const int segs = (int)std::clamp(radius * 2.4f, 16.0f, 64.0f);
+    dl->PathArcTo(center, radius, 0.0f, IM_PI * 2.0f, segs);
+    dl->PathStroke(trackCol, ImDrawFlags_None, t);
+    if (frac <= 0.0f) return;
+    // -pi/2 == 12 o'clock in ImGui's y-down screen space.
+    const float a0 = -IM_PI * 0.5f;
+    dl->PathArcTo(center, radius, a0, a0 + IM_PI * 2.0f * frac,
+                  std::max(3, (int)(segs * frac) + 2));
+    dl->PathStroke(arcCol, ImDrawFlags_None, t);
+}
+
 }  // namespace ui

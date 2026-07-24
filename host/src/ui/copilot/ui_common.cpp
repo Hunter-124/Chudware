@@ -187,6 +187,78 @@ void drawProseBox(const char* id, const std::string& text, float maxH) {
     ImGui::PopStyleColor();
 }
 
+// ---- copilot MENU chrome (Sessions / Tasks / Artifacts / Quick settings) --------------------
+// The four header views live in ONE scroll region and must read as one product, so their
+// chrome comes from here rather than each view inventing its own title treatment, spacer
+// stack and rule. Sizes come from ui::metrics::cpMenu*; tones from chatSurf() so the menus
+// stay legible over any viewport backdrop.
+namespace ui {
+
+// Title (medium font) + optional one-line subtitle + a hairline rule. Emits at the current
+// cursor and leaves it on the first body row.
+void cpMenuHeader(const ui::Fonts& fonts, const char* title, const char* subtitle) {
+    const ui::AdaptiveSurface& surf = chatSurf();
+    if (fonts.medium) ImGui::PushFont(fonts.medium);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::TextUnformatted(title);
+    ImGui::PopStyleColor();
+    if (fonts.medium) ImGui::PopFont();
+    if (subtitle && subtitle[0]) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", subtitle);
+        ImGui::PopStyleColor();
+    }
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImVec4 rule = surf.textTertiary;
+    rule.w *= 0.35f;
+    ImGui::GetWindowDrawList()->AddLine(p, ImVec2(p.x + w, p.y),
+                                        ImGui::ColorConvertFloat4ToU32(rule),
+                                        ui::metrics::stroke(1.0f));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
+}
+
+// Sub-section label inside a menu body: a section gap above, the dim label, a hairline, the
+// head gap below. `count >= 0` appends the count next to the label.
+void cpMenuSection(const char* label, int count) {
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    if (count >= 0) ImGui::Text("%s  %d", label, count);
+    else            ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImVec4 rule = surf.textTertiary;
+    rule.w *= 0.30f;
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y + ui::metrics::px(2.0f)),
+                                        ImVec2(p.x + w, p.y + ui::metrics::px(2.0f)),
+                                        ImGui::ColorConvertFloat4ToU32(rule),
+                                        ui::metrics::stroke(1.0f));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
+}
+
+// Field caption above a full-width control. Always the secondary tone, always the same gap,
+// so stacked combos/sliders share one rhythm.
+void cpMenuLabel(const char* label) {
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
+}
+
+// Dim, wrapped helper copy under a control (one rhythm for every menu hint).
+void cpMenuHint(const char* text) {
+    ImVec4 c = chatSurf().textTertiary;
+    c.w *= 0.9f;
+    ImGui::PushStyleColor(ImGuiCol_Text, c);
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+}
+
+}  // namespace ui
+
 // ---- Liquid Glass v2 host port (contract H5): glass surface + bubble helpers ----------------
 // ONE adaptivePanel id shared by the whole Copilot pane — header, composer, and every card below
 // fetch this SAME cached surface via ui::panelId("host_agent_glass"); ui::adaptivePanel is

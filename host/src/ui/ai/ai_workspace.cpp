@@ -42,6 +42,7 @@
 #include "core/app_state.h"
 #include "ui/copilot/copilot.h"
 #include "ui_theme.h"
+#include "ui/metrics.h"            // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
 #include "ui/leaderboard_ui.h"
 #include "ui/ai/active_work.h"
 #include "ui/ai/plan_board.h"
@@ -357,19 +358,24 @@ void agentDagFromJson(const std::string& convId, const nlohmann::json& j) {
 // Reopen the file-level anonymous namespace for the remaining internal helpers/renderers.
 namespace {
 
+// coloredRowWash / glassRowBackground / glassPanel take a LOGICAL dp radius (they multiply by
+// uiScale themselves), so hand them the shared cpMenu corner converted back to dp — one source
+// of truth for the corner without double-scaling it.
+inline float rowRoundDp() { return ui::metrics::cpMenuRowRound() / ui::uiScale; }
+
 // ---- shared little helpers (same visual grammar as parts/plm workspaces) --------
 
 static void sectionHeader(const char* label) {
-    const float S = ui::uiScale;
     ImGui::TextUnformatted(label);
     ImVec2 p0 = ImGui::GetItemRectMin();
     ImVec2 p1 = ImGui::GetItemRectMax();
+    const float rule = ui::metrics::stroke(1.0f);
     ImGui::GetWindowDrawList()->AddLine(
-        ImVec2(p0.x, p1.y + 1.0f * S), ImVec2(p1.x, p1.y + 1.0f * S),
+        ImVec2(p0.x, p1.y + rule), ImVec2(p1.x, p1.y + rule),
         ImGui::ColorConvertFloat4ToU32(
             ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.60f)),
-        1.0f * S);
-    ImGui::Spacing();
+        rule);
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
 }
 
 static void emptyState(const char* icon, const char* msg, const char* sub = nullptr) {
@@ -412,7 +418,7 @@ static void emptyState(const char* icon, const char* msg, const char* sub = null
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }
-    ImGui::Dummy(ImVec2(0, 8.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 }
 
 static const float* statusColor(const std::string& s) {
@@ -794,7 +800,19 @@ static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeId
         float logH = ImGui::GetContentRegionAvail().y - composerH;
         if (logH < 90.0f * S) logH = 90.0f * S;
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(rc[0], rc[1], rc[2], 0.06f));
-        ImGui::BeginChild("##subagent_log", ImVec2(0, logH), ImGuiChildFlags_None);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
+        ImGui::BeginChild("##subagent_log", ImVec2(0, logH),
+                          ImGuiChildFlags_AlwaysUseWindowPadding,
+                          ImGuiWindowFlags_NoScrollbar);
+        ImGui::PopStyleVar();
+        // The popup carries no glass slab of its own; resolve one surface for the pill's tones.
+        const ImVec2 lw0 = ImGui::GetWindowPos();
+        const AdaptiveSurface& logSurf = adaptivePanel(
+            panelId("aiws_subagent_log"),
+            ImRect(lw0, ImVec2(lw0.x + ImGui::GetWindowSize().x,
+                               lw0.y + ImGui::GetWindowSize().y)),
+            GlassGroup::Copilot);
         if (!cs.viewErr.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.statusErr[0], palette.statusErr[1],
@@ -816,18 +834,21 @@ static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeId
                 ImVec4(rc[0], rc[1], rc[2], m.who == "system" ? 0.6f : 1.0f));
             ImGui::TextUnformatted(tag);
             ImGui::PopStyleColor();
-            ImGui::SameLine(0, 6.0f * S);
+            ImGui::SameLine(0, ui::metrics::cpMenuRowGap());
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(c[0], c[1], c[2], m.who == "system" ? 0.9f : 1.0f));
             if (m.queued) {
                 ImGui::TextDisabled("(queued)");
-                ImGui::SameLine(0, 6.0f * S);
+                ImGui::SameLine(0, ui::metrics::cpMenuRowGap());
             }
             ImGui::TextWrapped("%s", m.text.c_str());
             ImGui::PopStyleColor();
             ImGui::Spacing();
         }
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12) ImGui::SetScrollHereY(1.0f);
+        // Same stick-to-bottom rule every streaming log in the app uses (releases the moment
+        // the user scrolls up); the region id keeps this popup's flag off the chat log's.
+        chatLogStickToBottom("aiws.subagent_log");
+        drawWindowPillScrollbarV(logSurf);
         ImGui::EndChild();
         ImGui::PopStyleColor();
 
@@ -1198,16 +1219,18 @@ static void drawAgentDagCanvas(AppState& st, AgentDagStore& dag, int verbosity) 
 // live ones sorted first. Click pops that sub-agent's role-themed chat window (v3).
 static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float listH) {
     const float S = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * S, 6 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ag_hub_rows", ImVec2(0, listH), ImGuiChildFlags_None);
+    ImGui::BeginChild("##ag_hub_rows", ImVec2(0, listH),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float lineH = ImGui::GetTextLineHeightWithSpacing();
-    const float rowH  = lineH * 2.0f + 12.0f * S;
-    const float gap   = 6.0f * S;
+    const float rowH  = lineH * 2.0f + ui::metrics::cpMenuRowPadY() * 1.5f;
+    const float gap   = ui::metrics::cpMenuRowGap();
 
     // Live first, then most-recently-updated (registry order is stable; updated_ts desc).
     std::vector<int> order(s_sub.sessions.size());
@@ -1240,11 +1263,11 @@ static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float li
         roleColorRgb(roleKey, rc);
 
         // Role-colored wash + left identity bar; an open chat gets the glow border.
-        coloredRowWash(dl, r0, r1, 8.0f * S, rc,
+        coloredRowWash(dl, r0, r1, rowRoundDp(), rc,
                        open ? 0.38f : (hov ? 0.30f : 0.20f), open);
-        dl->AddRectFilled(r0, ImVec2(r0.x + 3.0f * S, r1.y),
+        dl->AddRectFilled(r0, ImVec2(r0.x + ui::metrics::stroke(3.0f), r1.y),
             ImGui::ColorConvertFloat4ToU32(ImVec4(rc[0], rc[1], rc[2], 0.95f)),
-            8.0f * S, ImDrawFlags_RoundCornersLeft);
+            ui::metrics::cpMenuRowRound(), ImDrawFlags_RoundCornersLeft);
 
         if (ImGui::InvisibleButton("##hubrow", ImVec2(rw, rowH)))
             openSubagentView(st, s.id, s.role);
@@ -1261,11 +1284,11 @@ static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float li
                             s.status == "failed"     ? "[x]" :
                             s.status == "done"       ? "[v]" :
                             s.status == "terminated" ? "[o]" : "[ ]";
-        float y = r0.y + 5.0f * S;
-        float x = r0.x + 10.0f * S;
+        float y = r0.y + ui::metrics::cpMenuRowPadY() * 0.625f;
+        float x = r0.x + ui::metrics::cpMenuRowPadX();
         dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(
             ImVec4(sc[0], sc[1], sc[2], glyphA)), glyph);
-        x += ImGui::CalcTextSize(glyph).x + 8.0f * S;
+        x += ImGui::CalcTextSize(glyph).x + ui::metrics::cpMenuRowPadY();
         dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
                     roleKey.c_str());
         // right-aligned meta: model · age
@@ -1275,29 +1298,29 @@ static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float li
         if (!age.empty()) { if (!meta.empty()) meta += "  "; meta += age; }
         if (!meta.empty()) {
             const float mw = ImGui::CalcTextSize(meta.c_str()).x;
-            dl->AddText(ImVec2(r1.x - mw - 10.0f * S, y),
+            dl->AddText(ImVec2(r1.x - mw - ui::metrics::cpMenuRowPadX(), y),
                         ImGui::ColorConvertFloat4ToU32(surf.textTertiary), meta.c_str());
         }
 
         // line 2: dim brief (or status), truncated to the row width; pending-steer badge
         y += lineH;
         std::string sub = s.brief.empty() ? s.status : s.brief;
-        const float subMaxW = rw - 20.0f * S - 90.0f * S;
+        const float subMaxW = rw - ui::metrics::cpMenuRowPadX() * 2.0f - 90.0f * S;
         while (!sub.empty() && ImGui::CalcTextSize(sub.c_str()).x > subMaxW)
             sub.pop_back();
         if (sub.size() < (s.brief.empty() ? s.status : s.brief).size())
             sub += "\xE2\x80\xA6";
-        dl->AddText(ImVec2(r0.x + 10.0f * S, y),
+        dl->AddText(ImVec2(r0.x + ui::metrics::cpMenuRowPadX(), y),
                     ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub.c_str());
         if (s.pendingSteers > 0) {
             char badge[24];
             std::snprintf(badge, sizeof(badge), "%d queued", s.pendingSteers);
-            const float bw = ImGui::CalcTextSize(badge).x + 10.0f * S;
-            const ImVec2 b0(r1.x - bw - 8.0f * S, y - 1.0f * S);
-            const ImVec2 b1(r1.x - 8.0f * S, y + lineH - 2.0f * S);
+            const float bw = ImGui::CalcTextSize(badge).x + ui::metrics::cpMenuRowPadX();
+            const ImVec2 b0(r1.x - bw - ui::metrics::cpMenuRowPadY(), y - 1.0f * S);
+            const ImVec2 b1(r1.x - ui::metrics::cpMenuRowPadY(), y + lineH - 2.0f * S);
             dl->AddRectFilled(b0, b1, ImGui::ColorConvertFloat4ToU32(
                 ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.22f)),
-                4.0f * S);
+                ui::metrics::cpMenuChipRound());
             dl->AddText(ImVec2(b0.x + 5.0f * S, b0.y + 1.0f * S),
                         ImGui::ColorConvertFloat4ToU32(
                             ImVec4(palette.accent[0], palette.accent[1],
@@ -1307,6 +1330,7 @@ static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float li
         ImGui::SetCursorScreenPos(ImVec2(r0.x, r1.y + gap));
         ImGui::PopID();
     }
+    drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
 }
 
@@ -1408,19 +1432,19 @@ static bool navRow(int id, const char* label, bool active, const AdaptiveSurface
     ImGui::PushID(id);
     const ImVec2 r0 = ImGui::GetCursorScreenPos();
     const float  rw = ImGui::GetContentRegionAvail().x;
-    const float  rh = ImGui::GetFrameHeight() + 8.0f * S;
+    const float  rh = ImGui::GetFrameHeight() + ui::metrics::cpMenuRowPadY();
     const ImVec2 r1(r0.x + rw, r0.y + rh);
     const bool hov = ImGui::IsMouseHoveringRect(r0, r1);
     bool hit = ImGui::InvisibleButton("##navrow", ImVec2(rw, rh));
 
     if (active) {
         const float acc[3] = {palette.accent[0], palette.accent[1], palette.accent[2]};
-        coloredRowWash(dl, r0, r1, 8.0f * S, acc, 0.40f, true);
+        coloredRowWash(dl, r0, r1, rowRoundDp(), acc, 0.40f, true);
     } else if (hov) {
-        glassRowBackground(dl, r0, r1, 8.0f * S, false, false, 0.32f);
+        glassRowBackground(dl, r0, r1, rowRoundDp(), false, false, 0.32f);
     }
     const float textH = ImGui::GetTextLineHeight();
-    dl->AddText(ImVec2(r0.x + 12.0f * S, r0.y + (rh - textH) * 0.5f),
+    dl->AddText(ImVec2(r0.x + ui::metrics::cpMenuRowPadX(), r0.y + (rh - textH) * 0.5f),
                 ImGui::ColorConvertFloat4ToU32(active ? surf.textPrimary
                                                       : surf.textSecondary),
                 label);
@@ -1428,27 +1452,30 @@ static bool navRow(int id, const char* label, bool active, const AdaptiveSurface
         // Live-count chip pinned to the row's right edge (Agent Hub active agents).
         char b[16];
         std::snprintf(b, sizeof(b), "%d", badge);
-        const float bw = ImGui::CalcTextSize(b).x + 12.0f * S;
-        const ImVec2 b0(r1.x - bw - 8.0f * S, r0.y + (rh - textH - 4.0f * S) * 0.5f);
+        const float bw = ImGui::CalcTextSize(b).x + ui::metrics::cpMenuRowPadX();
+        const ImVec2 b0(r1.x - bw - ui::metrics::cpMenuRowPadY(),
+                        r0.y + (rh - textH - 4.0f * S) * 0.5f);
         const ImVec2 b1(b0.x + bw, b0.y + textH + 4.0f * S);
         dl->AddRectFilled(b0, b1, ImGui::ColorConvertFloat4ToU32(
             ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.26f)),
-            (b1.y - b0.y) * 0.5f);
-        dl->AddText(ImVec2(b0.x + 6.0f * S, b0.y + 2.0f * S),
+            (b1.y - b0.y) * 0.5f);   // fully-round count pill
+        dl->AddText(ImVec2(b0.x + ui::metrics::cpMenuRowPadX() * 0.6f, b0.y + 2.0f * S),
                     ImGui::ColorConvertFloat4ToU32(
                         ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f)),
                     b);
     }
-    ImGui::SetCursorScreenPos(ImVec2(r0.x, r1.y + 4.0f * S));
+    ImGui::SetCursorScreenPos(ImVec2(r0.x, r1.y + ui::metrics::cpMenuRowGap()));
     ImGui::PopID();
     return hit;
 }
 
 static void drawNavColumn(AppState& st, float navW) {
     const float S = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * S, 8 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ai_ws_nav", ImVec2(navW, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##ai_ws_nav", ImVec2(navW, 0),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
 
@@ -1459,9 +1486,9 @@ static void drawNavColumn(AppState& st, float navW) {
                                   w0.y + ImGui::GetWindowSize().y));
     const AdaptiveSurface& surf =
         adaptivePanel(panelId("ai_ws_nav_glass"), wRect, GlassGroup::Global);
-    glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
+    glassPanel(dl, wRect, GlassLevel::Thin, rowRoundDp(), surf);
 
-    ImGui::Dummy(ImVec2(0, 4.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
 
     // Live-agent badge for the Agent Hub row; in-flight doc badge for Active Work.
     int live = 0;
@@ -1482,16 +1509,18 @@ static void drawNavColumn(AppState& st, float navW) {
     if (navRow(6, "Metrics",      s_ai.view == 6, surf))       s_ai.view = 6;
 
     // Hairline + the utility section.
-    ImGui::Dummy(ImVec2(0, 4.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
     {
         const ImVec2 c = ImGui::GetCursorScreenPos();
-        dl->AddLine(ImVec2(c.x + 6.0f * S, c.y), ImVec2(c.x + navW - 22.0f * S, c.y),
-                    ui::Palette::toU32(palette.glassBorder), 1.0f * S);
+        dl->AddLine(ImVec2(c.x + ui::metrics::cpMenuRowGap(), c.y),
+                    ImVec2(c.x + navW - ui::metrics::cpMenuGutter() * 2.0f, c.y),
+                    ui::Palette::toU32(palette.glassBorder), ui::metrics::stroke(1.0f));
     }
-    ImGui::Dummy(ImVec2(0, 8.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
 
     if (navRow(7, "Options",      s_ai.view == 7, surf))       s_ai.view = 7;
 
+    drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
 }
 
@@ -1513,18 +1542,33 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
     if (logH < 120.0f * S) logH = 120.0f * S;
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ai_ws_chatlog", ImVec2(0, logH), ImGuiChildFlags_None);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
+    ImGui::BeginChild("##ai_ws_chatlog", ImVec2(0, logH),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar();
+    // The chat column's slab is drawn by the host child; resolve the same surface id here so
+    // the pill scrollbar picks up matching tones.
+    const ImVec2 lw0 = ImGui::GetWindowPos();
+    const AdaptiveSurface& logSurf = adaptivePanel(
+        panelId("ai_ws_conv_glass"),
+        ImRect(lw0, ImVec2(lw0.x + ImGui::GetWindowSize().x,
+                           lw0.y + ImGui::GetWindowSize().y)),
+        GlassGroup::Global);
     if (st.chat.empty()) {
         emptyState("[AI]", "Start a conversation",
                    "Describe what to build — the copilot plans, models and verifies it.");
     } else {
         chatDrawLog(st);
-        chatLogStickToBottom("ai.workspace");
+        // Shared stick-to-bottom (releases on a user scroll-up). The region id scopes the flag
+        // to this host so the docked Copilot column and the workspace never fight over one.
+        chatLogStickToBottom("aiws.chatlog");
     }
+    drawWindowPillScrollbarV(logSurf);
     ImGui::EndChild();
     ImGui::PopStyleColor();
 
-    ImGui::Dummy(ImVec2(0, 4.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     ImGui::BeginGroup();
     chatDrawComposer(st, busy, canRun);   // the docked Copilot's real composer + send path
     ImGui::EndGroup();
@@ -1579,7 +1623,7 @@ static void drawOptionsView(AppState& st) {
         ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
         ImGui::EndTable();
     }
-    ImGui::Dummy(ImVec2(0, 8.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
     // Shared with Settings -> AI -> Harness: the exact same widgets/fields, one source of
     // truth. Covers plan/subagent/advisor preference, role adoption, proactive advisor,
@@ -1587,7 +1631,7 @@ static void drawOptionsView(AppState& st) {
     // refine-pass cap, max subagent nesting, memory budget, Eng. Firm budget.
     sectionHeader("Workflow");
     if (ui::drawHarnessSessionKnobs(st, S)) saveSettings(st.settings);
-    ImGui::Dummy(ImVec2(0, 8.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
     sectionHeader("Generation");
     if (ImGui::BeginTable("##ai_ws_gen", 2, gridFlags)) {
@@ -1607,14 +1651,14 @@ static void drawOptionsView(AppState& st) {
         ImGui::EndTable();
     }
     if (changed) saveSettings(st.settings);
-    ImGui::Dummy(ImVec2(0, 8.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
     sectionHeader("More");
     if (ImGui::Button("Open full AI settings\xE2\x80\xA6")) {
         st.openSettings    = true;
         st.openSettingsTab = 2;   // Settings modal tab order: Appearance 0, General 1, AI 2
     }
-    ImGui::Dummy(ImVec2(0, 4.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                palette.textDisabled[2], 1.0f));
@@ -1631,24 +1675,23 @@ static void drawOptionsView(AppState& st) {
 // The right-panel content view: one glass pane hosting the nav-selected view (Agent Hub |
 // Session Plan | Active Work | Documents | Sessions | Leaderboard | Metrics | Options).
 static void drawViewPane(AppState& st, bool busy) {
-    const float S = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * S, 10 * S));
+    // (no local uiScale: every dimension below comes from ui::metrics)
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ai_ws_view", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##ai_ws_view", ImVec2(0, 0),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
 
     // Liquid-glass slab behind the whole pane (shared adaptive surface — the views fetch the
-    // same panelId for their text tones).
-    {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 w0 = ImGui::GetWindowPos();
-        const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
-                                      w0.y + ImGui::GetWindowSize().y));
-        const AdaptiveSurface& surf =
-            adaptivePanel(panelId("ai_ws_view_glass"), wRect, GlassGroup::Global);
-        glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
-    }
+    // same panelId for their text tones, and the pill scrollbar its track/thumb tones).
+    const ImVec2 vw0 = ImGui::GetWindowPos();
+    const ImRect vRect(vw0, ImVec2(vw0.x + ImGui::GetWindowSize().x,
+                                   vw0.y + ImGui::GetWindowSize().y));
+    const AdaptiveSurface& viewSurf =
+        adaptivePanel(panelId("ai_ws_view_glass"), vRect, GlassGroup::Global);
+    glassPanel(ImGui::GetWindowDrawList(), vRect, GlassLevel::Thin, rowRoundDp(), viewSurf);
 
     // Autopopulate (agent.ui_follow_active_session): a NEW live run in the VIEWED conversation
     // yanks the panel to the Agent Hub view so the streaming roster + execution trace show
@@ -1659,11 +1702,9 @@ static void drawViewPane(AppState& st, bool busy) {
         s_ai.view        = 0;
     }
 
-    // Left margin off the glass edge — one indent for every nav view so Agent Hub / Session
-    // Plan / Active Work / Documents / Sessions / Leaderboard / Metrics / Options all sit the
-    // same distance in (previously only Options/Metrics indented themselves, so switching
-    // views shifted content left/right).
-    ImGui::Indent(6.0f * S);
+    // The child's WindowPadding gutter (cpMenuGutter) IS the left margin now — one indent for
+    // every nav view, shared with the docked Copilot menus. The old ad-hoc Indent(6dp) stacked
+    // on top of it and is gone.
 
     switch (s_ai.view) {
         case 0:  // Agent Hub: sub-agent roster + live agent-execution DAG.
@@ -1708,7 +1749,7 @@ static void drawViewPane(AppState& st, bool busy) {
             s_ai.view = 0;
             break;
     }
-    ImGui::Unindent(6.0f * S);
+    drawWindowPillScrollbarV(viewSurf);
     ImGui::EndChild();
 }
 
@@ -1747,22 +1788,23 @@ void drawAiWorkspace(AppState& st) {
     const ImU32  hairline = ui::Palette::toU32(palette.glassBorder);
 
     // ---- left: main chat ----------------------------------------------------------
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * S, 10 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ai_ws_conv", ImVec2(chatW, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##ai_ws_conv", ImVec2(chatW, 0),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
-    {
-        // Liquid-glass slab behind the conversation (same recipe as the view pane).
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 w0 = ImGui::GetWindowPos();
-        const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
-                                      w0.y + ImGui::GetWindowSize().y));
-        const AdaptiveSurface& surf =
-            adaptivePanel(panelId("ai_ws_conv_glass"), wRect, GlassGroup::Global);
-        glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
-    }
+    // Liquid-glass slab behind the conversation (same recipe as the view pane); the same
+    // surface backs the pill scrollbar if the column ever overflows.
+    const ImVec2 cw0 = ImGui::GetWindowPos();
+    const ImRect cRect(cw0, ImVec2(cw0.x + ImGui::GetWindowSize().x,
+                                   cw0.y + ImGui::GetWindowSize().y));
+    const AdaptiveSurface& convSurf =
+        adaptivePanel(panelId("ai_ws_conv_glass"), cRect, GlassGroup::Global);
+    glassPanel(ImGui::GetWindowDrawList(), cRect, GlassLevel::Thin, rowRoundDp(), convSurf);
     drawChatCenter(st, busy, canRun);   // log + composer (same state/send path as the dock)
+    drawWindowPillScrollbarV(convSurf);
     ImGui::EndChild();
 
     ImGui::SameLine(0.0f, gap);
@@ -1772,8 +1814,12 @@ void drawAiWorkspace(AppState& st) {
     // Popup sub-agent chats cascade from the view pane's top-left corner.
     s_popupAnchor = ImVec2(rightPos.x + navW + gap + 16.0f * S, rightPos.y + 8.0f * S);
 
+    // Pure layout wrapper: it only hosts the nav column + the view pane side by side, both of
+    // which fill it exactly and carry their own gutter + pill scrollbar. It must never scroll
+    // or grow a bar of its own — hence 0 padding and NoScrollbar|NoScrollWithMouse.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##ai_ws_right", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##ai_ws_right", ImVec2(0, 0), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
 
     drawNavColumn(st, navW);
@@ -1786,7 +1832,8 @@ void drawAiWorkspace(AppState& st) {
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float x = origin.x + chatW + gap * 0.5f;
-        dl->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + bodyH), hairline, 1.0f * S);
+        dl->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + bodyH), hairline,
+                    ui::metrics::stroke(1.0f));
     }
 
     // Floating sub-agent chat windows draw last (above the whole workspace).

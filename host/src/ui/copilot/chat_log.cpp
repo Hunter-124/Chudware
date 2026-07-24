@@ -106,9 +106,13 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     // Right-align: indent ~22% of the panel so the bubble sits against the right edge.
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
     const float bw = ImGui::GetContentRegionAvail().x;
-    GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 8.0f);
-    // Tighter in-bubble padding than the theme default — slimmer message box.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 5.0f * sc));
+    GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 10.0f);
+    // Every chat bubble in the log shares ONE inset (cpMenuRowPadX/Y). Before this the user
+    // bubble ran 10/5, the prose card 10/7 and every other card inherited the pane's tight
+    // 3/2 — three different insets stacked down one column, which is what made the log read
+    // as unrelated widgets rather than one surface.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     // Zero the default 9px inter-item spacing for this bubble's body -> meta bar
@@ -121,7 +125,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     // click-drag + Ctrl+C toast + right-click Copy).
     const std::string userBody = stripMdMarks(m.text);
     const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, chatSurf().textPrimary);
-    ImGui::Dummy(ImVec2(0, 3.0f * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
 
     // ---- meta bar: You [rewind edit] ......... age ----
     const double now = ImGui::GetTime();
@@ -251,12 +255,12 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                 ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f));
         }
         ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max, border,
-            8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
+            ui::metrics::rounding(10.0f), 0, ui::metrics::stroke(1.0f));
     }
     const std::string sel = chatInputSelection(textId);
     chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
 
-    ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
+    ImGui::Dummy(ImVec2(0, ui::metrics::px(10.0f)));   // gap to the next TURN
 }
 
 
@@ -283,7 +287,7 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const auto& pal = ui::palette;
 
-    ImGui::Dummy(ImVec2(0, 3 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     {
         char hdr[64];
         std::snprintf(hdr, sizeof(hdr), "Provider log (%d)", (int)calls.size());
@@ -330,7 +334,9 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
                  : (!a->title.empty() ? a->title + "  " + a->reason : a->reason);
     }
 
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 6.0f);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##provlog", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     if (fonts.mono) ImGui::PushFont(fonts.mono);
@@ -368,6 +374,7 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     }
     if (fonts.mono) ImGui::PopFont();
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##provlog WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     chatCopyContext(cardRect, "##provlog_copy", allCopy);
 }
@@ -421,7 +428,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             drawAiVcTurnRestore(st, msgIdx, turnNum);
         }
         if ((haveModel && !metaInCard) || vcRestore)
-            ImGui::Dummy(ImVec2(0, 2.5f * sc));
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         ImGui::PopStyleVar();
     }
 
@@ -449,7 +456,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextUnformatted((std::string("Plan \xc2\xb7 ") + prog).c_str());
             ImGui::PopStyleColor();
-            ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
         }
     }
 
@@ -462,8 +469,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (proseCard) {
         const std::string prose = stripMdMarks(m.text);
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                          4.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 7.0f * sc));
+                                          10.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
         ImGui::BeginChild("##prose", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         // Author meta row INSIDE the card top (model left, age right) when it
@@ -472,7 +480,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
                            turnSurf.textSecondary, m.ts);
             metaDrawn = true;
-            ImGui::Dummy(ImVec2(0, 2.0f * sc));
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }
         // Raw m.text (not `prose`): the renderer needs the ``` fences intact to route code
         // spans into the mono box. `prose` stays the copy payload, as before.
@@ -490,7 +498,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImRect proseRect = endGlassBubble(gb);
         const std::string sel = chatInputSelection(textId);
         chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);
-        ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     }
 
 
@@ -518,7 +526,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         }
         if (!hasLiveContent && !m.text.empty()) hasLiveContent = true;
         if (!hasLiveContent) {
-            ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
             const ui::AdaptiveSurface& surf = chatSurf();
             std::string say = m.liveStatus;
             if (say == "Working" || say == "working...")
@@ -560,9 +568,11 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (m.errKind == ERR_PARTIAL || m.resultPartial) {
         std::string body = stripMdMarks(m.text);
         if (body.empty()) body = "Partially complete";
-        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                          8.0f);
+                                          10.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
         ImGui::BeginChild("##partialcard", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         const ImVec4 warnCol = semanticOnGlass(pal.statusWarn, chatSurf());
@@ -570,7 +580,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
                            turnSurf.textSecondary, m.ts);
             metaDrawn = true;
-            ImGui::Dummy(ImVec2(0, 2.0f * sc));
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }
         ImGui::PushFont(fonts.medium);
         ImGui::TextColored(warnCol, "Partially complete");
@@ -585,10 +595,11 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), body);
         }
         ImGui::EndChild();
+        ImGui::PopStyleVar();   // ##partialcard WindowPadding
         ImRect cardRect = endGlassBubble(gb);
         ImGui::GetWindowDrawList()->AddRect(
             cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusWarn),
-            8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
+            ui::metrics::rounding(10.0f), 0, ui::metrics::stroke(1.5f));
         const std::string sel = chatInputSelection(textId);
         chatCopyContext(cardRect, "##partial_copy", body, body, sel);
     } else if (m.errKind != ERR_NONE) {
@@ -671,9 +682,11 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         const bool haveFull = !fullErr.empty() && (clipped || fullErr != shown);
 
         if (!shown.empty() || !m.errorHuman.empty()) {
-            ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
             GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                              8.0f);
+                                              10.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
             ImGui::BeginChild("##errcard", ImVec2(0, 0),
                               ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
             // Error tone retuned for the frost so the reason stays readable over any model.
@@ -683,7 +696,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
                                turnSurf.textSecondary, m.ts);
                 metaDrawn = true;
-                ImGui::Dummy(ImVec2(0, 2.0f * sc));
+                ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
             }
             // Headline: the short actionable sentence core/agent derived from this same
             // failure ("Provider not signed in. Open Settings > AI > Accounts."). The stop
@@ -694,19 +707,19 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 ImGui::TextWrapped("%s", m.errorHuman.c_str());
                 ImGui::PopStyleColor();
                 ImGui::PopFont();
-                ImGui::Dummy(ImVec2(0, 3.0f * sc));
+                ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
             }
             // Headline-only card (humanized line, no stop fields) skips the body widget.
             ImGuiID textId = 0;
             if (!shown.empty()) textId = chatDrawSelectableText("##err_sel", shown, errCol);
             if (haveFull) {
-                ImGui::Dummy(ImVec2(0, 2.0f * sc));
+                ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
                 if (toggleChip("Error details", m.errFullOpen)) {
                     m.errFullOpen = !m.errFullOpen;
                     m.uiCachedH = -1.0f;  // the card just changed height
                 }
                 if (m.errFullOpen)
-                    drawCodeBox("##err_full", fullErr, fonts.mono, ui::metrics::px(220.0f));
+                    drawCodeBox("##err_full", fullErr, fonts.mono, ui::metrics::copilotDiffMaxH());
             }
             // Submitted before EndChild — see the comment on the user-bubble copy glyph in
             // drawUserBlock() for why an after-EndChild button silently eats no clicks here.
@@ -716,9 +729,10 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), fullErr);
             }
             ImGui::EndChild();
+            ImGui::PopStyleVar();   // ##errcard WindowPadding
             ImRect cardRect = endGlassBubble(gb);
             ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
-                                                8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
+                                                ui::metrics::rounding(10.0f), 0, ui::metrics::stroke(1.5f));
             const std::string sel = chatInputSelection(textId);
             chatCopyContext(cardRect, "##err_copy", fullErr, fullErr, sel);
         }
@@ -814,7 +828,7 @@ void drawChatLogWindowed(AppState& st) {
             drawUserBlock(st, m, fonts, logW, (int)mi);
         } else {
             drawAssistantTurn(st, m, fonts, logW, (int)mi, thisTurn);
-            ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
+            ImGui::Dummy(ImVec2(0, ui::metrics::px(10.0f)));   // gap to the next TURN
         }
         ImGui::EndGroup();
         // (Mode-colored left accent bar removed — it read as a stray vertical line next

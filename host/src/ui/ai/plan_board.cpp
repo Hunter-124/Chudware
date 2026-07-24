@@ -18,10 +18,25 @@
 #include "ui/copilot/copilot_internal.h"  // markChatHistoryDirty / aiVcRollback / s_aiVc /
                                           // aiTurnActive / ensureConversations / semanticOnGlass
 #include "ui_theme.h"
+#include "ui/metrics.h"       // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
 #include "ui/ai/ai_prefs.h"
 
 namespace ui {
 namespace {
+
+// glassPanel / glassRowBackground take a LOGICAL dp radius (they multiply by uiScale
+// themselves), so hand them the shared cpMenu corner converted back to dp — one source of
+// truth for the corner without double-scaling it.
+inline float rowRoundDp() { return ui::metrics::cpMenuRowRound() / ui::uiScale; }
+
+// Arc tone for a "how far along is this" ring — the SAME ladder the Copilot composer's
+// context-window meter uses (<50% ok, <85% warn, else err), applied to the REMAINING share
+// so a nearly-finished plan reads green and a barely-started one reads hot.
+inline ImU32 fracArcCol(float remaining) {
+    return remaining < 0.50f ? Palette::toU32(palette.statusOk)
+         : remaining < 0.85f ? Palette::toU32(palette.statusWarn)
+                             : Palette::toU32(palette.statusErr);
+}
 
 // ---- plan snapshot (de)serialization --------------------------------------------
 // Byte-compatible with planStateToJson in ui/copilot/conversations.cpp.
@@ -296,13 +311,18 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
     const float S = uiScale;
     const auto& pal = palette;
 
+    // Shared menu gutter so the checkpoint rows sit the same distance off the glass edge as
+    // every other AI-surface card list (pop right after Begin — the child captured it).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
     ImGui::BeginChild("##pb_tl", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PopStyleVar();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     {
         const ImVec2 c0 = ImGui::GetWindowPos();
         const ImVec2 c1(c0.x + ImGui::GetWindowWidth(), c0.y + ImGui::GetWindowHeight());
-        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, 8.0f, surf);
+        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, rowRoundDp(), surf);
     }
 
     ImGui::PushFont(st.fonts.medium);
@@ -358,14 +378,14 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
         const PbCheckpoint& cp = s_tl.cps[(size_t)ri];
         ImGui::PushID(ri);
         const float rowW = ImGui::GetContentRegionAvail().x;
-        const float rowH = ImGui::GetFrameHeight() + 6.0f * S;
+        const float rowH = ImGui::GetFrameHeight() + ui::metrics::cpMenuRowPadY();
         const ImVec2 rowMin = ImGui::GetCursorScreenPos();
         ImGui::Dummy(ImVec2(rowW, rowH));
-        glassRowBackground(dl, rowMin, ImVec2(rowMin.x + rowW, rowMin.y + rowH), 6.0f,
-                           (ri & 1) != 0, false, 0.30f);
+        glassRowBackground(dl, rowMin, ImVec2(rowMin.x + rowW, rowMin.y + rowH),
+                           rowRoundDp(), (ri & 1) != 0, false, 0.30f);
 
-        float x = rowMin.x + 8.0f * S;
-        const float y = rowMin.y + 3.0f * S;
+        float x = rowMin.x + ui::metrics::cpMenuRowPadX();
+        const float y = rowMin.y + ui::metrics::cpMenuRowPadY() * 0.5f;
 
         // Kind chip (prompt = accent, tool = iterBuilt blue, legacy = dim).
         const bool isPrompt = cp.kind == "prompt";
@@ -379,7 +399,7 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
         ImGui::PushStyleColor(ImGuiCol_Text, kindCol);
         ImGui::TextUnformatted(kindTag);
         ImGui::PopStyleColor();
-        x += ImGui::CalcTextSize(kindTag).x + 10.0f * S;
+        x += ImGui::CalcTextSize(kindTag).x + ui::metrics::cpMenuRowPadX();
 
         // Restore button (right edge) — inline click-again confirm, routes through the
         // shared aiVcRollback (honors chat_truncate_to, refreshes mirror, toasts).
@@ -453,12 +473,15 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
         pbDropRename();
     }
 
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
     ImGui::BeginChild("##pb_plan", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PopStyleVar();
     {
         const ImVec2 c0 = ImGui::GetWindowPos();
         const ImVec2 c1(c0.x + ImGui::GetWindowWidth(), c0.y + ImGui::GetWindowHeight());
-        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, 8.0f, surf);
+        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, rowRoundDp(), surf);
     }
 
     PlanState* plan = msg ? &msg->planState : nullptr;
@@ -469,7 +492,27 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
                        plan && !plan->title.empty() ? plan->title.c_str() : "Session Plan");
     ImGui::PopFont();
     if (plan) {
-        ImGui::SameLine(0, 8.0f * S);
+        ImGui::SameLine(0, ui::metrics::cpMenuRowPadX());
+        // Plan completion as the app's shared circular gauge — the same ring every compact
+        // "how full is this" readout uses, never a bespoke rectangular bar.
+        if (!plan->items.empty()) {
+            int done = 0;
+            for (const auto& it : plan->items)
+                if (it.status == "done" || it.status == "pass") ++done;
+            const float frac = (float)done / (float)plan->items.size();
+            const float r  = ImGui::GetFrameHeight() * 0.34f;
+            const float lh = ImGui::GetTextLineHeight();
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            ImVec4 track = surf.textTertiary;
+            track.w = 0.35f;
+            drawFractionRing(dl, ImVec2(rp.x + r, rp.y + lh * 0.5f), r,
+                             ui::metrics::stroke(2.0f), frac,
+                             ImGui::ColorConvertFloat4ToU32(track), fracArcCol(1.0f - frac));
+            ImGui::Dummy(ImVec2(r * 2.0f, lh));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%d of %d plan items done", done, (int)plan->items.size());
+            ImGui::SameLine(0, ui::metrics::cpMenuLabelGap());
+        }
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::Text("%d item%s - rev %d", (int)plan->items.size(),
                     plan->items.size() == 1 ? "" : "s", plan->revision);
@@ -535,15 +578,15 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
         ImGui::PushID(i);   // positional id too — item ids are not guaranteed unique
 
         const float rowW = ImGui::GetContentRegionAvail().x;
-        const float rowH = frameH + 6.0f * S;
+        const float rowH = frameH + ui::metrics::cpMenuRowPadY();
         const ImVec2 rowMin = ImGui::GetCursorScreenPos();
         ImGui::Dummy(ImVec2(rowW, rowH));   // reserve + advance the layout cursor
         const bool isActive = it.status == "running" || it.status == "active";
-        glassRowBackground(dl, rowMin, ImVec2(rowMin.x + rowW, rowMin.y + rowH), 6.0f,
-                           (i & 1) != 0, isActive, 0.30f);
+        glassRowBackground(dl, rowMin, ImVec2(rowMin.x + rowW, rowMin.y + rowH),
+                           rowRoundDp(), (i & 1) != 0, isActive, 0.30f);
 
-        const float y = rowMin.y + 3.0f * S;
-        float x = rowMin.x + 8.0f * S;
+        const float y = rowMin.y + ui::metrics::cpMenuRowPadY() * 0.5f;
+        float x = rowMin.x + ui::metrics::cpMenuRowPadX();
 
         // -- status chip (click cycles Pending -> Active -> Done -> Dropped) --
         const char* chipLabel = pbStatusLabel(it.status);
@@ -706,11 +749,10 @@ void drawPlanBoardView(AppState& st) {
     ImGui::TextUnformatted(aiTurnActive(st) ? "agent running — edits queue as a note"
                                             : "edits save with the session");
     ImGui::PopStyleColor();
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
 
     pbDrawPlanSection(st, surf, verbosity);
-    ImGui::Spacing();
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
     pbDrawTimeline(st, surf, verbosity);
 }
 

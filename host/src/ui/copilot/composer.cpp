@@ -1,10 +1,12 @@
 // Copilot composer (T-RF6 split of legacy_chat.cpp): the auto-growing wrapping chat input,
 // file attachments + context refs, design/mission run launch, the session slash commands
 // (/compact /shake /handoff /btw /prewalk), the submitTurn send path, and the composer chrome
-// (runtime banner, Agent/Plan/Swarm/Edit/Ask prelude + context meter, subscription usage box,
+// (runtime banner, Agent/Plan/Swarm/Edit/Ask prelude + context/provider-limit gauge rings,
 // graduated segmented toolbar, in-box send/stop).
 
 #include "copilot_internal.h"
+#include "ui/provider_usage.h"   // THE subscription-usage poller behind the prelude's limit rings
+#include "ui/provider_logos.h"   // brand mark for the model chip (same art as Settings->Providers)
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
 // ImGui's InputTextMultiline does NOT word-wrap (it renders with wrap_width=0, so long lines
@@ -1370,58 +1372,111 @@ void drawRuntimeBanner(AppState& st) {
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
 }
 
-// Build a compact "Provider · model" label for the composer's model chip.
-static void composerModelLabel(const Settings& s, char* out, size_t n) {
+// ---- composer model chip ---------------------------------------------------------------------
+// The chip identifies the MODEL; the provider is carried by its brand mark. The old
+// "Anthropic \xc2\xb7 claude-sonnet-5" text spent the widest segment on a prefix the mark already
+// states and then ellipsized away the only part that mattered (the model).
+
+// Provider display name — TOOLTIP ONLY; the chip itself never shows it.
+static const char* composerProviderName(int provider) {
     // Keep in lockstep with ui::ProviderIndex (Anthropic..ZenMux).
-    const char* provNames[] = {
+    static const char* kProvNames[] = {
         "Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API", "xAI", "Cursor",
         "Kimi Code", "ZenMux"
     };
-    static_assert(sizeof(provNames) / sizeof(provNames[0]) == ui::PROV_COUNT,
-                  "composerModelLabel provNames must match PROV_COUNT");
-    const char* prov = provNames[(s.provider >= 0 && s.provider < ui::PROV_COUNT)
-                                     ? s.provider : ui::PROV_GEMINI];
-    std::snprintf(out, n, "%s \xc2\xb7 %s", prov, s.model[0] ? s.model : "default");
+    static_assert(sizeof(kProvNames) / sizeof(kProvNames[0]) == ui::PROV_COUNT,
+                  "composerProviderName kProvNames must match PROV_COUNT");
+    return kProvNames[(provider >= 0 && provider < ui::PROV_COUNT) ? provider : ui::PROV_GEMINI];
 }
 
-// Context-window meter for the composer prelude row: a small fill-bar + "N/M" readout (compact
-// "ctx N/M" with no bar when the pane is too narrow). Drawn at the current cursor; advances it.
+// OMP provider id for the brand mark. This is the id space the Settings -> Providers rows hand
+// to drawProviderLogo, so the chip shows the IDENTICAL art. The resolve_provider wire name is a
+// DIFFERENT space ("kimi-sub" has no brand row; local endpoints resolve as "openai") and would
+// give a hashed badge or, worse, brand a loopback runtime as OpenAI.
+static std::string composerProviderLogoId(const Settings& s) {
+    switch (s.provider) {
+        case ui::PROV_ANTHROPIC:   return "anthropic";
+        case ui::PROV_OPENAI:      return "openai";
+        case ui::PROV_GEMINI:      return "google";
+        case ui::PROV_XAI:         return "xai";
+        case ui::PROV_CURSOR:      return "cursor";
+        case ui::PROV_KIMISUB:     return "kimi-code";
+        case ui::PROV_ZENMUX:      return "zenmux";
+        case ui::PROV_CLOUDCOMPAT: return ui::cloudServiceKey(s.baseUrl);
+        default:                   return ui::providerCatKey(s.provider);  // local: generic badge
+    }
+}
+
+// The model's REAL display name ("Claude Sonnet 5"). Resolution order, best label first:
+//   1. the OMP bridge catalog (live, covers models the static table has never heard of),
+//   2. the static builtinModels() table (works offline / before the bridge catalog lands —
+//      without it the chip fell straight through to the bare id, which is exactly the
+//      "claude-sonnet-5" wire string the chip exists to replace),
+//   3. shortModelName, 4. the raw id.
+// Never carries the provider — the brand mark says that.
+static std::string composerModelName(const Settings& s) {
+    if (!s.model[0]) return "default";
+    if (const ui::BridgeModelMeta* m = ui::bridgeModelMetaForCad(s.provider, s.model, s.baseUrl))
+        if (!m->name.empty()) return m->name;
+    for (const ui::ModelInfo& mi : ui::builtinModels())
+        if (mi.provider == s.provider && mi.id == s.model && !mi.label.empty())
+            return mi.label;
+    const std::string shortId = ui::shortModelName(s.model);
+    return shortId.empty() ? std::string(s.model) : shortId;
+}
+
+// ---- composer gauges ---------------------------------------------------------------------
+// ONE ring geometry for every gauge in the prelude row (context window + provider limits) so
+// they read as a set, and so each measure() can never drift from its draw().
+static float gaugeRingRadius()    { return ImGui::GetFrameHeight() * 0.30f; }
+static float gaugeRingThickness() { return ui::metrics::stroke(2.0f); }
+static float gaugeRingAdvance()   { return gaugeRingRadius() * 2.0f + gaugeRingThickness(); }
+
+// Shared track tone: the surface's own faint ink, so an unfilled ring reads on dark AND light
+// glass without a hardcoded gray.
+static ImU32 gaugeTrackColor(const ui::AdaptiveSurface& surf) {
+    ImVec4 c = surf.textTertiary;
+    c.w = 0.35f;
+    return ImGui::ColorConvertFloat4ToU32(c);
+}
+
+// Context-window gauge for the composer prelude row: a fraction ring + "N/M" readout (compact
+// "ctx N/M" with no ring when the pane is too narrow). Drawn at the current cursor; advances it.
 // Moved here from the footer chips, where it was pinned to the pane bottom against the status bar.
 static void drawContextMeter(AppState& st, float roomForMeter) {
     const auto& pal = ui::palette;
-    const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const int   win  = effectiveContextWindow(st.settings);
     const int   used = st.lastContextTokens;
     const float frac = win > 0 ? std::min(1.0f, (float)used / (float)win) : 0.0f;
-    const float barW = 40 * sc, gap = 5 * sc;
+    const float gap = ui::metrics::px(5), ringAdv = gaugeRingAdvance();
     const std::string full = fmtTokens(used) + "/" + fmtTokens(win);
-    const std::string lean = "ctx " + full;       // standalone (no bar) keeps a "ctx" tag so it reads
+    const std::string lean = "ctx " + full;   // standalone (no ring) keeps a "ctx" tag so it reads
     const float fh = ImGui::GetFrameHeight();
-    // Bar + readout only when there is room for both; uses the SAME roomForMeter the caller passed to
-    // measureContextMeter() so the width it reserved and the layout drawn here agree exactly.
+    // Ring + readout only when there is room for both; uses the SAME roomForMeter the caller passed
+    // to measureContextMeter() so the width it reserved and the layout drawn here agree exactly.
     const float fullTw = ImGui::CalcTextSize(full.c_str()).x;
-    const bool  showBar = roomForMeter >= barW + gap + fullTw;
+    const bool  showRing = roomForMeter >= ringAdv + gap + fullTw;
+    ImGui::BeginGroup();   // group so hovering the RING (not just the digits) raises the tooltip
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    if (showBar) {
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        float by0 = p.y + fh * 0.5f - 3 * sc, by1 = p.y + fh * 0.5f + 3 * sc;
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImU32 fg = frac < 0.5f ? ui::Palette::toU32(pal.statusOk)
-                 : frac < 0.85f ? ui::Palette::toU32(pal.statusWarn)
-                                : ui::Palette::toU32(pal.statusErr);
-        dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
-                          ui::Palette::toU32(pal.accentSoft), 2 * sc);
-        if (frac > 0)
-            dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW * frac, by1), fg, 2 * sc);
-        dl->AddRect(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
-                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary), 2 * sc);
-        ImGui::Dummy(ImVec2(barW, fh));
+    if (showRing) {
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        // Same thresholds usageStatusColor() uses, so every gauge agrees on when amber turns red.
+        const float* role = frac < 0.5f  ? pal.statusOk
+                          : frac < 0.85f ? pal.statusWarn
+                                         : pal.statusErr;
+        ui::drawFractionRing(ImGui::GetWindowDrawList(),
+                             ImVec2(p.x + ringAdv * 0.5f, p.y + fh * 0.5f),
+                             gaugeRingRadius(), gaugeRingThickness(), frac,
+                             gaugeTrackColor(surf),
+                             ImGui::ColorConvertFloat4ToU32(semanticOnGlass(role, surf)));
+        ImGui::Dummy(ImVec2(ringAdv, fh));
         ImGui::SameLine(0, gap);
     }
     ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(showBar ? full.c_str() : lean.c_str());
+    ImGui::TextUnformatted(showRing ? full.c_str() : lean.c_str());
     ImGui::PopStyleColor();
+    ImGui::EndGroup();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Context window usage — the last model call's input tokens vs the "
                           "active model's window (%d / %d).\nSet the window in AI settings if "
@@ -1429,15 +1484,76 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
 }
 
 // Width drawContextMeter() will occupy, so the caller can right-align it on its line above the
-// composer. Mirrors the showBar decision in drawContextMeter() so reserved width == drawn width.
+// composer. Mirrors the showRing decision in drawContextMeter() so reserved width == drawn width.
 static float measureContextMeter(AppState& st, float roomForMeter) {
-    const float sc = ui::uiScale;
-    const float barW = 40 * sc, gap = 5 * sc;
+    const float gap = ui::metrics::px(5), ringAdv = gaugeRingAdvance();
     const std::string full = fmtTokens(st.lastContextTokens) + "/" +
                              fmtTokens(effectiveContextWindow(st.settings));
     const float fullTw = ImGui::CalcTextSize(full.c_str()).x;
-    if (roomForMeter >= barW + gap + fullTw) return barW + gap + fullTw;
+    if (roomForMeter >= ringAdv + gap + fullTw) return ringAdv + gap + fullTw;
     return ImGui::CalcTextSize(("ctx " + full).c_str()).x;
+}
+
+// Provider rate-limit gauges for the prelude row: one ring per usage window the ACTIVE
+// subscription account reports ("5H (o) 7D (o)"), sitting immediately left of the context ring.
+// Every layer is opt-out by ABSENCE, which is what keeps inapplicable elements hidden: key-based
+// and local providers have no subscription id, an account may report no windows at all, and a
+// window without a fraction is status-only — each of those draws NOTHING rather than a
+// misleading empty ring. `draw == false` measures only (emits no ImGui items) so the caller can
+// right-align the usage cluster and the context gauge as one block.
+//
+// `budget` is the width the rings may consume. Indicators are dropped from the END until the
+// set fits, rather than all-or-nothing: a 340dp column only clears ~90dp next to the context
+// gauge, so an all-or-nothing rule would hide Claude's 5H+7D pair on the DEFAULT layout. Both
+// passes are handed the same budget, so measure and draw always pick the same set.
+static float usageRingCluster(AppState& st, float budget, bool draw) {
+    const char* sub = ui::subscriptionProviderForCad(st.settings.provider);
+    if (!sub) return 0.0f;
+    const std::vector<ui::UsageWindow>* wins = ui::activeAccountUsage(sub);
+    if (!wins || wins->empty()) return 0.0f;
+
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const float capGap  = ui::metrics::px(3);   // caption -> its ring
+    const float indGap  = ui::metrics::px(7);   // between indicators
+    const float ringAdv = gaugeRingAdvance();
+    const float fh = ImGui::GetFrameHeight();
+    float total = 0.0f;
+    int   shown = 0;
+    for (const ui::UsageWindow& w : *wins) {
+        if (shown >= 3) break;          // three rings is all even a wide prelude row can carry
+        if (!w.hasFraction) continue;   // status-only window: never render it as 0%
+        const std::string cap = ui::usageWindowShortLabel(w);
+        const float capW = ImGui::CalcTextSize(cap.c_str()).x;
+        const float indW = capW + capGap + ringAdv;
+        const float step = (shown > 0 ? indGap : 0.0f) + indW;
+        if (total + step > budget) break;   // out of room — the remaining windows drop
+        if (shown > 0 && draw) ImGui::SameLine(0, indGap);
+        total += step;
+        ++shown;
+        if (!draw) continue;
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(indW, fh));   // reserve first: the ring is painted into this rect
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float midY = p.y + fh * 0.5f;
+        dl->AddText(ImVec2(p.x, midY - ImGui::GetFontSize() * 0.5f),
+                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary), cap.c_str());
+        const float frac = ImClamp(w.usedFraction, 0.0f, 1.0f);
+        ui::drawFractionRing(dl, ImVec2(p.x + capW + capGap + ringAdv * 0.5f, midY),
+                             gaugeRingRadius(), gaugeRingThickness(), frac,
+                             gaugeTrackColor(surf),
+                             ImGui::ColorConvertFloat4ToU32(
+                                 semanticOnGlass(ui::usageStatusColor(w.status, frac), surf)));
+        if (ImGui::IsItemHovered()) {
+            const std::string label  = w.label.empty() ? w.window : w.label;
+            const std::string resets = ui::usageResetCountdown(w.resetsAt);
+            if (resets.empty())
+                ImGui::SetTooltip("%s \xe2\x80\x94 %.0f%%", label.c_str(), frac * 100.0f);
+            else
+                ImGui::SetTooltip("%s \xe2\x80\x94 %.0f%%\n%s", label.c_str(), frac * 100.0f,
+                                  resets.c_str());
+        }
+    }
+    return total;
 }
 
 // One row in the drop-up mode menu: frosted glass base + per-mode coloredRowWash gradient
@@ -1499,6 +1615,16 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     const float sc = ui::uiScale;
     const bool hasDoc = st.docMirror.hasDoc();
     const ui::AdaptiveSurface& surf = chatSurf();
+    // Subscription usage feeds the prelude's provider-limit rings. Both polls are TTL-gated and
+    // cheap; the 60s accounts TTL is deliberately lazier than the Settings UI's 1.5s — nothing is
+    // being MANAGED here, the rings just need the active account's windows to stay roughly fresh.
+    ui::providerUsagePollAccounts(st, 60.0, false);
+    ui::providerUsagePollUsage(st, false);
+    // The model chip's human name ("Claude Opus 5") comes from the OMP catalog. Until now the
+    // catalog was only fetched by the Settings/Providers UI and the model dropdown, so a user who
+    // never opened either saw the raw id in the chip — the exact thing the chip stopped showing.
+    // Same 5-min TTL + in-flight guard, so this is one RPC per session in practice.
+    ui::refreshBridgeModelCatalog(st, false);
 
     // Compact frame height matching the toolbar chips (model / thinking / New).
     // Arrow button uses ImGuiCol_Button — keep it identical to FrameBg so the caret
@@ -1613,9 +1739,9 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     }
     ImGui::PopStyleColor(3);
 
-    // Busy forging glyph — centered in the gap between the mode dropdown and the
-    // context meter. Hidden the instant Stop is pressed (aiTurnActive honors
-    // stopRequested) so the animation never keeps playing after a stop.
+    // Busy forging glyph — centered in the gap between the mode dropdown and the right-hand
+    // gauge cluster. Hidden the instant Stop is pressed (aiTurnActive honors stopRequested)
+    // so the animation never keeps playing after a stop.
     // Note: `busy` is job.running and can lag past Stop — always gate on the run's stopRequested.
     // Use `tmx` (mode chip screen rect captured above) — GetItemRectMax after the
     // popup is no longer the mode button.
@@ -1626,7 +1752,15 @@ static void drawComposerPrelude(AppState& st, bool busy) {
         const float meterRoomFull = ImGui::GetContentRegionAvail().x;
         const float meterW = measureContextMeter(st, meterRoomFull);
         const float rowRightScreen = ImGui::GetWindowPos().x + ImGui::GetContentRegionMax().x;
-        const float meterLeftScreen = rowRightScreen - meterW;
+        // Provider-limit rings ride LEFT of the context gauge as one right-aligned cluster, and
+        // give way first when the column narrows: the context gauge always wins, and the cluster
+        // may never reach back over the mode chip (px(6) keeps a visible break between them).
+        const float clusterGap = ui::metrics::px(10);
+        const float usageBudget = (rowRightScreen - tmx.x) - clusterGap - meterW -
+                                  ui::metrics::px(6);
+        const float usageW = usageRingCluster(st, usageBudget, /*draw=*/false);
+        const float clusterW = usageW > 0.0f ? usageW + clusterGap + meterW : meterW;
+        const float meterLeftScreen = rowRightScreen - clusterW;
         if (forging) {
             const float midScreen = (tmx.x + meterLeftScreen) * 0.5f;
             float hammerScreenX = midScreen - segH * 0.5f;
@@ -1641,10 +1775,14 @@ static void drawComposerPrelude(AppState& st, bool busy) {
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("AI is working\xe2\x80\xa6");
         }
-        // Context meter on the SAME row, right-aligned.
+        // Gauge cluster on the SAME row, right-aligned as one block.
         ImGui::SameLine(0, 0.0f);
-        const float meterCursorX = ImGui::GetContentRegionMax().x - meterW;
-        if (meterCursorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(meterCursorX);
+        const float clusterCursorX = ImGui::GetContentRegionMax().x - clusterW;
+        if (clusterCursorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(clusterCursorX);
+        if (usageW > 0.0f) {
+            usageRingCluster(st, usageBudget, /*draw=*/true);
+            ImGui::SameLine(0, clusterGap);
+        }
         drawContextMeter(st, meterRoomFull);
     }
 
@@ -1654,217 +1792,6 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     // Tight gap to the prompt — prelude sits closer to the input box.
 }
 
-// ============================ Subscription usage box (copilot) ============================
-// Compact account/plan + per-window usage bars for the ACTIVE provider. Polls
-// subscription_usage every 5 min; file-static cache (Main: do not touch app_state.h).
-// Degrade: hide permanently on unknown_method; xAI shows plan chip + dim "no usage API".
-
-namespace {
-
-struct UsageWindow {
-    std::string window;
-    std::string label;
-    float usedFraction = -1.0f;  // <0 = unknown
-    std::string status;          // ok|warn|blocked|unknown
-};
-
-struct UsageCache {
-    bool available = true;   // false after unknown_method
-    bool loading = false;
-    bool hasRow = false;     // true when we have at least identity/plan for active provider
-    double lastFetch = -1e9;
-    std::string lastProvider;  // friendly id last requested
-    std::string displayName;
-    std::string plan;
-    std::string accountId;
-    std::string dashboardUrl;
-    std::string source;        // api|jwt_inference|unavailable|...
-    std::vector<UsageWindow> windows;
-};
-static UsageCache s_usage;
-
-// Map settings.provider int → subscription_usage friendly id (codex|claude|cursor|xai).
-// Non-subscription providers return empty → box hidden.
-static std::string usageFriendlyProvider(int provider) {
-    switch (provider) {
-        case ui::PROV_ANTHROPIC: return "claude";
-        case ui::PROV_OPENAI:    return "codex";  // ChatGPT/Codex sub
-        case ui::PROV_XAI:       return "xai";
-        case ui::PROV_CURSOR:    return "cursor";
-        case ui::PROV_KIMISUB:   return "kimi";
-        default: return {};
-    }
-}
-
-static bool usageIsAbsent(const core::RpcResult& r) {
-    if (!r.ok) {
-        const std::string& e = r.err;
-        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
-            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
-            return true;
-        return false;
-    }
-    if (!r.result.is_object()) return false;
-    if (r.result.contains("code")) {
-        const std::string c = r.result.value("code", std::string());
-        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
-            return true;
-    }
-    if (!r.result.value("ok", true)) {
-        const std::string reason = r.result.value("reason", std::string());
-        if (reason == "unknown_method" || reason == "method_not_found" ||
-            reason == "not_implemented")
-            return true;
-    }
-    return false;
-}
-
-static void usageFetch(AppState& st, const std::string& provider, bool force) {
-    if (!s_usage.available || s_usage.loading || provider.empty()) return;
-    const double now = ImGui::GetTime();
-    if (!force && provider == s_usage.lastProvider && (now - s_usage.lastFetch) < 300.0)
-        return;
-    s_usage.loading = true;
-    s_usage.lastFetch = now;
-    s_usage.lastProvider = provider;
-    nlohmann::json p = nlohmann::json::object();
-    p["provider"] = provider;
-    st.rpc.call("subscription_usage", p, [provider](const core::RpcResult& r) {
-        s_usage.loading = false;
-        if (usageIsAbsent(r)) {
-            s_usage.available = false;
-            s_usage.hasRow = false;
-            s_usage.windows.clear();
-            return;
-        }
-        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) {
-            // Soft fail — keep prior cache, don't hide forever.
-            return;
-        }
-        s_usage.displayName.clear();
-        s_usage.plan.clear();
-        s_usage.accountId.clear();
-        s_usage.dashboardUrl.clear();
-        s_usage.source.clear();
-        s_usage.windows.clear();
-        s_usage.hasRow = false;
-        auto rowsIt = r.result.find("rows");
-        if (rowsIt == r.result.end() || !rowsIt->is_array()) return;
-        for (const auto& row : *rowsIt) {
-            if (!row.is_object()) continue;
-            const std::string rp = row.value("provider", std::string());
-            if (!rp.empty() && rp != provider && rp != provider + "-sub") continue;
-            s_usage.hasRow = true;
-            s_usage.displayName = row.value("display_name", row.value("email", std::string()));
-            s_usage.plan = row.value("plan", std::string());
-            s_usage.accountId = row.value("account_id", std::string());
-            s_usage.dashboardUrl = row.value("dashboard_url", std::string());
-            s_usage.source = row.value("source", std::string());
-            if (row.contains("usage") && row["usage"].is_array()) {
-                for (const auto& u : row["usage"]) {
-                    if (!u.is_object()) continue;
-                    UsageWindow w;
-                    w.window = u.value("window", std::string());
-                    w.label = u.value("label", w.window);
-                    if (u.contains("used_fraction") && u["used_fraction"].is_number())
-                        w.usedFraction = (float)u["used_fraction"].get<double>();
-                    w.status = u.value("status", std::string("unknown"));
-                    s_usage.windows.push_back(std::move(w));
-                }
-            }
-            break;  // first matching active row
-        }
-    });
-}
-
-// Compact usage strip above the model picker. Hidden when RPC absent or provider has no sub.
-static void drawCopilotUsageBox(AppState& st) {
-    if (!s_usage.available) return;
-    const std::string prov = usageFriendlyProvider(st.settings.provider);
-    if (prov.empty()) return;
-    usageFetch(st, prov, /*force=*/false);
-    // Nothing to show until first successful row (or xAI plan-only degrade).
-    if (!s_usage.hasRow && !s_usage.loading) {
-        // Still show a one-shot probe result for xAI once fetch returns empty row with no plan —
-        // only paint when we have something.
-        return;
-    }
-    if (!s_usage.hasRow) return;
-
-    const float sc = ui::uiScale;
-    const ui::AdaptiveSurface& surf = chatSurf();
-    const auto& pal = ui::palette;
-
-    ImGui::Dummy(ImVec2(0, 2.0f * sc));
-    ImGui::BeginGroup();
-    // Line 1: display_name · plan chip
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        if (!s_usage.displayName.empty()) {
-            ImGui::TextUnformatted(s_usage.displayName.c_str());
-            if (!s_usage.plan.empty()) ImGui::SameLine(0, 6.0f * sc);
-        }
-        ImGui::PopStyleColor();
-        if (!s_usage.plan.empty()) {
-            const ImVec2 p0 = ImGui::GetCursorScreenPos();
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-            ImGui::TextUnformatted(s_usage.plan.c_str());
-            ImGui::PopStyleColor();
-            const ImVec2 p1 = ImGui::GetItemRectMax();
-            ImGui::GetWindowDrawList()->AddRect(
-                ImVec2(p0.x - 3.0f * sc, p0.y - 1.0f * sc),
-                ImVec2(p1.x + 3.0f * sc, p1.y + 1.0f * sc),
-                ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
-                                                      surf.textPrimary.z, 0.30f)),
-                ui::metrics::rounding(4.0f), 0, ui::metrics::stroke(1.0f));
-        }
-    }
-    // Line 2: usage bars, OR a one-shot toast when usage API is absent (no in-composer spam).
-    if (s_usage.windows.empty()) {
-        static std::string s_usageToastKey;
-        std::string key = prov + "|" + s_usage.source + "|" + s_usage.plan + "|" + s_usage.accountId;
-        if (s_usageToastKey != key) {
-            s_usageToastKey = key;
-            if (prov == "xai") {
-                st.toast(ui::ToastLevel::Warn,
-                         "no usage API — check grok.com Settings \xe2\x86\x92 Usage");
-            } else if (s_usage.source == "unavailable" || s_usage.source.empty()) {
-                st.toast(ui::ToastLevel::Warn, "usage unavailable");
-            }
-            // "no usage windows" with a real source is quiet (no toast spam).
-        }
-    } else {
-        const float barH = 4.0f * sc;
-        const float barW = std::max(40.0f * sc, ImGui::GetContentRegionAvail().x * 0.45f);
-        for (const auto& w : s_usage.windows) {
-            const char* lab = w.label.empty() ? w.window.c_str() : w.label.c_str();
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-            ImGui::TextUnformatted(lab);
-            ImGui::PopStyleColor();
-            ImGui::SameLine(0, 6.0f * sc);
-            const float frac = w.usedFraction < 0.0f ? 0.0f
-                               : (w.usedFraction > 1.0f ? 1.0f : w.usedFraction);
-            ImVec4 fill = ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.85f);
-            if (w.status == "warn")
-                fill = semanticOnGlass(pal.errCad, surf);
-            else if (w.status == "blocked")
-                fill = semanticOnGlass(pal.statusErr, surf);
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, fill);
-            ImGui::PushStyleColor(ImGuiCol_FrameBg,
-                ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.10f));
-            char overlay[16] = "";
-            if (w.usedFraction >= 0.0f)
-                std::snprintf(overlay, sizeof(overlay), "%.0f%%", frac * 100.0f);
-            ImGui::ProgressBar(w.usedFraction < 0.0f ? 0.0f : frac, ImVec2(barW, barH),
-                               w.usedFraction < 0.0f ? "" : overlay);
-            ImGui::PopStyleColor(2);
-        }
-    }
-    ImGui::EndGroup();
-    ImGui::Dummy(ImVec2(0, 2.0f * sc));
-}
-
-}  // namespace
 // Toolbar row below the prompt: [model | thinking | paperclip | context-cube | New]
 // Graduated widths with overlapping rounded corners (connected segmented look).
 // Model picker is the largest share; paperclip/cube are icon-only minimums.
@@ -1878,9 +1805,10 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     const float availW = ImGui::GetContentRegionAvail().x;
     ImDrawList* bgDl = ImGui::GetWindowDrawList();
     if (embedded) {
-        // Hairline divider from the surface's own ink so it reads on any backdrop.
-        bgDl->AddLine(ImVec2(rowMin.x + 8.0f * sc, rowMin.y),
-                      ImVec2(rowMin.x + availW - 8.0f * sc, rowMin.y),
+        // Hairline divider from the surface's own ink so it reads on any backdrop, inset by the
+        // shared menu gutter so it lines up with every other copilot menu's content edge.
+        bgDl->AddLine(ImVec2(rowMin.x + ui::metrics::cpMenuGutter(), rowMin.y),
+                      ImVec2(rowMin.x + availW - ui::metrics::cpMenuGutter(), rowMin.y),
                       ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textTertiary.x,
                           surf.textTertiary.y, surf.textTertiary.z, 0.40f)),
                       ui::metrics::stroke(1.0f));
@@ -1896,7 +1824,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     const float overlap = -2.0f * sc;
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(overlap, ImGui::GetStyle().ItemSpacing.y));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
     // Shared translucent chip fill (opaque fills fought the adaptive text).
     const ImVec4 chipBg(0, 0, 0, 0);
     const ImVec4 chipHov(
@@ -1933,38 +1861,57 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     const float totalW = availW + join * (float)(nSeg - 1);
     const float iconW = segH;     // minimal — just an icon
     const float restW = std::max(0.0f, totalW - iconW * 2.0f);
-    // Relative shares of the non-icon remainder.
-    const float kNew = 1.25f, kThink = 1.75f, kModel = 3.40f;
+    // Relative shares of the non-icon remainder, solved against the DEFAULT 340dp column
+    // (metrics::dockRightTarget): availW 326 -> restW 287dp at 17.5px body text. "New" needs
+    // 48dp and the widest effort label ("Medium") 76dp before either clips inside its button, so
+    // the model chip may take the remaining ~159dp — which is what a brand mark (18dp) + gap +
+    // a real name like "Claude Opus 5" (117dp) actually occupies. Dropping the model share
+    // further (the chip lost its "Provider \xc2\xb7 " prefix) would just ellipsize the ONE string
+    // this chip exists to show, so the prefix's slack goes to thinking/New instead.
+    const float kNew = 1.30f, kThink = 2.05f, kModel = 4.15f;
     const float kSum = kNew + kThink + kModel;
     const float newW   = restW * (kNew   / kSum);
     const float thinkW = restW * (kThink / kSum);
     const float modelW = restW * (kModel / kSum);
 
-    char modelLabel[160];
-    composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
+    // ---- 1/5 model: provider brand mark + the model's REAL display name (no provider text) ----
+    const std::string modelLogo = composerProviderLogoId(s);
+    const float logoSide    = ImGui::GetFontSize() * 1.05f;
+    const float logoGap     = ui::metrics::px(6);
+    const float logoAdvance = logoSide + logoGap;
+    std::string modelText = composerModelName(s);
     {
-        // Ellipsize model text to fit inside its (largest) segment. No caret/arrow.
-        const float maxModelW = modelW - ImGui::GetStyle().FramePadding.x * 2.0f;
-        if (maxModelW > 0.0f && ImGui::CalcTextSize(modelLabel).x > maxModelW) {
+        // Ellipsize the NAME only — the mark is fixed-width and never clipped. No caret/arrow.
+        const float maxTextW = modelW - logoAdvance - ImGui::GetStyle().FramePadding.x * 2.0f;
+        if (maxTextW > 0.0f && ImGui::CalcTextSize(modelText.c_str()).x > maxTextW) {
             const float dotsW = ImGui::CalcTextSize("...").x;
-            size_t len = std::strlen(modelLabel);
-            while (len > 1 &&
-                   ImGui::CalcTextSize(modelLabel, modelLabel + len).x + dotsW > maxModelW) {
+            const char* b = modelText.c_str();
+            size_t len = modelText.size();
+            while (len > 1 && ImGui::CalcTextSize(b, b + len).x + dotsW > maxTextW) {
                 --len;
-                while (len > 1 && (modelLabel[len] & 0xC0) == 0x80) --len;  // keep UTF-8 whole
+                while (len > 1 && ((unsigned char)modelText[len] & 0xC0) == 0x80) --len;  // UTF-8
             }
-            std::snprintf(modelLabel + len, sizeof(modelLabel) - len, "...");
+            modelText.erase(len);
+            modelText += "...";
         }
     }
-
-    // ---- 1/5 model (biggest, no caret) ----
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    if (ImGui::Button(modelLabel, ImVec2(modelW, segH))) ImGui::OpenPopup("##modeldropdown");
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
+    // Empty button: mark + name are painted into its rect so the icon sits inline with the text.
+    if (ImGui::Button("##model", ImVec2(modelW, segH))) ImGui::OpenPopup("##modeldropdown");
     // Capture the model chip rect so the drop-up popup can anchor fixed above it.
     const ImVec2 modelBtnMin = ImGui::GetItemRectMin();
     const ImVec2 modelBtnMax = ImGui::GetItemRectMax();
+    {
+        ImDrawList* mdl = ImGui::GetWindowDrawList();
+        const float midY = (modelBtnMin.y + modelBtnMax.y) * 0.5f;
+        const float x0 = modelBtnMin.x + ImGui::GetStyle().FramePadding.x;
+        ui::drawProviderLogo(mdl, ImVec2(x0, midY - logoSide * 0.5f), logoSide, modelLogo);
+        mdl->AddText(ImVec2(x0 + logoAdvance, midY - ImGui::GetFontSize() * 0.5f),
+                     ImGui::ColorConvertFloat4ToU32(surf.textPrimary), modelText.c_str());
+    }
+    // The chip shows the model; the tooltip keeps the full provider + exact id.
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s \xc2\xb7 %s\nModel — click to search and switch.",
+                          composerProviderName(s.provider), s.model[0] ? s.model : "default");
 
     // ---- 2/5 thinking effort (level only; bigger than New) ----
     ImGui::SameLine();

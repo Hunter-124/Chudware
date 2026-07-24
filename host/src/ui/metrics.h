@@ -69,5 +69,54 @@ inline float copilotThumbW()      { return px(220.0f); }  // iteration contact-s
 inline float copilotProseMaxH()   { return px(150.0f); }  // thoughts / prose scroll cap
 inline float copilotDiffMaxH()    { return px(220.0f); }  // diff / code view scroll cap
 
+// ---- Copilot MENU views (Sessions / Tasks / Artifacts / Quick settings) ----------------------
+// The four header views share one scroll region inside the pinned column, so they must also
+// share their rhythm: same gutter, same row corner, same gap between rows, same gap between
+// sections. Before these tokens each view invented its own (10/8 vs 8/6 padding, 8 vs 6 dp
+// corners, four different Dummy() spacers), which is exactly what made the menus read as four
+// unrelated screens. Every copilot menu MUST size itself from here — no fresh literals.
+inline float cpMenuGutter()   { return px(10.0f); }  // left/right inset of menu content
+inline float cpMenuRowPadX()  { return px(10.0f); }  // inside a menu row/card, horizontal
+inline float cpMenuRowPadY()  { return px(8.0f); }   // inside a menu row/card, vertical
+inline float cpMenuRowGap()   { return px(5.0f); }   // between sibling rows/cards
+inline float cpMenuRowRound() { return rounding(8.0f); }   // menu row/card corner
+inline float cpMenuChipRound(){ return rounding(6.0f); }   // chips/pills inside menus
+inline float cpMenuSectionGap(){ return px(14.0f); }  // above a section header
+inline float cpMenuHeadGap()  { return px(6.0f); }    // below a section header rule
+inline float cpMenuLabelGap() { return px(3.0f); }    // label -> its control
+inline float cpMenuCtlGap()   { return px(7.0f); }    // control -> next label (vertical rhythm)
+
+// ---- Reverse Engineering workspace (ui/reveng/, RE-40 overhaul) -------------------------------
+// The RE tab is a wizard: a session rail, a stage stepper, one stage body, a properties column.
+// Before these tokens each of the four stage TUs invented its own paddings and card corners, so
+// the six stages read as six unrelated screens. Every reveng panel MUST size itself from here.
+// The rhythm deliberately mirrors the copilot menu tokens above (4-px grid, 8-dp card corner)
+// so the RE tab feels like the same product as the rest of the shell.
+inline float reRailW()        { return px(288.0f); }  // session rail column width
+inline float rePropW()        { return px(312.0f); }  // right properties/capability column
+inline float reGutter()       { return px(10.0f); }   // between the three top-level columns
+inline float reStepperH()     { return px(64.0f); }   // top stage stepper band height
+inline float reCardPadX()     { return px(12.0f); }   // inside a card, horizontal
+inline float reCardPadY()     { return px(10.0f); }   // inside a card, vertical
+inline float reCardGap()      { return px(8.0f); }    // between sibling cards
+inline float reCardRound()    { return rounding(8.0f); }
+inline float reChipRound()    { return rounding(6.0f); }
+inline float reSectionGap()   { return px(16.0f); }   // above a section header
+inline float reHeadGap()      { return px(6.0f); }    // below a section header rule
+inline float reLabelGap()     { return px(3.0f); }    // label -> its control
+inline float reCtlGap()       { return px(8.0f); }    // control -> next label
+inline float reFieldW()       { return px(150.0f); }  // numeric / combo field width
+inline float reBtnH()         { return px(30.0f); }   // primary action button height
+inline float reBtnW()         { return px(112.0f); }  // standard action button width
+// Thumbnails: gallery contact sheet, session-rail card preview, fit/result preview tiles.
+inline float reThumbSm()      { return px(48.0f); }   // rail card / inline row preview
+inline float reThumbMd()      { return px(104.0f); }  // gallery contact-sheet tile
+inline float reThumbLg()      { return px(196.0f); }  // stage hero preview (scale mat, result)
+inline float reThumbGap()     { return px(6.0f); }    // between contact-sheet tiles
+// Live webcam preview: 16:9 hero with a minimum so the coverage dome stays legible.
+inline float rePreviewMinW()  { return px(360.0f); }
+inline float rePreviewMaxW()  { return px(720.0f); }
+inline float reDomeR()        { return px(56.0f); }   // coverage dome ring radius
+inline float reProgressH()    { return px(8.0f); }    // stage progress bar thickness
 }  // namespace metrics
 }  // namespace ui

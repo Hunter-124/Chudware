@@ -17,11 +17,26 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"      // ui::palette / uiScale / adaptivePanel / glassPanel / glassRowBackground
+#include "ui/metrics.h"    // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
 #include "ai_prefs.h"
 #include "ui/plm/graph_thumbs.h"
 
 namespace ui {
 namespace {
+
+// glassPanel / glassCardWash take a LOGICAL dp radius (they multiply by uiScale themselves),
+// so hand them the shared cpMenu corner converted back to dp — one source of truth for the
+// corner without double-scaling it.
+inline float rowRoundDp()  { return ui::metrics::cpMenuRowRound()  / ui::uiScale; }
+inline float chipRoundDp() { return ui::metrics::cpMenuChipRound() / ui::uiScale; }
+
+// Arc tone for a "share of a budget" ring — the SAME ladder the Copilot composer's
+// context-window meter uses (<50% ok, <85% warn, else err) so one colour means one thing.
+inline ImU32 fracArcCol(float frac) {
+    return frac < 0.50f ? Palette::toU32(palette.statusOk)
+         : frac < 0.85f ? Palette::toU32(palette.statusWarn)
+                        : Palette::toU32(palette.statusErr);
+}
 
 // One observed agent operation (from agent.tool_call). `target` is the human-readable
 // "what it acts on" string the orchestrator emits (doc id / part name / path fragment).
@@ -209,7 +224,23 @@ void drawActiveWorkView(AppState& st) {
         ImGui::Text("%d ops this run", (int)s_aw.ops.size());
         ImGui::PopStyleColor();
         if (s_aw.failed > 0) {
-            ImGui::SameLine(0, 12 * S);
+            // "How much of this run went wrong" as the app's shared circular gauge — the same
+            // ring shape every compact fraction readout uses, never a bespoke mini-bar.
+            ImGui::SameLine(0, ui::metrics::cpMenuSectionGap());
+            const float frac = s_aw.ops.empty()
+                ? 0.0f
+                : (float)s_aw.failed / (float)s_aw.ops.size();
+            ImDrawList* hdl = ImGui::GetWindowDrawList();
+            const float  r   = ImGui::GetFrameHeight() * 0.34f;
+            const float  lh  = ImGui::GetTextLineHeight();
+            const ImVec2 rp  = ImGui::GetCursorScreenPos();
+            ImVec4 track = surf.textTertiary;
+            track.w = 0.35f;
+            drawFractionRing(hdl, ImVec2(rp.x + r, rp.y + lh * 0.5f), r,
+                             ui::metrics::stroke(2.0f), frac,
+                             ImGui::ColorConvertFloat4ToU32(track), fracArcCol(frac));
+            ImGui::Dummy(ImVec2(r * 2.0f, lh));
+            ImGui::SameLine(0, ui::metrics::cpMenuLabelGap());
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 1.0f));
             ImGui::Text("%d failed", s_aw.failed);
@@ -242,7 +273,7 @@ void drawActiveWorkView(AppState& st) {
     }
 
     // ---- auto-scaling card grid ---------------------------------------------------------
-    const float gap     = 10.0f * S;
+    const float gap     = ui::metrics::cpMenuRowGap();
     const float availW  = ImGui::GetContentRegionAvail().x;
     const float cellMin = 250.0f * S;
     const int   cols    = std::max(1, std::min((int)cards.size(), (int)(availW / cellMin)));
@@ -265,7 +296,7 @@ void drawActiveWorkView(AppState& st) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
 
         // Glass slab + status frame.
-        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, 8.0f, surf);
+        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, rowRoundDp(), surf);
         const bool anyFail = !c.ops.empty() && !c.ops.back()->ok;
         ImVec4 frame(palette.glassBorder[0], palette.glassBorder[1], palette.glassBorder[2], 0.9f);
         float frameW = 1.0f * S;
@@ -282,14 +313,17 @@ void drawActiveWorkView(AppState& st) {
         } else if (c.tab->dirty) {
             frame = ImVec4(palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 0.85f);
         }
-        dl->AddRect(c0, c1, ImGui::ColorConvertFloat4ToU32(frame), 8.0f * S, 0, frameW);
+        dl->AddRect(c0, c1, ImGui::ColorConvertFloat4ToU32(frame),
+                    ui::metrics::cpMenuRowRound(), 0, frameW);
 
         // Preview area: worker-rendered iso thumbnail when one is cached/available (THUMB
         // SEAM), else the lightweight kind-tag placeholder. Docs with no saved path (unsaved
         // daemon WIP) never have anything to render from and always keep the placeholder.
         {
-            const ImVec2 p0(c0.x + 6 * S, c0.y + 6 * S);
-            const ImVec2 p1(c1.x - 6 * S, c0.y + 6 * S + prevH - 12 * S);
+            const float padX = ui::metrics::cpMenuRowPadX();
+            const float padY = ui::metrics::cpMenuRowPadY();
+            const ImVec2 p0(c0.x + padX, c0.y + padY);
+            const ImVec2 p1(c1.x - padX, c0.y + prevH - padY);
             GraphGridThumb gth;
             if (previewsOn && !c.tab->path.empty() && !projectDir.empty()) {
                 // DocTab carries no content hash (that's a cad_graph concept) — the key falls
@@ -311,7 +345,7 @@ void drawActiveWorkView(AppState& st) {
                 // Liquid-glass gradient placeholder (accent wash, top-bright -> bottom-faint)
                 // with the doc kind tag centered — reads as a preview slot, not a flat box.
                 const float acc[3] = {palette.accent[0], palette.accent[1], palette.accent[2]};
-                glassCardWash(dl, p0, p1, 6.0f * S, acc, c.tab->aiPulse ? 0.16f : 0.09f);
+                glassCardWash(dl, p0, p1, chipRoundDp(), acc, c.tab->aiPulse ? 0.16f : 0.09f);
                 const char* tag = kindTag(*c.tab);
                 const ImVec2 ts = ImGui::CalcTextSize(tag);
                 dl->AddText(ImVec2(p0.x + (p1.x - p0.x - ts.x) * 0.5f,
@@ -321,13 +355,13 @@ void drawActiveWorkView(AppState& st) {
         }
 
         // Title + kind.
-        const float textX = c0.x + 10 * S;
+        const float textX = c0.x + ui::metrics::cpMenuRowPadX();
         float y = c0.y + prevH + 2 * S;
         ImGui::SetCursorScreenPos(ImVec2(textX, y));
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
         ImGui::TextUnformatted(c.tab->displayTitle().c_str());
         ImGui::PopStyleColor();
-        ImGui::SameLine(0, 6 * S);
+        ImGui::SameLine(0, ui::metrics::cpMenuRowGap());
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::TextUnformatted(kindTag(*c.tab));
         ImGui::PopStyleColor();

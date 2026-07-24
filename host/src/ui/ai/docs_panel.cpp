@@ -25,9 +25,15 @@
 #include "core/app_state.h"
 #include "ui/file_dialog.h"   // ui::openFileDialog (native open dialog)
 #include "ui_theme.h"         // ui::palette / uiScale / adaptivePanel / glassPanel / glassRowBackground
+#include "ui/metrics.h"       // cpMenu* rhythm tokens (gutter / row pad / corner)
 
 namespace ui {
 namespace {
+
+// glassPanel / glassRowBackground take a LOGICAL dp radius (they multiply by uiScale
+// themselves), so hand them the shared cpMenu corner converted back to dp — one source of
+// truth for the corner without double-scaling it.
+inline float rowRoundDp() { return ui::metrics::cpMenuRowRound() / ui::uiScale; }
 
 constexpr size_t kMaxEditBytes = 1024 * 1024;   // above this a text file is read-only preview
 constexpr size_t kCsvMaxRows   = 1000;
@@ -615,7 +621,7 @@ bool docRow(const DocEntry& e, bool selected, const AdaptiveSurface& surf, float
             bool& removeClicked) {
     removeClicked = false;
     const float avail  = ImGui::GetContentRegionAvail().x;
-    const float rowH   = ImGui::GetTextLineHeightWithSpacing() + 8.0f * S;
+    const float rowH   = ImGui::GetTextLineHeightWithSpacing() + ui::metrics::cpMenuRowPadY();
     const float rowW   = avail - (e.attached ? 40.0f * S : 0.0f);
     ImGui::PushID(e.path.c_str());
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -624,7 +630,7 @@ bool docRow(const DocEntry& e, bool selected, const AdaptiveSurface& surf, float
     const bool hovered = ImGui::IsItemHovered();
     if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ui::glassRowBackground(dl, p0, ImVec2(p0.x + rowW, p0.y + rowH), 4.0f, false,
+    ui::glassRowBackground(dl, p0, ImVec2(p0.x + rowW, p0.y + rowH), rowRoundDp(), false,
                            selected, selected ? 0.5f : 0.30f);
     std::error_code ec;
     const bool missing = !std::filesystem::exists(e.path, ec);
@@ -632,11 +638,13 @@ bool docRow(const DocEntry& e, bool selected, const AdaptiveSurface& surf, float
                      : selected   ? surf.textPrimary
                                   : surf.textSecondary;
     const ImVec2 tagSz = ImGui::CalcTextSize(e.kind.c_str());
-    const float nameMaxW = rowW - tagSz.x - 22.0f * S;
+    const float padX = ui::metrics::cpMenuRowPadX();
+    const float padY = ui::metrics::cpMenuRowPadY() * 0.5f;
+    const float nameMaxW = rowW - tagSz.x - padX * 2.0f - ui::metrics::cpMenuRowGap();
     const std::string name = ellipsize(baseName(e.path), std::max(24.0f, nameMaxW));
-    dl->AddText(ImVec2(p0.x + 8.0f * S, p0.y + 4.0f * S),
+    dl->AddText(ImVec2(p0.x + padX, p0.y + padY),
                 ImGui::ColorConvertFloat4ToU32(txt), name.c_str());
-    dl->AddText(ImVec2(p0.x + rowW - tagSz.x - 8.0f * S, p0.y + 4.0f * S),
+    dl->AddText(ImVec2(p0.x + rowW - tagSz.x - padX, p0.y + padY),
                 ImGui::ColorConvertFloat4ToU32(surf.textTertiary), e.kind.c_str());
     if (hovered) {
         ImGui::BeginTooltip();
@@ -657,7 +665,7 @@ bool docRow(const DocEntry& e, bool selected, const AdaptiveSurface& surf, float
         ImGui::EndTooltip();
     }
     if (e.attached) {
-        ImGui::SameLine(0, 4.0f * S);
+        ImGui::SameLine(0, ui::metrics::cpMenuRowGap());
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         removeClicked = ImGui::SmallButton("(x)");
         ImGui::PopStyleColor();
@@ -758,29 +766,41 @@ void drawDocsPanel(AppState& st) {
     const float availW = ImGui::GetContentRegionAvail().x;
     const float leftW  = std::clamp(availW * 0.32f, 190.0f * S, 340.0f * S);
 
+    // Both content children scroll with the app's pill-on-hairline scrollbar (NoScrollbar
+    // suppresses ImGui's default bar so the pill replaces it rather than doubling it) and
+    // carry the shared menu gutter so rows never touch the glass edge.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
+
     // ---- LEFT: session document list ----
-    ImGui::BeginChild("##docs_left", ImVec2(leftW, 0.0f), ImGuiChildFlags_None);
+    ImGui::BeginChild("##docs_left", ImVec2(leftW, 0.0f),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 c0 = ImGui::GetWindowPos();
         const ImVec2 c1(c0.x + ImGui::GetWindowSize().x, c0.y + ImGui::GetWindowSize().y);
-        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, 8.0f, surf);
+        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, rowRoundDp(), surf);
         drawDocList(st, D, surf, S);
     }
+    drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
 
-    ImGui::SameLine();
+    ImGui::SameLine(0.0f, ui::metrics::cpMenuRowGap());
 
     // ---- RIGHT: preview / edit ----
-    ImGui::BeginChild("##docs_right", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
+    ImGui::BeginChild("##docs_right", ImVec2(0.0f, 0.0f),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 c0 = ImGui::GetWindowPos();
         const ImVec2 c1(c0.x + ImGui::GetWindowSize().x, c0.y + ImGui::GetWindowSize().y);
-        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, 8.0f, surf);
+        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, rowRoundDp(), surf);
         drawPreview(st, D, surf, S);
     }
+    drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
+
+    ImGui::PopStyleVar();
 }
 
 }  // namespace ui

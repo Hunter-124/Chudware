@@ -353,7 +353,7 @@ static void planDrawTodosTree(const PlanState& plan,
                        plan.shape == "phased_todo" ||
                        (phases.size() == 1 && phases[0] != "Tasks");
 
-    ImGui::Dummy(ImVec2(0, 3.0f * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
     ImGui::PushFont(fonts.medium);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextUnformatted("Todos");
@@ -440,7 +440,7 @@ static void planDrawObjectives(const PlanState& plan,
         if (it.kind == "objective" || plan.shape == "objectives") ++n;
     if (n == 0) return;
 
-    ImGui::Dummy(ImVec2(0, 3.0f * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
     ImGui::PushFont(fonts.medium);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextUnformatted("Objectives");
@@ -504,7 +504,7 @@ static void planDrawSubagents(const PlanState& plan,
 
     const ui::AdaptiveSurface& surf = chatSurf();
     const float sc = ui::uiScale;
-    ImGui::Dummy(ImVec2(0, 3.0f * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
     ImGui::PushFont(fonts.medium);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextUnformatted("Subagents");
@@ -578,7 +578,9 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
     if (!sectionOpen) {
         // Collapsed: one-line card with title + live progress; click re-opens.
         GlassBubble gb0 = beginGlassBubble(ImGui::GetContentRegionAvail().x,
-                                           ui::GlassLevel::Thin, 8.0f);
+                                           ui::GlassLevel::Thin, 10.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
         ImGui::BeginChild("##plansec_min", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         ImGui::PushFont(fonts.medium);
@@ -600,18 +602,21 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) hdrStore->SetBool(hdrId, true);
         ImGui::EndChild();
+        ImGui::PopStyleVar();   // ##plansec_min WindowPadding
         endGlassBubble(gb0);
         return;
     }
 
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##plansec", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 w0 = ImGui::GetWindowPos();
     // Left accent bar (planAccentBar alpha).
-    dl->AddRectFilled(w0, ImVec2(w0.x + 3.0f, w0.y + ImGui::GetWindowHeight()),
+    dl->AddRectFilled(w0, ImVec2(w0.x + ui::metrics::px(3.0f), w0.y + ImGui::GetWindowHeight()),
                       (ui::Palette::toU32(pal.accent) & 0x00FFFFFFu) |
                       ((uint32_t)(unsigned char)pal.planAccentBar << 24));
 
@@ -683,7 +688,7 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
 
     // TILES row — compact status+title chips with hover tooltips.
     if (!plan.items.empty() && plan.shape != "objectives") {
-        ImGui::Dummy(ImVec2(0, 2.0f * sc));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         if (plan.shape == "dag") {
             planDrawTilesRow(plan.items, activity, fonts, "node");
             // If no kind=node, fall back to all non-subagent items.
@@ -733,6 +738,7 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
 
     ImGui::PopStyleColor();
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##plansec WindowPadding
     ImRect planRect = endGlassBubble(gb);
 
     // Flat copy string for the whole section.
@@ -785,8 +791,10 @@ void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, surf);
-    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##clarify", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
@@ -845,7 +853,7 @@ void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         ImGui::PushID((int)i);
         std::string lbl = q.ask;
         if (!q.unit.empty()) lbl += "  (" + q.unit + ")";
-        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
         ImGui::TextWrapped("%s", lbl.c_str());
 
         if (q.kind == "choice" && !q.options.empty()) {
@@ -954,7 +962,7 @@ void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         ImGui::PopID();
     }
     if (!m.clarify.assumptions.empty()) {
-        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
         ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
         ImGui::TextUnformatted("Assuming:");
         ImGui::PopStyleColor();
@@ -964,11 +972,12 @@ void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
             dimText(a.c_str());
         }
     }
-    ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     bool build = primaryButton("Build it", ImVec2(-1, ui::metrics::copilotBtnH()));
     bool skip = ImGui::Button("Skip - use defaults", ImVec2(-1, 0));
     ImGui::PopStyleColor(5);   // Text + FrameBg/Hovered/Active + TextDisabled
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##clarify WindowPadding
     endGlassBubble(gb);
     if (build || skip) {
         // Fold each answer (or its suggested default on Skip) into the request.
@@ -1036,8 +1045,10 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     if (style != "edit" && style != "agent" && style != "swarm" && style != "eng_firm")
         style = style.empty() ? "agent" : style;
 
-    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##plan_approve", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
@@ -1099,7 +1110,7 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         return ImGui::Button(label, ImVec2(-1, 0));
     };
 
-    ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     // Edit plan — focuses composer with plan text for revision (resend as plan_only).
     bool editPlan = ImGui::Button("Edit plan", ImVec2(-1, 0));
 
@@ -1130,6 +1141,7 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     bool cancel = ImGui::Button("Cancel", ImVec2(-1, 0));
     ImGui::PopStyleColor();
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##plan_approve WindowPadding
     endGlassBubble(gb);
 
     if (cancel) {
@@ -1224,8 +1236,10 @@ void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##corporg", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1285,6 +1299,7 @@ void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##corporg WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     {
         // Prefer human summary over the JSON detail stash.
@@ -1318,8 +1333,10 @@ void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const bool blocked = a.opsCount > 0 || a.status == "warn";
 
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##corpmeet", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1389,11 +1406,12 @@ void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##corpmeet WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     if (blocked) {
         ImGui::GetWindowDrawList()->AddRect(
             cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusWarn),
-            8.0f * sc, 0, ui::metrics::stroke(1.5f));
+            ui::metrics::rounding(8.0f), 0, ui::metrics::stroke(1.5f));
     }
     {
         const std::string copyTxt = chatActivityCopyText(a);
@@ -1406,8 +1424,10 @@ void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##corpsteer", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1431,6 +1451,7 @@ void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##corpsteer WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     {
         const std::string copyTxt = chatActivityCopyText(a);
@@ -1441,9 +1462,8 @@ void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts) {
 
 // Muted single-line activity (route rejection / wind-down summary).
 void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts) {
-    const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 1 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     const std::string& line = !a.reason.empty() ? a.reason
                             : !a.title.empty()  ? a.title
                                                 : a.detail;
@@ -1471,8 +1491,10 @@ void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##classcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1610,6 +1632,7 @@ void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##classcard WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     {
         const std::string copyTxt = chatActivityCopyText(a);
@@ -1627,8 +1650,10 @@ void drawSwarmWaveCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##swarmwave", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1672,6 +1697,7 @@ void drawSwarmWaveCard(const ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##swarmwave WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     chatCopyContext(cardRect, "##swarm_wave_copy", chatActivityCopyText(a));
 }
@@ -1680,8 +1706,10 @@ void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##firmbids", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1755,7 +1783,7 @@ void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts) {
                     std::snprintf(aw, sizeof(aw), "Awarded %s  \xc2\xb7 $%.2f", awarded.c_str(), ausd);
                 else
                     std::snprintf(aw, sizeof(aw), "Awarded %s", awarded.c_str());
-                ImGui::Dummy(ImVec2(0, 2 * sc));
+                ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
                 ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.statusOk, surf));
                 ImGui::TextUnformatted(aw);
                 ImGui::PopStyleColor();
@@ -1764,6 +1792,7 @@ void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##firmbids WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     // Copy: human summary, never raw JSON.
     std::string copyTxt = a.title.empty() ? "Firm bids" : a.title;
@@ -1792,8 +1821,10 @@ void drawFirmAwardCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##firmaward", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1816,6 +1847,7 @@ void drawFirmAwardCard(const ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##firmaward WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     chatCopyContext(cardRect, "##firm_award_copy", chatActivityCopyText(a));
 }
@@ -1824,8 +1856,10 @@ void drawFirmTeamCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##firmteam", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1883,6 +1917,7 @@ void drawFirmTeamCard(const ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##firmteam WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     std::string copyTxt = a.title.empty() ? "Firm team" : a.title;
     if (!a.reason.empty()) { copyTxt += "\n"; copyTxt += a.reason; }
@@ -1905,8 +1940,10 @@ void drawFirmCommCard(ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##firmcomm", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1940,6 +1977,7 @@ void drawFirmCommCard(ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##firmcomm WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     std::string copyTxt = a.title.empty() ? "Internal comms" : a.title;
     if (!a.reason.empty()) { copyTxt += "\n"; copyTxt += a.reason; }
@@ -1953,8 +1991,10 @@ void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const bool planApproval = (a.opsCount > 0);  // feed stamps opsCount=1 for plan-approval
-    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##advisor", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -2022,6 +2062,7 @@ void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##advisor WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     std::string copyTxt = a.title.empty()
         ? (planApproval ? "Advisor-approved plan" : "Advisor")
@@ -2038,8 +2079,10 @@ void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, 1 * sc));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 6.0f);
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
     ImGui::BeginChild("##subrun", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -2061,6 +2104,7 @@ void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
     }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##subrun WindowPadding
     ImRect cardRect = endGlassBubble(gb);
     chatCopyContext(cardRect, "##sub_run_copy", chatActivityCopyText(a));
 }
@@ -2327,7 +2371,7 @@ static void drawAiVcTimelinePopover(AppState& st) {
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
     ImGui::TextUnformatted("Restore the part to a prior AI step.");
     ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
 
     if (s_aiVc.loading && s_aiVc.checkpoints.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
@@ -2351,13 +2395,22 @@ static void drawAiVcTimelinePopover(AppState& st) {
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float padX = 8.0f * sc;
-    const float padY = 6.0f * sc;
+    const float padX = ui::metrics::cpMenuRowPadX();
+    const float padY = ui::metrics::cpMenuRowPadY();
     const float rowH = ImGui::GetTextLineHeight() * 2.0f + padY * 2.0f + 2.0f * sc;
     const float restW = ImGui::CalcTextSize("Restore").x + ImGui::GetStyle().FramePadding.x * 2.0f;
 
-    ImGui::BeginChild("##ai_vc_list", ImVec2(ui::metrics::px(320), ui::metrics::px(280)),
-                      ImGuiChildFlags_None, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    // Content-driven height, capped: the fixed 280 px box left a slab of empty glass under one
+    // or two checkpoints, and AlwaysVerticalScrollbar put the last rectangular ImGui bar in a
+    // pane that draws the pill scrollbar everywhere else.
+    const float rowPitch = rowH + ui::metrics::cpMenuRowGap();
+    const float listH =
+        std::max(ui::metrics::px(96.0f),
+                 std::min(ui::metrics::px(280.0f),
+                          (float)s_aiVc.checkpoints.size() * rowPitch +
+                              ImGui::GetStyle().WindowPadding.y * 2.0f));
+    ImGui::BeginChild("##ai_vc_list", ImVec2(ui::metrics::px(320.0f), listH),
+                      ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     for (int i = 0; i < (int)s_aiVc.checkpoints.size(); ++i) {
         const AiVcCheckpoint& cp = s_aiVc.checkpoints[(size_t)i];
         ImGui::PushID(i);
@@ -2367,7 +2420,7 @@ static void drawAiVcTimelinePopover(AppState& st) {
 
         ImGui::InvisibleButton("##cprow", ImVec2(std::max(1.0f, rowW), rowH));
         const bool hov = ImGui::IsItemHovered();
-        ui::glassRowBackground(dl, rowMin, rowMax, 8.0f * sc, (i % 2) == 1, false,
+        ui::glassRowBackground(dl, rowMin, rowMax, ui::metrics::cpMenuRowRound(), (i % 2) == 1, false,
                                hov ? 0.42f : 0.28f);
 
         char title[160];
@@ -2422,9 +2475,12 @@ static void drawAiVcTimelinePopover(AppState& st) {
                 ImGui::SetTooltip("Restore the part to this checkpoint.");
         }
 
-        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + 3.0f * sc));
+        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + ui::metrics::cpMenuRowGap()));
         ImGui::PopID();
     }
+    // Pill scrollbar (NoScrollbar above so it replaces, not doubles, the default bar) — MUST be
+    // submitted while the list child is still the current window.
+    ui::drawWindowPillScrollbarV(chatSurf());
     ImGui::EndChild();
 }
 

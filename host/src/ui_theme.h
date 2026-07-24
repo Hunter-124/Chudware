@@ -468,4 +468,11 @@ void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackM
 // to carry ImGuiWindowFlags_NoScrollbar (so it replaces, not doubles, the default bar).
 void drawWindowPillScrollbarV(const AdaptiveSurface& surf);
 
+// Circular fraction gauge: a full track ring plus a clockwise arc from 12 o'clock covering
+// `frac` (0..1) of the circle. PURE draw — no layout, no interaction, no ImGui item. Shared by
+// the Copilot composer's context-window / provider-limit rings and the Settings Accounts rows
+// so every "how much of a budget is used" readout in the app has ONE shape.
+void drawFractionRing(ImDrawList* dl, const ImVec2& center, float radius, float thickness,
+                      float frac, ImU32 trackCol, ImU32 arcCol);
+
 }  // namespace ui

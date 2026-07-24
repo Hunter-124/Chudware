@@ -14,6 +14,7 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #ifdef __EMSCRIPTEN__
+#include <emscripten.h>
 #include <emscripten/html5.h>
 #include <GLFW/emscripten_glfw3.h>
 #endif
@@ -428,6 +429,75 @@ static ChipResult drawChipAt(const char* btnId,
 // pills that only wash on hover/active. Click opens the same folder picker the
 // old PLM-tab nav button used (see plm/plm_workspace.cpp drawNavFolderButton,
 // now removed in favor of this one shared control).
+// "Project Folder" affordance (File > Open Project Folder..., and the title-bar
+// active-project chip below) — same trigger, platform-appropriate target:
+//   - Native: an OS folder picker choosing the CAD workspace dir (unchanged).
+//   - Web: the native-dialog stand-in (openFolderDialog()'s Emscripten branch)
+//     browses /workspace/* — the engine's live doc tree, not a place a team
+//     drops arbitrary files. The Team Bucket (/bucket) is that place, so on
+//     web this opens the SAME centered-overlay treatment the workspace picker
+//     uses (see chudware_web_dialogs.js's #chudware-ws-browse: dark panel,
+//     backdrop, middle of the screen) but with the bucket page embedded in an
+//     iframe as its content instead of a bespoke re-implementation — reuses
+//     bucket.html/bucket.js/the /api/bucket/* surface wholesale, so upload,
+//     drag-drop, rename, mkdir, download all just work with zero duplicated
+//     logic. Fire-and-forget (no path is picked/returned), so no Asyncify and
+//     no setActiveProjectDir() call — the bucket is independent of the CAD
+//     workspace. /bucket itself is no longer a directly-linked destination
+//     (dropped from the portal nav) — this modal is the only way in now.
+static void openProjectFolderAction(AppState& st) {
+#ifdef __EMSCRIPTEN__
+    (void)st;
+    EM_ASM({
+        var old = document.getElementById('chudware-bucket-modal');
+        if (old) { try { old.remove(); } catch (e) {} }
+        var overlay = document.createElement('div');
+        overlay.id = 'chudware-bucket-modal';
+        overlay.style.cssText =
+            'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,0.45);' +
+            'display:flex;align-items:center;justify-content:center;font-family:' +
+            'system-ui,-apple-system,Segoe UI,Roboto,sans-serif;';
+        var panel = document.createElement('div');
+        panel.style.cssText =
+            'background:#1e1e24;color:#e8e8ee;border-radius:10px;' +
+            'width:min(1100px,94vw);height:min(760px,88vh);' +
+            'display:flex;flex-direction:column;overflow:hidden;' +
+            'box-shadow:0 12px 40px rgba(0,0,0,0.45);border:1px solid #3a3a48;';
+        var titleBar = document.createElement('div');
+        titleBar.style.cssText =
+            'padding:10px 14px;font-weight:600;font-size:14px;' +
+            'border-bottom:1px solid #3a3a48;flex:0 0 auto;' +
+            'display:flex;align-items:center;justify-content:space-between;';
+        var titleLbl = document.createElement('span');
+        titleLbl.textContent = 'Project Folder \u2014 Team Bucket';
+        var closeBtn = document.createElement('button');
+        closeBtn.textContent = '\u00d7';
+        closeBtn.setAttribute('aria-label', 'Close');
+        closeBtn.style.cssText =
+            'background:transparent;color:#c0c0cc;border:none;font-size:20px;' +
+            'line-height:1;cursor:pointer;padding:2px 9px;border-radius:6px;';
+        closeBtn.onmouseenter = function () { closeBtn.style.background = '#2a2a38'; };
+        closeBtn.onmouseleave = function () { closeBtn.style.background = 'transparent'; };
+        closeBtn.onclick = function () { overlay.remove(); };
+        titleBar.appendChild(titleLbl);
+        titleBar.appendChild(closeBtn);
+        var frame = document.createElement('iframe');
+        frame.src = '/bucket';
+        frame.style.cssText = 'flex:1 1 auto;border:0;width:100%;background:#fff;';
+        panel.appendChild(titleBar);
+        panel.appendChild(frame);
+        overlay.appendChild(panel);
+        overlay.addEventListener('mousedown', function (e) {
+            if (e.target === overlay) overlay.remove();
+        });
+        document.body.appendChild(overlay);
+    });
+#else
+    std::string abs = ui::openFolderDialog();
+    if (!abs.empty()) setActiveProjectDir(st, abs);
+#endif
+}
+
 static ChipResult drawActiveProjectControl(AppState& st, ImVec2 p0, float h, ImFont* boldFont,
                                             float& outW) {
     const float S = ui::uiScale;
@@ -559,8 +629,7 @@ struct FilMenuDrawer {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) st.requestOpenDialog = true;
         if (ImGui::MenuItem("Import...")) st.requestOpenDialog = true;
         if (ImGui::MenuItem("Open Project Folder...")) {
-            std::string abs = ui::openFolderDialog();
-            if (!abs.empty()) setActiveProjectDir(st, abs);
+            openProjectFolderAction(st);
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc)) st.requestSave = true;
@@ -902,8 +971,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             auto res = drawActiveProjectControl(st, ctrlP0, chipH, boldFont, ctrlW);
             hitLayout.addSpan((int)(cx - winX), (int)(cx - winX + ctrlW));
             if (res.clicked) {
-                std::string abs = ui::openFolderDialog();
-                if (!abs.empty()) setActiveProjectDir(st, abs);
+                openProjectFolderAction(st);
             }
             cx += ctrlW + 10.0f * s;
         }

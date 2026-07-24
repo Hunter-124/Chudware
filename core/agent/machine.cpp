@@ -21,10 +21,17 @@ std::mutex g_run_ctl_mtx;
 std::map<std::string, RunControl> g_run_ctl;
 }  // namespace
 
-void register_run_control(const std::string& run_id, RunControl control) {
+void register_run_control(const std::string& run_id, RunControl& control) {
     if (run_id.empty()) return;
     std::lock_guard<std::mutex> lk(g_run_ctl_mtx);
-    g_run_ctl[run_id] = std::move(control);
+    auto it = g_run_ctl.find(run_id);
+    if (it != g_run_ctl.end()) {
+        // Same id already live (nested same-id run): adopt the existing control so
+        // both nesting levels share ONE flag and an in-between cancel is preserved.
+        control = it->second;
+        return;
+    }
+    g_run_ctl.emplace(run_id, control);
 }
 
 void unregister_run_control(const std::string& run_id) {

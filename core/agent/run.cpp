@@ -640,6 +640,9 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         }
+        // Whole process group: the worker plus any tool subprocesses it spawned
+        // (both sides setpgid the child into its own group).
+        ::kill(-pid, SIGKILL);
         ::kill(pid, SIGKILL);
         ::waitpid(pid, nullptr, 0);
     };
@@ -673,7 +676,20 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     std::string read_buf;
     bool got_final = false;
     bool ok_final = false;
+    // Stop button: run_design registered this run's RunControl and pointed the
+    // provider cancel flag at it before entering the pre-flight branch, but the
+    // python worker cannot observe that flag across the process boundary — THIS
+    // loop is the cancellation point. Poll it every iteration (200ms poll tick);
+    // on cancel, hard-kill the worker's process group so the output stream dies
+    // immediately instead of streaming on for up to 5 minutes.
+    const std::atomic<bool>* cancel_flag = provider_cancel_flag();
+    bool cancelled = false;
     for (;;) {
+        if (cancel_flag && cancel_flag->load(std::memory_order_relaxed)) {
+            cancelled = true;
+            err = "cancelled";
+            break;
+        }
         size_t nl = read_buf.find('\n');
         if (nl == std::string::npos) {
             if (std::chrono::steady_clock::now() >= deadline) {
@@ -738,7 +754,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         break;
     }
     ::close(rd);
-    reap(got_final);
+    reap(got_final && !cancelled);
     return ok_final;
 }
 #else   // _WIN32
@@ -773,6 +789,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // parent's flag back so later parent-level provider calls stay cancellable.
     const std::atomic<bool>* prev_cancel_flag = provider_cancel_flag();
     set_provider_cancel_flag(run_ctl.flag.get());
+    // A cancel that hit the parent run while this nest was being entered must not
+    // be lost: inherit an already-flipped parent flag into this run's control.
+    if (prev_cancel_flag && prev_cancel_flag->load(std::memory_order_acquire))
+        run_ctl.request_cancel();
     struct ProvCancelGuard {
         const std::atomic<bool>* prev;
         ~ProvCancelGuard() { set_provider_cancel_flag(prev); }
@@ -984,6 +1004,14 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         json turn;
         std::string worker_err;
         if (!call_admin_worker_turn(request, run_id, events, turn, worker_err)) {
+            if (worker_err == "cancelled" || run_ctl.cancelled()) {
+                events.emit("run_finished", json{{"status", "cancelled"},
+                                                 {"stop_reason", "cancelled"}});
+                return json{{"run_id", run_id},
+                            {"status", "cancelled"},
+                            {"stop_reason", "cancelled"},
+                            {"doc_id", doc_id}};
+            }
             events.emit("run_note", json{{"note", "general-work worker turn unavailable"},
                                          {"reason", worker_err}});
             return blocked_response();
@@ -2707,6 +2735,8 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     } run_ctl_guard{run_id};
     const std::atomic<bool>* prev_cancel_flag = provider_cancel_flag();
     set_provider_cancel_flag(run_ctl.flag.get());
+    if (prev_cancel_flag && prev_cancel_flag->load(std::memory_order_acquire))
+        run_ctl.request_cancel();
     struct ProvCancelGuard {
         const std::atomic<bool>* prev;
         ~ProvCancelGuard() { set_provider_cancel_flag(prev); }
@@ -3405,6 +3435,8 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     // parent's flag back so later parent-level provider calls stay cancellable.
     const std::atomic<bool>* prev_cancel_flag = provider_cancel_flag();
     set_provider_cancel_flag(run_ctl.flag.get());
+    if (prev_cancel_flag && prev_cancel_flag->load(std::memory_order_acquire))
+        run_ctl.request_cancel();
     struct ProvCancelGuard {
         const std::atomic<bool>* prev;
         ~ProvCancelGuard() { set_provider_cancel_flag(prev); }

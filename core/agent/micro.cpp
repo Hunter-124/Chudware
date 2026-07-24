@@ -776,6 +776,8 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
     // parent's flag back so later parent-level provider calls stay cancellable.
     const std::atomic<bool>* prev_cancel_flag = provider_cancel_flag();
     set_provider_cancel_flag(run_ctl.flag.get());
+    if (prev_cancel_flag && prev_cancel_flag->load(std::memory_order_acquire))
+        run_ctl.request_cancel();
     struct ProvCancelGuard {
         const std::atomic<bool>* prev;
         ~ProvCancelGuard() { set_provider_cancel_flag(prev); }

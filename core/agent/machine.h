@@ -128,8 +128,12 @@ struct RunControl {
 };
 
 // Process-wide run-id → RunControl registry. Runs register on start, unregister on finish.
-// agent_cancel(run_id) flips the flag so stage boundaries + HTTP xfer callbacks abort.
-void register_run_control(const std::string& run_id, RunControl control);
+// Registering an id that is ALREADY live ADOPTS the existing control (control is
+// overwritten with the registered one, sharing its flag) instead of replacing it —
+// nested same-id runs (run_assembly_design's single-doc fallthrough tail-calls
+// run_design with its own run_id) must never mint a fresh un-flipped flag, or a
+// Stop that landed before the nested run registered is silently lost.
+void register_run_control(const std::string& run_id, RunControl& control);
 void unregister_run_control(const std::string& run_id);
 // Returns {ok:true, cancelled:bool} — cancelled is true when a live run was flagged.
 // Empty run_id is a no-op (cancelled:false); use cancel_all_runs to stop every live run.

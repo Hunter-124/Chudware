@@ -166,7 +166,13 @@ const char* kDefaultFastenerFamily = "shcs";
 // pitch only appears when both are given. Returns false when no M-thread token.
 bool parse_metric(const std::string& mpn, std::string& thread, json& length_mm) {
     std::smatch m;
-    if (!re_search(kMetricRe, fold_multiplication_sign(mpn), &m)) return false;
+    // NAMED local, not a temporary: std::smatch stores iterators into its subject
+    // string, so the folded string must outlive every m[i] access below (a temporary
+    // bound only to re_search's parameter is destroyed at the end of that call,
+    // leaving m's iterators dangling -- UB that happened to read back clean bytes on
+    // Linux/glibc's allocator but surfaced as corrupt captures under MSVC).
+    const std::string folded = fold_multiplication_sign(mpn);
+    if (!re_search(kMetricRe, folded, &m)) return false;
     thread = "M" + m[1].str();
     const std::string pitch = m[2].str();
     std::string length = m[3].str();

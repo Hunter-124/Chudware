@@ -3971,10 +3971,30 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       if ((hn->kind == "part" || hn->kind == "assembly" || hn->kind == "doc" ||
            hn->kind == "drawing") &&
           !hn->path.empty()) {
-        const std::string abs = resolveNodeAbsPath(st, *hn);
-        if (const GraphThumb *th = ensureGraphThumb(abs)) {
+        // Prefer the worker-rendered iso thumbnail (same pipeline as the
+        // sidebar/grid). The embedded thumbnail.png is often a blank grey
+        // placeholder for extracted/reverse-engineered packages, which is why
+        // the hover preview looked dead while the sidebar looked fine. Resolve
+        // instance nodes to their referenced doc first.
+        const GNode *instTgt = instanceTarget(G, *hn);
+        const GNode &tn = instTgt ? *instTgt : *hn;
+        const std::string abs = resolveNodeAbsPath(st, tn);
+        GraphGridThumb gth;
+        if (!abs.empty()) {
+          const std::string tkey = graphThumbKey(tn.metaDh, tn.metaMt, abs);
+          gth = graphThumbEnsure(st, G.projectDir, tkey, abs);
+        }
+        // Only fall back to the embedded png when the worker render is not
+        // coming (failed / nothing queued) — avoids flashing the grey stub
+        // while a proper render is in flight.
+        const GraphThumb *th = nullptr;
+        if (!gth.tex && !gth.pending && !abs.empty())
+          th = ensureGraphThumb(abs);
+        if (gth.tex || (th && th->tex)) {
+          const GLuint tex = gth.tex ? gth.tex : th->tex;
           const float maxSide = 120.0f * S;
-          float tw = (float)th->w, thh = (float)th->h;
+          float tw = (float)(gth.tex ? gth.w : th->w),
+                thh = (float)(gth.tex ? gth.h : th->h);
           if (tw > 1.0f && thh > 1.0f) {
             const float sc = std::min(maxSide / tw, maxSide / thh);
             tw *= sc;
@@ -3982,7 +4002,7 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
           } else {
             tw = thh = maxSide;
           }
-          ImGui::Image((ImTextureID)(intptr_t)th->tex, ImVec2(tw, thh));
+          ImGui::Image((ImTextureID)(intptr_t)tex, ImVec2(tw, thh));
         }
       }
       ImGui::PushStyleColor(

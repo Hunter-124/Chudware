@@ -34,6 +34,51 @@ chudware_ipc::EngineClient* g_client = nullptr;  // non-null iff daemon mode won
 bool g_daemon = false;
 std::once_flag g_once;
 
+chudware_ipc::EngineClient* g_runClient = nullptr;  // dedicated conn for long streaming runs
+std::mutex g_runClientMtx;                          // guards g_runClient creation
+
+// The long streaming agent methods stream for minutes and EngineClient::call holds that
+// connection's mutex for the whole call. Running them on the shared g_client starved the
+// GL thread — openMirrorTab's synchronous attach_doc, doc_discard on close, the
+// Recover/Discard buttons all call g_client directly and block on its mutex until the run
+// unwinds. That is the "freeze after Stop" hang: Stop cancels cooperatively but the run
+// keeps holding g_client until it actually returns, so the UI stays wedged. Give the long
+// run its OWN connection instead; hostd serves each connection on its own thread and its
+// doc registry gates multi-writer overlap (same rationale as the cancel/steer side
+// sockets), so concurrent edits are safe. Only one long run is live at a time
+// (WorkerClient::callMtx_), so one reserved connection suffices.
+//
+// Both naming variants must match: the host RPC names (agent_run_v2 / agent_mission_v1)
+// reach engine::call directly when the C++ agent is OFF, but with it ON WorkerClient's
+// routeAgentToCpp translates them to the CORE names (agent_run / agent_mission_v1) before
+// engine::call — miss either and the run silently falls back to the shared client.
+bool isLongRunMethod(const std::string& method) {
+    return method == "agent_run" || method == "agent_run_v2" ||
+           method == "agent_mission" || method == "agent_mission_v1";
+}
+
+// Lazily open (and reuse) the dedicated long-run connection. nullptr on connect failure —
+// the caller then falls back to the shared client (correctness over the anti-freeze
+// optimization). EngineClient reconnects itself on EOF, so one connect is reused forever.
+chudware_ipc::EngineClient* runClient() {
+    std::lock_guard<std::mutex> lk(g_runClientMtx);
+    if (g_runClient) return g_runClient;
+    auto* c = new chudware_ipc::EngineClient();
+    chudware_ipc::EngineClient::Options opts;
+    opts.hostdBin = hostdBinHint();
+    opts.clientKind = "gui";
+    std::string err;
+    if (!c->connectOrSpawn(opts, err)) {
+        std::fprintf(stderr,
+                     "[engine] run-connection connect failed (%s) — long runs share the "
+                     "GUI connection\n",
+                     err.c_str());
+        delete c;
+        return nullptr;
+    }
+    return g_runClient = c;
+}
+
 std::string selfExePath() {
 #ifdef __EMSCRIPTEN__
     return std::string();
@@ -171,19 +216,19 @@ chudware_ipc::EngineClient* client() {
 
 // Inner dispatch: daemon socket round-trip (with loading-wait and ro-upgrade retries) or
 // the in-process DLL call. Split out so the doc_activate compat shim below can re-enter.
-static bool callDispatch(const std::string& method, const json& params, json& result,
-                         std::string& err, int timeoutMs,
+static bool callDispatch(chudware_ipc::EngineClient* cl, const std::string& method,
+                         const json& params, json& result, std::string& err, int timeoutMs,
                          const std::function<void(const json&)>& onEvent) {
     // timeoutMs only bounds the daemon round trip; the in-process DLL call is
     // synchronous and can't be interrupted (matches the pre-daemon behavior).
     if (!daemonMode()) return core::cpp_core().call(method, params, result, err);
-    bool ok = g_client->call(method, params, result, err, timeoutMs, onEvent);
+    bool ok = cl->call(method, params, result, err, timeoutMs, onEvent);
     if (!ok && result.is_object()) {
         const std::string code = result.value("code", std::string());
         if (code == "loading") {
             std::string werr;
-            if (waitEngineReady(*g_client, werr))
-                ok = g_client->call(method, params, result, err, timeoutMs, onEvent);
+            if (waitEngineReady(*cl, werr))
+                ok = cl->call(method, params, result, err, timeoutMs, onEvent);
             else if (err.empty())
                 err = werr;
         } else if (code == "read_only" && params.is_object() && params.contains("doc_id")) {
@@ -192,9 +237,9 @@ static bool callDispatch(const std::string& method, const json& params, json& re
             // once. Documented Phase 4 choice: auto-upgrade over new UI.
             json ar;
             std::string ae;
-            if (g_client->call("attach_doc",
-                               json{{"doc_id", params["doc_id"]}, {"mode", "rw"}}, ar, ae))
-                ok = g_client->call(method, params, result, err, timeoutMs);
+            if (cl->call("attach_doc",
+                         json{{"doc_id", params["doc_id"]}, {"mode", "rw"}}, ar, ae))
+                ok = cl->call(method, params, result, err, timeoutMs);
         }
     }
     return ok;
@@ -202,7 +247,15 @@ static bool callDispatch(const std::string& method, const json& params, json& re
 
 bool call(const std::string& method, const json& params, json& result, std::string& err,
           int timeoutMs, const std::function<void(const json&)>& onEvent) {
-    bool ok = callDispatch(method, params, result, err, timeoutMs, onEvent);
+    // Long streaming runs go on a dedicated connection so they never hold the shared GUI
+    // client's call mutex (needed by the GL thread for attach_doc / doc_discard / event
+    // drains) — otherwise a live run freezes the UI until it unwinds. Fall back to the
+    // shared client if the dedicated connection can't be established.
+    chudware_ipc::EngineClient* cl = g_client;
+    if (daemonMode() && isLongRunMethod(method)) {
+        if (auto* rc = runClient()) cl = rc;
+    }
+    bool ok = callDispatch(cl, method, params, result, err, timeoutMs, onEvent);
     // Compat shim: doc_activate (cheap tab-switch activation, cached-serve) is served by
     // this tree's engine, but a long-lived hostd daemon may predate it. On "unknown
     // method" fall back ONCE to the historical forced doc_rebuild — identical response
@@ -214,10 +267,19 @@ bool call(const std::string& method, const json& params, json& result, std::stri
                                         .find("unknown method") != std::string::npos);
         if (unknown) {
             err.clear();
-            ok = callDispatch("doc_rebuild", params, result, err, timeoutMs, {});
+            ok = callDispatch(g_client, "doc_rebuild", params, result, err, timeoutMs, {});
         }
     }
     return ok;
+}
+
+// Wake a blocked long run on its dedicated connection at teardown (mirror of
+// EngineClient::abortPending on the shared client) so app quit / AsyncRpc shutdown never
+// hangs on a multi-minute modeling call. No-op if the run connection was never opened.
+// Safe from any thread.
+void abortRunClient() {
+    std::lock_guard<std::mutex> lk(g_runClientMtx);
+    if (g_runClient) g_runClient->abortPending();
 }
 
 bool available() {

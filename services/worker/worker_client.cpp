@@ -721,6 +721,9 @@ void WorkerClient::abortPending() {
   if (engine::daemonMode()) {
     if (auto *c = engine::client())
       c->abortPending();
+    // The long agent/mission run now streams on its own dedicated connection
+    // (engine_backend runClient) — abort that too, or a blocked run pins quit.
+    engine::abortRunClient();
   }
 }
 

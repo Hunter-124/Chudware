@@ -61,6 +61,10 @@ bool call(const std::string& method, const nlohmann::json& params,
           nlohmann::json& result, std::string& err, int timeoutMs = -1,
           const std::function<void(const nlohmann::json&)>& onEvent = {});
 
+// Teardown-only: wake a blocked long agent/mission run on its dedicated connection so app
+// quit / AsyncRpc shutdown never hangs on a multi-minute call. No-op if never opened.
+void abortRunClient();
+
 // Backend availability probes with InProcCore semantics (routing predicates in
 // worker_client.cpp use these instead of core::cpp_core() directly). In daemon
 // mode both report the connection state (the daemon owns the DLL).

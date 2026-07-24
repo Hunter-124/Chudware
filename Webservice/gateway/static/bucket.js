@@ -162,20 +162,83 @@
     } catch (e) { setStatus(String(e.message || e), "err"); }
   }
 
+  // The whole app sits behind a Cloudflare Tunnel, which hard-caps every HTTP
+  // request at 100MB (Free/Pro plans) — no way around it short of upgrading
+  // the Cloudflare plan. A folder drop can easily add up to far more than
+  // that in one shot, and a request over the cap gets killed at Cloudflare's
+  // edge before it ever reaches this app, which surfaces in the browser as a
+  // bare "Failed to fetch" network error. So: split into small batches well
+  // under the cap and upload them with limited concurrency instead of one
+  // giant multipart POST.
+  var UPLOAD_BATCH_TARGET_BYTES = 40 * 1024 * 1024;  // soft grouping size per request
+  var UPLOAD_HARD_CAP_BYTES = 95 * 1024 * 1024;      // safety margin under Cloudflare's 100MB/request cap
+  var UPLOAD_BATCH_MAX_FILES = 100;
+  var UPLOAD_CONCURRENCY = 3;
+
   // entries: array of { file: File, relPath: "sub/dir/name.ext" }
-  async function uploadEntries(entries) {
-    if (!entries || !entries.length) return;
+  function chunkEntries(entries) {
+    var batches = [];
+    var cur = [];
+    var curBytes = 0;
+    entries.forEach(function (e) {
+      var sz = e.file.size || 0;
+      if (cur.length && (curBytes + sz > UPLOAD_BATCH_TARGET_BYTES || cur.length >= UPLOAD_BATCH_MAX_FILES)) {
+        batches.push(cur);
+        cur = [];
+        curBytes = 0;
+      }
+      cur.push(e);
+      curBytes += sz;
+    });
+    if (cur.length) batches.push(cur);
+    return batches;
+  }
+
+  async function uploadBatch(entries) {
     var form = new FormData();
     entries.forEach(function (e) { form.append("files", e.file, e.relPath); });
     form.append("dir", state.dir);
-    setStatus("Uploading " + entries.length + " file(s)…");
-    try {
-      var r = await api("/api/bucket/upload", { method: "POST", body: form });
-      var msg = "Uploaded " + r.uploaded.length + " file(s).";
-      if (r.skipped && r.skipped.length) msg += " Skipped " + r.skipped.length + ".";
-      setStatus(msg, "ok");
-      refresh();
-    } catch (e) { setStatus(String(e.message || e), "err"); }
+    return api("/api/bucket/upload", { method: "POST", body: form });
+  }
+
+  async function uploadEntries(entries) {
+    if (!entries || !entries.length) return;
+    var oversize = entries.filter(function (e) { return (e.file.size || 0) > UPLOAD_HARD_CAP_BYTES; });
+    entries = entries.filter(function (e) { return (e.file.size || 0) <= UPLOAD_HARD_CAP_BYTES; });
+    var batches = chunkEntries(entries);
+    var uploadedCount = 0, skippedCount = 0;
+    var failedBatches = [];
+    var next = 0, doneBatches = 0;
+    var totalBatches = batches.length;
+
+    async function worker() {
+      while (next < batches.length) {
+        var batch = batches[next++];
+        try {
+          var r = await uploadBatch(batch);
+          uploadedCount += r.uploaded.length;
+          skippedCount += (r.skipped || []).length;
+        } catch (e) {
+          failedBatches.push(String(e.message || e));
+        }
+        doneBatches++;
+        if (totalBatches > 1) {
+          setStatus("Uploading… " + doneBatches + "/" + totalBatches + " batch(es), " + uploadedCount + " file(s) done so far");
+        }
+      }
+    }
+
+    setStatus("Uploading " + entries.length + " file(s)" + (totalBatches > 1 ? " in " + totalBatches + " batch(es)" : "") + "…");
+    var workers = [];
+    for (var i = 0; i < Math.min(UPLOAD_CONCURRENCY, totalBatches); i++) workers.push(worker());
+    await Promise.all(workers);
+
+    var msg = "Uploaded " + uploadedCount + " file(s).";
+    if (skippedCount) msg += " Skipped " + skippedCount + ".";
+    if (oversize.length) msg += " " + oversize.length + " file(s) exceeded the ~95MB single-request limit (Cloudflare Tunnel cap) and were not uploaded.";
+    if (failedBatches.length) msg += " " + failedBatches.length + " batch(es) failed: " + failedBatches[0] + (failedBatches.length > 1 ? " (+" + (failedBatches.length - 1) + " more)" : "");
+    setStatus(msg, (failedBatches.length || oversize.length) ? "err" : "ok");
+    refresh();
   }
 
   // Flat FileList (plain <input multiple> or drag-drop fallback without entry API).

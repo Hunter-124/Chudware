@@ -373,14 +373,17 @@ static ChipResult drawChipAt(const char* btnId,
     // so chipMeasureW and the layout share one width — previously active pills measured with
     // bold but inactive layout used the regular font, which shifted icon↔label spacing.
     // Draw weight still tracks active (bold) vs rest (regular) for the visual cue.
+    const bool hasLabel = (label && label[0]);
     ImFont* measureFont = boldFont ? boldFont : ImGui::GetFont();
     ImFont* drawFont    = (isActive && boldFont) ? boldFont : ImGui::GetFont();
-    const float textW = measureFont->CalcTextSizeA(measureFont->FontSize, FLT_MAX, 0, label).x;
+    const float textW = hasLabel
+        ? measureFont->CalcTextSizeA(measureFont->FontSize, FLT_MAX, 0, label).x
+        : 0.0f;
 
     const ImVec4 textColV(ui::palette.text[0], ui::palette.text[1],
                           ui::palette.text[2], ui::palette.text[3]);
     const ImU32 textU32 = ImGui::ColorConvertFloat4ToU32(textColV);
-    const float contentW = iconSz + iconGap + textW;
+    const float contentW = hasLabel ? (iconSz + iconGap + textW) : iconSz;
     const float gx = p0.x + (chipW - contentW) * 0.5f;  // group left edge
     const ImVec2 iconCenter(gx + iconSz * 0.5f, p0.y + chipH * 0.5f);
     // Prefer a crisp procedural TbIcon for the small (~13–15 px) workspace chips.
@@ -414,9 +417,11 @@ static ChipResult drawChipAt(const char* btnId,
     } else {
         drawTbIcon(dl, icon, iconCenter, iconSz, textU32);
     }
-    const float tx = gx + iconSz + iconGap;
-    const float ty = p0.y + (chipH - drawFont->FontSize) * 0.5f;
-    dl->AddText(drawFont, drawFont->FontSize, ImVec2(tx, ty), textU32, label);
+    if (hasLabel) {
+        const float tx = gx + iconSz + iconGap;
+        const float ty = p0.y + (chipH - drawFont->FontSize) * 0.5f;
+        dl->AddText(drawFont, drawFont->FontSize, ImVec2(tx, ty), textU32, label);
+    }
 
     return {clicked, hovered};
 }
@@ -653,9 +658,11 @@ static ChipResult drawActiveProjectControl(AppState& st, ImVec2 p0, float h, ImF
     return {clicked, hovered};
 }
 
-// Measure chip width (same formula as drawChipAt so sizes are consistent).
+// Measure chip width (same formula as drawChipAt so sizes are consistent). An empty
+// label measures as an icon-only chip (no label gap) — see drawChipAt's hasLabel path.
 static float chipMeasureW(const char* label, float padX, ImFont* boldFont,
                           float iconSz, float iconGap) {
+    if (!label || !label[0]) return iconSz + padX * 2.0f;
     float textW;
     if (boldFont)
         textW = boldFont->CalcTextSizeA(boldFont->FontSize, FLT_MAX, 0, label).x;
@@ -1069,17 +1076,34 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         const float tabGapX  = 3.0f * s;    // gap between tabs
         const float tabPadX  = 10.0f * s;   // horizontal text padding inside each tab
 
-        // Measure total width of all tabs.
+        // Measure the full labelled strip. A workspace tab the user cannot see is a
+        // workspace they cannot REACH (the tab strip is the only mouse route to it), so
+        // the strip must never silently drop one: when labels don't fit, every chip
+        // except the active one collapses to icon-only and gains a name tooltip.
         const bool fwTabVisible = ui::firmwareTabVisible(st);   // T-FIN5 disclosure
-        float totalTabsW = 0.0f;
-        for (int i = 0; i < kTabCount; ++i) {
-            if (kTabs[i].ws == AppState::Workspace::Firmware && !fwTabVisible) continue;
-            if (totalTabsW > 0.0f) totalTabsW += tabGapX;
-            totalTabsW += chipMeasureW(kTabs[i].label, tabPadX, boldFont, iconSz, iconGap);
-        }
+        auto tabVisible = [&](int i) {
+            return kTabs[i].ws != AppState::Workspace::Firmware || fwTabVisible;
+        };
+        // The active tab keeps its label in icon-only mode so "where am I" stays readable.
+        auto tabLabel = [&](int i, bool iconOnly) -> const char* {
+            return (iconOnly && st.activeWorkspace != kTabs[i].ws) ? "" : kTabs[i].label;
+        };
+        auto measureStrip = [&](bool iconOnly) {
+            float w = 0.0f;
+            for (int i = 0; i < kTabCount; ++i) {
+                if (!tabVisible(i)) continue;
+                if (w > 0.0f) w += tabGapX;
+                w += chipMeasureW(tabLabel(i, iconOnly), tabPadX, boldFont, iconSz, iconGap);
+            }
+            return w;
+        };
 
         // Available center zone, window-relative.
         const float centerZoneW = rightGroupStartRelX - leftGroupEndRelX;
+
+        float totalTabsW = measureStrip(/*iconOnly=*/false);
+        const bool iconOnly = (totalTabsW + 8.0f * s > centerZoneW);
+        if (iconOnly) totalTabsW = measureStrip(/*iconOnly=*/true);
 
         // Compute where tabs start, window-relative, then convert to screen for drawing.
         float tabsStartRelX;
@@ -1087,7 +1111,8 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             // Centered: equal margin on each side.
             tabsStartRelX = leftGroupEndRelX + (centerZoneW - totalTabsW) * 0.5f;
         } else {
-            // Compressed: start right after left group (no overlap with OS buttons due to clip below).
+            // Even icon-only overflows (extremely narrow window): start right after the
+            // left group and let the clip below drop the tail.
             tabsStartRelX = leftGroupEndRelX + 4.0f * s;
         }
 
@@ -1098,10 +1123,11 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         for (int i = 0; i < kTabCount; ++i) {
             // T-FIN5 progressive disclosure: the Firmware tab is offered only when a
             // firmware project exists / ECAD is in play (Simulate-tab disclosure rules).
-            if (kTabs[i].ws == AppState::Workspace::Firmware && !fwTabVisible)
+            if (!tabVisible(i))
                 continue;
             const bool isActive = (st.activeWorkspace == kTabs[i].ws);
-            const float chipW = chipMeasureW(kTabs[i].label, tabPadX, boldFont, iconSz, iconGap);
+            const char* tabText = tabLabel(i, iconOnly);
+            const float chipW = chipMeasureW(tabText, tabPadX, boldFont, iconSz, iconGap);
 
             // Clip tab if it would overlap the OS controls area (window-relative check).
             if ((tx - winX) + chipW > rightGroupStartRelX - 2.0f * s) break;
@@ -1123,9 +1149,12 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             // drawChipAt places InvisibleButton + draws fill/label.
             char btnId[32];
             snprintf(btnId, sizeof(btnId), "##ws_%d", i);
-            auto res = drawChipAt(btnId, kTabs[i].label, p0, chipW, chipH,
+            auto res = drawChipAt(btnId, tabText, p0, chipW, chipH,
                                   isActive, tabRound, boldFont,
                                   kTabs[i].icon, iconSz, iconGap, kTabs[i].rasterCell);
+            // Icon-only chips must still announce which workspace they are.
+            if (res.hovered && (!tabText || !tabText[0]))
+                ImGui::SetTooltip("%s", kTabs[i].label);
 
             // Register window-relative span.
             hitLayout.addSpan((int)(tx - winX), (int)(tx - winX + chipW));

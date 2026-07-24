@@ -39,13 +39,14 @@
 namespace ui {
 namespace parts {
 
-namespace {
-
 // Null-tolerant string read. Client-mode wizard payloads carry embed_id /
 // current_site as JSON null (Python None); nlohmann::json::value(key, "")
 // THROWS type_error.302 on a present-but-null key (null → std::string is not
 // convertible), which — uncaught in an st.rpc drain callback — aborts the whole
-// GUI. Treat null / missing / non-string uniformly as the default.
+// GUI. Treat null / missing / non-string uniformly as the default: EVERY string
+// read of a worker response in this TU and in parts_vendors.cpp goes through here.
+// Deliberately outside the anonymous namespace below so parts_vendors.cpp can
+// forward-declare it and share the one definition.
 std::string jstr(const nlohmann::json& j, const char* key,
                  const std::string& dflt = "") {
     if (!j.is_object()) return dflt;
@@ -53,6 +54,18 @@ std::string jstr(const nlohmann::json& j, const char* key,
     if (it == j.end() || !it->is_string()) return dflt;
     return it->get<std::string>();
 }
+
+// Magento MSP invisible reCAPTCHA (and similar) reject in-panel OSR CEF under
+// software GL / automation. Mirror services/browser NATIVE_CHROME_LOGIN sites:
+// open real system Chrome, export cookies → Playwright profile + CEF warm so
+// headless browser_fetch / CEF daemon can reuse the session.
+// External linkage for the same reason as jstr: parts_vendors.cpp's vendor rows
+// forward-declare it so this bot-check rule has exactly one definition.
+bool sitePrefersDesktopLogin(const std::string& site) {
+    return site == "anaheimautomation";
+}
+
+namespace {
 
 struct WizardState {
     // Backend-agnostic (screencast today, CEF later) — see web_view_backend.h.
@@ -65,11 +78,11 @@ struct WizardState {
     std::vector<std::string> done, skipped, remaining;
     bool   statusPending = false, actionPending = false;
     double lastStatusAt = 0.0;
-    // Client-driven auto-advance (CEF backend): time the login chip first read
-    // "logged_in" on the current site; 0 while not logged in. After a short
-    // stability window we export the session + advance — the worker can't see
-    // the in-process browser, so the GUI is the one that must drive the wizard.
-    double loggedInSince = 0.0;
+    // Vendor rows this wizard marked loginInProgress (the embedded flow mirroring
+    // what headed vendor_login does). loadVendors() rewrites the flag from the
+    // worker — which only tracks headed login threads — so drawBrowserPanel
+    // re-asserts this set every frame and every exit path releases it.
+    std::vector<std::string> busySites;
     // Load watchdog: when the current site's page was (re)opened, and whether we
     // already toasted a timeout for it. Lets the panel surface a stall + Retry
     // instead of leaving the user on an eternal "Loading".
@@ -97,12 +110,36 @@ std::string vendorLabel(const std::string& site) {
     return site;
 }
 
-// Magento MSP invisible reCAPTCHA (and similar) reject in-panel OSR CEF under
-// software GL / automation. Mirror services/browser NATIVE_CHROME_LOGIN sites:
-// open real system Chrome, export cookies → Playwright profile + CEF warm so
-// headless browser_fetch / CEF daemon can reuse the session.
-bool sitePrefersDesktopLogin(const std::string& site) {
-    return site == "anaheimautomation";
+// ---- vendor-row busy bookkeeping -----------------------------------------------------
+// The embedded wizard must mark the rows it owns loginInProgress, exactly like the
+// headed vendor_login flow: drawVendorStrip's re-poll is edge-triggered on that flag,
+// and the popup's per-row "Sign in" button uses it to render disabled instead of
+// dead-clicking into startLoginWizard's already-active guard.
+
+void applyWizardBusy() {
+    auto& b = W().busySites;
+    if (b.empty()) return;
+    for (auto& v : S().vendors)
+        if (std::find(b.begin(), b.end(), v.id) != b.end()) v.loginInProgress = true;
+}
+
+// Release one row (handover to the headed flow, whose own bookkeeping then owns the
+// flag) or — with an empty site — every row this wizard still holds.
+void clearWizardBusy(const std::string& site = std::string()) {
+    auto& b = W().busySites;
+    for (auto& v : S().vendors)
+        if ((site.empty() || v.id == site) &&
+            std::find(b.begin(), b.end(), v.id) != b.end())
+            v.loginInProgress = false;
+    if (site.empty()) b.clear();
+    else              b.erase(std::remove(b.begin(), b.end(), site), b.end());
+}
+
+// Take ownership of `sites`, releasing whatever the previous set was.
+void setWizardBusy(std::vector<std::string> sites) {
+    clearWizardBusy();
+    W().busySites = std::move(sites);
+    applyWizardBusy();
 }
 
 // Point the web view at the wizard's current step. The screencast backend adopts
@@ -112,7 +149,6 @@ bool sitePrefersDesktopLogin(const std::string& site) {
 // lands in the warm jar for headless reuse when the user closes the window).
 void openWizardSite(AppState& st, const std::string& embedId) {
     auto& w = W();
-    w.loggedInSince = 0.0;
     w.siteOpenedAt  = ImGui::GetTime();   // arm the load watchdog
     w.loadTimedOut  = false;
     WIZ_TRACE("openWizardSite site='%s' embed='%s' workerEmbed=%d",
@@ -126,6 +162,10 @@ void openWizardSite(AppState& st, const std::string& embedId) {
         return;
     }
     if (sitePrefersDesktopLogin(w.currentSite)) {
+        // Hand this row to the headed flow's bookkeeping first — our own wizard
+        // mark would otherwise trip the !loginInProgress guard below and nothing
+        // would open at all.
+        clearWizardBusy(w.currentSite);
         for (auto& v : S().vendors) {
             if (v.id == w.currentSite && !v.loginInProgress) {
                 WIZ_TRACE("openWizardSite: native desktop for '%s' (reCAPTCHA)",
@@ -165,7 +205,7 @@ void closeWizard(AppState& st, bool sendStop) {
     w.remaining.clear();
     w.setupError.clear();
     w.setupHint.clear();
-    w.loggedInSince = 0.0;
+    clearWizardBusy();               // release every vendor row the wizard held
     w.siteOpenedAt  = 0.0;
     w.loadTimedOut  = false;
     S().browserWizardRequested = false;
@@ -213,6 +253,11 @@ void applyWizardStatus(AppState& st, const nlohmann::json& j) {
     }
     w.currentSite = jstr(j, "current_site", w.currentSite);
 
+    // Rows the wizard is finished with stop reading as "login in progress" — the set
+    // is re-asserted every frame, so releasing it here is what makes it stick.
+    for (const auto& s : w.done)    clearWizardBusy(s);
+    for (const auto& s : w.skipped) clearWizardBusy(s);
+
     if (j.value("all_done", false) || !j.value("active", true)) {
         finishWizard(st);
         return;
@@ -257,9 +302,8 @@ void wizardNext(AppState& st, bool skip, bool assertLoggedIn = false) {
                     [&st](const core::RpcResult& r) {
             W().actionPending = false;
             if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
-                std::string why = r.ok && r.result.is_object()
-                                      ? r.result.value("reason", std::string("wizard step failed"))
-                                      : r.err;
+                std::string why = r.ok ? jstr(r.result, "reason", "wizard step failed")
+                                       : r.err;
                 st.toast(ui::ToastLevel::Error, "Wizard: " + why);
                 return;
             }
@@ -348,6 +392,19 @@ void startLoginWizard(AppState& st, const std::string& site) {
     w.starting                 = true;
     w.singleSite               = !site.empty();
     S().browserWizardRequested = true;   // engage the panel immediately (shows "starting")
+    S().vendorsPopupOpen       = false;  // the wizard owns the results column now
+    // Mark the rows this wizard is about to visit busy right away; the worker's
+    // authoritative site list replaces this guess in the callback below.
+    {
+        std::vector<std::string> busy;
+        if (!site.empty()) {
+            busy.push_back(site);
+        } else {
+            for (const auto& v : S().vendors)
+                if (!v.loggedIn) busy.push_back(v.id);
+        }
+        setWizardBusy(std::move(busy));
+    }
 
     nlohmann::json p = nlohmann::json::object();
     if (!site.empty()) p["sites"] = nlohmann::json::array({site});
@@ -366,22 +423,18 @@ void startLoginWizard(AppState& st, const std::string& site) {
         WIZ_TRACE("login_wizard_start cb: transport_ok=%d ok=%d reason='%s' "
                   "current_site='%s' embed='%s'",
                   (int)r.ok, (int)ok,
-                  (r.ok && r.result.is_object()) ? r.result.value("reason", std::string()).c_str()
-                                                 : r.err.c_str(),
+                  r.ok ? jstr(r.result, "reason", "").c_str() : r.err.c_str(),
                   jstr(r.result, "current_site").c_str(), jstr(r.result, "embed_id").c_str());
         if (!ok) {
-            std::string reason = r.ok && r.result.is_object()
-                                     ? r.result.value("reason", std::string())
-                                     : r.err;
-            std::string hint = r.ok && r.result.is_object()
-                                   ? r.result.value("hint", std::string())
-                                   : std::string();
+            std::string reason = r.ok ? jstr(r.result, "reason", "") : r.err;
+            std::string hint   = r.ok ? jstr(r.result, "hint", "") : std::string();
             // Playwright/embed setup failures affect headed login too — don't fall back
             // to vendor_login (it would toast "browser opened" while nothing appears).
             const bool embedSetup =
                 reason == "playwright_not_installed" || reason == "embed_start_failed" ||
                 reason.find("playwright") != std::string::npos;
             if (embedSetup || reason == "wizard_active") {
+                clearWizardBusy();   // nothing is signing in — free the rows
                 if (reason == "wizard_active")
                     st.rpc.call("login_wizard_stop", {}, [](const core::RpcResult&) {});
                 w.setupError = embedSetup
@@ -396,6 +449,7 @@ void startLoginWizard(AppState& st, const std::string& site) {
             }
             // Embed backend missing / failed → old headed vendor_login fallback.
             S().browserWizardRequested = false;
+            clearWizardBusy();   // must precede the !loginInProgress guards below
             if (!site.empty()) {
                 for (auto& v : S().vendors)
                     if (v.id == site && !v.loginInProgress) {
@@ -415,6 +469,7 @@ void startLoginWizard(AppState& st, const std::string& site) {
         }
         if (r.result.value("all_done", false)) {
             S().browserWizardRequested = false;
+            clearWizardBusy();
             st.toast(ui::ToastLevel::Info, "All vendor sites are already signed in.");
             return;
         }
@@ -425,6 +480,7 @@ void startLoginWizard(AppState& st, const std::string& site) {
         if (!w.web->usesWorkerEmbed() && !w.web->available()) {
             S().browserWizardRequested = false;
             w.active = false;
+            clearWizardBusy();   // must precede the !loginInProgress guards below
             std::string fallback = !w.currentSite.empty() ? w.currentSite : site;
             if (fallback.empty() && r.result.contains("sites") && r.result["sites"].is_array()
                 && !r.result["sites"].empty() && r.result["sites"][0].is_string())
@@ -451,6 +507,8 @@ void startLoginWizard(AppState& st, const std::string& site) {
         if (r.result.contains("sites") && r.result["sites"].is_array())
             for (const auto& s : r.result["sites"])
                 if (s.is_string()) w.remaining.push_back(s.get<std::string>());
+        if (!w.remaining.empty())
+            setWizardBusy(w.remaining);   // authoritative site list from the worker
         w.embedId.clear();
         const std::string embed = jstr(r.result, "embed_id");
         if (!embed.empty()) {
@@ -468,6 +526,11 @@ void startLoginWizard(AppState& st, const std::string& site) {
 void drawBrowserPanel(AppState& st) {
     auto& w        = W();
     const float sc = ui::uiScale;
+
+    // loadVendors() rewrites loginInProgress from the worker, which only knows about
+    // headed vendor_login threads — re-assert the rows this wizard owns. Runs before
+    // drawFiltersBlock/drawVendorStrip in the frame, so the strip reads the truth.
+    applyWizardBusy();
 
     // Background work: WebView frame/input polling + wizard status watch (2 s, single-flight;
     // the worker auto-advances on logged_in — embed_id changes are picked up here).
@@ -631,6 +694,8 @@ void drawBrowserPanel(AppState& st) {
         if (showDesktop) {
             vcenter(th);
             if (ImGui::SmallButton("Desktop browser")) {
+                // Hand the row over before the !loginInProgress guard below.
+                clearWizardBusy(w.currentSite);
                 for (auto& v : S().vendors) {
                     if (v.id == w.currentSite && !v.loginInProgress) {
                         startVendorLogin(st, v);
@@ -680,7 +745,6 @@ void drawBrowserPanel(AppState& st) {
         dl->AddText(ImVec2(p0.x + (avail.x - errTs.x) * 0.5f, p0.y + avail.y * 0.45f),
                     Palette::toU32(palette.statusErr), w.setupError.c_str());
         if (!w.setupHint.empty()) {
-            const float wrapW = avail.x - 40.0f * sc;
             ImGui::PushTextWrapPos(p0.x + avail.x - 20.0f * sc);
             ImGui::SetCursorScreenPos(ImVec2(p0.x + 20.0f * sc, p0.y + avail.y * 0.55f));
             ImGui::PushStyleColor(ImGuiCol_Text,

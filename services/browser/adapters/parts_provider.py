@@ -1,9 +1,9 @@
 """services/browser/adapters/parts_provider.py — CatalogProvider wrapper (T-X3).
 
 Presents a T-X2 :class:`services.browser.adapters.SourceAdapter` (search/
-acquire) as an ``engine_oracle.parts_hub`` ``CatalogProvider``
+acquire) as a ``services.parts.hub`` ``CatalogProvider``
 (``contracts/parts.md`` §3): live-search-only (``count``/``iter_records``
-raise ``NotImplementedError``, same as ``EcadVendorAdapter``), domain
+raise ``NotImplementedError``), domain
 ``"catalog"`` — the seam ``contracts/parts.md`` §6.3 reserved for "paid
 catalog providers" (TraceParts/Werk24). This is the user-authenticated
 browser-session mechanism for the same catalogs instead of a paid API; both

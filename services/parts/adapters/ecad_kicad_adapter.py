@@ -9,8 +9,8 @@ Wraps engine.ecad.library.search (the ecad_find_part surface) for runtime
 .search() calls, and directly enumerates starter.SYMBOLS / starter.FOOTPRINTS
 plus any user-lib files for iter_records() (index build).
 
-Live search of user libs beyond CHUDWARE_KICAD_SYM_PATH is handled by ecad_vendor
-(T-P2 live provider) — this adapter covers the LOCAL, deterministic set only.
+This adapter covers the LOCAL, deterministic set only: user libs beyond
+CHUDWARE_KICAD_SYM_PATH are not searched.
 
 geometry_ref.kind = "symbol_footprint" (symbols) per contracts/parts.md §2.
 

@@ -70,38 +70,64 @@ static void itemTooltip(const PartsItem& item) {
     itemTooltipAt(item, ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal));
 }
 
-void drawResultsList(AppState& st) {
-    const float sc = ui::uiScale;
-
-    if (S().searching) { spinner("Searching"); return; }
+// Searching / error / empty preamble, shared by both renderers so a backend failure can
+// never be misreported as "No results" in one view but not the other. Returns true when it
+// painted a state and the caller must return without drawing results; each renderer passes
+// its own empty-state copy.
+static bool resultsPreamble(const char* noResultsSub, const char* promptSub) {
+    if (S().searching) { spinner("Searching"); return true; }
     if (!S().searchErr.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.statusErr[0], palette.statusErr[1],
                    palette.statusErr[2], 1.0f));
         ImGui::TextWrapped("Error: %s", S().searchErr.c_str());
         ImGui::PopStyleColor();
-        return;
+        return true;
     }
     if (S().results.empty()) {
-        if (S().liveSearching) { spinner("Searching vendors"); return; }
+        if (S().liveSearching) { spinner("Searching vendors"); return true; }
         if (S().searchDone)
-            emptyState("cancel_x", "No results",
-                       "Try a different search term, category, or loosen the filters.");
+            emptyState("cancel_x", "No results", noResultsSub);
         else
-            emptyState("parts_all", "Search for parts",
-                       "Type in the search bar or pick a category to browse.");
-        return;
+            emptyState("parts_all", "Search for parts", promptSub);
+        return true;
     }
+    return false;
+}
+
+void drawResultsList(AppState& st) {
+    const float sc = ui::uiScale;
+
+    if (resultsPreamble("Try a different search term, category, or loosen the filters.",
+                        "Type in the search bar or pick a category to browse."))
+        return;
+
+    // Narrow-pane column budget: the fixed columns keep their full width no matter how
+    // little is left, which crushes the stretch "Name" column — the one telling you what the
+    // part actually is — to nothing when the pane is squeezed (AI Copilot docked alongside).
+    // Below the threshold the lowest-value columns yield, Material first then Vendor, so
+    // Name always keeps a readable minimum. No-op at any normal pane width.
+    const float wVendor = 110.0f * sc, wPart = 90.0f * sc, wMaterial = 90.0f * sc;
+    const float wPrice  =  80.0f * sc, wAct  = 140.0f * sc;
+    const float nameMin = 150.0f * sc;
+    const float chrome  = 6.0f * ImGui::GetStyle().CellPadding.x * 2.0f;  // 2 per cell x 6
+    const float budget  = ImGui::GetContentRegionAvail().x - chrome - nameMin;
+    const bool showMaterial = budget >= wVendor + wPart + wMaterial + wPrice + wAct;
+    const bool showVendor   = budget >= wVendor + wPart + wPrice + wAct;
+    const ImGuiTableColumnFlags colVendor = ImGuiTableColumnFlags_WidthFixed |
+        (showVendor   ? 0 : ImGuiTableColumnFlags_Disabled);
+    const ImGuiTableColumnFlags colMaterial = ImGuiTableColumnFlags_WidthFixed |
+        (showMaterial ? 0 : ImGuiTableColumnFlags_Disabled);
 
     const ImGuiTableFlags tblFlags =
         ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoBordersInBody;
     if (!ImGui::BeginTable("##parts_tbl", 6, tblFlags)) return;
     ImGui::TableSetupColumn("Name",     ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("Vendor",   ImGuiTableColumnFlags_WidthFixed, 110.0f * sc);
-    ImGui::TableSetupColumn("Part #",   ImGuiTableColumnFlags_WidthFixed,  90.0f * sc);
-    ImGui::TableSetupColumn("Material", ImGuiTableColumnFlags_WidthFixed,  90.0f * sc);
-    ImGui::TableSetupColumn("Price",    ImGuiTableColumnFlags_WidthFixed,  80.0f * sc);
-    ImGui::TableSetupColumn("##act",    ImGuiTableColumnFlags_WidthFixed, 140.0f * sc);
+    ImGui::TableSetupColumn("Vendor",   colVendor,   wVendor);
+    ImGui::TableSetupColumn("Part #",   ImGuiTableColumnFlags_WidthFixed, wPart);
+    ImGui::TableSetupColumn("Material", colMaterial, wMaterial);
+    ImGui::TableSetupColumn("Price",    ImGuiTableColumnFlags_WidthFixed, wPrice);
+    ImGui::TableSetupColumn("##act",    ImGuiTableColumnFlags_WidthFixed, wAct);
 
     // Header row (textDim, no ugly TableHeadersRow chrome).
     ImGui::TableNextRow();
@@ -227,16 +253,9 @@ void drawResultsGrid(AppState& st) {
     const float gap   = 8.0f * sc;
     const float pad   = 8.0f * sc;
 
-    if (S().searching) { spinner("Searching"); return; }
-    if (S().results.empty()) {
-        if (S().liveSearching) { spinner("Searching vendors"); return; }
-        if (S().searchDone)
-            emptyState("cancel_x", "No results", "Try a different search term or category.");
-        else
-            emptyState("parts_all", "Search for parts",
-                       "Type in the search bar or pick a category.");
+    if (resultsPreamble("Try a different search term or category.",
+                        "Type in the search bar or pick a category."))
         return;
-    }
 
     const float availW = ImGui::GetContentRegionAvail().x;
     const int   cols   = std::max(1, (int)((availW - gap) / (cardW + gap)));

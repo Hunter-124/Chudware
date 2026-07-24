@@ -49,7 +49,6 @@ struct VendorEntry {
     bool loggedIn        = false;
     bool loginInProgress = false;
     std::string loginError;
-    std::string lastLogin;
 };
 
 // One vendor in an in-flight live search: its logo + inline progress state. Shown after the
@@ -98,19 +97,18 @@ struct Notice {
 struct HealthRow {
     std::string site;
     bool   ok        = false;
-    bool   loggedIn  = false;
     bool   expected  = false;   // expected failure (sign-in required) → amber, not red
     double latencyMs = 0.0;
-    int    hitCount  = 0;
     std::string error;
 };
 
-// ---- taxonomy / facets (phase B data model — populated by later phases) ----------
+// ---- taxonomy / facets --------------------------------------------------------------
+// Live end-to-end: `parts_taxonomy` returns the tree, and the server applies `facets`
+// authoritatively in services/parts/gui_rpc.py:_filter_items.
 
 struct TaxFacet {
     std::string id, label, type, unit;    // type: "range" | "enum" | "text" (RPC field is "key" → id)
     std::vector<std::string> options;
-    float vmin = 0, vmax = 0;
 };
 
 struct TaxNode {
@@ -122,10 +120,9 @@ struct TaxNode {
 struct FacetValue {
     float rmin = 0, rmax = 0;
     std::set<std::string> multi;
-    int sel = -1;
     char text[64] = {};
     bool active() const {
-        return rmin != 0.0f || rmax != 0.0f || !multi.empty() || sel >= 0 || text[0] != 0;
+        return rmin != 0.0f || rmax != 0.0f || !multi.empty() || text[0] != 0;
     }
 };
 
@@ -189,8 +186,9 @@ struct PartsState {
     double lastHealthPoll  = 0.0;
     std::vector<HealthRow> healthResults;
 
-    // Phase C seam: set true when openVendorWizard finds the embedded-browser RPC live;
-    // parts_browser_panel.cpp will key browserPanelActive() off this in phase C.
+    // True while the embedded vendor-browser wizard owns the results column. Set
+    // optimistically by startLoginWizard (so the panel engages without waiting on the
+    // RPC) and rolled back on the failure branches that fall back to the headed flow.
     bool browserWizardRequested = false;
 
     // ---- download queue ----
@@ -202,7 +200,7 @@ struct PartsState {
     // ---- thumbnails ----
     std::map<std::string, Thumb> thumbs;      // part_id → GL texture; LRU-capped in storeThumb
     std::set<std::string>        thumbBusy;   // requests in flight
-    std::set<std::string>        thumbFailed; // don't retry (cleared when it grows past ~1024)
+    std::set<std::string> thumbFailed; // no image available — never retried this session
 
     // Set every frame by drawPartsLibraryWorkspace so widget TUs can reach the app fonts
     // (sectionHeader h2). Never dereferenced outside a frame.
@@ -247,7 +245,6 @@ void drawResultsGrid(AppState& st);                 // parts_results.cpp
 // vendor health-check flow, and the phase-C wizard seam.
 void drawVendorStrip(AppState& st, float paneW);    // fixed footer inside the filters pane
 void drawVendorsPopup(AppState& st);                // floating glass window; no-op when closed
-void openVendorWizard(AppState& st);                // phase C seam: embed wizard or headed fallback
 void startHealthCheck(AppState& st);
 void pollHealthStatus(AppState& st);
 

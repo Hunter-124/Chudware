@@ -4,7 +4,7 @@ Ties together the ProviderRegistry, the FTS index, and the provider lookup.
 Bootstrap auto-registers all adapters:
   T-P1: bolts/bearings + core_families
   T-P2: structural_sections, piping_fittings, hydraulic_components,
-         ecad_kicad (indexable), ecad_vendor (live, non-indexed)
+         ecad_kicad (indexable)
 
 Live-vendor fallback (T-P2): when the local FTS index returns no results for a
 query, any registered live-only provider (iter_records raises NotImplementedError)
@@ -73,8 +73,6 @@ class PartsHub:
         from .adapters.heatsinks_adapter import HeatsinksAdapter
         # Watched local library (vendor_parts index) — indexable STEP/STEP+ files
         from .adapters.local_library_adapter import LocalLibraryAdapter
-        # T-P2 live-vendor adapter (non-indexed, search-only)
-        from .adapters.ecad_vendor_adapter import EcadVendorAdapter
 
         self.register(BoltsAdapter())
         self.register(CoreFamiliesAdapter())
@@ -84,7 +82,6 @@ class PartsHub:
         self.register(EcadKicadAdapter())
         self.register(HeatsinksAdapter())
         self.register(LocalLibraryAdapter())
-        self.register(EcadVendorAdapter())
         self._register_browser_catalog_adapters()
         # Build the index immediately so first search is fast.
         self._ensure_index()
@@ -165,7 +162,7 @@ class PartsHub:
 
         Primary: FTS5 index over all indexable providers.
         Fallback: when the index returns no results AND domain matches a live
-        provider (e.g. ecad_vendor for domain=ecad or unfiltered), query each
+        provider (e.g. a browser catalog adapter), query each
         live-only provider concurrently under a wall-clock budget
         (``CHUDWARE_PARTS_LIVE_BUDGET_S``, default a few seconds). Live results
         carry source:"live" and are NEVER indexed. Timed-out sites surface as

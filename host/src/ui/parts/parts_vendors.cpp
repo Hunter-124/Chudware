@@ -5,8 +5,6 @@
 //     running whether or not the popup is open.
 //   * drawVendorsPopup — floating glass window with the vendor sign-in list, API-provider
 //     credential editors, download queue and health-check results table.
-//   * openVendorWizard — opens the embedded-browser sign-in wizard via
-//     login_wizard_start; a Playwright/embed setup failure → headed vendor_login fallback.
 //   * startHealthCheck/pollHealthStatus — vendors_health_check/_status flow (single-flight,
 //     2 s backoff while running).
 #include <cmath>
@@ -25,6 +23,18 @@
 namespace ui {
 namespace parts {
 
+// Defined in parts_browser_panel.cpp with external linkage so the vendor pair shares
+// one definition each. Deliberately NOT in parts_internal.h — they are private to
+// these two TUs; promote them if a third ever needs them.
+//   jstr: null-tolerant string read. nlohmann's value(key, "") THROWS type_error.302
+//         on a present-but-NULL key, and an exception raised inside an st.rpc drain
+//         callback aborts the GUI — every string read of a worker response goes
+//         through this.
+//   sitePrefersDesktopLogin: the one bot-check rule (Magento invisible reCAPTCHA
+//         rejects the in-panel OSR CEF); it used to be duplicated inline here.
+std::string jstr(const nlohmann::json& j, const char* key, const std::string& dflt);
+bool sitePrefersDesktopLogin(const std::string& site);
+
 // ---- health check flow -------------------------------------------------------------
 
 void startHealthCheck(AppState& st) {
@@ -42,7 +52,7 @@ void startHealthCheck(AppState& st) {
         }
         if (!r.result.is_object() || !r.result.value("ok", false)) {
             st.toast(ui::ToastLevel::Error, "Health check failed to start: " +
-                     (r.result.is_object() ? r.result.value("error", std::string("unknown"))
+                     (r.result.is_object() ? jstr(r.result, "error", "unknown")
                                            : std::string("bad response")));
             return;
         }
@@ -55,39 +65,62 @@ void pollHealthStatus(AppState& st) {
     if (!S().healthSupported || S().healthPolling) return;
     S().healthPolling  = true;
     S().lastHealthPoll = ImGui::GetTime();
-    st.rpc.call("vendors_health_status", {}, [](const core::RpcResult& r) {
+    st.rpc.call("vendors_health_status", {}, [&st](const core::RpcResult& r) {
         S().healthPolling = false;
+        // EVERY exit below must leave the state machine consistent: startHealthCheck
+        // and both trigger buttons gate on !healthRunning, so a branch that returns
+        // with it still set wedges the widget on "Testing…" until the app restarts.
         if (!r.ok) {
             if (r.err.find("unknown method") != std::string::npos)
                 S().healthSupported = false;
+            else
+                st.toast(ui::ToastLevel::Error, "Vendor health check failed: " + r.err);
             S().healthRunning = false;
             return;
         }
-        if (!r.result.is_object() || !r.result.value("ok", false)) return;
+        if (!r.result.is_object() || !r.result.value("ok", false)) {
+            // Transport succeeded but the sweep answered {"ok": false, "error": …}
+            // (gui_rpc's own except-branch). Same terminal state as a transport error.
+            S().healthRunning = false;
+            st.toast(ui::ToastLevel::Error, "Vendor health check failed: " +
+                     (r.result.is_object() ? jstr(r.result, "error", "unknown")
+                                           : std::string("bad response")));
+            return;
+        }
         S().healthRunning = r.result.value("running", false);
         S().healthChecked = true;
         std::vector<HealthRow> rows;
         if (r.result.contains("results"))
             for (auto& x : r.result["results"]) {
                 HealthRow h;
-                h.site      = x.value("site", "");
+                h.site      = jstr(x, "site", "");
                 h.ok        = x.value("ok", false);
-                h.loggedIn  = x.value("logged_in", false);
                 h.expected  = x.value("expected", false);
                 h.latencyMs = x.value("latency_ms", 0.0);
-                h.hitCount  = x.value("hit_count", 0);
-                h.error     = x.value("error", "");
+                h.error     = jstr(x, "error", "");
                 rows.push_back(std::move(h));
             }
         S().healthResults = std::move(rows);
     });
 }
 
-// ---- phase C: vendor sign-in wizard --------------------------------------------------
-// Launches the embedded-browser login wizard (parts_browser_panel.cpp); startLoginWizard
-// falls back to the old headed vendor_login flow when the worker lacks the embed backend.
+namespace {
 
-void openVendorWizard(AppState& st) { startLoginWizard(st); }
+// borderRow paints its own label straight into the draw list with palette.text, so
+// ImGui::BeginDisabled's alpha never reaches it. Wash the row that was just submitted
+// with the pane colour so a gated action visibly reads as disabled, and hang the
+// reason off it: a live-looking button whose click the callee silently swallows is
+// exactly what made this strip feel broken. Call right AFTER ImGui::EndDisabled().
+void gatedRowFeedback(bool gated, const char* why) {
+    if (!gated) return;
+    const float wash[4] = {palette.panelBg[0], palette.panelBg[1], palette.panelBg[2], 0.55f};
+    ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                              Palette::toU32(wash), 6.0f * ui::uiScale);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", why);
+}
+
+}  // namespace
 
 // ---- compact strip (fixed footer of the filters pane) --------------------------------
 
@@ -172,20 +205,36 @@ void drawVendorStrip(AppState& st, float paneW) {
     }
 
     // -- buttons -------------------------------------------------------------------------
+    // Anything the callee would refuse is drawn disabled and says why.
+    const bool wizardOpen = browserPanelActive();
+    ImGui::BeginDisabled(wizardOpen);
     if (borderRow("##connect_vendors", "Connect vendor accounts", "browser_panel",
                   /*selected=*/false, ImVec2(0, 22.0f * sc), /*centerText=*/true))
-        openVendorWizard(st);
+        startLoginWizard(st);
+    ImGui::EndDisabled();
+    gatedRowFeedback(wizardOpen, "The sign-in wizard is already open.");
 
     const float half = (ImGui::GetContentRegionAvail().x - 4.0f * sc) * 0.5f;
+    ImGui::BeginDisabled(wizardOpen);
     if (borderRow("##vendors_popup", "Vendors…", nullptr, S().vendorsPopupOpen,
                   ImVec2(half, 20.0f * sc), /*centerText=*/true))
         S().vendorsPopupOpen = !S().vendorsPopupOpen;
+    ImGui::EndDisabled();
+    gatedRowFeedback(wizardOpen, "Vendor Accounts stays hidden while the sign-in "
+                                 "wizard owns the results column.");
     ImGui::SameLine(0.0f, 4.0f * sc);
-    const bool healthBusy = S().healthStarting || S().healthRunning;
+    const bool healthBusy  = S().healthStarting || S().healthRunning;
+    const bool healthGated = healthBusy || wizardOpen || !S().healthSupported;
+    ImGui::BeginDisabled(healthGated);
     if (borderRow("##test_vendors", healthBusy ? "Testing…" : "Test vendors", nullptr,
-                  /*selected=*/false, ImVec2(half, 20.0f * sc), /*centerText=*/true) &&
-        !healthBusy && !browserPanelActive())
+                  /*selected=*/false, ImVec2(half, 20.0f * sc), /*centerText=*/true))
         startHealthCheck(st);
+    ImGui::EndDisabled();
+    gatedRowFeedback(healthGated,
+                     !S().healthSupported ? "Health check unavailable — update the worker."
+                     : healthBusy         ? "A health check is already running."
+                                          : "Paused while the sign-in wizard is open — its "
+                                            "browser sweeps would starve the check.");
 }
 
 // ---- floating "Vendor Accounts" popup ------------------------------------------------
@@ -227,10 +276,13 @@ void drawVendorSignInList(AppState& st) {
             const char* lbl = v.loginInProgress ? "..." : (v.loggedIn ? "Re-login" : "Sign in");
             // Magento + invisible reCAPTCHA (Anaheim) scores the in-panel OSR CEF
             // as a bot under software GL — open real desktop Chromium for those.
-            // Everyone else gets the embedded CEF wizard first.
-            const bool preferDesktop =
-                (v.id == "anaheimautomation");
-            if (!v.loginInProgress && ImGui::SmallButton(lbl)) {
+            // Everyone else gets the embedded CEF wizard first. One rule, one
+            // definition (parts_browser_panel.cpp).
+            const bool preferDesktop = sitePrefersDesktopLogin(v.id);
+            // A row already mid sign-in must LOOK unavailable: this button used to
+            // stay live while startLoginWizard's active guard ate the click.
+            ImGui::BeginDisabled(v.loginInProgress);
+            if (ImGui::SmallButton(lbl)) {
                 if (preferDesktop) {
                     startVendorLogin(st, v);
                     st.toast(ui::ToastLevel::Info,
@@ -240,6 +292,9 @@ void drawVendorSignInList(AppState& st) {
                     startLoginWizard(st, v.id);
                 }
             }
+            ImGui::EndDisabled();
+            if (v.loginInProgress && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Sign-in already in progress");
             ImGui::PopStyleColor();
 
             ImGui::PushStyleColor(ImGuiCol_Text,
@@ -376,10 +431,10 @@ void drawDownloadQueue(AppState& st) {
                                       r.result.value("ok", false);
                             if (ok) {
                                 st.toast(ui::ToastLevel::Success,
-                                    "Imported → " + r.result.value("doc_id", std::string("doc")));
+                                    "Imported → " + jstr(r.result, "doc_id", "doc"));
                             } else {
                                 std::string why = r.ok
-                                    ? r.result.value("reason", std::string("import failed"))
+                                    ? jstr(r.result, "reason", "import failed")
                                     : r.err;
                                 st.toast(ui::ToastLevel::Error, "Import failed: " + why);
                             }
@@ -422,10 +477,15 @@ void drawHealthTable(AppState& st) {
         ImGui::TextDisabled("Health check unavailable — the worker does not support it yet.");
         return;
     }
+    // The popup can no longer be on screen while the wizard owns the results column
+    // (drawVendorsPopup stands down), so "busy" is the only reachable gate here.
     const bool busy = S().healthStarting || S().healthRunning;
-    if (ImGui::SmallButton(busy ? "Running…" : "Run health check") && !busy &&
-        !browserPanelActive())
+    ImGui::BeginDisabled(busy);
+    if (ImGui::SmallButton(busy ? "Running…" : "Run health check"))
         startHealthCheck(st);
+    ImGui::EndDisabled();
+    if (busy && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("A health check is already running.");
     if (busy && S().healthResults.empty()) {
         spinner("Testing");
         return;
@@ -462,7 +522,8 @@ void drawHealthTable(AppState& st) {
 }  // namespace
 
 void drawVendorsPopup(AppState& st) {
-    if (!S().vendorsPopupOpen) return;
+    // The embedded wizard owns the results column — never float this on top of it.
+    if (!S().vendorsPopupOpen || browserPanelActive()) return;
     const float sc = ui::uiScale;
     const float popW = 420.0f * sc;
 

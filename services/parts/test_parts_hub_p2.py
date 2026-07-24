@@ -14,8 +14,6 @@ from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
 
-import pytest
-
 # Ensure repo root is on path
 _REPO = Path(__file__).resolve().parent.parent.parent.parent
 if str(_REPO) not in sys.path:
@@ -312,78 +310,6 @@ class TestEcadKicadAdapter:
 
 
 # ---------------------------------------------------------------------------
-# EcadVendorAdapter (mocked — CI-safe)
-# ---------------------------------------------------------------------------
-
-class TestEcadVendorAdapter:
-
-    def _mock_vendor_part(self) -> dict:
-        return {
-            "mpn": "GRM155R61A105KE15D",
-            "manufacturer": "Murata",
-            "description": "CAP CER 1UF 10V X5R 0402",
-            "price": 0.10,
-            "currency": "USD",
-            "stock": 10000,
-        }
-
-    def test_search_returns_live_record(self):
-        from services.parts.adapters.ecad_vendor_adapter import EcadVendorAdapter
-        adapter = EcadVendorAdapter()
-        vp = self._mock_vendor_part()
-        with patch("services.parts.adapters.ecad_vendor_adapter._get_chain") as mock_chain:
-            chain = mock_chain.return_value
-            chain.fetch.return_value = vp
-            results = adapter.search("GRM155R61A105KE15D")
-        assert len(results) == 1
-        rec = results[0]
-        assert rec["domain"] == "ecad"
-        assert rec["source"] == "live"
-        assert rec["sourcing"] == [vp]
-        assert "GRM155R61A105KE15D" in rec["part_id"]
-
-    def test_search_no_creds_returns_empty(self):
-        from services.parts.adapters.ecad_vendor_adapter import EcadVendorAdapter
-        adapter = EcadVendorAdapter()
-        with patch("services.parts.adapters.ecad_vendor_adapter._get_chain",
-                   return_value=None):
-            results = adapter.search("GRM155R61A105KE15D")
-        assert results == []
-
-    def test_search_chain_returns_none_gives_empty(self):
-        from services.parts.adapters.ecad_vendor_adapter import EcadVendorAdapter
-        adapter = EcadVendorAdapter()
-        with patch("services.parts.adapters.ecad_vendor_adapter._get_chain") as mock_chain:
-            chain = mock_chain.return_value
-            chain.fetch.return_value = None
-            results = adapter.search("UNKNOWN_MPN")
-        assert results == []
-
-    def test_iter_records_raises(self):
-        from services.parts.adapters.ecad_vendor_adapter import EcadVendorAdapter
-        adapter = EcadVendorAdapter()
-        with pytest.raises(NotImplementedError):
-            list(adapter.iter_records())
-
-    def test_count_raises(self):
-        from services.parts.adapters.ecad_vendor_adapter import EcadVendorAdapter
-        adapter = EcadVendorAdapter()
-        with pytest.raises(NotImplementedError):
-            adapter.count()
-
-    def test_live_marker_in_record(self):
-        """source:"live" is present on every vendor record."""
-        from services.parts.adapters.ecad_vendor_adapter import EcadVendorAdapter
-        adapter = EcadVendorAdapter()
-        vp = self._mock_vendor_part()
-        with patch("services.parts.adapters.ecad_vendor_adapter._get_chain") as mock_chain:
-            chain = mock_chain.return_value
-            chain.fetch.return_value = vp
-            results = adapter.search("anything")
-        assert all(r.get("source") == "live" for r in results)
-
-
-# ---------------------------------------------------------------------------
 # Cross-domain federation tests
 # ---------------------------------------------------------------------------
 
@@ -462,37 +388,6 @@ class TestFederation:
         assert "m3" in ecad_titles or "mounting" in ecad_titles, (
             f"Expected M3/mounting in ecad hit titles; got: {ecad_titles!r}"
         )
-
-    def test_live_fallback_on_empty_index(self):
-        """Live-only providers are queried when index has no hits."""
-        from services.parts.adapters.ecad_vendor_adapter import EcadVendorAdapter
-        hub = _make_hub()
-        vp = {"mpn": "VERY_UNIQUE_XYZ999", "manufacturer": "Acme",
-              "description": "Test part", "price": 1.0}
-        # Patch the vendor adapter's chain to return a result
-        with patch("services.parts.adapters.ecad_vendor_adapter._get_chain") as mc:
-            chain = mc.return_value
-            chain.fetch.return_value = vp
-            results = hub.search("VERY_UNIQUE_XYZ999", domain="ecad")
-        # Either from index (unlikely for this MPN) or from live fallback
-        # The test just ensures no crash and graceful empty when live is mocked off
-        assert isinstance(results, list)
-
-    def test_live_results_marked_source_live(self):
-        """Live vendor records carry source='live'."""
-        from services.parts.adapters.ecad_vendor_adapter import EcadVendorAdapter
-        hub = _make_hub()
-        vp = {"mpn": "LIVE_TEST_MPN", "manufacturer": "TestCo",
-              "description": "A live result", "price": 5.0}
-        with patch("services.parts.adapters.ecad_vendor_adapter._get_chain") as mc:
-            chain = mc.return_value
-            chain.fetch.return_value = vp
-            results = hub.search("LIVE_TEST_MPN", domain="ecad")
-        live = [r for r in results if r.get("source") == "live"]
-        # If the live fallback fired, all returned records are live
-        # (index won't have this MPN)
-        if live:
-            assert all(r.get("source") == "live" for r in live)
 
     def test_p1_44_tests_still_pass_via_hub_search(self):
         """Regression: hub.search still returns fastener/bearing results (T-P1 baseline)."""

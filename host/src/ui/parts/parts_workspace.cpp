@@ -131,7 +131,6 @@ void loadVendors(AppState& st, bool force) {
                 e.loggedIn        = v.value("logged_in", false);
                 e.loginInProgress = v.value("login_in_progress", false);
                 e.loginError      = v.value("login_error", "");
-                e.lastLogin       = v.value("last_login", "");
                 vs.push_back(std::move(e));
             }
         S().vendors = std::move(vs);
@@ -218,20 +217,23 @@ static void collectNotices(const nlohmann::json& res) {
         }
 }
 
-void doSearch(AppState& st) {
-    if (S().searching) return;
-    S().searching  = true;
-    S().searchDone = false;
-    S().searchErr.clear();
-    S().results.clear();
-    // A fresh query invalidates any in-flight live job (stale polls are dropped).
-    S().liveSearching = false;
-    S().liveToken.clear();
-    S().liveCursor = 0;
-    nlohmann::json p;
-    p["query"]    = S().searchBuf;
-    p["limit"]    = 100;
-    p["live"]     = false;   // instant local layer only; live vendors stream separately
+// Monotonic search generation. Bumped by doSearch and captured BY VALUE by every async
+// search callback: the fast local layer clears S().searching long before the slow live
+// fan-out resolves, so two queries in quick succession overlap and the loser must drop its
+// payload instead of hijacking the winner's list.
+static unsigned g_searchGen = 0;
+
+// The one search-parameter serializer, shared by the fast local `parts_search` and the slow
+// `parts_search_live_start` fan-out: query + category + global filters + facets. Single code
+// path so the two call sites can never drift apart again.
+//
+// Facets are scoped to the selected taxonomy node: S().facetValues is a flat map that
+// outlives the selection, so a value set under one category would otherwise still be sent
+// while browsing another and silently filter every row away. Only keys declared by the
+// current node are emitted (no node — "All Parts", flat mode — means no facets at all).
+static void fillSearchParams(nlohmann::json& p) {
+    p["query"] = S().searchBuf;
+    p["limit"] = 100;
     // Tree mode → taxonomy category_id (incl. vendors.*.<site> leaves = browse that vendor);
     // fallback flat mode keeps the legacy "category" param.
     if (S().taxonomyIsTree) p["category_id"] = S().selectedCategory;
@@ -243,25 +245,47 @@ void doSearch(AppState& st) {
     if (S().sourceFilter == 1) p["source"] = "local";
     if (S().sourceFilter == 2) p["source"] = "live";
     // Active facet values: range → {min?,max?}, enum → string list, text → substring.
-    {
+    if (const TaxNode* node = findTaxNode(S().taxonomyRoot, S().selectedCategory)) {
         nlohmann::json facets = nlohmann::json::object();
-        for (const auto& [key, fv] : S().facetValues) {
+        for (const auto& f : node->facets) {
+            auto it = S().facetValues.find(f.id);
+            if (it == S().facetValues.end()) continue;
+            const FacetValue& fv = it->second;
             if (!fv.active()) continue;
             if (fv.rmin != 0.0f || fv.rmax != 0.0f) {
                 nlohmann::json range = nlohmann::json::object();
                 if (fv.rmin != 0.0f) range["min"] = fv.rmin;
                 if (fv.rmax != 0.0f) range["max"] = fv.rmax;
-                facets[key] = std::move(range);
+                facets[f.id] = std::move(range);
             } else if (!fv.multi.empty()) {
-                facets[key] = std::vector<std::string>(fv.multi.begin(), fv.multi.end());
+                facets[f.id] = std::vector<std::string>(fv.multi.begin(), fv.multi.end());
             } else if (fv.text[0]) {
-                facets[key] = fv.text;
+                facets[f.id] = fv.text;
             }
         }
         if (!facets.empty()) p["facets"] = std::move(facets);
     }
-    st.rpc.call("parts_search", p, [&st](const core::RpcResult& r) {
+}
+
+void doSearch(AppState& st) {
+    if (S().searching) return;
+    S().searching  = true;
+    S().searchDone = false;
+    S().searchErr.clear();
+    S().results.clear();
+    // A fresh query invalidates any in-flight live job (stale polls are dropped) and
+    // supersedes every async callback still carrying an older generation.
+    S().liveSearching = false;
+    S().liveToken.clear();
+    S().liveCursor = 0;
+    const unsigned gen = ++g_searchGen;
+    nlohmann::json p;
+    fillSearchParams(p);
+    p["live"] = false;   // instant local layer only; live vendors stream separately
+    st.rpc.call("parts_search", p, [gen, &st](const core::RpcResult& r) {
         S().searching  = false;
+        // Superseded by a newer query while this one was in flight — drop its rows.
+        if (gen != g_searchGen) return;
         S().searchDone = true;
         if (!r.ok) { S().searchErr = r.err; return; }
         if (!r.result.is_object()) return;
@@ -287,35 +311,6 @@ void doSearch(AppState& st) {
         if (S().sourceFilter != 1)
             startLiveSearch(st);
     });
-}
-
-// Build the same routing params as doSearch (query + category + filters) so the live
-// fan-out targets the identical set the local search resolved.
-static void fillSearchParams(nlohmann::json& p) {
-    p["query"] = S().searchBuf;
-    p["limit"] = 100;
-    if (S().taxonomyIsTree) p["category_id"] = S().selectedCategory;
-    else                    p["category"]    = S().selectedCategory;
-    if (S().priceMin > 0.0f) p["price_min"] = S().priceMin;
-    if (S().priceMax > 0.0f) p["price_max"] = S().priceMax;
-    if (S().materialBuf[0])  p["material"]  = S().materialBuf;
-    if (S().vendorBuf[0])    p["vendor"]    = S().vendorBuf;
-    if (S().sourceFilter == 2) p["source"] = "live";
-    nlohmann::json facets = nlohmann::json::object();
-    for (const auto& [key, fv] : S().facetValues) {
-        if (!fv.active()) continue;
-        if (fv.rmin != 0.0f || fv.rmax != 0.0f) {
-            nlohmann::json range = nlohmann::json::object();
-            if (fv.rmin != 0.0f) range["min"] = fv.rmin;
-            if (fv.rmax != 0.0f) range["max"] = fv.rmax;
-            facets[key] = std::move(range);
-        } else if (!fv.multi.empty()) {
-            facets[key] = std::vector<std::string>(fv.multi.begin(), fv.multi.end());
-        } else if (fv.text[0]) {
-            facets[key] = fv.text;
-        }
-    }
-    if (!facets.empty()) p["facets"] = std::move(facets);
 }
 
 // Update S().liveVendors from a live-search start/poll payload's "vendors" array and kick a live
@@ -448,7 +443,12 @@ void startLiveSearch(AppState& st) {
     S().liveVendors.clear();       // fresh fan-out — drop the previous search's vendor strip
     nlohmann::json p;
     fillSearchParams(p);
-    st.rpc.call("parts_search_live_start", p, [&st](const core::RpcResult& r) {
+    // The local layer returns long before this fan-out resolves, so S().searching is already
+    // clear and a newer query may have started meanwhile: pin the generation and let the
+    // loser drop its token instead of hijacking the newer search.
+    const unsigned gen = g_searchGen;
+    st.rpc.call("parts_search_live_start", p, [gen, &st](const core::RpcResult& r) {
+        if (gen != g_searchGen) return;   // superseded by a newer query
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) return;
         std::string token = r.result.value("token", "");
         if (token.empty() || r.result.value("done", false)) return;  // no live vendors
@@ -764,16 +764,35 @@ void drawPartsLibraryWorkspace(AppState& st) {
         return;
     }
 
-    // Layout: [taxonomy tree 240px] | [results flex] | [filters + vendor strip 260px]
-    float totalW = ImGui::GetContentRegionAvail().x;
-    const float catW  = 240.0f * sc;
-    const float filtW = 260.0f * sc;
-    const float midW  = totalW - catW - filtW - 12.0f * sc;
+    // Layout: [taxonomy tree 240px] | [results flex] | [filters + vendor strip 260px].
+    // The docked AI Copilot column can squeeze this workspace well below the three columns'
+    // natural width, and ImGui reads a negative child width as "available minus |w|" — a
+    // silently wrong layout rather than an error. So the columns degrade instead: results
+    // are the primary content and keep a hard floor, the two side panes shrink
+    // proportionally, and once even a 60 %-width side pane will not fit they drop out.
+    const float totalW     = ImGui::GetContentRegionAvail().x;
+    const float catFullW   = 240.0f * sc;
+    const float filtFullW  = 260.0f * sc;
+    const float gapsW      = 12.0f * sc;    // the two SameLine gaps between the columns
+    const float minMidW    = 320.0f * sc;   // results column never narrower than this
+    const float kSideFloor = 0.60f;         // shrink the side panes to 60 % before dropping
+
+    float catW = catFullW, filtW = filtFullW;
+    const float sidesRoom = totalW - gapsW - minMidW;
+    if (sidesRoom < catFullW + filtFullW) {
+        const float k = sidesRoom / (catFullW + filtFullW);
+        if (k >= kSideFloor) { catW = catFullW * k; filtW = filtFullW * k; }
+        else                 { catW = filtW = 0.0f; }
+    }
+    const bool  sides = catW > 0.0f;
+    const float midW  = std::max(minMidW, totalW - catW - filtW - (sides ? gapsW : 0.0f));
 
     // ---- three-column body (full height — the search bar lives INSIDE the middle
     // column so Categories/Filters start flush at the top, no dead space) ---------
-    drawTaxonomyPane(st, catW);
-    ImGui::SameLine();
+    if (sides) {
+        drawTaxonomyPane(st, catW);
+        ImGui::SameLine();
+    }
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 4 * sc));
     ImGui::BeginChild("##parts_results", ImVec2(midW, 0), ImGuiChildFlags_None);
@@ -793,7 +812,10 @@ void drawPartsLibraryWorkspace(AppState& st) {
             sortW = std::max(sortW, ImGui::CalcTextSize(it).x);
         sortW += ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetFrameHeight();
 
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 152.0f * sc - sortW);
+        // The results column has a floor but the fixed items on this row can still eat the
+        // whole line — never hand the input a negative width.
+        ImGui::SetNextItemWidth(std::max(80.0f * sc,
+            ImGui::GetContentRegionAvail().x - 152.0f * sc - sortW));
         bool hit = ImGui::InputTextWithHint("##parts_q",
                                     "search fasteners, bearings, sections, electronics, vendors…",
                                     S().searchBuf, sizeof(S().searchBuf),
@@ -810,7 +832,7 @@ void drawPartsLibraryWorkspace(AppState& st) {
         if (ImGui::Combo("##sort", &S().sortMode, kSortItems, IM_ARRAYSIZE(kSortItems))) {
             st.settings.partsSortMode = S().sortMode;
             saveSettings(st.settings);
-            doSearch(st);
+            applyResultSort();   // cosmetic — never re-run the local + vendor fan-out
         }
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button,
@@ -864,8 +886,10 @@ void drawPartsLibraryWorkspace(AppState& st) {
     }
     ImGui::EndChild();
 
-    ImGui::SameLine();
-    drawFiltersBlock(st, filtW);   // right pane: filters + facets + vendor strip footer
+    if (sides) {
+        ImGui::SameLine();
+        drawFiltersBlock(st, filtW);   // right pane: filters + facets + vendor strip footer
+    }
 
     drawVendorsPopup(st);          // floating "Vendor Accounts" window (no-op when closed)
 }

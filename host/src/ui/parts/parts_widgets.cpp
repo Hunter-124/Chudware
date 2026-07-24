@@ -317,10 +317,21 @@ void borderCardRect(ImDrawList* dl, ImVec2 p0, ImVec2 p1, bool selected, bool ho
 
 // ---- thumbnails --------------------------------------------------------------------
 
+// A failed thumbnail is a permanent property of the record for this session — most
+// local-catalog parts simply have no image — so thumbFailed is a suppression list, not a
+// cache. It must never be mass-cleared: dropping every id at once makes the next scroll
+// re-fire a burst of RPCs that are all doomed to fail again. Bound it by refusing new
+// entries once the cap is reached (the ids already recorded keep suppressing their
+// retries); the cap is set where a realistic session will never reach it.
+static void markThumbFailed(const std::string& id) {
+    constexpr size_t kFailedCap = 65536;
+    if (S().thumbFailed.size() < kFailedCap) S().thumbFailed.insert(id);
+}
+
 void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes) {
     int w = 0, h = 0, n = 0;
     unsigned char* px = stbi_load_from_memory(bytes.data(), (int)bytes.size(), &w, &h, &n, 4);
-    if (!px) { S().thumbFailed.insert(id); return; }
+    if (!px) { markThumbFailed(id); return; }
     Thumb t;
     t.w = w; t.h = h;
     glGenTextures(1, &t.tex);
@@ -332,7 +343,9 @@ void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes) 
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
     stbi_image_free(px);
     t.lastUse = ImGui::GetTime();
-    S().thumbs[id] = t;
+    Thumb& slot = S().thumbs[id];
+    if (slot.tex) glDeleteTextures(1, &slot.tex);  // never orphan a texture we overwrite
+    slot = t;
     // LRU cap: a long browse session used to accumulate GL textures unboundedly (never
     // deleted). This runs inside rpc.drain() on the GL thread — the same thread that draws
     // the thumbs — so deleting the evicted texture right here is safe.
@@ -347,7 +360,6 @@ void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes) 
 }
 
 void requestThumb(AppState& st, const PartsItem& item) {
-    if (S().thumbFailed.size() > 1024) S().thumbFailed.clear();  // cap: retry beats unbounded growth
     if (S().thumbs.count(item.id) || S().thumbBusy.count(item.id) ||
         S().thumbFailed.count(item.id))
         return;
@@ -355,7 +367,7 @@ void requestThumb(AppState& st, const PartsItem& item) {
     // CAD model on demand (cached by item_id). Still fire the RPC for a placeable local part;
     // only give up when there's neither a URL nor a renderable local part.
     const bool localRenderable = item.placeable && (item.source == "local" || item.source.empty());
-    if (item.imageUrl.empty() && !localRenderable) { S().thumbFailed.insert(item.id); return; }
+    if (item.imageUrl.empty() && !localRenderable) { markThumbFailed(item.id); return; }
     S().thumbBusy.insert(item.id);
     nlohmann::json p;
     p["item_id"]   = item.id;
@@ -363,11 +375,11 @@ void requestThumb(AppState& st, const PartsItem& item) {
     st.rpc.call("parts_thumbnail", p, [id = item.id](const core::RpcResult& r) {
         S().thumbBusy.erase(id);
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
-            S().thumbFailed.insert(id);
+            markThumbFailed(id);
             return;
         }
         std::string b64 = r.result.value("image_b64", "");
-        if (b64.empty()) { S().thumbFailed.insert(id); return; }
+        if (b64.empty()) { markThumbFailed(id); return; }
         storeThumb(id, b64decode(b64));
     });
 }
@@ -376,7 +388,6 @@ void requestVendorLogo(AppState& st, const std::string& site, const std::string&
     // Live vendor logo for the search-progress strip. Stored in the SAME texture cache as
     // part thumbs, keyed "vendorlogo:<site>", fetched through the existing parts_thumbnail RPC.
     const std::string id = "vendorlogo:" + site;
-    if (S().thumbFailed.size() > 1024) S().thumbFailed.clear();  // cap: retry beats unbounded growth
     if (site.empty() || domain.empty() ||
         S().thumbs.count(id) || S().thumbBusy.count(id) || S().thumbFailed.count(id))
         return;
@@ -389,11 +400,11 @@ void requestVendorLogo(AppState& st, const std::string& site, const std::string&
     st.rpc.call("parts_thumbnail", p, [id](const core::RpcResult& r) {
         S().thumbBusy.erase(id);
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
-            S().thumbFailed.insert(id);
+            markThumbFailed(id);
             return;
         }
         std::string b64 = r.result.value("image_b64", "");
-        if (b64.empty()) { S().thumbFailed.insert(id); return; }
+        if (b64.empty()) { markThumbFailed(id); return; }
         storeThumb(id, b64decode(b64));
     });
 }

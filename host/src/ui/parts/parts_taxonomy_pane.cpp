@@ -32,6 +32,11 @@ void persistExpanded(AppState& st) {
 }
 
 void pickNode(AppState& st, const std::string& id) {
+    // Facet keys are scoped to the node that declared them, and only the selected node's
+    // facet widgets are drawn — so a value left over from the previous category is invisible
+    // yet still live, silently filtering the new category down to zero rows. Re-selecting the
+    // same node keeps its values.
+    if (id != S().selectedCategory) S().facetValues.clear();
     S().selectedCategory = id;
     doSearch(st);  // browse-on-click, even with an empty query
 }

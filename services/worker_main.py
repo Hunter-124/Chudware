@@ -115,9 +115,7 @@ def _register(label: str, import_paths: list[str], attr: str, structured: bool =
 
 
 # ---- Supplier/vendor parts cache (registry only; insert runs in the C++ core) ----
-_register("vendor_parts",
-          ["services.parts.vendor_parts", "engine.vendor_parts"],
-          "WORKER_METHODS", structured=True)
+_register("vendor_parts", ["services.parts.vendor_parts"], "WORKER_METHODS", structured=True)
 
 # ---- Deliverables ----
 _register("deliverables", ["deliverables.worker_rpc"], "WORKER_METHODS")
@@ -141,12 +139,10 @@ _register("subagent", ["services.agent.subagent_rpc"], "WORKER_METHODS")
 _register("plm", ["services.plm.worker_rpc"], "WORKER_METHODS")
 
 # ---- EM (T-SIM11 hold — moved, not worked) ----
-_register("em", ["services.sim.em.worker_rpc", "engine.sim.em.worker_rpc"],
-          "WORKER_METHODS")
+_register("em", ["services.sim.em.worker_rpc"], "WORKER_METHODS")
 
 # ---- Multi-physics seam ----
-_register("multiphysics", ["services.sim.multiphysics_rpc", "engine.sim.multiphysics_rpc"],
-          "WORKER_METHODS")
+_register("multiphysics", ["services.sim.multiphysics_rpc"], "WORKER_METHODS")
 
 
 def _emit(obj: dict) -> None:

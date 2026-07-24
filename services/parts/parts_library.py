@@ -149,26 +149,9 @@ def scan_library_folder(folder: str | None = None) -> dict:
     return {"scanned": scanned, "added": added, "updated": updated, "parts": touched}
 
 
-def resolve_priced_part(mpn: str) -> dict | None:
-    """Resolve a manufacturer part number to a priced VendorPart record, or ``None``.
-
-    This is the default catalog-lookup resolver. The priced-provider chain
-    (Nexar → Digi-Key → Mouser) was deleted with ``engine_oracle/parts_providers.py``
-    (T-RF18) — the C++ sourcing RPC owns pricing now — so this resolver always returns
-    ``None``: a graceful "no price feed" state, never a raised traceback or a network
-    call without configured keys.
-    """
-    return None
-
-
 EmitFn = Callable[[dict], None]
 
 
 def _vendor_part_scan_library(params: dict, _emit: EmitFn) -> dict:
     folder = params.get("folder")
     return scan_library_folder(str(folder) if folder else None)
-
-
-WORKER_METHODS = {
-    "vendor_part_scan_library": _vendor_part_scan_library,
-}

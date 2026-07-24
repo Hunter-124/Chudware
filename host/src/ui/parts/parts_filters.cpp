@@ -1,6 +1,6 @@
 // Parts Library — right-hand filters pane (GUI V2 phase B).
 // Global block (price / vendor / material / source) followed by per-selection facet widgets
-// from the selected taxonomy node: range → DragFloatRange2, enum → wrapping toggle chips,
+// from the selected taxonomy node: range → paired non-negative min/max drags, enum → chips,
 // text → InputTextWithHint. Every change stamps S().filterDirtyAt; the workspace loop fires
 // doSearch once 0.35 s after the last change (debounce — no Apply button). The pane's fixed
 // footer is the compact vendor strip (parts_vendors.cpp).
@@ -53,10 +53,25 @@ void drawFacetWidgets(const TaxNode& node) {
                 std::snprintf(fmtMin, sizeof(fmtMin), "min %%.2f");
                 std::snprintf(fmtMax, sizeof(fmtMax), "max %%.2f");
             }
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::DragFloatRange2("##range", &fv.rmin, &fv.rmax, 0.25f,
-                                       0.0f, 0.0f, fmtMin, fmtMax))
+            // The RPC facet schema carries no per-facet bound (contracts/parts.md §7.2), so
+            // the only honest floor is zero: dimensions, counts and prices are never negative.
+            // 0 also means "omit this end" to the search serializer, which is why the two ends
+            // are driven by separate drags instead of DragFloatRange2 — the stock widget hard-
+            // ties min <= max, which pins min at an unset (0) max and kills min-only queries.
+            const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
+            ImGui::SetNextItemWidth((ImGui::GetContentRegionAvail().x - gap) * 0.5f);
+            if (ImGui::DragFloat("##rmin", &fv.rmin, 0.25f, 0.0f,
+                                 fv.rmax > 0.0f ? fv.rmax : FLT_MAX, fmtMin,
+                                 ImGuiSliderFlags_AlwaysClamp))
                 markDirty();
+            ImGui::SameLine(0.0f, gap);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::DragFloat("##rmax", &fv.rmax, 0.25f, 0.0f, FLT_MAX, fmtMax,
+                                 ImGuiSliderFlags_AlwaysClamp)) {
+                // Dragging max down past min drags min with it rather than inverting the range.
+                if (fv.rmax > 0.0f && fv.rmax < fv.rmin) fv.rmin = fv.rmax;
+                markDirty();
+            }
         } else if (f.type == "enum") {
             // Wrapping toggle chips with manual SameLine wrap.
             const float availR = ImGui::GetContentRegionAvail().x +

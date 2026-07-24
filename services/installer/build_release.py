@@ -31,6 +31,8 @@ if not HOST_EXE.exists():
 # Engine host daemon (core/hostd). MSVC builds of chudware-hostd are new — absence is a
 # warning + skip, not a failure (the app falls back to legacy in-process engine mode).
 HOSTD_EXE_CANDIDATES = (
+    REPO / "build" / "windows-occt" / "bin" / "chudware-hostd.exe",
+    REPO / "build" / "windows-core" / "bin" / "chudware-hostd.exe",
     REPO / "core" / "build" / "bin" / "Release" / "chudware-hostd.exe",
     REPO / "core" / "build" / "bin" / "chudware-hostd.exe",
 )
@@ -54,6 +56,13 @@ def stage_app(dst: Path) -> None:
             shutil.copy2(init_py, services_dst / "__init__.py")
         else:
             (services_dst / "__init__.py").write_text("", encoding="utf-8")
+        # Loose top-level services/*.py modules (paths.py, kernel_exec.py, worker_main.py, …) --
+        # SERVICE_PACKAGES below only covers subpackages; installer.provision imports
+        # `services.paths` directly, so these single-file modules must ship too.
+        for py in services_src.glob("*.py"):
+            if py.name == "__init__.py" or py.name.startswith("test_"):
+                continue
+            shutil.copy2(py, services_dst / py.name)
         for name in SERVICE_PACKAGES:
             s = services_src / name
             if s.exists():

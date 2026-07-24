@@ -51,10 +51,18 @@ try {
     $whArgs = @()
     if (Test-Path $wh) { $whArgs = @("--wheelhouse", $wh) }
     Write-Host "==> Provisioning runtime into %APPDATA%\Chudware ..."
-    & $basePy -m installer.provision @whArgs --base-python $basePy --with-app-code
-    if ($LASTEXITCODE -ne 0) { throw "provisioning failed" }
-
-    $venvPy = "$env:APPDATA\Chudware\runtime\venv\Scripts\python.exe"
+    $provisionOut = & $basePy -m installer.provision @whArgs --base-python $basePy --with-app-code
+    if ($LASTEXITCODE -ne 0) { $provisionOut | ForEach-Object { Write-Host $_ }; throw "provisioning failed" }
+    $provisionOut | ForEach-Object { Write-Host $_ }
+    # provision.py may legitimately reuse a pre-Chudware-rename venv (services/paths.py's
+    # active_root() back-compat) -- read the actual python path it reports rather than
+    # assuming the new %APPDATA%\Chudware name, or registration below targets a python.exe
+    # that was never created.
+    $provisionJson = ($provisionOut -join "`n") | ConvertFrom-Json
+    $venvPy = $provisionJson.python
+    if (-not $venvPy -or -not (Test-Path $venvPy)) {
+        throw "provisioning reported no usable python (got '$venvPy')"
+    }
     if (-not $NoRegister) {
         Write-Host "==> Registering Chudware MCP server with Claude ..."
         # Pin CHUDWARE_HOSTD_BIN in the registered server env so MCP sessions and the GUI

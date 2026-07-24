@@ -1,8 +1,0 @@
-# Bench corpora are frozen by content hash (tools/flywheel/bench/dataset.py). Store every
-# member verbatim so a checkout on any OS reproduces the same bytes and therefore the same
-# hash — never let git apply EOL/CRLF conversion here.
-* -text
-*.json -text
-*.jsonl -text
-*.txt -text
-*.png binary

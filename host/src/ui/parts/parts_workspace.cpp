@@ -87,7 +87,8 @@ static void parseTaxNode(const nlohmann::json& j, TaxNode& out) {
 
 void loadTaxonomy(AppState& st) {
     if (S().taxonomyLoaded || S().taxonomyLoading) return;
-    S().taxonomyLoading = true;
+    S().taxonomyLoading   = true;
+    S().taxonomyStartedAt = ImGui::GetTime();
     st.rpc.call("parts_taxonomy", {}, [&st](const core::RpcResult& r) {
         S().taxonomyLoading = false;
         S().taxonomyLoaded  = true;
@@ -741,6 +742,16 @@ void drawPartsLibraryWorkspace(AppState& st) {
     if (st.workerStarted) {
         if (!S().taxonomyLoaded && !S().taxonomyLoading) loadTaxonomy(st);
         if (!S().vendorsLoaded  && !S().vendorsLoading)  loadVendors(st);
+    }
+    // Watchdog: parts_taxonomy is answered by the Python parts worker, which may never
+    // reply (not provisioned, crashed, or the request was dropped). Without a deadline the
+    // pane spins "Loading" forever. Mark the load finished-but-empty so the pane falls
+    // through to its honest "No catalog data" state, which offers a Retry.
+    if (S().taxonomyLoading &&
+        ImGui::GetTime() - S().taxonomyStartedAt > 20.0) {
+        S().taxonomyLoading = false;
+        S().taxonomyLoaded  = true;   // no auto-retry loop; the pane's Retry button re-arms
+        st.addLog("[parts] parts_taxonomy timed out — is the parts worker running?");
     }
 
     // Debounced filter → search: any facet/global-filter change stamps filterDirtyAt; fire

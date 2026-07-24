@@ -160,11 +160,16 @@ struct PartsState {
 
     bool gridView = false;
 
-    // ---- taxonomy tree + facet filter values (phase B; harmless now) ----
+    // ---- taxonomy tree + facet filter values ----
     TaxNode taxonomyRoot;
     bool taxonomyLoaded  = false;
     bool taxonomyLoading = false;
     bool taxonomyIsTree  = false;
+    // ImGui::GetTime() when the in-flight parts_taxonomy call started. The RPC callback is
+    // the only thing that clears taxonomyLoading, so a worker that never answers used to
+    // leave the Categories pane spinning "Loading" forever with no error and no retry.
+    // drawPartsLibraryWorkspace gives it a deadline.
+    double taxonomyStartedAt = 0.0;
     std::set<std::string> expandedCats;
     std::map<std::string, FacetValue> facetValues;
     double filterDirtyAt = 0;

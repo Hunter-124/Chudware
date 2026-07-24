@@ -119,6 +119,13 @@ void drawTaxonomyPane(AppState& st, float paneW) {
                    palette.textDisabled[2], 1.0f));
         ImGui::TextWrapped("No catalog data. Start the parts service or check the network.");
         ImGui::PopStyleColor();
+        ImGui::Spacing();
+        // Re-arm the one-shot load (loadTaxonomy early-outs while taxonomyLoaded is set).
+        if (ImGui::SmallButton("Retry##cat_retry")) {
+            S().taxonomyLoaded   = false;
+            S().taxonomyIsTree   = false;
+            S().categoriesLoaded = false;
+        }
     } else {
         // ---- fallback: flat parts_list_categories 2-level list -----------------------
         const float rowH = ImGui::GetFrameHeight() * 1.15f;

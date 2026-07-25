@@ -44,6 +44,11 @@ _PROVIDER_AUTH = "provider_auth"  # non-retryable auth/bad-request (mega-1 TOP-4
 # Prompt outgrew the model's context window: structural and FIXABLE (trim +
 # retry), never a credential failure — must not land in the provider_auth bucket.
 _CONTEXT_OVERFLOW = "context_overflow"
+# The model DID try to finish, repeatedly, and a HARD guardrail rejected the
+# handoff every time. Reporting that as _NOCODE ("produced no output") is a lie
+# that hides which guardrail fired and sends retry/escalation down the wrong
+# branch — the fix is on the guardrail's terms, not the model's.
+_GUARD_BLOCKED = "guardrail_blocked"
 
 # Human-facing error_detail scrubbers (never leak keys/tokens to the GUI).
 _SECRET_RE = re.compile(
@@ -173,6 +178,10 @@ def error_detail_for_stop(
             f"({tool_calls_made}"
             + (f" of {budget}" if budget else "")
             + " call(s)) without a clean finish."
+        )
+    if stop_reason == _GUARD_BLOCKED:
+        return format_error_detail(
+            extra or "Every attempt to finish was rejected by a HARD guardrail."
         )
     if stop_reason == "phase_step_cap":
         return format_error_detail(
@@ -940,6 +949,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     calls: list[dict] = []
     tool_calls_made = 0
     last_reason = _NOCODE
+    #: last HARD-guardrail rejection of a finish attempt (drives _GUARD_BLOCKED)
+    last_guard_block: str | None = None
     _prev_stage: str | None = None
     _ecad_gate_denials = 0  # mega-14 hard-gate thrash → force-inject cap
     _ecad_bootstrap_nudge = 0  # bare-text incomplete → force after 2
@@ -1308,6 +1319,10 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 block = _done_guardrail_block(bare_handoff, ledger, actor, calls)
                 if block is not None:
                     messages.append({"role": "user", "content": _parts(block)})
+                    last_reason = _GUARD_BLOCKED
+                    last_guard_block = block
+                    _log(ledger, actor, {"event": "done_blocked",
+                                         "guardrail": block[:300]})
                     continue
                 bare_handoff = _attach_typed_refusal_if_needed(
                     bare_handoff, calls,
@@ -1332,7 +1347,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 if forced:
                     last_reason = _RETRY
                     continue
-            last_reason = _NOCODE
+            last_reason = _NOCODE if last_guard_block is None else _GUARD_BLOCKED
             break
 
         # Finish forms accepted:
@@ -1404,6 +1419,10 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             block = _done_guardrail_block(handoff, ledger, actor, calls)
             if block is not None:
                 messages.append({"role": "user", "content": _parts(block)})
+                last_reason = _GUARD_BLOCKED
+                last_guard_block = block
+                _log(ledger, actor, {"event": "done_blocked",
+                                     "guardrail": block[:300]})
                 continue
             handoff = _attach_typed_refusal_if_needed(handoff, calls)
             _log(ledger, actor, {"event": "turn", "kind": "done", "handoff": handoff})
@@ -1443,6 +1462,10 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 )
                 if block is not None:
                     messages.append({"role": "user", "content": _parts(block)})
+                    last_reason = _GUARD_BLOCKED
+                    last_guard_block = block
+                    _log(ledger, actor, {"event": "done_blocked",
+                                         "guardrail": block[:300]})
                     continue
                 bare_handoff = _attach_typed_refusal_if_needed(
                     bare_handoff, calls,
@@ -1466,7 +1489,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 if forced:
                     last_reason = _RETRY
                     continue
-            last_reason = _NOCODE
+            last_reason = _NOCODE if last_guard_block is None else _GUARD_BLOCKED
             break
 
         # Model-requestable tool categories (anti-context-flood). Handle before
@@ -2433,7 +2456,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     # budget headroom — same class as hard_gate_cap, at end-of-turn.
     try:
         if (
-            last_reason in (_RETRY, "phase_step_cap", _NOCODE)
+            last_reason in (_RETRY, "phase_step_cap", _NOCODE, _GUARD_BLOCKED)
             and callable(dispatch)
             and tool_calls_made > 0
         ):
@@ -2484,7 +2507,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     except Exception:  # noqa: BLE001 — force never breaks the turn
         pass
     if (tool_calls_made > 0
-            and last_reason in (_RETRY, "phase_step_cap", _NOCODE)
+            and last_reason in (_RETRY, "phase_step_cap", _NOCODE, _GUARD_BLOCKED)
             and wrote):
         synth = {
             "status": "done",
@@ -2596,10 +2619,13 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         tool_calls_made=tool_calls_made,
         budget=budget,
         calls=calls,
+        extra=(f"Every finish attempt was rejected by a HARD guardrail: "
+               f"{last_guard_block}" if last_guard_block else ""),
     )
     return TurnResult(False, last_reason, _with_usage(
         {"calls": calls, "tool_calls": tool_calls_made,
          "stop_reason": last_reason,
+         "guardrail_block": last_guard_block,
          "error_detail": detail}, _tu))
 
 

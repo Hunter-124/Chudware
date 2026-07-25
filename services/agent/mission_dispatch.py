@@ -598,6 +598,16 @@ class MissionDispatch:
         role_raw = str(role or "").strip()
         role_key = role_raw.lower()
         role_resolved = self._ROLE_ALIASES.get(role_key, role_raw)
+        # A model cannot know its own dg_<hex> node id, and nothing injected it,
+        # so every nested delegate() arrived with parent_id=None and
+        # request_delegation fell back to the tree ROOT — pinning every spawn at
+        # depth 1 no matter how many levels of delegation really happened. That
+        # made max_subagent_depth / soft_depth_limit unreachable via the only
+        # tool a model has to spawn, and kept the depth-aware model-cost
+        # throttle from ever seeing a deep leaf. _run_subagent marks the node it
+        # is currently executing so the chain is measured for real.
+        if not parent_id:
+            parent_id = getattr(self, "_current_node_id", None)
         # Models send budget_tokens as "12000" often enough that the bare
         # comparison in DelegationTree.request_delegation blew up with
         # "'<=' not supported between instances of 'str' and 'int'" — an
@@ -1167,17 +1177,25 @@ class MissionDispatch:
                         allowed = list(allowed) + ["advise"]
             except Exception:  # noqa: BLE001
                 pass
-            result = _at.run_turn(
-                brief, provider, name=role, actor=role,
-                system_prompt=system_prompt,
-                allowed_tools=allowed,
-                tools_text=tools_text,
-                mission_dispatch=self,
-                ledger=self._ledger(), max_tool_calls=max_calls,
-                on_event=self.on_event, run_id=self.run_id,
-                node_id=node_id, subagent_id=node_id,
-                capability=_cap, tier=self.tier, phase=_phase,
-                task_class=self.task_class)
+            # Mark the node this turn IS, so a nested delegate() from inside it
+            # attaches to this node instead of the tree root. Saved/restored so
+            # sibling and deeper spawns nest correctly.
+            _prev_node = getattr(self, "_current_node_id", None)
+            self._current_node_id = node_id or _prev_node
+            try:
+                result = _at.run_turn(
+                    brief, provider, name=role, actor=role,
+                    system_prompt=system_prompt,
+                    allowed_tools=allowed,
+                    tools_text=tools_text,
+                    mission_dispatch=self,
+                    ledger=self._ledger(), max_tool_calls=max_calls,
+                    on_event=self.on_event, run_id=self.run_id,
+                    node_id=node_id, subagent_id=node_id,
+                    capability=_cap, tier=self.tier, phase=_phase,
+                    task_class=self.task_class)
+            finally:
+                self._current_node_id = _prev_node
             # mega-6: prefer real provider usage tokens over the tool-count estimate.
             # Join must never surface handoff=null when the child produced calls or
             # a partial finish (mega-5: executed=true, spent=0, handoff=null).
@@ -2172,10 +2190,42 @@ def run_linear_role_turn(
         run_id=run_id,
         capability=capability,
     )
+    # Handoff synthesis — the same rescue _run_subagent applies at its join.
+    # This is the UNIVERSAL top-level entry (every online run lands here via
+    # worker_rpc.agent_admin_turn), yet it returned run_turn's raw result: on a
+    # turn that did real tool work but emitted no formal envelope, the caller
+    # got a payload with no "handoff" key at all and had to treat a productive
+    # run as a blank failure.
+    res_dict = result.result if isinstance(result.result, dict) else {}
+    handoff = res_dict.get("handoff")
+    if not isinstance(handoff, dict) or not handoff:
+        calls = res_dict.get("calls") if isinstance(res_dict.get("calls"), list) else []
+        n_tool = len([c for c in calls if isinstance(c, dict)])
+        if calls or result.success:
+            res_dict = dict(res_dict)
+            res_dict["handoff"] = {
+                "status": "done" if result.success else "blocked",
+                "summary": (
+                    f"{role} turn finished stop_reason={result.stop_reason} "
+                    f"tool_calls={n_tool}"
+                )[:600],
+                "outputs": {
+                    "tool_calls": n_tool,
+                    "calls": [
+                        {"tool": c.get("tool"), "ok": c.get("ok")}
+                        for c in calls[:20] if isinstance(c, dict)
+                    ],
+                    "stop_reason": result.stop_reason,
+                    "reasoning_summary": (
+                        "Synthesised from the turn result (no formal envelope "
+                        "emitted); mirrors the sub-agent join rescue."
+                    ),
+                },
+            }
     return {
         "success": result.success,
         "stop_reason": result.stop_reason,
-        "result": result.result,
+        "result": res_dict or result.result,
         "role": role,
         "allowed_tools": allowed,
     }

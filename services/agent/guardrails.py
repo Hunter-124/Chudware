@@ -80,7 +80,10 @@ MSG_ORPHAN_SKETCH = (
 )
 MSG_CHECKPOINT_FAIL = (
     "HARD guardrail: auto-checkpoint before destructive tool {tool!r} failed "
-    "({reason}); the destructive call was blocked."
+    "({reason}); the destructive call was blocked. The snapshot is a safety "
+    "net, not a correctness gate — if the engine still cannot checkpoint this "
+    "doc, repeat the call and it will proceed UNPROTECTED (recorded on the "
+    "ledger), or close the doc to escape it."
 )
 MSG_REFS = (
     "HARD guardrail: dangling feature/face refs — cannot apply. "
@@ -992,6 +995,26 @@ def take_auto_checkpoint(doc_id: str | None,
         return False, reason
 
 
+# WI-12 escape hatches. The checkpoint gate guarantees a restore point before
+# destructive work — it is a SAFETY NET, not kernel integrity (contrast
+# refs_resolve, which is deliberately waiver-less). Unlike WI-11/13/14 it had no
+# waiver of any kind, so once doc_checkpoint started failing for a doc_id the
+# gate refused EVERY destructive call against it forever: delete_feature, shell,
+# boolean cuts — and close_part, which is in DESTRUCTIVE_TOOLS, so the session
+# could not even close the wedged doc. The model holds no tool that can repair a
+# checkpoint and cannot reach the config kill-switch, so it retried into
+# max_iters. Two bounded escapes below.
+_CHECKPOINT_ESCAPE_TOOLS: frozenset[str] = frozenset({"close_part"})
+
+#: doc_id → consecutive checkpoint failures (bounded; cleared on success).
+_checkpoint_failures: dict[str, int] = {}
+
+
+def reset_checkpoint_failures() -> None:
+    """Clear the WI-12 failure memo (tests / new run)."""
+    _checkpoint_failures.clear()
+
+
 def pre_dispatch_checkpoint(tool: str, args: dict | None, *,
                             ledger: Any = None,
                             actor: str = "guardrails",
@@ -1016,7 +1039,30 @@ def pre_dispatch_checkpoint(tool: str, args: dict | None, *,
         doc_id, tool, ledger=ledger, actor=actor,
         checkpoint_fn=checkpoint_fn, vault_bound=vault_bound,
     )
+    key = doc_id or ""
     if ok:
+        _checkpoint_failures.pop(key, None)
+        return None
+    # Escape 1: never trap the session inside a doc it cannot snapshot.
+    if tool in _CHECKPOINT_ESCAPE_TOOLS:
+        emit_hard_guardrail(
+            ledger, "auto_checkpoint", "waived",
+            reason=(f"checkpoint failed ({reason}) but {tool} is the escape "
+                    "from an unsnapshottable doc — allowed unprotected"),
+            actor=actor)
+        return None
+    if len(_checkpoint_failures) > 256:  # bounded memo
+        _checkpoint_failures.clear()
+    fails = _checkpoint_failures.get(key, 0) + 1
+    _checkpoint_failures[key] = fails
+    # Escape 2: warn once, then proceed unprotected rather than wedge the run.
+    if fails > 1:
+        emit_hard_guardrail(
+            ledger, "auto_checkpoint", "waived",
+            reason=(f"checkpoint still failing for doc {key!r} after {fails} "
+                    f"attempts ({reason}); proceeding UNPROTECTED so the doc is "
+                    "not permanently locked"),
+            actor=actor)
         return None
     return GuardVerdict(
         ok=False, name="auto_checkpoint", outcome="blocked",

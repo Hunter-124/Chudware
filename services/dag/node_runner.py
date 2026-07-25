@@ -67,7 +67,11 @@ _DONE_REASONS = frozenset(["confirmed", "stabilized"])
 #   matches on the literal "failed", could never fire and every transient hiccup
 #   hard-escalated on its FIRST occurrence with retry budget untouched.
 # phase_step_cap: a capability-tier step ceiling, same class as max_iters.
-_RETRY_REASONS = frozenset(["max_iters", "provider_error", "phase_step_cap"])
+# guardrail_blocked: the model tried to finish and a HARD guardrail refused —
+#   another turn can satisfy the guardrail, so this is a retry, not an escalate.
+_RETRY_REASONS = frozenset([
+    "max_iters", "provider_error", "phase_step_cap", "guardrail_blocked",
+])
 # stop_reason values that map to escalate (failed build / no model output / auth)
 _ESCALATE_REASONS = frozenset(["failed", "no_code", "provider_auth"])
 

@@ -4089,3 +4089,39 @@ WI-12 auto-checkpoint has no waiver path and can permanently block close_part on
 doc_checkpoint RPC fails; guardrail-blocked done attempts still report `no_code`;
 `run_linear_role_turn` has no handoff-synthesis rescue; `delegate` never threads the caller's
 node id so every spawn lands at depth 1 and the depth rails never trip.
+
+## 2026-07-25 — Agent harness sweep III: the four deferred defects
+Closes the items reported-but-not-fixed in sweep II. (1) WI-12 AUTO-CHECKPOINT LOCKOUT —
+alone among the HARD guards it had no waiver of any kind (WI-11/13/14 all read
+handoff.waivers; only refs_resolve is deliberately waiver-less, for kernel integrity). Once
+`doc_checkpoint` began failing for a doc_id, `pre_dispatch_checkpoint` refused every
+destructive call against it forever — and `close_part` is in `DESTRUCTIVE_TOOLS`, so the
+session could not even close the wedged doc. The model holds no tool that repairs a checkpoint
+and cannot reach the `hard_guardrails.auto_checkpoint` config kill-switch, so it retried into
+max_iters. Two bounded escapes: tools in `_CHECKPOINT_ESCAPE_TOOLS` (close_part) are never
+blocked by a snapshot failure, and a repeat attempt on the same doc proceeds UNPROTECTED with a
+loud `waived` ledger event rather than wedging the run; the memo is per-doc, bounded, and
+cleared on the first success. MSG_CHECKPOINT_FAIL now states both escapes. (2) `no_code`
+MISREPORT — `last_reason` initialised to `_NOCODE` and none of the three `_done_guardrail_block`
+sites touched it or logged, so a turn that tried to finish repeatedly and was rejected every
+time reported "Model produced no valid tool call or completion" with no record of which
+guardrail fired. New `_GUARD_BLOCKED` stop_reason + `last_guard_block`, recorded at all three
+sites (`done_blocked` ledger event) and surfaced as `result["guardrail_block"]` + error_detail.
+Because `_GUARD_BLOCKED` is a strictly more precise label for a subset of what used to be
+`_NOCODE`, it was added everywhere `_NOCODE` is accepted (both auto-complete gates) — a
+reporting change must not become a control-flow change; the mega-7 auto-complete test caught
+exactly that and is green again. (3) `run_linear_role_turn` — the universal top-level entry
+every online run reaches via `agent_admin_turn` — returned run_turn's raw result, so a turn that
+did real tool work without a formal envelope reached the caller with no `handoff` key at all;
+it now applies the same synthesis `_run_subagent` uses at its join, and leaves a real handoff
+untouched. (4) DELEGATION DEPTH — a model cannot know its own `dg_<hex>` id and nothing injected
+one, so every nested `delegate()` arrived with `parent_id=None` and `request_delegation` fell
+back to the tree root, pinning the entire chain at depth 1; `max_subagent_depth` /
+`soft_depth_limit` were therefore unreachable through the only tool a model has to spawn, and
+the depth-aware model-cost throttle never saw a deep leaf. `_run_subagent` now marks the node
+in flight (`_current_node_id`, saved/restored around the turn so siblings and deeper spawns
+nest correctly) and `delegate()` uses it when the caller passes none; an explicit parent_id
+still wins. Also added `guardrail_blocked` to `node_runner._RETRY_REASONS` (another turn can
+satisfy a guardrail, so it is a retry, not an escalate). 36 tests in
+`services/agent/test_harness_integrity.py`; suites 2643 passed with the same 4 pre-existing
+failures as the stashed baseline; `scripts/check.py` 6/6 PASS.

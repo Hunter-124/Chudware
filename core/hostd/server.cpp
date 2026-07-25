@@ -362,7 +362,14 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c) {
             json payload;
             try {
                 InflightTally tally(status_.inflight);
-                payload = dispatch(*c, method, msg.value("params", json::object()), isError);
+                // `value("params", object())` substitutes its default only when the KEY is
+                // ABSENT — an explicit `"params": null` on the wire comes back as null and
+                // makes the first `params.value(...)` in a handler throw type_error.306.
+                // Coerce anything that is not an object so a zero-argument request can never
+                // be rejected for it (client-side normalization also exists in AsyncRpc).
+                const json rawParams = msg.value("params", json::object());
+                payload = dispatch(*c, method,
+                                   rawParams.is_object() ? rawParams : json::object(), isError);
             } catch (const std::exception& e) {
                 // Canonical case: a field of the wrong JSON type ({"force":1} instead of
                 // {"force":true}) throws nlohmann::json::type_error out of one of dispatch()'s

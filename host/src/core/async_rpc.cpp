@@ -10,7 +10,15 @@ namespace core {
 void AsyncRpc::call(std::string method, nlohmann::json params, Done done, int timeoutMs) {
     auto p = std::make_unique<Pending>();
     p->method = std::move(method);
-    p->params = std::move(params);
+    // `rpc.call("m", {}, cb)` looks like "no arguments" but nlohmann parses a bare `{}` as
+    // NULL, not an empty object — and a null lands on the wire as `"params": null`. hostd's
+    // `msg.value("params", json::object())` then returns the stored null (value() only
+    // substitutes the default when the KEY is absent), so the first `params.value(...)` in a
+    // handler throws type_error.306 and the daemon rejects the request. That silently broke
+    // every zero-argument RPC — parts_taxonomy / parts_list_categories / vendor_status /
+    // parts_queue_status / vendors_health_* / login_wizard_* — while calls that pass real
+    // arguments worked fine. Normalize here so no null params can ever reach a handler.
+    p->params = params.is_null() ? nlohmann::json::object() : std::move(params);
     p->timeoutMs = timeoutMs;
     p->done = std::move(done);
     {

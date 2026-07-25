@@ -14,6 +14,7 @@
 #include "parts_workspace.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -36,6 +37,10 @@ PartsState& S() {
     static PartsState s;
     return s;
 }
+
+// Bounded cold-start retries for the category tree (see drawPartsLibraryWorkspace). Eight
+// attempts on a 1.5s-doubling backoff capped at 15s covers ~75s of Python-sidecar boot.
+constexpr int kTaxonomyMaxAttempts = 8;
 
 // ---- async loaders -------------------------------------------------------------
 
@@ -108,8 +113,9 @@ void loadTaxonomy(AppState& st) {
             parseTaxNode(n, ch);
             root.children.push_back(std::move(ch));
         }
-        S().taxonomyRoot   = std::move(root);
-        S().taxonomyIsTree = true;
+        S().taxonomyRoot    = std::move(root);
+        S().taxonomyIsTree  = true;
+        S().taxonomyAttempts = 0;   // recovered — stop the backoff
     });
 }
 
@@ -743,15 +749,39 @@ void drawPartsLibraryWorkspace(AppState& st) {
         if (!S().taxonomyLoaded && !S().taxonomyLoading) loadTaxonomy(st);
         if (!S().vendorsLoaded  && !S().vendorsLoading)  loadVendors(st);
     }
-    // Watchdog: parts_taxonomy is answered by the Python parts worker, which may never
-    // reply (not provisioned, crashed, or the request was dropped). Without a deadline the
-    // pane spins "Loading" forever. Mark the load finished-but-empty so the pane falls
-    // through to its honest "No catalog data" state, which offers a Retry.
-    if (S().taxonomyLoading &&
-        ImGui::GetTime() - S().taxonomyStartedAt > 20.0) {
-        S().taxonomyLoading = false;
-        S().taxonomyLoaded  = true;   // no auto-retry loop; the pane's Retry button re-arms
-        st.addLog("[parts] parts_taxonomy timed out — is the parts worker running?");
+    // Cold-start recovery for the category tree. The parts worker is a Python sidecar that
+    // may still be booting when this workspace opens; parts_taxonomy AND its
+    // parts_list_categories fallback then both fail on transport, and the one-shot `loaded`
+    // latch used to leave the pane stuck on "No catalog data" until the user found Retry.
+    // Re-arm on a bounded exponential backoff so it heals itself once the worker answers.
+    {
+        const double now      = ImGui::GetTime();
+        const bool   haveData = S().taxonomyIsTree || !S().categories.empty();
+        // A dropped callback would strand taxonomyLoading forever; AsyncRpc's own per-call
+        // timeout is 120s, so anything past that is a lost result, not a slow one.
+        if (S().taxonomyLoading && now - S().taxonomyStartedAt > 130.0) {
+            S().taxonomyLoading = false;
+            S().taxonomyLoaded  = true;
+            st.addLog("[parts] parts_taxonomy produced no result — treating as failed");
+        }
+        if (st.workerStarted && !haveData && !S().taxonomyLoading &&
+            S().taxonomyLoaded && S().taxonomyAttempts < kTaxonomyMaxAttempts) {
+            if (S().taxonomyRetryAt == 0.0) {
+                // First observed failure — schedule the next attempt.
+                ++S().taxonomyAttempts;
+                const double delay =
+                    std::min(15.0, 1.5 * std::pow(2.0, (double)S().taxonomyAttempts - 1.0));
+                S().taxonomyRetryAt = now + delay;
+                st.addLog("[parts] category load failed — retry " +
+                          std::to_string(S().taxonomyAttempts) + "/" +
+                          std::to_string(kTaxonomyMaxAttempts) + " in " +
+                          std::to_string((int)delay) + "s");
+            } else if (now >= S().taxonomyRetryAt) {
+                S().taxonomyRetryAt  = 0.0;
+                S().taxonomyLoaded   = false;   // re-arm the one-shot guard
+                S().categoriesLoaded = false;
+            }
+        }
     }
 
     // Debounced filter → search: any facet/global-filter change stamps filterDirtyAt; fire

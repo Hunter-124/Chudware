@@ -17,14 +17,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import sys
 
-# The render helper (and this script) reach the core via a top-level ``import core_bridge``
-# — the pattern the in-worker code (place.py) uses. Standalone, that top-level module lacks
-# package context, so core_bridge's own relative imports (daemon mode) would fail. Register
-# the proper package module under the top-level name up front so both resolve to one module.
+# The core, as the PACKAGE module — the same object gui_rpc._render_local_part_png uses. Never
+# a bare `import core_bridge` off a sys.path hack: that leaves __package__ empty and
+# core_bridge.call()'s own relative import of daemon_bridge then fails in daemon mode.
 import services.mcp.core_bridge as _core_bridge  # noqa: E402
-sys.modules.setdefault("core_bridge", _core_bridge)
 
 # Reuse the exact cache dir + render helper the RPC uses, so keys/paths can never drift.
 from .gui_rpc import (  # noqa: E402

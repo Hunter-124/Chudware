@@ -10,6 +10,7 @@ covered by test_parts_hub.py / test_parts_hub_p2.py / test_parts_hub_p3.py.
 """
 from __future__ import annotations
 
+import base64
 import json
 import pytest
 
@@ -384,3 +385,50 @@ class TestPartPlace:
         r = _place("mech_family:shcs:M100000")
         # Either ok:true (core present) or ok:false (core absent) — never a traceback.
         assert "ok" in r
+
+
+class TestPartsThumbnail:
+    """Parts Library V2: parts_thumbnail must RENDER a standard part's own 3D model.
+
+    Daemon-mode regression guard, same bug class as the placer's (see
+    test_x3_browser_catalog.py): ``_render_local_part_png`` used to reach the engine through a
+    bare ``import core_bridge`` off a sys.path hack. A bare import leaves the module with no
+    package, so ``core_bridge.call``'s own ``from .daemon_bridge import DaemonError`` raised
+    "attempted relative import with no known parent package" on the FIRST call — swallowed by
+    the render's broad ``except``, so every part not already on disk answered ok:false and the
+    GUI card fell back to a flat glyph. Only the handful of ids left in the shared on-disk
+    cache still produced an image, which is exactly why the failure looked random. The cache
+    dir is redirected to tmp_path here so a stale cache can never mask a broken render.
+    """
+
+    @staticmethod
+    def _thumb(part_id, tmp_path, monkeypatch, **extra):
+        from services.parts import gui_rpc
+        monkeypatch.setattr(gui_rpc, "_thumb_cache_dir", lambda: tmp_path)
+        return gui_rpc._parts_thumbnail({"item_id": part_id, **extra}, _noop_emit)
+
+    def test_missing_item_id_returns_ok_false(self, tmp_path, monkeypatch):
+        r = self._thumb("", tmp_path, monkeypatch)
+        assert r.get("ok") is False
+        assert "item_id" in r.get("reason", "")
+
+    def test_unknown_part_returns_ok_false_not_traceback(self, tmp_path, monkeypatch):
+        r = self._thumb("fastener:__no_such__:X999", tmp_path, monkeypatch)
+        assert r.get("ok") is False
+        assert "reason" in r
+
+    def test_uncached_core_family_part_renders_png(self, tmp_path, monkeypatch):
+        """A local catalog fastener carries NO vendor image_url — its preview exists only if
+        the worker renders geometry_ref.kind == "core_family" through the engine."""
+        from services.parts.gui_rpc import _resolve_core_family
+        part_id = "fastener:ISO 7380:M5"
+        if _resolve_core_family(part_id) is None:
+            pytest.skip("hub data for the button-head catalog record not present")
+        r = self._thumb(part_id, tmp_path, monkeypatch)
+        if not r.get("ok") and "core" in r.get("reason", "").lower():
+            pytest.skip(f"native core not available: {r.get('reason')}")
+        assert r.get("ok") is True, \
+            f"core_family part rendered nothing — the GUI card gets a bare glyph: {r}"
+        raw = base64.b64decode(r["image_b64"])
+        assert raw[:8] == b"\x89PNG\r\n\x1a\n", "preview is not a decodable PNG"
+        assert list(tmp_path.glob("*.img")), "render was not cached — every view re-renders"

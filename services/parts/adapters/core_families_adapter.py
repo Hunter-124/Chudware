@@ -35,14 +35,14 @@ class CoreFamiliesAdapter:
         if self._catalog is not None:
             return self._catalog
         try:
-            import sys
-            from pathlib import Path
-            # Allow core_bridge import from the services/mcp directory.
-            repo = Path(__file__).resolve().parent.parent.parent.parent
-            svc = repo / "services" / "mcp"
-            if str(svc) not in sys.path:
-                sys.path.insert(0, str(svc))
-            import core_bridge as cb  # type: ignore
+            # MUST be the PACKAGE module: a bare `import core_bridge` off a sys.path hack
+            # leaves __package__ empty, so core_bridge.call()'s own
+            # `from .daemon_bridge import DaemonError` (core_bridge.py:377, taken whenever
+            # daemon mode is on — the DEFAULT) raises "attempted relative import with no known
+            # parent package". The debug-only except below then swallowed it and this adapter
+            # reported an EMPTY catalog, silently dropping the whole mech_family domain from
+            # the Parts Library. Same defect the placer and the thumbnail renderer had.
+            from services.mcp import core_bridge as cb
             result = cb.call("parts_catalog_list", {})
             families = result if isinstance(result, list) else result.get("families", [])
             self._catalog = families if isinstance(families, list) else []

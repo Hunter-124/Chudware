@@ -165,11 +165,14 @@ struct PartsState {
     bool taxonomyLoaded  = false;
     bool taxonomyLoading = false;
     bool taxonomyIsTree  = false;
-    // ImGui::GetTime() when the in-flight parts_taxonomy call started. The RPC callback is
-    // the only thing that clears taxonomyLoading, so a worker that never answers used to
-    // leave the Categories pane spinning "Loading" forever with no error and no retry.
-    // drawPartsLibraryWorkspace gives it a deadline.
-    double taxonomyStartedAt = 0.0;
+    // Cold-start recovery. The parts worker is a Python sidecar that can still be booting
+    // when the user opens this workspace; both parts_taxonomy and its parts_list_categories
+    // fallback then fail on transport (RpcResult::ok == false) and the one-shot `loaded`
+    // latch left the pane permanently empty — the "stuck on No catalog data" report.
+    // drawPartsLibraryWorkspace re-arms the load on a bounded backoff instead.
+    double taxonomyStartedAt = 0.0;   // GetTime() when the in-flight call started
+    double taxonomyRetryAt   = 0.0;   // GetTime() after which the next attempt may fire
+    int    taxonomyAttempts  = 0;     // consecutive failed attempts; reset on success/Retry
     std::set<std::string> expandedCats;
     std::map<std::string, FacetValue> facetValues;
     double filterDirtyAt = 0;

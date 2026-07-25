@@ -21,6 +21,19 @@ std::vector<unsigned char> b64decode(const std::string& in);
 // top (no leading gap); subsequent headers add breathing room above.
 void sectionHeader(const char* label, bool firstInPane = false);
 
+// Scoped horizontal content inset (ui::metrics::partsPadX — the ONE inset of this workspace).
+// Everything drawn inside the scope lands on the pane's TEXT line: the line sectionHeader puts
+// its label on, borderRow puts its icon/label on, a grid card puts its title on and ImGui puts
+// the text inside a framed widget on (partsPadX == style.FramePadding.x). Wrap the plain text
+// and hand-drawn content that would otherwise sit one padding to the left of everything around
+// it. Open it AFTER a full-bleed surface (borderRowSurface) so the surface keeps the full width.
+struct ContentInset {
+    ContentInset();
+    ~ContentInset();
+    ContentInset(const ContentInset&)            = delete;
+    ContentInset& operator=(const ContentInset&) = delete;
+};
+
 // Centered empty-state: 40px atlas icon (drawIconGlass, textDisabled) + message + optional sub.
 void emptyState(const char* iconName, const char* msg, const char* sub = nullptr);
 
@@ -42,8 +55,9 @@ void partIconDraw(ImDrawList* dl, ImVec2 center, float sizePx, const std::string
 //   hover/active → treeHover fill; selected → accent 1.5*S border; hover-not-selected →
 //   accentMid 1.0*S border (both inset 0.5px so the stroke never bleeds outside).
 //   Optional 18px icon (atlas name; skipped when null/unknown), tinted accent when selected.
-//   Text vertically centered exactly; horizontally centered when centerText, else left after
-//   the icon. size.x<=0 → content width; size.y<=0 → frame height. Returns clicked.
+//   Text vertically centered exactly; horizontally centered when centerText, else inset by
+//   ui::metrics::partsPadX() (this workspace's one content inset) and placed after the icon.
+//   size.x<=0 → content width; size.y<=0 → frame height. Returns clicked.
 bool borderRow(const char* strId, const char* label, const char* icon, bool selected,
                ImVec2 size, bool centerText, float rounding = 6.f);
 

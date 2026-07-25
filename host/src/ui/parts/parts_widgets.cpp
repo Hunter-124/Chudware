@@ -11,6 +11,7 @@
 
 #include "core/app_state.h"
 #include "ui/icons.h"
+#include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
 #include "ui_theme.h"
 
 #include "parts_internal.h"
@@ -48,12 +49,19 @@ std::vector<unsigned char> b64decode(const std::string& in) {
 // ---- headers / states ----------------------------------------------------------------
 
 void sectionHeader(const char* label, bool firstInPane) {
-    const float sc = ui::uiScale;
+    const float sc  = ui::uiScale;
+    const float pad = ui::metrics::partsPadX();
     if (!firstInPane) ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    // The label sits on the pane's TEXT line (pane gutter + partsPadX) — the same line
+    // borderRow paints its icon/label on, a grid card starts its title on, and ImGui puts
+    // the text of a framed widget on (partsPadX == style.FramePadding.x). A header and the
+    // body under it therefore share one left edge instead of stepping by the row padding.
+    ImGui::Indent(pad);
     ImFont* h2 = S().fonts ? S().fonts->h2 : nullptr;
     if (h2) ImGui::PushFont(h2);
     ImGui::TextUnformatted(label);
     if (h2) ImGui::PopFont();
+    ImGui::Unindent(pad);
     ImVec2 p0 = ImGui::GetItemRectMin();
     ImVec2 p1 = ImGui::GetItemRectMax();
     ImGui::GetWindowDrawList()->AddLine(
@@ -63,6 +71,9 @@ void sectionHeader(const char* label, bool firstInPane) {
         1.0f * sc);
     ImGui::Spacing();
 }
+
+ContentInset::ContentInset()  { ImGui::Indent(ui::metrics::partsPadX()); }
+ContentInset::~ContentInset() { ImGui::Unindent(ui::metrics::partsPadX()); }
 
 void emptyState(const char* iconName, const char* msg, const char* sub) {
     const float sc = ui::uiScale;
@@ -81,25 +92,18 @@ void emptyState(const char* iconName, const char* msg, const char* sub) {
         ImGui::Dummy(ImVec2(0, iconSz + 4.0f * sc));
     }
 
-    {
-        float mw = ImGui::CalcTextSize(msg).x;
+    // Centered, not inset: an empty state owns the whole pane, so it deliberately ignores
+    // the content line. One helper so the two lines can never drift apart.
+    auto centeredLine = [](const char* text, const float role[4], float alpha) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (ImGui::GetContentRegionAvail().x - mw) * 0.5f);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextUnformatted(msg);
+                             (ImGui::GetContentRegionAvail().x -
+                              ImGui::CalcTextSize(text).x) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(role[0], role[1], role[2], alpha));
+        ImGui::TextUnformatted(text);
         ImGui::PopStyleColor();
-    }
-    if (sub) {
-        float sw = ImGui::CalcTextSize(sub).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (ImGui::GetContentRegionAvail().x - sw) * 0.5f);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 0.8f));
-        ImGui::TextUnformatted(sub);
-        ImGui::PopStyleColor();
-    }
+    };
+    centeredLine(msg, palette.textDim, 1.0f);
+    if (sub) centeredLine(sub, palette.textDisabled, 0.8f);
     ImGui::Dummy(ImVec2(0, 8.0f * sc));
 }
 
@@ -252,7 +256,7 @@ bool borderRow(const char* strId, const char* label, const char* icon, bool sele
     // ---- content ----
     const float iconSz  = 18.0f * sc;
     const float iconGap = 6.0f * sc;
-    const float padX    = 8.0f * sc;
+    const float padX    = ui::metrics::partsPadX();   // matches cards, cells and frames
     bool haveIcon = icon && icon[0] && (ui::hasIconSdf(icon) || ui::getIcon(icon).valid);
 
     float textW = (label && label[0]) ? ImGui::CalcTextSize(label).x : 0.0f;
@@ -280,7 +284,7 @@ bool borderRow(const char* strId, const char* label, const char* icon, bool sele
 
     if (label && label[0]) {
         // Vertically centered exactly; clip inside the row so long labels never overflow.
-        dl->PushClipRect(p0, ImVec2(p1.x - 4.0f * sc, p1.y), true);
+        dl->PushClipRect(p0, ImVec2(p1.x - padX, p1.y), true);
         dl->AddText(ImVec2(x, p0.y + (size.y - textH) * 0.5f),
                     Palette::toU32(palette.text), label);
         dl->PopClipRect();
@@ -316,16 +320,58 @@ void borderCardRect(ImDrawList* dl, ImVec2 p0, ImVec2 p1, bool selected, bool ho
 }
 
 // ---- thumbnails --------------------------------------------------------------------
+//
+// Part thumbnails and vendor logos ride ONE RPC (parts_thumbnail), ONE texture cache
+// (S().thumbs) and ONE AsyncRpc dispatch thread, so they share a single request budget here.
+//
+// Cost model, measured against the live worker: an uncached standard part is RENDERED on
+// demand (services/parts/gui_rpc.py::_render_local_part_png — parts_make → material/threads →
+// doc_render_png) and takes 2-4 s; every later request for that id is a disk-cache hit at
+// ~0 ms. AsyncRpc dispatches FIFO on a SINGLE thread, and drawResultsList/drawResultsGrid call
+// requestThumb for every row every frame (no clipper), so a 100-row search used to hand the
+// worker ~100 back-to-back renders: minutes of queue in which the queue/live-search/taxonomy
+// polls behind them never ran and most cards never got their image. Bound the outstanding
+// calls instead — the remaining rows are issued on later frames as slots free.
+constexpr size_t kMaxThumbInFlight = 4;
 
-// A failed thumbnail is a permanent property of the record for this session — most
-// local-catalog parts simply have no image — so thumbFailed is a suppression list, not a
-// cache. It must never be mass-cleared: dropping every id at once makes the next scroll
-// re-fire a burst of RPCs that are all doomed to fail again. Bound it by refusing new
-// entries once the cap is reached (the ids already recorded keep suppressing their
-// retries); the cap is set where a realistic session will never reach it.
+// A transport failure (worker still booting, socket EOF, timeout) is NOT an answer, so it must
+// never reach thumbFailed — a startup race would blank that card for the whole session. Retry
+// it a bounded number of times with a widening gap, then stop.
+constexpr int    kThumbTransportRetries = 3;
+constexpr double kThumbRetryBackoffSec  = 2.0;
+
+// Safety net for the budget above: AsyncRpc::shutdown() drops queued and undrained callbacks
+// unrun, so an id can sit in thumbBusy with no callback ever arriving — and four such ids would
+// wedge every thumbnail for the session. Past this deadline the id is RELEASED (never marked
+// failed) so a later frame may ask again; the worker's disk cache makes the duplicate cheap.
+// Comfortably above the 120 s RPC timeout plus the queue wait the in-flight cap permits.
+constexpr double kThumbWatchdogSec = 600.0;
+
+// Per-id request bookkeeping. Deliberately TU-local rather than PartsState: nothing outside
+// this file reads it, and it is dropped the moment a request resolves either way.
+struct ThumbReq {
+    double startedAt = 0.0;   // ImGui::GetTime() when the call was handed to AsyncRpc
+    double retryAt   = 0.0;   // earliest re-request after a transport failure
+    int    attempts  = 0;     // transport failures so far
+};
+static std::map<std::string, ThumbReq> gThumbReq;
+
+// A failed thumbnail is a permanent property of the record for this session — a part with no
+// vendor image and no renderable geometry has nothing to show — so thumbFailed is a suppression
+// list, not a cache. It must never be mass-cleared: dropping every id at once makes the next
+// scroll re-fire a burst of RPCs that are all doomed to fail again. Bound it by refusing new
+// entries once the cap is reached; the cap is set where a realistic session will never reach it.
+// ONLY a definitive answer reaches here — transport failures retry, see issueThumbRequest.
 static void markThumbFailed(const std::string& id) {
     constexpr size_t kFailedCap = 65536;
-    if (S().thumbFailed.size() < kFailedCap) S().thumbFailed.insert(id);
+    if (S().thumbFailed.size() < kFailedCap) {
+        S().thumbFailed.insert(id);
+        gThumbReq.erase(id);   // suppressed for good — no retry bookkeeping left to keep
+    } else {
+        // Cap reached: the id cannot be recorded, so park it on a long backoff instead.
+        // Suppression by other means; never a per-frame re-request storm.
+        gThumbReq[id].retryAt = ImGui::GetTime() + kThumbWatchdogSec;
+    }
 }
 
 void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes) {
@@ -342,71 +388,122 @@ void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes) 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
     stbi_image_free(px);
-    t.lastUse = ImGui::GetTime();
+    const double now = ImGui::GetTime();
+    t.lastUse = now;
     Thumb& slot = S().thumbs[id];
     if (slot.tex) glDeleteTextures(1, &slot.tex);  // never orphan a texture we overwrite
     slot = t;
     // LRU cap: a long browse session used to accumulate GL textures unboundedly (never
     // deleted). This runs inside rpc.drain() on the GL thread — the same thread that draws
     // the thumbs — so deleting the evicted texture right here is safe.
+    //
+    // 256 comfortably clears one screenful: the search asks for limit=100 (parts_workspace.cpp)
+    // plus a handful of vendor logos. It is NOT raised further because a rendered part comes
+    // back at 512x400 = 800 KiB of RGBA8, so the cap already fronts ~200 MiB of VRAM.
+    // Entries touched THIS frame are pinned: drain() runs before NewFrame(), so every thumb the
+    // previous frame drew carries exactly this timestamp. Without the pin, a result set larger
+    // than the cap makes every lastUse tie and eviction picks an on-screen thumb, which the very
+    // next frame re-requests and re-renders — a permanent churn that starves everything else.
+    // Overshooting while that many thumbs are genuinely visible is the lesser evil; trimming
+    // resumes the moment anything scrolls out of view.
     constexpr size_t kThumbCap = 256;
     while (S().thumbs.size() > kThumbCap) {
-        auto oldest = S().thumbs.begin();
-        for (auto it = S().thumbs.begin(); it != S().thumbs.end(); ++it)
-            if (it->second.lastUse < oldest->second.lastUse) oldest = it;
+        auto oldest = S().thumbs.end();
+        for (auto it = S().thumbs.begin(); it != S().thumbs.end(); ++it) {
+            if (it->second.lastUse >= now) continue;   // drawn this frame — pinned
+            if (oldest == S().thumbs.end() || it->second.lastUse < oldest->second.lastUse)
+                oldest = it;
+        }
+        if (oldest == S().thumbs.end()) break;         // everything resident is on screen
         if (oldest->second.tex) glDeleteTextures(1, &oldest->second.tex);
         S().thumbs.erase(oldest);
     }
+}
+
+// Release ids whose callback can never arrive (see kThumbWatchdogSec). Walks at most
+// kMaxThumbInFlight entries, and only when the budget is actually exhausted.
+static void releaseStuckThumbs(double now) {
+    for (auto it = S().thumbBusy.begin(); it != S().thumbBusy.end();) {
+        auto q = gThumbReq.find(*it);
+        if (q != gThumbReq.end() && now - q->second.startedAt > kThumbWatchdogSec)
+            it = S().thumbBusy.erase(it);
+        else
+            ++it;
+    }
+}
+
+// The one issue path for parts_thumbnail: single-flight, paced, and honest about which failures
+// are permanent. `imageUrl` may be empty — the worker renders the part's own 3D model when it
+// recognises the id, and answers ok:false when it genuinely has nothing to show.
+static void issueThumbRequest(AppState& st, const std::string& id, const std::string& imageUrl) {
+    if (S().thumbs.count(id) || S().thumbBusy.count(id) || S().thumbFailed.count(id))
+        return;
+    const double now = ImGui::GetTime();
+    auto req = gThumbReq.find(id);
+    if (req != gThumbReq.end() && req->second.retryAt > now)
+        return;                                   // transport backoff still running
+    if (S().thumbBusy.size() >= kMaxThumbInFlight) {
+        releaseStuckThumbs(now);
+        if (S().thumbBusy.size() >= kMaxThumbInFlight)
+            return;                               // budget full — a later frame issues this one
+    }
+    gThumbReq[id].startedAt = now;
+    S().thumbBusy.insert(id);
+    nlohmann::json p;
+    p["item_id"]   = id;
+    p["image_url"] = imageUrl;
+    st.rpc.call("parts_thumbnail", p, [id](const core::RpcResult& r) {
+        // FIRST on every path: the in-flight slot is released whatever happens below.
+        S().thumbBusy.erase(id);
+        if (!r.ok) {
+            // Transport-level failure — the worker never answered. Permanent only when it says
+            // it has no such method (it will not grow one mid-session; same signal
+            // parts_vendors.cpp reads for healthSupported). Everything else is retryable.
+            if (r.err.find("unknown method") != std::string::npos) {
+                markThumbFailed(id);
+                return;
+            }
+            ThumbReq& q = gThumbReq[id];
+            if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(id); return; }
+            q.retryAt = ImGui::GetTime() + kThumbRetryBackoffSec * q.attempts;
+            return;
+        }
+        // The worker answered: ok:false means it looked and there is nothing to show.
+        if (!r.result.is_object() || !r.result.value("ok", false)) { markThumbFailed(id); return; }
+        const std::string b64 = r.result.value("image_b64", "");
+        if (b64.empty()) { markThumbFailed(id); return; }
+        storeThumb(id, b64decode(b64));   // marks failed itself if the bytes will not decode
+        gThumbReq.erase(id);
+    });
 }
 
 void requestThumb(AppState& st, const PartsItem& item) {
     if (S().thumbs.count(item.id) || S().thumbBusy.count(item.id) ||
         S().thumbFailed.count(item.id))
         return;
-    // Standard/library parts carry no vendor image_url — the backend renders their actual 3D
-    // CAD model on demand (cached by item_id). Still fire the RPC for a placeable local part;
-    // only give up when there's neither a URL nor a renderable local part.
+    // What the worker can actually answer for, verified against gui_rpc.py::_parts_thumbnail
+    // and _resolve_core_family: (a) any record carrying a vendor image_url — fetched; (b) a
+    // LOCAL record whose hub entry has geometry_ref.kind == "core_family" — RENDERED from its
+    // own 3D model, no image_url required. `placeable` is precisely "geometry_ref is not None"
+    // (gui_rpc.py:222) so it is the necessary condition for (b), and _resolve_core_family
+    // refuses "catalog:" / live ids outright. Local ISO fastener rows arrive placeable + local
+    // with an EMPTY image_url and do go to the worker — those are the rendered ones. Anything
+    // else has no image on either side: record it once instead of paying an RPC per row for a
+    // guaranteed ok:false. Either way the caller still paints partIconDraw's glyph, never a hole.
     const bool localRenderable = item.placeable && (item.source == "local" || item.source.empty());
     if (item.imageUrl.empty() && !localRenderable) { markThumbFailed(item.id); return; }
-    S().thumbBusy.insert(item.id);
-    nlohmann::json p;
-    p["item_id"]   = item.id;
-    p["image_url"] = item.imageUrl;
-    st.rpc.call("parts_thumbnail", p, [id = item.id](const core::RpcResult& r) {
-        S().thumbBusy.erase(id);
-        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
-            markThumbFailed(id);
-            return;
-        }
-        std::string b64 = r.result.value("image_b64", "");
-        if (b64.empty()) { markThumbFailed(id); return; }
-        storeThumb(id, b64decode(b64));
-    });
+    issueThumbRequest(st, item.id, item.imageUrl);
 }
 
 void requestVendorLogo(AppState& st, const std::string& site, const std::string& domain) {
-    // Live vendor logo for the search-progress strip. Stored in the SAME texture cache as
-    // part thumbs, keyed "vendorlogo:<site>", fetched through the existing parts_thumbnail RPC.
-    const std::string id = "vendorlogo:" + site;
-    if (site.empty() || domain.empty() ||
-        S().thumbs.count(id) || S().thumbBusy.count(id) || S().thumbFailed.count(id))
-        return;
-    S().thumbBusy.insert(id);
-    nlohmann::json p;
-    p["item_id"] = id;
-    // The vendor's live favicon via a PNG-returning resolver — stb_image has no ICO decoder,
-    // so a raw <domain>/favicon.ico would fetch but fail to decode. Cached by item_id.
-    p["image_url"] = "https://www.google.com/s2/favicons?domain=" + domain + "&sz=64";
-    st.rpc.call("parts_thumbnail", p, [id](const core::RpcResult& r) {
-        S().thumbBusy.erase(id);
-        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
-            markThumbFailed(id);
-            return;
-        }
-        std::string b64 = r.result.value("image_b64", "");
-        if (b64.empty()) { markThumbFailed(id); return; }
-        storeThumb(id, b64decode(b64));
-    });
+    if (site.empty() || domain.empty()) return;
+    // Live vendor logo for the search-progress strip. Stored in the SAME texture cache as part
+    // thumbs, keyed "vendorlogo:<site>", fetched through the existing parts_thumbnail RPC — so
+    // it shares the in-flight budget with the part renders rather than jumping the queue.
+    // A PNG-returning favicon resolver, not <domain>/favicon.ico: stb_image has no ICO decoder,
+    // so the raw .ico would fetch and then fail to decode. Cached by item_id.
+    issueThumbRequest(st, "vendorlogo:" + site,
+                      "https://www.google.com/s2/favicons?domain=" + domain + "&sz=64");
 }
 
 }  // namespace parts

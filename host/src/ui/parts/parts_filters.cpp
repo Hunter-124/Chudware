@@ -12,6 +12,7 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"
+#include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -22,6 +23,15 @@ namespace parts {
 namespace {
 
 inline void markDirty() { S().filterDirtyAt = ImGui::GetTime(); }
+
+// A dim field label on the pane's TEXT line (pane gutter + partsPadX): the line the section
+// header sits on and the line ImGui draws the text of the framed widget below it on
+// (partsPadX == style.FramePadding.x). Plain TextDisabled would sit a frame padding to the
+// left of its own input, which is the "label and body don't line up" defect.
+void fieldLabel(const char* text) {
+    ContentInset inset;
+    ImGui::TextDisabled("%s", text);
+}
 
 // Wrapping toggle chip (enum facet value): small centered borderRow sized to the label,
 // accent border + accentSoft fill when active. Caller handles PushID.
@@ -42,7 +52,7 @@ void drawFacetWidgets(const TaxNode& node) {
     for (const auto& f : node.facets) {
         FacetValue& fv = S().facetValues[f.id];
         ImGui::PushID(f.id.c_str());
-        ImGui::TextDisabled("%s", f.label.c_str());
+        fieldLabel(f.label.c_str());
 
         if (f.type == "range") {
             char fmtMin[48], fmtMax[48];
@@ -108,19 +118,32 @@ void drawFacetWidgets(const TaxNode& node) {
 
 void drawFiltersBlock(AppState& st, float paneW) {
     const float sc = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 2 * sc));  // symmetric inner margins
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::partsPadX(), 2.0f * sc));  // pane gutter
     ImGui::BeginChild("##parts_filters", ImVec2(paneW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
     // Scrollable filter body above the fixed vendor-strip footer.
     const float stripH = 108.0f * sc;   // dots row + health line + connect + half-width row
+    // WindowPadding 0: a nested child re-applies the DEFAULT style padding (15 px), which
+    // pushed every filter widget 15 px right of the vendor-strip footer drawn below in the
+    // OUTER child — one pane, two left edges. The scroll region must inherit the gutter,
+    // not add a second one.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##filters_scroll", ImVec2(0, -stripH), ImGuiChildFlags_None);
+    ImGui::PopStyleVar();
 
     sectionHeader("Filters", /*firstInPane=*/true);
 
     // ---- global filters ---------------------------------------------------------
-    ImGui::TextDisabled("Price (USD)");
-    ImGui::SetNextItemWidth((paneW - 40.0f * sc) * 0.5f);
+    fieldLabel("Price (USD)");
+    // Both ends split the content width that is actually left, minus the "-" and its two
+    // spacings — a hardcoded pane-width guess overflowed the pane once the gutter changed.
+    const float dashW  = ImGui::CalcTextSize("-").x;
+    const float fieldW = std::max(ui::metrics::U(8),
+        (ImGui::GetContentRegionAvail().x - dashW -
+         ImGui::GetStyle().ItemSpacing.x * 2.0f) * 0.5f);
+    ImGui::SetNextItemWidth(fieldW);
     if (ImGui::InputFloat("##pmin", &S().priceMin, 0, 0, "%.2f")) {
         S().priceMin = std::max(0.0f, S().priceMin);
         markDirty();
@@ -128,25 +151,25 @@ void drawFiltersBlock(AppState& st, float paneW) {
     ImGui::SameLine();
     ImGui::TextDisabled("-");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth((paneW - 40.0f * sc) * 0.5f);
+    ImGui::SetNextItemWidth(fieldW);
     if (ImGui::InputFloat("##pmax", &S().priceMax, 0, 0, "%.2f")) {
         S().priceMax = std::max(0.0f, S().priceMax);
         markDirty();
     }
 
-    ImGui::TextDisabled("Vendor");
+    fieldLabel("Vendor");
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::InputTextWithHint("##fven", "any vendor",
                                  S().vendorBuf, sizeof(S().vendorBuf)))
         markDirty();
 
-    ImGui::TextDisabled("Material");
+    fieldLabel("Material");
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::InputTextWithHint("##fmat", "steel, brass, nylon…",
                                  S().materialBuf, sizeof(S().materialBuf)))
         markDirty();
 
-    ImGui::TextDisabled("Source");
+    fieldLabel("Source");
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::Combo("##fsrc", &S().sourceFilter, "All\0Local library\0Live vendors\0"))
         markDirty();

@@ -16,6 +16,7 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"
+#include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -151,8 +152,12 @@ void drawVendorStrip(AppState& st, float paneW) {
 
     ImGui::Separator();
 
-    // -- status dot row + "N/M signed in" ---------------------------------------------
+    // -- status dot row + "N/M signed in" + health summary ----------------------------
+    // One inset scope: the dots, the count and the health line are plain content, so they
+    // sit on the pane's TEXT line with the filter labels and the section header above them.
+    // The Separator and the borderRows below stay full-bleed on the pane gutter.
     {
+        ContentInset inset;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 p = ImGui::GetCursorScreenPos();
         const float d   = 7.0f * sc;           // dot diameter
@@ -181,27 +186,26 @@ void drawVendorStrip(AppState& st, float paneW) {
             ImGui::TextDisabled("%d/%d signed in", signedIn, (int)S().vendors.size());
         else
             ImGui::TextDisabled("no vendors");
-    }
 
-    // -- one-line health summary --------------------------------------------------------
-    if (!S().healthSupported) {
-        ImGui::TextDisabled("Health check unavailable (update the worker)");
-    } else if (S().healthStarting || (S().healthRunning && S().healthResults.empty())) {
-        spinner("Testing vendors");
-    } else if (S().healthChecked && !S().healthResults.empty()) {
-        int ok = 0, needLogin = 0, failing = 0;
-        for (auto& h : S().healthResults) {
-            if (h.ok) ++ok;
-            else if (h.expected) ++needLogin;
-            else ++failing;
+        if (!S().healthSupported) {
+            ImGui::TextDisabled("Health check unavailable (update the worker)");
+        } else if (S().healthStarting || (S().healthRunning && S().healthResults.empty())) {
+            spinner("Testing vendors");
+        } else if (S().healthChecked && !S().healthResults.empty()) {
+            int ok = 0, needLogin = 0, failing = 0;
+            for (auto& h : S().healthResults) {
+                if (h.ok) ++ok;
+                else if (h.expected) ++needLogin;
+                else ++failing;
+            }
+            if (failing > 0)
+                ImGui::TextDisabled("Health: %d ok · %d need sign-in · %d failing",
+                                    ok, needLogin, failing);
+            else
+                ImGui::TextDisabled("Health: %d ok · %d need sign-in", ok, needLogin);
+        } else {
+            ImGui::TextDisabled(" ");
         }
-        if (failing > 0)
-            ImGui::TextDisabled("Health: %d ok · %d need sign-in · %d failing",
-                                ok, needLogin, failing);
-        else
-            ImGui::TextDisabled("Health: %d ok · %d need sign-in", ok, needLogin);
-    } else {
-        ImGui::TextDisabled(" ");
     }
 
     // -- buttons -------------------------------------------------------------------------
@@ -242,17 +246,19 @@ void drawVendorStrip(AppState& st, float paneW) {
 namespace {
 
 void drawVendorSignInList(AppState& st) {
-    const float sc = ui::uiScale;
     sectionHeader("Vendor Sites", /*firstInPane=*/true);
 
     if (S().vendorsLoading && S().vendors.empty()) {
+        ContentInset inset;
         spinner("Checking");
     } else if (S().vendors.empty()) {
+        ContentInset inset;
         ImGui::TextDisabled("No vendor adapters registered.");
     } else {
         for (auto& v : S().vendors) {
             ImGui::PushID(v.id.c_str());
             borderRowSurface(false, 2.0f);
+            ContentInset inset;   // row content, inside the full-bleed surface above
             ImGui::BeginGroup();
 
             ImVec4 dot = v.loggedIn
@@ -267,13 +273,17 @@ void drawVendorSignInList(AppState& st) {
             ImGui::PopStyleColor();
             ImGui::SameLine();
             ImGui::TextUnformatted(v.label.c_str());
+            const char* lbl = v.loginInProgress ? "..." : (v.loggedIn ? "Re-login" : "Sign in");
+            // Right-aligned on the row's content edge, measured: the old fixed 80 px left
+            // "Sign in" and "Re-login" ending at different x and ignored the right inset.
             ImGui::SameLine();
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                                 ImGui::GetContentRegionAvail().x - 80.0f * sc);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x -
+                                 ImGui::CalcTextSize(lbl).x -
+                                 ImGui::GetStyle().FramePadding.x * 2.0f -
+                                 ui::metrics::partsPadX());
             ImGui::PushStyleColor(ImGuiCol_Button,
                 ImVec4(palette.button[0], palette.button[1],
                        palette.button[2], 0.80f));
-            const char* lbl = v.loginInProgress ? "..." : (v.loggedIn ? "Re-login" : "Sign in");
             // Magento + invisible reCAPTCHA (Anaheim) scores the in-panel OSR CEF
             // as a bot under software GL — open real desktop Chromium for those.
             // Everyone else gets the embedded CEF wizard first. One rule, one
@@ -317,20 +327,21 @@ void drawVendorSignInList(AppState& st) {
     }
 }
 
-void drawApiProviders(AppState& st, float paneW) {
-    const float sc = ui::uiScale;
+void drawApiProviders(AppState& st) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
     sectionHeader("API Providers");
 
     if (S().apiProviders.empty()) {
+        ContentInset inset;
         ImGui::TextDisabled("No API providers available.");
         return;
     }
     for (auto& a : S().apiProviders) {
         ImGui::PushID(a.id.c_str());
         borderRowSurface(false, a.editing ? (2.2f + (float)a.fields.size()) : 1.6f);
+        ContentInset inset;   // row content, inside the full-bleed surface above
         ImGui::BeginGroup();
 
         ImVec4 dot = a.configured
@@ -343,13 +354,16 @@ void drawApiProviders(AppState& st, float paneW) {
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::TextUnformatted(a.label.c_str());
+        const char* albl = a.editing ? "Close" : (a.configured ? "Edit" : "Set up");
         ImGui::SameLine();
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             ImGui::GetContentRegionAvail().x - 80.0f * sc);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x -
+                             ImGui::CalcTextSize(albl).x -
+                             ImGui::GetStyle().FramePadding.x * 2.0f -
+                             ui::metrics::partsPadX());
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(palette.button[0], palette.button[1],
                    palette.button[2], 0.80f));
-        if (ImGui::SmallButton(a.editing ? "Close" : (a.configured ? "Edit" : "Set up")))
+        if (ImGui::SmallButton(albl))
             a.editing = !a.editing;
         ImGui::PopStyleColor();
 
@@ -361,7 +375,8 @@ void drawApiProviders(AppState& st, float paneW) {
 
         if (a.editing) {
             for (size_t i = 0; i < a.fields.size() && i < 2; ++i) {
-                ImGui::SetNextItemWidth(paneW - 24.0f * sc);
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x -
+                                        ui::metrics::partsPadX());
                 ImGui::InputTextWithHint(
                     (std::string("##cred_") + a.fields[i]).c_str(),
                     a.fields[i].c_str(), a.fieldBuf[i], sizeof(a.fieldBuf[i]),
@@ -388,6 +403,7 @@ void drawDownloadQueue(AppState& st) {
     sectionHeader("Download Queue");
 
     if (S().queue.empty()) {
+        ContentInset inset;
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                    palette.textDisabled[2], 1.0f));
@@ -397,12 +413,16 @@ void drawDownloadQueue(AppState& st) {
             pollQueue(st);
         return;
     }
-    if (ImGui::SmallButton("Refresh"))
-        pollQueue(st);
+    {
+        ContentInset inset;
+        if (ImGui::SmallButton("Refresh"))
+            pollQueue(st);
+    }
     ImGui::Spacing();
     for (auto& q : S().queue) {
         ImGui::PushID(q.id.c_str());
         borderRowSurface(false, 1.8f);
+        ContentInset inset;   // row content, inside the full-bleed surface above
         ImGui::BeginGroup();
         std::string label = q.query;
         if (label.size() > 34) label = label.substr(0, 31) + "...";
@@ -467,19 +487,22 @@ void drawDownloadQueue(AppState& st) {
 }
 
 void drawHealthTable(AppState& st) {
-    const float sc = ui::uiScale;
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
     sectionHeader("Vendor Health");
 
     if (!S().healthSupported) {
+        ContentInset inset;
         ImGui::TextDisabled("Health check unavailable — the worker does not support it yet.");
         return;
     }
     // The popup can no longer be on screen while the wizard owns the results column
     // (drawVendorsPopup stands down), so "busy" is the only reachable gate here.
     const bool busy = S().healthStarting || S().healthRunning;
+    // Everything below is plain content (no full-bleed row surface), so one scope puts the
+    // button, the states and every result row on the section's text line.
+    ContentInset inset;
     ImGui::BeginDisabled(busy);
     if (ImGui::SmallButton(busy ? "Running…" : "Run health check"))
         startHealthCheck(st);
@@ -506,13 +529,16 @@ void drawHealthTable(AppState& st) {
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::TextUnformatted(h.site.c_str());
+        char rt[32];
+        if (h.ok) std::snprintf(rt, sizeof(rt), "%.0f ms", h.latencyMs);
+        else      std::snprintf(rt, sizeof(rt), "%s",
+                                h.expected ? "sign-in required" : "error");
+        // Right-aligned on the section's content edge, measured: the old fixed 78 px left
+        // "12 ms" and "sign-in required" ending at different x.
         ImGui::SameLine();
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             ImGui::GetContentRegionAvail().x - 78.0f * sc);
-        if (h.ok)
-            ImGui::TextDisabled("%.0f ms", h.latencyMs);
-        else
-            ImGui::TextDisabled("%s", h.expected ? "sign-in required" : "error");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x -
+                             ImGui::CalcTextSize(rt).x - ui::metrics::partsPadX());
+        ImGui::TextDisabled("%s", rt);
         if (!h.error.empty() && ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", h.error.c_str());
         ImGui::PopID();
@@ -532,7 +558,7 @@ void drawVendorsPopup(AppState& st) {
     if (ImGui::Begin("Vendor Accounts##parts_vendors_popup", &S().vendorsPopupOpen,
                      ImGuiWindowFlags_NoCollapse)) {
         drawVendorSignInList(st);
-        drawApiProviders(st, popW);
+        drawApiProviders(st);
         drawDownloadQueue(st);
         drawHealthTable(st);
     }

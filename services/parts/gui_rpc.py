@@ -970,11 +970,15 @@ def _render_local_part_png(part_id: str, tmp_png) -> bytes | None:
     family, size = fam_sz
     try:
         import pathlib as _pathlib  # noqa: PLC0415
-        import sys as _sys  # noqa: PLC0415
-        svc = _pathlib.Path(__file__).resolve().parents[2] / "services" / "mcp"
-        if str(svc) not in _sys.path:
-            _sys.path.insert(0, str(svc))
-        import core_bridge as cb  # type: ignore  # noqa: PLC0415
+        # MUST be the PACKAGE module (`services.mcp.core_bridge`), never a bare
+        # `import core_bridge` off a sys.path hack: a bare import gives the module an empty
+        # __package__, so core_bridge.call()'s own `from .daemon_bridge import DaemonError`
+        # (core_bridge.py:377, taken whenever daemon mode is on — the DEFAULT) raises
+        # "attempted relative import with no known parent package". That ImportError was
+        # swallowed by the render's broad `except` below and every uncached part fell back
+        # to the flat glyph — the "thumbnails only load for some parts" bug. Same defect the
+        # placer had (see test_x3_browser_catalog.py's regression guard).
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
     except Exception:  # noqa: BLE001 — core bridge unavailable → glyph fallback
         return None
     doc_id = ""

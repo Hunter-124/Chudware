@@ -99,8 +99,11 @@ void drawTaxonomyPane(AppState& st, float paneW) {
 
     sectionHeader("Categories", /*firstInPane=*/true);
 
-    if (S().taxonomyLoading || (S().categoriesLoading && !S().taxonomyIsTree)) {
-        spinner("Loading");
+    const bool retrying = S().taxonomyAttempts > 0 && S().taxonomyRetryAt > 0.0;
+    if (S().taxonomyLoading || (S().categoriesLoading && !S().taxonomyIsTree) || retrying) {
+        // A retry is pending: the parts worker is most likely still booting. Say so rather
+        // than flashing an error the user is expected to act on.
+        spinner(S().taxonomyAttempts > 0 ? "Waiting for the parts service" : "Loading");
     } else if (S().taxonomyIsTree) {
         // ---- recursive taxonomy tree ------------------------------------------------
         {
@@ -117,14 +120,17 @@ void drawTaxonomyPane(AppState& st, float paneW) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                    palette.textDisabled[2], 1.0f));
-        ImGui::TextWrapped("No catalog data. Start the parts service or check the network.");
+        ImGui::TextWrapped("No catalog data. The parts service did not respond.");
         ImGui::PopStyleColor();
         ImGui::Spacing();
-        // Re-arm the one-shot load (loadTaxonomy early-outs while taxonomyLoaded is set).
+        // Auto-retry gave up (kTaxonomyMaxAttempts exhausted). Clearing the attempt counter
+        // re-arms both the one-shot guard and the backoff schedule.
         if (ImGui::SmallButton("Retry##cat_retry")) {
-            S().taxonomyLoaded   = false;
-            S().taxonomyIsTree   = false;
-            S().categoriesLoaded = false;
+            S().taxonomyLoaded    = false;
+            S().taxonomyIsTree    = false;
+            S().categoriesLoaded  = false;
+            S().taxonomyAttempts  = 0;
+            S().taxonomyRetryAt   = 0.0;
         }
     } else {
         // ---- fallback: flat parts_list_categories 2-level list -----------------------

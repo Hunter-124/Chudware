@@ -118,5 +118,18 @@ inline float rePreviewMinW()  { return px(360.0f); }
 inline float rePreviewMaxW()  { return px(720.0f); }
 inline float reDomeR()        { return px(56.0f); }   // coverage dome ring radius
 inline float reProgressH()    { return px(8.0f); }    // stage progress bar thickness
+
+// ---- Parts Library workspace (ui/parts/) ------------------------------------------------------
+// ONE horizontal inset for the whole Parts workspace, used in two STACKED roles:
+//   * pane gutter   — the child WindowPadding.x of every parts pane, so the categories / results
+//                     / filters columns all start their SURFACES (rows, cards, frames) on one line;
+//   * content inset — how far a row, a grid card or a results-table cell insets its own text from
+//                     that surface, so every LABEL lands on one text line at gutter + inset.
+// Deliberately equal to the theme FramePadding.x (ui_theme.cpp), which is where ImGui puts the
+// text inside an InputText / Combo / Button — native framed widgets then align for free.
+// Before this token the three panes used 12 / 10 / 12+15 px (a nested child silently re-applied
+// the default WindowPadding) and a grid card mixed an 8-px pad, a 6-px text margin and a centred
+// title, so nothing in the workspace shared a left edge.
+inline float partsPadX()      { return px(12.0f); }
 }  // namespace metrics
 }  // namespace ui

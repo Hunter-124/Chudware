@@ -774,21 +774,12 @@ def get_ai_roles(cfg: Mapping[str, Any] | None = None) -> dict[str, Any]:
     return out
 
 
-def set_ai_roles(
-    roles_partial: Mapping[str, Any],
-    cfg: Mapping[str, Any] | None = None,
-    *,
-    persist: bool = True,
-) -> dict[str, Any]:
-    """Merge *roles_partial* into config ai_roles. Returns the full map.
+def _apply_role_updates(current: dict, roles_partial: Mapping[str, Any] | None) -> dict:
+    """Apply *roles_partial* onto the *current* ai_roles map in place, and return it.
 
-    When *persist* is True, writes via ``config.save_config`` (shallow merge).
-    Partial updates merge *thinking* onto the existing role entry when the
-    caller only sends one side of the assignment.
+    Only roles named in *roles_partial* are touched; every other entry is left byte-identical
+    so one role's save can never rewrite its siblings.
     """
-    current = dict((cfg or {}).get(AI_ROLES_KEY) or {})
-    if not isinstance(current, dict):
-        current = {}
     for role, value in (roles_partial or {}).items():
         role_s = str(role).strip()
         if not role_s:
@@ -816,15 +807,46 @@ def set_ai_roles(
                 current[role_s] = _normalize_role_value(merged)
                 continue
         current[role_s] = _normalize_role_value(value)
+    return current
+
+
+def set_ai_roles(
+    roles_partial: Mapping[str, Any],
+    cfg: Mapping[str, Any] | None = None,
+    *,
+    persist: bool = True,
+) -> dict[str, Any]:
+    """Merge *roles_partial* into config ai_roles. Returns the full map.
+
+    When *persist* is True the on-disk map is re-read INSIDE the config lock and only the
+    roles named in *roles_partial* are touched. That matters because ``get_ai_roles``
+    materializes an entry for every :data:`KNOWN_ROLES` member: a caller that hands us one
+    of those expanded maps as *cfg* would otherwise persist roles the user never configured.
+    Building from disk makes that structurally impossible — the write can only ever contain
+    what was already on disk plus what the caller explicitly changed.
+
+    Partial updates merge *thinking* onto the existing role entry when the caller only
+    sends one side of the assignment.
+    """
     if persist:
         from services.agent import config as agent_config  # noqa: PLC0415
-        # `current` IS the whole ai_roles map, so it must REPLACE what is on disk.
-        # A plain save_config deep-merges dict-valued keys, which would union each
-        # role entry with the old one and resurrect the provider/model we just
-        # cleared — the role would read as "default" while still carrying a pin.
-        agent_config.save_config({AI_ROLES_KEY: current}, replace=(AI_ROLES_KEY,))
-        disk = agent_config.load_config()
-        return get_ai_roles(disk)
+        # One critical section for read → apply → write, so a concurrent writer cannot
+        # land between our read of ai_roles and our write of it. config_lock is
+        # re-entrant, so the nested save_config below shares this acquisition.
+        with agent_config.config_lock():
+            current = dict(agent_config.read_config_uncached().get(AI_ROLES_KEY) or {})
+            _apply_role_updates(current, roles_partial)
+            # `current` IS the whole ai_roles map, so it must REPLACE what is on disk.
+            # A plain save_config deep-merges dict-valued keys, which would union each
+            # role entry with the old one and resurrect the provider/model we just
+            # cleared — the role would read as "default" while still carrying a pin.
+            agent_config.save_config({AI_ROLES_KEY: current}, replace=(AI_ROLES_KEY,))
+            return get_ai_roles(agent_config.load_config())
+
+    current = dict((cfg or {}).get(AI_ROLES_KEY) or {})
+    if not isinstance(current, dict):
+        current = {}
+    _apply_role_updates(current, roles_partial)
     merged_cfg = dict(cfg or {})
     merged_cfg[AI_ROLES_KEY] = current
     return get_ai_roles(merged_cfg)

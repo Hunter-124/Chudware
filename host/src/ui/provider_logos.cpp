@@ -312,13 +312,8 @@ bool providerLogosEnabled() { return logoEnabled(); }
 
 void setProviderLogosEnabled(bool on) {
     g_logoEnabled = on ? 1 : 0;
-    // Persist config.json agent.provider_logos (load-modify-write).
-    nlohmann::json j = nlohmann::json::object();
-    { std::ifstream f(configPath()); if (f) { try { f >> j; } catch (...) { j = nlohmann::json::object(); } } }
-    if (!j.is_object()) j = nlohmann::json::object();
-    j["agent"]["provider_logos"] = on;
-    std::error_code ec; std::filesystem::create_directories(appdataAppDir(), ec);
-    { std::ofstream o(configPath(), std::ios::trunc); if (o) o << j.dump(2); }
+    // Persist config.json agent.provider_logos via the shared locked updater.
+    updateConfigJson([on](nlohmann::json& j) { j["agent"]["provider_logos"] = on; });
     if (!on) {
         // Drop cached textures so the list falls back to badges immediately (GL thread).
         for (auto& kv : g_logoTex)

@@ -212,6 +212,17 @@ std::string appdataAppDir();
 // Default Documents workspace dir (Documents/Chudware if it exists, else Documents/Chudware).
 std::string defaultWorkspaceDir();
 std::string configPath();
+// Serialized, atomic read-modify-write of config.json. `patch` receives the parsed JSON
+// (always an object) and mutates it in place; the result is written via tmp+rename.
+//
+// config.json is SHARED with the Python worker and the C++ engine, and every writer here
+// used to do its own unsynchronized load-modify-write — so "GUI reads, Python writes, GUI
+// writes" silently reverted Python's keys (the class of bug behind the 2026-07-14 account
+// wipe). This takes the advisory lock on <config.json>.lock, the SAME file
+// core/agent/auth.cpp and services/agent/providers/sub_auth.py use, so all three
+// serialize. ALWAYS use this instead of hand-rolling ifstream/ofstream on configPath().
+// Returns false if the file could not be written (the patch is then a no-op on disk).
+bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch);
 void loadSettings(Settings& s);
 void saveSettings(const Settings& s);
 // WASM IDBFS: mount /persist early, populate before first config/chat load, flush after writes.

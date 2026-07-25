@@ -275,8 +275,11 @@ def _load_cfg() -> dict:
 
 def _write_cfg(cfg: dict) -> None:
     paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic replace so concurrent readers never see a partial JSON document.
-    tmp = paths.CONFIG.with_name(paths.CONFIG.name + ".tmp")
+    # Atomic replace so concurrent readers never see a partial JSON document. The tmp name
+    # carries our pid: every writer of this file takes the <config.json>.lock, but if that
+    # lock is ever unavailable a shared ".tmp" lets two writers publish each other's
+    # half-written file — with OAuth tokens in it.
+    tmp = paths.CONFIG.with_name("%s.tmp.%d" % (paths.CONFIG.name, os.getpid()))
     data = json.dumps(cfg, indent=2)
     tmp.write_text(data, encoding="utf-8")
     # OAuth tokens for every provider live in here — never world/group readable.

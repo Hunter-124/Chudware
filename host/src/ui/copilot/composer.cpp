@@ -442,24 +442,11 @@ static void pushSessionNotice(AppState& st, const std::string& text) {
 }
 
 static void ovSetAgentBool(const char* key, bool v) {
-    try {
-        nlohmann::json j = nlohmann::json::object();
-        {
-            std::ifstream in(configPath());
-            if (in) {
-                nlohmann::json old;
-                in >> old;
-                if (old.is_object()) j = std::move(old);
-            }
-        }
+    updateConfigJson([&](nlohmann::json& j) {
         if (!j.contains("agent") || !j["agent"].is_object())
             j["agent"] = nlohmann::json::object();
         j["agent"][key] = v;
-        const std::string path = configPath();
-        const std::string tmp = path + ".tmp";
-        std::ofstream(tmp) << j.dump(2);
-        std::filesystem::rename(tmp, path);
-    } catch (...) {}
+    });
 }
 
 // Returns true if `text` was a slash command (handled; do not run a normal turn).

@@ -2747,16 +2747,7 @@ static void loadEngFirmModelsUi() {
 }
 
 static void saveEngFirmModelsUi() {
-    try {
-        nlohmann::json j = nlohmann::json::object();
-        {
-            std::ifstream in(configPath());
-            if (in) {
-                nlohmann::json old;
-                in >> old;
-                if (old.is_object()) j = std::move(old);
-            }
-        }
+    updateConfigJson([&](nlohmann::json& j) {
         if (!j.contains("eng_firm") || !j["eng_firm"].is_object())
             j["eng_firm"] = nlohmann::json::object();
         nlohmann::json models = nlohmann::json::object();
@@ -2800,12 +2791,7 @@ static void saveEngFirmModelsUi() {
             j["eng_firm"]["models"] = std::move(models);
         if (j["eng_firm"].empty())
             j.erase("eng_firm");
-
-        const std::string path = configPath();
-        const std::string tmp = path + ".tmp";
-        std::ofstream(tmp) << j.dump(2);
-        std::rename(tmp.c_str(), path.c_str());
-    } catch (...) {}
+    });
 }
 
 static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label,
@@ -3168,7 +3154,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
 
 // ---- agent.* memory/learning knobs (config.json) -----------------------------
 // Same load-modify-write recipe as ui::loadMaxSubagentDepth/saveMaxSubagentDepth
-// (copilot/settings.cpp): read with a default, save via atomic .tmp rename.
+// (copilot/settings.cpp): read with a default, save through updateConfigJson().
 static std::string loadAgentConfigString(const char* key, const char* fallback) {
     std::string v = fallback;
     try {
@@ -3202,28 +3188,15 @@ static bool loadAgentConfigBool(const char* key, bool fallback) {
     return v;
 }
 static void saveAgentConfigValue(const char* key, const nlohmann::json& value) {
-    try {
-        nlohmann::json j = nlohmann::json::object();
-        {
-            std::ifstream in(configPath());
-            if (in) {
-                nlohmann::json old;
-                in >> old;
-                if (old.is_object()) j = std::move(old);
-            }
-        }
+    updateConfigJson([&](nlohmann::json& j) {
         if (!j.contains("agent") || !j["agent"].is_object())
             j["agent"] = nlohmann::json::object();
         j["agent"][key] = value;
-        const std::string path = configPath();
-        const std::string tmp = path + ".tmp";
-        std::ofstream(tmp) << j.dump(2);
-        std::rename(tmp.c_str(), path.c_str());
-    } catch (...) {}
+    });
 }
 
 // Nested agent.<obj>.<key> variants (e.g. agent.compaction.supersede_reads): same
-// load-modify-write recipe, ensuring the intermediate object exists on write.
+// load-modify-write, ensuring the intermediate object exists on write.
 static bool loadAgentConfigNestedBool(const char* obj, const char* key, bool fallback) {
     bool v = fallback;
     try {
@@ -3242,26 +3215,13 @@ static bool loadAgentConfigNestedBool(const char* obj, const char* key, bool fal
     return v;
 }
 static void saveAgentConfigNestedBool(const char* obj, const char* key, bool value) {
-    try {
-        nlohmann::json j = nlohmann::json::object();
-        {
-            std::ifstream in(configPath());
-            if (in) {
-                nlohmann::json old;
-                in >> old;
-                if (old.is_object()) j = std::move(old);
-            }
-        }
+    updateConfigJson([&](nlohmann::json& j) {
         if (!j.contains("agent") || !j["agent"].is_object())
             j["agent"] = nlohmann::json::object();
         if (!j["agent"].contains(obj) || !j["agent"][obj].is_object())
             j["agent"][obj] = nlohmann::json::object();
         j["agent"][obj][key] = value;
-        const std::string path = configPath();
-        const std::string tmp = path + ".tmp";
-        std::ofstream(tmp) << j.dump(2);
-        std::rename(tmp.c_str(), path.c_str());
-    } catch (...) {}
+    });
 }
 
 // Memory & Learning + Workspace visibility knobs (Settings > AI > Harness).
@@ -5285,30 +5245,23 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "%s",
                                                    s_globalErr.c_str());
                             if (ImGui::Button("Save global limits", ImVec2(180.0f * sc, 0))) {
-                                try {
-                                    nlohmann::json j = nlohmann::json::object();
-                                    {
-                                        std::ifstream in(configPath());
-                                        if (in) {
-                                            nlohmann::json old; in >> old;
-                                            if (old.is_object()) j = old;
-                                        }
-                                    }
-                                    if (!j.contains("agent") || !j["agent"].is_object())
-                                        j["agent"] = nlohmann::json::object();
-                                    j["agent"]["tool_timeout_s_default"] = std::max(0, s_globalTimeout);
-                                    j["agent"]["tool_max_calls_default"] = std::max(0, s_globalMaxCalls);
-                                    j["agent"]["supervision_interval_calls"] =
-                                        std::max(0, s_globalSupervision);
-                                    j["agent"]["tool_loop_guard_enabled"] = s_loopGuardEnabled;
-                                    j["agent"]["tool_loop_guard_threshold"] =
-                                        std::max(1, s_loopGuardThreshold);
-                                    std::ofstream outf(configPath(), std::ios::trunc);
-                                    outf << j.dump(2);
+                                if (updateConfigJson([&](nlohmann::json& j) {
+                                        if (!j.contains("agent") || !j["agent"].is_object())
+                                            j["agent"] = nlohmann::json::object();
+                                        j["agent"]["tool_timeout_s_default"] =
+                                            std::max(0, s_globalTimeout);
+                                        j["agent"]["tool_max_calls_default"] =
+                                            std::max(0, s_globalMaxCalls);
+                                        j["agent"]["supervision_interval_calls"] =
+                                            std::max(0, s_globalSupervision);
+                                        j["agent"]["tool_loop_guard_enabled"] = s_loopGuardEnabled;
+                                        j["agent"]["tool_loop_guard_threshold"] =
+                                            std::max(1, s_loopGuardThreshold);
+                                    })) {
                                     s_globalDirty = false;
                                     s_globalErr.clear();
                                     s_globalLast = -1e9;
-                                } catch (...) {
+                                } else {
                                     s_globalErr = "Failed to save global tool limits.";
                                 }
                             }
@@ -5580,61 +5533,51 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                             if (ImGui::Button("Save tool families & options",
                                               ImVec2(240.0f * sc, 0))) {
-                                try {
-                                    nlohmann::json j = nlohmann::json::object();
-                                    {
-                                        std::ifstream in(configPath());
-                                        if (in) {
-                                            nlohmann::json old; in >> old;
-                                            if (old.is_object()) j = old;
-                                        }
-                                    }
-                                    if (!j.contains("agent") || !j["agent"].is_object())
-                                        j["agent"] = nlohmann::json::object();
-                                    nlohmann::json tf = nlohmann::json::object();
-                                    for (const auto& kv : s_toolFam) tf[kv.first] = kv.second;
-                                    j["agent"]["tool_families"] = tf;
+                                nlohmann::json tf = nlohmann::json::object();
+                                for (const auto& kv : s_toolFam) tf[kv.first] = kv.second;
 
-                                    nlohmann::json to = nlohmann::json::object();
-                                    // Collect all tool names we know about
-                                    std::set<std::string> names;
-                                    for (const auto& kv : s_toolEnabled) names.insert(kv.first);
-                                    for (const auto& kv : s_toolTimeout) names.insert(kv.first);
-                                    for (const auto& kv : s_toolMaxCalls) names.insert(kv.first);
-                                    for (const auto& kv : s_toolDefaults) names.insert(kv.first);
-                                    for (const auto& kv : s_toolNote) names.insert(kv.first);
-                                    s_toolOptErr.clear();
-                                    for (const auto& tn : names) {
-                                        nlohmann::json e = nlohmann::json::object();
-                                        bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
-                                        if (!en) e["enabled"] = false;
-                                        int tmo = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
-                                        if (tmo > 0) e["timeout_s"] = tmo;
-                                        int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
-                                        if (mc > 0) e["max_calls_per_turn"] = mc;
-                                        if (s_toolDefaults.count(tn) && !s_toolDefaults[tn].empty()) {
-                                            try {
-                                                auto parsed = nlohmann::json::parse(s_toolDefaults[tn]);
-                                                if (parsed.is_object() && !parsed.empty())
-                                                    e["param_defaults"] = parsed;
-                                            } catch (...) {
-                                                s_toolOptErr = "Invalid JSON in param_defaults for " + tn;
-                                                break;
-                                            }
+                                nlohmann::json to = nlohmann::json::object();
+                                // Collect all tool names we know about
+                                std::set<std::string> names;
+                                for (const auto& kv : s_toolEnabled) names.insert(kv.first);
+                                for (const auto& kv : s_toolTimeout) names.insert(kv.first);
+                                for (const auto& kv : s_toolMaxCalls) names.insert(kv.first);
+                                for (const auto& kv : s_toolDefaults) names.insert(kv.first);
+                                for (const auto& kv : s_toolNote) names.insert(kv.first);
+                                s_toolOptErr.clear();
+                                for (const auto& tn : names) {
+                                    nlohmann::json e = nlohmann::json::object();
+                                    bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
+                                    if (!en) e["enabled"] = false;
+                                    int tmo = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
+                                    if (tmo > 0) e["timeout_s"] = tmo;
+                                    int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
+                                    if (mc > 0) e["max_calls_per_turn"] = mc;
+                                    if (s_toolDefaults.count(tn) && !s_toolDefaults[tn].empty()) {
+                                        try {
+                                            auto parsed = nlohmann::json::parse(s_toolDefaults[tn]);
+                                            if (parsed.is_object() && !parsed.empty())
+                                                e["param_defaults"] = parsed;
+                                        } catch (...) {
+                                            s_toolOptErr = "Invalid JSON in param_defaults for " + tn;
+                                            break;
                                         }
-                                        if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
-                                            e["prompt_note"] = s_toolNote[tn];
-                                        if (!e.empty()) to[tn] = e;
                                     }
-                                    if (s_toolOptErr.empty()) {
+                                    if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
+                                        e["prompt_note"] = s_toolNote[tn];
+                                    if (!e.empty()) to[tn] = e;
+                                }
+                                if (s_toolOptErr.empty()) {
+                                    updateConfigJson([&](nlohmann::json& j) {
+                                        if (!j.contains("agent") || !j["agent"].is_object())
+                                            j["agent"] = nlohmann::json::object();
+                                        j["agent"]["tool_families"] = tf;
                                         j["agent"]["tool_options"] = to;
-                                        std::ofstream outf(configPath(), std::ios::trunc);
-                                        outf << j.dump(2);
-                                        s_toolFamDirty = false;
-                                        s_toolOptDirty = false;
-                                        s_toolFamLast = -1e9;
-                                    }
-                                } catch (...) {}
+                                    });
+                                    s_toolFamDirty = false;
+                                    s_toolOptDirty = false;
+                                    s_toolFamLast = -1e9;
+                                }
                             }
                             ImGui::SameLine();
                             if (ImGui::Button("Reset all on", ImVec2(120.0f * sc, 0))) {

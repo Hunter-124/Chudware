@@ -22,6 +22,15 @@
 #include <set>
 #include <thread>
 
+// Platform primitives for the config.json advisory lock (see updateConfigJson below).
+#if defined(_WIN32)
+#include <windows.h>
+#elif !defined(__EMSCRIPTEN__)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 #include "app_state.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -499,22 +508,121 @@ void loadSettings(Settings& s) {
     }
 }
 
-void saveSettings(const Settings& s) {
-    // Merge-not-replace: config.json is SHARED with the Python side (subscription_auth OAuth
-    // tokens, plm.*, ai_roles, ...). Start from the on-disk JSON and only rewrite the keys the
-    // GUI owns — a fixed-allowlist full overwrite here silently wiped every signed-in account
-    // whenever any setting was saved (2026-07-14 wipe incident).
+namespace {
+// Advisory exclusive lock on <config.json>.lock — deliberately the SAME file
+// core/agent/auth.cpp's FileLock and services/agent/providers/sub_auth.py's _lock_path
+// take, so the GUI, the engine and the Python worker serialize against one another.
+// flock on POSIX, LockFileEx on Windows; a failure to acquire degrades to an unlocked
+// write rather than losing the user's edit.
+class ConfigFileLock {
+public:
+    explicit ConfigFileLock(const std::string& p) {
+#if defined(_WIN32)
+        h_ = CreateFileA(p.c_str(), GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h_ == INVALID_HANDLE_VALUE) { h_ = nullptr; return; }
+        OVERLAPPED ov{};
+        if (!LockFileEx(h_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov)) {
+            CloseHandle(h_);
+            h_ = nullptr;
+        }
+#elif !defined(__EMSCRIPTEN__)
+        fd_ = ::open(p.c_str(), O_CREAT | O_RDWR, 0644);
+        if (fd_ < 0) return;
+        if (::flock(fd_, LOCK_EX) != 0) { ::close(fd_); fd_ = -1; }
+#else
+        (void)p;  // single-threaded browser build: no other process shares this file
+#endif
+    }
+    ~ConfigFileLock() {
+#if defined(_WIN32)
+        if (h_) { OVERLAPPED ov{}; UnlockFileEx(h_, 0, 1, 0, &ov); CloseHandle(h_); }
+#elif !defined(__EMSCRIPTEN__)
+        if (fd_ >= 0) { ::flock(fd_, LOCK_UN); ::close(fd_); }
+#endif
+    }
+    ConfigFileLock(const ConfigFileLock&) = delete;
+    ConfigFileLock& operator=(const ConfigFileLock&) = delete;
+
+private:
+#if defined(_WIN32)
+    HANDLE h_ = nullptr;
+#elif !defined(__EMSCRIPTEN__)
+    int fd_ = -1;
+#endif
+};
+
+// In-process serialization. flock is per open-file-description, so two GUI threads each
+// opening the lock file would NOT exclude one another; this mutex closes that gap and is
+// held for the whole read-modify-write.
+std::mutex& configWriteMutex() {
+    static std::mutex m;
+    return m;
+}
+}  // namespace
+
+bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch) {
+    if (!patch) return false;
+    const std::string path = configPath();
+    std::lock_guard<std::mutex> guard(configWriteMutex());
+    std::error_code ec;
+    std::filesystem::create_directories(appdataAppDir(), ec);
+    ConfigFileLock lock(path + ".lock");
+    // Re-read INSIDE the lock: anything we parsed earlier may be stale by now.
     nlohmann::json j = nlohmann::json::object();
-    try {
-        std::ifstream in(configPath());
+    {
+        std::ifstream in(path);
         if (in) {
             nlohmann::json old;
-            in >> old;
-            if (old.is_object()) j = std::move(old);
+            try {
+                in >> old;
+                if (old.is_object()) j = std::move(old);
+            } catch (...) {
+                j = nlohmann::json::object();  // corrupt file: start clean rather than abort
+            }
         }
-    } catch (...) {
-        j = nlohmann::json::object();  // corrupt/absent file: rebuild GUI-owned keys only
     }
+    try {
+        patch(j);
+    } catch (...) {
+        return false;  // a throwing patch must not leave a partial write behind
+    }
+    try {
+        // Per-process tmp name: the lock already serializes well-behaved writers, but a
+        // shared ".tmp" means any writer that skips the lock races us into renaming a file
+        // we already moved, or publishes our half-written one.
+        const std::string tmp = path + ".tmp." + std::to_string(
+#if defined(_WIN32)
+            (long long)GetCurrentProcessId()
+#else
+            (long long)::getpid()
+#endif
+        );
+        {
+            std::ofstream out(tmp, std::ios::trunc);
+            if (!out) return false;
+            out << j.dump(2);
+            if (!out) return false;
+        }
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            std::filesystem::remove(tmp, ec);  // don't leave a stray tmp behind
+            return false;
+        }
+        appstatePersistSync();  // WASM: flush IDBFS; no-op on desktop
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// Overlay every GUI-owned key onto *j*, the live on-disk config. Merge-not-replace:
+// config.json is SHARED with the Python side (subscription_auth OAuth tokens, plm.*,
+// ai_roles, ...) — a fixed-allowlist full overwrite here silently wiped every signed-in
+// account whenever any setting was saved (2026-07-14 wipe incident). The read and the
+// write live in updateConfigJson, which holds the shared lock across both.
+static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // Capture partially-modeled maps BEFORE erase. config.json "keys" is shared with the
     // agent harness (openrouter, etc.); "experimental" may grow fields the GUI doesn't
     // model. Rebuild-from-struct alone wiped unknown entries on every save (same class as
@@ -737,17 +845,12 @@ void saveSettings(const Settings& s) {
     if (s.expCadSequenceMode) expOut["cad_sequence_mode"] = true;
     else expOut.erase("cad_sequence_mode");
     if (!expOut.empty()) j["experimental"] = std::move(expOut);
-    try {
-        std::filesystem::create_directories(appdataAppDir());
-        // Atomic-ish write: tmp + rename, so a concurrent Python reader/writer never sees a
-        // half-written file (sub_auth writes are load-modify-write on this same path).
-        const std::string path = configPath();
-        const std::string tmp = path + ".tmp";
-        std::ofstream(tmp) << j.dump(2);
-        std::filesystem::rename(tmp, path);
-        appstatePersistSync();  // WASM: flush IDBFS; no-op on desktop
-    } catch (...) {
-    }
+}
+
+void saveSettings(const Settings& s) {
+    // Locked + atomic via the shared config lock, so a concurrent Python/engine write can
+    // neither clobber us nor be clobbered by us between our read and our write.
+    updateConfigJson([&s](nlohmann::json& j) { applyGuiOwnedSettings(j, s); });
 }
 
 // ---------------- textures ----------------

@@ -16,9 +16,11 @@ state. config.json shape:
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
+import threading
 from collections.abc import Iterable
 from urllib.parse import urlparse
 
@@ -67,6 +69,73 @@ def load_config() -> dict:
     return copy.deepcopy(cfg)
 
 
+# --------------------------------------------------------------------- cross-process lock
+# config.json is read-modify-written by SEVERAL processes: this worker, the C++ GUI
+# (host/src/core/app_state.cpp and friends) and the engine (core/agent/auth.cpp). Without
+# serialization, "A reads → B writes → A writes" silently drops B's keys — the class of bug
+# behind the 2026-07-14 account wipe. Every writer takes the same advisory lock on
+# <config.json>.lock; services/agent/providers/sub_auth.py and core/agent/auth.cpp already
+# use that exact path, so this interoperates with them rather than inventing a second scheme.
+_CFG_LOCK_SUFFIX = ".lock"
+_cfg_write_lock = threading.RLock()
+_cfg_lock_depth = 0
+
+
+@contextlib.contextmanager
+def config_lock():
+    """Serialize a config.json read-modify-write against every other process and thread.
+
+    Re-entrant. ``flock`` is per open-file-description, so a nested acquire in this process
+    on a second fd would self-deadlock against itself; the recursive mutex already provides
+    in-process exclusion, so only the OUTERMOST acquisition touches the lock file. Mirrors
+    the depth-aware StoreLock in core/agent/auth.cpp.
+
+    Degrades to the process lock alone where ``fcntl`` is unavailable (Windows): the GUI
+    there takes the same lock via LockFileEx, and losing cross-process exclusion is strictly
+    better than refusing to save.
+    """
+    global _cfg_lock_depth
+    with _cfg_write_lock:
+        if _cfg_lock_depth > 0:
+            _cfg_lock_depth += 1
+            try:
+                yield
+            finally:
+                _cfg_lock_depth -= 1
+            return
+        try:
+            import fcntl  # noqa: PLC0415 — POSIX only
+        except ImportError:
+            fcntl = None  # type: ignore[assignment]
+        paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        lock_p = paths.CONFIG.with_name(paths.CONFIG.name + _CFG_LOCK_SUFFIX)
+        _cfg_lock_depth += 1
+        try:
+            if fcntl is None:
+                yield
+                return
+            with open(lock_p, "a+", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        finally:
+            _cfg_lock_depth -= 1
+
+
+def read_config_uncached() -> dict:
+    """Parse config.json from disk, bypassing the mtime cache.
+
+    save_config MUST NOT merge onto a cached snapshot: the cache is keyed on mtime_ns, and
+    another process can land a write whose mtime we already recorded. Inside the lock the
+    file is quiescent, so one honest read is both correct and cheap.
+    """
+    try:
+        return json.loads(paths.CONFIG.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — missing/corrupt config starts empty, as load_config does
+        return {}
+
 def _deep_merge(base: dict, updates: dict) -> dict:
     """Recursively merge dict-valued keys of *updates* into *base* in place;
     scalars/lists in *updates* replace outright. Lets save_config's read-merge-write
@@ -95,13 +164,28 @@ def save_config(cfg: dict, *, replace: Iterable[str] = ()) -> None:
     the complete value of that key (e.g. the full ai_roles map) — a deep merge would
     otherwise union each nested entry with the old one and silently resurrect fields
     the caller deliberately removed. Everything not named here still merges.
+
+    The whole read-merge-write runs under :func:`config_lock`, and the read bypasses the
+    mtime cache — otherwise a concurrent writer (the C++ GUI, the engine) can land between
+    our read and our write and have its keys silently reverted. The write itself is
+    tmp+replace so no reader ever observes a half-written file.
     """
-    current = load_config()
-    for key in replace:
-        current.pop(key, None)
-    _deep_merge(current, cfg)
-    paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    paths.CONFIG.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    with config_lock():
+        current = read_config_uncached()
+        for key in replace:
+            current.pop(key, None)
+        _deep_merge(current, cfg)
+        paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        # Per-process tmp name: the lock already serializes well-behaved writers, but a
+        # shared ".tmp" means any writer that skips the lock races us into a rename of a
+        # file we already moved (FileNotFoundError) or, worse, publishes our half-file.
+        tmp = paths.CONFIG.with_name("%s.tmp.%d" % (paths.CONFIG.name, os.getpid()))
+        try:
+            tmp.write_text(json.dumps(current, indent=2), encoding="utf-8")
+            os.replace(tmp, paths.CONFIG)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink()  # no-op after a successful replace; cleans up a failed write
 
 
 def workspace_dir(cfg: dict | None = None) -> "Path":

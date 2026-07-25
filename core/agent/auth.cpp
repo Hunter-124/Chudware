@@ -115,7 +115,18 @@ bool resolve_provider_id(const std::string& provider, ProviderSpec& out) {
 
 fs::path config_path() { return paths_config(); }
 fs::path lock_path() { return config_path().parent_path() / (config_path().filename().string() + ".lock"); }
-fs::path tmp_path() { return config_path().parent_path() / (config_path().filename().string() + ".tmp"); }
+// Per-process tmp name: every writer of config.json takes lock_path(), but if that lock is
+// ever unavailable a shared ".tmp" lets two writers publish each other's half-written file.
+fs::path tmp_path() {
+    return config_path().parent_path() /
+           (config_path().filename().string() + ".tmp." + std::to_string(
+#ifdef _WIN32
+                (long long)GetCurrentProcessId()
+#else
+                (long long)::getpid()
+#endif
+                ));
+}
 
 json load_cfg() {
     std::error_code ec;

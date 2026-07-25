@@ -458,15 +458,29 @@ ImVec4 maxContrastTextOn(const ImVec4& surface);
 // drag handling. `trackMin`/`trackMax` bound the full track rect; `thumbA`/`thumbB` are the pill's
 // start/end along the scroll axis (screen coords). `vertical` picks the axis. Used by the doc-tab
 // file strip and the FeatureManager body so both scrollbars read identically.
+// `thickness` (unscaled px, 0 = the app default hairline) overrides the pill/track width.
 void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackMax,
                     float thumbA, float thumbB, bool vertical, bool hovered,
-                    const AdaptiveSurface& surf);
+                    const AdaptiveSurface& surf, float thickness = 0.0f);
+
+// Geometry overrides for drawWindowPillScrollbarV. The defaults reproduce the app-wide
+// hairline look: a 2px pill running down the centre of a 10px band at the window's right
+// edge. The drag strip stays wide enough to grab regardless of the pill's drawn width.
+struct PillScrollbarStyle {
+    float thickness = 0.0f;    // unscaled px; 0 = app default (2px)
+    bool flushRight = false;   // true: pill sits ON the right edge instead of band-centred
+};
+
+// The copilot/agent chat's bar: 6px, sitting ON the right edge. Shared by the docked copilot
+// panel and the AI tab's conversation pane so the same chat never looks different in two hosts.
+inline constexpr PillScrollbarStyle kChatScrollbar{6.0f, true};
 
 // FeatureManager-style custom vertical scrollbar for the CURRENT window/child. Call just before
 // EndChild; reads GetScrollY/GetScrollMaxY + the window rect, draws the pill overlay on the right
 // edge and handles drag (SetScrollY). No-op when the content doesn't overflow. Requires the child
 // to carry ImGuiWindowFlags_NoScrollbar (so it replaces, not doubles, the default bar).
-void drawWindowPillScrollbarV(const AdaptiveSurface& surf);
+void drawWindowPillScrollbarV(const AdaptiveSurface& surf,
+                              const PillScrollbarStyle& style = PillScrollbarStyle{});
 
 // Circular fraction gauge: a full track ring plus a clockwise arc from 12 o'clock covering
 // `frac` (0..1) of the circle. PURE draw — no layout, no interaction, no ImGui item. Shared by

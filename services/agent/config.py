@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+from collections.abc import Iterable
 from urllib.parse import urlparse
 
 from services import paths
@@ -79,7 +80,7 @@ def _deep_merge(base: dict, updates: dict) -> dict:
     return base
 
 
-def save_config(cfg: dict) -> None:
+def save_config(cfg: dict, *, replace: Iterable[str] = ()) -> None:
     """Read-merge-write a partial update into config.json (creating it on first run).
 
     Deep-merges into whatever is already on disk — recursing into dict-valued keys,
@@ -88,8 +89,16 @@ def save_config(cfg: dict) -> None:
     etc.), including nested siblings under a shared parent key (e.g. {"keys": {...}}) —
     the same non-destructive contract the C++ GUI's first-run dialog follows when it
     writes this file directly (ui/imgui/src/ui/first_run.cpp).
+
+    *replace* names top-level keys the caller owns WHOLESALE: they are dropped before
+    the merge so the incoming value is authoritative. Needed when the caller's dict is
+    the complete value of that key (e.g. the full ai_roles map) — a deep merge would
+    otherwise union each nested entry with the old one and silently resurrect fields
+    the caller deliberately removed. Everything not named here still merges.
     """
     current = load_config()
+    for key in replace:
+        current.pop(key, None)
     _deep_merge(current, cfg)
     paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
     paths.CONFIG.write_text(json.dumps(current, indent=2), encoding="utf-8")

@@ -36,6 +36,14 @@ AI_ROLES_KEY = "ai_roles"
 # User overrides for rankings (Settings GUI). Distinct from ai_roles.
 USER_RANKINGS_KEY = "model_rankings"
 
+# Third assignment form, beside "auto" (ranked pick) and a fixed {provider, model}:
+# follow whatever model the chat composer is currently set to. Resolution yields an
+# assignment with EMPTY provider/model and mode == SESSION_DEFAULT; the caller keeps
+# its ambient provider rather than constructing one. This exists because "auto" ranks
+# across every enabled provider and will happily route a subagent to a provider the
+# user never picked (and whose key may be dead) while their chat sits on another.
+SESSION_DEFAULT = "default"
+
 # Roles the Settings GUI / Contract expose. routing.yaml roles still resolve via
 # routing.py; these are the *harness-level* role knobs (advisor/task/planning/...).
 KNOWN_ROLES = (
@@ -159,14 +167,23 @@ class ModelRank:
 
 @dataclass(frozen=True)
 class RoleModelAssignment:
-    """Resolved provider+model for one role (or auto pick)."""
+    """Resolved provider+model for one role (or auto pick, or session default)."""
     role: str
     provider: str
     model: str
-    mode: str                       # "fixed" | "auto"
+    mode: str                       # "fixed" | "auto" | "default"
     rank: int | None = None
     source: str = ""                # ranking source when auto
     reason: str = ""
+
+    @property
+    def is_session_default(self) -> bool:
+        """True when this role follows whatever model the chat composer is set to.
+
+        Callers MUST keep their ambient provider instead of building one from
+        ``provider``/``model`` — both are empty for this mode by construction.
+        """
+        return self.mode == SESSION_DEFAULT
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -520,17 +537,20 @@ def _normalize_thinking(value: Any) -> str:
 
 
 def _normalize_role_value(value: Any) -> str | dict[str, str]:
-    """Coerce a config ai_roles entry to ``"auto"`` or a role dict.
+    """Coerce a config ai_roles entry to ``"auto"``, ``"default"`` or a role dict.
 
     Dict form carries ``thinking`` ONLY when concrete (low|medium|high) — auto is
     the default and is omitted so legacy ``{provider, model}`` entries round-trip
-    unchanged. When model is auto but thinking is concrete, return
-    ``{mode: "auto", thinking}`` so both knobs persist.
-    Legacy string ``"auto"`` / ``"provider/model"`` are accepted.
+    unchanged. When model is auto/default but thinking is concrete, return
+    ``{mode: <mode>, thinking}`` so both knobs persist.
+    Legacy string ``"auto"`` / ``"provider/model"`` are accepted, as is the newer
+    ``"default"`` (follow the chat composer's model).
     """
     if value is None or value == "" or value == "auto":
         return "auto"
     if isinstance(value, str):
+        if value.strip().lower() == SESSION_DEFAULT:
+            return SESSION_DEFAULT
         if "/" in value:
             prov, _, model = value.partition("/")
             return {"provider": prov.strip(), "model": model.strip()}
@@ -540,6 +560,12 @@ def _normalize_role_value(value: Any) -> str | dict[str, str]:
         mode = str(value.get("mode") or "").lower()
         prov = str(value.get("provider") or "").strip()
         model = str(value.get("model") or "").strip()
+        # An explicit mode wins over the presence of stale provider/model keys, so
+        # switching a role to Default in Settings does not silently stay pinned.
+        if mode == SESSION_DEFAULT:
+            if thinking == DEFAULT_THINKING:
+                return SESSION_DEFAULT
+            return {"mode": SESSION_DEFAULT, "thinking": thinking}
         is_auto = mode == "auto" or (not prov and not model)
         if is_auto:
             if thinking == DEFAULT_THINKING:
@@ -776,11 +802,15 @@ def set_ai_roles(
                 for k, v in value.items():
                     if v is not None and v != "":
                         merged[k] = v
-                # Explicit mode=auto clears fixed provider/model.
-                if str(value.get("mode") or "").lower() == "auto":
+                # An explicit mode clears any fixed provider/model, so flipping a
+                # role to Auto or Default in Settings cannot leave a stale pin
+                # behind on the entry (it would be inert, but it reads as if the
+                # role were still bound to that model).
+                mode_in = str(value.get("mode") or "").lower()
+                if mode_in in ("auto", SESSION_DEFAULT):
                     merged.pop("provider", None)
                     merged.pop("model", None)
-                    merged["mode"] = "auto"
+                    merged["mode"] = mode_in
                 elif value.get("provider") or value.get("model"):
                     merged.pop("mode", None)
                 current[role_s] = _normalize_role_value(merged)
@@ -788,7 +818,11 @@ def set_ai_roles(
         current[role_s] = _normalize_role_value(value)
     if persist:
         from services.agent import config as agent_config  # noqa: PLC0415
-        agent_config.save_config({AI_ROLES_KEY: current})
+        # `current` IS the whole ai_roles map, so it must REPLACE what is on disk.
+        # A plain save_config deep-merges dict-valued keys, which would union each
+        # role entry with the old one and resurrect the provider/model we just
+        # cleared — the role would read as "default" while still carrying a pin.
+        agent_config.save_config({AI_ROLES_KEY: current}, replace=(AI_ROLES_KEY,))
         disk = agent_config.load_config()
         return get_ai_roles(disk)
     merged_cfg = dict(cfg or {})
@@ -1885,8 +1919,12 @@ def resolve_role_model(
     """Resolve provider+model for *role* honouring config.json ``ai_roles``.
 
     * Fixed ``{provider, model}`` entries are returned as mode=fixed.
-    * ``\"auto\"`` (default) difficulty-aware picks from rankings.
+    * ``\"default\"`` returns mode=default with EMPTY provider/model — the caller
+      keeps whatever model the chat composer is on (see :data:`SESSION_DEFAULT`).
+    * ``\"auto\"`` difficulty-aware picks from rankings.
     * Redaction role: HARD refuse non-loopback (raises :class:`RoleModelError`).
+      ``\"default\"`` is downgraded to ``\"auto\"`` for redaction, because the chat
+      model is normally a cloud provider and this role may never leave loopback.
     """
     role_s = (role or "default").strip().lower() or "default"
     role_s = ROLE_MODEL_KEY_ALIASES.get(role_s, role_s)
@@ -1898,6 +1936,24 @@ def resolve_role_model(
 
     require_loopback = role_s == "redaction"
     rank_table = rankings if rankings is not None else load_rankings(cfg)
+
+    entry_mode = (
+        str(entry.get("mode") or "").lower() if isinstance(entry, Mapping)
+        else str(entry or "").strip().lower()
+    )
+    if entry_mode == SESSION_DEFAULT:
+        if require_loopback:
+            entry = "auto"  # loopback rule outranks the session model
+        else:
+            return RoleModelAssignment(
+                role=role_s,
+                provider="",
+                model="",
+                mode=SESSION_DEFAULT,
+                rank=None,
+                source="ai_roles",
+                reason=f"default ai_roles.{role_s} (follows the chat model)",
+            )
 
     if isinstance(entry, Mapping):
         prov = str(entry.get("provider") or "").strip().lower()

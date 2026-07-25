@@ -669,14 +669,34 @@ def _ai_roles_set(params: dict, _emit: Callable) -> dict:
                 "reason": "roles mapping required",
                 "hint": (
                     "Pass roles: {advisor|task|planning|default|plm|redaction: "
-                    "{provider, model, thinking?} | {mode:\"auto\", thinking?} | \"auto\"}. "
+                    "{provider, model, thinking?} | {mode:\"auto\"|\"default\", thinking?} "
+                    "| \"auto\" | \"default\"}. mode default follows the chat model. "
                     "thinking: auto|low|medium|high (default auto)."
                 ),
             }
 
-        # HARD floor at set-time for redaction fixed assignments.
+        # HARD floor at set-time for redaction. A fixed assignment must be loopback,
+        # and "default" is refused outright: it would hand redaction whatever the chat
+        # composer is on, which is normally a cloud provider.
         if "redaction" in partial:
             val = partial["redaction"]
+            mode = ""
+            if isinstance(val, dict):
+                mode = str(val.get("mode") or "").strip().lower()
+            elif isinstance(val, str):
+                mode = val.strip().lower()
+            if mode == "default":
+                return {
+                    "ok": False,
+                    "reason": (
+                        "redaction cannot follow the chat model — it is hard-locked "
+                        "to loopback providers."
+                    ),
+                    "hint": (
+                        "Pin redaction to a local model "
+                        "(llamacpp/lmstudio/ollama/vllm), or set it to \"auto\"."
+                    ),
+                }
             if isinstance(val, dict):
                 prov = str(val.get("provider") or "").strip()
                 if prov:

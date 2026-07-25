@@ -1109,12 +1109,12 @@ void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float roun
 // fully-rounded pill thumb riding on it. Pure draw; caller owns geometry + drag.
 void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackMax,
                     float thumbA, float thumbB, bool vertical, bool hovered,
-                    const AdaptiveSurface& surf) {
+                    const AdaptiveSurface& surf, float thickness) {
     const float s = ui::uiScale;
     // A thin track runs down the CENTER of the band; the thumb is the SAME thickness as the track
     // (no fatter oval bulge — Hunter's program-wide default), just a brighter, rounded segment of
-    // the same line so it reads as a minimal hairline scrollbar.
-    const float trackThin = 2.0f * s;
+    // the same line so it reads as a minimal hairline scrollbar. Callers may widen both together.
+    const float trackThin = thickness > 0.0f ? thickness * s : 2.0f * s;
     const float pillThick = trackThin;
     const float outlineW = 1.0f * s;
     const ImU32 trackCol = ImGui::ColorConvertFloat4ToU32(
@@ -1142,7 +1142,7 @@ void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackM
 
 // Custom vertical scrollbar for the current window/child (see ui_theme.h). Reads the live scroll
 // state, draws the pill overlay on the right edge, and drags to scroll. No-op if nothing overflows.
-void drawWindowPillScrollbarV(const AdaptiveSurface& surf) {
+void drawWindowPillScrollbarV(const AdaptiveSurface& surf, const PillScrollbarStyle& style) {
     const float scrollMax = ImGui::GetScrollMaxY();
     // Ignore sub-padding phantom overflow: a child with AlwaysUseWindowPadding + a fixed height can
     // report a few px of ScrollMaxY even when the content visually fits (e.g. collapsed tree
@@ -1157,14 +1157,21 @@ void drawWindowPillScrollbarV(const AdaptiveSurface& surf) {
     const float viewH = wsz.y;
     const float contentH = viewH + scrollMax;
 
-    // Track hugs the right edge, inset a hair; a little top/bottom margin so the pill's rounded
-    // ends aren't flush with the window corners.
-    const float bandW = 10.0f * s;
+    // Track hugs the right edge; a little top/bottom margin so the pill's rounded ends aren't
+    // flush with the window corners. The DRAG strip stays comfortably wide even when the drawn
+    // pill is thin, so a hairline bar is still grabbable.
+    const float thick = style.thickness > 0.0f ? style.thickness * s : 2.0f * s;
+    const float bandW = std::max(10.0f * s, thick + 4.0f * s);
     const float margin = 3.0f * s;
-    const float trackX0 = wpos.x + wsz.x - bandW;
+    const float rightX = wpos.x + wsz.x;
+    const float trackX0 = rightX - bandW;
     const float trackTop = wpos.y + margin;
     const float trackBot = wpos.y + wsz.y - margin;
     const float trackLen = trackBot - trackTop;
+    // Pill band: exactly `thick` wide so drawScrollPill centres the line on it. Flush against the
+    // window's right edge when asked, otherwise centred in the drag strip (the historical look).
+    const float pillX1 = style.flushRight ? rightX : trackX0 + (bandW + thick) * 0.5f;
+    const float pillX0 = pillX1 - thick;
 
     const float thumbLen = std::max(24.0f * s, trackLen * (viewH / contentH));
     const float thumbTop = trackTop + (scrollY / scrollMax) * (trackLen - thumbLen);
@@ -1180,9 +1187,9 @@ void drawWindowPillScrollbarV(const AdaptiveSurface& surf) {
         const float t = (my - trackTop - thumbLen * 0.5f) / std::max(1.0f, trackLen - thumbLen);
         ImGui::SetScrollY(std::min(std::max(t, 0.0f), 1.0f) * scrollMax);
     }
-    drawScrollPill(ImGui::GetWindowDrawList(), ImVec2(trackX0, trackTop),
-                   ImVec2(trackX0 + bandW, trackBot), thumbTop, thumbBot,
-                   /*vertical=*/true, hov, surf);
+    drawScrollPill(ImGui::GetWindowDrawList(), ImVec2(pillX0, trackTop),
+                   ImVec2(pillX1, trackBot), thumbTop, thumbBot,
+                   /*vertical=*/true, hov, surf, style.thickness);
 }
 
 // Circular fraction gauge (see ui_theme.h). Pure draw: a full track ring plus an arc that

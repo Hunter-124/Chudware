@@ -1718,8 +1718,25 @@ static BenchCategoriesUi s_cats;
 // ---- Model roles (Settings → AI → Roles) -------------------------------------
 // RPC: ai_roles_get/set. Degrade read-only when worker offline.
 // when the RPC is absent.
+//
+// Tri-state assignment. Default follows whatever provider+model the chat composer is set
+// to (wire form {"mode":"default"} — the resolver sees no provider and falls through to
+// the ambient session model). Auto ranks across enabled providers. Fixed pins one.
+enum class RoleMode { Default, Auto, Fixed };
+static constexpr const char* kRoleModeDefaultLabel = "Default (chat model)";
+static constexpr const char* kRoleModeAutoLabel = "Auto (best available)";
+
+// Wire entry → mode: explicit mode wins, else a provider/model pin, else Auto.
+static RoleMode roleModeFromWire(const std::string& mode, const std::string& provider,
+                                 const std::string& model) {
+    if (mode == "default") return RoleMode::Default;
+    if (mode == "auto") return RoleMode::Auto;
+    if (!provider.empty() || !model.empty()) return RoleMode::Fixed;
+    return RoleMode::Auto;
+}
+
 struct RoleAssign {
-    bool isAuto = true;
+    RoleMode mode = RoleMode::Auto;
     std::string provider;
     std::string model;
     // Per-role reasoning effort: "auto" | "low" | "medium" | "high" (default auto).
@@ -1915,15 +1932,20 @@ static bool providerIsLoopback(int prov) {
 
 // Flat picker entry for role model dropdowns.
 struct RolePickEntry {
-    bool isAuto = false;
+    RoleMode mode = RoleMode::Fixed;
     int provider = ui::PROV_LOCAL;
     std::string model;
     std::string label;  // display
 };
 
-static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly) {
+// includeAuto=false for surfaces with no ranked-auto engine (Eng. Firm): those get
+// exactly the Default row plus the concrete models.
+static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly,
+                                                    bool includeAuto = true) {
     std::vector<RolePickEntry> out;
-    out.push_back(RolePickEntry{true, 0, "", "Auto"});
+    out.push_back(RolePickEntry{RoleMode::Default, 0, "", kRoleModeDefaultLabel});
+    if (includeAuto)
+        out.push_back(RolePickEntry{RoleMode::Auto, 0, "", kRoleModeAutoLabel});
     // Keep the pick list aligned with the composer dropdown: only providers the user can
     // actually run (API key present, subscription signed in, or local endpoint up).
     ui::refreshModelAvailability(st, false);
@@ -1931,7 +1953,7 @@ static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly
         if (localOnly && !providerIsLoopback(prov)) return;
         if (!ui::providerUsable(st, prov)) return;
         RolePickEntry e;
-        e.isAuto = false;
+        e.mode = RoleMode::Fixed;
         e.provider = prov;
         e.model = model;
         e.label = label;
@@ -2005,7 +2027,7 @@ static void ensureDefaultRoles() {
     for (int i = 0; i < kRoleCount; ++i) {
         if (s_roles.roles.find(kRoleKeys[i]) == s_roles.roles.end()) {
             RoleAssign a;
-            a.isAuto = true;
+            a.mode = RoleMode::Auto;
             s_roles.roles[kRoleKeys[i]] = a;
         }
     }
@@ -2038,19 +2060,22 @@ static void pollModelRoles(AppState& st, bool force) {
         s_roles.roles.clear();
         for (int i = 0; i < kRoleCount; ++i) {
             RoleAssign a;
-            a.isAuto = true;
+            a.mode = RoleMode::Auto;
             a.thinking = "auto";
             auto it = roles.find(kRoleKeys[i]);
             if (it != roles.end()) {
                 if (it->is_string()) {
-                    std::string v = it->get<std::string>();
-                    a.isAuto = (v == "auto" || v.empty());
+                    // A bare string never pins a model (the resolver requires an object
+                    // with a provider), so anything but "default" means Auto.
+                    a.mode = (it->get<std::string>() == "default") ? RoleMode::Default
+                                                                   : RoleMode::Auto;
                 } else if (it->is_object()) {
                     a.provider = optionalJsonString(*it, "provider");
                     a.model = optionalJsonString(*it, "model");
-                    // Model auto when provider+model absent (or explicit mode=auto).
-                    const std::string mode = optionalJsonString(*it, "mode");
-                    a.isAuto = (mode == "auto") || (a.provider.empty() && a.model.empty());
+                    // mode=default → chat model, mode=auto → ranked pick, provider/model
+                    // → fixed pin, nothing recognized → Auto.
+                    a.mode = roleModeFromWire(optionalJsonString(*it, "mode"),
+                                              a.provider, a.model);
                     // thinking: auto|low|medium|high (default auto).
                     std::string th = optionalJsonString(*it, "thinking");
                     if (th.empty()) th = "auto";
@@ -2072,7 +2097,9 @@ static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a
     nlohmann::json roles = nlohmann::json::object();
     // Always object form so thinking can ride alongside model auto/fixed.
     nlohmann::json entry = nlohmann::json::object();
-    if (a.isAuto) {
+    if (a.mode == RoleMode::Default) {
+        entry["mode"] = "default";  // no provider → resolver falls through to chat model
+    } else if (a.mode == RoleMode::Auto) {
         entry["mode"] = "auto";
     } else {
         entry["provider"] = a.provider;
@@ -2099,12 +2126,13 @@ static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a
                 RoleAssign a;
                 a.thinking = "auto";
                 if (it->is_string()) {
-                    a.isAuto = (it->get<std::string>() == "auto");
+                    a.mode = (it->get<std::string>() == "default") ? RoleMode::Default
+                                                                   : RoleMode::Auto;
                 } else if (it->is_object()) {
                     a.provider = optionalJsonString(*it, "provider");
                     a.model = optionalJsonString(*it, "model");
-                    const std::string mode = optionalJsonString(*it, "mode");
-                    a.isAuto = (mode == "auto") || (a.provider.empty() && a.model.empty());
+                    a.mode = roleModeFromWire(optionalJsonString(*it, "mode"),
+                                              a.provider, a.model);
                     std::string th = optionalJsonString(*it, "thinking");
                     if (th.empty()) th = "auto";
                     if (th != "low" && th != "medium" && th != "high" && th != "auto")
@@ -2398,9 +2426,10 @@ static void drawModelRolesSection(AppState& st, float sc) {
     pollModelRoles(st, /*force=*/false);
     ensureDefaultRoles();
 
-    dimText("Per-role model + thinking effort. Auto picks within enabled "
-            "providers. Thinking Auto lets the classifier (Default) or dispatcher (subagents) choose. "
-            "Redaction is hard-locked to local (loopback) providers.");
+    dimText("Per-role model + thinking effort. Default follows the model chosen in the chat "
+            "composer; Auto picks the best available within enabled providers; or pin a "
+            "specific model. Thinking Auto lets the classifier (Default role) or dispatcher "
+            "(subagents) choose. Redaction is hard-locked to local (loopback) providers.");
 
     if (s_roles.rolesRpcMissing) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
@@ -2477,11 +2506,14 @@ static void drawModelRolesSection(AppState& st, float sc) {
             }
 
             ImGui::TableNextColumn();
-            // Resolve current selection index.
-            int sel = 0;  // Auto
-            if (!a.isAuto) {
+            // Selection index: row 0 = Default, row 1 = Auto, the rest concrete models.
+            // sel < 0 means a pinned model that is not in the current pick list.
+            int sel = (a.mode == RoleMode::Default) ? 0 : 1;
+            if (a.mode == RoleMode::Fixed) {
+                sel = -1;
                 const int wantProv = roleProviderFromWire(a.provider);
-                for (int pi = 1; pi < (int)picks.size(); ++pi) {
+                for (int pi = 0; pi < (int)picks.size(); ++pi) {
+                    if (picks[pi].mode != RoleMode::Fixed) continue;
                     if (picks[pi].model == a.model &&
                         (wantProv < 0 || picks[pi].provider == wantProv ||
                          roleProviderWire(picks[pi].provider, picks[pi].model) == a.provider)) {
@@ -2489,22 +2521,20 @@ static void drawModelRolesSection(AppState& st, float sc) {
                         break;
                     }
                 }
-                // Unknown model: inject a synthetic entry so the combo still shows it.
-                if (sel == 0 && !a.model.empty()) {
-                    // Keep Auto selected visually but show the current value dimly.
-                    // Better: force index 0 label via preview — fall through to custom.
-                }
             }
 
-            // Preview label.
+            // Preview label. An unmatched pin still shows its raw wire value.
             std::string preview;
-            if (a.isAuto) {
-                preview = "Auto";
-            } else if (sel > 0) {
+            if (a.mode == RoleMode::Default) {
+                preview = kRoleModeDefaultLabel;
+            } else if (a.mode == RoleMode::Auto) {
+                preview = kRoleModeAutoLabel;
+            } else if (sel >= 0) {
                 preview = picks[sel].label;
             } else {
                 preview = a.provider + " \xc2\xb7 " + a.model;
-                if (preview == " \xc2\xb7 ") preview = a.model.empty() ? "Auto" : a.model;
+                if (preview == " \xc2\xb7 ") preview = a.model.empty() ? kRoleModeAutoLabel
+                                                                       : a.model;
             }
 
             const bool ro = s_roles.rolesRpcMissing || s_roles.rolesSaveInFlight;
@@ -2530,24 +2560,29 @@ static void drawModelRolesSection(AppState& st, float sc) {
                         const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
                         if (hay.find(fq) == std::string::npos) continue;
                     }
-                    const bool selected = (pi == sel) || (pi == 0 && a.isAuto);
+                    const bool selected = (pi == sel);
                     if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
                         RoleAssign next = a;  // preserve thinking
-                        if (picks[pi].isAuto) {
-                            next.isAuto = true;
-                            next.provider.clear();
-                            next.model.clear();
-                        } else {
-                            next.isAuto = false;
+                        next.mode = picks[pi].mode;
+                        if (picks[pi].mode == RoleMode::Fixed) {
                             next.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
                             next.model = picks[pi].model;
+                        } else {
+                            next.provider.clear();
+                            next.model.clear();
                         }
-                        // Hard-enforce redaction local-only client-side too.
-                        if (isRedaction && !next.isAuto &&
-                            !providerIsLoopback(picks[pi].provider)) {
+                        // Hard-enforce redaction local-only client-side too. Default is
+                        // refused as well: the chat model is usually a cloud provider.
+                        if (isRedaction && next.mode == RoleMode::Default) {
+                            s_roles.lastError =
+                                "Redaction role cannot follow the chat model \xe2\x80\x94 "
+                                "pick Auto or a loopback model.";
+                        } else if (isRedaction && next.mode == RoleMode::Fixed &&
+                                   !providerIsLoopback(picks[pi].provider)) {
                             s_roles.lastError =
                                 "Redaction role refuses non-loopback providers.";
                         } else {
+                            s_roles.lastError.clear();
                             setRoleAssign(st, key, next);
                         }
                     }
@@ -2632,13 +2667,15 @@ bool        drawHarnessSessionKnobs(AppState& st, float sc);
 static void drawMemoryLearningSection(AppState& st, float sc);
 
 // ---- Eng. Firm model assignments (config.json eng_firm.models) ----------------
-// Top-level roles + 8 disciplines. Auto = omit entry (ambient chat model). Merge-overlay
-// load/save never clobbers unrelated keys.
+// Top-level roles + 8 disciplines. Two states only — there is no ranked-auto engine here:
+// Default writes {"mode":"default"} (empty provider ⇒ the resolver falls through to the
+// ambient chat model), otherwise a pinned provider+model. Merge-overlay load/save never
+// clobbers unrelated keys.
 struct EngFirmAssign {
-    bool isAuto = true;
+    bool isDefault = true;
     std::string provider;
     std::string model;
-    std::string thinking = "medium";  // low|medium|high (auto omits thinking key)
+    std::string thinking = "medium";  // low|medium|high (default state omits thinking key)
 };
 struct EngFirmModelsUi {
     std::map<std::string, EngFirmAssign> top;   // mission_planner|advisor|lead|subcontractor
@@ -2669,7 +2706,10 @@ static EngFirmAssign parseEngFirmAssign(const nlohmann::json& j) {
     std::string th = j.value("thinking", std::string());
     if (th != "low" && th != "medium" && th != "high") th = "medium";
     a.thinking = th.empty() ? "medium" : th;
-    a.isAuto = a.provider.empty() && a.model.empty();
+    // Explicit {"mode":"default"} and the legacy empty provider+model form both mean
+    // "follow the chat model".
+    a.isDefault = j.value("mode", std::string()) == "default" ||
+                  (a.provider.empty() && a.model.empty());
     return a;
 }
 
@@ -2725,8 +2765,12 @@ static void saveEngFirmModelsUi() {
             models = j["eng_firm"]["models"];
 
         auto writeEntry = [](nlohmann::json& parent, const char* key, const EngFirmAssign& a) {
-            if (a.isAuto || a.model.empty()) {
-                parent.erase(key);
+            if (a.isDefault || a.model.empty()) {
+                // Explicit default state — the row stays in config.json instead of
+                // silently vanishing. Empty provider ⇒ ambient chat model.
+                nlohmann::json e = nlohmann::json::object();
+                e["mode"] = "default";
+                parent[key] = std::move(e);
                 return;
             }
             nlohmann::json e = nlohmann::json::object();
@@ -2776,10 +2820,12 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
     ImGui::TextUnformatted(label);
 
     ImGui::TableNextColumn();
-    int sel = 0;
-    if (!a.isAuto) {
+    int sel = 0;  // row 0 = Default (chat model); the rest are concrete models
+    if (!a.isDefault) {
+        sel = -1;
         const int wantProv = roleProviderFromWire(a.provider);
-        for (int pi = 1; pi < (int)picks.size(); ++pi) {
+        for (int pi = 0; pi < (int)picks.size(); ++pi) {
+            if (picks[pi].mode != RoleMode::Fixed) continue;
             if (picks[pi].model == a.model &&
                 (wantProv < 0 || picks[pi].provider == wantProv ||
                  roleProviderWire(picks[pi].provider, picks[pi].model) == a.provider)) {
@@ -2789,13 +2835,14 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
         }
     }
     std::string preview;
-    if (a.isAuto) {
-        preview = "Auto";
-    } else if (sel > 0) {
+    if (a.isDefault) {
+        preview = kRoleModeDefaultLabel;
+    } else if (sel >= 0) {
         preview = picks[sel].label;
     } else {
         preview = a.provider + " \xc2\xb7 " + a.model;
-        if (preview == " \xc2\xb7 ") preview = a.model.empty() ? "Auto" : a.model;
+        if (preview == " \xc2\xb7 ")
+            preview = a.model.empty() ? kRoleModeDefaultLabel : a.model;
     }
     ImGui::SetNextItemWidth(-1);
     if (ImGui::BeginCombo("##ef_pick", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
@@ -2817,18 +2864,18 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
                 const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
                 if (hay.find(fq) == std::string::npos) continue;
             }
-            const bool selected = (pi == sel) || (pi == 0 && a.isAuto);
+            const bool selected = (pi == sel);
             if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
-                if (picks[pi].isAuto) {
-                    a.isAuto = true;
-                    a.provider.clear();
-                    a.model.clear();
-                } else {
-                    a.isAuto = false;
+                if (picks[pi].mode == RoleMode::Fixed) {
+                    a.isDefault = false;
                     a.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
                     a.model = picks[pi].model;
                     if (a.thinking != "low" && a.thinking != "medium" && a.thinking != "high")
                         a.thinking = "medium";
+                } else {
+                    a.isDefault = true;
+                    a.provider.clear();
+                    a.model.clear();
                 }
                 saveEngFirmModelsUi();
             }
@@ -2844,7 +2891,7 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
     for (int ti = 0; ti < 3; ++ti) {
         if (a.thinking == kThinkValues[ti]) { thinkSel = ti; break; }
     }
-    if (a.isAuto) ImGui::BeginDisabled();
+    if (a.isDefault) ImGui::BeginDisabled();
     ImGui::SetNextItemWidth(-1);
     if (ImGui::BeginCombo("##ef_think", kThinkLabels[thinkSel])) {
         for (int ti = 0; ti < 3; ++ti) {
@@ -2857,7 +2904,7 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
         }
         ImGui::EndCombo();
     }
-    if (a.isAuto) ImGui::EndDisabled();
+    if (a.isDefault) ImGui::EndDisabled();
 
     ImGui::PopID();
 }
@@ -2865,10 +2912,11 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
 static void drawEngFirmModelAssignments(AppState& st, float sc) {
     if (!s_efModels.loaded) loadEngFirmModelsUi();
 
-    dimText("Empty rows inherit the active chat model. Eng. Firm runs resolve: discipline -> "
-            "lead/subcontractor -> chat model.");
+    dimText("Default (chat model) rows follow whatever model the chat composer is set to "
+            "\xe2\x80\x94 there is no ranked auto-pick here. Eng. Firm runs resolve: "
+            "discipline -> lead/subcontractor -> chat model.");
 
-    const auto picks = buildRolePickList(st, /*localOnly=*/false);
+    const auto picks = buildRolePickList(st, /*localOnly=*/false, /*includeAuto=*/false);
 
     if (ImGui::BeginTable("##ef_models", 3,
                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |

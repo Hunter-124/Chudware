@@ -1008,12 +1008,18 @@ class MissionDispatch:
                         oai.setdefault("api_key", "ollama")
                         cfg_pick["openai"] = oai
                     try:
-                        prov_name = assignment.provider
-                        if prov_name == "ollama":
-                            prov_name = "openai"
-                            cfg_pick.setdefault("api_key", "ollama")
-                        provider = agent_config.get_provider(
-                            name=prov_name, cfg=cfg_pick)
+                        if assignment.is_session_default:
+                            # Role follows the chat composer: keep the mission's own
+                            # provider. There is nothing to build — provider/model are
+                            # empty by construction for this mode.
+                            provider = self.provider
+                        else:
+                            prov_name = assignment.provider
+                            if prov_name == "ollama":
+                                prov_name = "openai"
+                                cfg_pick.setdefault("api_key", "ollama")
+                            provider = agent_config.get_provider(
+                                name=prov_name, cfg=cfg_pick)
                     except Exception:  # noqa: BLE001 — keep mission provider
                         provider = self.provider
                     if isinstance(node, dict):

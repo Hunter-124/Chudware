@@ -1269,7 +1269,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         const bool  logScrolled = ImGui::GetScrollY() > 0.5f;
         const ImVec2 logP0 = ImGui::GetWindowPos();
         const float  logVisW = ImGui::GetWindowSize().x;
-        ui::drawWindowPillScrollbarV(chatSurf());
+        // Chat scrollbar: 6px, sitting ON the right edge rather than inset in its drag strip.
+        ui::drawWindowPillScrollbarV(chatSurf(), ui::kChatScrollbar);
         ImGui::EndChild();
 
         // Top fade mask over the conversation scroll viewport.

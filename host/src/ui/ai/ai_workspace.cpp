@@ -1804,7 +1804,7 @@ void drawAiWorkspace(AppState& st) {
         adaptivePanel(panelId("ai_ws_conv_glass"), cRect, GlassGroup::Global);
     glassPanel(ImGui::GetWindowDrawList(), cRect, GlassLevel::Thin, rowRoundDp(), convSurf);
     drawChatCenter(st, busy, canRun);   // log + composer (same state/send path as the dock)
-    drawWindowPillScrollbarV(convSurf);
+    drawWindowPillScrollbarV(convSurf, ui::kChatScrollbar);  // same 6px right-edge bar as the dock
     ImGui::EndChild();
 
     ImGui::SameLine(0.0f, gap);

@@ -191,6 +191,18 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
       4. Ambient ``config.get_provider()`` default.
     """
     node_inputs = context_pack.get("node_inputs") or {}
+
+    def _ambient():
+        """The provider this node gets when no role-specific pick applies:
+        caller-injected → node tier → ambient config default."""
+        if provider is not None:
+            return provider
+        tier = node_inputs.get("tier") or context_pack.get("tier")
+        if tier:
+            from services.agent.tiers import provider_for_tier  # noqa: PLC0415
+            return provider_for_tier(tier)
+        from services.agent import config  # noqa: PLC0415
+        return config.get_provider()
     # WS2/WS4 + mega-5: difficulty-aware pick first (even without ai_roles).
     try:
         from services.agent.role_models import (  # noqa: PLC0415
@@ -385,6 +397,11 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
                         pass
             except Exception:  # noqa: BLE001 — never block on telemetry
                 pass
+            if assignment.is_session_default:
+                # Role follows the chat composer: provider/model are empty by
+                # construction, so there is nothing to build. Use whatever the
+                # mission was launched with.
+                return _ambient()
             prov_name = assignment.provider
             if prov_name == "ollama":
                 prov_name = "openai"
@@ -453,14 +470,7 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
     except Exception:  # noqa: BLE001 — never block node on role_models
         pass
 
-    if provider is not None:
-        return provider
-    tier = node_inputs.get("tier") or context_pack.get("tier")
-    if tier:
-        from services.agent.tiers import provider_for_tier  # noqa: PLC0415
-        return provider_for_tier(tier)
-    from services.agent import config  # noqa: PLC0415 — real import, no wrong name
-    return config.get_provider()
+    return _ambient()
 
 
 def _default_agent_fn(request: str, context_pack: dict[str, Any], *,

@@ -1543,7 +1543,6 @@ static void drawOmpProviderManager(AppState& st) {
     pollOmpProviderList(st, false);
     pollOmpOAuth(st);
     ui::refreshBridgeModelCatalog(st, false);
-    ui::providerLogosTick(st);  // load/fetch real provider brand icons (gated; badges otherwise)
 
     if (!s_omp.available) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));

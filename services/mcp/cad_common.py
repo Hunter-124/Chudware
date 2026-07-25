@@ -139,26 +139,43 @@ def _doc(doc_id: Optional[str]) -> str:
     # subagents work in parallel, so each addresses its OWN part and can never touch another's.
     if doc_id:
         return _resolve_alias(doc_id)
-    d = _CUR["doc_id"]
-    if not d:
-        raise ValueError("No current part. Call new_part(...) first (or pass doc_id=).")
-    # Concurrency guard: `_CUR` is a single PROCESS-WIDE "current part" shared by every tool call.
-    # With one document open it's an unambiguous convenience. But when MORE than one part is open —
-    # exactly the multi-subagent case — an omitted doc_id is ambiguous: whichever agent last created
-    # or opened a part moved `_CUR`, so relying on the default silently edits the WRONG part (and
-    # republishes it to the viewport twice). Turn that silent clobber into a loud, fixable error so
-    # parallel agents are forced to be explicit. Single-part workflows are unaffected.
+    # `_CUR` is a single PROCESS-WIDE "current part", and it is only ever set by a doc THIS
+    # process created or opened. A part the human already had open in the GUI — or one another
+    # client made — never touches it, so trusting `_CUR` alone reports "no current part" while
+    # the part sits right there in the viewport. Always ask the engine what is actually open and
+    # reconcile against it.
     try:
         docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                 if isinstance(e, dict) and e.get("doc_id")]
     except Exception:  # noqa: BLE001 — doc_list unavailable: fall back to legacy current-doc behavior
         docs = []
-    if len(docs) > 1:
+
+    def _ambiguous() -> ValueError:
         listing = ", ".join(f'{e.get("doc_id")}="{e.get("name", "")}"' for e in docs)
-        raise ValueError(
+        return ValueError(
             f"Ambiguous: {len(docs)} parts are open, so there is no single current part. "
             "Pass doc_id= explicitly (required whenever multiple parts/agents are active). "
             f"Open parts: {listing}")
+
+    d = _CUR["doc_id"]
+    if not d:
+        # Nothing claimed by this process. Adopt the open part when there is exactly one —
+        # unambiguous, and it makes every read/measure/edit tool act on the part the user is
+        # actually looking at instead of demanding a redundant new_part().
+        if len(docs) == 1:
+            d = docs[0]["doc_id"]
+            _CUR["doc_id"] = d
+            return _resolve_alias(d)
+        if not docs:
+            raise ValueError("No current part. Call new_part(...) first (or pass doc_id=).")
+        raise _ambiguous()
+    # Concurrency guard: with one document open `_CUR` is an unambiguous convenience. But when
+    # MORE than one part is open — exactly the multi-subagent case — an omitted doc_id is
+    # ambiguous: whichever agent last created or opened a part moved `_CUR`, so relying on the
+    # default silently edits the WRONG part (and republishes it to the viewport twice). Turn that
+    # silent clobber into a loud, fixable error so parallel agents are forced to be explicit.
+    if len(docs) > 1:
+        raise _ambiguous()
     return _resolve_alias(d)
 
 

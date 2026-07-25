@@ -2046,12 +2046,15 @@ def run_linear_role_turn(
     """Run ONE bounded ``agent_turn.run_turn`` against *role*'s card.
 
     The linear-structure executor for ``workflow_router.RouterResult.structure
-    == "linear"``: no manifest, no DAG compilation, no delegation-tree /
-    approval-chain machinery (this IS the top-level turn, not a spawned
-    sub-agent) — just the role's card + the same file-handling floor every
-    DAG-node/sub-agent gets (``copilot_mode_tools.SUBAGENT_DEFAULT_TOOLS``),
-    streamed through *on_event* the same way a normal run is so the GUI chat
-    renders it.
+    == "linear"``: no manifest, no DAG compilation — just the role's card + the
+    same file-handling floor every DAG-node/sub-agent gets
+    (``copilot_mode_tools.SUBAGENT_DEFAULT_TOOLS``), streamed through *on_event*
+    the same way a normal run is so the GUI chat renders it.
+
+    A delegation tree IS bound (see below): the role cards used on this path
+    advertise ``delegate`` in their allowlist and their prompts tell the model to
+    use it, so leaving the tree unbound made an advertised tool fail every single
+    time with "no delegation tree bound to this mission".
     """
     from services.agent import agent_turn as _at
     from services.agent.roles import load_role
@@ -2066,9 +2069,23 @@ def run_linear_role_turn(
     if mission_dispatch is None and tool_dispatch is None:
         try:
             import uuid as _uuid  # noqa: PLC0415
+            _rid = run_id or f"linear-{_uuid.uuid4().hex[:8]}"
+            # Bind a real delegation tree so `delegate` — which every role card on
+            # this path advertises — actually spawns and RUNS a sub-agent instead of
+            # returning a refusal. The provider is already bound below, which is the
+            # other half `_run_subagent` needs. The tree self-limits via its budget
+            # meter and agent.max_subagent_depth cap, so this stays bounded.
+            tree = None
+            try:
+                from services.agent.delegation import (  # noqa: PLC0415
+                    DelegationTree as _DelegationTree,
+                )
+                tree = _DelegationTree(run_id=_rid, ledger=ledger, on_event=on_event)
+            except Exception:  # noqa: BLE001 — degrade to the old no-delegation turn
+                tree = None
             mission_dispatch = MissionDispatch(
-                run_id=run_id or f"linear-{_uuid.uuid4().hex[:8]}",
-                ledger=ledger, provider=provider, on_event=on_event)
+                run_id=_rid, ledger=ledger, provider=provider, on_event=on_event,
+                delegation_tree=tree)
         except Exception:  # noqa: BLE001 — dispatcher is best-effort
             mission_dispatch = None
 

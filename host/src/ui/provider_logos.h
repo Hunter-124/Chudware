@@ -28,7 +28,9 @@ void drawProviderLogo(ImDrawList* dl, ImVec2 pos, float side, const std::string&
 
 // Per-frame driver (GL thread): for provider ids drawn since the previous tick, load a cached
 // favicon from appdata or kick a ONE-SHOT bridge fetch, then upload it as a GL texture.
-// Throttled to a few fetches per frame; no-op while disabled. Call once from the Providers UI.
+// Throttled to a few fetches per frame; no-op while disabled. Call once per frame from the
+// main loop AFTER the UI body — never from a conditionally-drawn panel, or every other call
+// site is starved of textures until the user happens to open that panel.
 void providerLogosTick(AppState& st);
 
 // Runtime favicon toggle (config.json agent.provider_logos, default true). When off, no network

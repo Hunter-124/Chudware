@@ -415,6 +415,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             rib, split, thread, text, import, script, plane, axis, point, csys, sketch3d, …
           WRONG: {"op":"box",…} / {"op":"sketch",…} / {"op":"extrude",…} / {"op":"cylinder",…}
           RIGHT: {"op":"add_feature","feature":{"type":"box"|"cylinder"|"sketch"|…, …}}
+          A leading {"op":"new_part","name":…} is also accepted as a convenience: it mints the
+            document and the rest of the batch builds into it, so you can create-and-build in
+            one call. Everywhere else new_part is the standalone tool, not an op.
           Live list: engine doc_list_ops (sourced from core/doc/op_registry — single source).
           Call cad_guide() for worked examples and full param shapes.
 
@@ -441,7 +444,29 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         Pass background=True to hand off immediately for an op you already know is heavy.
         """
         try:
+            ops = list(ops or [])
+            # Model-robustness: `new_part` is a top-level TOOL, not a batch op — but models
+            # reliably open a build batch with {"op":"new_part","name":…} because that reads as
+            # the natural first step. Rejecting the whole batch over it (and over the bare
+            # "No current part" that follows) burns a turn for nothing, so honour the intent:
+            # mint the document here and apply the remaining ops to it.
+            created: Optional[str] = None
+            while (ops and isinstance(ops[0], dict)
+                   and str(ops[0].get("op", "")).strip().lower() == "new_part"):
+                head = ops.pop(0)
+                if doc_id or created:
+                    continue  # a target doc already exists; the extra create is a no-op
+                r = cb.call("doc_new", {"kind": "part",
+                                        "name": head.get("name") or head.get("part") or "part"})
+                created = r.get("doc_id")
+                _CUR["doc_id"] = created
+                _LAST_VOLUME[created] = 0.0
+            if created and not doc_id:
+                doc_id = created
             d = _doc(doc_id)
+            if created and not ops:
+                return _dumps({"ok": True, "doc_id": d, "created_doc": created,
+                               "note": "created the part; send its build ops in the next call"})
             # Model-robustness: accept the natural/flat sketch shape LLMs emit
             # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
             # to the engine's canonical schema before validation.
@@ -631,12 +656,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             if background:
                 jid = _start_job("add_features", _apply)
                 return _dumps({"ok": True, "doc_id": d, "job_id": jid, "status": "running",
+                               "created_doc": created,
                                "note": f"applying {len(ops)} op(s) in the background — "
                                        f"poll get_job('{jid}')."})
             # Run on a worker thread with auto-handoff: a fast batch returns inline exactly as
             # before; a heavy one that overruns the budget keeps running and returns a job_id so
             # the transport call returns in time and the session survives.
             raw = _solve_sync_or_handoff("add_features", _apply)
+            if created and isinstance(raw, dict):
+                raw["created_doc"] = created
             # mega-8 F7: enrich thin unknown-op errors with closest + cad_guide
             # (C++ path sometimes returns only "unknown op 'cylinder'").
             try:

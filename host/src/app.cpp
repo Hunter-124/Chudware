@@ -163,6 +163,7 @@ inline void wasmBootDom(const char *msg) {
 #include "ui/plm/graph_tab.h" // plmGraphLoaded — PLM graph shot sync
 #include "ui/plm/plm_quickbar.h" // ui::plmAutoRecordSave — record agent self-saves in PLM
 #include "ui/plm/plm_workspace.h"
+#include "ui/provider_logos.h" // per-frame provider brand-icon fetch/upload pump
 
 #include <filesystem> // Wave N: ecad export output dir + W14: flat-pattern DXF export
 
@@ -6511,6 +6512,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
     // ---------- modals ----------
     ui::drawSettingsModal(st, busy);
+
+    // Provider brand icons: drain the requests queued by every drawProviderLogo() call this
+    // frame (composer model chip, Settings rows, …). This MUST live in the always-drawn frame
+    // body — hosting it inside the Settings > Providers tab meant the pump only ran while that
+    // tab was open, so the copilot's chip showed the fallback badge until the user went looking
+    // at provider settings. GL-thread only, which the main loop already guarantees.
+    ui::providerLogosTick(st);
 
     // ---------- in-app profiler window + unified command/settings search
     // ----------

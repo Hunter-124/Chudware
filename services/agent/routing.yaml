@@ -72,6 +72,10 @@ assignments:
   # 2D/3D split roles.
   sketch2d:               [cheap_local, strong]
   model3d:                [cheap_local, strong]
+  # Universal entry surface: general_agent handles EVERY online top-level run and
+  # decides inline-vs-delegate-vs-mission, so it must never fall through to the
+  # `default` row (cheap_local first) the way an unlisted role does.
+  general_agent:          [strongest, strong]
   # Project-admin linear surface (file/PLM organizing — needs solid tool use).
   project_organizer:      [strong, cheap_local]
   default:                [cheap_local, strong]

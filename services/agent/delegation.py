@@ -428,8 +428,12 @@ class DelegationTree:
             raise DelegationError("brief must be non-empty")
         if budget_tokens <= 0:
             raise DelegationError(f"budget_tokens must be positive, got {budget_tokens}")
+        # The ≤500 cap is the RECORD shape (contract §12). Hard-rejecting the
+        # whole spawn over it burned a turn and lost the spec; truncate the
+        # stored row instead — the same soft-truncate precedent MissionDispatch
+        # .delegate already applies before it calls us (mega-5).
         if len(brief) > 500:
-            raise DelegationError(f"brief must be ≤500 chars (contract §12), got {len(brief)}")
+            brief = brief[:499].rstrip() + "…"
 
         # Kill-switch guard (T-DP9): reject all spawns after kill().
         if self._meter.killed:
@@ -995,8 +999,12 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
                 "required": ["role", "brief", "budget_tokens"],
                 "properties": {
                     "role": {"type": "string", "description": "Role id to spawn"},
-                    "brief": {"type": "string", "maxLength": 500,
-                              "description": "Self-contained brief for the sub-agent (≤500 chars)"},
+                    "brief": {"type": "string", "maxLength": 20000,
+                              "description": (
+                                  "Self-contained assignment for the sub-agent. It CANNOT see "
+                                  "your conversation, so include every requirement, dimension "
+                                  "and acceptance criterion it needs. Delivered to the child in "
+                                  "full; the delegation record keeps a 500-char summary.")},
                     "budget_tokens": {"type": "integer",
                                       "description": "Token budget for the sub-agent"},
                     "kind": {"type": "string", "enum": ["worker", "ponder"],

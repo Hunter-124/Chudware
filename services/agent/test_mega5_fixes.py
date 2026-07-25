@@ -634,6 +634,81 @@ def test_delegate_soft_truncates_overlong_brief(tmp_path, monkeypatch):
         assert out["tokens_used"] > 0
 
 
+def test_delegate_executes_child_on_full_brief_not_the_record_summary(tmp_path):
+    """The ≤500 cap is the RECORD shape (contract §12 node row), not the child's
+    assignment. Executing the truncated text silently deleted the tail of every
+    real spec — a live 1464-char part brief lost its slot/handle/material lines
+    and the child built the wrong part."""
+    from services.agent.ledger import Ledger
+    from services.agent.mission_dispatch import MissionDispatch
+    import services.agent.delegation as dlg
+    import services.agent.agent_turn as at
+
+    ledger = Ledger("mega5_fullbrief", path=tmp_path / "ledger.json")
+
+    class _Tree:
+        root_id = "root"
+        _nodes = {"root": type("N", (), {"depth": 0, "role": "orchestrator"})()}
+
+        def start(self, node_id):
+            return None
+
+        def finish(self, node_id, **kw):
+            return None
+
+        def fail(self, node_id, reason=""):
+            return None
+
+    class _Provider:
+        name = "mock"
+        model = "mock"
+
+        def complete(self, system, messages, max_tokens=8000):
+            return '```json\n{"status":"done","summary":"ok"}\n```'
+
+    md = MissionDispatch(run_id="mega5_fullbrief", ledger=ledger,
+                         delegation_tree=_Tree(), provider=_Provider(),
+                         task_class="simple_part")
+
+    head = "Build a mud bucket. "
+    tail = " HANDLE: bent round bar welded near the top rim."
+    long_brief = head + ("wall 4.76mm constant. " * 65) + tail
+    assert len(long_brief) > 1400
+
+    seen = {}
+
+    def _spy_delegate(role, brief, budget_tokens, **kw):
+        seen["record_brief"] = brief
+        return {"id": "dg_fb", "status": "approved", "role": role, "depth": 1,
+                "kind": "worker", "parent": "root",
+                "budget": {"tokens_granted": int(budget_tokens)}}
+
+    class _Turn:
+        success = True
+        stop_reason = "confirmed"
+        result = {"handoff": {"status": "done"}, "tool_calls": 1,
+                  "calls": [{"tool": "new_part"}]}
+
+    def _spy_run_turn(brief, provider, **kw):
+        seen["exec_brief"] = brief
+        return _Turn()
+
+    real_delegate, real_run = dlg.delegate, at.run_turn
+    dlg.delegate, at.run_turn = _spy_delegate, _spy_run_turn
+    try:
+        # budget_tokens as a STRING: models send "12000" and the bare
+        # `budget_tokens <= 0` comparison used to raise TypeError.
+        md.delegate(role="model3d", brief=long_brief, budget_tokens="12000")
+    finally:
+        dlg.delegate, at.run_turn = real_delegate, real_run
+
+    # Record row stays contract-compliant...
+    assert len(seen["record_brief"]) <= 500
+    # ...but the child runs on the WHOLE spec, tail included.
+    assert seen["exec_brief"] == long_brief
+    assert tail in seen["exec_brief"]
+
+
 def test_delegate_role_alias_part_fixer_to_feature_modeler():
     from services.agent.mission_dispatch import MissionDispatch
 

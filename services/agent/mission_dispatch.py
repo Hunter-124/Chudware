@@ -552,7 +552,8 @@ class MissionDispatch:
         "mech_fixer": "fixer",
         "feature_fixer": "fixer",
     }
-    _BRIEF_MAX = 500  # contract §12
+    _BRIEF_MAX = 500  # contract §12 — the RECORDED node-row brief, not the child's task
+    _BRIEF_EXEC_MAX = 20000  # sanity bound on what the child actually executes
 
 
     def adopt_role(self, role: str = "", **kwargs):
@@ -587,14 +588,24 @@ class MissionDispatch:
         checked before the tree spawn; deeper spawns require decreasing
         difficulty for auto model assignment.
 
-        mega-5: overlong briefs are soft-truncated to ≤500 chars (contract §12)
-        with an explicit note instead of burning a turn on a hard reject;
-        invented role names (part_fixer, …) map onto loadable cards so the
-        child is not a bare sub-agent without new_part/add_features.
+        mega-5: overlong briefs are soft-truncated for the RECORDED node row
+        (≤500 chars, contract §12) instead of burning a turn on a hard reject —
+        but the child EXECUTES on the full brief, because the cap describes the
+        audit row, not the assignment. Invented role names (part_fixer, …) map
+        onto loadable cards so the child is not a bare sub-agent without
+        new_part/add_features.
         """
         role_raw = str(role or "").strip()
         role_key = role_raw.lower()
         role_resolved = self._ROLE_ALIASES.get(role_key, role_raw)
+        # Models send budget_tokens as "12000" often enough that the bare
+        # comparison in DelegationTree.request_delegation blew up with
+        # "'<=' not supported between instances of 'str' and 'int'" — an
+        # opaque crash for a trivially coercible arg (seen in gym run logs).
+        try:
+            budget_tokens = int(float(str(budget_tokens).strip() or 0))
+        except (TypeError, ValueError):
+            budget_tokens = 0
         brief_raw = str(brief or "")
         brief_truncated = False
         if len(brief_raw) > self._BRIEF_MAX:
@@ -602,6 +613,13 @@ class MissionDispatch:
             brief_truncated = True
         else:
             brief = brief_raw
+        # The ≤500 cap is the RECORD shape (contract §12 node row; the
+        # agent.spawn event clips to 120) — it was never meant to shrink the
+        # child's actual assignment. Executing the truncated text silently
+        # deleted the tail of every real spec: a 1464-char part brief lost its
+        # slot, handle and material lines, and the child confidently built the
+        # wrong part and was then judged for not delivering them.
+        exec_brief = brief_raw[: self._BRIEF_EXEC_MAX]
 
         if self.delegation_tree is None:
             if self.ledger is not None:
@@ -686,10 +704,12 @@ class MissionDispatch:
             node["role_requested"] = role_raw
             node["role_resolved"] = role_resolved
         if brief_truncated:
+            # Record-only truncation; the child still runs on the full brief.
             node["brief_truncated"] = True
             node["brief_len_original"] = len(brief_raw)
             node["brief"] = brief
-        node.update(self._run_subagent(node, brief))
+            node["brief_executed_in_full"] = len(exec_brief) == len(brief_raw)
+        node.update(self._run_subagent(node, exec_brief))
         return node
 
     def _run_subagent(self, node: dict, brief: str) -> dict:

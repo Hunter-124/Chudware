@@ -1042,6 +1042,19 @@ class MissionDispatch:
                             cfg_pick["reasoning_effort"] = "low"
                         elif rank <= 3:
                             cfg_pick["reasoning_effort"] = "medium"
+                    # Ceiling: a sub-agent NEVER runs above "high". cfg_pick is
+                    # a copy of the user's global config, so a Settings-level
+                    # max/xhigh rode straight into the child whenever the
+                    # resolver above returned None or raised past the rank arms.
+                    try:
+                        from services.agent.role_models import (  # noqa: PLC0415
+                            clamp_subagent_effort,
+                        )
+                        _raw_eff = cfg_pick.get("reasoning_effort")
+                        if _raw_eff:
+                            cfg_pick["reasoning_effort"] = clamp_subagent_effort(_raw_eff)
+                    except Exception:  # noqa: BLE001 — ceiling is best-effort
+                        pass
                     if assignment.provider == "ollama":
                         ocfg = dict(cfg_pick.get("ollama") or {})
                         ocfg.setdefault(

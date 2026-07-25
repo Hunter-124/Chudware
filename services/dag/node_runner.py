@@ -325,6 +325,18 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
                 retry_rem == 1 or context_pack.get("retry_cheap")
             ):
                 cfg_pick["reasoning_effort"] = "low"
+            # Ceiling: a DAG node/sub-agent NEVER runs above "high". cfg_pick
+            # inherits the user's global config, so a Settings-level max/xhigh
+            # leaked in whenever the resolver returned None.
+            try:
+                from services.agent.role_models import (  # noqa: PLC0415
+                    clamp_subagent_effort,
+                )
+                _raw_eff = cfg_pick.get("reasoning_effort")
+                if _raw_eff:
+                    cfg_pick["reasoning_effort"] = clamp_subagent_effort(_raw_eff)
+            except Exception:  # noqa: BLE001 — ceiling is best-effort
+                pass
             if assignment.provider == "ollama":
                 # OpenAI-compatible local Ollama endpoint.
                 ocfg = dict(cfg_pick.get("ollama") or {})

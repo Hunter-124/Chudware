@@ -83,6 +83,35 @@ DEFAULT_THINKING = "auto"
 # Concrete levels that pin provider reasoning_effort (excludes auto).
 CONCRETE_THINKING = frozenset({"low", "medium", "high"})
 
+# Hard ceiling on sub-agent reasoning effort (Hunter directive 2026-07-25):
+# NO subagent may ever dispatch above "high". Providers accept richer ladders
+# (anthropic_provider._EFFORTS has max/xhigh; gemini/moonshot expose "max"),
+# and a subagent inherits the user's global config via `dict(cfg)` — so a
+# Settings-level "max" silently rode into every spawned child whenever
+# resolve_role_thinking returned None. Clamp at the dispatch boundary.
+SUBAGENT_MAX_THINKING = "high"
+_ABOVE_HIGH_THINKING = frozenset({
+    "max", "maximum", "xhigh", "x-high", "extra_high", "extra-high",
+    "ultra", "highest",
+})
+
+
+def clamp_subagent_effort(level: Any) -> str | None:
+    """Clamp *level* to the sub-agent effort ceiling ("high").
+
+    Returns None for an unset/blank level so callers can leave the provider
+    default alone. Anything above high collapses to high; every other value
+    passes through untouched (unknown ladders are the provider's business).
+    """
+    if level is None:
+        return None
+    s = str(level).strip().lower()
+    if not s:
+        return None
+    if s == "med":
+        s = "medium"
+    return SUBAGENT_MAX_THINKING if s in _ABOVE_HIGH_THINKING else s
+
 _RANKINGS_YAML = Path(__file__).resolve().parent / "model_rankings.yaml"
 _DEFAULT_LEADERBOARD = (
     Path(__file__).resolve().parents[2] / "benchmarks" / "leaderboard" / "leaderboard.json"

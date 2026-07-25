@@ -117,3 +117,24 @@ Composer copilot toolbar icons for the chat context-reference feature:
 - `eng_firm` — General/copilot: classical portico (pediment + three columns + base)
   for the Copilot **Eng. Firm** org mode. Procedural line-art (accent pediment,
   stroke columns); no baked plate. @32/@20.
+
+## 2026-07-24 append (workspace rail)
+
+The workspace rail had glyphs for only 8 of its tabs; the app logged
+`[icons] unknown icon: 'ws_parts'` / `'ws_manufacture'` on every run and fell
+through to procedural `TbIcon` art. Both are line-art in the existing `ws_*`
+idiom (2 px stroke, accent highlight, no baked plate), appended LAST in
+`make_icons.py` `CONTRACT_NAMES` so every pre-existing cell keeps its UVs.
+
+- `ws_parts` — Parts Library tab: hex bolt + cog. The head is a flat-top hex
+  squashed ~15% vertically; a regular point-up hex downsamples to a circle at
+  20 px and the glyph then reads as a magnifier.
+- `ws_manufacture` — Manufacture tab: an end mill (accent, chamfered tip, two
+  flutes) cutting into a neutral stock slab. Flutes are drawn at full alpha
+  because the atlas paste premultiplies (RGB*a, a^2) and a translucent stroke
+  bakes down into one dark bar.
+
+Neither belongs in `atlas.json` `raster_only` — that list is for photographic
+tiles that must never derive an SDF. `icon_pipeline.py` had listed both names
+there years before either had a cell; `make_icons.py` now prunes carried-forward
+`raster_only` entries whose cell it draws itself.

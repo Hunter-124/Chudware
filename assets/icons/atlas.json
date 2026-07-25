@@ -1,7 +1,7 @@
 {
   "atlas_px": [
     56,
-    8058
+    8126
   ],
   "cell": {
     "app@32": {
@@ -2847,6 +2847,30 @@
       "y": 8031,
       "w": 20,
       "h": 20
+    },
+    "ws_parts@32": {
+      "x": 0,
+      "y": 8059,
+      "w": 32,
+      "h": 32
+    },
+    "ws_parts@20": {
+      "x": 34,
+      "y": 8065,
+      "w": 20,
+      "h": 20
+    },
+    "ws_manufacture@32": {
+      "x": 0,
+      "y": 8093,
+      "w": 32,
+      "h": 32
+    },
+    "ws_manufacture@20": {
+      "x": 34,
+      "y": 8099,
+      "w": 20,
+      "h": 20
     }
   },
   "raster_only": [
@@ -2909,8 +2933,6 @@
     "weld_member",
     "ws_drawing",
     "ws_electronics",
-    "ws_manufacture",
-    "ws_model",
-    "ws_parts"
+    "ws_model"
   ]
 }

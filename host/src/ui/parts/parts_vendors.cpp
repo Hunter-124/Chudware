@@ -107,6 +107,22 @@ void pollHealthStatus(AppState& st) {
 
 namespace {
 
+// palette role → ImVec4 for PushStyleColor. Every colour in this TU is a role lookup
+// (scripts/gui_lint.py --rule theme bans literals); this keeps the call sites one line
+// instead of the four-line ImVec4 construction that used to be copied per status word.
+inline ImVec4 roleV4(const float role[4], float a = 1.0f) {
+    return ImVec4(role[0], role[1], role[2], role[3] * a);
+}
+
+// One-line coloured status word. The vendor/provider/queue/health rows all print a bare
+// state word; painting each by role is what makes a failed row readable at a glance
+// instead of dissolving into the surrounding dim chrome.
+void textRole(const float role[4], const char* s) {
+    ImGui::PushStyleColor(ImGuiCol_Text, roleV4(role));
+    ImGui::TextUnformatted(s);
+    ImGui::PopStyleColor();
+}
+
 // borderRow paints its own label straight into the draw list with palette.text, so
 // ImGui::BeginDisabled's alpha never reaches it. Wash the row that was just submitted
 // with the pane colour so a gated action visibly reads as disabled, and hang the
@@ -150,28 +166,68 @@ void drawVendorStrip(AppState& st, float paneW) {
         ImGui::GetTime() - S().lastHealthPoll > 2.0)
         pollHealthStatus(st);
 
-    ImGui::Separator();
+    // Full-bleed 1px rule in the pane's border role. The stock ImGui separator that used
+    // to sit here read as a leftover divider from a different design language than the
+    // accent header rules every other section in this workspace is closed with.
+    {
+        ImDrawList* dl  = ImGui::GetWindowDrawList();
+        const ImVec2 rp = ImGui::GetCursorScreenPos();
+        const float  y  = rp.y + 0.5f;
+        dl->AddLine(ImVec2(rp.x, y), ImVec2(rp.x + ImGui::GetContentRegionAvail().x, y),
+                    Palette::toU32(palette.border), 1.0f);
+    }
+    ImGui::Dummy(ImVec2(0.0f, 6.0f * sc));
 
     // -- status dot row + "N/M signed in" + health summary ----------------------------
     // One inset scope: the dots, the count and the health line are plain content, so they
     // sit on the pane's TEXT line with the filter labels and the section header above them.
-    // The Separator and the borderRows below stay full-bleed on the pane gutter.
+    // The rule above and the borderRows below stay full-bleed on the pane gutter.
     {
         ContentInset inset;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 p = ImGui::GetCursorScreenPos();
-        const float d   = 7.0f * sc;           // dot diameter
-        const float gap = 4.0f * sc;
-        float x = p.x + d * 0.5f;
-        float cy = p.y + 5.0f * sc + d * 0.5f;
-        int i = 0;
-        for (auto& v : S().vendors) {
+        const float d    = 7.0f * sc;          // dot diameter
+        const float gap  = 4.0f * sc;
+        const float step = d + gap;
+        const float cy   = p.y + 5.0f * sc + d * 0.5f;
+
+        // How many dots FIT. One dot per vendor ran straight off the pane and wrapped into
+        // a second ragged row that collided with the count text; the run is now clipped to
+        // the space left beside the count and the remainder collapses into a dim "+N".
+        const int total = (int)S().vendors.size();
+        char countNum[32];
+        std::snprintf(countNum, sizeof(countNum), "%d/%d", signedIn, total);
+        const char* const countTail = " signed in";
+        const float countW = total > 0
+            ? ImGui::CalcTextSize(countNum).x + ImGui::CalcTextSize(countTail).x
+            : ImGui::CalcTextSize("no vendors").x;
+        const float budget = ImGui::GetContentRegionAvail().x - countW - 8.0f * sc;
+        auto fitCount = [&](float b) {
+            if (b < d) return 0;
+            const int n = (int)((b + gap) / step);
+            return n > total ? total : n;
+        };
+        int shown = fitCount(budget);
+        char overflow[16];
+        overflow[0] = '\0';
+        if (shown < total) {
+            // Second pass: the "+N" badge needs room of its own, or the badge itself
+            // becomes the thing that pushes the count off the pane edge.
+            std::snprintf(overflow, sizeof(overflow), "+%d", total - shown);
+            shown = fitCount(budget - ImGui::CalcTextSize(overflow).x - gap);
+            std::snprintf(overflow, sizeof(overflow), "+%d", total - shown);
+            if (shown >= total) overflow[0] = '\0';
+        }
+
+        float x = p.x;   // left edge of the next dot slot
+        for (int i = 0; i < shown; ++i) {
+            auto& v = S().vendors[(size_t)i];
             const float* role = v.loggedIn ? palette.statusOk : palette.textDisabled;
             if (!v.loginError.empty()) role = palette.statusErr;
-            dl->AddCircleFilled(ImVec2(x, cy), d * 0.5f, Palette::toU32(role));
+            dl->AddCircleFilled(ImVec2(x + d * 0.5f, cy), d * 0.5f, Palette::toU32(role));
             // Invisible hover target per dot for the tooltip.
-            ImGui::SetCursorScreenPos(ImVec2(x - d * 0.5f, cy - d * 0.5f));
-            ImGui::PushID(i++);
+            ImGui::SetCursorScreenPos(ImVec2(x, cy - d * 0.5f));
+            ImGui::PushID(i);
             ImGui::InvisibleButton("##dot", ImVec2(d, d));
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s — %s", v.label.c_str(),
@@ -179,13 +235,27 @@ void drawVendorStrip(AppState& st, float paneW) {
                                   : v.loggedIn          ? "signed in"
                                                         : "not signed in");
             ImGui::PopID();
-            x += d + gap;
+            x += step;
         }
-        ImGui::SetCursorScreenPos(ImVec2(x + 4.0f * sc, p.y + 3.0f * sc));
-        if (!S().vendors.empty())
-            ImGui::TextDisabled("%d/%d signed in", signedIn, (int)S().vendors.size());
-        else
+        float runEnd = shown > 0 ? x - gap : p.x;
+        if (overflow[0]) {
+            const ImVec2 ts = ImGui::CalcTextSize(overflow);
+            dl->AddText(ImVec2(runEnd + gap, cy - ts.y * 0.5f),
+                        Palette::toU32(palette.textDisabled), overflow);
+            runEnd += gap + ts.x;
+        }
+
+        ImGui::SetCursorScreenPos(ImVec2(runEnd + (runEnd > p.x ? 6.0f * sc : 0.0f),
+                                         p.y + 3.0f * sc));
+        if (total > 0) {
+            // The count is this line's real information: the numbers carry full text
+            // weight and only the word after them stays dim.
+            textRole(palette.text, countNum);
+            ImGui::SameLine(0.0f, 0.0f);
+            textRole(palette.textDim, countTail);
+        } else {
             ImGui::TextDisabled("no vendors");
+        }
 
         if (!S().healthSupported) {
             ImGui::TextDisabled("Health check unavailable (update the worker)");
@@ -198,11 +268,25 @@ void drawVendorStrip(AppState& st, float paneW) {
                 else if (h.expected) ++needLogin;
                 else ++failing;
             }
+            // Coloured tokens. The whole summary used to be one dim sentence, so a failing
+            // vendor read exactly like the inert labels around it.
+            auto token = [&](const float* numRole, int n, const char* word, bool lead) {
+                if (lead) {
+                    ImGui::SameLine(0.0f, 5.0f * sc);
+                    textRole(palette.textDisabled, "·");
+                }
+                char b[16];
+                std::snprintf(b, sizeof(b), "%d", n);
+                ImGui::SameLine(0.0f, 5.0f * sc);
+                textRole(numRole, b);
+                ImGui::SameLine(0.0f, 4.0f * sc);
+                textRole(palette.textDim, word);
+            };
+            textRole(palette.textDim, "Health:");
+            token(palette.statusOk,   ok,        "ok",           false);
+            token(palette.statusWarn, needLogin, "need sign-in", true);
             if (failing > 0)
-                ImGui::TextDisabled("Health: %d ok · %d need sign-in · %d failing",
-                                    ok, needLogin, failing);
-            else
-                ImGui::TextDisabled("Health: %d ok · %d need sign-in", ok, needLogin);
+                token(palette.statusErr, failing, "failing", true);
         } else {
             ImGui::TextDisabled(" ");
         }
@@ -211,6 +295,15 @@ void drawVendorStrip(AppState& st, float paneW) {
     // -- buttons -------------------------------------------------------------------------
     // Anything the callee would refuse is drawn disabled and says why.
     const bool wizardOpen = browserPanelActive();
+    // Primary CTA. borderRow paints hover/selection treatment only, so the resting accent
+    // surface has to come from here — without it this row was pixel-identical to the two
+    // secondary buttons below it and the pane had no visible primary action.
+    {
+        ImDrawList* dl  = ImGui::GetWindowDrawList();
+        const ImVec2 c0 = ImGui::GetCursorScreenPos();
+        const ImVec2 c1(c0.x + ImGui::GetContentRegionAvail().x, c0.y + 22.0f * sc);
+        dl->AddRectFilled(c0, c1, Palette::toU32(palette.accentSoft), 6.0f * sc);
+    }
     ImGui::BeginDisabled(wizardOpen);
     if (borderRow("##connect_vendors", "Connect vendor accounts", "browser_panel",
                   /*selected=*/false, ImVec2(0, 22.0f * sc), /*centerText=*/true))
@@ -246,7 +339,7 @@ void drawVendorStrip(AppState& st, float paneW) {
 namespace {
 
 void drawVendorSignInList(AppState& st) {
-    sectionHeader("Vendor Sites", /*firstInPane=*/true);
+    sectionHeader("Vendor Sites", /*firstInPane=*/true, "vendor_globe");
 
     if (S().vendorsLoading && S().vendors.empty()) {
         ContentInset inset;
@@ -307,16 +400,15 @@ void drawVendorSignInList(AppState& st) {
                 ImGui::SetTooltip("Sign-in already in progress");
             ImGui::PopStyleColor();
 
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                       palette.textDisabled[2], 1.0f));
+            // The state word carries the row's state: one dim colour for all four made
+            // "Login failed" read exactly like "Signed in".
             if (v.loginInProgress)
-                ImGui::TextUnformatted("  Waiting for browser sign-in...");
+                textRole(palette.statusWarn, "  Waiting for browser sign-in...");
             else if (!v.loginError.empty())
-                ImGui::TextUnformatted("  Login failed (hover)");
+                textRole(palette.statusErr, "  Login failed (hover)");
             else
-                ImGui::TextUnformatted(v.loggedIn ? "  Signed in" : "  Not signed in");
-            ImGui::PopStyleColor();
+                textRole(v.loggedIn ? palette.statusOk : palette.textDisabled,
+                         v.loggedIn ? "  Signed in" : "  Not signed in");
             if (!v.loginError.empty() && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", v.loginError.c_str());
 
@@ -331,7 +423,7 @@ void drawApiProviders(AppState& st) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    sectionHeader("API Providers");
+    sectionHeader("API Providers", /*firstInPane=*/false, "settings");
 
     if (S().apiProviders.empty()) {
         ContentInset inset;
@@ -367,11 +459,8 @@ void drawApiProviders(AppState& st) {
             a.editing = !a.editing;
         ImGui::PopStyleColor();
 
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 1.0f));
-        ImGui::TextUnformatted(a.configured ? "  Configured" : "  Not configured");
-        ImGui::PopStyleColor();
+        textRole(a.configured ? palette.statusOk : palette.textDisabled,
+                 a.configured ? "  Configured" : "  Not configured");
 
         if (a.editing) {
             for (size_t i = 0; i < a.fields.size() && i < 2; ++i) {
@@ -400,7 +489,7 @@ void drawDownloadQueue(AppState& st) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    sectionHeader("Download Queue");
+    sectionHeader("Download Queue", /*firstInPane=*/false, "save");
 
     if (S().queue.empty()) {
         ContentInset inset;
@@ -430,11 +519,7 @@ void drawDownloadQueue(AppState& st) {
         ImGui::SameLine();
         ImGui::TextDisabled("%s", q.site.c_str());
         if (q.status == "done") {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.statusOk[0], palette.statusOk[1],
-                       palette.statusOk[2], 1.0f));
-            ImGui::TextUnformatted("  Done");
-            ImGui::PopStyleColor();
+            textRole(palette.statusOk, "  Done");
             if (!q.artifactPath.empty()) {
                 ImGui::SameLine();
                 if (q.importing) {
@@ -462,15 +547,13 @@ void drawDownloadQueue(AppState& st) {
                 }
             }
         } else if (q.status == "error") {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.statusErr[0], palette.statusErr[1],
-                       palette.statusErr[2], 1.0f));
-            ImGui::TextUnformatted("  Failed");
-            ImGui::PopStyleColor();
+            textRole(palette.statusErr, "  Failed");
             if (!q.error.empty() && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", q.error.c_str());
         } else if (q.status == "cancelled") {
-            ImGui::TextDisabled("  Cancelled");
+            // Cancelled is a non-success terminal state, so it takes the middle role
+            // rather than dissolving into the row chrome like a caption.
+            textRole(palette.statusWarn, "  Cancelled");
         } else {
             float ph = (float)(0.5 + 0.5 * sin(ImGui::GetTime() * 2.5));
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
@@ -490,7 +573,8 @@ void drawHealthTable(AppState& st) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    sectionHeader("Vendor Health");
+    sectionHeader("Vendor Health", /*firstInPane=*/false, "health_check");
+    const float sc = ui::uiScale;
 
     if (!S().healthSupported) {
         ContentInset inset;
@@ -520,14 +604,19 @@ void drawHealthTable(AppState& st) {
     ImGui::Spacing();
     for (auto& h : S().healthResults) {
         ImGui::PushID(h.site.c_str());
-        // Badge: green ok, amber expected sign-in-required failure, red real error.
+        // State reads as a coloured dot rather than a bracket glyph: green ok, amber
+        // expected sign-in-required failure, red real error.
         const float* role = h.ok ? palette.statusOk
                           : h.expected ? palette.statusWarn
                                        : palette.statusErr;
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(role[0], role[1], role[2], 1.0f));
-        ImGui::TextUnformatted(h.ok ? "[+]" : (h.expected ? "[!]" : "[x]"));
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
+        const float dotD  = 8.0f * sc;
+        const float lineH = ImGui::GetTextLineHeight();
+        ImDrawList* dl    = ImGui::GetWindowDrawList();
+        const ImVec2 c    = ImGui::GetCursorScreenPos();
+        dl->AddCircleFilled(ImVec2(c.x + dotD * 0.5f, c.y + lineH * 0.5f), dotD * 0.5f,
+                            Palette::toU32(role));
+        ImGui::Dummy(ImVec2(dotD, lineH));
+        ImGui::SameLine(0.0f, 6.0f * sc);
         ImGui::TextUnformatted(h.site.c_str());
         char rt[32];
         if (h.ok) std::snprintf(rt, sizeof(rt), "%.0f ms", h.latencyMs);
@@ -538,7 +627,7 @@ void drawHealthTable(AppState& st) {
         ImGui::SameLine();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x -
                              ImGui::CalcTextSize(rt).x - ui::metrics::partsPadX());
-        ImGui::TextDisabled("%s", rt);
+        textRole(palette.textDim, rt);
         if (!h.error.empty() && ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", h.error.c_str());
         ImGui::PopID();

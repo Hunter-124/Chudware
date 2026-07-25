@@ -48,28 +48,60 @@ std::vector<unsigned char> b64decode(const std::string& in) {
 
 // ---- headers / states ----------------------------------------------------------------
 
-void sectionHeader(const char* label, bool firstInPane) {
+void sectionHeader(const char* label, bool firstInPane, const char* icon,
+                   const char* trailing) {
     const float sc  = ui::uiScale;
     const float pad = ui::metrics::partsPadX();
-    if (!firstInPane) ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    if (!firstInPane) ImGui::Dummy(ImVec2(0, 8.0f * sc));
     // The label sits on the pane's TEXT line (pane gutter + partsPadX) — the same line
     // borderRow paints its icon/label on, a grid card starts its title on, and ImGui puts
     // the text of a framed widget on (partsPadX == style.FramePadding.x). A header and the
     // body under it therefore share one left edge instead of stepping by the row padding.
     ImGui::Indent(pad);
+    const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+    const float  rowW   = ImGui::GetContentRegionAvail().x;
+    ImDrawList*  dl     = ImGui::GetWindowDrawList();
+
     ImFont* h2 = S().fonts ? S().fonts->h2 : nullptr;
     if (h2) ImGui::PushFont(h2);
+    const float lh = ImGui::GetTextLineHeight();
+
+    // Optional accent glyph ahead of the label: a header reads as a section marker rather
+    // than a bare underlined word, and the pane picks up the same iconography as its rows.
+    const float iconSz = 15.0f * sc;
+    if (icon && icon[0] && (ui::hasIconSdf(icon) || ui::getIcon(icon).valid)) {
+        ui::drawIconGlass(dl, icon,
+                          ImVec2(rowMin.x + iconSz * 0.5f, rowMin.y + lh * 0.5f), iconSz,
+                          Palette::toU32(palette.accent), 0);
+        ImGui::Dummy(ImVec2(iconSz, lh));
+        ImGui::SameLine(0.0f, 6.0f * sc);
+    }
     ImGui::TextUnformatted(label);
     if (h2) ImGui::PopFont();
+
+    // Right-aligned secondary text (counts, state) on the header's own line — the pane no
+    // longer has to spend a whole dim line under the header on a number.
+    const float rowBot = ImGui::GetItemRectMax().y;
+    if (trailing && trailing[0]) {
+        const ImVec2 ts = ImGui::CalcTextSize(trailing);
+        const float  tx = rowMin.x + rowW - ts.x;
+        if (tx > ImGui::GetItemRectMax().x + 6.0f * sc)
+            dl->AddText(ImVec2(tx, rowMin.y + (lh - ts.y) * 0.5f),
+                        Palette::toU32(palette.textDim), trailing);
+    }
+
+    // Rule: accent fading to nothing across the pane, not a flat full-strength underline
+    // clipped to the label — it reads as a section edge instead of a hyperlink.
+    float a0[4], a1[4];
+    Palette::withAlpha(palette.accent, a0, 0.55f);
+    Palette::withAlpha(palette.accent, a1, 0.00f);
+    const float ry = rowBot + 3.0f * sc;
+    dl->AddRectFilledMultiColor(ImVec2(rowMin.x, ry),
+                                ImVec2(rowMin.x + rowW, ry + 1.5f * sc),
+                                Palette::toU32(a0), Palette::toU32(a1),
+                                Palette::toU32(a1), Palette::toU32(a0));
     ImGui::Unindent(pad);
-    ImVec2 p0 = ImGui::GetItemRectMin();
-    ImVec2 p1 = ImGui::GetItemRectMax();
-    ImGui::GetWindowDrawList()->AddLine(
-        ImVec2(p0.x, p1.y + 1.0f * sc), ImVec2(p1.x, p1.y + 1.0f * sc),
-        ImGui::ColorConvertFloat4ToU32(
-            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.60f)),
-        1.0f * sc);
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0, 5.0f * sc));
 }
 
 ContentInset::ContentInset()  { ImGui::Indent(ui::metrics::partsPadX()); }
@@ -284,12 +316,68 @@ bool borderRow(const char* strId, const char* label, const char* icon, bool sele
 
     if (label && label[0]) {
         // Vertically centered exactly; clip inside the row so long labels never overflow.
-        dl->PushClipRect(p0, ImVec2(p1.x - padX, p1.y), true);
+        // A CENTERED label is inset by (size.x - textW)/2, which on a snugly-sized row
+        // (a chip) is smaller than padX — clipping at p1.x - padX then ate the last
+        // character of every one of them. Centered rows clip on their own rect.
+        dl->PushClipRect(p0, ImVec2(centerText ? p1.x : p1.x - padX, p1.y), true);
         dl->AddText(ImVec2(x, p0.y + (size.y - textH) * 0.5f),
                     Palette::toU32(palette.text), label);
         dl->PopClipRect();
     }
     return clicked;
+}
+
+// ---- chips -------------------------------------------------------------------------
+
+float chipWidth(const char* label) {
+    return ImGui::CalcTextSize(label).x + chipPadX() * 2.0f;
+}
+
+float chipPadX()  { return 10.0f * ui::uiScale; }
+float chipHeight() { return ImGui::GetTextLineHeight() + 9.0f * ui::uiScale; }
+
+bool chipToggle(const char* strId, const char* label, bool active) {
+    const float sc   = ui::uiScale;
+    const float padX = chipPadX();
+    const ImVec2 ts  = ImGui::CalcTextSize(label);
+    const ImVec2 sz(ts.x + padX * 2.0f, chipHeight());
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
+
+    const bool clicked = ImGui::InvisibleButton(strId, sz);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held    = ImGui::IsItemActive();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float r  = sz.y * 0.5f;   // full pill
+    if (active) {
+        dl->AddRectFilled(p0, p1, Palette::toU32(palette.accentSoft), r);
+        dl->AddRect(ImVec2(p0.x + 0.5f, p0.y + 0.5f), ImVec2(p1.x - 0.5f, p1.y - 0.5f),
+                    Palette::toU32(palette.accent), r, 0, 1.2f * sc);
+    } else {
+        // A RESTING surface is the whole point: the old chips were invisible until hovered,
+        // so a facet's options read as a ragged paragraph of clipped words.
+        float fill[4];
+        Palette::withAlpha(palette.frameBg, fill, held ? 1.0f : (hovered ? 0.95f : 0.70f));
+        dl->AddRectFilled(p0, p1, Palette::toU32(fill), r);
+        dl->AddRect(ImVec2(p0.x + 0.5f, p0.y + 0.5f), ImVec2(p1.x - 0.5f, p1.y - 0.5f),
+                    Palette::toU32(hovered ? palette.accentMid : palette.border), r, 0,
+                    1.0f * sc);
+    }
+    // Sized from the text, so no clip rect is needed — that is what used to truncate them.
+    dl->AddText(ImVec2(p0.x + padX, p0.y + (sz.y - ts.y) * 0.5f),
+                Palette::toU32(active ? palette.accent
+                                      : (hovered ? palette.text : palette.textDim)),
+                label);
+    return clicked;
+}
+
+void fieldLabel(const char* text) {
+    ContentInset inset;
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 0.95f));
+    ImGui::TextUnformatted(text);
+    ImGui::PopStyleColor();
 }
 
 void borderRowSurface(bool selected, float rows, float rounding) {

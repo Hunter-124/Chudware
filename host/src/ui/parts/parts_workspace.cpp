@@ -25,6 +25,7 @@
 #include "imgui.h"
 
 #include "core/app_state.h"
+#include "ui/icons.h"      // drawIconGlass — the in-field search-clear glyph
 #include "ui_theme.h"
 
 #include "parts_internal.h"
@@ -854,13 +855,66 @@ void drawPartsLibraryWorkspace(AppState& st) {
         sortW += ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetFrameHeight();
 
         // The results column has a floor but the fixed items on this row can still eat the
-        // whole line — never hand the input a negative width.
-        ImGui::SetNextItemWidth(std::max(80.0f * sc,
-            ImGui::GetContentRegionAvail().x - 152.0f * sc - sortW));
+        // whole line — never hand the input a negative width. The reserve is MEASURED from
+        // the widgets that actually follow instead of a literal, so growing the view switch
+        // from one button to two segments cannot silently push them off the row.
+        const float frameH  = ImGui::GetFrameHeight();
+        const float gapW    = ImGui::GetStyle().ItemSpacing.x;
+        const float searchW = ImGui::CalcTextSize("Search").x +
+                              ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float segW    = frameH * 1.30f;    // one icon-only view-switch segment
+        const float inputW  = std::max(80.0f * sc,
+            ImGui::GetContentRegionAvail().x - (gapW * 3.0f + searchW + sortW + segW * 2.0f));
+
+        const ImVec2 qOrigin = ImGui::GetCursorScreenPos();
+        const ImVec2 xCenter(qOrigin.x + inputW - 15.0f * sc, qOrigin.y + frameH * 0.5f);
+
+        // The clear affordance is submitted BEFORE the input on purpose. An item submitted
+        // AFTER an active InputText cannot be hovered on the mouse-down frame (InputText
+        // resets g.ActiveIdAllowOverlap while the button is held), so the first click on it
+        // would only blur the field and the second would clear — submitted first it wins the
+        // click outright. Its glyph is still painted after the input, below, or the input's
+        // frame background would cover it.
+        bool clearHit = false, clearHov = false;
+        if (S().searchBuf[0]) {
+            const float xsz = 20.0f * sc;
+            ImGui::SetCursorScreenPos(ImVec2(xCenter.x - xsz * 0.5f, xCenter.y - xsz * 0.5f));
+            clearHit = ImGui::InvisibleButton("##parts_q_clear", ImVec2(xsz, xsz));
+            clearHov = ImGui::IsItemHovered();
+            if (clearHov) ImGui::SetTooltip("Clear search");
+            ImGui::SetCursorScreenPos(qOrigin);
+        }
+
+        // Both in-field affordances sit in the frame padding: widening FramePadding.x for the
+        // input ONLY is the one way to move ImGui's own text/hint origin clear of them.
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(26.0f * sc, 5 * sc));
+        ImGui::SetNextItemWidth(inputW);
         bool hit = ImGui::InputTextWithHint("##parts_q",
                                     "search fasteners, bearings, sections, electronics, vendors…",
                                     S().searchBuf, sizeof(S().searchBuf),
                                     ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::PopStyleVar();
+        {
+            ImDrawList*  dl  = ImGui::GetWindowDrawList();
+            const ImVec2 mn  = ImGui::GetItemRectMin();
+            const ImVec2 mx  = ImGui::GetItemRectMax();
+            const ImVec2 gc(mn.x + 13.0f * sc, (mn.y + mx.y) * 0.5f);
+            const float  gr  = 4.5f * sc;
+            const float  gth = 1.5f * sc;
+            const ImU32  gcol = Palette::toU32(palette.textDisabled);
+            dl->AddCircle(gc, gr, gcol, 0, gth);
+            dl->AddLine(ImVec2(gc.x + gr * 0.72f, gc.y + gr * 0.72f),
+                        ImVec2(gc.x + gr * 1.80f, gc.y + gr * 1.80f), gcol, gth);
+            if (S().searchBuf[0]) {
+                float xc[4];
+                Palette::withAlpha(palette.textDim, xc, clearHov ? 1.0f : 0.70f);
+                ui::drawIconGlass(dl, "cancel_x", xCenter, 12.0f * sc, Palette::toU32(xc), 0);
+            }
+        }
+        if (clearHit) {
+            S().searchBuf[0] = '\0';
+            doSearch(st);
+        }
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
@@ -876,14 +930,56 @@ void drawPartsLibraryWorkspace(AppState& st) {
             applyResultSort();   // cosmetic — never re-run the local + vendor fan-out
         }
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            ImVec4(palette.button[0], palette.button[1], palette.button[2], 0.80f));
-        if (ImGui::Button(S().gridView ? "List" : "Grid")) {
+
+        // Two-segment view switch. The old single button was labelled with the mode you were
+        // NOT in, so the toolbar never said which view was live; now both affordances are
+        // always present and the active one is accent-filled.
+        auto viewSegment = [&](const char* id, bool wantGrid, const char* tip) {
+            const bool on = (S().gridView == wantGrid);
+            float bg[4], bgHov[4];
+            Palette::withAlpha(on ? palette.accentSoft : palette.button,        bg,    on ? 1.0f : 0.80f);
+            Palette::withAlpha(on ? palette.accentMid  : palette.buttonHovered, bgHov, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(bg[0], bg[1], bg[2], bg[3]));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(bgHov[0], bgHov[1], bgHov[2], bgHov[3]));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(bgHov[0], bgHov[1], bgHov[2], bgHov[3]));
+            const bool clicked = ImGui::Button(id, ImVec2(segW, frameH));
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+
+            // The atlas has no grid/list glyph, so both are drawn: a 2x2 dot matrix and three
+            // stacked rules — legible at 20px where a text label would not fit the segment.
+            ImDrawList*  dl = ImGui::GetWindowDrawList();
+            const ImVec2 a  = ImGui::GetItemRectMin();
+            const ImVec2 b  = ImGui::GetItemRectMax();
+            const ImVec2 c((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+            const ImU32  gcol = Palette::toU32(on ? palette.accent : palette.textDim);
+            if (wantGrid) {
+                const float d = 3.4f * sc, gap = 2.2f * sc;
+                for (int i = 0; i < 4; ++i) {
+                    const float ox = ((i & 1) ? 0.5f : -0.5f) * (d + gap);
+                    const float oy = ((i & 2) ? 0.5f : -0.5f) * (d + gap);
+                    dl->AddRectFilled(ImVec2(c.x + ox - d * 0.5f, c.y + oy - d * 0.5f),
+                                      ImVec2(c.x + ox + d * 0.5f, c.y + oy + d * 0.5f),
+                                      gcol, 1.0f * sc);
+                }
+            } else {
+                const float w = 10.0f * sc, gap = 3.6f * sc, th = 1.6f * sc;
+                for (int i = -1; i <= 1; ++i)
+                    dl->AddLine(ImVec2(c.x - w * 0.5f, c.y + i * gap),
+                                ImVec2(c.x + w * 0.5f, c.y + i * gap), gcol, th);
+            }
+            return clicked;
+        };
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 6 * sc));  // segments touch
+        const bool wantGridView = viewSegment("##parts_view_grid", true,  "Grid view");
+        ImGui::SameLine();
+        const bool wantListView = viewSegment("##parts_view_list", false, "List view");
+        ImGui::PopStyleVar();
+        if ((wantGridView && !S().gridView) || (wantListView && S().gridView)) {
             S().gridView = !S().gridView;
             st.settings.partsGridView = S().gridView;
             saveSettings(st.settings);
         }
-        ImGui::PopStyleColor();
         ImGui::PopStyleVar(2);
 
         if ((hit || go) && !S().searching)
@@ -891,16 +987,20 @@ void drawPartsLibraryWorkspace(AppState& st) {
 
         ImGui::Spacing();
         {
-            char hdr[96];
-            if (!S().results.empty())
-                std::snprintf(hdr, sizeof(hdr), "Parts  (%d%s)", (int)S().results.size(),
-                              S().hasLive ? ", incl. live vendor results" : "");
-            else
-                std::snprintf(hdr, sizeof(hdr), "Parts");
-            sectionHeader(hdr, /*firstInPane=*/true);
+            // The count rides in the header's trailing slot, not baked into its label — a
+            // "Parts  (128)" label makes the count compete with the title for the eye.
+            char countBuf[64];
+            const char* trailing = nullptr;
+            if (!S().results.empty()) {
+                std::snprintf(countBuf, sizeof(countBuf), "%d result%s%s",
+                              (int)S().results.size(), S().results.size() == 1 ? "" : "s",
+                              S().hasLive ? " · incl. live" : "");
+                trailing = countBuf;
+            }
+            sectionHeader("Parts", /*firstInPane=*/true, "parts_all", trailing);
         }
         // While the background vendor fan-out is still running, show each vendor being searched
-        // (its live logo + a per-vendor progress bar) inline to the right of the "Parts(N)" title.
+        // (its live logo + a per-vendor progress bar) inline under the "Parts" header.
         if (!S().liveVendors.empty()) {
             drawLiveVendorStrip(st);
         } else if (S().liveSearching && !S().results.empty()) {

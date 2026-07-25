@@ -1,8 +1,11 @@
 // Parts Library — results (list table + grid cards) and per-item actions.
 // GUI V2 phase A: the list is a real ImGui table (Name | Vendor | Part# | Material | Price,
 // natural clipping instead of the old printf %-36.36s column hack) with an 18px domain icon
-// before the name; hover shows the border treatment + the Download/Insert actions.
+// before the name; hover shows the border treatment + the item's actions.
+// Status ("downloaded", "live vendor result") is carried by drawn badges/glyphs — the ASCII
+// bracket tags they replace read as debug output and shoved the real text sideways.
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 
@@ -10,6 +13,7 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"
+#include "ui/icons.h"      // ui::drawIconGlass — atlas glyphs on the card preview band
 #include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
 
 #include "parts_internal.h"
@@ -19,15 +23,22 @@ namespace ui {
 namespace parts {
 
 // ---- per-item actions ------------------------------------------------------------------
-// The action SET is collected before anything is drawn, so a grid card can MEASURE the
-// wrapped button layout and size its hover band before painting it. A card must never put a
-// button outside its own rounded rect — the old strip laid the buttons out on one unbounded
-// line from the card's left pad and spilled them over the neighbouring card.
+// A card must never put a button outside its own rounded rect — the old strip laid the
+// buttons out on one unbounded line from the card's left pad and spilled them over the
+// neighbouring card. The grid now shows only the PRIMARY action plus a "…" overflow popup,
+// so its hover band is a single text line instead of a measured, wrapped four-button block
+// that grew until it covered the thumbnail and the title it was meant to annotate.
 namespace {
 
 enum class ActKind { Download, Insert, ReverseEngineer, GenerateModel };
 struct ItemAction { const char* label; ActKind kind; };
 constexpr int kMaxItemActions = 4;
+
+// Shown on the "Generate 3D model" entry wherever it appears (list row, grid overflow popup).
+constexpr const char* kGenModelTip =
+    "Reverse Engineer \xe2\x86\x92 Generate 3D model\n"
+    "Pulls specs from the internet and builds a parametric\n"
+    "model, then attaches it to this part so you can place it.";
 
 int collectActions(const PartsItem& item, ItemAction* out) {
     int n = 0;
@@ -55,48 +66,77 @@ void runAction(AppState& st, const PartsItem& item, ActKind kind) {
     }
 }
 
-// Lays the buttons out from the current cursor and returns the total height.
-//   maxW > 0  → the row is bounded: it wraps onto a new line (anchored back on the start x,
-//               not on the window indent) and clamps a single over-wide button, so nothing
-//               ever crosses maxW.
-//   maxW <= 0 → one line, unbounded (list view: the table cell clips).
-// `draw == false` runs the identical arithmetic without emitting anything — that is how the
-// grid card reserves its band height before it paints the band.
-float actionsLayout(AppState& st, const PartsItem& item, float maxW, bool draw) {
+// ---- status badges -----------------------------------------------------------------------
+// A rounded pill (opaque base + role wash + role hairline + role text) replacing the ASCII
+// bracket tags this file used to print: they read as debug output, and on a grid card the
+// live tag was concatenated onto the price string, so the price shared its line with a
+// status marker. The label renders a notch under body size so the pill stays ~14dp tall
+// beside a full text line.
+float badgeTextSize() { return ImGui::GetFontSize() * 0.82f; }
+
+float badgeH() {
+    return std::max(14.0f * ui::uiScale, badgeTextSize() + 4.0f * ui::uiScale);
+}
+
+float badgeW(const char* label) {
+    ImFont* f = ImGui::GetFont();
+    return f->CalcTextSizeA(badgeTextSize(), FLT_MAX, 0.0f, label).x + 10.0f * ui::uiScale;
+}
+
+void drawBadge(ImDrawList* dl, ImVec2 p0, const char* label, const float role[4]) {
+    const float sc = ui::uiScale;
+    const float fs = badgeTextSize();
+    ImFont* f = ImGui::GetFont();
+    const ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, label);
+    const ImVec2 p1(p0.x + ts.x + 10.0f * sc, p0.y + badgeH());
+    const float r = (p1.y - p0.y) * 0.5f;    // full pill
+    float wash[4], line[4];
+    Palette::withAlpha(role, wash, 0.22f);
+    Palette::withAlpha(role, line, 0.55f);
+    // Opaque base BEFORE the wash: a grid badge sits on top of a product photo, where a
+    // purely translucent chip takes the photo's colour and stops reading as a badge.
+    dl->AddRectFilled(p0, p1, Palette::toU32(palette.panelBg), r);
+    dl->AddRectFilled(p0, p1, Palette::toU32(wash), r);
+    dl->AddRect(ImVec2(p0.x + 0.5f, p0.y + 0.5f), ImVec2(p1.x - 0.5f, p1.y - 0.5f),
+                Palette::toU32(line), r, 0, ui::metrics::stroke(1.0f));
+    dl->AddText(f, fs, ImVec2(p0.x + (p1.x - p0.x - ts.x) * 0.5f,
+                              p0.y + (p1.y - p0.y - ts.y) * 0.5f),
+                Palette::toU32(role), label);
+}
+
+// Layout-participating badge for the list rows: reserves its own footprint with a Dummy so
+// the SameLine flow (badges, then the name) is unchanged, centred on the current text line.
+void badgeInline(const char* label, const float role[4]) {
+    const ImVec2 cur = ImGui::GetCursorScreenPos();
+    const float  lh  = ImGui::GetTextLineHeight();
+    drawBadge(ImGui::GetWindowDrawList(),
+              ImVec2(cur.x, cur.y + (lh - badgeH()) * 0.5f), label, role);
+    ImGui::Dummy(ImVec2(badgeW(label), lh));
+}
+
+// One unbounded line of compact action buttons from the cursor — LIST view only, where the
+// table cell does the clipping. The grid does NOT use this: it draws one primary pill plus a
+// "…" overflow popup so its hover band can never grow past a single text line.
+void actionsLayout(AppState& st, const PartsItem& item) {
     ItemAction acts[kMaxItemActions];
     const int n = collectActions(item, acts);
-    if (n == 0) return 0.0f;
+    if (n == 0) return;
 
     const float btnH = ImGui::GetTextLineHeight();     // compact: no vertical frame padding
     const float fpX  = ImGui::GetStyle().FramePadding.x;
     const float gap  = ui::metrics::U(1);
-    const bool  wrap = maxW > 0.0f;
-    const ImVec2 origin = ImGui::GetCursorScreenPos();
-    if (draw) {
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(fpX, 0.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
-    }
-
-    float lineW = 0.0f, h = btnH;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(fpX, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f * ui::uiScale);
+    ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
     for (int i = 0; i < n; ++i) {
-        float w = ImGui::CalcTextSize(acts[i].label).x + fpX * 2.0f;
-        if (wrap && w > maxW) w = maxW;
-        const bool nl = wrap && lineW > 0.0f && lineW + gap + w > maxW;
-        if (nl) { lineW = 0.0f; h += gap + btnH; }
-        if (draw) {
-            if (nl)         ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + h - btnH));
-            else if (i > 0) ImGui::SameLine(0.0f, gap);
-            if (ImGui::Button(acts[i].label, ImVec2(w, btnH)))
-                runAction(st, item, acts[i].kind);
-            if (acts[i].kind == ActKind::GenerateModel && ImGui::IsItemHovered())
-                ImGui::SetTooltip("Reverse Engineer \xe2\x86\x92 Generate 3D model\n"
-                                  "Pulls specs from the internet and builds a parametric\n"
-                                  "model, then attaches it to this part so you can place it.");
-        }
-        lineW += (lineW > 0.0f ? gap : 0.0f) + w;
+        if (i > 0) ImGui::SameLine(0.0f, gap);
+        const float w = ImGui::CalcTextSize(acts[i].label).x + fpX * 2.0f;
+        if (ImGui::Button(acts[i].label, ImVec2(w, btnH)))
+            runAction(st, item, acts[i].kind);
+        if (acts[i].kind == ActKind::GenerateModel && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", kGenModelTip);
     }
-    if (draw) ImGui::PopStyleVar(2);
-    return h;
+    ImGui::PopStyleVar(3);
 }
 
 }  // namespace
@@ -259,18 +299,11 @@ void drawResultsList(AppState& st) {
         ImGui::SetCursorScreenPos(ImVec2(rowPos.x + iconSz + 6.0f * sc,
                                          rowPos.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f));
         if (item.downloaded) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.statusOk[0], palette.statusOk[1],
-                       palette.statusOk[2], 1.0f));
-            ImGui::TextUnformatted("[v]");
-            ImGui::PopStyleColor();
+            badgeInline("saved", palette.statusOk);
             ImGui::SameLine();
         }
         if (item.source == "live") {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.9f));
-            ImGui::TextUnformatted("[live]");
-            ImGui::PopStyleColor();
+            badgeInline("live", palette.accent);
             ImGui::SameLine();
         }
         ImGui::TextUnformatted(item.name.c_str());   // table clipping ellipsizes naturally
@@ -287,17 +320,23 @@ void drawResultsList(AppState& st) {
         dimCell(3, item.material.empty() ? "-" : item.material.c_str());
 
         ImGui::TableSetColumnIndex(4);
-        if (item.priceUsd > 0.0)
+        if (item.priceUsd > 0.0) {
+            // The one number a buyer scans a results table for — it should not be the same
+            // tone as the part number three columns to its left.
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
             ImGui::Text("$%.2f/%s", item.priceUsd, item.unit.c_str());
-        else
+            ImGui::PopStyleColor();
+        } else {
             ImGui::TextDisabled("—");
+        }
 
         ImGui::TableSetColumnIndex(5);
         if (hovered) {
             ImGui::PushStyleColor(ImGuiCol_Button,
                 ImVec4(palette.button[0], palette.button[1],
                        palette.button[2], palette.button[3]));
-            actionsLayout(st, item, /*maxW=*/0.0f, /*draw=*/true);
+            actionsLayout(st, item);
             ImGui::PopStyleColor();
         }
 
@@ -313,15 +352,32 @@ void drawResultsList(AppState& st) {
 // clipped to the card — free-floating text/SameLine bookkeeping was cascading cards
 // diagonally and letting long names bleed past the card edge (WS4a regression).
 // Every horizontal offset inside a card is partsPadX(): the thumbnail, the title, the part
-// number, the price and the hover action row all start on ONE content line, and the row of
-// buttons wraps inside the content width instead of spilling over the next card.
+// number, the price and the hover action row all start on ONE content line, and the hover
+// band is exactly one text line so it can never cover the thumbnail it annotates.
 void drawResultsGrid(AppState& st) {
     const float sc    = ui::uiScale;
     const float pad   = ui::metrics::partsPadX();
-    const float cardH = 168.0f * sc;
     const float imgH  = 88.0f * sc;
     const float gap   = 8.0f * sc;
     const float cardRound = 8.0f;      // logical corner; the helpers scale it themselves
+
+    // The card height is DERIVED from what a card actually holds — preview band, title in
+    // the medium face, part number, price, and the one-line hover action band — instead of a
+    // 168 px guess that the band then had to overlap. A hovered card must never eat its own
+    // price line, so the band's strip is reserved in the height rather than borrowed from
+    // the text. Every term below is repeated verbatim by the per-card painter; change both.
+    const float lineH    = ImGui::GetTextLineHeight();
+    float titleH = lineH;
+    if (S().fonts && S().fonts->medium) {
+        ImGui::PushFont(S().fonts->medium);
+        titleH = ImGui::GetTextLineHeight();
+        ImGui::PopFont();
+    }
+    const float bandPadY = 4.0f * sc;
+    const float bandH    = lineH + 2.0f * bandPadY;
+    const float textH    = 6.0f * sc + titleH + 2.0f * sc + lineH + 2.0f * sc + lineH +
+                           6.0f * sc;
+    const float cardH    = imgH + textH + bandH;
 
     if (resultsPreamble("Try a different search term or category.",
                         "Type in the search bar or pick a category."))
@@ -338,7 +394,7 @@ void drawResultsGrid(AppState& st) {
     // The card reserves `pad` on BOTH sides; the floor keeps a squeezed pane from producing a
     // negative content width (which would make the ellipsize loop and AddImage draw garbage).
     const float contentW = std::max(ui::metrics::U(4), cardW - 2.0f * pad);
-    const float lineH    = ImGui::GetTextLineHeight();
+    // lineH / titleH / bandH computed above — the card height depends on them.
     ImDrawList* dl       = ImGui::GetWindowDrawList();
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, gap));  // uniform row gap
@@ -356,7 +412,9 @@ void drawResultsGrid(AppState& st) {
         ImGui::SetNextItemAllowOverlap();
         ImGui::InvisibleButton("##card", ImVec2(cardW, cardH));
         itemTooltipAt(item, ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal));
-        const bool hov = ImGui::IsMouseHoveringRect(p0, p1);  // stays true over the buttons
+        // The overflow popup floats OUTSIDE the card, so plain rect-hover would drop the band
+        // (and with it the BeginPopup call) the instant the pointer left the card to reach it.
+        const bool hov = ImGui::IsMouseHoveringRect(p0, p1) || ImGui::IsPopupOpen("##more");
 
         // Resting glass surface stays; hover reads by BORDER, not a stronger wash.
         ui::glassRowBackground(dl, p0, p1, cardRound, false, false, 0.20f);
@@ -364,7 +422,18 @@ void drawResultsGrid(AppState& st) {
 
         dl->PushClipRect(p0, p1, true);
 
-        // ---- preview band: thumbnail when available, domain icon/glyph otherwise ----
+        // ---- preview band: backdrop, thumbnail (or domain glyph), status markers ----
+        // The backdrop is what stops a transparent product PNG and the flat vector fallback
+        // from floating on the card's glass with no defined picture area; the hairline under
+        // it separates the picture from the text block instead of leaving them one soft blur.
+        const ImVec2 bandBR(p1.x, p0.y + imgH);
+        float previewBg[4];
+        Palette::withAlpha(palette.frameBg, previewBg, 0.5f);
+        dl->AddRectFilled(p0, bandBR, Palette::toU32(previewBg), cardRound * sc,
+                          ImDrawFlags_RoundCornersTop);
+        dl->AddLine(ImVec2(p0.x, bandBR.y - 0.5f), ImVec2(p1.x, bandBR.y - 0.5f),
+                    Palette::toU32(palette.border), ui::metrics::stroke(1.0f));
+
         requestThumb(st, item);
         auto th = S().thumbs.find(item.id);
         if (th != S().thumbs.end() && th->second.tex) {
@@ -379,6 +448,17 @@ void drawResultsGrid(AppState& st) {
             partIconDraw(dl, ImVec2(cx + contentW * 0.5f, p0.y + imgH * 0.5f + 4.0f * sc),
                          std::min(52.0f * sc, contentW), item.domain);
         }
+
+        // Status rides ON the preview band, inside the card clip: "downloaded" as a check
+        // glyph top-left, "live vendor result" as a badge top-right. Both used to be ASCII
+        // tags welded to the price line, which left half that line to a status marker.
+        const float markY = p0.y + 6.0f * sc;
+        if (item.downloaded)
+            ui::drawIconGlass(dl, "check",
+                              ImVec2(cx + badgeH() * 0.5f, markY + badgeH() * 0.5f),
+                              badgeH(), Palette::toU32(palette.statusOk), 0);
+        if (item.source == "live")
+            drawBadge(dl, ImVec2(p1.x - pad - badgeW("live"), markY), "live", palette.accent);
 
         // ---- text lines: all three start on the content line, ellipsized to contentW ----
         auto contentText = [&](float y, const char* t, ImU32 colU32) {
@@ -395,50 +475,103 @@ void drawResultsGrid(AppState& st) {
             dl->AddText(ImVec2(cx, y), colU32, s.c_str());
         };
         float ty = p0.y + imgH + 6.0f * sc;
+        // Title in the medium face so a card has a headline instead of three identical rows of
+        // small text. contentText MEASURES with the live font (it ellipsizes against contentW)
+        // and paints through the drawlist, so the push has to wrap the whole call — and the
+        // next line advances by the TITLE's height, not the body height, or it overlaps.
+        ImFont* titleFont = S().fonts ? S().fonts->medium : nullptr;
+        if (titleFont) ImGui::PushFont(titleFont);
+        // titleH is hoisted (the card height is derived from it) — just push the face here.
         contentText(ty, item.name.c_str(), ImGui::GetColorU32(ImGuiCol_Text));
-        ty += lineH + 2.0f * sc;
+        if (titleFont) ImGui::PopFont();
+        ty += titleH + 2.0f * sc;
         if (!item.partNumber.empty()) {
             contentText(ty, item.partNumber.c_str(), Palette::toU32(palette.textDim));
             ty += lineH + 2.0f * sc;
         }
+        // The "live" marker moved to the preview badge, so this line is just the price.
         char pbuf[48];
-        if (item.priceUsd > 0.0)
-            std::snprintf(pbuf, sizeof(pbuf), "$%.2f%s", item.priceUsd,
-                          item.source == "live" ? "  [live]" : "");
-        else
-            std::snprintf(pbuf, sizeof(pbuf), "%s",
-                          item.source == "live" ? "[live]" : "—");
-        contentText(ty, pbuf, ImGui::ColorConvertFloat4ToU32(
-                                  ImVec4(palette.accent[0], palette.accent[1],
-                                         palette.accent[2], 1.0f)));
+        if (item.priceUsd > 0.0) std::snprintf(pbuf, sizeof(pbuf), "$%.2f", item.priceUsd);
+        else                     std::snprintf(pbuf, sizeof(pbuf), "%s", "—");
+        contentText(ty, pbuf, item.priceUsd > 0.0 ? Palette::toU32(palette.accent)
+                                                  : Palette::toU32(palette.textDisabled));
 
         dl->PopClipRect();
 
-        // ---- hover actions: a bottom band INSIDE the card rect ------------------------
-        // Measured first so the band grows upward to fit however many lines the buttons wrap
-        // onto, and hard-clipped to the band: an item with four actions can never spill onto
-        // its neighbour. The buttons start on the same content line as the title above them.
+        // ---- hover actions: a ONE-LINE band INSIDE the card rect ----------------------
+        // The band used to MEASURE a wrapped block of up to four full-width buttons and grow
+        // upward to fit them, which swallowed the price, the title and most of the thumbnail:
+        // hovering a card erased the card. It is now pinned to one text line — the primary
+        // action (collectActions orders Download before Insert) as an accent pill, plus a
+        // compact "…" button that opens the remaining actions in a popup.
         if (hov) {
-            const float bandPadY = 4.0f * sc;
-            const float actH     = actionsLayout(st, item, contentW, /*draw=*/false);
-            if (actH > 0.0f) {
-                const float bandTop = std::max(p0.y, p1.y - actH - 2.0f * bandPadY);
+            ItemAction acts[kMaxItemActions];
+            const int n = collectActions(item, acts);
+            if (n > 0) {
+                // bandPadY / bandH are hoisted: the card RESERVES this strip, so the band
+                // sits under the price line instead of covering it.
+                const float btnH    = lineH;
+                const float bandTop = p1.y - bandH;
                 const ImVec2 b0(p0.x, bandTop), b1(p1.x, p1.y);
-                // Opaque base BEFORE the glass tint: glassBg is translucent (alpha .87),
-                // so with four wrapped action rows the card's own title showed through the
-                // band and read as overlapping text.
+                // Opaque base BEFORE the glass tint: glassBg is translucent (alpha .87), so
+                // the card's own price line showed through the band as overlapping text.
                 dl->AddRectFilled(b0, b1, Palette::toU32(palette.panelBg), cardRound * sc,
                                   ImDrawFlags_RoundCornersBottom);
                 dl->AddRectFilled(b0, b1, Palette::toU32(palette.glassBg), cardRound * sc,
                                   ImDrawFlags_RoundCornersBottom);
+
+                const float fpX   = ImGui::GetStyle().FramePadding.x;
+                const float gapX  = ui::metrics::U(1);
+                // Sized from its own label but never past 62% of the content width, so the
+                // "…" button always has room on the same line no matter how long the label.
+                const float primW = std::min(ImGui::CalcTextSize(acts[0].label).x + fpX * 2.0f,
+                                             contentW * 0.62f);
+
                 ImGui::PushClipRect(b0, b1, true);
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                    ImVec4(palette.button[0], palette.button[1],
-                           palette.button[2], palette.button[3]));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(fpX, 0.0f));
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f * sc);
                 ImGui::SetCursorScreenPos(ImVec2(cx, bandTop + bandPadY));
-                actionsLayout(st, item, contentW, /*draw=*/true);
-                ImGui::PopStyleColor();
+                // Primary = the card's call to action, so it carries the accent fill with
+                // max-contrast ink (readable in BOTH themes); overflow stays neutral.
+                const ImVec4 acc(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(acc.x, acc.y, acc.z, 0.85f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, acc);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                    ImVec4(palette.accentDim[0], palette.accentDim[1],
+                           palette.accentDim[2], 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::maxContrastTextOn(acc));
+                if (ImGui::Button(acts[0].label, ImVec2(primW, btnH)))
+                    runAction(st, item, acts[0].kind);
+                ImGui::PopStyleColor(4);
+                if (n > 1) {
+                    ImGui::SameLine(0.0f, gapX);
+                    // Square, with its OWN zero horizontal padding: inside a button only one
+                    // text line wide the row's frame padding inverts the inner rect and shoves
+                    // the ellipsis onto the right edge instead of centring it.
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                        ImVec4(palette.button[0], palette.button[1],
+                               palette.button[2], palette.button[3]));
+                    if (ImGui::Button("\xe2\x80\xa6##more", ImVec2(btnH, btnH)))
+                        ImGui::OpenPopup("##more");
+                    ImGui::PopStyleColor();
+                    ImGui::PopStyleVar();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("More actions");
+                }
+                ImGui::PopStyleVar(2);
                 ImGui::PopClipRect();
+
+                // Popup AFTER the clip scope: it is its own window and must inherit neither
+                // the band's clip rect nor the compact button styling.
+                if (n > 1 && ImGui::BeginPopup("##more")) {
+                    for (int a = 1; a < n; ++a) {
+                        if (ImGui::Selectable(acts[a].label))
+                            runAction(st, item, acts[a].kind);
+                        if (acts[a].kind == ActKind::GenerateModel && ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s", kGenModelTip);
+                    }
+                    ImGui::EndPopup();
+                }
             }
             // Re-anchor layout on the card rect so the buttons' line doesn't skew the
             // next SameLine/new-row bookkeeping.

@@ -400,11 +400,12 @@ static ChipResult drawChipAt(const char* btnId,
         if (riv.valid) {
             // Always allow monochrome line-art style tiles via SDF when available;
             // otherwise keep the raster only when the name is not a known photo tile.
-            // ws_model / ws_manufacture / ws_simulate are engine renders (raster_only)
-            // that look wrong at chip size — force procedural for those.
+            // ws_model / ws_simulate / ws_electronics are engine renders (raster_only)
+            // that look wrong at chip size — force procedural for those. ws_manufacture
+            // USED to be one; it is now a generated line-art glyph in the atlas
+            // (assets/make_icons.py) and reads fine at 20 px, so it takes the raster path.
             const bool photoTile =
                 std::strcmp(rasterCell, "ws_model") == 0 ||
-                std::strcmp(rasterCell, "ws_manufacture") == 0 ||
                 std::strcmp(rasterCell, "ws_simulate") == 0 ||
                 std::strcmp(rasterCell, "ws_electronics") == 0;
             useRaster = !photoTile;

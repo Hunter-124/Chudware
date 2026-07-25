@@ -109,6 +109,10 @@ CONTRACT_NAMES: list[str] = [
     "paperclip", "context_cube",
     # ---- Copilot modes (append-only): mode-picker Ask + Eng. Firm glyphs ----
     "ask", "eng_firm",
+    # ---- Workspace rail tabs (append-only; appended LAST so every existing
+    # row keeps its packed UVs). The app logged "unknown icon: 'ws_parts' /
+    # 'ws_manufacture'" every run and fell through to procedural glyphs. ----
+    "ws_parts", "ws_manufacture",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -3011,6 +3015,70 @@ def draw_ws_appearance(d, cell, p):
     filled_circle(d, cx - r * 0.32, cy - r * 0.34, r * 0.20, _rgba((255, 255, 255), 150))
     d.arc([cx - r, cy - r, cx + r, cy + r], start=20, end=150, fill=_rgba(p.stroke, 120), width=max(1, lw // 2))
 
+@icon("ws_parts")
+def draw_ws_parts(d, cell, p):
+    """Workspace tab: Parts Library — a stocked pair: hex bolt + cog.
+    Only two silhouettes on purpose: the crate-of-everything motif is already
+    `parts_all`, and a third body smears into mush at the 20 px rail size."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # Hex bolt (neutral stroke) — the library's signature fastener. The head is a
+    # FLAT-TOP hex squashed ~15% vertically: a regular point-up hex this small
+    # LANCZOS-downsamples into a circle and the glyph then reads as a magnifier.
+    bx = s * 0.30
+    hrx, hry = s * 0.245, s * 0.205
+    head = [(bx + hrx * math.cos(math.radians(i * 60)),
+             s * 0.25 + hry * math.sin(math.radians(i * 60))) for i in range(6)]
+    d.polygon(head, fill=_rgba(p.stroke, 70))
+    d.line(head + [head[0]], fill=p.stroke, width=lw)
+    d.rectangle([bx - s * 0.08, s * 0.44, bx + s * 0.08, s * 0.82],
+                fill=_rgba(p.stroke, 55), outline=p.stroke, width=lw)
+    for i in range(2):
+        y = s * (0.56 + i * 0.13)
+        d.line([(bx - s * 0.125, y), (bx + s * 0.125, y + s * 0.05)],
+               fill=p.stroke, width=lw)
+    # Cog (accent) — the second stocked component.
+    cx, cy = s * 0.71, s * 0.63
+    ro, ri = s * 0.23, s * 0.15
+    teeth = 7
+    cog = []
+    for i in range(teeth * 2):
+        a = math.radians(i * 180.0 / teeth - 90)
+        rad = ro if i % 2 == 0 else ri
+        cog.append((cx + rad * math.cos(a), cy + rad * math.sin(a)))
+    d.polygon(cog, fill=_rgba(p.accent, 110))
+    d.line(cog + [cog[0]], fill=p.accent, width=lw)
+    # Bore punched clean through (alpha 0, as in draw_hole_wizard): a solid-filled
+    # cog collapses into a teal blob once downsampled to 20 px.
+    filled_circle(d, cx, cy, s * 0.072, (0, 0, 0, 0))
+    circle(d, cx, cy, s * 0.072, outline=p.accent, lw=max(1, lw // 2))
+
+@icon("ws_manufacture")
+def draw_ws_manufacture(d, cell, p):
+    """Workspace tab: Manufacture — an end mill cutting into stock.
+    The stock stays neutral and the cutter carries the accent; drawn in one
+    tone the tool sinks into the block at 20 px and the pair reads as one lump."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    shaded_prism(d, s, s * 0.08, s * 0.74, s * 0.64, s * 0.14, s * 0.13, s * 0.10, p, accent=False)
+    cx = s * 0.50
+    # shank
+    d.rectangle([cx - s * 0.07, s * 0.06, cx + s * 0.07, s * 0.32],
+                fill=_rgba(p.stroke, 45), outline=p.stroke, width=lw)
+    # cutter body with a chamfered tip biting the stock top face
+    body = [(cx - s * 0.125, s * 0.32), (cx + s * 0.125, s * 0.32),
+            (cx + s * 0.125, s * 0.62), (cx + s * 0.05, s * 0.72),
+            (cx - s * 0.05, s * 0.72), (cx - s * 0.125, s * 0.62)]
+    d.polygon(body, fill=_rgba(p.accent, 110))
+    d.line(body + [body[0]], fill=p.accent, width=lw)
+    # Two flutes only (three fill in solid at 20 px), drawn at FULL alpha: the
+    # atlas paste premultiplies (RGB*a, a^2), so a translucent stroke here bakes
+    # down into one dark bar instead of two bright helical lines.
+    for i in range(2):
+        x0 = cx - s * 0.085 + i * s * 0.085
+        d.line([(x0, s * 0.62), (x0 + s * 0.055, s * 0.36)],
+               fill=p.stroke, width=max(1, lw // 2))
+
 # ---- Appearance ----
 
 @icon("color_picker")
@@ -4076,6 +4144,16 @@ def main():
             has_px = sample.getbbox() is not None
         if has_render or has_px:
             ro.add(name)
+    # ...but a carried-forward name is a LIE once this script draws that cell as a
+    # glyph. _preserve_rendered_tiles() only restores _is_rendered_name() tiles, so
+    # any other raster_only entry that we hold a drawer for was just overwritten
+    # with flat line art — and icons_sdf::build() skips SDF for raster_only names,
+    # which would ship the new glyph as an untintable blurry blit. Bit ws_parts /
+    # ws_manufacture: icon_pipeline had listed them here years before they had any
+    # cell at all. Drop exactly those; dangling names with no cell stay so a later
+    # icon_pipeline injection still self-heals.
+    ro -= {n for n in ro
+           if not _is_rendered_name(n) and n in _REGISTRY and n in set(CONTRACT_NAMES)}
 
     json_data = {
         "atlas_px": [atlas_w, atlas_h],

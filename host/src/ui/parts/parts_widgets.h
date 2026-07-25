@@ -17,9 +17,12 @@ struct PartsItem;
 // Minimal base64 decode for parts_thumbnail image_b64 payloads.
 std::vector<unsigned char> b64decode(const std::string& in);
 
-// Section header: h2 font label + accent underline. firstInPane=true sits flush at the pane
-// top (no leading gap); subsequent headers add breathing room above.
-void sectionHeader(const char* label, bool firstInPane = false);
+// Section header: optional accent glyph + h2 label + optional right-aligned dim `trailing`
+// text (counts/state), closed by an accent-to-transparent rule spanning the pane.
+// firstInPane=true sits flush at the pane top (no leading gap); subsequent headers add
+// breathing room above.
+void sectionHeader(const char* label, bool firstInPane = false, const char* icon = nullptr,
+                   const char* trailing = nullptr);
 
 // Scoped horizontal content inset (ui::metrics::partsPadX — the ONE inset of this workspace).
 // Everything drawn inside the scope lands on the pane's TEXT line: the line sectionHeader puts
@@ -60,6 +63,18 @@ void partIconDraw(ImDrawList* dl, ImVec2 center, float sizePx, const std::string
 //   size.x<=0 → content width; size.y<=0 → frame height. Returns clicked.
 bool borderRow(const char* strId, const char* label, const char* icon, bool selected,
                ImVec2 size, bool centerText, float rounding = 6.f);
+
+// Pill toggle chip (facet values, quick filters). Unlike borderRow it paints a RESTING
+// surface, so a wrapped block of them reads as a set of options rather than loose words,
+// and it is sized from its own text so nothing is ever clipped. Caller handles PushID.
+bool  chipToggle(const char* strId, const char* label, bool active);
+float chipWidth(const char* label);   // exact footprint — use this for wrap arithmetic
+float chipPadX();
+float chipHeight();
+
+// Dim field label on the pane's content line (partsPadX). Plain TextDisabled would sit a
+// frame padding left of the widget it labels — the "label and body don't line up" defect.
+void fieldLabel(const char* text);
 
 // Border treatment for MULTI-WIDGET rows (vendor cards, queue rows, API providers) where an
 // InvisibleButton would eat the inner buttons: paints resting glass surface + hover/selected

@@ -4,11 +4,13 @@
 // expand + select, re-click on the selected parent = collapse. Expanded set persists via
 // settings.partsExpandedCats. Falls back to the flat parts_list_categories 2-level list when
 // the worker doesn't speak parts_taxonomy.
+#include <cstdio>
 #include <string>
 
 #include "imgui.h"
 
 #include "core/app_state.h"
+#include "ui/metrics.h"   // ui::metrics::partsPadX — the ONE horizontal gutter of this workspace
 #include "ui_theme.h"
 
 #include "parts_internal.h"
@@ -41,13 +43,18 @@ void pickNode(AppState& st, const std::string& id) {
     doSearch(st);  // browse-on-click, even with an empty query
 }
 
+// One geometric indent step per taxonomy level (dp; scale at the callsite).
+constexpr float kIndentDp = 14.0f;
+
 // Right-aligned expand chevron over the row rect (drawlist triangle; rotates when expanded).
+// Expanded is tinted accent so an open branch is readable from the chevron alone — a uniformly
+// disabled-grey chevron made the pane's open/closed state depend entirely on the rotation.
 void rowChevron(ImVec2 mn, ImVec2 mx, bool expanded) {
     const float sc = ui::uiScale;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 c(mx.x - 12.0f * sc, (mn.y + mx.y) * 0.5f);
     const float r = 3.5f * sc;
-    ImU32 col = Palette::toU32(palette.textDisabled);
+    ImU32 col = Palette::toU32(expanded ? palette.accent : palette.textDim);
     if (expanded)  // pointing down
         dl->AddTriangleFilled(ImVec2(c.x - r, c.y - r * 0.6f), ImVec2(c.x + r, c.y - r * 0.6f),
                               ImVec2(c.x, c.y + r), col);
@@ -69,7 +76,18 @@ void drawNode(AppState& st, const TaxNode& node, int depth) {
     bool clicked = borderRow("##node", node.label.c_str(), icon, sel,
                              ImVec2(0, rowH), /*centerText=*/false);
     if (depth == 0 && S().fonts && S().fonts->medium) ImGui::PopFont();
-    if (kids) rowChevron(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), open);
+    const ImVec2 rowMin = ImGui::GetItemRectMin();
+    const ImVec2 rowMax = ImGui::GetItemRectMax();
+    if (kids) rowChevron(rowMin, rowMax, open);
+    // Depth guide: every level is a bare 14dp geometric indent, so a deep branch read as a
+    // ragged left edge with no hint of what owns what. One hairline per level, half a step
+    // left of the row and stretched over the inter-row gap so the segments join into a rule.
+    if (depth > 0) {
+        const float gx = rowMin.x - kIndentDp * sc * 0.5f;
+        ImGui::GetWindowDrawList()->AddLine(
+            ImVec2(gx, rowMin.y - ImGui::GetStyle().ItemSpacing.y), ImVec2(gx, rowMax.y),
+            Palette::toU32(palette.border), 1.0f * sc);
+    }
     ImGui::PopID();
 
     if (clicked) {
@@ -83,9 +101,9 @@ void drawNode(AppState& st, const TaxNode& node, int depth) {
     }
 
     if (open) {
-        ImGui::Indent(14.0f * sc);
+        ImGui::Indent(kIndentDp * sc);
         for (const auto& c : node.children) drawNode(st, c, depth + 1);
-        ImGui::Unindent(14.0f * sc);
+        ImGui::Unindent(kIndentDp * sc);
     }
 }
 
@@ -93,11 +111,29 @@ void drawNode(AppState& st, const TaxNode& node, int depth) {
 
 void drawTaxonomyPane(AppState& st, float paneW) {
     const float sc = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 2 * sc));  // symmetric inner margins
+    // One gutter token for the whole workspace: the results column and the filters pane use
+    // partsPadX too, so the three panes' content lines agree instead of drifting by a pixel.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::partsPadX(), 2.0f * sc));
     ImGui::BeginChild("##parts_cats", ImVec2(paneW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
-    sectionHeader("Categories", /*firstInPane=*/true);
+    // Count rides in the header's trailing slot (never baked into the label) — nullptr while
+    // the tree is still loading so the header does not flash a "0".
+    char catCount[16];
+    const char* catTrailing = nullptr;
+    int rootCount = 0;
+    if (S().taxonomyIsTree) {
+        rootCount = (int)S().taxonomyRoot.children.size();
+    } else {
+        for (const auto& c : S().categories)
+            if (c.parentId.empty()) ++rootCount;
+    }
+    if (rootCount > 0) {
+        std::snprintf(catCount, sizeof(catCount), "%d", rootCount);
+        catTrailing = catCount;
+    }
+    sectionHeader("Categories", /*firstInPane=*/true, "parts_all", catTrailing);
 
     const bool retrying = S().taxonomyAttempts > 0 && S().taxonomyRetryAt > 0.0;
     if (S().taxonomyLoading || (S().categoriesLoading && !S().taxonomyIsTree) || retrying) {
@@ -164,6 +200,10 @@ void drawTaxonomyPane(AppState& st, float paneW) {
             }
         }
     }
+
+    // Bottom breathing room: without it the last root category sits flush against the pane
+    // edge and reads as a clipped list rather than the end of one.
+    ImGui::Dummy(ImVec2(0, 8.0f * sc));
 
     ImGui::EndChild();
 }

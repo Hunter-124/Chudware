@@ -66,8 +66,12 @@ MSG_VERIFY_BATTERY = (
     "with check='verify_battery' and a non-empty reason) before declaring done."
 )
 MSG_INTERFERENCE = (
-    "HARD guardrail: run check_interference (or waive with check="
-    "'check_interference' + reason) before declaring an assembly/multi-body done."
+    "HARD guardrail: prove no clashes before declaring an assembly/multi-body "
+    "done. Run check_interference, or — if it is not on your tool list — "
+    "verify_battery(doc_id, checks=['check_interference']), which covers it. "
+    "(A plain verify_battery(doc_id) does NOT: the default battery runs only "
+    "subsecond checks and check_interference is cost-class 'seconds'.) "
+    "Otherwise waive with check='check_interference' + reason."
 )
 MSG_ORPHAN_SKETCH = (
     "HARD guardrail: orphan sketch(es) remain unconsumed. Extrude/revolve them, "

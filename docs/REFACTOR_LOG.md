@@ -4042,3 +4042,50 @@ Verified: full `services/agent` suite 2358 passed with the same 5 pre-existing f
 as a stashed baseline (openrouter key, project_memory ×2, router plm_checkpoint order
 pollution, routing.yaml missing a `general_agent` row — all untouched by this work);
 `scripts/check.py` 6/6 gates PASS; trace payloads replayed headlessly.
+
+## 2026-07-25 — Agent harness sweep II: dead tool advertisements, producer budgets, artifact-gated done
+Four parallel read-only audits over `services/agent` + `services/dag`, then verified each claim
+before acting. Everything fixed here is the same shape as the earlier `f170dfa5` batch: the
+harness advertises a capability, dispatches it, and it cannot succeed. (1) DEAD TOOL
+ADVERTISEMENTS — 11 tools named on role cards resolved nowhere, so every call failed with
+"could not be resolved" and no rephrasing recovered: `general_agent`'s own `mission_start`
+(its prompt explicitly tells the model to call it to escalate a multi-part build),
+`department_manager`'s `channel_send`/`request_resolve`/`council_convene` (org_tools.py was
+fully implemented but no module ever registered it — and `roles.FEATURE_FLAGGED_TOOLS`'s
+comment wrongly claimed it had landed), `sourcing_specialist`'s `bom_price`/`bom_rollup`,
+`orchestrator`'s `dag_run`/`dag_status`/`dag_replan`, `cam_programmer`'s mandated `cam_audit`
+gate, `sketch2d`'s `render_sketch`, `re_datasheet_reader`'s `match_part_number`/
+`spec_sheet_match`, `feature_architect`'s `advisory_dispute`. All wired into
+`reviewer_exec._resolve_extra`; a new anti-drift test resolves EVERY tool on EVERY role card
+through the real dispatch path (365 entries / 32 cards, 0 dead). A glob over
+`services/mcp/*_tools.py` is not evidence of registration — that false signal is exactly why
+org_tools sat dead. (2) PRODUCER BUDGET STARVATION — the `_BUILD_ROLES` name list that starved
+model3d also omitted cam_programmer/sim_engineer/drawing_detailer, whose own cards mandate
+11-16 calls against `max(4, min(12, granted//2000))` — an absolute ceiling of 12. Worse, the
+DAG path never consulted the floor at all: `context_pack["max_tools_per_turn"]` has no writer
+anywhere, so every graph node fell through to agent_turn's flat role-blind default of 16. Both
+paths now share `services/agent/tool_budget.py` (floor 16, detected on the TOOL GRANT first so
+a rename cannot silently re-starve a role). (3) FABRICATED SUCCESS — `ledger_note` is in
+`_PRODUCTIVE_TOOLS` (it IS the deliverable for PLAN nodes), and CAM/sim/drawing have no
+recognized bootstrap opener, so a turn whose only successful call was a ledger row returned
+`status: done` with zero artifacts. `_ARTIFACT_PRODUCT_GATES` now requires the role's granted
+product tool to have actually run. (4) DEAD RETRY RESCUE — agent_turn rewrites a transient
+429/5xx from `failed` to `provider_error` so the GUI won't mislabel it, which made
+node_runner's retryable rescue (matching the literal `failed`) unreachable; every transient
+hiccup hard-escalated on first occurrence with retry budget untouched. `provider_error` and
+`phase_step_cap` added to `_RETRY_REASONS`. (5) UNSATISFIABLE GUARDRAIL — WI-13 told
+model3d/feature_modeler to "run check_interference", a tool neither holds (both sit exactly at
+the 14-tool cap), and a bare `verify_battery(doc_id)` runs only subsecond checks while
+check_interference is cost-class `seconds`; the remedy now names
+`verify_battery(doc_id, checks=['check_interference'])`, which they can call and which
+`_battery_covers_interference` already accepts. Also enforced Hunter's standing rule that no
+sub-agent dispatches above `high` effort: `role_models.clamp_subagent_effort` applied in both
+dispatchers (`cfg_pick = dict(cfg)` inherited a Settings-level `max` whenever the per-role
+resolver returned None — verified live by neutering the clamp). Suites: 2633 passed with the
+same 4 pre-existing failures as a stashed baseline (openrouter key + project_memory ×2 +
+router plm_checkpoint order-pollution, all traced to another session's in-flight
+omp_bridge_provider work); `scripts/check.py` 6/6 PASS. NOT fixed, reported instead:
+WI-12 auto-checkpoint has no waiver path and can permanently block close_part on a doc whose
+doc_checkpoint RPC fails; guardrail-blocked done attempts still report `no_code`;
+`run_linear_role_turn` has no handoff-synthesis rescue; `delegate` never threads the caller's
+node id so every spawn lands at depth 1 and the depth rails never trip.

@@ -879,28 +879,15 @@ class MissionDispatch:
                 except Exception:  # noqa: BLE001
                     _cap = None
             _phase = self.phase or str(node.get("phase") or node.get("stage") or "") or None
-            # mega-6 BUILD mortality: geometry workers need enough tool steps to
-            # reach new_part/add_features (read ledger → new_part → add_features
-            # → measure is ≥4). Raise the floor for feature-class roles.
-            _BUILD_ROLES = {
-                "feature_modeler", "geometry_designer", "sketcher",
-                "assembly_fit_engineer", "layout_engineer",
-                # model3d/sketch2d are the roles loop.py and role_catalog
-                # actually tell the main agent to delegate 3D/2D work to, yet
-                # they were missing here — so the most-recommended build role
-                # ran on the bare derived budget (12k granted → 6 calls) and
-                # died at max_iters before it could finish a part.
-                "model3d", "sketch2d", "re_modeler", "fixer",
-            }
-            _BUILD_MIN_CALLS = 10
-            # Role names drift; the tool grant does not. Anything holding a
-            # geometry mutator is a build worker whatever its card is called.
-            _is_build = (
-                role in _BUILD_ROLES
-                or str(_phase or "").lower() in (
-                    "build", "feature", "geometry", "layout", "assembly")
-                or any(t in (allowed or ()) for t in ("new_part", "add_features"))
-            )
+            # Producer roles need room for their whole mandated chain. The role
+            # list + floor live in tool_budget so this path and the DAG path
+            # (services/dag/node_runner.py) cannot drift apart again — that
+            # drift is what starved model3d, and it still starved
+            # cam_programmer / sim_engineer / drawing_detailer, whose cards
+            # mandate 11-16 calls against an absolute ceiling of 12.
+            from services.agent import tool_budget as _tb  # noqa: PLC0415
+            _BUILD_MIN_CALLS = _tb.PRODUCER_MIN_CALLS
+            _is_build = _tb.is_producer_role(role, allowed, _phase)
             if _is_build:
                 max_calls = max(max_calls, _BUILD_MIN_CALLS)
             if _cap is not None:

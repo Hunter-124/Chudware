@@ -109,7 +109,9 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
     # builds.  Same one-FastMCP-per-module pattern; still ONE process-wide registry.
     for module_key in ("files", "shell", "plm", "gsl", "parts", "ledger", "preflight",
                        "regen", "buildgraph", "intake", "designreview", "req", "cost",
-                       "structural", "dimscheme", "workspace", "firmware", "em", "antenna"):
+                       "structural", "dimscheme", "workspace", "firmware", "em", "antenna",
+                       "mission", "org", "sourcing", "dag", "advisor", "camaudit",
+                       "spec", "sketch3d"):
         fn = _resolve_extra(module_key, tool)
         if fn is not None:
             return fn
@@ -223,6 +225,49 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 # plm_* — the project_organizer role card (contract §7 envelope).
                 from mcp_server.plm_tools import register_plm_tools
                 register_plm_tools(mcp)
+            elif module_key == "mission":
+                # general_agent.yaml advertises mission_start AND its prompt tells
+                # the model to call it to escalate a real multi-part build — but
+                # the name resolved nowhere, so the universal entry role's own
+                # escalation path failed 100% of the time with "could not be
+                # resolved" and no rephrasing could recover it.
+                from mcp_server.mission_tools import register_mission_tools
+                register_mission_tools(mcp)
+            elif module_key == "org":
+                # department_manager.yaml advertises channel_send/request_resolve/
+                # council_convene (aicad.org/1 §18). org_tools implements them but
+                # nothing ever registered the module.
+                from mcp_server.org_tools import register_org_tools
+                register_org_tools(mcp)
+            elif module_key == "sourcing":
+                # sourcing_specialist.yaml advertises bom_price/bom_rollup.
+                from mcp_server.sourcing_tools import register_sourcing_tools
+                register_sourcing_tools(mcp)
+            elif module_key == "dag":
+                # orchestrator/overseer cards advertise dag_run/dag_status and
+                # dag_replan — the orchestrator's whole execution surface.
+                from services.dag.mcp_tools import (
+                    register_dag_replan_tools,
+                    register_dag_tools,
+                )
+                register_dag_tools(mcp)
+                register_dag_replan_tools(mcp)
+            elif module_key == "advisor":
+                # feature_architect advertises advisory_dispute (contract §9.3).
+                from mcp_server.advisor_tools import register_advisor_tools
+                register_advisor_tools(mcp)
+            elif module_key == "camaudit":
+                # cam_programmer's mandated final gate.
+                from mcp_server.cam_audit import register_cam_audit_tools
+                register_cam_audit_tools(mcp)
+            elif module_key == "spec":
+                # re_datasheet_reader: match_part_number / spec_sheet_match.
+                from mcp_server.spec_tools import register_spec_tools
+                register_spec_tools(mcp)
+            elif module_key == "sketch3d":
+                # sketch2d advertises render_sketch (its own preview tool).
+                from mcp_server.sketch3d_tools import register_sketch3d_tools
+                register_sketch3d_tools(mcp)
             else:
                 return None
             _EXTRA_MCP[module_key] = mcp

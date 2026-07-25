@@ -6726,6 +6726,30 @@ def _ecad_sanitize_wire_args(args: dict, calls: list) -> dict:
 
 
 
+# Artifact-producing roles with NO recognized bootstrap opener. new_part /
+# ecad_new_schematic / fw_new_project each pair an opener with a product tool
+# below, so a half-finished chain is caught. CAM / simulation / drawing have no
+# such opener, so a turn whose only successful call was ledger_note sailed past
+# every check and auto-completed as `status: done` with zero artifacts —
+# ledger_note is in _PRODUCTIVE_TOOLS (it IS the deliverable for PLAN nodes),
+# so `wrote` was True and nothing corrected it. The harness reported a CAM
+# program / FEA study / drawing package that does not exist.
+_ARTIFACT_PRODUCT_GATES: tuple[tuple[frozenset, str], ...] = (
+    (frozenset({"cam_generate", "cam_post"}),
+     "no toolpath exists — cam_generate/cam_post never ran. A CAM role cannot "
+     "declare done off ledger/read calls alone: cam_generate, then cam_simulate "
+     "and cam_post."),
+    (frozenset({"run_fea_static", "run_fea_modal", "run_cfd_flow"}),
+     "no study was run — run_fea_static/run_fea_modal/run_cfd_flow never ran. A "
+     "simulation role cannot declare done off ledger/read calls alone: run the "
+     "study, then describe_results."),
+    (frozenset({"make_drawing", "export_drawing"}),
+     "no drawing sheet exists — make_drawing/export_drawing never ran. A drawing "
+     "role cannot declare done off ledger/read calls alone: make_drawing, place "
+     "the views, then export_drawing."),
+)
+
+
 _BOOTSTRAP_OPENERS = frozenset({
     "new_part", "ecad_new_schematic", "fw_new_project",
 })
@@ -6821,6 +6845,12 @@ def _bootstrap_incomplete(
             "fw_new_project without fw_build — project scaffold is not "
             "firmware product success (mega-11). Call fw_build next."
         )
+    # Opener-less artifact roles (CAM / simulation / drawing): the role is
+    # granted the product tools but ran none of them, so whatever it wrote was
+    # ledger/read chatter, not the deliverable.
+    for product, remedy in _ARTIFACT_PRODUCT_GATES:
+        if (product & allow_set) and not (ok_tools & product):
+            return remedy
     return None
 
 

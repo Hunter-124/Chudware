@@ -60,8 +60,14 @@ VERDICT_ESCALATE = "escalate"
 
 # stop_reason values that map to done
 _DONE_REASONS = frozenset(["confirmed", "stabilized"])
-# stop_reason values that map to retry
-_RETRY_REASONS = frozenset(["max_iters"])
+# stop_reason values that map to retry.
+# provider_error: agent_turn rewrites a transient 429/5xx/timeout from "failed"
+#   to "provider_error" right before returning (so the GUI does not mislabel it
+#   as budget exhaustion) — which meant the mega-5 retryable rescue below, which
+#   matches on the literal "failed", could never fire and every transient hiccup
+#   hard-escalated on its FIRST occurrence with retry budget untouched.
+# phase_step_cap: a capability-tier step ceiling, same class as max_iters.
+_RETRY_REASONS = frozenset(["max_iters", "provider_error", "phase_step_cap"])
 # stop_reason values that map to escalate (failed build / no model output / auth)
 _ESCALATE_REASONS = frozenset(["failed", "no_code", "provider_auth"])
 
@@ -557,6 +563,22 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
                 max_tools = int(env_cap)
             except ValueError:
                 max_tools = None
+    # ...then the producer floor. `max_tools_per_turn` has no writer anywhere in
+    # the tree, so before this every graph node — model3d, cam_programmer,
+    # ecad_engineer alike — fell through to agent_turn's flat, role-blind
+    # default of 16, and the BUILD floor applied on the delegate path never
+    # reached graph execution at all. Same helper both paths (tool_budget).
+    if not os.environ.get("CHUDWARE_AGENT_MAX_TOOL_CALLS"):
+        try:
+            from services.agent import tool_budget as _tb  # noqa: PLC0415
+            max_tools = _tb.floor_for(
+                context_pack.get("role_id") or node_name,
+                allowed_tools,
+                str(context_pack.get("phase") or "") or None,
+                base=max_tools,
+            )
+        except Exception:  # noqa: BLE001 — floor is best-effort, never blocks
+            pass
 
     # T-W32: render the §9.1 tools slot — trimmed schemas for EXACTLY the node's
     # allowed tools, within the tier's budgets.tools, resolved through the SAME

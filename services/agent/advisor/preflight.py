@@ -291,6 +291,13 @@ def _check_refs_resolve(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
         # If doc_tree fails, skip this check rather than false-fail.
         return []
 
+    # The clone carries the LIVE tree only — the planned ops have not been
+    # applied to it — so a ref to a feature an earlier op in this same batch
+    # creates is legitimate. Accumulate declarations as we walk (mirrors
+    # guardrails.check_refs_resolve_ids, which hard-blocks on the same rule).
+    from services.agent.guardrails import declared_by_op
+
+    declared: set[str] = set()
     for op in ops:
         if not isinstance(op, dict):
             continue
@@ -300,8 +307,10 @@ def _check_refs_resolve(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
             if isinstance(ref_val, dict):
                 ref_id = ref_val.get("id") or ref_val.get("feature")
                 if ref_id and not ref_id.startswith("$") and \
-                   ref_id not in known_ids and ref_id not in known_names:
+                   ref_id not in known_ids and ref_id not in known_names and \
+                   ref_id not in declared:
                     missing.append(ref_id)
+        declared |= declared_by_op(op)
 
     if missing:
         checks.append({

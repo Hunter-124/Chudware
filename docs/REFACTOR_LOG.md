@@ -4013,3 +4013,32 @@ verified no-regression via stash A/B; verify message meta live in the app.
 
 ## 2026-07-23 — Agent harness overhaul: tool floors, admin routing, sidecar lifecycle, tab-crash hardening, PLM diffs
 Root-caused the 3x "AI can't touch files" failures (forensics in ~/.local/share/AI-CAD/chat_history.json): "rename GA to general assembly" keyword-misrouted cleanup asks into the CAD build swarm whose role cards carry only doc-ops. Fixes: (1) contracts/copilot_modes.json gained `agent_default_tools` (fs_write/fs_edit/fs_list/run_shell/research_fetch_page — main-agent floor for unrestricted modes, survives role-card narrowing) and `subagent_default_tools` (full fs family for every DAG node/subagent); wired through copilot_mode_tools.py, roles.py apply_tool_policy, mission_dispatch.py, and C++ copilot_modes.cpp with parity tests both sides. (2) workflow_router.py TaskClass.PROJECT_ADMIN (matched ahead of `assembl\w*`) + roles/project_organizer.yaml + mission_dispatch.route_request/run_linear_role_turn; live C++ path (run.cpp admin pre-flight) now EXECUTES admin asks via a one-shot `python -m services.worker_main` agent_admin_turn RPC (worker_rpc.py) instead of refusing — offline/worker-failure falls back to the old blocked reply. (3) Sidecar lifecycle: omp_bridge_client + worker_bridge spawn with setpgid+PR_SET_PDEATHSIG+close_range fd hygiene; new C-ABI `chudware_agent_sidecars_shutdown` (libchudware.h append) reached from hostd main.cpp shutdown tail via cpp_core dlsym (missing-symbol tolerant); bridge.ts got SIGTERM handler + ppid-watchdog; omp_bridge.py got preexec pdeathsig + atexit. (4) Tab-switch crash: s_asm_tess_cache switched to shared_future find-or-install (TShape pinning kept), doc-GC reap now atomic under registry lock (doc_registry.reapUnderLock), GUI coalesces doc_activate storms (pending-slot, ≤2 activations per burst) and brakes reconnect crash-loops (3 reconnects/60s ⇒ no auto-activate). (5) PLM: services/plm/ecad_diff.py (id-based nets/components/footprints/tracks), office docs diff via office_extract in generic_compare, ssh/https/file remote sync via dulwich (kind gate removed; CAS semantics preserved), plm_tools plm_compare parity with worker_rpc. Deferred (scouted, not built): PLM merge-conflict UI, unified code-item story (link vs tree vs Git tab), generic-item restore UX; engine caches still never evict (pre-existing). Pre-existing test failures NOT from this wave (verified via stash A/B): test_project_memory x2, asm_fea x2, ecad_packs thermal, reveng fit stub, verify_battery x3, ctest firmware.
+
+## 2026-07-25 — Agent harness: same-batch ref guardrail, unbound run ledger, build-role call budget
+Root-caused three independent failures from one live `model3d` mud-bucket run, all of
+which made a basic build prompt unfinishable. (1) `guardrails.check_refs_resolve_ids`
+validated every op ref against the PRE-batch doc tree only, so the normal authoring
+shape — `[add OuterBody, add InnerCut, boolean target=OuterBody]` — was a HARD block on
+"Missing: OuterBody" that no retry could satisfy (bench logs show the same for `Flange`,
+`Ffa9a6e`). Ops are now walked in order and each op's declarations (`declared_by_op`,
+now public) join the known set for the ops that FOLLOW it; forward refs and
+never-declared names still block. The block message also appends the refs that DO
+resolve (or, on an empty doc, how batch-local refs work) — a bare "Missing: X" gave the
+model nothing to converge on and it burned the turn on name variants.
+`advisor/preflight.py::_check_refs_resolve` had the identical gap (it clones the live
+tree WITHOUT the planned ops) and now shares the helper. (2) `MissionDispatch._ledger`
+returned `self.ledger`, which is None on the `general_agent` linear entry — every
+non-mission run advertised `ledger_get`/`ledger_note` on its role card and failed 100%
+of calls with "no ledger bound to this mission run". It now lazily binds the run's own
+on-disk `Ledger.load(run_id)`, memoized so `_run_subagent` hands children the same
+object; a run with no run_id keeps the structured error. (3) `_run_subagent` derives
+`max_tool_calls` as `tokens_granted // 2000` (12k → 6) and floored only five
+pipeline-era role names — omitting `model3d`/`sketch2d`, the exact roles `loop.py` and
+`role_catalog` tell the main agent to delegate to, so the most-recommended build role
+died at `max_iters` after 6 calls. Added them plus `re_modeler`/`fixer`, raised the
+build floor 8→10, and made the floor also trigger on the tool grant (`new_part`/
+`add_features` in the allowlist) so role-name drift can't silently reintroduce it.
+Verified: full `services/agent` suite 2358 passed with the same 5 pre-existing failures
+as a stashed baseline (openrouter key, project_memory ×2, router plm_checkpoint order
+pollution, routing.yaml missing a `general_agent` row — all untouched by this work);
+`scripts/check.py` 6/6 gates PASS; trace payloads replayed headlessly.

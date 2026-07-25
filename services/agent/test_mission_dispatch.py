@@ -167,8 +167,22 @@ class TestLedgerTools:
                              run_id="someone_elses_run")
         assert out["ok"] is True and out["run_id"] == "t_w32_run"
 
-    def test_no_ledger_is_structured_error(self, cache_root):
+    def test_unbound_ledger_is_lazily_created_for_the_run(self, cache_root):
+        """An advertised tool must not fail 100% of the time: a dispatch built
+        without a ledger (the general_agent linear entry) binds the run's own
+        on-disk ledger on first use, and the same object is reused."""
         bare = MissionDispatch(run_id="r")
+        assert bare.ledger is None
+        assert bare.ledger_note(kind="note", payload={"text": "hi"})["ok"] is True
+        bound = bare.ledger
+        assert bound is not None and bound.run_id == "r"
+        got = bare.ledger_get()
+        assert got["ok"] is True and got["run_id"] == "r"
+        assert bare.ledger is bound
+
+    def test_no_run_id_is_still_a_structured_error(self):
+        """Nothing to key a ledger on — the structured error stands."""
+        bare = MissionDispatch(run_id="")
         assert bare.ledger_get()["ok"] is False
         assert bare.ledger_note(kind="note", payload={})["ok"] is False
 

@@ -458,7 +458,21 @@ class MissionDispatch:
     def _ledger(self, run_id: str | None = None):
         """The bound ledger.  A model-supplied run_id for a DIFFERENT run is
         ignored in favour of the mission's own — a node never writes outside its
-        run (scoping is the point of this layer)."""
+        run (scoping is the point of this layer).
+
+        Non-mission runs (the general_agent linear entry) build a dispatch with
+        ledger=None while every role card still advertises ledger_get/
+        ledger_note, so those calls failed 100% of the time with "no ledger
+        bound to this mission run".  Bind the run's own on-disk ledger lazily
+        instead of failing an advertised tool; memoized so sub-agents spawned
+        later inherit the same object.
+        """
+        if self.ledger is None and self.run_id:
+            try:
+                from services.agent.ledger import Ledger  # noqa: PLC0415
+                self.ledger = Ledger.load(str(self.run_id))
+            except Exception:  # noqa: BLE001 — fall back to structured error
+                return None
         return self.ledger
 
     # ------------------------------------------------------------------ plan
@@ -851,11 +865,24 @@ class MissionDispatch:
             _BUILD_ROLES = {
                 "feature_modeler", "geometry_designer", "sketcher",
                 "assembly_fit_engineer", "layout_engineer",
+                # model3d/sketch2d are the roles loop.py and role_catalog
+                # actually tell the main agent to delegate 3D/2D work to, yet
+                # they were missing here — so the most-recommended build role
+                # ran on the bare derived budget (12k granted → 6 calls) and
+                # died at max_iters before it could finish a part.
+                "model3d", "sketch2d", "re_modeler", "fixer",
             }
-            if role in _BUILD_ROLES or str(_phase or "").lower() in (
-                "build", "feature", "geometry", "layout", "assembly",
-            ):
-                max_calls = max(max_calls, 8)
+            _BUILD_MIN_CALLS = 10
+            # Role names drift; the tool grant does not. Anything holding a
+            # geometry mutator is a build worker whatever its card is called.
+            _is_build = (
+                role in _BUILD_ROLES
+                or str(_phase or "").lower() in (
+                    "build", "feature", "geometry", "layout", "assembly")
+                or any(t in (allowed or ()) for t in ("new_part", "add_features"))
+            )
+            if _is_build:
+                max_calls = max(max_calls, _BUILD_MIN_CALLS)
             if _cap is not None:
                 try:
                     from services.agent import scaffolds as _sc  # noqa: PLC0415
@@ -867,10 +894,8 @@ class MissionDispatch:
                         max_calls = max(4, min(12, derived))
                     # Re-assert BUILD floor after phase cap so A/B caps don't
                     # starve geometry mutators below enablement threshold.
-                    if role in _BUILD_ROLES or str(_phase or "").lower() in (
-                        "build", "feature", "geometry", "layout", "assembly",
-                    ):
-                        max_calls = max(int(max_calls or 0), 8)
+                    if _is_build:
+                        max_calls = max(int(max_calls or 0), _BUILD_MIN_CALLS)
                 except Exception:  # noqa: BLE001
                     pass
             # WS2/WS4 + mega-5: always attempt per-spawn model assignment with
@@ -1128,7 +1153,7 @@ class MissionDispatch:
                 allowed_tools=allowed,
                 tools_text=tools_text,
                 mission_dispatch=self,
-                ledger=self.ledger, max_tool_calls=max_calls,
+                ledger=self._ledger(), max_tool_calls=max_calls,
                 on_event=self.on_event, run_id=self.run_id,
                 node_id=node_id, subagent_id=node_id,
                 capability=_cap, tier=self.tier, phase=_phase,

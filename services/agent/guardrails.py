@@ -674,15 +674,49 @@ def extract_ops(args: dict | None) -> list[dict]:
     return ops if isinstance(ops, list) else []
 
 
+# Ops that introduce a new feature even without a ``feature`` payload.
+_DECLARING_OPS: frozenset[str] = frozenset({
+    "add_feature", "add", "create", "create_feature", "insert_feature",
+    "add_sketch", "new_sketch", "sketch", "boolean", "combine",
+})
+
+
+def declared_by_op(op: dict) -> set[str]:
+    """Ids/names an op introduces — resolvable by LATER ops in the same batch."""
+    feat = op.get("feature") if isinstance(op.get("feature"), dict) else None
+    kind = str(op.get("op") or op.get("kind") or "").lower()
+    if feat is None and kind not in _DECLARING_OPS:
+        return set()
+    out: set[str] = set()
+    sources = [feat, op] if feat is not None else [op]
+    for src in sources:
+        for key in ("name", "id", "feature_id"):
+            val = src.get(key)
+            if isinstance(val, str) and val and not val.startswith("$"):
+                out.add(val)
+    return out
+
+
 def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
                            known_names: set[str] | None = None) -> list[str]:
     """Return dangling ref ids from *ops* against *known_ids*/*known_names*.
 
     Reuses the advisor/preflight._check_refs_resolve shape without a clone:
     walk feature.refs for non-$ ids not in the known set.
+
+    Ops are walked IN ORDER and each op's declarations join the known set for
+    the ops that FOLLOW it, because an add_features batch is normally authored
+    as "create A, create B, combine A with B". Checking every ref against the
+    pre-batch doc tree alone made that shape a hard block no model could
+    satisfy — the refs it names only exist once the batch applies.
     """
     known_names = known_names or set()
     missing: list[str] = []
+    declared: set[str] = set()
+
+    def _resolves(ref: str) -> bool:
+        return ref in known_ids or ref in known_names or ref in declared
+
     for op in ops:
         if not isinstance(op, dict):
             continue
@@ -709,7 +743,7 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
                     if ref_id.startswith("$"):
                         continue  # pending id map in same batch
                     # Plain-English geometry queries are not stable ids
-                    if ref_id in known_ids or ref_id in known_names:
+                    if _resolves(ref_id):
                         continue
                     # Heuristic: words like "top"/"face" are query predicates, not ids
                     if _looks_like_geom_query(ref_id):
@@ -721,7 +755,7 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
             rid = op.get(id_key)
             if not (isinstance(rid, str) and rid and not rid.startswith("$")):
                 continue
-            if rid in known_ids or rid in known_names:
+            if _resolves(rid):
                 continue
             kind = (op.get("op") or op.get("kind") or "").lower()
             # DESTRUCTIVE ops' target refs must always resolve — WI-15 has no
@@ -735,6 +769,7 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
             if is_destructive_target or id_key != "id":
                 if rid not in missing:
                     missing.append(rid)
+        declared |= declared_by_op(op)
     return missing
 
 
@@ -770,23 +805,55 @@ def known_ids_from_tree(tree: dict | None) -> tuple[set[str], set[str]]:
     return known_ids, known_names
 
 
+def resolve_known_refs(ops: list[dict], doc_id: str | None,
+                       tree_provider: Callable[[str], dict] | None = None,
+                       known: tuple[set[str], set[str]] | None = None,
+                       ) -> tuple[set[str], set[str]] | None:
+    """Known (ids, names) for a ref check, or None when the check must be SKIPPED.
+
+    None is "cannot check" (no doc, engine unavailable) and must never be read
+    as "nothing resolves" — that would false-block every call.
+    """
+    if not ops:
+        return None
+    if known is not None:
+        return known
+    if not doc_id and tree_provider is None:
+        return None  # cannot check — do not false-block
+    tree = _doc_tree(doc_id, tree_provider)
+    if not tree:
+        return None  # engine unavailable — skip (same as preflight soft path)
+    return known_ids_from_tree(tree)
+
+
+def _refs_hint(known: tuple[set[str], set[str]] | None) -> str:
+    """Recovery hint appended to a refs block: name what DOES resolve.
+
+    A bare "Missing: X" gives a model nothing to converge on, so it retries
+    name variants until the turn budget dies. Listing the real refs turns the
+    block into a one-shot correction.
+    """
+    avail = sorted((known[0] | known[1]) if known else set())
+    if not avail:
+        return (" The document has no features yet — create every feature you "
+                "reference within this same ops batch (refs to features added "
+                "by EARLIER ops in the batch do resolve), and name datum "
+                "planes front/top/right.")
+    shown = ", ".join(avail[:20])
+    more = f" (+{len(avail) - 20} more)" if len(avail) > 20 else ""
+    return f" Refs that exist: {shown}{more}."
+
+
 def check_refs_against_doc(ops: list[dict], doc_id: str | None,
                            tree_provider: Callable[[str], dict] | None = None,
                            known: tuple[set[str], set[str]] | None = None,
                            ) -> list[str]:
     """Cheap id-set ref check (WI-15). Empty list = all resolve / skipped."""
-    if not ops:
+    resolved = resolve_known_refs(ops, doc_id, tree_provider=tree_provider,
+                                  known=known)
+    if resolved is None:
         return []
-    if known is not None:
-        known_ids, known_names = known
-    else:
-        if not doc_id and tree_provider is None:
-            return []  # cannot check — do not false-block
-        tree = _doc_tree(doc_id, tree_provider)
-        if not tree:
-            return []  # engine unavailable — skip (same as preflight soft path)
-        known_ids, known_names = known_ids_from_tree(tree)
-    return check_refs_resolve_ids(ops, known_ids, known_names)
+    return check_refs_resolve_ids(ops, resolved[0], resolved[1])
 
 
 # Re-export shape compatible with preflight (for callers that want the same API).
@@ -967,12 +1034,15 @@ def pre_dispatch_refs(tool: str, args: dict | None, *,
     if not ops:
         return None
     doc_id = str(args.get("doc_id")) if isinstance(args, dict) and args.get("doc_id") else None
-    missing = check_refs_against_doc(ops, doc_id, tree_provider=tree_provider, known=known)
+    resolved = resolve_known_refs(ops, doc_id, tree_provider=tree_provider,
+                                  known=known)
+    missing = ([] if resolved is None
+               else check_refs_resolve_ids(ops, resolved[0], resolved[1]))
     if not missing:
         emit_hard_guardrail(ledger, "refs_resolve", "passed",
                             reason="all refs resolve", actor=actor)
         return None
-    msg = MSG_REFS.format(missing=", ".join(missing))
+    msg = MSG_REFS.format(missing=", ".join(missing)) + _refs_hint(resolved)
     emit_hard_guardrail(ledger, "refs_resolve", "blocked",
                         reason=msg, actor=actor)
     return GuardVerdict(ok=False, name="refs_resolve", outcome="blocked",

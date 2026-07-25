@@ -222,6 +222,63 @@ def test_refs_resolve_non_destructive_id_still_bypasses_geom_words():
     assert missing == []
 
 
+def test_refs_resolve_accepts_features_declared_earlier_in_same_batch():
+    """Live trace: [add OuterBody, add InnerCut, boolean target=OuterBody] on a
+    fresh doc was a HARD block on 'Missing: OuterBody' — the ref names a feature
+    the SAME batch creates. This shape must apply."""
+    ops = [
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "OuterBody"}},
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "InnerCut"}},
+        {"op": "boolean", "operation": "subtract",
+         "target": "OuterBody", "tool": "InnerCut"},
+    ]
+    assert gr.check_refs_resolve_ids(ops, known_ids=set(), known_names=set()) == []
+    assert gr.pre_dispatch_refs("add_features",
+                                {"doc_id": "d1", "ops": ops},
+                                known=(set(), set())) is None
+
+
+def test_refs_resolve_still_blocks_a_ref_declared_only_later():
+    """Ordering is the contract: forward references remain dangling."""
+    ops = [
+        {"op": "boolean", "operation": "subtract",
+         "target": "OuterBody", "tool": "InnerCut"},
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "OuterBody"}},
+    ]
+    assert gr.check_refs_resolve_ids(
+        ops, known_ids=set(), known_names=set()) == ["OuterBody"]
+
+
+def test_refs_resolve_still_blocks_a_name_nothing_declares():
+    ops = [
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "OuterBody"}},
+        {"op": "boolean", "operation": "subtract", "target": "Ghost"},
+    ]
+    assert gr.check_refs_resolve_ids(
+        ops, known_ids=set(), known_names=set()) == ["Ghost"]
+
+
+def test_refs_block_message_names_what_does_resolve():
+    """A bare 'Missing: X' gives the model nothing to converge on."""
+    v = gr.pre_dispatch_refs(
+        "add_features",
+        {"doc_id": "d1", "ops": [{"op": "delete_feature", "id": "Ghost"}]},
+        known=({"f1"}, {"Base"}),
+    )
+    assert v is not None and not v.ok
+    assert "Ghost" in v.message
+    assert "Base" in v.message and "f1" in v.message
+
+
+def test_refs_block_message_on_empty_doc_explains_batch_local_refs():
+    v = gr.pre_dispatch_refs(
+        "add_features",
+        {"doc_id": "d1", "ops": [{"op": "delete_feature", "id": "Ghost"}]},
+        known=(set(), set()),
+    )
+    assert v is not None and "same ops batch" in v.message
+
+
 def test_refs_no_waiver():
     """WI-15: pure dangling refs have no waiver path."""
     v = gr.pre_dispatch_refs(

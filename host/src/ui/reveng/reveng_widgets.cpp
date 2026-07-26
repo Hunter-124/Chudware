@@ -26,6 +26,7 @@
 #include "ui_theme.h"
 #include "../icons.h"
 #include "../metrics.h"
+#include "ui/tesseract.h"   // ui::drawTesseractSpinner — the brand mark IS the busy indicator
 
 namespace ui {
 namespace reveng {
@@ -132,7 +133,22 @@ inline const float* levelRole(Level l) {
 }
 
 // ---- small painters -----------------------------------------------------------------------------
+// The kit's one busy primitive, in two regimes. `r` is a RADIUS, so the ink box is `2r`.
+//
+// At or above ui::kTesseractSpinnerMinPx the indicator IS the brand mark, a turning tesseract, so a
+// working RE stage says "working" in the same visual language as the rest of the product. Below it
+// a 16-vertex wireframe collapses into a smudge, so the original 243-degree arc stays. The ~6 dp
+// Level::Busy dots in StatusChip / InlineStatus land in that lower regime at ordinary DPI by
+// design: growing them past the gate would reflow every chip and inline row in the workspace.
 void drawSpinner(ImDrawList* dl, ImVec2 c, float r, float thickness, ImU32 col) {
+    const float box = r * 2.0f;
+    if (box >= ui::kTesseractSpinnerMinPx) {
+        // `thickness` is deliberately dropped here: it was tuned to make a single-stroke ARC
+        // visible, and at that weight 32 edges in a ~20 px box fuse into a solid patch. The mark
+        // derives a stroke from its own size, which is what its legibility ladder was measured at.
+        ui::drawTesseractSpinner(dl, c, box, ImGui::GetTime(), col);
+        return;
+    }
     const float a0 = (float)ImGui::GetTime() * kSpinnerSpeed;
     dl->PathClear();
     dl->PathArcTo(c, r, a0, a0 + IM_PI * kSpinnerSweep, kSpinnerSegs);
@@ -881,13 +897,19 @@ int StepTrack(const char* id, const char* const* labels, const Level* states, in
                 kPulseBase + kPulseAmp * (float)std::sin(ImGui::GetTime() * kPulseSpeed);
             dl->AddCircleFilled(c, nodeR * pulse, roleU32(palette.accent, kNodeHaloA));
         }
-        dl->AddCircleFilled(c, nodeR, roleU32(rl, lv == Level::Neutral ? kNodeIdleA : 1.0f));
-        dl->AddCircle(c, nodeR, roleU32(rl, hovered ? 1.0f : kChipBorderA), 0,
-                      ui::metrics::stroke(1.0f));
-        if (lv == Level::Busy) {
-            drawSpinner(dl, c, nodeR + ui::metrics::stroke(2.5f), ui::metrics::stroke(1.5f),
-                        levelColor(Level::Busy));
+        // The arc this replaced was a ring drawn OUTSIDE the filled node disc. The brand mark
+        // instead fills its whole box, so painting it over the disc in the same colour just
+        // merges into a blob — a busy node therefore BECOMES the mark rather than wearing one.
+        // Below the legibility gate drawSpinner still paints the old ring, so the disc stays.
+        const float busyR    = nodeR + ui::metrics::stroke(2.5f);
+        const bool  busyMark = lv == Level::Busy && busyR * 2.0f >= ui::kTesseractSpinnerMinPx;
+        if (!busyMark) {
+            dl->AddCircleFilled(c, nodeR, roleU32(rl, lv == Level::Neutral ? kNodeIdleA : 1.0f));
+            dl->AddCircle(c, nodeR, roleU32(rl, hovered ? 1.0f : kChipBorderA), 0,
+                          ui::metrics::stroke(1.0f));
         }
+        if (lv == Level::Busy)
+            drawSpinner(dl, c, busyR, ui::metrics::stroke(1.5f), levelColor(Level::Busy));
 
         // Fit the label to its own segment (minus a hair of breathing room) BEFORE centring.
         // Centre-then-clip would trim both ends and leave an unreadable middle fragment.

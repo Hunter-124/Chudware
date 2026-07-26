@@ -16,6 +16,7 @@
 #include "ui_theme.h"
 #include "ui/icons.h"      // ui::drawIconGlass — atlas glyphs on the card preview band
 #include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
+#include "ui/tesseract.h"  // ui::drawTesseractSpinner — the brand mark IS the busy indicator
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -374,6 +375,16 @@ void drawResultsList(AppState& st) {
             ui::glassCardWash(dl, ImVec2(rowPos.x, rowPos.y + (rowH - iconSz) * 0.5f),
                               ImVec2(rowPos.x + iconSz, rowPos.y + (rowH + iconSz) * 0.5f),
                               4.0f, tint, 0.14f + 0.20f * ph, 0.55f);
+            // The wash alone only says "empty, breathing"; the mark turning on top of it is
+            // what says a fetch is running right now. 0.78 of the 18dp slot clears the mark's
+            // legibility floor at 1x while still leaving a margin inside the wash rect — at
+            // 0.55 it fell under the floor and the branch never fired at default DPI.
+            const float markSz = iconSz * 0.78f;
+            if (markSz >= ui::kTesseractSpinnerMinPx)
+                ui::drawTesseractSpinner(
+                    dl, ImVec2(rowPos.x + iconSz * 0.5f, rowPos.y + rowH * 0.5f), markSz,
+                    ImGui::GetTime(),
+                    ImGui::ColorConvertFloat4ToU32(ImVec4(tint[0], tint[1], tint[2], 1.0f)));
         } else {
             partIconDraw(dl, ImVec2(rowPos.x + iconSz * 0.5f, rowPos.y + rowH * 0.5f),
                          iconSz, item.domain);

@@ -6,6 +6,7 @@
 
 #include "imgui.h"
 #include "imgui_internal.h"   // ImHashStr (panelId)
+#include "ui/tesseract.h"     // drawTesseractSpinner — the brand mark doubles as the busy indicator
 
 #include <algorithm>
 #include <cmath>
@@ -1190,6 +1191,32 @@ void drawWindowPillScrollbarV(const AdaptiveSurface& surf, const PillScrollbarSt
     drawScrollPill(ImGui::GetWindowDrawList(), ImVec2(pillX0, trackTop),
                    ImVec2(pillX1, trackBot), thumbTop, thumbBot,
                    /*vertical=*/true, hov, surf, style.thickness);
+}
+
+// Inline busy indicator (see ui_theme.h). One ImGui item pair — a reserved square that the mark
+// is painted into, then the label — so callers keep whatever layout they already had around the
+// old text-only spinner.
+void busyLabel(const char* label, ImU32 col) {
+    if (col == 0)
+        col = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
+    const float box = ImGui::GetTextLineHeight();
+    const ImVec2 p  = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(box, box));
+    // Below the legibility floor the wireframe is a smudge; a filled accent dot at least reads as
+    // a state marker. Only reachable at very small font scales.
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 c(p.x + box * 0.5f, p.y + box * 0.5f);
+    if (box >= kTesseractSpinnerMinPx)
+        drawTesseractSpinner(dl, c, box, ImGui::GetTime(), col);
+    else
+        dl->AddCircleFilled(c, box * 0.25f, col);
+    if (label && *label) {
+        ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextUnformatted(label);
+        ImGui::PopStyleColor();
+    }
 }
 
 // Circular fraction gauge (see ui_theme.h). Pure draw: a full track ring plus an arc that

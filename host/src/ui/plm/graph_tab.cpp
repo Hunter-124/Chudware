@@ -39,6 +39,7 @@
 #include "miniz.h"
 #include "stb_image.h"
 #include "ui/icons.h"
+#include "ui/tesseract.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -1963,17 +1964,24 @@ void drawDashedLine(ImDrawList *dl, ImVec2 a, ImVec2 b, ImU32 col, float thick,
   }
 }
 
-// Rotating arc spinner for the graph canvas overlay. Draw-list only (no
-// widgets), driven by GetTime() so it stays alive while G.loading keeps the
-// frame loop busy via st.rpc.busy(). Visual language matches plmSpinner: accent
-// stroke, ~2 rev/s.
+// Busy indicator for the graph canvas overlay and the pending thumbnails.
+// Draw-list only (no widgets), driven by GetTime() so it stays alive while
+// G.loading keeps the frame loop busy via st.rpc.busy(). Takes a radius, not a
+// box, because its three call sites are all circle-shaped slots.
 void drawArcSpinner(ImDrawList *dl, ImVec2 c, float radius, ImU32 col) {
-  const float t = (float)ImGui::GetTime();
-  const float a0 = t * (4.0f * 3.14159265f); // 2 revolutions per second
-  const float sweep = 3.14159265f * 1.5f;    // 270° arc
-  const float th = std::max(1.5f, radius * 0.18f);
-  dl->PathArcTo(c, radius, a0, a0 + sweep, 24);
-  dl->PathStroke(col, 0, th);
+  const float box = radius * 2.0f;
+  if (box >= ui::kTesseractSpinnerMinPx) {
+    ui::drawTesseractSpinner(dl, c, box, ImGui::GetTime(), col);
+  } else {
+    // Below the mark's legibility floor a 16-vertex wireframe is a smudge, so
+    // the original accent arc stays: ~2 rev/s, 270°.
+    const float t = (float)ImGui::GetTime();
+    const float a0 = t * (4.0f * 3.14159265f);
+    const float sweep = 3.14159265f * 1.5f;
+    const float th = std::max(1.5f, radius * 0.18f);
+    dl->PathArcTo(c, radius, a0, a0 + sweep, 24);
+    dl->PathStroke(col, 0, th);
+  }
 }
 
 // ---- settled-layout cache (solve state) -------------------------------------
@@ -4129,8 +4137,8 @@ void drawListView(AppState & /*st*/, ImVec2 canvasSz) {
   }
   if (G.loading && G.nodes.empty()) {
     ImGui::Dummy(ImVec2(0, 24 * Sc));
-    // Widget spinner (plmSpinner) — same accent-dot language as the rest of
-    // PLM. Continuous redraw while loading is covered by st.rpc.busy() in the
+    // Widget spinner (plmSpinner) — same brand mark as the rest of PLM.
+    // Continuous redraw while loading is covered by st.rpc.busy() in the
     // frame loop.
     plmSpinner("Loading graph");
     ImGui::EndChild();

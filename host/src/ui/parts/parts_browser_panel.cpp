@@ -17,6 +17,7 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"
+#include "ui/tesseract.h"  // ui::drawTesseractSpinner — the brand mark IS the busy indicator
 
 #include "ui/widgets/web_view_backend.h"
 #include "ui/widgets/cef/cef_trace_file.h"
@@ -731,7 +732,16 @@ void drawBrowserPanel(AppState& st) {
                           Palette::toU32(palette.panelBg), 6.0f * sc);
         const char* msg = "Starting sign-in wizard…";
         const ImVec2 ts = ImGui::CalcTextSize(msg);
-        dl->AddText(ImVec2(p0.x + (avail.x - ts.x) * 0.5f, p0.y + avail.y * 0.5f),
+        // Mark + gap + label centred as ONE block: a start that can take seconds needs motion,
+        // and a mark pinned independently of the line would drift apart from it as avail moves.
+        const float mark = 28.0f * sc;
+        const float gap  = 8.0f * sc;
+        const float topY = p0.y + (avail.y - (mark + gap + ts.y)) * 0.5f;
+        const float midX = p0.x + avail.x * 0.5f;
+        if (mark >= ui::kTesseractSpinnerMinPx)
+            ui::drawTesseractSpinner(dl, ImVec2(midX, topY + mark * 0.5f), mark, ImGui::GetTime(),
+                                     Palette::toU32(palette.textDisabled));
+        dl->AddText(ImVec2(midX - ts.x * 0.5f, topY + mark + gap),
                     Palette::toU32(palette.textDisabled), msg);
         ImGui::Dummy(avail);
         return;

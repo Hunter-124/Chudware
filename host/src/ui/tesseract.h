@@ -19,8 +19,9 @@
 //                   "inner cube turning itself inside out".
 //
 //   DoubleRotation  A DOUBLE rotation: two independent turns in two orthogonal 4D planes (xy and
-//                   zw) at different angular rates, so the motion never repeats over a short loop
-//                   and no point of the figure stays fixed. Perspective 4D -> 3D projection.
+//                   zw) at incommensurate rates, so the two planes never realign, the motion has
+//                   no short loop, and — unlike a simple rotation — no direction of the figure
+//                   stays fixed through it. Perspective 4D -> 3D projection.
 //
 //   EightCell       The same simple rotation as the first style, but with an ORTHOGRAPHIC
 //                   4D -> 3D projection. Dropping the perspective divide collapses the two
@@ -50,11 +51,26 @@ inline TesseractAnim tesseractAnimFromInt(int v) {
     return (TesseractAnim)v;
 }
 
-// Draw the mark centred on `center`, inscribed in a `size` x `size` box (the projection is
-// pre-fitted per style so the figure never breathes or clips as it turns). `timeSec` drives the
-// animation — pass ImGui::GetTime(); `col` is the ink (its alpha scales the whole mark, so a
-// status tint works directly). `thickness` in pixels; 0 picks a size-appropriate stroke.
+// Draw the mark centred on `center`, inscribed in a `size` x `size` box: the projection is
+// pre-fitted per style so the figure never breathes or clips as it turns, and the stroke is inset
+// so `size` bounds the INK, not just the vertices. `timeSec` drives the animation — pass
+// ImGui::GetTime(); `col` is the ink (its alpha scales the whole mark, so a status tint works
+// directly). `thickness` in pixels; 0 picks a size-appropriate stroke.
 void drawTesseract(ImDrawList* dl, ImVec2 center, float size, double timeSec,
                    TesseractAnim anim, ImU32 col, float thickness = 0.0f);
+
+// Smallest box in which the mark still reads as a turning solid rather than a smudge (measured on
+// a rendered size ladder). Busy indicators smaller than this — the ~6 dp status dots inside chips
+// and pills — MUST keep their existing arc or dot: a 16-vertex wireframe in 8 px is noise, and
+// shipping one there would be worse than the thing it replaced.
+inline constexpr float kTesseractSpinnerMinPx = 12.0f;
+
+// Busy / loading flavour of the same mark: a fixed style (always the simple rotation, for
+// legibility at indicator sizes), a livelier spin, and a reduced edge set below ~18 px. Use this
+// wherever the product needs to say "working" so every such indicator is the brand mark in
+// motion rather than a generic arc. `size` is the ink box, as above; guard the call with
+// `size >= kTesseractSpinnerMinPx`.
+void drawTesseractSpinner(ImDrawList* dl, ImVec2 center, float size, double timeSec, ImU32 col,
+                          float thickness = 0.0f);
 
 }  // namespace ui

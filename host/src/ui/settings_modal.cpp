@@ -37,6 +37,7 @@
 #include "provider_usage.h"  // ui::UsageAccount/UsageWindow + THE subscription_* poller
 #include "metrics.h"  // ui::metrics::px/stroke — DPI-scaled Settings gutter + usage rings
 #include "tesseract.h"  // ui::drawTesseract + TesseractAnim — Appearance > Brand mark picker
+#include "../ui_theme.h"  // ui::busyLabel — the one inline "working" indicator
 
 
 // ---- C22b prompt editor state ----
@@ -2180,15 +2181,13 @@ static void drawPassRateBar(float rate, float width, float height) {
 
 static void drawBenchStatusLine(AppState& st, float sc) {
     if (s_bench.running) {
-        static const char* kSpin[] = {".  ", ".. ", "...", " ..", "  .", "   "};
-        int frame = (int)(ImGui::GetTime() * 6.0) % 6;
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.accent));
+        char msg[256];
         if (!s_bench.activeCategory.empty())
-            ImGui::Text("Running %s (%s) %s", s_bench.stage.c_str(),
-                        s_bench.activeCategory.c_str(), kSpin[frame]);
+            std::snprintf(msg, sizeof(msg), "Running %s (%s)", s_bench.stage.c_str(),
+                          s_bench.activeCategory.c_str());
         else
-            ImGui::Text("Running %s %s", s_bench.stage.c_str(), kSpin[frame]);
-        ImGui::PopStyleColor();
+            std::snprintf(msg, sizeof(msg), "Running %s", s_bench.stage.c_str());
+        ui::busyLabel(msg);
     } else if (s_bench.stage == "done") {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
         ImGui::TextUnformatted("Done \xe2\x80\x94 leaderboard refreshed");

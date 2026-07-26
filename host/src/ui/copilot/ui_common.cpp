@@ -6,6 +6,7 @@
 // copilot_internal.h.
 
 #include "copilot_internal.h"
+#include "ui/tesseract.h"  // ui::drawTesseractSpinner — the brand mark doubles as the busy art
 
 // ============================ shared small-UI helpers ============================
 bool primaryButton(const char* label, const ImVec2& size) {
@@ -377,9 +378,9 @@ void drawFitReadout(const FitReport& fit, bool detailed) {
     }
 }
 
-// Draw a run-status glyph (spinning comet arc / check / cross / retry ring / pending hollow dot)
-// centered in a `box`-wide cell at the cursor, then advance past it. Shared by the plan checklist
-// and the action cards so every surface shows the same animated status art.
+// Draw a run-status glyph (the turning brand mark while running / check / cross / retry ring /
+// pending hollow dot) centered in a `box`-wide cell at the cursor, then advance past it. Shared by
+// the plan checklist and the action cards so every surface shows the same animated status art.
 void drawStatusGlyph(const std::string& status, float box) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -397,14 +398,23 @@ void drawStatusGlyph(const std::string& status, float box) {
         : fail          ? semanticOnGlass(pal.statusErr, surf)
                         : surf.textTertiary);
     const float th = ui::metrics::stroke(1.6f);
-    if (running) {                              // spinning comet arc
-        float t = (float)ImGui::GetTime();
-        const int seg = 14;
-        for (int s = 0; s < seg; ++s) {
-            float f = (float)s / seg, aa = t * 6.0f + f * 6.2831853f;
-            float al = 0.12f + 0.88f * f;
-            ImU32 cc = (col & 0x00FFFFFFu) | ((ImU32)(al * 255) << 24);
-            dl->AddCircleFilled(ImVec2(c.x + std::cos(aa) * r, c.y + std::sin(aa) * r), th, cc);
+    if (running) {
+        // Busy state is the brand mark in motion, so a running step, the composer and the copilot
+        // header are all visibly the same object.
+        if (box >= ui::kTesseractSpinnerMinPx) {
+            ui::drawTesseractSpinner(dl, c, box, ImGui::GetTime(), col);
+        } else {
+            // Below the mark's legibility floor a 16-vertex wireframe is a smudge, so the original
+            // comet arc stays.
+            float t = (float)ImGui::GetTime();
+            const int seg = 14;
+            for (int s = 0; s < seg; ++s) {
+                float f = (float)s / seg, aa = t * 6.0f + f * 6.2831853f;
+                float al = 0.12f + 0.88f * f;
+                ImU32 cc = (col & 0x00FFFFFFu) | ((ImU32)(al * 255) << 24);
+                dl->AddCircleFilled(ImVec2(c.x + std::cos(aa) * r, c.y + std::sin(aa) * r), th,
+                                    cc);
+            }
         }
     } else if (pass) {                          // check mark
         dl->AddLine(ImVec2(c.x - r * 0.55f, c.y + r * 0.05f),
@@ -424,83 +434,24 @@ void drawStatusGlyph(const std::string& status, float box) {
     ImGui::Dummy(ImVec2(box, box));
 }
 
-// Animated hammer striking an anvil — the "AI is working" busy affordance for the chat column.
+// The "AI is working" busy affordance for the chat column. It was a hammer striking an anvil;
+// it is the brand mark turning in place now, so the composer and the copilot header show the
+// same object moving the same way while a run is live. (Name kept: single call site in
+// composer.cpp's prelude.)
 // ImDrawList-only, driven by GetTime(); colors via palette / chatSurf (theme lint).
 // Sized to `box` (logical height of the glyph cell). Caller places it with Dummy/SetCursor.
-// Tuned for the compact composer-prelude slot (~frame height); still reads at the older 28px size.
 void drawForgingAnimation(float box) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const ImVec2 c(p0.x + box * 0.5f, p0.y + box * 0.5f);
-    const float sc = box / 22.0f;  // unit grid: denser silhouette at prelude size
-    const float t = (float)ImGui::GetTime();
-    // Strike cycle ~2.4 Hz: hammer rises, then snaps down onto the anvil.
-    const float cycle = std::fmod(t * 2.4f, 1.0f);
-    const bool striking = cycle > 0.55f;
-    const float lift = striking
-        ? (1.0f - (cycle - 0.55f) / 0.45f) * 0.12f   // snap down
-        : (cycle / 0.55f) * 0.78f;                    // rise
-    const float ang = striking
-        ? (-0.48f + (1.0f - (cycle - 0.55f) / 0.45f) * 0.82f)
-        : (-0.48f - (cycle / 0.55f) * 0.78f);
-
-    ImU32 anvilCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accentMid, surf));
-    ImU32 faceCol  = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accent, surf));
-    ImU32 hammerCol = faceCol;
-    ImU32 sparkCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.statusWarn, surf));
-    ImU32 haftCol = ImGui::ColorConvertFloat4ToU32(surf.textTertiary);
-
-    // Anvil — waist + broad face + short horn (reads as silhouette at ~18–22px).
-    const float faceY = c.y + 5.2f * sc;
-    const float faceT = 2.4f * sc;
-    // Top face (slightly lighter accent so the strike target pops).
-    dl->AddRectFilled(ImVec2(c.x - 7.5f * sc, faceY - faceT),
-                      ImVec2(c.x + 7.5f * sc, faceY), faceCol, 1.2f * sc);
-    // Body / waist under the face.
-    dl->AddRectFilled(ImVec2(c.x - 4.2f * sc, faceY),
-                      ImVec2(c.x + 4.2f * sc, faceY + 3.6f * sc), anvilCol, 0.8f * sc);
-    // Base foot.
-    dl->AddRectFilled(ImVec2(c.x - 6.5f * sc, faceY + 3.6f * sc),
-                      ImVec2(c.x + 6.5f * sc, faceY + 5.4f * sc), anvilCol, 1.0f * sc);
-    // Horn (right) — sharp triangle, not a soft blob.
-    dl->AddTriangleFilled(ImVec2(c.x + 7.5f * sc, faceY - faceT),
-                          ImVec2(c.x + 11.5f * sc, faceY - faceT * 0.35f),
-                          ImVec2(c.x + 7.5f * sc, faceY - 0.2f * sc), anvilCol);
-    // Heel notch (left) — tiny step so the silhouette isn't a plain bar.
-    dl->AddRectFilled(ImVec2(c.x - 9.0f * sc, faceY - faceT * 0.55f),
-                      ImVec2(c.x - 7.5f * sc, faceY - 0.15f * sc), anvilCol, 0.6f * sc);
-
-    // Hammer pivot above the face; head + handle rotate about the pivot.
-    const ImVec2 pivot(c.x - 1.5f * sc, c.y - 1.2f * sc - lift * 8.5f * sc);
-    const float ca = std::cos(ang), sa = std::sin(ang);
-    auto rot = [&](float x, float y) -> ImVec2 {
-        return ImVec2(pivot.x + x * ca - y * sa, pivot.y + x * sa + y * ca);
-    };
-    // Handle — slightly thicker stroke so it survives downscale.
-    dl->AddLine(rot(0.0f, 0.5f * sc), rot(0.0f, -9.5f * sc), haftCol, ui::metrics::stroke(1.8f));
-    // Head — short peen + longer face (asymmetric so it reads as a hammer, not a bar).
-    ImVec2 h0 = rot(-5.0f * sc, -9.5f * sc);
-    ImVec2 h1 = rot( 3.6f * sc, -9.5f * sc);
-    ImVec2 h2 = rot( 3.6f * sc, -6.2f * sc);
-    ImVec2 h3 = rot(-5.0f * sc, -6.2f * sc);
-    dl->AddQuadFilled(h0, h1, h2, h3, hammerCol);
-
-    // Sparks on impact — fewer, smaller, fade fast (subtle at prelude size).
-    if (striking && cycle < 0.72f) {
-        const float sp = (cycle - 0.55f) / 0.17f;
-        const float fade = (1.0f - sp) * (1.0f - sp);
-        for (int i = 0; i < 4; ++i) {
-            float a = -1.05f + i * 0.62f;
-            float d = (2.2f + i * 0.95f) * sc * (0.35f + sp * 0.9f);
-            ImU32 scc = (sparkCol & 0x00FFFFFFu) | ((ImU32)(fade * 180) << 24);
-            dl->AddCircleFilled(
-                ImVec2(c.x + std::cos(a) * d,
-                       faceY - faceT * 0.4f - std::sin(a) * d * 0.55f),
-                0.85f * sc, scc);
-        }
-    }
+    // The forge's brightest element (its strike face) was plain accent — keep that tone.
+    const ImU32 col = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accent, surf));
+    if (box >= ui::kTesseractSpinnerMinPx)
+        ui::drawTesseractSpinner(dl, c, box, ImGui::GetTime(), col);
+    else
+        dl->AddCircleFilled(c, box * 0.25f, col);  // legibility floor: a dot still reads as busy
     ImGui::Dummy(ImVec2(box, box));
 }
 

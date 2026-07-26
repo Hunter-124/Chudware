@@ -81,25 +81,21 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // PLM quick chip so it is never trapped under the left-pane PLM / Explorer / Feature Manager
     // rail (the old viewport "Rebuilding..." HUD was). Covers startup/warmup and rebuild/solve.
     {
-        static const char* kSpin[] = {"|", "/", "-", "\\"};
-        const int si = static_cast<int>(ImGui::GetTime() * 8.0) & 3;
         std::string chip;
         bool isStartup = false;
         if (st.setupRunning.load() || st.workerBootPending || !st.startupPhase.empty()) {
             isStartup = true;
             if (st.setupRunning.load())
-                chip = std::string("Setup ") + kSpin[si] +
-                       "  Provisioning runtime\xe2\x80\xa6";
+                chip = "Setup  Provisioning runtime\xe2\x80\xa6";
             else if (!st.startupPhase.empty())
-                chip = std::string("Startup ") + kSpin[si] + "  " + st.startupPhase;
+                chip = "Startup  " + st.startupPhase;
             else
-                chip = std::string("Startup ") + kSpin[si] +
-                       "  Starting engine\xe2\x80\xa6";
+                chip = "Startup  Starting engine\xe2\x80\xa6";
         } else if (st.rebuildsInFlight > 0) {
             // Prefer an explicit livePhase that names rebuild work; else derive progress from
             // feature_status / tree feature count / ops-in-flight. Gated on rebuildsInFlight
             // (same signal as the old viewport HUD) so agent/sim RPCs do not false-trigger it.
-            chip = std::string("Rebuild ") + kSpin[si] + "  ";
+            chip = "Rebuild  ";
             bool named = false;
             if (!st.livePhase.empty()) {
                 const std::string& lp = st.livePhase;
@@ -155,18 +151,26 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         }
         if (!chip.empty()) {
             ImGui::SameLine();
+            // The mark occupies its own square ahead of the text, so the pill has to pay for
+            // that width itself: the measured string no longer carries a spinner glyph.
+            const float box = ImGui::GetTextLineHeight();
+            const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
             ImVec2 tsz = ImGui::CalcTextSize(chip.c_str());
             ImVec2 cp  = ImGui::GetCursorScreenPos();
             const float px = 10.0f * dpiS, py = 2.5f * dpiS;
             ui::glassBackground(ImGui::GetWindowDrawList(),
                                 ImVec2(cp.x - px * 0.5f, cp.y - py),
-                                ImVec2(cp.x + tsz.x + px, cp.y + tsz.y + py),
+                                ImVec2(cp.x + box + gap + tsz.x + px, cp.y + tsz.y + py),
                                 (tsz.y + py * 2.0f) * 0.5f / dpiS);
             float pulse = 0.80f + 0.20f * std::sin(static_cast<float>(ImGui::GetTime()) * 3.0f);
             const float* role = isStartup ? pal.statusWarn : pal.statusOk;
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(role[0] * pulse, role[1] * pulse, role[2] * pulse, 1.0f));
-            ImGui::TextUnformatted(chip.c_str());
+            // One tint for mark and text so both breathe on the same beat; grouped so the hover
+            // target still spans the whole pill instead of only the text half of it.
+            ImGui::BeginGroup();
+            ui::busyLabel(chip.c_str(),
+                          ImGui::ColorConvertFloat4ToU32(
+                              ImVec4(role[0], role[1], role[2], pulse)));
+            ImGui::EndGroup();
             if (ImGui::IsItemHovered()) {
                 if (isStartup)
                     ImGui::SetTooltip(
@@ -177,7 +181,6 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                         "Model rebuild / solve in flight.\n"
                         "Viewport mesh may lag until this completes.");
             }
-            ImGui::PopStyleColor();
         }
     }
     // Embedded PLM control: current item's revision/lifecycle + a checkpoint/release popover,
@@ -212,28 +215,27 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // stays until reconnect clears the flag.
     if (st.daemonUnreachable) {
         ImGui::SameLine();
-        static const char* kSpin[] = {"|", "/", "-", "\\"};
-        int si = static_cast<int>(ImGui::GetTime() * 6.0) & 3;
-        std::string chip = std::string("Engine daemon unreachable \xe2\x80\x94 retrying ");
-        chip += kSpin[si];
-        ImVec2 tsz = ImGui::CalcTextSize(chip.c_str());
+        const char* chip = "Engine daemon unreachable \xe2\x80\x94 retrying";
+        const float box = ImGui::GetTextLineHeight();
+        const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
+        ImVec2 tsz = ImGui::CalcTextSize(chip);
         ImVec2 cp  = ImGui::GetCursorScreenPos();
         const float px = 10.0f * dpiS, py = 2.5f * dpiS;
         ui::glassBackground(ImGui::GetWindowDrawList(),
                             ImVec2(cp.x - px * 0.5f, cp.y - py),
-                            ImVec2(cp.x + tsz.x + px, cp.y + tsz.y + py),
+                            ImVec2(cp.x + box + gap + tsz.x + px, cp.y + tsz.y + py),
                             (tsz.y + py * 2.0f) * 0.5f / dpiS);
         float pulse = 0.75f + 0.25f * std::sin(static_cast<float>(ImGui::GetTime()) * 4.0f);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(pal.statusWarn[0] * pulse, pal.statusWarn[1] * pulse,
-                   pal.statusWarn[2] * pulse, 1.0f));
-        ImGui::TextUnformatted(chip.c_str());
+        ImGui::BeginGroup();
+        ui::busyLabel(chip, ImGui::ColorConvertFloat4ToU32(
+                                ImVec4(pal.statusWarn[0], pal.statusWarn[1],
+                                       pal.statusWarn[2], pulse)));
+        ImGui::EndGroup();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
                 "The engine host daemon (chudware-hostd) is not reachable.\n"
                 "Chudware will keep retrying (1s, 2s, 5s, then every 10s).\n"
                 "Agent/shared docs reappear automatically on reconnect.");
-        ImGui::PopStyleColor();
     }
     if (busy && !st.livePhase.empty()) {
         ImGui::SameLine();
@@ -259,30 +261,33 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // stuck on "Solving" for a long static analysis.
     const bool simForce = std::getenv("CHUDWARE_SIMPROG") != nullptr;  // headless smoke: force the chip
     if ((st.simClient && st.simClient->busy()) || simForce) {
-        static const char* kSpin[] = {"|", "/", "-", "\\"};
-        int si = static_cast<int>(ImGui::GetTime() * 8.0) & 3;
         const bool live = st.simClient && st.simClient->busy();
         std::string stg = live ? st.simClient->stage() : std::string("solve");
         std::string lg  = live ? st.simClient->recentLog()
                                : std::string("assembling stiffness matrix (12,480 nodes)");
         float elapsed   = live ? st.simClient->elapsedSeconds() : 7.0f;
-        std::string chip = std::string("Sim ") + kSpin[si] + "  " + prettySimStage(stg);
+        std::string chip = "Sim  " + prettySimStage(stg);
         if (!lg.empty()) chip += "  \xe2\x80\x94  " + lg;  // em-dash separator before detail
         chip += "  (" + std::to_string(static_cast<int>(elapsed)) + "s)";
         ImGui::SameLine();
+        const float box = ImGui::GetTextLineHeight();
+        const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
         ImVec2 tsz = ImGui::CalcTextSize(chip.c_str());
         ImVec2 cp  = ImGui::GetCursorScreenPos();
         const float px = 10.0f * dpiS, py = 2.5f * dpiS;
         ui::glassBackground(ImGui::GetWindowDrawList(),
                             ImVec2(cp.x - px * 0.5f, cp.y - py),
-                            ImVec2(cp.x + tsz.x + px, cp.y + tsz.y + py),
+                            ImVec2(cp.x + box + gap + tsz.x + px, cp.y + tsz.y + py),
                             (tsz.y + py * 2.0f) * 0.5f / dpiS);
-        // Pulse the text alpha slightly so it is visually "alive" even during a long quiet stage.
+        // Pulse mark and text on the same beat so the chip is obviously alive even during a
+        // long quiet stage.
         float pulse = 0.80f + 0.20f * std::sin(static_cast<float>(ImGui::GetTime()) * 3.0f);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(pal.statusOk[0] * pulse, pal.statusOk[1] * pulse,
-                   pal.statusOk[2] * pulse, 1.0f));
-        ImGui::TextUnformatted(chip.c_str());
+        // Grouped so the click target still spans the whole pill, mark included.
+        ImGui::BeginGroup();
+        ui::busyLabel(chip.c_str(), ImGui::ColorConvertFloat4ToU32(
+                                        ImVec4(pal.statusOk[0], pal.statusOk[1],
+                                               pal.statusOk[2], pulse)));
+        ImGui::EndGroup();
         // Clicking the progress chip navigates to the Simulation tab so the user can
         // watch progress or cancel without hunting for the panel.
         if (ImGui::IsItemClicked()) {
@@ -291,7 +296,6 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Click to focus the Simulation pane");
-        ImGui::PopStyleColor();
     }
     // W5C: pick / selection label (e.g. "Face 12 of Body1") — shown when not editing a sketch
     // (a sketch shows its DOF status instead). The label is maintained on hover/selection change.

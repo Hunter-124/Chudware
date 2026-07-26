@@ -1039,10 +1039,8 @@ void drawCamManager(AppState& st) {
         ImGui::SameLine();
         ImGui::TextDisabled("|");
         ImGui::SameLine();
-        // Lightweight spinner: rotating braille dots via frame time (no theme dependency).
-        static const char* kSpin[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
-        const int fi = ((int)(ImGui::GetTime() * 10.0)) % 10;
-        ImGui::TextDisabled("%s working...", kSpin[fi]);
+        // Disabled text, not accent: a busy note in the toolbar is chrome, not a call to action.
+        busyLabel("working...", ImGui::GetColorU32(ImGuiCol_TextDisabled));
     }
     if (!g.status.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", g.status.c_str()); }
 
@@ -1512,10 +1510,9 @@ void drawCamTreeBody(AppState& st) {
         ImGui::Spacing();
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
         if (camBusy()) {
-            static const char* kSpin[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
-            const int fi = ((int)(ImGui::GetTime() * 10.0)) % 10;
-            ImGui::TextDisabled("%s %s", kSpin[fi],
-                               g.status.empty() ? "working..." : g.status.c_str());
+            // Disabled text, not accent — matches the toolbar busy note above.
+            busyLabel(g.status.empty() ? "working..." : g.status.c_str(),
+                      ImGui::GetColorU32(ImGuiCol_TextDisabled));
         } else {
             ImGui::TextDisabled("%s", g.status.c_str());
         }

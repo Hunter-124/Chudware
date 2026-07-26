@@ -86,12 +86,11 @@ void plmEmptyState(const char* icon, const char* msg, const char* sub) {
     ImGui::Dummy(ImVec2(0, 8.0f * S));
 }
 
+// Every "working" indicator in the product is the brand mark in motion, so this
+// hub-wide helper is now a thin alias over the shared one; it survives only
+// because seven call sites spell their busy state as plmSpinner("Loading…").
 void plmSpinner(const char* prefix) {
-    static const char* kF[] = {". . .", "o . .", ". o .", ". . o"};
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
-    ImGui::Text("%s %s", prefix, kF[(int)(ImGui::GetTime() * 4.0) & 3]);
-    ImGui::PopStyleColor();
+    ui::busyLabel(prefix);
 }
 
 void plmError(const std::string& msg) {

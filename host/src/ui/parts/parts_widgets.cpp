@@ -143,12 +143,9 @@ void emptyState(const char* iconName, const char* msg, const char* sub) {
 }
 
 void spinner(const char* prefix) {
-    static const char* kFrames[] = {". . .", "o . .", ". o .", ". . o"};
-    int f = (int)(ImGui::GetTime() * 4.0) & 3;
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
-    ImGui::Text("%s %s", prefix, kFrames[f]);
-    ImGui::PopStyleColor();
+    // Every "working" indicator in the app is the brand mark in motion; busyLabel owns the
+    // reserved square, the legibility floor and the accent tint the ASCII frames used to carry.
+    ui::busyLabel(prefix);
 }
 
 // ---- domain glyph / part icons ---------------------------------------------------------

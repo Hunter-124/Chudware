@@ -496,4 +496,13 @@ void drawWindowPillScrollbarV(const AdaptiveSurface& surf,
 void drawFractionRing(ImDrawList* dl, const ImVec2& center, float radius, float thickness,
                       float frac, ImU32 trackCol, ImU32 arcCol);
 
+// Inline "working" indicator: the brand mark turning in a text-line-sized box, then `label` on the
+// same baseline. Replaces the ASCII dot / braille / |-\ cycles that used to be spliced into the
+// label string itself — those could not be styled, could not be measured apart from the text, and
+// each panel had invented its own. Advances the cursor like an ImGui::Text of the same content,
+// so it drops into existing layout. Pass a null/empty `label` for the mark alone.
+//
+// `col` 0 (the default) uses the accent at the same 0.85 alpha the old ASCII spinners used.
+void busyLabel(const char* label, ImU32 col = 0);
+
 }  // namespace ui

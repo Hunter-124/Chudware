@@ -8,6 +8,7 @@
 //   * startHealthCheck/pollHealthStatus — vendors_health_check/_status flow (single-flight,
 //     2 s backoff while running).
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -167,39 +168,67 @@ void drawVendorStrip(AppState& st, float paneW) {
         ImGui::GetTime() - S().lastHealthPoll > 2.0)
         pollHealthStatus(st);
 
-    // Full-bleed liquid-glass band behind the WHOLE footer. A bare 1px border rule used to
-    // sit here and the strip read as a loose stack of controls dropped under a grey line.
-    // The footer is ONE section, so it gets one tinted surface in the app's shared glass
-    // language (accent hue, low alpha) closed by an accent hairline as its section edge.
-    // Painted before the footer's widgets so it stays behind them.
+    // Liquid-glass band behind the WHOLE footer. A bare 1px border rule used to sit here and
+    // the strip read as a loose stack of controls dropped under a grey line. The footer is ONE
+    // section, so it gets one tinted surface in the app's shared glass language (accent hue,
+    // low alpha) closed by an accent hairline as its section edge. Painted before the footer's
+    // widgets so it stays behind them.
+    //
+    // kBandInset pulls the band 2 px inside the pane gutter so it reads as a CARD sitting in
+    // the pane instead of a full-bleed slab wedged against the pane border; kCtrlInset keeps
+    // the full-width controls 4 px inside that card edge — the CTA pill used to be exactly as
+    // wide as the band, so its border WAS the band's border.
+    const float kBandInset = 2.0f * sc;
+    const float kCtrlInset = kBandInset + 4.0f * sc;
     {
         ImDrawList*  dl    = ImGui::GetWindowDrawList();
         const ImVec2 p0    = ImGui::GetCursorScreenPos();
         const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float  bx0   = p0.x + kBandInset;
+        const float  bx1   = p0.x + avail.x - kBandInset;
         if (avail.y > 1.0f)
-            ui::glassCardWash(dl, p0, ImVec2(p0.x + avail.x, p0.y + avail.y), 8.0f,
+            ui::glassCardWash(dl, ImVec2(bx0, p0.y), ImVec2(bx1, p0.y + avail.y), 8.0f,
                               palette.accent, 0.14f);
         float edge[4];
         Palette::withAlpha(palette.accent, edge, 0.35f);
-        dl->AddLine(ImVec2(p0.x, p0.y + 0.5f), ImVec2(p0.x + avail.x, p0.y + 0.5f),
+        dl->AddLine(ImVec2(bx0, p0.y + 0.5f), ImVec2(bx1, p0.y + 0.5f),
                     Palette::toU32(edge), 1.0f);
     }
-    ImGui::Dummy(ImVec2(0.0f, 6.0f * sc));
+    // The footer's own vertical rhythm. Under the theme's 9 px paragraph spacing the four
+    // stacked rows measured ~122 px against a ~99 px band and the bottom button hung out of
+    // the card entirely. 4 px is this footer's one gap — and it is also the clearance above
+    // and below the CTA pill. Popped at the very end (this function has no early returns).
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * sc));
+    ImGui::Dummy(ImVec2(0.0f, 2.0f * sc));   // 2 + 4 spacing = 6 px of band-top clearance
 
-    // -- status dot row + "N/M signed in" + health summary ----------------------------
-    // One inset scope: the dots, the count and the health line are plain content, so they
+    // -- status logo/dot row + "N/M signed in" + health summary ------------------------
+    // One inset scope: the logos, the count and the health line are plain content, so they
     // sit on the pane's TEXT line with the filter labels and the section header above them.
     // The glass band above and the borderRows below stay full-bleed on the pane gutter.
     {
         ContentInset inset;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 p = ImGui::GetCursorScreenPos();
-        const float d    = 7.0f * sc;          // dot diameter
+        // Real vendor favicons wherever the prefetch has landed (S().thumbs["vendorlogo:"+id],
+        // filled by another TU — this file never REQUESTS one, it only draws what is resident).
+        // ONE cell size drives both the fit arithmetic below and the draw, so the run stays
+        // homogeneous: sizing the layout on the 7 px dot while drawing 14 px images is exactly
+        // what would overflow the pane again. The moment any logo is resident the whole row
+        // switches to the wide cell; vendors still without one keep their 7 px pip centred in
+        // it.
+        bool anyLogoCached = false;
+        for (auto& lv : S().vendors) {
+            auto it = S().thumbs.find("vendorlogo:" + lv.id);
+            if (it != S().thumbs.end() && it->second.tex) { anyLogoCached = true; break; }
+        }
+        const float cell = anyLogoCached ? 14.0f * sc : 7.0f * sc;
+        const float dotD = 7.0f * sc;          // the pip itself never grows with the cell
         const float gap  = 4.0f * sc;
-        const float step = d + gap;
-        const float cy   = p.y + 5.0f * sc + d * 0.5f;
+        const float step = cell + gap;
+        const float cy   = p.y + 5.0f * sc + cell * 0.5f;
 
-        // How many dots FIT. One dot per vendor ran straight off the pane and wrapped into
+        // How many cells FIT. One cell per vendor ran straight off the pane and wrapped into
         // a second ragged row that collided with the count text; the run is now clipped to
         // the space left beside the count and the remainder collapses into a dim "+N".
         const int total = (int)S().vendors.size();
@@ -209,9 +238,12 @@ void drawVendorStrip(AppState& st, float paneW) {
         const float countW = total > 0
             ? ImGui::CalcTextSize(countNum).x + ImGui::CalcTextSize(countTail).x
             : ImGui::CalcTextSize("no vendors").x;
-        const float budget = ImGui::GetContentRegionAvail().x - countW - 8.0f * sc;
+        // kCtrlInset is reserved on the right so the count text stops short of the band's
+        // inset edge instead of running onto (or past) it.
+        const float budget =
+            ImGui::GetContentRegionAvail().x - countW - 8.0f * sc - kCtrlInset;
         auto fitCount = [&](float b) {
-            if (b < d) return 0;
+            if (b < cell) return 0;
             const int n = (int)((b + gap) / step);
             return n > total ? total : n;
         };
@@ -227,22 +259,36 @@ void drawVendorStrip(AppState& st, float paneW) {
             if (shown >= total) overflow[0] = '\0';
         }
 
-        float x = p.x;   // left edge of the next dot slot
+        float x = p.x;   // left edge of the next cell
+        const double now = ImGui::GetTime();
         for (int i = 0; i < shown; ++i) {
             auto& v = S().vendors[(size_t)i];
             const float* role = v.loggedIn ? palette.statusOk : palette.textDisabled;
             if (!v.loginError.empty()) role = palette.statusErr;
-            // Soft glow ring under the filled dot: a signed-in vendor reads as LIT instead
-            // of as a flat 7px pip lost in the band.
-            float glow[4];
-            Palette::withAlpha(role, glow, 0.28f);
-            dl->AddCircle(ImVec2(x + d * 0.5f, cy), d * 0.5f * 1.6f, Palette::toU32(glow),
-                          0, 1.5f * sc);
-            dl->AddCircleFilled(ImVec2(x + d * 0.5f, cy), d * 0.5f, Palette::toU32(role));
-            // Invisible hover target per dot for the tooltip.
-            ImGui::SetCursorScreenPos(ImVec2(x, cy - d * 0.5f));
+            auto lg = S().thumbs.find("vendorlogo:" + v.id);
+            if (lg != S().thumbs.end() && lg->second.tex) {
+                lg->second.lastUse = now;   // LRU: keep on-screen logos resident
+                dl->AddImage((ImTextureID)(intptr_t)lg->second.tex,
+                             ImVec2(x, cy - cell * 0.5f),
+                             ImVec2(x + cell, cy + cell * 0.5f));
+                // Status ring around the favicon, in the SAME role the pip carried, so the
+                // row still reads signed-in / failed / idle at a glance once it shows brands.
+                dl->AddCircle(ImVec2(x + cell * 0.5f, cy), 9.0f * sc, Palette::toU32(role),
+                              0, 1.5f * sc);
+            } else {
+                // Soft glow ring under the filled dot: a signed-in vendor reads as LIT instead
+                // of as a flat 7px pip lost in the band.
+                float glow[4];
+                Palette::withAlpha(role, glow, 0.28f);
+                dl->AddCircle(ImVec2(x + cell * 0.5f, cy), dotD * 0.5f * 1.6f,
+                              Palette::toU32(glow), 0, 1.5f * sc);
+                dl->AddCircleFilled(ImVec2(x + cell * 0.5f, cy), dotD * 0.5f,
+                                    Palette::toU32(role));
+            }
+            // Invisible hover target per cell for the tooltip.
+            ImGui::SetCursorScreenPos(ImVec2(x, cy - cell * 0.5f));
             ImGui::PushID(i);
-            ImGui::InvisibleButton("##dot", ImVec2(d, d));
+            ImGui::InvisibleButton("##dot", ImVec2(cell, cell));
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s — %s", v.label.c_str(),
                                   !v.loginError.empty() ? v.loginError.c_str()
@@ -314,9 +360,10 @@ void drawVendorStrip(AppState& st, float paneW) {
     // secondary buttons below it and the pane had no visible primary action. Same
     // InvisibleButton click contract, same startLoginWizard(st) action, same wizard gating.
     {
+        ImGui::Indent(kCtrlInset);
         ImDrawList*  dl = ImGui::GetWindowDrawList();
         const ImVec2 c0 = ImGui::GetCursorScreenPos();
-        const float  w  = ImGui::GetContentRegionAvail().x;
+        const float  w  = ImGui::GetContentRegionAvail().x - kCtrlInset;
         const float  h  = 22.0f * sc;
         const ImVec2 c1(c0.x + w, c0.y + h);
 
@@ -351,10 +398,12 @@ void drawVendorStrip(AppState& st, float paneW) {
         dl->PopClipRect();
 
         if (clicked) startLoginWizard(st);
+        ImGui::Unindent(kCtrlInset);
     }
     gatedRowFeedback(wizardOpen, "The sign-in wizard is already open.");
 
-    const float half = (ImGui::GetContentRegionAvail().x - 4.0f * sc) * 0.5f;
+    ImGui::Indent(kCtrlInset);
+    const float half = (ImGui::GetContentRegionAvail().x - kCtrlInset - 4.0f * sc) * 0.5f;
     ImGui::BeginDisabled(wizardOpen);
     if (borderRow("##vendors_popup", "Vendors…", nullptr, S().vendorsPopupOpen,
                   ImVec2(half, 20.0f * sc), /*centerText=*/true))
@@ -375,6 +424,8 @@ void drawVendorStrip(AppState& st, float paneW) {
                      : healthBusy         ? "A health check is already running."
                                           : "Paused while the sign-in wizard is open — its "
                                             "browser sweeps would starve the check.");
+    ImGui::Unindent(kCtrlInset);
+    ImGui::PopStyleVar();   // footer ItemSpacing
 }
 
 // ---- floating "Vendor Accounts" popup ------------------------------------------------
@@ -382,6 +433,7 @@ void drawVendorStrip(AppState& st, float paneW) {
 namespace {
 
 void drawVendorSignInList(AppState& st) {
+    const float sc = ui::uiScale;
     sectionHeader("Vendor Sites", /*firstInPane=*/true, "vendor_globe");
 
     if (S().vendorsLoading && S().vendors.empty()) {
@@ -391,6 +443,17 @@ void drawVendorSignInList(AppState& st) {
         ContentInset inset;
         ImGui::TextDisabled("No vendor adapters registered.");
     } else {
+        // A logo lane is reserved for EVERY row as soon as any one favicon is resident
+        // (S().thumbs["vendorlogo:"+id], prefetched elsewhere — this file only draws what is
+        // already there). Reserving per-row instead would leave the "[+]" column ragged; with
+        // nothing cached at all the list falls back to exactly its old presentation.
+        const float logoSz = 18.0f * sc;
+        bool anyLogo = false;
+        for (auto& lv : S().vendors) {
+            auto it = S().thumbs.find("vendorlogo:" + lv.id);
+            if (it != S().thumbs.end() && it->second.tex) { anyLogo = true; break; }
+        }
+        const float logoLane = anyLogo ? logoSz + 6.0f * sc : 0.0f;
         for (auto& v : S().vendors) {
             ImGui::PushID(v.id.c_str());
             // Row rect measured exactly as borderRowSurface measures it, so a failed
@@ -404,6 +467,21 @@ void drawVendorSignInList(AppState& st) {
                 ui::glassCardWash(ImGui::GetWindowDrawList(), rmn, rmx, 7.0f,
                                   palette.statusErr, 0.18f);
             ContentInset inset;   // row content, inside the full-bleed surface above
+            // Favicon lead-in, painted straight into the draw list at the row origin with the
+            // row's content indented past it — so the state word on the row's SECOND line
+            // clears the logo too instead of tucking under it.
+            if (logoLane > 0.0f) {
+                auto lg = S().thumbs.find("vendorlogo:" + v.id);
+                if (lg != S().thumbs.end() && lg->second.tex) {
+                    lg->second.lastUse = ImGui::GetTime();  // LRU: keep on-screen logos resident
+                    const ImVec2 lp = ImGui::GetCursorScreenPos();
+                    const float  ly = lp.y + (ImGui::GetTextLineHeight() - logoSz) * 0.5f;
+                    ImGui::GetWindowDrawList()->AddImage(
+                        (ImTextureID)(intptr_t)lg->second.tex,
+                        ImVec2(lp.x, ly), ImVec2(lp.x + logoSz, ly + logoSz));
+                }
+                ImGui::Indent(logoLane);
+            }
             ImGui::BeginGroup();
 
             ImVec4 dot = v.loggedIn
@@ -465,6 +543,7 @@ void drawVendorSignInList(AppState& st) {
                 ImGui::SetTooltip("%s", v.loginError.c_str());
 
             ImGui::EndGroup();
+            if (logoLane > 0.0f) ImGui::Unindent(logoLane);
             ImGui::Spacing();
             ImGui::PopID();
         }

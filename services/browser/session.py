@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -52,12 +53,53 @@ _LOGIN_POLL_INTERVAL_S = 2.0
 #: How long browser_login waits (seconds) for the user's login window to close
 #: on its own before this module closes it for them.
 DEFAULT_LOGIN_TIMEOUT_S = 300.0
+
+
+def _env_float(name: str, default: float) -> float:
+    """Env override for a timing knob (same shape as :mod:`.ratelimit`'s)."""
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
 #: After navigation, how long (seconds) to let the network settle so XHR-driven
 #: single-page-app catalogs (McMaster, Misumi, DigiKey, Amazon, Home Depot, …)
 #: finish rendering their product cards before we snapshot the DOM. Bounded and
 #: best-effort — a chatty page that never idles just gets snapshotted at the
 #: deadline (still far better than the pre-render empty shell).
-DEFAULT_RENDER_SETTLE_S = 8.0
+#:
+#: This is NOT a Python sleep: it rides to the CEF daemon as ``settle_ms`` and is
+#: burned there by an unconditional ``pump(settle_ms)`` (cef_headless.cpp). The
+#: daemon's fetch reply carries no DOM-ready signal and its protocol has no poll
+#: verb, so this side cannot early-out of it — Python-side "poll until the HTML
+#: stops growing" would cost one full re-navigation per poll, strictly worse.
+#: Shortening the default would silently truncate the SPA adapters that need the
+#: whole dwell, so the default stands at 8.0s and the env var is how you tune it.
+DEFAULT_RENDER_SETTLE_S = _env_float("CHUDWARE_BROWSER_SETTLE_S", 8.0)
+
+#: Opt-in per-fetch timing breakdown (``CHUDWARE_BROWSER_TIMING=1``). Resolved
+#: once at import, so leaving it unset costs one already-false bool test per
+#: fetch and allocates nothing.
+_TIMING = os.environ.get("CHUDWARE_BROWSER_TIMING") == "1"
+
+
+def _log_timing(site: str, url: str, t: dict, started: float, outcome: str) -> None:
+    """One stdout line per fetch, matching this module's ``[browser_*]`` prints.
+
+    ``cef`` folds in the CEF daemon's queue wait: the daemon serves one request at
+    a time (single accept loop in cef_daemon.cpp), so the parts fan-out's per-site
+    threads line up behind each other there and each pays its own settle dwell.
+    That is why ``cef`` dominates a fan-out while ``lock`` and ``rate`` stay ~0.
+    """
+    print(f"[browser_timing] {site} {outcome}"
+          f" cache={t.get('cache_ms', 0.0):.1f}ms"
+          f" lock={t.get('lock_ms', 0.0):.1f}ms"
+          f" rate={t.get('rate_ms', 0.0):.1f}ms"
+          f" cef={t.get('cef_ms', 0.0):.1f}ms"
+          f" parse={t.get('parse_ms', 0.0):.1f}ms"
+          f" total={(time.perf_counter() - started) * 1000.0:.1f}ms"
+          f" {url}", flush=True)
 
 
 def _busy(site: str) -> dict:
@@ -679,34 +721,54 @@ def browser_fetch(url: str, site: str, *,
     browsing of public catalogs is allowed — login-gated content still degrades to
     login_required via the adapters).
     """
+    started = time.perf_counter() if _TIMING else 0.0
+    timing: dict[str, float] | None = {} if _TIMING else None
     if not no_cache:
         from . import page_cache  # lazy: keep import cheap for non-browser callers
+        t0 = time.perf_counter() if _TIMING else 0.0
         hit = page_cache.get(url, site)
+        if timing is not None:
+            timing["cache_ms"] = (time.perf_counter() - t0) * 1000.0
         if hit is not None:
+            if timing is not None:
+                _log_timing(site, url, timing, started, "cache-hit")
             return hit
     profiles.ensure_profile(site)
     lock = profiles.profile_lock(site)
-    if not lock.acquire(blocking=False):
+    t0 = time.perf_counter() if _TIMING else 0.0
+    acquired = lock.acquire(blocking=False)
+    if timing is not None:
+        timing["lock_ms"] = (time.perf_counter() - t0) * 1000.0
+    if not acquired:
+        if timing is not None:
+            _log_timing(site, url, timing, started, "busy")
         return _busy(site)
     try:
         return _browser_fetch_locked(url, site, render_settle=render_settle,
                                      min_interval=min_interval, cef=_cef,
-                                     no_cache=no_cache)
+                                     no_cache=no_cache, timing=timing)
     finally:
         lock.release()
+        if timing is not None:
+            _log_timing(site, url, timing, started, "fetch")
 
 
 def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
                           min_interval: float, cef: Any | None = None,
-                          no_cache: bool = False) -> dict:
+                          no_cache: bool = False,
+                          timing: dict[str, float] | None = None) -> dict:
     ceiling = ratelimit.reserve_request(site)
     if ceiling is not None:
         return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
                              f"already made the maximum allowed fetches (a runaway-loop guard). "
                              f"Nothing was fetched.")
+    t0 = time.perf_counter() if timing is not None else 0.0
     ratelimit.wait(site, min_interval=min_interval, url=url)
+    if timing is not None:
+        timing["rate_ms"] = (time.perf_counter() - t0) * 1000.0
     status: int | None = None
     content = ""
+    t_cef = time.perf_counter() if timing is not None else 0.0
     try:
         try:
             from . import cef_client  # lazy: keep import cheap for non-browser callers
@@ -720,6 +782,8 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
         except Exception as exc:  # noqa: BLE001 — daemon spawn/connect/protocol
             return fail("browser_fetch_failed", str(exc))
     finally:
+        if timing is not None:
+            timing["cef_ms"] = (time.perf_counter() - t_cef) * 1000.0
         # Drives inter-request spacing AND 429/403 exponential backoff off the
         # real status (None on error/challenge → clears any backoff, keeps spacing).
         ratelimit.note_result(site, status)
@@ -732,7 +796,10 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
     # markup is never ingested as product data (data-quality signal, see
     # :mod:`.challenge`). With the consistent fingerprint most false flags don't
     # appear; a genuine one just yields no content for this URL.
+    t_parse = time.perf_counter() if timing is not None else 0.0
     challenge_kind = challenge.classify_challenge(content, url)
+    if timing is not None:
+        timing["parse_ms"] = (time.perf_counter() - t_parse) * 1000.0
     if challenge_kind:
         return fail("challenge_page",
                     f"{site} returned a {challenge_kind} page for {url} — no product "

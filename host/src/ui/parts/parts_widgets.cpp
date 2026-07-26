@@ -5,8 +5,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <map>
+#include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "gl_compat.h"
 
@@ -567,17 +571,46 @@ void borderCardRect(ImDrawList* dl, ImVec2 p0, ImVec2 p1, bool selected, bool ho
 
 // ---- thumbnails --------------------------------------------------------------------
 //
-// Part thumbnails and vendor logos ride ONE RPC (parts_thumbnail), ONE texture cache
-// (S().thumbs) and ONE AsyncRpc dispatch thread, so they share a single request budget here.
+// Part thumbnails and vendor logos ride ONE texture cache (S().thumbs) and ONE AsyncRpc
+// dispatch thread, so they share a single request budget here.
 //
 // Cost model, measured against the live worker: an uncached standard part is RENDERED on
 // demand (services/parts/gui_rpc.py::_render_local_part_png — parts_make → material/threads →
-// doc_render_png) and takes 2-4 s; every later request for that id is a disk-cache hit at
-// ~0 ms. AsyncRpc dispatches FIFO on a SINGLE thread, and drawResultsList/drawResultsGrid call
-// requestThumb for every row every frame (no clipper), so a 100-row search used to hand the
-// worker ~100 back-to-back renders: minutes of queue in which the queue/live-search/taxonomy
-// polls behind them never ran and most cards never got their image. Bound the outstanding
-// calls instead — the remaining rows are issued on later frames as slots free.
+// doc_render_png) and takes 2-4 s; a vendor image is an HTTP fetch of a few hundred ms; every
+// later request for that id is a disk-cache hit at ~0 ms. AsyncRpc dispatches FIFO on a SINGLE
+// thread, and drawResultsList/drawResultsGrid call requestThumb for every row every frame (no
+// clipper), so one round trip PER IMAGE meant a 100-row search paid 100 serialized round trips
+// four at a time: minutes of queue in which the queue/live-search/taxonomy polls behind them
+// never ran and most cards never got their image.
+//
+// So requests are BATCHED. requestThumb / requestVendorLogo no longer dispatch: they push onto
+// a pending queue, and a flush drains up to kThumbBatch of them into ONE `parts_thumbnails`
+// call that the worker services CONCURRENTLY. A 100-row search is now ceil(100/16) = 7 calls,
+// at most kMaxBatchInFlight of them outstanding — 48 images in flight against 4 before.
+//
+// THREADING. gPending / gPendingIds / gPendingSince / gBatchInFlight / gThumbReq /
+// g_batchSupported are touched ONLY from the GUI thread: requestThumb & friends run inside the
+// frame, and every RPC completion runs inside st.rpc.drain(), which async_rpc.h pins to the GL
+// thread. That is the same thread, so none of this needs a lock and storeThumb may keep making
+// GL textures straight from the completion. Nothing here is ever touched from the AsyncRpc
+// dispatch thread.
+constexpr size_t kThumbBatch       = 16;   // images per parts_thumbnails call
+constexpr size_t kMaxBatchInFlight = 3;    // concurrent batches → 48 images outstanding
+
+// Coalescing window. Callers ask row-by-row while the list draws, so a flush on the very first
+// request would send a batch of one. Hold new entries this long (or until a full batch has
+// accumulated) and the whole visible page leaves as a couple of calls. 80 ms is under a
+// perceptible delay at any frame rate and comfortably spans one frame's worth of requestThumb
+// calls even on a slow frame.
+constexpr double kThumbFlushDelaySec = 0.08;
+
+// Absurd-backlog guard: the queue is bounded by the number of DISTINCT ids the UI has asked
+// about, so a realistic session never approaches this. Past it, new entries are refused and the
+// caller's next frame re-asks — never an unbounded queue.
+constexpr size_t kThumbPendingCap = 4096;
+
+// Fallback budget: outstanding SINGULAR parts_thumbnail calls, used only once g_batchSupported
+// has latched off against a worker that predates the plural method.
 constexpr size_t kMaxThumbInFlight = 4;
 
 // A transport failure (worker still booting, socket EOF, timeout) is NOT an answer, so it must
@@ -586,29 +619,102 @@ constexpr size_t kMaxThumbInFlight = 4;
 constexpr int    kThumbTransportRetries = 3;
 constexpr double kThumbRetryBackoffSec  = 2.0;
 
-// Safety net for the budget above: AsyncRpc::shutdown() drops queued and undrained callbacks
-// unrun, so an id can sit in thumbBusy with no callback ever arriving — and four such ids would
-// wedge every thumbnail for the session. Past this deadline the id is RELEASED (never marked
-// failed) so a later frame may ask again; the worker's disk cache makes the duplicate cheap.
-// Comfortably above the 120 s RPC timeout plus the queue wait the in-flight cap permits.
+// Safety net for the budgets above: AsyncRpc::shutdown() drops queued and undrained callbacks
+// unrun, so an id can sit in thumbBusy with no callback ever arriving — and a wedged batch slot
+// would stall every thumbnail for the session. Past this deadline the id is RELEASED (never
+// marked failed) and the batch slot is reclaimed, so a later frame may ask again; the worker's
+// disk cache makes the duplicate cheap. Comfortably above the 120 s RPC timeout plus the queue
+// wait the in-flight cap permits.
 constexpr double kThumbWatchdogSec = 600.0;
 
 // Per-id request bookkeeping. Deliberately TU-local rather than PartsState: nothing outside
 // this file reads it, and it is dropped the moment a request resolves either way.
 struct ThumbReq {
-    double startedAt = 0.0;   // ImGui::GetTime() when the call was handed to AsyncRpc
+    double startedAt = 0.0;   // ImGui::GetTime() when the call carrying this id was dispatched
     double retryAt   = 0.0;   // earliest re-request after a transport failure
     int    attempts  = 0;     // transport failures so far
 };
 static std::map<std::string, ThumbReq> gThumbReq;
+
+// The coalescing queue. Front = next out; prioritizeThumb() moves an id here so an on-screen
+// row can jump a backlog of scrolled-past ones.
+struct PendingThumb {
+    std::string id;
+    std::string url;
+};
+static std::vector<PendingThumb> gPending;
+static std::set<std::string>     gPendingIds;   // O(log n) dedup mirror of gPending
+static double                    gPendingSince = 0.0;   // GetTime() the queue last went non-empty
+
+// In-flight batches: id → dispatch time, for the watchdog. size() IS the in-flight count.
+static std::map<std::uint64_t, double> gBatchInFlight;
+static std::uint64_t                   gBatchSeq = 0;
+
+// Latched off the first time a worker says it has no parts_thumbnails; the singular path below
+// then serves the rest of the session. A worker does not grow a method mid-session, so this is
+// never re-armed.
+static bool g_batchSupported = true;
+
+// ---- vendor-logo provider fallback ---------------------------------------------------
+// The favicon service requestVendorLogo used to be the only source, and three of the
+// login-gated vendor domains get a HARD HTTP 404 out of it — 3dcontentcentral.com, thk.com
+// and traceparts.com, curl-verified, reproducible, not transient. `&default=1` does NOT
+// change that (still 404; Google serves a 16px generic globe as the 404 BODY, which the
+// worker's raise_for_status still rejects), so it is deliberately not appended. One 404 used
+// to latch the site into thumbFailed for the whole session and those three vendors showed
+// the lettered fallback tile forever.
+//
+// So a definitive failure for a "vendorlogo:" id buys exactly ONE more attempt, against a
+// second provider, before it is suppressed. icon.horse answers 200 + a real PNG for all
+// three (curl-verified: thk.com 256x256, 3dcontentcentral.com 256x256, traceparts.com
+// 64x64). It is NOT the primary: for several domains that DO work on Google — digikey,
+// amazon, misumi, homedepot… — icon.horse serves ICO or SVG, and stb_image decodes neither.
+// Part thumbnails never enter this path; their failure policy is untouched.
+constexpr const char* kVendorLogoIdPrefix = "vendorlogo:";
+
+struct VendorLogoSrc {
+    std::string domain;              // registrable domain, for building either provider URL
+    bool        alternateTried = false;   // one alternate per site per session, ever
+};
+static std::map<std::string, VendorLogoSrc> gVendorLogoSrc;   // "vendorlogo:<site>" → source
+
+static std::string vendorLogoPrimaryUrl(const std::string& domain) {
+    // A PNG-returning favicon resolver, not <domain>/favicon.ico: stb_image has no ICO
+    // decoder, so the raw .ico would fetch and then fail to decode.
+    return "https://www.google.com/s2/favicons?domain=" + domain + "&sz=64";
+}
+static std::string vendorLogoAlternateUrl(const std::string& domain) {
+    return "https://icon.horse/icon/" + domain;
+}
+
+static void enqueueThumb(const std::string& id, const std::string& url);
+
+// Second-provider attempt for a vendor logo whose first provider gave a definitive failure.
+// Returns true when the id was requeued INSTEAD of being suppressed. Bounded to one alternate
+// per site: the flag is set before the requeue, so the alternate's own failure falls straight
+// through to markThumbFailed. Non-logo ids always return false.
+static bool retryVendorLogoAlternate(const std::string& id) {
+    if (id.rfind(kVendorLogoIdPrefix, 0) != 0) return false;
+    auto it = gVendorLogoSrc.find(id);
+    if (it == gVendorLogoSrc.end() || it->second.alternateTried || it->second.domain.empty())
+        return false;
+    it->second.alternateTried = true;
+    gThumbReq.erase(id);   // different provider, fresh transport-retry budget
+    enqueueThumb(id, vendorLogoAlternateUrl(it->second.domain));
+    return true;
+}
 
 // A failed thumbnail is a permanent property of the record for this session — a part with no
 // vendor image and no renderable geometry has nothing to show — so thumbFailed is a suppression
 // list, not a cache. It must never be mass-cleared: dropping every id at once makes the next
 // scroll re-fire a burst of RPCs that are all doomed to fail again. Bound it by refusing new
 // entries once the cap is reached; the cap is set where a realistic session will never reach it.
-// ONLY a definitive answer reaches here — transport failures retry, see issueThumbRequest.
+// ONLY a definitive answer reaches here — transport failures retry, see the callbacks below.
 static void markThumbFailed(const std::string& id) {
+    // The ONE place every definitive failure funnels through (worker ok:false, empty payload,
+    // undecodable bytes, retry budget exhausted), so it is the one place the vendor-logo
+    // second provider needs to hook.
+    if (retryVendorLogoAlternate(id)) return;
     constexpr size_t kFailedCap = 65536;
     if (S().thumbFailed.size() < kFailedCap) {
         S().thumbFailed.insert(id);
@@ -666,8 +772,8 @@ void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes) 
     }
 }
 
-// Release ids whose callback can never arrive (see kThumbWatchdogSec). Walks at most
-// kMaxThumbInFlight entries, and only when the budget is actually exhausted.
+// Release ids whose callback can never arrive (see kThumbWatchdogSec). thumbBusy is bounded by
+// the in-flight budget (<= 48), so this is a trivial walk.
 static void releaseStuckThumbs(double now) {
     for (auto it = S().thumbBusy.begin(); it != S().thumbBusy.end();) {
         auto q = gThumbReq.find(*it);
@@ -678,9 +784,19 @@ static void releaseStuckThumbs(double now) {
     }
 }
 
-// The one issue path for parts_thumbnail: single-flight, paced, and honest about which failures
-// are permanent. `imageUrl` may be empty — the worker renders the part's own 3D model when it
-// recognises the id, and answers ok:false when it genuinely has nothing to show.
+// Same net one level up: reclaim a batch SLOT whose callback was dropped. Without this a
+// shutdown-dropped completion would burn one of the three slots for the rest of the session.
+static void releaseStuckBatches(double now) {
+    for (auto it = gBatchInFlight.begin(); it != gBatchInFlight.end();) {
+        if (now - it->second > kThumbWatchdogSec) it = gBatchInFlight.erase(it);
+        else                                      ++it;
+    }
+}
+
+// The SINGULAR parts_thumbnail path. Kept intact and complete: it is what serves a worker that
+// predates parts_thumbnails (see g_batchSupported), and it must still deliver every image.
+// `imageUrl` may be empty — the worker renders the part's own 3D model when it recognises the
+// id, and answers ok:false when it genuinely has nothing to show.
 static void issueThumbRequest(AppState& st, const std::string& id, const std::string& imageUrl) {
     if (S().thumbs.count(id) || S().thumbBusy.count(id) || S().thumbFailed.count(id))
         return;
@@ -723,7 +839,237 @@ static void issueThumbRequest(AppState& st, const std::string& id, const std::st
     });
 }
 
+// Whitespace an id may have picked up upstream. The worker parses item_id with .strip() and
+// ECHOES the stripped form, so a padded id would come back as a string we never sent; every
+// id crossing the wire is matched through this so the two sides always agree. Nothing here
+// rewrites a cache key: S().thumbs stays keyed by exactly the id the drawing TUs look up.
+static std::string trimmedId(const std::string& s) {
+    const char* ws = " \t\r\n";
+    const size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return std::string();
+    return s.substr(b, s.find_last_not_of(ws) - b + 1);
+}
+
+// Queue an id for the next flush. Dedups against the resident cache, the in-flight set, the
+// suppression list AND the queue itself, so the per-frame requestThumb storm from the results
+// list collapses to one entry per id.
+static void enqueueThumb(const std::string& id, const std::string& url) {
+    // Blank or whitespace-only can never be answered — the worker replies ok:false
+    // "item_id required", which is definitive. Never pay a batch slot for it.
+    if (trimmedId(id).empty()) return;
+    if (S().thumbs.count(id) || S().thumbBusy.count(id) || S().thumbFailed.count(id)) return;
+    if (gPendingIds.count(id)) return;
+    if (gPending.size() >= kThumbPendingCap) return;
+    if (gPending.empty()) gPendingSince = ImGui::GetTime();
+    gPending.push_back(PendingThumb{id, url});
+    gPendingIds.insert(id);
+}
+
+// Take up to kThumbBatch eligible entries off the front of the queue and send them as ONE
+// parts_thumbnails call. Entries whose transport backoff has not expired keep their place;
+// entries that resolved meanwhile are dropped. Returns false when nothing was eligible.
+static bool issueBatch(AppState& st, double now) {
+    std::vector<std::string> ids, urls;
+    ids.reserve(kThumbBatch);
+    urls.reserve(kThumbBatch);
+    size_t w = 0;                     // compaction cursor: survivors stay in queue order
+    for (size_t r = 0; r < gPending.size(); ++r) {
+        const std::string& id = gPending[r].id;
+        if (S().thumbs.count(id) || S().thumbBusy.count(id) || S().thumbFailed.count(id)) {
+            gPendingIds.erase(id);
+            continue;                 // resolved or already in flight — drop
+        }
+        auto q = gThumbReq.find(id);
+        const bool backoff = (q != gThumbReq.end() && q->second.retryAt > now);
+        if (!backoff && ids.size() < kThumbBatch) {
+            ids.push_back(id);
+            urls.push_back(gPending[r].url);
+            gPendingIds.erase(id);
+            continue;                 // consumed into this batch
+        }
+        if (w != r) gPending[w] = std::move(gPending[r]);
+        ++w;
+    }
+    gPending.resize(w);
+    if (ids.empty()) return false;
+
+    const std::uint64_t bid = ++gBatchSeq;
+    gBatchInFlight[bid] = now;
+    nlohmann::json items = nlohmann::json::array();
+    for (size_t i = 0; i < ids.size(); ++i) {
+        // Marked busy UP FRONT, all of them: nothing may re-request an id this batch owns.
+        gThumbReq[ids[i]].startedAt = now;
+        S().thumbBusy.insert(ids[i]);
+        nlohmann::json e;
+        e["item_id"]   = ids[i];
+        e["image_url"] = urls[i];
+        items.push_back(std::move(e));
+    }
+    nlohmann::json p;
+    p["items"] = std::move(items);
+
+    st.rpc.call("parts_thumbnails", p, [ids, urls, bid](const core::RpcResult& r) {
+        // FIRST on every path, for EVERY id: a partial or failed batch must not wedge slots.
+        gBatchInFlight.erase(bid);
+        for (const auto& id : ids) S().thumbBusy.erase(id);
+        const double now2 = ImGui::GetTime();
+
+        if (!r.ok) {
+            if (r.err.find("unknown method") != std::string::npos ||
+                r.err.find("unknown_method") != std::string::npos) {
+                // Old worker. Never batch again — requeue this batch verbatim and the singular
+                // path picks all of it up, so not one image is lost to the discovery.
+                g_batchSupported = false;
+                for (size_t i = 0; i < ids.size(); ++i) enqueueThumb(ids[i], urls[i]);
+                return;
+            }
+            // Transport failure — not an answer. Bounded retries per id, then give up.
+            for (size_t i = 0; i < ids.size(); ++i) {
+                ThumbReq& q = gThumbReq[ids[i]];
+                if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(ids[i]); continue; }
+                q.retryAt = now2 + kThumbRetryBackoffSec * q.attempts;
+                enqueueThumb(ids[i], urls[i]);
+            }
+            return;
+        }
+
+        // Envelope. `images` missing / not an array means the worker answered in some other
+        // shape (protocol-2 method error carrying result.code, a partial rebrand of the
+        // method) — same treatment as an unknown method: fall back for good, lose nothing.
+        const nlohmann::json* imgs = nullptr;
+        if (r.result.is_object()) {
+            auto it = r.result.find("images");
+            if (it != r.result.end() && it->is_array()) imgs = &(*it);
+        }
+        if (!imgs || !r.result.value("ok", false)) {
+            g_batchSupported = false;
+            for (size_t i = 0; i < ids.size(); ++i) enqueueThumb(ids[i], urls[i]);
+            return;
+        }
+
+        // Per-entry: ok:false here IS a definitive answer (the worker looked and found
+        // nothing) — with ONE exception, reason "timeout". The worker cuts a batch loose at
+        // CHUDWARE_THUMB_BATCH_BUDGET_S and reports the unfinished entries that way WITHOUT
+        // negatively caching them, so neither may we: suppressing one would permanently blank
+        // a card whose render is merely slow. Retried on the same bounded budget as a
+        // transport failure.
+        //
+        // Entries are matched by item_id, NOT by array position: the worker's ordering is a
+        // guarantee this code deliberately does not lean on. The echoed item_id is the
+        // STRIPPED form, so the match falls back to comparing trimmed ids — and every state
+        // update below then uses OUR id, which is what S().thumbs is keyed by and what the
+        // drawing TUs look up. An id we never sent is ignored rather than cached or
+        // suppressed. Duplicates in the payload are harmless: first match wins, `answered` is
+        // a set, and a second storeThumb for the same id just replaces the texture cleanly.
+        // Ids re-found by value — a refresh may have rebuilt every row meanwhile, and S() is
+        // keyed by id precisely so that does not matter.
+        auto slotFor = [&ids](const std::string& echoed) -> size_t {
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (ids[i] == echoed) return i;
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (trimmedId(ids[i]) == echoed) return i;
+            return (size_t)-1;
+        };
+        std::set<std::string> answered;
+        for (const auto& e : *imgs) {
+            if (!e.is_object()) continue;
+            const std::string echoed = e.value("item_id", std::string());
+            if (echoed.empty()) continue;
+            const size_t slot = slotFor(echoed);
+            if (slot == (size_t)-1) continue;          // not ours — never cache or suppress it
+            const std::string& id = ids[slot];
+            answered.insert(id);
+            if (!e.value("ok", false)) {
+                if (e.value("reason", std::string()) == "timeout") {
+                    ThumbReq& q = gThumbReq[id];
+                    if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(id); continue; }
+                    q.retryAt = now2 + kThumbRetryBackoffSec * q.attempts;
+                    enqueueThumb(id, urls[slot]);
+                    continue;
+                }
+                markThumbFailed(id);
+                continue;
+            }
+            const std::string b64 = e.value("image_b64", std::string());
+            if (b64.empty()) { markThumbFailed(id); continue; }
+            storeThumb(id, b64decode(b64));   // marks failed itself if the bytes will not decode
+            gThumbReq.erase(id);
+        }
+        // Partial response: an id we asked about that came back in no entry is NOT an answer.
+        // Treat it exactly like a transport failure so a truncating worker can neither blank
+        // those cards forever nor spin them forever.
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (answered.count(ids[i])) continue;
+            ThumbReq& q = gThumbReq[ids[i]];
+            if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(ids[i]); continue; }
+            q.retryAt = now2 + kThumbRetryBackoffSec * q.attempts;
+            enqueueThumb(ids[i], urls[i]);
+        }
+    });
+    return true;
+}
+
+// g_batchSupported == false: drain the same queue one singular call at a time, honouring the
+// old kMaxThumbInFlight budget. Entries that do not fit keep their place in the queue.
+static void drainSingularPending(AppState& st, double now) {
+    size_t w = 0;
+    for (size_t r = 0; r < gPending.size(); ++r) {
+        const std::string& id = gPending[r].id;
+        if (S().thumbs.count(id) || S().thumbFailed.count(id) || S().thumbBusy.count(id)) {
+            gPendingIds.erase(id);
+            continue;
+        }
+        if (S().thumbBusy.size() < kMaxThumbInFlight) {
+            issueThumbRequest(st, id, gPending[r].url);
+            if (S().thumbBusy.count(id)) {   // dispatched (backoff/budget would have refused)
+                gPendingIds.erase(id);
+                continue;
+            }
+        }
+        if (w != r) gPending[w] = std::move(gPending[r]);
+        ++w;
+    }
+    gPending.resize(w);
+}
+
+void flushThumbRequests(AppState& st) {
+    const double now = ImGui::GetTime();
+    releaseStuckBatches(now);
+    releaseStuckThumbs(now);
+    if (gPending.empty()) { gPendingSince = 0.0; return; }
+    if (g_batchSupported) {
+        while (!gPending.empty() && gBatchInFlight.size() < kMaxBatchInFlight)
+            if (!issueBatch(st, now)) break;
+    } else {
+        drainSingularPending(st, now);
+    }
+    // Whatever is left waits out another coalescing window before the next attempt — a full
+    // in-flight budget must not turn into a per-frame rescan of the whole queue.
+    gPendingSince = gPending.empty() ? 0.0 : now;
+}
+
+// The pipeline owes NOTHING to its callers: the four GUI TUs that call requestThumb do not (yet)
+// call flushThumbRequests, so both entry points flush themselves — on a full batch, and on the
+// coalescing window expiring. An explicit flushThumbRequests() from a caller only makes it
+// prompter.
+static bool thumbBudgetFree() {
+    return g_batchSupported ? gBatchInFlight.size() < kMaxBatchInFlight
+                            : S().thumbBusy.size() < kMaxThumbInFlight;
+}
+
+static void maybeAutoFlush(AppState& st) {
+    if (gPending.empty()) return;
+    // A full batch goes out at once — but only if a slot can actually take it. With the budget
+    // saturated the size trigger would otherwise fire on every one of a hundred requestThumb
+    // calls per frame and rescan the queue each time; the age trigger (which flush re-arms)
+    // keeps that to one attempt per coalescing window and still runs the watchdogs.
+    const bool full = gPending.size() >= kThumbBatch && thumbBudgetFree();
+    const bool aged = ImGui::GetTime() - gPendingSince >= kThumbFlushDelaySec;
+    if (full || aged) flushThumbRequests(st);
+}
+
 void requestThumb(AppState& st, const PartsItem& item) {
+    maybeAutoFlush(st);                 // time-based flush, no caller cooperation required
     if (S().thumbs.count(item.id) || S().thumbBusy.count(item.id) ||
         S().thumbFailed.count(item.id))
         return;
@@ -738,18 +1084,36 @@ void requestThumb(AppState& st, const PartsItem& item) {
     // guaranteed ok:false. Either way the caller still paints partIconDraw's glyph, never a hole.
     const bool localRenderable = item.placeable && (item.source == "local" || item.source.empty());
     if (item.imageUrl.empty() && !localRenderable) { markThumbFailed(item.id); return; }
-    issueThumbRequest(st, item.id, item.imageUrl);
+    enqueueThumb(item.id, item.imageUrl);
+    maybeAutoFlush(st);                 // full-batch flush: never hold 16 ready images back
 }
 
 void requestVendorLogo(AppState& st, const std::string& site, const std::string& domain) {
+    maybeAutoFlush(st);
     if (site.empty() || domain.empty()) return;
     // Live vendor logo for the search-progress strip. Stored in the SAME texture cache as part
-    // thumbs, keyed "vendorlogo:<site>", fetched through the existing parts_thumbnail RPC — so
-    // it shares the in-flight budget with the part renders rather than jumping the queue.
-    // A PNG-returning favicon resolver, not <domain>/favicon.ico: stb_image has no ICO decoder,
-    // so the raw .ico would fetch and then fail to decode. Cached by item_id.
-    issueThumbRequest(st, "vendorlogo:" + site,
-                      "https://www.google.com/s2/favicons?domain=" + domain + "&sz=64");
+    // thumbs, keyed "vendorlogo:<site>", carried by the same batched RPC — so it shares the
+    // in-flight budget with the part renders rather than jumping the queue. Cached by item_id.
+    //
+    // The domain is remembered here (and ONLY here — parts_internal.h grows no field for it)
+    // so a definitive failure can rebuild the URL against the second provider; see
+    // retryVendorLogoAlternate. Once the alternate has been tried, the alternate URL is also
+    // what a later re-request uses: re-issuing a provider we already know 404s that domain
+    // would be a guaranteed wasted round trip.
+    const std::string id = std::string(kVendorLogoIdPrefix) + site;
+    VendorLogoSrc& src = gVendorLogoSrc[id];
+    if (src.domain.empty()) src.domain = domain;
+    enqueueThumb(id, src.alternateTried ? vendorLogoAlternateUrl(src.domain)
+                                        : vendorLogoPrimaryUrl(src.domain));
+    maybeAutoFlush(st);
+}
+
+void prioritizeThumb(const std::string& id) {
+    if (id.empty() || !gPendingIds.count(id)) return;
+    auto it = std::find_if(gPending.begin(), gPending.end(),
+                           [&id](const PendingThumb& p) { return p.id == id; });
+    if (it == gPending.end() || it == gPending.begin()) return;
+    std::rotate(gPending.begin(), it, it + 1);   // to the FRONT, order of the rest preserved
 }
 
 }  // namespace parts

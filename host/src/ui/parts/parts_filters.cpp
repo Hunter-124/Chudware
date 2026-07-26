@@ -5,9 +5,9 @@
 // doSearch once 0.35 s after the last change (debounce — no Apply button). The pane's fixed
 // footer is the compact vendor strip (parts_vendors.cpp).
 // V3: every framed widget in the pane wears the shared liquid-glass frame (glassFieldBegin /
-// glassFieldEnd) in ONE hue taken from the selected category, and the global block sits on a
-// hue-tinted card, so the filters read as part of the branch being browsed instead of a grey
-// box bolted to its side.
+// glassFieldEnd) in ONE hue taken from the selected category, so the filters read as part of
+// the branch being browsed instead of a grey box bolted to its side. NO slab sits behind the
+// global block — the field frames alone carry the hue.
 #include <algorithm>
 #include <cfloat>
 #include <cstdio>
@@ -16,6 +16,7 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"
+#include "ui/icons.h"      // ui::drawIconGlass — the wrapped dead-zone hint at the pane foot
 #include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
 
 #include "parts_internal.h"
@@ -57,6 +58,9 @@ void drawFacetWidgets(const TaxNode& node, const float* tint) {
     // the field it names, the next facet starts a real gap away.
     const float gapLabel = 3.0f * sc;
     const float gapField = 9.0f * sc;
+    // Right-hand gutter reserved for the pane's pill scrollbar (drawn in drawFiltersBlock):
+    // every full-width facet widget stops laneW short so none of them run under the bar.
+    const float laneW = ui::metrics::px(ui::kChatScrollbarLane);
     for (const auto& f : node.facets) {
         FacetValue& fv = S().facetValues[f.id];
         ImGui::PushID(f.id.c_str());
@@ -78,7 +82,7 @@ void drawFacetWidgets(const TaxNode& node, const float* tint) {
             // are driven by separate drags instead of DragFloatRange2 — the stock widget hard-
             // ties min <= max, which pins min at an unset (0) max and kills min-only queries.
             const float gap  = ImGui::GetStyle().ItemInnerSpacing.x;
-            const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+            const float half = (ImGui::GetContentRegionAvail().x - gap - laneW) * 0.5f;
             // glassFieldEnd reads the widget's REAL item rect and hover/active state, so it
             // must follow its own widget immediately — markDirty() waits until after.
             glassFieldBegin();
@@ -90,7 +94,7 @@ void drawFacetWidgets(const TaxNode& node, const float* tint) {
             if (minChanged) markDirty();
             ImGui::SameLine(0.0f, gap);
             glassFieldBegin();
-            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - laneW);
             const bool maxChanged = ImGui::DragFloat("##rmax", &fv.rmax, 0.25f, 0.0f, FLT_MAX,
                                                      fmtMax, ImGuiSliderFlags_AlwaysClamp);
             glassFieldEnd(tint);
@@ -103,7 +107,7 @@ void drawFacetWidgets(const TaxNode& node, const float* tint) {
             // Wrapping toggle chips with manual SameLine wrap. The measured width is
             // chipWidth() — the exact footprint chipToggle paints — so the wrap test and the
             // drawn pill read one number and can never disagree the way they used to.
-            const float availR = ImGui::GetContentRegionAvail().x +
+            const float availR = ImGui::GetContentRegionAvail().x - laneW +
                                  ImGui::GetCursorPosX();  // right edge in window coords
             bool first = true;
             for (const auto& opt : f.options) {
@@ -129,7 +133,7 @@ void drawFacetWidgets(const TaxNode& node, const float* tint) {
             }
         } else {  // "text" (and anything unknown degrades to a substring box)
             glassFieldBegin();
-            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - laneW);
             const bool changed =
                 ImGui::InputTextWithHint("##text", "contains…", fv.text, sizeof(fv.text));
             glassFieldEnd(tint);
@@ -153,18 +157,22 @@ void drawFiltersBlock(AppState& st, float paneW) {
     const float gapLabel = 3.0f * sc;
     const float gapField = 9.0f * sc;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::partsPadX(), 2.0f * sc));  // pane gutter
+                        ImVec2(ui::metrics::partsPadX(), 6.0f * sc));  // pane gutter
     ImGui::BeginChild("##parts_filters", ImVec2(paneW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
     // Scrollable filter body above the fixed vendor-strip footer.
-    const float stripH = 108.0f * sc;   // dots row + health line + connect + half-width row
+    // 118, not 108: the footer band is stripH - ItemSpacing.y, and the strip's four stacked
+    // rows measure ~98*sc even with drawVendorStrip's own tightened spacing — at 108 the last
+    // row hung out the bottom of the glass card. This leaves it a real ~9*sc bottom margin.
+    const float stripH = 118.0f * sc;   // dots row + health line + connect + half-width row
     // WindowPadding 0: a nested child re-applies the DEFAULT style padding (15 px), which
     // pushed every filter widget 15 px right of the vendor-strip footer drawn below in the
     // OUTER child — one pane, two left edges. The scroll region must inherit the gutter,
     // not add a second one.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::BeginChild("##filters_scroll", ImVec2(0, -stripH), ImGuiChildFlags_None);
+    ImGui::BeginChild("##filters_scroll", ImVec2(0, -stripH), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleVar();
 
     // Tight base spacing, body only. ItemSpacing.y is spent BEFORE and AFTER every item, so
@@ -175,6 +183,11 @@ void drawFiltersBlock(AppState& st, float paneW) {
     // Popped before the vendor-strip footer, which keeps the theme rhythm.
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(ImGui::GetStyle().ItemSpacing.x, 3.0f * sc));
+
+    // Right-hand lane for the pill scrollbar drawn just before EndChild below. Every
+    // full-width control in this child ends laneW short of the border, so no field can slide
+    // under the bar and nothing touches the pane's right edge.
+    const float laneW = ui::metrics::px(ui::kChatScrollbarLane);
 
     // ---- pane hue ----------------------------------------------------------------
     // ONE colour for the whole pane, taken from the category being browsed, so the filters
@@ -192,26 +205,11 @@ void drawFiltersBlock(AppState& st, float paneW) {
     std::snprintf(activeBuf, sizeof(activeBuf), "%d active", activeCount);
     sectionHeader("Filters", /*firstInPane=*/true, "filter_funnel",
                   activeCount > 0 ? activeBuf : nullptr);
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
 
     // ---- global filters ---------------------------------------------------------
-    // The four global fields sit on ONE hue-tinted liquid-glass card so they read as a group.
-    // The gradient must be painted BEFORE the block — painted after, it would cover its own
-    // labels — and the deferred-channel idiom (plmCardBegin/plmCardEnd in ui/plm/plm_pages.cpp)
-    // is unavailable here because glassFieldBegin already owns this draw list's single channel
-    // split and ImDrawListSplitter cannot nest. So the block measures its own height at the
-    // end and the card is painted from that number on the next frame: the group is fixed in
-    // content, so it is exact from frame two and self-corrects on a DPI or font change. Height
-    // 0 (first frame only) simply skips the paint.
-    static float s_globalCardH = 0.0f;
-    const float  cardPad  = 6.0f * sc;
-    const ImVec2 cardTop  = ImGui::GetCursorScreenPos();
-    const float  cardW    = ImGui::GetContentRegionAvail().x;
-    if (s_globalCardH > 0.0f)
-        ui::glassCardWash(ImGui::GetWindowDrawList(),
-                          ImVec2(cardTop.x - cardPad, cardTop.y - cardPad * 0.5f),
-                          ImVec2(cardTop.x + cardW + cardPad,
-                                 cardTop.y + s_globalCardH + cardPad * 0.5f),
-                          8.0f, tint, 0.13f, 0.45f);
+    // No card behind this group: the per-field liquid-glass frames (glassFieldBegin /
+    // glassFieldEnd, all in the one pane hue) are the only chrome it needs.
 
     fieldLabel("Price (USD)");
     ImGui::Dummy(ImVec2(0, gapLabel));
@@ -220,7 +218,7 @@ void drawFiltersBlock(AppState& st, float paneW) {
     // changed. sepW is the width of the rule drawn below, so the split and the paint agree.
     const float sepW   = 8.0f * sc;
     const float fieldW = std::max(ui::metrics::U(8),
-        (ImGui::GetContentRegionAvail().x - sepW -
+        (ImGui::GetContentRegionAvail().x - sepW - laneW -
          ImGui::GetStyle().ItemSpacing.x * 2.0f) * 0.5f);
     // The "$" is chrome drawn into the frame's left inset, NOT part of the format string.
     // InputScalar prints the buffer with the decorated format but parses it back with a bare
@@ -271,7 +269,7 @@ void drawFiltersBlock(AppState& st, float paneW) {
     fieldLabel("Vendor");
     ImGui::Dummy(ImVec2(0, gapLabel));
     glassFieldBegin();
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - laneW);
     const bool venChanged = ImGui::InputTextWithHint("##fven", "any vendor",
                                                      S().vendorBuf, sizeof(S().vendorBuf));
     glassFieldEnd(tint);
@@ -281,7 +279,7 @@ void drawFiltersBlock(AppState& st, float paneW) {
     fieldLabel("Material");
     ImGui::Dummy(ImVec2(0, gapLabel));
     glassFieldBegin();
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - laneW);
     const bool matChanged = ImGui::InputTextWithHint("##fmat", "steel, brass, nylon…",
                                                      S().materialBuf, sizeof(S().materialBuf));
     glassFieldEnd(tint);
@@ -291,7 +289,7 @@ void drawFiltersBlock(AppState& st, float paneW) {
     fieldLabel("Source");
     ImGui::Dummy(ImVec2(0, gapLabel));
     glassFieldBegin();
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - laneW);
     const bool srcChanged =
         ImGui::Combo("##fsrc", &S().sourceFilter, "All\0Local library\0Live vendors\0");
     glassFieldEnd(tint);
@@ -303,7 +301,7 @@ void drawFiltersBlock(AppState& st, float paneW) {
     // looked like it was asking to be reset.
     const float clearX0 = ImGui::GetCursorPosX();
     ImGui::SetCursorPosX(std::max(clearX0,
-        clearX0 + ImGui::GetContentRegionAvail().x - chipWidth("Clear all")));
+        clearX0 + ImGui::GetContentRegionAvail().x - chipWidth("Clear all") - laneW));
     // A resettable filter set is an ACTION, not a label: the live chip gets a statusErr wash
     // UNDER its own pill (chipToggle paints straight into the draw list, so "under" means a
     // local two-channel split — legal here, no glass field is open inside it).
@@ -338,8 +336,6 @@ void drawFiltersBlock(AppState& st, float paneW) {
         Palette::withAlpha(palette.panelBg, wash, 0.55f);
         clearDl->AddRectFilled(c0, c1, Palette::toU32(wash), (c1.y - c0.y) * 0.5f);
     }
-    // Height of the global block, for NEXT frame's card (see s_globalCardH above).
-    s_globalCardH = ImGui::GetCursorScreenPos().y - cardTop.y;
 
     // ---- per-selection facets (from the selected taxonomy node) ------------------
     bool drewFacets = false;
@@ -357,17 +353,40 @@ void drawFiltersBlock(AppState& st, float paneW) {
     // back while the taxonomy is still in flight (the region is about to be filled) and while
     // a stale facet value is still narrowing the search, since claiming "no extra filters"
     // while one is active would be a lie.
-    // emptyState() spends 35% of the REMAINING height centring itself, so it is only honest
-    // when there is a gap to fill: below one empty-state's worth of room there is no dead
-    // zone, and the leading Dummy would go negative and drag the cursor back up the pane.
+    // The hint is drawn locally rather than through emptyState(): that helper centres each
+    // line on the raw available width with NO wrapping, so at this pane width the sub-line was
+    // clipped at both ends ("ck a category to filter by its own spec"). Here both lines wrap
+    // inside the lane-reserved content width. The height guard stays: below one hint's worth
+    // of room there is no dead zone to fill and the leading Dummy would go negative.
     if (!drewFacets && !S().taxonomyLoading &&
         ImGui::GetContentRegionAvail().y > 96.0f * sc) {
         bool anyFacetValue = false;
         for (const auto& kv : S().facetValues)
             if (kv.second.active()) { anyFacetValue = true; break; }
-        if (!anyFacetValue)
-            emptyState("filter_funnel", "No extra filters here",
-                       "Pick a category to filter by its own specs.");
+        if (!anyFacetValue) {
+            const float hintW = ImGui::GetContentRegionAvail().x - laneW;
+            ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.25f));
+            const float  iconSz = 32.0f * sc;
+            const ImVec2 cur    = ImGui::GetCursorScreenPos();
+            float dis[4];
+            Palette::withAlpha(palette.textDisabled, dis, 0.6f);
+            ui::drawIconGlass(ImGui::GetWindowDrawList(), "filter_funnel",
+                              ImVec2(cur.x + hintW * 0.5f, cur.y + iconSz * 0.5f), iconSz,
+                              Palette::toU32(dis), 0);
+            ImGui::Dummy(ImVec2(0, iconSz + 6.0f * sc));
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + hintW);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(palette.textDim[0], palette.textDim[1],
+                                         palette.textDim[2], 1.0f));
+            ImGui::TextWrapped("No extra filters here");
+            ImGui::PopStyleColor();
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                                         palette.textDisabled[2], 0.85f));
+            ImGui::TextWrapped("Pick a category to filter by its own specs.");
+            ImGui::PopStyleColor();
+            ImGui::PopTextWrapPos();
+        }
     }
 
     // The scroll child ends flush against the fixed vendor-strip footer, so the last facet
@@ -375,6 +394,17 @@ void drawFiltersBlock(AppState& st, float paneW) {
     ImGui::Dummy(ImVec2(0, 12.0f * sc));
     ImGui::PopStyleVar();   // body ItemSpacing
 
+    // The pane's own scrollbar: the copilot's thick 9px pill, sitting ON the right edge of the
+    // lane every control above reserved via laneW. The child carries NoScrollbar so this
+    // REPLACES the default hairline instead of doubling it.
+    {
+        const ImVec2 wp = ImGui::GetWindowPos();
+        const ImVec2 ws = ImGui::GetWindowSize();
+        const ui::AdaptiveSurface& surf =
+            ui::adaptivePanel(ui::panelId("parts_filters_glass"),
+                              ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)));
+        ui::drawWindowPillScrollbarV(surf, ui::kChatScrollbar);
+    }
     ImGui::EndChild();  // ##filters_scroll
 
     // ---- fixed footer: compact vendor strip --------------------------------------

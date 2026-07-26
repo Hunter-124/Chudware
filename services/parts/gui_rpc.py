@@ -19,7 +19,9 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout, as_completed
 from typing import Any, Callable
 
 # ---- vocabulary ------------------------------------------------------------------
@@ -1089,15 +1091,246 @@ def _thumb_cache_dir():
     return d
 
 
+# ---- thumbnail tuning knobs / disk cache ---------------------------------------------
+#
+# Every knob is read PER CALL (never memoised into a module global) so a worker can be
+# retuned from the environment without a restart.
+
+_THUMB_MAX_BATCH = 32            # entries honoured by one parts_thumbnails call
+_THUMB_DIR_MAX_ENTRIES = 20000   # cache-dir bound before the .miss sweep kicks in
+_THUMB_TRIM_EVERY_S = 600.0      # at most one sweep per 10 minutes
+_THUMB_MISS_SUFFIX = ".miss"
+_THUMB_MISS_REASON = "no preview available (cached)"
+
+# THE RENDER PATH IS NOT THREAD-SAFE. `_render_local_part_png` drives the native core as a
+# FOUR-CALL sequence around one doc_id (parts_make → doc_apply_ops → doc_render_png →
+# doc_close). In daemon mode (the default) services/mcp/daemon_bridge.py serialises each
+# INDIVIDUAL rpc behind DaemonClient._lock — one outstanding request per connection — so
+# running renders 8-wide buys nothing and merely interleaves four-call sequences on one
+# socket. Worse, in the legacy in-process mode (CHUDWARE_ENGINE_DAEMON=0, and the STICKY
+# fallback core_bridge drops into for the rest of the session whenever hostd is
+# unreachable) core_bridge.call() invokes `dll.chudware_call` with NO lock at all — the
+# `_lock` there guards only the one-time DLL load — so concurrent renders would race OCCT
+# inside this process. Renders therefore run strictly one at a time behind this lock;
+# network fetches, which touch nothing shared, stay fully parallel.
+_THUMB_RENDER_LOCK = threading.Lock()
+
+_thumb_trim_lock = threading.Lock()
+_thumb_last_trim = 0.0
+
+
+def _thumb_env_num(name: str, default: float, lo: float, hi: float) -> float:
+    """A positive numeric env knob clamped to [lo, hi]. Unset/garbage/<=0 → default."""
+    try:
+        val = float(str(os.environ.get(name, "")).strip())
+    except (TypeError, ValueError):
+        return default
+    if val <= 0:
+        return default
+    return max(lo, min(hi, val))
+
+
+def _thumb_workers() -> int:
+    """Fan-out width for a batch. CHUDWARE_THUMB_WORKERS, default 8, clamped 1..16."""
+    return int(_thumb_env_num("CHUDWARE_THUMB_WORKERS", 8.0, 1.0, 16.0))
+
+
+def _thumb_batch_budget_s() -> float:
+    """Wall budget for one parts_thumbnails call. CHUDWARE_THUMB_BATCH_BUDGET_S, default 20 s."""
+    return _thumb_env_num("CHUDWARE_THUMB_BATCH_BUDGET_S", 20.0, 0.05, 300.0)
+
+
+def _thumb_fetch_timeout_s() -> float:
+    """urllib timeout for one image GET. CHUDWARE_THUMB_FETCH_TIMEOUT_S, default 4.0 s."""
+    return _thumb_env_num("CHUDWARE_THUMB_FETCH_TIMEOUT_S", 4.0, 0.05, 60.0)
+
+
+def _thumb_miss_ttl_s() -> float:
+    """How long a negative marker suppresses a retry. CHUDWARE_THUMB_MISS_TTL_S, default 24 h."""
+    return _thumb_env_num("CHUDWARE_THUMB_MISS_TTL_S", 86400.0, 1.0, 365.0 * 86400.0)
+
+
+def _thumb_cache_paths(part_id: str):
+    """(image, miss-marker) paths for a part id. The sha1 key is shared with
+    gen_standard_thumbs.py's cache warmer — never change it without wiping the dir."""
+    h = hashlib.sha1(part_id.encode()).hexdigest()
+    d = _thumb_cache_dir()
+    return d / (h + ".img"), d / (h + _THUMB_MISS_SUFFIX)
+
+
+def _thumb_cached(part_id: str) -> dict | None:
+    """The on-disk answer for a part: a positive hit, a fresh negative marker, or None
+    for a genuine miss. Two stat()s at worst — this is why the batch handler can resolve
+    every cached entry SYNCHRONOUSLY before it even builds a thread pool."""
+    try:
+        img, miss = _thumb_cache_paths(part_id)
+    except Exception:  # noqa: BLE001 — unwritable cache dir → behave as a miss
+        return None
+    try:
+        if img.exists():
+            return {"ok": True, "image_b64": base64.b64encode(img.read_bytes()).decode()}
+    except Exception:  # noqa: BLE001 — truncated / racing write → re-produce below
+        pass
+    try:
+        if (time.time() - miss.stat().st_mtime) < _thumb_miss_ttl_s():
+            return {"ok": False, "reason": _THUMB_MISS_REASON}
+        miss.unlink(missing_ok=True)   # expired — let the part be tried again
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except Exception:  # noqa: BLE001 — a cache problem must never fail a thumbnail
+        pass
+    return None
+
+
+def _thumb_store(img_path, data: bytes) -> None:
+    """Publish a fresh image and clear any stale negative marker. Best-effort: a full or
+    read-only cache dir costs a re-fetch next time, never this call's result."""
+    try:
+        img_path.write_bytes(data)
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        img_path.with_suffix(_THUMB_MISS_SUFFIX).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _thumb_mark_miss(miss_path) -> None:
+    """Touch the zero-byte negative marker. Without it a part with nothing to show
+    re-runs its 2-4 s render (or a doomed CDN fetch) on every single worker restart."""
+    try:
+        miss_path.touch(exist_ok=True)
+        os.utime(miss_path, None)
+    except Exception:  # noqa: BLE001
+        return
+    _thumb_trim_cache_dir()
+
+
+def _thumb_trim_cache_dir() -> None:
+    """Bound the cache dir: past _THUMB_DIR_MAX_ENTRIES entries drop the oldest 20% of
+    `.miss` markers — never a real image (those are expensive renders), and at most one
+    sweep per 10 minutes so a batch of misses cannot turn into a batch of scans."""
+    global _thumb_last_trim
+    now = time.monotonic()
+    with _thumb_trim_lock:
+        if _thumb_last_trim and (now - _thumb_last_trim) < _THUMB_TRIM_EVERY_S:
+            return
+        _thumb_last_trim = now
+
+    def _mtime(p) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:   # vanished mid-sweep — sort it to the front, unlink is tolerant
+            return 0.0
+
+    try:
+        entries = list(_thumb_cache_dir().iterdir())
+        if len(entries) <= _THUMB_DIR_MAX_ENTRIES:
+            return
+        misses = [p for p in entries if p.name.endswith(_THUMB_MISS_SUFFIX)]
+        misses.sort(key=_mtime)
+        for p in misses[: max(1, len(misses) // 5)]:
+            p.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 — a failed sweep must never fail a thumbnail
+        pass
+
+
 _BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
+
+
+def _looks_like_image(body: bytes) -> bool:
+    """True if these bytes open with a decodable raster magic. Used to salvage an image
+    that arrived attached to an HTTP ERROR status — see :func:`_http_image_get`."""
+    if not body:
+        return False
+    if body.startswith(_IMAGE_MAGIC):
+        return True
+    return body[:4] == b"RIFF" and body[8:12] == b"WEBP"
+
+
+def _http_image_get(url: str, headers: dict) -> tuple[bytes | None, int]:
+    """One bounded HTTP GET for an image → ``(bytes|None, http_status)``; status 0 means
+    the request never produced a response (DNS/TCP/TLS/timeout).
+
+    The subtle part is the ERROR path. Google's s2 favicon service answers **HTTP 404 with
+    a perfectly valid 726-byte generic-globe PNG in the body** (measured: thk.com,
+    3dcontentcentral.com, traceparts.com all 404 + a decodable PNG; mcmaster.com 200).
+    ``urlopen`` turns any 4xx/5xx into an HTTPError and the old code dropped the exception
+    on the floor, throwing that usable image away — which is precisely why those three
+    vendors fell back to a lettered tile. So on an error status we still READ the body
+    (same 4 MiB cap) and hand it back when it carries an image magic. A non-image error
+    body (an HTML 404 page, an empty response) yields None and the caller decides.
+    """
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        # Short timeout ON PURPOSE: the old 8 s burned the GUI's whole patience budget on a
+        # dead CDN before the CEF fallback even started, so the card sat empty for 8+ s.
+        with urllib.request.urlopen(req, timeout=_thumb_fetch_timeout_s()) as resp:  # noqa: S310
+            body = resp.read(4 * 1024 * 1024)
+            return (body or None), int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        code = int(getattr(exc, "code", 0) or 0)
+        try:
+            body = exc.read(4 * 1024 * 1024) or b""
+        except Exception:  # noqa: BLE001 — error carried no readable body
+            body = b""
+        return (body if _looks_like_image(body) else None), code
+    except Exception:  # noqa: BLE001 — DNS/TCP/TLS/timeout; the caller may try CEF
+        return None, 0
+
+
+def _gstatic_favicon_url(image_url: str) -> str:
+    """The gstatic faviconV2 equivalent of a Google **s2** favicon url, or ``""`` when
+    ``image_url`` is not one.
+
+    Measured: for domains s2 has no icon for it 404s with its generic globe, while
+    faviconV2 sometimes still serves the vendor's REAL icon at 200 (traceparts.com →
+    a 1075-byte JPEG). Worth exactly one extra request before settling for the globe."""
+    import urllib.parse
+
+    try:
+        pu = urllib.parse.urlparse(image_url)
+    except ValueError:
+        return ""
+    host = (pu.hostname or "").lower()
+    if not (host == "google.com" or host.endswith(".google.com")):
+        return ""
+    if not pu.path.startswith("/s2/favicons"):
+        return ""
+    q = urllib.parse.parse_qs(pu.query)
+    domain = (q.get("domain") or [""])[0].strip()
+    if not domain:
+        domain = urllib.parse.urlparse((q.get("url") or [""])[0].strip()).hostname or ""
+    if not domain:
+        return ""
+    size = (q.get("sz") or [""])[0].strip() or "64"
+    return ("https://t3.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON"
+            "&fallback_opts=TYPE,SIZE,URL"
+            f"&url=https://{urllib.parse.quote(domain, safe='')}&size={size}")
+
+
 def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
-    """Fetch a product image, defeating the common hotlink guard by sending a
-    browser User-Agent and a same-origin Referer derived from the part's product
-    URL (part_id = ``catalog:<site>::<product_url>``). Many vendor CDNs 403 a bare
-    request but serve the byte stream once a plausible Referer is present."""
+    """Fetch a product image or vendor favicon, defeating the common hotlink guard by
+    sending a browser User-Agent and a same-origin Referer derived from the part's product
+    URL (part_id = ``catalog:<site>::<product_url>``). Many vendor CDNs 403 a bare request
+    but serve the byte stream once a plausible Referer is present.
+
+    Three ordered attempts, at most two of them HTTP:
+      1. ``image_url`` itself. A 200 body wins outright; a 4xx/5xx body wins too **if it
+         is an image** (Google's s2 favicons 404 with a valid globe PNG — see
+         :func:`_http_image_get`).
+      2. For an s2 favicon url that 404'd, ONE retry against gstatic's faviconV2, which
+         measurably still has the real icon for some of those domains. A 200 there beats
+         the globe; otherwise the globe stands, because any icon beats a lettered tile.
+      3. The CEF session (real browser fingerprint + saved cookies) — the thing that
+         defeats CDNs which 403 a plain hotlink. Skipped when we already have bytes, and
+         skipped on a bodyless 404: that asset is simply gone and CEF would spend seconds
+         collecting the same 404.
+    """
     import urllib.parse
 
     referer = ""
@@ -1114,14 +1347,24 @@ def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
                "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8"}
     if referer:
         headers["Referer"] = referer
-    try:
-        req = urllib.request.Request(image_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as resp:  # noqa: S310
-            data = resp.read(4 * 1024 * 1024)
-            if data:
-                return data
-    except Exception:  # noqa: BLE001 — hotlink-blocked / transient; fall through to CEF
-        pass
+
+    data, status = _http_image_get(image_url, headers)
+    if data and status == 200:
+        return data
+    if status == 404:
+        alt_url = _gstatic_favicon_url(image_url)
+        if alt_url:   # exactly one alternate attempt — never a provider loop
+            alt_data, alt_status = _http_image_get(alt_url, headers)
+            if alt_data and alt_status == 200:
+                return alt_data          # the vendor's REAL icon
+            data = data or alt_data      # both generic: keep whichever globe we got
+    if data:
+        return data   # an image body that came with an error status — still an image
+    if status == 404:
+        # Genuinely nothing there. CEF would re-request the SAME url from the SAME CDN and
+        # collect the same 404 seconds later. Every OTHER failure (403 hotlink guard, 5xx,
+        # timeout) still falls through — those are exactly what the CEF session fixes.
+        return None
     # Fallback: pull the image through the CEF session, which carries the vendor's
     # real browser fingerprint + saved cookies — this is what defeats the CDNs that
     # 403 a plain hotlink. site = the catalog part_id's vendor segment.
@@ -1274,6 +1517,61 @@ def _render_local_part_png(part_id: str, tmp_png) -> bytes | None:
                 pass
 
 
+def _thumb_produce(part_id: str, image_url: str, deadline: float | None = None) -> dict:
+    """The CACHE-MISS half of one preview: vendor image first, else a render of the part's
+    own 3D model. Writes the positive cache entry on success and the negative marker on a
+    definitive failure. ``deadline`` is a ``time.monotonic()`` stamp bounding how long this
+    may block for the serialised render slot; None blocks (the singular RPC's behaviour).
+
+    Callers must have consulted :func:`_thumb_cached` first."""
+    img_path, miss_path = _thumb_cache_paths(part_id)
+    if image_url.startswith(("http://", "https://")):
+        data = _fetch_image_bytes(image_url, part_id)
+        if data:
+            _thumb_store(img_path, data)
+            return {"ok": True, "image_b64": base64.b64encode(data).decode()}
+    # No usable vendor image → render the 3D model of any local parametric (core_family)
+    # part: mech_family:/fastener:/bearing:/… all resolve through _render_local_part_png.
+    # Resolve the family FIRST so that only a genuine render pays for the global render
+    # lock — a catalog: id resolves to None in microseconds and must never queue behind
+    # someone else's 3 s engine round-trip.
+    try:
+        renderable = _resolve_core_family(part_id) is not None
+    except Exception:  # noqa: BLE001 — unknown id → not a render, just answer below
+        renderable = False
+    if renderable:
+        wait = -1.0 if deadline is None else max(0.0, deadline - time.monotonic())
+        if not _THUMB_RENDER_LOCK.acquire(timeout=wait):
+            # Out of budget waiting our turn. NOT cached as a miss: this is a scheduling
+            # answer, not a statement about the part.
+            return {"ok": False, "reason": "timeout"}
+        try:
+            data = _render_local_part_png(part_id, str(img_path) + ".png")
+        finally:
+            _THUMB_RENDER_LOCK.release()
+    else:
+        # Still routed through the renderer: it answers None immediately for a
+        # non-core_family id, and ONE call site keeps the two branches honest.
+        data = _render_local_part_png(part_id, str(img_path) + ".png")
+    if data:
+        _thumb_store(img_path, data)
+        return {"ok": True, "image_b64": base64.b64encode(data).decode()}
+    _thumb_mark_miss(miss_path)
+    return {"ok": False, "reason": "no preview available"}
+
+
+def _thumb_resolve_one(part_id: str, image_url: str, deadline: float | None = None) -> dict:
+    """THE single-entry preview implementation, shared by ``parts_thumbnail`` (singular)
+    and ``parts_thumbnails`` (batch) so the two can never drift: disk cache — positive
+    image or fresh negative marker — and only then the produce path."""
+    if not part_id:
+        return {"ok": False, "reason": "item_id required"}
+    hit = _thumb_cached(part_id)
+    if hit is not None:
+        return hit
+    return _thumb_produce(part_id, image_url, deadline)
+
+
 def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
     """Best-effort PNG/JPEG preview for a part, base64-encoded, cached on disk.
 
@@ -1281,31 +1579,99 @@ def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
     ``mech_family`` library parts (parts_make → doc_render_png, cached by part_id),
     (c) a vendor image_url passed by the GUI. The GUI falls back to a domain glyph
     when this returns ok:false.
+
+    Kept as the GUI's fallback for workers that predate ``parts_thumbnails``; it is a thin
+    wrapper over :func:`_thumb_resolve_one`, which the batch method also uses.
     """
     try:
-        part_id = str((params or {}).get("item_id", "")).strip()
-        image_url = str((params or {}).get("image_url", "")).strip()
-        if not part_id:
-            return {"ok": False, "reason": "item_id required"}
-        cache = _thumb_cache_dir() / (hashlib.sha1(part_id.encode()).hexdigest() + ".img")
-        if cache.exists():
-            return {"ok": True, "image_b64": base64.b64encode(cache.read_bytes()).decode()}
-        # Standard/library part with no vendor image: render its 3D model on demand and
-        # cache it (keyed by part_id, so subsequent views are instant cache hits).
-        if image_url.startswith(("http://", "https://")):
-            data = _fetch_image_bytes(image_url, part_id)
-            if data:
-                cache.write_bytes(data)
-                return {"ok": True, "image_b64": base64.b64encode(data).decode()}
-        # No usable vendor image → render the 3D model of any local parametric (core_family) part:
-        # mech_family:/fastener:/bearing:/… all resolve through _render_local_part_png.
-        data = _render_local_part_png(part_id, str(cache) + ".png")
-        if data:
-            cache.write_bytes(data)
-            return {"ok": True, "image_b64": base64.b64encode(data).decode()}
-        return {"ok": False, "reason": "no preview available"}
+        p = params or {}
+        return _thumb_resolve_one(str(p.get("item_id", "")).strip(),
+                                  str(p.get("image_url", "")).strip())
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_thumbnail failed: {exc}"}
+
+
+def _parts_thumbnails(params: dict, _emit: Callable) -> dict:
+    """BATCH previews — ``{"items":[{item_id,image_url},…]}`` → ``{"ok":true, "images":
+    [{item_id, ok, image_b64, reason},…]}``, exactly one entry per input, in input order.
+
+    Why it exists: the GUI used to issue one ``parts_thumbnail`` per card down a single
+    FIFO dispatch thread, so a grid of thirty uncached products fetched thirty images
+    strictly one after another and the page filled in over half a minute. Here the genuine
+    misses fan out across a per-call pool, and every disk-cache hit is answered
+    synchronously before the pool is even built — a warm grid comes back in milliseconds
+    having created no threads at all.
+
+    The envelope stays ok:true whenever the CALL worked; a per-item failure is reported in
+    that item's own ok/reason so one dead CDN cannot blank the whole page.
+    """
+    try:
+        raw = (params or {}).get("items") or []
+        if not isinstance(raw, list):
+            return {"ok": False, "reason": "items must be a list"}
+        # Excess is IGNORED rather than rejected: a GUI that over-asks should still get its
+        # first screenful instead of an error card on every tile.
+        reqs: list[tuple[str, str]] = []
+        for ent in raw[:_THUMB_MAX_BATCH]:
+            if isinstance(ent, dict):
+                reqs.append((str(ent.get("item_id", "")).strip(),
+                             str(ent.get("image_url", "")).strip()))
+            else:
+                reqs.append(("", ""))   # keep the 1:1 index mapping the GUI relies on
+        results: list[dict | None] = [None] * len(reqs)
+
+        # Pass 1 — the free answers. A disk hit (image, or a fresh negative marker) costs
+        # two stat()s, so a batch that is 90% cached must not spend a millisecond of it
+        # waiting behind a pool slot occupied by a slow CDN.
+        pending: list[int] = []
+        for i, (pid, _url) in enumerate(reqs):
+            if not pid:
+                results[i] = {"ok": False, "reason": "item_id required"}
+                continue
+            hit = _thumb_cached(pid)
+            if hit is not None:
+                results[i] = hit
+            else:
+                pending.append(i)
+
+        # Pass 2 — the genuine misses, fanned out. The pool is created PER CALL and shut
+        # down in the finally: no module-level pool outliving the worker, and no unbounded
+        # thread creation (width is clamped 1..16 and never exceeds the miss count).
+        if pending:
+            budget = _thumb_batch_budget_s()
+            deadline = time.monotonic() + budget
+            ex = ThreadPoolExecutor(max_workers=max(1, min(_thumb_workers(), len(pending))),
+                                    thread_name_prefix="parts-thumb")
+            try:
+                futs = {ex.submit(_thumb_produce, reqs[i][0], reqs[i][1], deadline): i
+                        for i in pending}
+                try:
+                    for fut in as_completed(futs, timeout=budget):
+                        i = futs[fut]
+                        try:
+                            results[i] = fut.result()
+                        except Exception as exc:  # noqa: BLE001 — one bad item, not a bad call
+                            results[i] = {"ok": False, "reason": f"thumbnail failed: {exc}"}
+                except _FutureTimeout:
+                    pass   # anything still None below is reported as reason:"timeout"
+            finally:
+                # wait=False + cancel_futures: queued work is dropped and anything still
+                # running is ABANDONED rather than joined, so this call can never outlast
+                # its wall budget. A straggler is harmless — it is itself bounded (a short
+                # urllib timeout, then the CEF download), it only writes into the disk
+                # cache, and the next request for that id is then a hit.
+                ex.shutdown(wait=False, cancel_futures=True)
+
+        images: list[dict] = []
+        for i, (pid, _url) in enumerate(reqs):
+            r = results[i] or {"ok": False, "reason": "timeout"}
+            images.append({"item_id": pid,
+                           "ok": bool(r.get("ok")),
+                           "image_b64": str(r.get("image_b64") or ""),
+                           "reason": str(r.get("reason") or "")})
+        return {"ok": True, "images": images}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"parts_thumbnails failed: {exc}"}
 
 
 def _parts_match_model(params: dict, _emit: Callable) -> dict:
@@ -1361,5 +1727,6 @@ GUI_WORKER_METHODS: dict[str, Callable] = {
     "vendor_status":         _vendor_status,
     "vendor_login":          _vendor_login,
     "vendor_creds_set":      _vendor_creds_set,
-    "parts_thumbnail":       _parts_thumbnail,
+    "parts_thumbnail":       _parts_thumbnail,   # singular: legacy / old-worker fallback
+    "parts_thumbnails":      _parts_thumbnails,  # batch: what the GUI grid uses
 }

@@ -65,6 +65,71 @@ static bool   g_indexStatusSupported = true;
 // chunk of perceived latency in a live search — so the poll bursts first, then settles.
 static double g_liveStartedAt = 0.0;
 
+// ---- vendor logo (favicon) prefetch ---------------------------------------------
+// The vendor logos used to be requested from ONE place — applyLiveVendors(), which only runs
+// while a live fan-out is in flight. So a logo's first request went out at the exact moment
+// the transient progress strip that displays it was about to disappear, and at no other time:
+// the user never saw a single one. They are now prefetched as soon as the vendor list lands
+// and drawn persistently (drawResultSourcesRow).
+namespace {
+
+// Registrable domain per site key, feeding the favicon URL in requestVendorLogo.
+//
+// Group 1 is transcribed verbatim from the backend's `_SITE_DOMAINS`
+// (services/parts/gui_rpc.py:115-125), which `_site_domain` (gui_rpc.py:128-143) consults
+// first. Group 2 covers the backend's SECOND step (gui_rpc.py:133-142: import
+// services.browser.adapters.<site>, take its BASE_URL netloc, drop "www.") — there is no
+// client-side equivalent for that import, so the keys where it disagrees with the
+// `<site>.com` fallback are snapshotted here instead. Without group 2, cadenas / maxon /
+// thomson — all login-gated vendors the GUI DOES list — would fetch the favicon of an
+// unrelated site that happens to own <key>.com, which is worse than no logo.
+//
+// Anything not listed falls through to `<site>.com`, exactly like gui_rpc.py:143.
+struct SiteDomain { const char* key; const char* domain; };
+constexpr SiteDomain kSiteDomains[] = {
+    // -- group 1: gui_rpc.py:115-125, verbatim ------------------------------------------
+    {"mcmaster", "mcmaster.com"}, {"grabcad", "grabcad.com"}, {"traceparts", "traceparts.com"},
+    {"amazon", "amazon.com"}, {"jlcpcb", "jlcpcb.com"}, {"pcbway", "pcbway.com"},
+    {"misumi", "misumi.com"}, {"lcsc", "lcsc.com"}, {"digikey", "digikey.com"},
+    {"snapeda", "snapeda.com"}, {"content3d", "3dcontentcentral.com"},
+    {"3dcontentcentral", "3dcontentcentral.com"}, {"homedepot", "homedepot.com"},
+    {"lowes", "lowes.com"}, {"acehardware", "acehardware.com"}, {"grainger", "grainger.com"},
+    {"fastenal", "fastenal.com"}, {"harborfreight", "harborfreight.com"},
+    {"tractorsupply", "tractorsupply.com"}, {"onlinemetals", "onlinemetals.com"},
+    {"metalsdepot", "metalsdepot.com"},
+    // -- group 2: adapter BASE_URL netloc, for the keys where it != "<key>.com" ----------
+    {"cadenas", "3dfindit.com"}, {"cui", "cuidevices.com"},
+    {"freecadlibrary", "github.com"}, {"gbstandards", "openstd.samr.gov.cn"},
+    {"hdsc", "hdsc.com.cn"}, {"hiwin", "hiwin.us"}, {"maxon", "maxongroup.com"},
+    {"rockwest", "rockwestcomposites.com"}, {"thomson", "thomsonlinear.com"},
+    {"wch", "wch-ic.com"},
+};
+
+std::string vendorDomain(const std::string& id) {
+    if (id.empty()) return {};
+    // Some ids reach the GUI carrying their transport suffix ("mcmaster_web",
+    // "amazon_browser"); the registrable domain belongs to the stem, not the suffix.
+    std::string stem = id;
+    for (const char* suf : {"_web", "_browser"}) {
+        const size_t n = std::strlen(suf);
+        if (stem.size() > n && stem.compare(stem.size() - n, n, suf) == 0) {
+            stem.erase(stem.size() - n);
+            break;
+        }
+    }
+    for (const auto& e : kSiteDomains)
+        if (stem == e.key) return e.domain;
+    return stem + ".com";
+}
+
+}  // namespace
+
+// Site keys whose favicon is wanted but not yet requested. requestVendorLogo funnels through
+// the SHARED 4-slot thumbnail budget, so firing all ~16 on the frame the vendor list lands
+// would starve the part renders the user is actually looking at. Drained one per frame by
+// pumpVendorLogos, and only while the budget is mostly idle.
+static std::vector<std::string> g_logoQueue;
+
 // ---- async loaders -------------------------------------------------------------
 
 void loadCategories(AppState& st) {
@@ -165,6 +230,13 @@ void loadVendors(AppState& st, bool force) {
             }
         S().vendors = std::move(vs);
 
+        // Prefetch every known vendor's favicon now that the list has landed. Queued rather
+        // than fired: pumpVendorLogos drains it one per frame so the shared thumbnail budget
+        // stays available for the part renders on screen.
+        g_logoQueue.clear();
+        for (const auto& v : S().vendors)
+            if (!v.id.empty()) g_logoQueue.push_back(v.id);
+
         // API providers: preserve open editors across refreshes.
         std::map<std::string, ApiProvider> old;
         for (auto& a : S().apiProviders) old[a.id] = a;
@@ -187,6 +259,33 @@ void loadVendors(AppState& st, bool force) {
             }
         S().apiProviders = std::move(as);
     });
+}
+
+// One queued vendor favicon per frame, and only while the shared 4-slot thumbnail budget is
+// mostly idle — part thumbnails are what the user is looking at and always win the slots.
+// Called from the workspace body once the worker is known to be up.
+static void pumpVendorLogos(AppState& st) {
+    if (g_logoQueue.empty()) return;
+    if (S().thumbBusy.size() >= 2) return;   // budget in use — try again next frame
+    while (!g_logoQueue.empty()) {
+        const std::string site = g_logoQueue.front();
+        g_logoQueue.erase(g_logoQueue.begin());
+        const std::string key = "vendorlogo:" + site;
+        if (S().thumbs.count(key) || S().thumbFailed.count(key)) continue;  // already resolved
+        requestVendorLogo(st, site, vendorDomain(site));
+        return;                                                            // exactly one/frame
+    }
+}
+
+// Queue a site's favicon if it is neither cached, failed, in flight, nor already queued.
+// Result rows can come from commerce sites that vendor_status never lists (it only surfaces
+// login-gated adapters), so the Sources row tops the queue up from what it actually draws.
+static void wantVendorLogo(const std::string& site) {
+    if (site.empty()) return;
+    const std::string key = "vendorlogo:" + site;
+    if (S().thumbs.count(key) || S().thumbFailed.count(key) || S().thumbBusy.count(key)) return;
+    if (std::find(g_logoQueue.begin(), g_logoQueue.end(), site) != g_logoQueue.end()) return;
+    g_logoQueue.push_back(site);
 }
 
 // Client-side result sort, shared by the initial local search and each live append
@@ -473,6 +572,85 @@ static void drawLiveVendorStrip(AppState& st) {
     ImGui::SetCursorScreenPos(ImVec2(leftEdge, base.y));
     const float reserve = (bottom - base.y) > cellH ? (bottom - base.y) : cellH;
     ImGui::Dummy(ImVec2(1.0f, reserve));
+}
+
+// Friendly name for a site key: the live-vendor list first (it carries the backend's label
+// for exactly the sites in play), then the account list, else the raw key.
+static std::string vendorLabelFor(const std::string& site) {
+    for (const auto& lv : S().liveVendors)
+        if (lv.site == site && !lv.label.empty()) return lv.label;
+    for (const auto& v : S().vendors)
+        if (v.id == site && !v.label.empty()) return v.label;
+    return site;
+}
+
+// Persistent "Sources" row — the vendors that actually contributed rows to the CURRENT result
+// set, with their real logos. drawLiveVendorStrip above is deliberately transient (it is the
+// in-flight progress readout and vanishes with the fan-out), which is why the user never saw
+// a vendor logo outside the couple of seconds a live search was running. Drawn under the
+// "Parts" header; skipped entirely when nothing on screen came from a live catalog.
+// Needs no AppState: pending fetches go through wantVendorLogo/g_logoQueue, which the
+// workspace body drains one per frame.
+static void drawResultSourcesRow() {
+    if (S().results.empty()) return;
+    // Live catalog ids are "catalog:<site>::<url>". First-appearance order, capped at 8.
+    constexpr size_t kMaxSources = 8;
+    std::vector<std::string> sites;
+    for (const auto& item : S().results) {
+        if (item.id.compare(0, 8, "catalog:") != 0) continue;
+        const auto sep = item.id.find("::", 8);
+        if (sep == std::string::npos || sep == 8) continue;
+        std::string site = item.id.substr(8, sep - 8);
+        if (std::find(sites.begin(), sites.end(), site) != sites.end()) continue;
+        sites.push_back(std::move(site));
+        if (sites.size() >= kMaxSources) break;
+    }
+    if (sites.empty()) return;
+
+    const float s = ui::uiScale;
+    const auto& pal = ui::palette;
+    const float logo = 16.0f * s, gap = 6.0f * s;
+
+    ImGui::TextDisabled("Sources");
+    ImGui::SameLine();
+    ImDrawList*  dl    = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    // Stop short of the pill scrollbar's lane so a logo can never slide under the bar.
+    const float  rightB = start.x + ImGui::GetContentRegionAvail().x -
+                          ui::kChatScrollbarLane * s;
+    const float  y      = start.y + (ImGui::GetTextLineHeight() - logo) * 0.5f;
+    float x = start.x;
+    for (const auto& site : sites) {
+        if (x + logo > rightB && x > start.x + 0.5f) break;   // narrow column — clip cleanly
+        const ImVec2 l0(x, y), l1(x + logo, y + logo);
+        auto it = S().thumbs.find("vendorlogo:" + site);
+        if (it != S().thumbs.end() && it->second.tex) {
+            it->second.lastUse = ImGui::GetTime();   // LRU: keep on-screen logos resident
+            dl->AddImage((ImTextureID)(intptr_t)it->second.tex, l0, l1);
+        } else {
+            // Not fetched yet (or a site vendor_status never listed) — queue it and show a
+            // lettered tile meanwhile, so the row never collapses to nothing.
+            wantVendorLogo(site);
+            const std::string lbl = vendorLabelFor(site);
+            float bg[4];
+            ui::Palette::withAlpha(pal.accent, bg, 0.16f);
+            dl->AddRectFilled(l0, l1, ui::Palette::toU32(bg), 4.0f * s);
+            char c = lbl.empty() ? '?' : lbl[0];
+            if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+            const char L[2] = {c, 0};
+            const ImVec2 ts = ImGui::CalcTextSize(L);
+            dl->AddText(ImVec2(x + (logo - ts.x) * 0.5f, y + (logo - ts.y) * 0.5f),
+                        ui::Palette::toU32(pal.text), L);
+        }
+        ImGui::SetCursorScreenPos(l0);
+        ImGui::InvisibleButton((std::string("##src_") + site).c_str(), ImVec2(logo, logo));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", vendorLabelFor(site).c_str());
+        x += logo + gap;
+    }
+    // Close the line at its natural height so the results list flows below it.
+    ImGui::SetCursorScreenPos(start);
+    ImGui::Dummy(ImVec2(x - start.x, logo));
 }
 
 void startLiveSearch(AppState& st) {
@@ -839,6 +1017,9 @@ void drawPartsLibraryWorkspace(AppState& st) {
         return;
     }
 
+    // Vendor favicons: one queued request per frame, budget permitting (see g_logoQueue).
+    pumpVendorLogos(st);
+
     // Catalog index build → poll ~1 Hz until it lands, then silently re-run the query.
     // Tolerant by construction: transport failure, `ok:false`, or a worker with no
     // parts_index_status at all all resolve to "not building" rather than pinning the
@@ -874,7 +1055,10 @@ void drawPartsLibraryWorkspace(AppState& st) {
     const float totalW     = ImGui::GetContentRegionAvail().x;
     const float catFullW   = 240.0f * sc;
     const float filtFullW  = 260.0f * sc;
-    const float gapsW      = 12.0f * sc;    // the two SameLine gaps between the columns
+    // The two SameLine gaps between the columns. MUST match 2 x style ItemSpacing.x (10 px
+    // scaled, ui_theme.cpp:327) — under-reserving it pushed the columns wider than the
+    // available width, which is what made the side panes read as touching their borders.
+    const float gapsW      = 20.0f * sc;
     const float minMidW    = 320.0f * sc;   // results column never narrower than this
     const float kSideFloor = 0.60f;         // shrink the side panes to 60 % before dropping
 
@@ -895,8 +1079,15 @@ void drawPartsLibraryWorkspace(AppState& st) {
         ImGui::SameLine();
     }
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 4 * sc));
-    ImGui::BeginChild("##parts_results", ImVec2(midW, 0), ImGuiChildFlags_None);
+    // Vertical window padding is 8 px, not the frame-tight 4: the search row used to sit
+    // welded to the child's top edge.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
+    // NoScrollbar: ImGui's default bar is replaced by the app-wide pill-on-track scrollbar
+    // (ui::drawWindowPillScrollbarV) drawn just before EndChild, like the taxonomy pane and
+    // every other list column. parts_results.cpp reserves the matching kChatScrollbarLane on
+    // the right of its table/grid arithmetic, so rows never slide under the pill.
+    ImGui::BeginChild("##parts_results", ImVec2(midW, 0), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleVar();
     if (browserPanelActive()) {
         drawBrowserPanel(st);
@@ -1086,6 +1277,7 @@ void drawPartsLibraryWorkspace(AppState& st) {
             doSearch(st);
 
         ImGui::Spacing();
+        ImGui::Dummy(ImVec2(0.0f, 3.0f * sc));   // unweld the header from the toolbar
         {
             // The count rides in the header's trailing slot, not baked into its label — a
             // "Parts  (128)" label makes the count compete with the title for the eye.
@@ -1100,12 +1292,16 @@ void drawPartsLibraryWorkspace(AppState& st) {
             sectionHeader("Parts", /*firstInPane=*/true, "parts_all", trailing);
         }
         // While the background vendor fan-out is still running, show each vendor being searched
-        // (its live logo + a per-vendor progress bar) inline under the "Parts" header.
-        if (!S().liveVendors.empty()) {
+        // (its live logo + a per-vendor progress bar) inline under the "Parts" header. Once it
+        // ends that strip is gone, so the persistent Sources row takes over and keeps the logos
+        // of the vendors that actually contributed rows on screen.
+        if (S().liveSearching && !S().liveVendors.empty()) {
             drawLiveVendorStrip(st);
         } else if (S().liveSearching && !S().results.empty()) {
             ImGui::SameLine();
             ImGui::TextDisabled("· loading more from vendors…");
+        } else {
+            drawResultSourcesRow();
         }
         // Cold catalog: the rows below are only what is indexed so far. Say so with an
         // indeterminate bar — an index build has no honest percentage — and note that the
@@ -1157,6 +1353,16 @@ void drawPartsLibraryWorkspace(AppState& st) {
         }
         if (S().gridView) drawResultsGrid(st);
         else              drawResultsList(st);
+    }
+    // App pill scrollbar on the results column's right edge (no-op unless it overflows).
+    // Outside the if/else so the embedded browser panel gets the same bar.
+    {
+        const ImVec2 cwp = ImGui::GetWindowPos();
+        const ImVec2 cws = ImGui::GetWindowSize();
+        const ui::AdaptiveSurface& surf = ui::adaptivePanel(
+            ui::panelId("parts_results_glass"),
+            ImRect(cwp, ImVec2(cwp.x + cws.x, cwp.y + cws.y)));
+        ui::drawWindowPillScrollbarV(surf, ui::kChatScrollbar);
     }
     ImGui::EndChild();
 

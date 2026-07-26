@@ -125,6 +125,13 @@ void drawNode(AppState& st, const TaxNode& node, int depth, bool first) {
     const bool  kids = !node.children.empty();
     const bool  open = kids && S().expandedCats.count(node.id) > 0;
     const float* tint = categoryTint(node.id);
+    // Right-hand gutter reserved for the pane's kChatScrollbar pill. Reserved UNCONDITIONALLY
+    // (not only when the tree overflows) so a row never changes width the moment the list
+    // grows past one screen. Indent() moves DC.CursorPos right and GetContentRegionAvail() is
+    // ContentRegionRect.Max.x - CursorPos.x, so subtracting the lane keeps every row's RIGHT
+    // edge on the same line at any depth.
+    const float laneW = ui::metrics::px(ui::kChatScrollbarLane);
+    const float rowW  = ImGui::GetContentRegionAvail().x - laneW;
 
     ImGui::PushID(node.id.c_str());
     if (root && S().fonts && S().fonts->medium) ImGui::PushFont(S().fonts->medium);
@@ -134,10 +141,10 @@ void drawNode(AppState& st, const TaxNode& node, int depth, bool first) {
     std::string  fitted;
     const char*  shown = node.label.c_str();
     if (kids) {
-        fitted = fitLabel(node.label, labelBudget(ImGui::GetContentRegionAvail().x, icon));
+        fitted = fitLabel(node.label, labelBudget(rowW, icon));
         shown  = fitted.c_str();
     }
-    bool clicked = glassRow("##node", shown, icon, sel, ImVec2(0, rowH), tint,
+    bool clicked = glassRow("##node", shown, icon, sel, ImVec2(rowW, rowH), tint,
                             root ? 1.0f : kChildEmphasis, root ? 7.0f : 6.0f);
     if (root && S().fonts && S().fonts->medium) ImGui::PopFont();
     const ImVec2 rowMin = ImGui::GetItemRectMin();
@@ -191,12 +198,16 @@ void drawTaxonomyPane(AppState& st, float paneW) {
     // One gutter token for the whole workspace: the results column and the filters pane use
     // partsPadX too, so the three panes' content lines agree instead of drifting by a pixel.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::partsPadX(), 2.0f * sc));
+                        ImVec2(ui::metrics::partsPadX(), 6.0f * sc));
     // NoScrollbar: ImGui's default bar is replaced by the app-wide pill-on-track scrollbar
     // (ui::drawWindowPillScrollbarV) drawn just before EndChild, like every other list pane.
     ImGui::BeginChild("##parts_cats", ImVec2(paneW, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleVar();
+
+    // Right-hand gutter for the thick chat-style pill drawn just before EndChild. Every
+    // full-width row below subtracts it so no pill is ever painted under the scrollbar.
+    const float laneW = ui::metrics::px(ui::kChatScrollbarLane);
 
     // Count rides in the header's trailing slot (never baked into the label) — nullptr while
     // the tree is still loading so the header does not flash a "0".
@@ -214,6 +225,7 @@ void drawTaxonomyPane(AppState& st, float paneW) {
         catTrailing = catCount;
     }
     sectionHeader("Categories", /*firstInPane=*/true, "parts_all", catTrailing);
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));   // first row is not welded to the header rule
 
     // "All Parts" is not a taxonomy node, so it has no category hue — it wears the app accent,
     // which is exactly the "everything" colour the rest of the workspace already uses.
@@ -230,7 +242,8 @@ void drawTaxonomyPane(AppState& st, float paneW) {
             bool sel = S().selectedCategory.empty();
             if (S().fonts && S().fonts->medium) ImGui::PushFont(S().fonts->medium);
             if (glassRow("##cat_all", "All Parts", "parts_all", sel,
-                         ImVec2(0, kRootRowDp * sc), allTint, /*emphasis=*/1.0f))
+                         ImVec2(ImGui::GetContentRegionAvail().x - laneW, kRootRowDp * sc),
+                         allTint, /*emphasis=*/1.0f))
                 pickNode(st, "");
             if (S().fonts && S().fonts->medium) ImGui::PopFont();
         }
@@ -263,7 +276,8 @@ void drawTaxonomyPane(AppState& st, float paneW) {
         {
             bool sel = S().selectedCategory.empty();
             if (glassRow("##cat_all", "All Parts", "parts_all", sel,
-                         ImVec2(0, kRootRowDp * sc), allTint, /*emphasis=*/1.0f))
+                         ImVec2(ImGui::GetContentRegionAvail().x - laneW, kRootRowDp * sc),
+                         allTint, /*emphasis=*/1.0f))
                 pickNode(st, "");
         }
         ImGui::Spacing();
@@ -272,7 +286,8 @@ void drawTaxonomyPane(AppState& st, float paneW) {
             bool sel = (S().selectedCategory == c.id);
             ImGui::PushID(c.id.c_str());
             if (glassRow("##cat", c.label.c_str(), partIcon(c.id), sel,
-                         ImVec2(0, kRootRowDp * sc), categoryTint(c.id), /*emphasis=*/1.0f))
+                         ImVec2(ImGui::GetContentRegionAvail().x - laneW, kRootRowDp * sc),
+                         categoryTint(c.id), /*emphasis=*/1.0f))
                 pickNode(st, sel ? "" : c.id);
             ImGui::PopID();
 
@@ -282,8 +297,9 @@ void drawTaxonomyPane(AppState& st, float paneW) {
                 ImGui::Indent(kIndentDp * sc);
                 ImGui::PushID(ch.id.c_str());
                 if (glassRow("##cat", ch.label.c_str(), partIcon(ch.id), csel,
-                             ImVec2(0, kChildRowDp * sc), categoryTint(ch.id),
-                             kChildEmphasis, 6.0f))
+                             ImVec2(ImGui::GetContentRegionAvail().x - laneW,
+                                    kChildRowDp * sc),
+                             categoryTint(ch.id), kChildEmphasis, 6.0f))
                     pickNode(st, csel ? "" : ch.id);
                 ImGui::PopID();
                 ImGui::Unindent(kIndentDp * sc);
@@ -297,14 +313,14 @@ void drawTaxonomyPane(AppState& st, float paneW) {
     // edge and reads as a clipped list rather than the end of one.
     ImGui::Dummy(ImVec2(0, 8.0f * sc));
 
-    // App pill scrollbar on the pane's right edge (no-op unless the tree overflows). Same
-    // surface-fetch idiom as the FeatureManager / file-explorer columns.
+    // The copilot chat's thick pill, flush on the pane's right edge (no-op unless the tree
+    // overflows). Rows above reserve kChatScrollbarLane so none is drawn under it.
     const ImVec2 cwp = ImGui::GetWindowPos();
     const ImVec2 cws = ImGui::GetWindowSize();
     const ui::AdaptiveSurface& surf = ui::adaptivePanel(
         ui::panelId("parts_cats_glass"),
         ImRect(cwp, ImVec2(cwp.x + cws.x, cwp.y + cws.y)));
-    ui::drawWindowPillScrollbarV(surf);
+    ui::drawWindowPillScrollbarV(surf, ui::kChatScrollbar);
 
     ImGui::EndChild();
 }

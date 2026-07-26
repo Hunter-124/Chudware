@@ -14,8 +14,11 @@ Four layers, all persisted in the site's profile-metadata sidecar
 1. **Minimum inter-request delay** — at least ``min_interval`` seconds between
    two fetches of the same site (default 3s).
 2. **Published crawl-delay** — if the site's ``robots.txt`` publishes a
-   ``Crawl-delay``, we honour it when it is *longer* than our default. (We read
-   only ``Crawl-delay``; path ``Disallow`` rules are intentionally NOT enforced
+   ``Crawl-delay``, we honour it when it is *longer* than our default. It is
+   consulted lazily — only once a site has a recorded ``last_fetch_ts``, since
+   that is the only branch whose result it can change — so a site's first fetch
+   of a run never blocks on a robots.txt round-trip. (We read only
+   ``Crawl-delay``; path ``Disallow`` rules are intentionally NOT enforced
    here — that would silently disable adapters for the ``/search`` paths many
    vendors list, and this layer is about pace, not access policy.)
 3. **Exponential backoff on 429/403** — when a site returns a rate-limit or
@@ -70,6 +73,9 @@ MAX_REQ_PER_SITE = _env_int("CHUDWARE_BROWSER_MAX_REQ_PER_SITE", 120)
 MAX_REQ_PER_PROCESS = _env_int("CHUDWARE_BROWSER_MAX_REQ_PER_PROCESS", 600)
 #: How long a fetched robots.txt crawl-delay is cached before we re-read it.
 _ROBOTS_TTL_S = 24 * 3600.0
+#: Budget for the best-effort robots.txt read. It is a politeness hint, not
+#: content, so it must never become a long stall on the fetch critical path.
+_ROBOTS_TIMEOUT_S = _env_float("CHUDWARE_BROWSER_ROBOTS_TIMEOUT_S", 5.0)
 #: HTTP statuses that mean "the site is asking us to slow down / backing us off".
 _BACKOFF_STATUSES = frozenset({403, 429, 503})
 
@@ -129,7 +135,7 @@ def _fetch_robots_crawl_delay(host: str) -> float | None:
         req = urllib.request.Request(
             f"https://{host}/robots.txt",
             headers={"User-Agent": "Mozilla/5.0 (Chudware parts browser)"})
-        with urllib.request.urlopen(req, timeout=5.0) as resp:  # noqa: S310 — https host only
+        with urllib.request.urlopen(req, timeout=_ROBOTS_TIMEOUT_S) as resp:  # noqa: S310 — https host only
             text = resp.read(65536).decode("utf-8", "replace")
     except Exception:  # noqa: BLE001 — no robots / network error → no published delay
         return None
@@ -184,18 +190,26 @@ def seconds_until_ready(site: str, *, min_interval: float = DEFAULT_MIN_INTERVAL
 
     The wait is the max of (a) the inter-request delay since the last fetch —
     itself the larger of ``min_interval`` and any published crawl-delay — and
-    (b) any active 429/403 backoff cooldown."""
+    (b) any active 429/403 backoff cooldown.
+
+    The crawl-delay is read only inside branch (a), so it is only consulted when
+    ``last_fetch_ts`` exists. Without one there is no inter-request window to
+    stretch and the published delay provably cannot change the result — while
+    fetching it is a blocking network round-trip on the fetch critical path
+    (measured 2026-07-26 against six vendor hosts: 133-256ms typical, and a full
+    ``_ROBOTS_TIMEOUT_S`` stall on us.misumi-ec.com, whose robots.txt never
+    answers). A site's first fetch of a run used to pay that for nothing.
+    """
     meta = profiles.load_meta(site)
     now = time.time()
-
-    effective_interval = min_interval
-    published = crawl_delay(site, url)
-    if published and published > effective_interval:
-        effective_interval = published
 
     remaining = 0.0
     last = meta.get("last_fetch_ts")
     if isinstance(last, (int, float)):
+        effective_interval = min_interval
+        published = crawl_delay(site, url)
+        if published and published > effective_interval:
+            effective_interval = published
         remaining = max(remaining, effective_interval - (now - last))
 
     cooldown_until = meta.get("rl_cooldown_until")

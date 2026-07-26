@@ -4173,3 +4173,48 @@ suites, `gui_lint --rule theme|icons` clean, `CHUDWARE_SHOT=parts` smoke clean. 
 `test_adapters.py::test_mcmaster_acquire_*` failures are pre-existing (proven against a
 `git stash` baseline of `session.py`) — they stub `browser_fetch` but the adapter now routes
 through the untouched `browser_interact`.
+
+### Parts Library V3.1 — padding, scrollbars, vendor logos, batched images (2026-07-26)
+
+User review of the running app drove a second pass. **Padding/chrome:** the Categories and
+Filters scroll children now use the copilot's thick bar (`drawWindowPillScrollbarV(surf,
+ui::kChatScrollbar)`) and every full-width row/field reserves `ui::kChatScrollbarLane` on the
+right, so nothing is drawn under it. The solid slab behind the global filter block is gone
+(per-field gradients stay). The filters empty-state wraps instead of clipping. A real layout
+bug was found and fixed: `gapsW` reserved `12*sc` for two `SameLine` gaps that actually cost
+`2 * ItemSpacing.x = 20*sc`, so the three columns consumed 8dp more than available — the direct
+cause of "boxes touching the bounding box". The vendor footer band is inset and its
+`ItemSpacing.y` dropped to `4*sc`, because four stacked rows measured ~122dp against a ~99dp
+band and the bottom control hung outside the card.
+
+**Vendor logos.** They were requested *only* from `applyLiveVendors()` during an in-flight
+fan-out — i.e. first requested exactly as the transient strip showing them disappeared. Now
+prefetched from the `vendor_status` callback and pumped one per frame while
+`thumbBusy.size() < 2`, then displayed persistently in the footer strip (favicon + status ring,
+falling back to the old dot), the accounts popup, result rows, and a new "Sources" row under the
+Parts header. Three domains never rendered: Google's s2 favicon service answers **HTTP 404 with
+a valid 726-byte PNG body**, and `urllib` raises `HTTPError`, discarding it. `_fetch_image_bytes`
+now salvages an error-status body when it carries PNG/JPEG/GIF/WEBP magic, and falls back once
+to `gstatic faviconV2` — which returns a *real* traceparts icon where s2 has none.
+
+**Image pipeline.** Was one `parts_thumbnail` RPC per part, 4 outstanding, over a single
+dispatch thread — 100 rows meant 100 serialised round trips. Now a coalescing queue flushes 16
+per `parts_thumbnails` (new plural RPC) with 3 batches in flight (48 images), self-flushing on a
+full batch or an 80 ms window, with a permanent per-session fallback to the singular path on
+`unknown method`. Worker side resolves disk-cache hits synchronously before fanning the misses
+out 8-wide; **renders are serialised behind a lock** because `_render_local_part_png` is a
+four-call non-atomic sequence and `core_bridge.call()` enters the OCCT core with no lock at all
+(an unguarded ctypes data race in the sticky in-process fallback mode). Plus a `.miss` negative
+cache and a 4 s fetch timeout.
+
+**Web speed — measured, not guessed.** Rate limiting and the profile lock are already strictly
+per-site and parallel (6 sites/6 threads = 2.00 s where serial is 12.0 s; 0.0 ms lock
+contention) — not the bottleneck. Of a 62 s six-vendor fan-out, `6 * 8.0 s = 48 s (77%)` is CEF
+render-settle dwell and only 9 s is real network. It costs 6x rather than 1x because
+`cef_daemon.cpp`'s accept loop handles one request to completion before accepting the next. An
+unconditional robots.txt round-trip was also removed from the fetch critical path (5000 ms ->
+3.1 ms; none of the six vendors publishes a `Crawl-delay`). The daemon concurrency + adaptive
+settle work is tracked separately.
+
+Gates: `./build.sh` green, `check.py` 6/6, 352 passed / 1 skipped, `gui_lint theme|icons` clean,
+`CHUDWARE_SHOT` smoke clean for parts/workspaces/m1/asm/drawing/plm.

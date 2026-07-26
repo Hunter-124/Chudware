@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <string_view>
 
 #include "imgui.h"
 
@@ -80,17 +81,32 @@ float badgeH() {
     return std::max(14.0f * ui::uiScale, badgeTextSize() + 4.0f * ui::uiScale);
 }
 
-float badgeW(const char* label) {
-    ImFont* f = ImGui::GetFont();
-    return f->CalcTextSizeA(badgeTextSize(), FLT_MAX, 0.0f, label).x + 10.0f * ui::uiScale;
+// A vendor favicon riding INSIDE the source pill. 14dp square, 4dp of air before the label;
+// a pill without one keeps exactly the geometry it always had, so an uncached vendor renders
+// pixel-identical to before. Measurement and painting share these helpers — if badgeW and
+// drawBadge disagreed about the logo the pill would be mis-sized every frame.
+float badgeLogoSz() { return 14.0f * ui::uiScale; }
+float badgeLogoAdvance(bool withLogo) {
+    return withLogo ? badgeLogoSz() + 4.0f * ui::uiScale : 0.0f;
 }
 
-void drawBadge(ImDrawList* dl, ImVec2 p0, const char* label, const float role[4]) {
-    const float sc = ui::uiScale;
-    const float fs = badgeTextSize();
+// Air inside the pill, per side (the 10dp the old single-term width formula folded together).
+float badgePadX() { return 5.0f * ui::uiScale; }
+
+float badgeW(const char* label, bool withLogo = false) {
+    ImFont* f = ImGui::GetFont();
+    return f->CalcTextSizeA(badgeTextSize(), FLT_MAX, 0.0f, label).x +
+           2.0f * badgePadX() + badgeLogoAdvance(withLogo);
+}
+
+void drawBadge(ImDrawList* dl, ImVec2 p0, const char* label, const float role[4],
+               unsigned int logoTex = 0) {
+    const float fs  = badgeTextSize();
+    const float px  = badgePadX();
+    const float adv = badgeLogoAdvance(logoTex != 0);
     ImFont* f = ImGui::GetFont();
     const ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, label);
-    const ImVec2 p1(p0.x + ts.x + 10.0f * sc, p0.y + badgeH());
+    const ImVec2 p1(p0.x + ts.x + 2.0f * px + adv, p0.y + badgeH());
     const float r = (p1.y - p0.y) * 0.5f;    // full pill
     float wash[4], line[4];
     Palette::withAlpha(role, wash, 0.22f);
@@ -101,19 +117,23 @@ void drawBadge(ImDrawList* dl, ImVec2 p0, const char* label, const float role[4]
     dl->AddRectFilled(p0, p1, Palette::toU32(wash), r);
     dl->AddRect(ImVec2(p0.x + 0.5f, p0.y + 0.5f), ImVec2(p1.x - 0.5f, p1.y - 0.5f),
                 Palette::toU32(line), r, 0, ui::metrics::stroke(1.0f));
-    dl->AddText(f, fs, ImVec2(p0.x + (p1.x - p0.x - ts.x) * 0.5f,
-                              p0.y + (p1.y - p0.y - ts.y) * 0.5f),
+    if (logoTex) {
+        const float lz = badgeLogoSz();
+        const ImVec2 l0(p0.x + px, p0.y + (badgeH() - lz) * 0.5f);
+        dl->AddImage((ImTextureID)(intptr_t)logoTex, l0, ImVec2(l0.x + lz, l0.y + lz));
+    }
+    dl->AddText(f, fs, ImVec2(p0.x + px + adv, p0.y + (p1.y - p0.y - ts.y) * 0.5f),
                 Palette::toU32(role), label);
 }
 
 // Layout-participating badge for the list rows: reserves its own footprint with a Dummy so
 // the SameLine flow (badges, then the name) is unchanged, centred on the current text line.
-void badgeInline(const char* label, const float role[4]) {
+void badgeInline(const char* label, const float role[4], unsigned int logoTex = 0) {
     const ImVec2 cur = ImGui::GetCursorScreenPos();
     const float  lh  = ImGui::GetTextLineHeight();
     drawBadge(ImGui::GetWindowDrawList(),
-              ImVec2(cur.x, cur.y + (lh - badgeH()) * 0.5f), label, role);
-    ImGui::Dummy(ImVec2(badgeW(label), lh));
+              ImVec2(cur.x, cur.y + (lh - badgeH()) * 0.5f), label, role, logoTex);
+    ImGui::Dummy(ImVec2(badgeW(label, logoTex != 0), lh));
 }
 
 // ---- source pills --------------------------------------------------------------------
@@ -130,11 +150,42 @@ const float* sourceBadgeRole(const PartsItem& item) {
     return item.source == "live" ? palette.statusWarn : palette.accent;
 }
 
+// A live result's id is "catalog:<site>::<url>", so the vendor's site key is the token
+// between the prefix and the separator. Anything else — a local library row — has no vendor
+// site and keeps the plain text pill.
+std::string_view siteKeyFor(const PartsItem& item) {
+    constexpr char   kPfx[] = "catalog:";
+    constexpr size_t kPfxN  = sizeof(kPfx) - 1;
+    if (item.id.compare(0, kPfxN, kPfx) != 0) return {};
+    const size_t sep = item.id.find("::", kPfxN);
+    if (sep == std::string::npos || sep == kPfxN) return {};
+    return std::string_view(item.id).substr(kPfxN, sep - kPfxN);
+}
+
+// DRAW-ONLY favicon lookup. The prefetch that populates "vendorlogo:<site>" lives with the
+// vendor list, so a miss here is normal (not fetched yet, or a local row) and simply yields
+// the text-only pill this file has always drawn. The lastUse touch is what keeps a logo the
+// user can currently see out of the thumb LRU's eviction set.
+unsigned int vendorLogoTex(const PartsItem& item) {
+    const std::string_view site = siteKeyFor(item);
+    if (site.empty()) return 0;
+    // Reused key buffer: this runs once per visible row per frame and S().thumbs is keyed by
+    // std::string (no heterogeneous lookup), so a fresh temporary would cost an allocation
+    // per row per frame for nothing. ImGui draws on one thread.
+    static std::string key;
+    key.assign("vendorlogo:").append(site);
+    auto it = S().thumbs.find(key);
+    if (it == S().thumbs.end() || !it->second.tex) return 0;
+    it->second.lastUse = ImGui::GetTime();
+    return it->second.tex;
+}
+
 // A vendor name is unbounded where the old fixed "live" tag could not overflow, so the
-// label is shrunk (whole UTF-8 code points) until the PILL — not the text — fits `maxW`.
-std::string fitBadgeLabel(std::string s, float maxW) {
-    if (badgeW(s.c_str()) <= maxW) return s;
-    while (s.size() > 1 && badgeW((s + "\xe2\x80\xa6").c_str()) > maxW) {
+// label is shrunk (whole UTF-8 code points) until the PILL — logo included, not just the
+// text — fits `maxW`.
+std::string fitBadgeLabel(std::string s, float maxW, bool withLogo = false) {
+    if (badgeW(s.c_str(), withLogo) <= maxW) return s;
+    while (s.size() > 1 && badgeW((s + "\xe2\x80\xa6").c_str(), withLogo) > maxW) {
         do { s.pop_back(); } while (!s.empty() &&
                                     ((unsigned char)s.back() & 0xC0) == 0x80);
     }
@@ -142,29 +193,71 @@ std::string fitBadgeLabel(std::string s, float maxW) {
     return s;
 }
 
-// One unbounded line of compact action buttons from the cursor — LIST view only, where the
-// table cell does the clipping. The grid does NOT use this: it draws one primary pill plus a
-// "…" overflow popup so its hover band can never grow past a single text line.
+// ONE line of compact action buttons from the cursor — LIST view only. The line is BUDGETED
+// against the cell's remaining width: the table's PadOuterX already holds partsPadX() back
+// from the row's right edge, so laying out inside GetContentRegionAvail() is exactly what
+// keeps the last button that far clear of it. Anything that does not fit moves into a "…"
+// popup instead of being drawn half-clipped off the row — which is what the unbounded old
+// line did with four actions in a 140dp column.
 void actionsLayout(AppState& st, const PartsItem& item) {
     ItemAction acts[kMaxItemActions];
     const int n = collectActions(item, acts);
     if (n == 0) return;
 
-    const float btnH = ImGui::GetTextLineHeight();     // compact: no vertical frame padding
-    const float fpX  = ImGui::GetStyle().FramePadding.x;
-    const float gap  = ui::metrics::U(1);
+    const float btnH  = ImGui::GetTextLineHeight();    // compact: no vertical frame padding
+    const float fpX   = ImGui::GetStyle().FramePadding.x;
+    const float gap   = ui::metrics::U(1);
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const float moreW = btnH;                          // square overflow button
+
+    float w[kMaxItemActions];
+    for (int i = 0; i < n; ++i) w[i] = ImGui::CalcTextSize(acts[i].label).x + fpX * 2.0f;
+    int   shown = 0;
+    float used  = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float step = (shown > 0 ? gap : 0.0f) + w[i];
+        const float tail = (i + 1 < n) ? gap + moreW : 0.0f;   // room for "…" if any remain
+        if (used + step + tail > avail) break;
+        used += step;
+        ++shown;
+    }
+    if (shown == 0 && moreW > avail) return;   // nothing fits at all: draw nothing
+
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(fpX, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f * ui::uiScale);
     ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < shown; ++i) {
         if (i > 0) ImGui::SameLine(0.0f, gap);
-        const float w = ImGui::CalcTextSize(acts[i].label).x + fpX * 2.0f;
-        if (ImGui::Button(acts[i].label, ImVec2(w, btnH)))
+        if (ImGui::Button(acts[i].label, ImVec2(w[i], btnH)))
             runAction(st, item, acts[i].kind);
         if (acts[i].kind == ActKind::GenerateModel && ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", kGenModelTip);
     }
+    if (shown < n) {
+        if (shown > 0) ImGui::SameLine(0.0f, gap);
+        // Square, with its OWN zero horizontal padding and a centred label: inside a button
+        // only one text line wide the row's frame padding inverts the inner rect and shoves
+        // the ellipsis onto the right edge instead of centring it.
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.5f));
+        const bool clicked = ImGui::Button("\xe2\x80\xa6##rowmore", ImVec2(moreW, btnH));
+        ImGui::PopStyleVar(2);
+        if (clicked) ImGui::OpenPopup("##rowmore");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("More actions");
+    }
     ImGui::PopStyleVar(3);
+
+    // Popup AFTER the compact styling is popped: it is its own window and must inherit none
+    // of it. The row keeps `hovered` true while it is open (see drawResultsList).
+    if (shown < n && ImGui::BeginPopup("##rowmore")) {
+        for (int i = shown; i < n; ++i) {
+            if (ImGui::Selectable(acts[i].label))
+                runAction(st, item, acts[i].kind);
+            if (acts[i].kind == ActKind::GenerateModel && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", kGenModelTip);
+        }
+        ImGui::EndPopup();
+    }
 }
 
 }  // namespace
@@ -201,7 +294,10 @@ static void resultsProgressBar() {
     const float  sc = ui::uiScale;
     const float  h  = std::max(2.0f * sc, 2.0f);
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const float  w  = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+    // The results pane's scroll child carries the copilot pill scrollbar on its right edge,
+    // so the bar stops a lane short of the content region instead of running under it.
+    const float  w  = std::max(ImGui::GetContentRegionAvail().x -
+                                   ui::metrics::px(ui::kChatScrollbarLane), 1.0f);
     const ImVec2 p1(p0.x + w, p0.y + h);
     ImDrawList*  dl = ImGui::GetWindowDrawList();
     const float  r  = h * 0.5f;
@@ -273,6 +369,14 @@ void drawResultsList(AppState& st) {
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding,
                         ImVec2(ui::metrics::partsPadX(), ImGui::GetStyle().CellPadding.y));
 
+    // The results render into the workspace's scroll child, whose right edge carries the
+    // copilot's thick pill scrollbar (ui::kChatScrollbar). The row highlight spans the WHOLE
+    // table (SpanAllColumns), so unless the table itself stops a lane short, every row pill —
+    // and the action buttons in the last column — slides under the bar.
+    const float laneW  = ui::metrics::px(ui::kChatScrollbarLane);
+    const float tableW = std::max(ImGui::GetContentRegionAvail().x - laneW,
+                                  ui::metrics::U(12));
+
     // Narrow-pane column budget: the fixed columns keep their full width no matter how
     // little is left, which crushes the stretch "Name" column — the one telling you what the
     // part actually is — to nothing when the pane is squeezed (AI Copilot docked alongside).
@@ -284,7 +388,7 @@ void drawResultsList(AppState& st) {
     // PadOuterX chrome is exactly 2*CellPadding.x per column (outer padding both ends +
     // inner spacing between each pair), i.e. 2 per cell x 6 cells.
     const float chrome  = 6.0f * ImGui::GetStyle().CellPadding.x * 2.0f;
-    const float budget  = ImGui::GetContentRegionAvail().x - chrome - nameMin;
+    const float budget  = tableW - chrome - nameMin;
     const bool showMaterial = budget >= wVendor + wPart + wMaterial + wPrice + wAct;
     const bool showVendor   = budget >= wVendor + wPart + wPrice + wAct;
     const ImGuiTableColumnFlags colVendor = ImGuiTableColumnFlags_WidthFixed |
@@ -295,7 +399,10 @@ void drawResultsList(AppState& st) {
     const ImGuiTableFlags tblFlags = ImGuiTableFlags_SizingFixedFit |
                                      ImGuiTableFlags_NoBordersInBody |
                                      ImGuiTableFlags_PadOuterX;
-    if (!ImGui::BeginTable("##parts_tbl", 6, tblFlags)) { ImGui::PopStyleVar(); return; }
+    if (!ImGui::BeginTable("##parts_tbl", 6, tblFlags, ImVec2(tableW, 0.0f))) {
+        ImGui::PopStyleVar();
+        return;
+    }
     ImGui::TableSetupColumn("Name",     ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableSetupColumn("Vendor",   colVendor,   wVendor);
     ImGui::TableSetupColumn("Part #",   ImGuiTableColumnFlags_WidthFixed, wPart);
@@ -332,8 +439,13 @@ void drawResultsList(AppState& st) {
                           ImGuiSelectableFlags_AllowOverlap,
                           ImVec2(0, rowH));
         ImGui::PopStyleColor(2);
+        // The overflow popup floats OUTSIDE the row, so plain hover would drop the action
+        // cell (and with it the BeginPopup call) the instant the pointer left the row to
+        // reach the popup.
         bool hovered = ImGui::IsItemHovered(
-            ImGuiHoveredFlags_AllowWhenOverlappedByItem | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+                           ImGuiHoveredFlags_AllowWhenOverlappedByItem |
+                           ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) ||
+                       ImGui::IsPopupOpen("##rowmore");
         ImVec2 rMin = ImGui::GetItemRectMin();
         ImVec2 rMax = ImGui::GetItemRectMax();
         // Domain colour: the SAME hue the grid card and the category tree use, so a
@@ -352,6 +464,17 @@ void drawResultsList(AppState& st) {
         }
         itemTooltipAt(item, hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal |
                                                             ImGuiHoveredFlags_AllowWhenOverlappedByItem));
+
+        // Every cell's content sits on the row pill's vertical centre line. A bare
+        // TableSetColumnIndex drops it at the row's TOP, where the text touches the pill's
+        // border; the name cell already centred itself by hand, so the rest now match it.
+        // The x is untouched — CellPadding already insets it by partsPadX() from the row.
+        auto cellLine = [&](int col) {
+            ImGui::TableSetColumnIndex(col);
+            const ImVec2 c = ImGui::GetCursorScreenPos();
+            ImGui::SetCursorScreenPos(
+                ImVec2(c.x, rowPos.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f));
+        };
 
         // ---- Name cell: thumbnail (or domain icon fallback) + status badges + name ----
         ImGui::SetCursorScreenPos(rowPos);
@@ -396,14 +519,21 @@ void drawResultsList(AppState& st) {
             ImGui::SameLine();
         }
         // Source pill: the vendor's name (amber) for a live hit, "library" (accent) for a
-        // local one. Capped so a long vendor can never shove the part name out of the cell.
-        badgeInline(fitBadgeLabel(sourceBadgeLabel(item), 96.0f * sc).c_str(),
-                    sourceBadgeRole(item));
+        // local one, carrying the vendor's favicon when one is already cached. Capped so a
+        // long vendor can never shove the part name out of the cell — the cap grows by the
+        // logo's advance so adding the icon does not eat the label.
+        {
+            const unsigned int logoTex = vendorLogoTex(item);
+            const bool  hasLogo = logoTex != 0;
+            const float capW    = 96.0f * sc + badgeLogoAdvance(hasLogo);
+            badgeInline(fitBadgeLabel(sourceBadgeLabel(item), capW, hasLogo).c_str(),
+                        sourceBadgeRole(item), logoTex);
+        }
         ImGui::SameLine();
         ImGui::TextUnformatted(item.name.c_str());   // table clipping ellipsizes naturally
 
         auto dimCell = [&](int col, const char* text) {
-            ImGui::TableSetColumnIndex(col);
+            cellLine(col);
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
             ImGui::TextUnformatted(text);
@@ -413,7 +543,7 @@ void drawResultsList(AppState& st) {
         dimCell(2, item.partNumber.c_str());
         dimCell(3, item.material.empty() ? "-" : item.material.c_str());
 
-        ImGui::TableSetColumnIndex(4);
+        cellLine(4);
         if (item.priceUsd > 0.0) {
             // The one number a buyer scans a results table for — it should not be the same
             // tone as the part number three columns to its left.
@@ -425,7 +555,7 @@ void drawResultsList(AppState& st) {
             ImGui::TextDisabled("—");
         }
 
-        ImGui::TableSetColumnIndex(5);
+        cellLine(5);
         if (hovered) {
             ImGui::PushStyleColor(ImGuiCol_Button,
                 ImVec4(palette.button[0], palette.button[1],
@@ -477,11 +607,15 @@ void drawResultsGrid(AppState& st) {
                         "Type in the search bar or pick a category."))
         return;
 
-    // Column packing: n cards fit when n*(cardW+gap) <= availW+gap. The grid stays LEFT
-    // aligned on the pane's content origin — the same line the "Parts (N)" section header
-    // starts at — instead of the old centering, which pushed the first card off that line by
-    // up to half a column. A card is also never wider than the pane it sits in.
-    const float availW   = ImGui::GetContentRegionAvail().x;
+    // Column packing: n cards fit when n*(cardW+gap) <= availW+gap, where availW already has
+    // the scroll child's pill-scrollbar lane taken out of it — otherwise the right-hand card
+    // of every row runs under the bar. Whatever is left over past the last column stays a
+    // TRAILING MARGIN: the grid is LEFT aligned on the pane's content origin (the same line
+    // the "Parts (N)" section header starts at) rather than centred, which used to push the
+    // first card off that line by up to half a column. A card is never wider than the pane.
+    const float laneW    = ui::metrics::px(ui::kChatScrollbarLane);
+    const float availW   = std::max(ImGui::GetContentRegionAvail().x - laneW,
+                                    ui::metrics::U(12));
     const float cardW    = std::min(168.0f * sc, availW);
     const int   cols     = std::max(1, (int)((availW + gap) / (cardW + gap)));
     const float startX   = ImGui::GetCursorPosX();
@@ -564,11 +698,19 @@ void drawResultsGrid(AppState& st) {
                               ImVec2(cx + badgeH() * 0.5f, markY + badgeH() * 0.5f),
                               badgeH(), Palette::toU32(palette.statusOk), 0);
         // Source pill, one system for both kinds (see sourceBadgeLabel): live hits name
-        // their VENDOR in amber, local hits read "library" in accent.
+        // their VENDOR in amber — with its favicon when the logo is already cached — and
+        // local hits read "library" in accent.
         {
-            const std::string sb = fitBadgeLabel(sourceBadgeLabel(item), contentW * 0.72f);
-            drawBadge(dl, ImVec2(p1.x - pad - badgeW(sb.c_str()), markY), sb.c_str(),
-                      sourceBadgeRole(item));
+            const unsigned int logoTex = vendorLogoTex(item);
+            const bool  hasLogo = logoTex != 0;
+            // The logo's advance is ADDED to the 72% cap so the icon does not eat the label,
+            // then the whole pill is held inside the card's content line — on a squeezed pane
+            // 72% + 18dp would otherwise reach past cx and be clipped mid-glyph.
+            const float capW    = std::min(contentW * 0.72f + badgeLogoAdvance(hasLogo),
+                                           contentW);
+            const std::string sb = fitBadgeLabel(sourceBadgeLabel(item), capW, hasLogo);
+            drawBadge(dl, ImVec2(p1.x - pad - badgeW(sb.c_str(), hasLogo), markY), sb.c_str(),
+                      sourceBadgeRole(item), logoTex);
         }
 
         // ---- text lines: all three start on the content line, ellipsized to contentW ----

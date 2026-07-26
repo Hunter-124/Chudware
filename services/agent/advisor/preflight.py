@@ -243,7 +243,14 @@ def _clone_doc(live_tree: dict, cb: Any) -> tuple[str, list[dict]]:
     equations and features in order — the same pattern used by the verify bench.
     """
     name = (live_tree.get("name") or "preflight_clone") + "_pf"
-    r = cb.call("doc_new", {"kind": "part", "name": name})
+    # `internal: True` tells hostd's shared doc registry this doc is a throwaway: it is
+    # registered normally (attach/close/GC bookkeeping unchanged) but never fanned out as
+    # doc.opened/doc.changed/doc.closed to the other clients on the shared daemon. Without
+    # it the desktop GUI faithfully opened a visible mirror tab for this shadow clone on
+    # EVERY add_features call — what users reported as "the AI creates a new part for every
+    # operation". An older engine that does not know the param simply ignores it, degrading
+    # to the old visible-tab behaviour rather than erroring.
+    r = cb.call("doc_new", {"kind": "part", "name": name, "internal": True})
     clone_id = r.get("doc_id") or r.get("id")
     if not clone_id:
         raise RuntimeError("doc_new returned no doc_id")

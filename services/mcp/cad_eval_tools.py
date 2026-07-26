@@ -38,16 +38,47 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def query_geometry(query: Union[str, dict], doc_id: Optional[str] = None) -> str:
-        """Resolve a plain-English face/edge query against the part — explore/confirm geometry.
+        """Resolve a STRUCTURED face/edge query against the part — explore/confirm geometry.
 
-        `query` is a geometry query like {"of":"face","side":"top"}, {"of":"edge","parallel":"z"},
-        {"of":"face","surf":"round","pick":"outer"} — or a bare side word ("top") for a face.
-        Returns each matching face/edge with its shape (surf), side, centroid and size, so you can
-        confirm "the top face" resolves before you reference it in a feature or a simulation.
+        `query` is a dict of query keys — a whole sentence is NOT a query (see the note below):
+          of             "face" | "edge" — defaults to "face"
+          side           top/bottom/left/right/front/back(rear) or +x/-x/+y/-y/+z/-z — the
+                         extreme face/edge that way (top=+Z, right=+X, front=-Y, back=+Y)
+          surf           faces: flat/round/cylindrical/conical/spherical/toroidal ("round" = ANY
+                         curved face); edges: straight/round/circular/elliptical
+          parallel       "x"|"y"|"z" — keep those whose axis is parallel to it. A FACE's axis is
+          perpendicular  its NORMAL, an EDGE's is its DIRECTION, so a vertical wall face is
+                         perpendicular:"z" while a vertical edge is parallel:"z".
+          pick           largest/smallest (area), longest/shortest (length), inner/outer
+                         (bore vs boss, for coaxial round faces/edges)
+          near/count/index   [x,y,z] nearest-first / cap the set / keep specific ordinals
+
+        Examples:
+          {"of":"face","side":"top"}                                     the top face
+          {"of":"face","surf":"cylinder","side":"bottom","pick":"outer"} outer barrel, bottom end
+          {"of":"edge","surf":"line","parallel":"z"}                     the vertical straight edges
+          {"of":"edge","surf":"line","near":[40,0,2],"count":1}          exactly ONE edge, by position
+
+        Returns each matching face/edge with its shape (surf), side, centroid, size and stable
+        sid, so you can confirm "the top face" resolves before you reference it in a feature or a
+        simulation. CONVENIENCE: a short phrase built only from the words above ("top", "outer
+        cylindrical face at bottom") is normalised into those keys; anything else is rejected
+        with the vocabulary rather than silently mis-resolved. For open-ended exploration call
+        describe_part (the named face/edge roster) then hover(sid) — not this tool with a sentence.
         """
         try:
             q = query if isinstance(query, dict) else _as_face_query(query)
-            return _dumps(cb.call("doc_query", {"doc_id": _doc(doc_id), "query": q}))
+            res = cb.call("doc_query", {"doc_id": _doc(doc_id), "query": q})
+            # Every other tool reports `ok`; doc_query returns a bare match list, so a model
+            # checking the usual success flag saw None and couldn't tell a hit from a miss.
+            # Echo the RESOLVED query too: when a phrase was normalised into keys, the model
+            # needs to see what it actually asked for before trusting the matches.
+            out = {"ok": True, "query": q}
+            out.update(res if isinstance(res, dict) else {"result": res})
+            if not (out.get("matches") or []):
+                out["note"] = ("no face/edge matched this query — loosen it (drop `side` or "
+                               "`surf`) or call describe_part to see the actual roster")
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

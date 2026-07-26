@@ -966,36 +966,29 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     env["params"] = feat.contains("params") ? feat["params"] : json::object();
     env["refs"] = feat.contains("refs") ? feat["refs"] : json::object();
     if (feat.contains("folder")) env["folder"] = feat["folder"];
-    // A model may put primitive/feature OPTIONS at the feature TOP LEVEL instead of in
-    // params (their canonical home) — e.g. {"type":"cylinder","mode":"cut",...}. Only
-    // type/name/suppressed/params/refs/folder are kept above, so a stray top-level option
-    // would be SILENTLY DROPPED -> wrong geometry with no error (a cut cylinder fuses).
-    // Relocate the known options into params so both conventions behave identically.
-    // `body` is the transform/fillet/chamfer/shell/hole/draft target — documented as a
-    // top-level field; without hoisting it here it was dropped on persistence, so
-    // transform body:"fN" silently moved the current/last body instead (the assembly
-    // mistargeting bug T-1). `copy` is transform's instancing flag, same hazard.
+    // A model may put feature OPTIONS at the feature TOP LEVEL instead of in params (their
+    // canonical home) — e.g. {"type":"cylinder","mode":"cut",...}, {"type":"transform",
+    // "translate":[5,0,0]}, {"type":"hole","positions":[...]}, {"type":"sketch",
+    // "entities":[...]}. Only type/name/suppressed/params/refs/folder are kept above, so a
+    // stray top-level option used to be SILENTLY DROPPED -> wrong geometry with no error (a
+    // cut cylinder fuses; transform body:"fN" moved the wrong body — the T-1 assembly
+    // mistargeting bug; a hole built 1 bore instead of N; a sketch stored empty).
+    //
+    // This was previously a hand-maintained whitelist of the options someone had already been
+    // bitten by, which meant every NEW option repeated the same bug once. Hoist EVERY
+    // non-structural top-level key instead: params is where the compiler reads from, unknown
+    // params are ignored rather than rejected, and an existing params entry always wins. That
+    // makes the two spellings equivalent for every feature type at once, present and future,
+    // and leaves no drop path to rediscover.
     if (env["params"].is_object()) {
-        for (const char* k : {"mode", "merge", "centered", "at", "at_offset", "offset",
-                              "body", "copy",
-                              // W1: `positions` on hole/bolt_circle is documented as a top-level
-                              // field but was silently dropped because op_add_feature copies only
-                              // type/name/suppressed/params/refs/folder into the stored feature.
-                              // Without hoisting it here the feature built only ONE hole at the
-                              // face centre (the default when no positions are given). Hoist it
-                              // into params exactly like `body`/`copy` so both placements produce
-                              // the same N-hole result — consistent with the no-silent-drop rule.
-                              "positions"}) {
-            if (feat.contains(k) && !env["params"].contains(k)) env["params"][k] = feat[k];
+        static const std::set<std::string> kStructuralKeys = {
+            "type", "name", "id", "suppressed", "params", "refs", "folder",
+        };
+        for (auto it = feat.begin(); it != feat.end(); ++it) {
+            const std::string& k = it.key();
+            if (kStructuralKeys.count(k)) continue;
+            if (!env["params"].contains(k)) env["params"][k] = it.value();
         }
-    }
-    // A sketch feature's entities/constraints often arrive at the FEATURE top level rather than
-    // under params — grok emits {feature:{type:sketch, entities:[...], constraints:[...]}} with no
-    // params wrapper ~half the time. The generic option-hoist above skips them, so without this
-    // the sketch is stored EMPTY and dry-run rejects it ("params.entities required for sketch").
-    if (env["type"] == "sketch" && env["params"].is_object()) {
-        for (const char* k : {"entities", "constraints"})
-            if (feat.contains(k) && !env["params"].contains(k)) env["params"][k] = feat[k];
     }
     // Normalize inline sketch entities the SAME way sketch_add_entity does, so a hexagon /
     // airfoil / {value:N} scalar authored INLINE (grok emits sketches this way ~half the time)
@@ -1041,6 +1034,62 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
                     if (ait != aliases.end()) rref = ait->second + sub;
                 }
             }
+        }
+    }
+    // NO SILENT DROPS, part 2. The total hoist above guarantees nothing is discarded, but a
+    // key the compiler doesn't read still does nothing — and for the PRIMITIVES that is the
+    // difference between the part the model asked for and a solid centred on the origin. A
+    // live Claude run sent placement:{origin,direction} + boolean:"union" on a cylinder boss;
+    // both were inert, the cylinder built at the origin buried inside the body, and the model
+    // burned three turns on the opaque "boss added no material" with no clue what it did
+    // wrong. Primitives have a small CLOSED vocabulary, so here we can reject an unrecognised
+    // key outright and teach the real spelling. Other feature types keep the permissive hoist
+    // (their param sets are open-ended and type-specific), except for the dialect keys below
+    // which are unambiguously wrong on ANY feature.
+    {
+        static const std::set<std::string> kPrimitiveTypes = {
+            "box", "cylinder", "sphere", "cone", "torus",
+        };
+        static const std::set<std::string> kPrimitiveKeys = {
+            // structural
+            "type", "name", "id", "suppressed", "params", "refs", "folder",
+            // placement / boolean options
+            "at", "at_offset", "axis", "axis_dir", "centered", "mode", "merge",
+            // dimensions (params is merged into the feature, so these may appear either way)
+            "length", "width", "height", "radius", "r1", "r2", "major_r", "minor_r",
+        };
+        // The dialect models actually invent -> the canonical spelling, so the error teaches
+        // the fix instead of only naming the offence. These are rejected on EVERY feature
+        // type: none of them is a real param anywhere, and each has an exact replacement.
+        static const std::map<std::string, std::string> kBadKeyHints = {
+            {"placement", "use at:[x,y,z] (or at:{\"of\":\"face\",\"side\":\"top\"}) for the "
+                          "position and axis:[x,y,z] for the direction"},
+            {"boolean",   "use mode:\"boss\" to fuse or mode:\"cut\" to subtract, and "
+                          "merge:false to start a new body"},
+            {"operation", "use mode:\"boss\" to fuse or mode:\"cut\" to subtract, and "
+                          "merge:false to start a new body"},
+            {"before",    "\"before\"/\"after\" order the OP, so they belong beside \"op\", "
+                          "not inside \"feature\""},
+            {"after",     "\"before\"/\"after\" order the OP, so they belong beside \"op\", "
+                          "not inside \"feature\""},
+        };
+        const bool is_primitive = kPrimitiveTypes.count(ftype_early) > 0;
+        for (auto it = feat.begin(); it != feat.end(); ++it) {
+            const std::string& k = it.key();
+            auto hint = kBadKeyHints.find(k);
+            const bool bad_dialect = hint != kBadKeyHints.end();
+            if (!bad_dialect && !(is_primitive && !kPrimitiveKeys.count(k))) continue;
+            std::string msg = "add_feature " +
+                              (ftype_early.empty() ? std::string("feature") : ftype_early) +
+                              ": unknown feature key '" + k + "'";
+            if (bad_dialect) msg += " — " + hint->second;
+            if (is_primitive)
+                msg += ". A " + ftype_early + " accepts: params (length/width/height, radius, "
+                       "r1/r2, major_r/minor_r), at, at_offset, axis, centered, mode, merge, "
+                       "plus name/refs/folder/suppressed.";
+            msg += " Unknown keys are rejected, never ignored, so a typo can't build "
+                   "silently-wrong geometry.";
+            throw OpError("invalid_op", msg);
         }
     }
     resolve_placeholders_deep(env["params"], id_map);

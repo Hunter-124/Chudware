@@ -103,22 +103,37 @@ bool noteReconnectAndCheckBrake() {
 }
 
 // doc_ids with a doc.opened seen but not yet revealed as a tab (deferred while
-// the user is mid-edit, exactly like the poller's `pending`), and the latest
+// the user is mid-edit, exactly like the poller's `pending`), each mapped to the
+// display name its event carried (empty when it carried none), and the latest
 // unapplied doc.changed payload per doc.
-std::set<std::string> pendingOpen;
+std::map<std::string, std::string> pendingOpen;
 std::map<std::string, json> pendingChanged;
+
+// Display name out of a doc.opened / doc.changed payload. doc.opened carries it
+// flat (hostd DocRegistry::sniffName); doc.changed pushes the whole document as
+// "tree". Empty for an older daemon that sends neither — the caller then falls
+// back to the placeholder title plus an async doc_tree backfill.
+std::string eventDocName(const json& d) {
+    if (!d.is_object()) return {};
+    if (d.contains("name") && d["name"].is_string()) return d["name"].get<std::string>();
+    if (d.contains("tree") && d["tree"].is_object() && d["tree"].contains("name") &&
+        d["tree"]["name"].is_string())
+        return d["tree"]["name"].get<std::string>();
+    return {};
+}
 
 // Open a read-only mirror tab for a doc another client minted. Mirrors the
 // poller's focus rules: the FIRST mirror ever opened may take focus; later
 // parts open in the background with the aiPulse glow.
-void openMirrorTab(AppState& st, const std::string& docId) {
+void openMirrorTab(AppState& st, const std::string& docId, const std::string& name = {}) {
     if (docId.rfind("doc-cpp", 0) != 0) return;  // parts/assemblies only (no dwg/ecad mirror yet)
     if (tabIndexForDoc(st, docId) >= 0) {        // already visible (ours or a prior mirror)
         pendingOpen.erase(docId);  // a deferred reveal is satisfied — don't retry every frame
         return;
     }
     if (userMidEdit(st)) {                       // defer the reveal, never disrupt
-        pendingOpen.insert(docId);
+        // Keep a name we already know if this retry arrived without one.
+        if (!name.empty() || !pendingOpen.count(docId)) pendingOpen[docId] = name;
         return;
     }
     auto* c = engine::client();
@@ -134,30 +149,35 @@ void openMirrorTab(AppState& st, const std::string& docId) {
         if (t.aiHandoff) anyMirror = true;
     const bool takeFocus = !anyMirror;
 
-    // Display name from the doc tree (doc.opened doesn't carry one). ASYNC via st.rpc:
-    // doc_tree takes the doc's engine lock, and with an agent mid-op on that doc a sync
-    // call here parked the whole GL thread (multiplied by every doc at bootstrap when a
-    // swarm has dozens open). The tab appears immediately with a fallback title; the
-    // callback (a later frame's drain) fills the real name in. Tolerate failure.
-    st.rpc.call("doc_tree", json{{"doc_id", docId}},
-                [&st, docId](const core::RpcResult& r) {
-                    if (!r.ok || !r.result.is_object()) return;
-                    std::string name;
-                    if (r.result.contains("tree") && r.result["tree"].is_object())
-                        name = r.result["tree"].value("name", std::string());
-                    if (name.empty()) name = r.result.value("name", std::string());
-                    if (name.empty()) return;
-                    const int i = tabIndexForDoc(st, docId);
-                    if (i < 0) return;
-                    AppState::DocTab& t = st.docTabs[i];
-                    if (t.title.empty() || t.title == "AI part") t.title = name;
-                    if (t.handoffName.empty()) t.handoffName = name;
-                }, 30000);
+    // Fallback ONLY when the event carried no name (older daemon): read it off the
+    // doc tree. ASYNC via st.rpc — doc_tree takes the doc's engine lock, and with an
+    // agent mid-op on that doc a sync call here parked the whole GL thread
+    // (multiplied by every doc at bootstrap when a swarm has dozens open). The tab
+    // appears immediately with the placeholder title; the callback (a later frame's
+    // drain) fills the real name in. Tolerate failure.
+    if (name.empty())
+        st.rpc.call("doc_tree", json{{"doc_id", docId}},
+                    [&st, docId](const core::RpcResult& r) {
+                        if (!r.ok || !r.result.is_object()) return;
+                        std::string nm;
+                        if (r.result.contains("tree") && r.result["tree"].is_object())
+                            nm = r.result["tree"].value("name", std::string());
+                        if (nm.empty()) nm = r.result.value("name", std::string());
+                        if (nm.empty()) return;
+                        const int i = tabIndexForDoc(st, docId);
+                        if (i < 0) return;
+                        AppState::DocTab& t = st.docTabs[i];
+                        if (t.title.empty() || t.title == "AI part") t.title = nm;
+                        if (t.handoffName.empty()) t.handoffName = nm;
+                    }, 30000);
 
     AppState::DocTab t;
     t.kind = AppState::DocTab::TabKind::Part;
     t.docId = docId;
-    t.title = "AI part";   // async doc_tree above fills the real name in
+    // Primary path: doc.opened carries the doc's name, so the tab is titled correctly
+    // the frame it appears — no dependency on the doc_tree round-trip above.
+    t.title = name.empty() ? std::string("AI part") : name;
+    t.handoffName = name;
     t.aiHandoff = true;
     t.handoffDocId = docId;
     st.docTabs.push_back(std::move(t));
@@ -365,14 +385,14 @@ void handleEvent(AppState& st, const json& evt) {
     }
 
     if (name == "doc.opened") {
-        if (!docId.empty()) openMirrorTab(st, docId);
+        if (!docId.empty()) openMirrorTab(st, docId, eventDocName(d));
         return;
     }
     if (name == "doc.changed") {
         if (docId.empty()) return;
         int idx = tabIndexForDoc(st, docId);
         if (idx < 0) {  // changed before we ever saw it (subscribe race): reveal it
-            openMirrorTab(st, docId);
+            openMirrorTab(st, docId, eventDocName(d));
             idx = tabIndexForDoc(st, docId);
         }
         if (idx < 0) {  // reveal deferred (mid-edit) — remember the change
@@ -530,7 +550,7 @@ bool tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
                 doc.is_object() ? doc.value("doc_id", std::string()) : std::string();
             if (!id.empty()) {
                 liveIds.insert(id);
-                openMirrorTab(st, id);
+                openMirrorTab(st, id, eventDocName(doc));
                 // origin_kind (daemon-annotated): a doc minted by a GUI client is user-owned,
                 // so if we mirrored it after (re)connecting, mark it adopted — it must be
                 // quit-warned and never auto-closed. Unknown/mcp/agent origin stays AI-owned.
@@ -931,8 +951,8 @@ void engineEventsTick(AppState& st) {
 
     // Deferred work queued while the user was mid-edit / away: apply when safe.
     if (!pendingOpen.empty() && !userMidEdit(st)) {
-        const std::set<std::string> retry = pendingOpen;
-        for (const auto& id : retry) openMirrorTab(st, id);
+        const std::map<std::string, std::string> retry = pendingOpen;
+        for (const auto& [id, nm] : retry) openMirrorTab(st, id, nm);
     }
     if (!pendingChanged.empty() && !userMidEdit(st)) {
         // Only the ACTIVE tab applies immediately; background ones stay pulsed
@@ -955,6 +975,8 @@ void mirrorRecoveredDocs(AppState& st, const std::vector<std::string>& docIds) {
     // openMirrorTab is the same path bootstrap's doc_list uses for live docs:
     // it dedups against already-open tabs, attaches ro, and focuses the first
     // reveal. Recovered docs are minted with a fresh doc_id, so none are open yet.
+    // recovery_open hands back ids only, so these take openMirrorTab's name-less
+    // path: placeholder title now, async doc_tree backfill on a later frame.
     for (const auto& id : docIds)
         if (!id.empty()) openMirrorTab(st, id);
 }

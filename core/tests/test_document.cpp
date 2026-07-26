@@ -26,6 +26,8 @@
 #include <nlohmann/json.hpp>
 
 #include <BRep_Tool.hxx>                                  // seam/degenerate edge test (S1/S2)
+#include <BRepBndLib.hxx>                                  // exact kernel bbox (axis cases)
+#include <Bnd_Box.hxx>
 #include <BRepCheck_Analyzer.hxx>                          // thread cut B-rep validity (case 12)
 #include <BRepGProp.hxx>                                   // thread volume-reduced check
 #include <GProp_GProps.hxx>
@@ -207,6 +209,23 @@ std::string status_err(const json& row) {
     if (it == row.end() || it->is_null()) return std::string();
     return it->is_string() ? it->get<std::string>() : it->dump();
 }
+
+// EXACT (kernel, not tessellated) bbox of a compiled body. The `axis` cases below assert
+// analytic extents — a cylinder's inscribed triangle facets would blur the radial ones by
+// the chordal deflection, so read the geometry directly and zero the Bnd_Box gap.
+void shape_bbox(const TopoDS_Shape& s, double lo[3], double hi[3]) {
+    REQUIRE_FALSE(s.IsNull());
+    Bnd_Box bb;
+    BRepBndLib::Add(s, bb, /*useTriangulation=*/Standard_False);
+    REQUIRE_FALSE(bb.IsVoid());
+    bb.SetGap(0.0);
+    bb.Get(lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
+}
+
+// Absolute-tolerance coordinate compare. doctest::Approx's epsilon is RELATIVE, which
+// degenerates to an exact-equality test whenever the expected value is 0 (and half the
+// axis-case coordinates are 0).
+bool near_abs(double a, double b, double tol = 1e-3) { return std::abs(a - b) < tol; }
 
 constexpr double PI = 3.14159265358979323846;
 
@@ -569,6 +588,278 @@ TEST_CASE("polygon entity builds a closed hexagon -> hex standoff extrudes + bor
     const double hex_area = (3.0 * std::sqrt(3.0) / 2.0) * R * R;
     const double expect = hex_area * 22.0 - 3.14159265 * 1.7 * 1.7 * 22.0;  // minus M3 (3.4) bore
     CHECK(vol == doctest::Approx(expect).epsilon(0.01));
+}
+
+// 1i. PRIMITIVE `axis`: the feature-level orientation param. Before this, primitives were
+//     hard-wired to their natural local +Z — `axis`/`direction`/`dir` were all silently
+//     ignored, so there was NO way to make a sideways cylinder without sketch+extrude, and
+//     a model asking for one got a +Z cylinder buried in the body ("boss added no
+//     material"). The contract: build centred -> rotate local +Z onto `axis` about the
+//     ORIGIN -> add the `centered:false` base offset ALONG THE ROTATED AXIS -> translate by
+//     `at` -> add `at_offset`.
+TEST_CASE("primitive axis orients a cylinder and carries its centered:false base") {
+    // r25 h60 with its base at [200,0,40] — the live failing case (a drain spout on the
+    // side of a bucket) restated analytically.
+    const double R = 25.0, H = 60.0;
+    auto spout = [&](const json& axis) {
+        json f{{"id", "cyl"}, {"type", "cylinder"}, {"radius", R}, {"height", H},
+               {"centered", false}, {"at", json::array({200.0, 0.0, 40.0})}};
+        if (!axis.is_null()) f["axis"] = axis;
+        json doc;
+        doc["features"] = json::array({f});
+        return compile_document(doc, json::object());
+    };
+
+    SUBCASE("no axis key -> the historical +Z build, unchanged") {
+        CompileResult r = spout(json(nullptr));
+        REQUIRE(r.ok);
+        REQUIRE(r.shapes.size() == 1);
+        double lo[3], hi[3];
+        shape_bbox(r.shapes[0], lo, hi);
+        // Base at z=40, growing +Z; radially centred on x=200,y=0.
+        CHECK(near_abs(lo[0], 175.0));
+        CHECK(near_abs(hi[0], 225.0));
+        CHECK(near_abs(lo[1], -25.0));
+        CHECK(near_abs(hi[1], 25.0));
+        CHECK(near_abs(lo[2], 40.0));
+        CHECK(near_abs(hi[2], 100.0));
+    }
+
+    SUBCASE("axis:[0,0,1] is the identity — bit-identical to omitting it") {
+        CompileResult base = spout(json(nullptr));
+        CompileResult expl = spout(json::array({0.0, 0.0, 1.0}));
+        REQUIRE(base.ok);
+        REQUIRE(expl.ok);
+        double blo[3], bhi[3], elo[3], ehi[3];
+        shape_bbox(base.shapes[0], blo, bhi);
+        shape_bbox(expl.shapes[0], elo, ehi);
+        for (int k = 0; k < 3; ++k) {
+            CHECK(near_abs(blo[k], elo[k], 1e-9));
+            CHECK(near_abs(bhi[k], ehi[k], 1e-9));
+        }
+        CHECK(expl.volume == doctest::Approx(base.volume).epsilon(1e-12));
+    }
+
+    SUBCASE("axis:[1,0,0] -> the base sits at x=200 and the body grows to x=260") {
+        CompileResult r = spout(json::array({1.0, 0.0, 0.0}));
+        REQUIRE_MESSAGE(r.ok, "sideways cylinder failed: " << r.statuses.front().error);
+        REQUIRE(r.shapes.size() == 1);
+        double lo[3], hi[3];
+        shape_bbox(r.shapes[0], lo, hi);
+        MESSAGE("axis +x bbox x=[" << lo[0] << "," << hi[0] << "] y=[" << lo[1] << ","
+                                   << hi[1] << "] z=[" << lo[2] << "," << hi[2] << "]");
+        CHECK(near_abs(lo[0], 200.0));   // base ON the placement point
+        CHECK(near_abs(hi[0], 260.0));   // + full height along the rotated axis
+        CHECK(near_abs(lo[1], -25.0));   // centred on y=0
+        CHECK(near_abs(hi[1], 25.0));
+        CHECK(near_abs(lo[2], 15.0));    // centred on z=40
+        CHECK(near_abs(hi[2], 65.0));
+        // Rotation is rigid: the EXACT kernel volume is still the same cylinder.
+        // (CompileResult::volume is tessellation-derived and reads ~0.15% low on a
+        // faceted barrel, so assert on the B-rep, not on the mesh.)
+        GProp_GProps gpv;
+        BRepGProp::VolumeProperties(r.shapes[0], gpv);
+        CHECK(gpv.Mass() == doctest::Approx(PI * R * R * H).epsilon(1e-6));
+    }
+
+    SUBCASE("axis as a string word == the equivalent vector, case-insensitively") {
+        CompileResult vec = spout(json::array({1.0, 0.0, 0.0}));
+        REQUIRE(vec.ok);
+        double vlo[3], vhi[3];
+        shape_bbox(vec.shapes[0], vlo, vhi);
+        for (const char* word : {"x", "+x", "X", " +X "}) {
+            CompileResult w = spout(json(word));
+            REQUIRE_MESSAGE(w.ok, "axis word '" << word << "' rejected: "
+                                                << w.statuses.front().error);
+            double wlo[3], whi[3];
+            shape_bbox(w.shapes[0], wlo, whi);
+            for (int k = 0; k < 3; ++k) {
+                CHECK(near_abs(wlo[k], vlo[k], 1e-9));
+                CHECK(near_abs(whi[k], vhi[k], 1e-9));
+            }
+        }
+    }
+
+    SUBCASE("the SIGN matters — axis:\"-x\" grows the other way from the same base") {
+        CompileResult r = spout(json("-x"));
+        REQUIRE(r.ok);
+        double lo[3], hi[3];
+        shape_bbox(r.shapes[0], lo, hi);
+        CHECK(near_abs(hi[0], 200.0));   // base still ON the placement point
+        CHECK(near_abs(lo[0], 140.0));   // grown toward -X
+        CHECK(near_abs(lo[1], -25.0));
+        CHECK(near_abs(hi[1], 25.0));
+        CHECK(near_abs(lo[2], 15.0));
+        CHECK(near_abs(hi[2], 65.0));
+    }
+
+    SUBCASE("antiparallel axis:\"-z\" (degenerate cross product) still flips cleanly") {
+        json doc;
+        doc["features"] = json::array({
+            json{{"id", "cyl"}, {"type", "cylinder"}, {"radius", R}, {"height", H},
+                 {"centered", false}, {"axis", "-z"}},
+        });
+        CompileResult r = compile_document(doc, json::object());
+        REQUIRE_MESSAGE(r.ok, "antiparallel axis failed: " << r.statuses.front().error);
+        double lo[3], hi[3];
+        shape_bbox(r.shapes[0], lo, hi);
+        CHECK(near_abs(hi[2], 0.0));     // base at the origin
+        CHECK(near_abs(lo[2], -60.0));   // hanging downward
+        CHECK(near_abs(lo[0], -25.0));
+        CHECK(near_abs(hi[0], 25.0));
+    }
+
+    SUBCASE("centered:true + axis rotates about `at` with no base offset") {
+        json doc;
+        doc["features"] = json::array({
+            json{{"id", "cyl"}, {"type", "cylinder"}, {"radius", R}, {"height", H},
+                 {"axis", json::array({1.0, 0.0, 0.0})},
+                 {"at", json::array({200.0, 0.0, 40.0})}},
+        });
+        CompileResult r = compile_document(doc, json::object());
+        REQUIRE(r.ok);
+        double lo[3], hi[3];
+        shape_bbox(r.shapes[0], lo, hi);
+        CHECK(near_abs(lo[0], 170.0));   // centred ON `at`, not based on it
+        CHECK(near_abs(hi[0], 230.0));
+        CHECK(near_abs(lo[2], 15.0));
+        CHECK(near_abs(hi[2], 65.0));
+    }
+}
+
+// 1i-b. The `centered:false` base offset must rotate WITH the body, not stay world-axis:
+//       a box's corner still lands on `at` after the primitive is turned on its side.
+TEST_CASE("primitive axis rotates a box's centered:false corner offset") {
+    // L(x)=10, W(y)=20, H(z)=30 -> rotating local +Z onto +X (a +90deg turn about +Y)
+    // maps local +z -> world +x, local +y -> world +y, local +x -> world -z. The corner
+    // offset (5,10,15) therefore becomes (15,10,-5) and the corner still sits at `at`.
+    json doc;
+    doc["features"] = json::array({
+        json{{"id", "blk"}, {"type", "box"}, {"length", 10.0}, {"width", 20.0},
+             {"height", 30.0}, {"centered", false}, {"axis", "x"}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE_MESSAGE(r.ok, "rotated box failed: " << r.statuses.front().error);
+    double lo[3], hi[3];
+    shape_bbox(r.shapes[0], lo, hi);
+    CHECK(near_abs(lo[0], 0.0));     // corner ON the origin along every rotated axis
+    CHECK(near_abs(hi[0], 30.0));    // the local HEIGHT now spans world x
+    CHECK(near_abs(lo[1], 0.0));
+    CHECK(near_abs(hi[1], 20.0));
+    CHECK(near_abs(hi[2], 0.0));
+    CHECK(near_abs(lo[2], -10.0));   // the local LENGTH now spans world -z
+    CHECK(r.volume == doctest::Approx(10.0 * 20.0 * 30.0).epsilon(1e-6));
+}
+
+// 1i-c. A sphere is rotation-invariant: `axis` must be accepted as a documented no-op,
+//       never an error, so a model can set it uniformly across a batch of primitives.
+TEST_CASE("primitive axis is a clean no-op on a sphere") {
+    auto ball = [](const json& axis) {
+        json f{{"id", "s"}, {"type", "sphere"}, {"radius", 10.0}};
+        if (!axis.is_null()) f["axis"] = axis;
+        json doc;
+        doc["features"] = json::array({f});
+        return compile_document(doc, json::object());
+    };
+    CompileResult plain = ball(json(nullptr));
+    CompileResult tilted = ball(json::array({1.0, 2.0, -3.0}));
+    REQUIRE(plain.ok);
+    REQUIRE_MESSAGE(tilted.ok, "sphere rejected axis: " << tilted.statuses.front().error);
+    // Exact B-rep volume, not the tessellated CompileResult::volume: a rotated sphere may
+    // facet marginally differently, but the SOLID is identical.
+    GProp_GProps gp0, gp1;
+    BRepGProp::VolumeProperties(plain.shapes[0], gp0);
+    BRepGProp::VolumeProperties(tilted.shapes[0], gp1);
+    CHECK(gp1.Mass() == doctest::Approx(gp0.Mass()).epsilon(1e-9));
+    CHECK(tilted.volume == doctest::Approx(plain.volume).epsilon(1e-3));
+    double lo[3], hi[3];
+    shape_bbox(tilted.shapes[0], lo, hi);
+    for (int k = 0; k < 3; ++k) {
+        CHECK(near_abs(lo[k], -10.0));
+        CHECK(near_abs(hi[k], 10.0));
+    }
+}
+
+// 1i-d. A malformed `axis` must FAIL the feature with a message that names the fix — never
+//       fall back to +Z, which is the silent-wrong-geometry class this whole change exists
+//       to end. The document still rebuilds (never-raise): the earlier body survives.
+TEST_CASE("a malformed primitive axis errors loudly instead of silently building +Z") {
+    auto compile_with = [](const json& axis) {
+        json doc;
+        doc["features"] = json::array({
+            json{{"id", "plate"}, {"type", "box"}, {"length", 80.0}, {"width", 40.0},
+                 {"height", 10.0}},
+            json{{"id", "cyl"}, {"type", "cylinder"}, {"radius", 5.0}, {"height", 40.0},
+                 {"mode", "cut"}, {"axis", axis}},
+        });
+        return compile_document(doc, json::object());
+    };
+
+    SUBCASE("zero-length vector") {
+        CompileResult r = compile_with(json::array({0.0, 0.0, 0.0}));
+        const chudware::doc::FeatureStatus* st = status_of(r, "cyl");
+        REQUIRE(st != nullptr);
+        CHECK_FALSE(st->ok);
+        CHECK(st->error.find("zero-length") != std::string::npos);
+        CHECK(r.body_count == 1);  // the plate survives untouched
+    }
+
+    SUBCASE("an unrecognised word") {
+        CompileResult r = compile_with(json("diagonal"));
+        const chudware::doc::FeatureStatus* st = status_of(r, "cyl");
+        REQUIRE(st != nullptr);
+        CHECK_FALSE(st->ok);
+        CHECK(st->error.find("axis must be") != std::string::npos);
+        CHECK(st->error.find("\"-x\"") != std::string::npos);  // the message names the fix
+        CHECK(r.body_count == 1);
+    }
+}
+
+// 1i-e. END TO END through the real op path: `axis` under params (where op_add_feature
+//       stores it and normalize_feature merges it back to the feature top level) must bore
+//       an actual CROSS-HOLE — the capability that previously required a sketch+extrude.
+//       Also pins that a canonical doc carrying params.axis / refs.axis validates clean.
+TEST_CASE("params.axis bores a real cross-hole through a primitive block") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    json nr = doc_new("part", "CrossBore");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Blk"},
+             {"params", {{"length", dimv(80)}, {"width", dimv(40)}, {"height", dimv(20)}}}}}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "CrossBore"},
+             {"params", {{"radius", dimv(5)}, {"height", dimv(100)}, {"mode", "cut"},
+                         {"axis", "x"}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    for (const json& row : resp.value("feature_status", json::array()))
+        CHECK_MESSAGE(row.value("ok", false), "feature failed: " << status_err(row));
+    const double vol = resp.value("volume", 0.0);
+    const double expect = 80.0 * 40.0 * 20.0 - PI * 5.0 * 5.0 * 80.0;
+    MESSAGE("cross-bored block vol = " << vol << " (expect " << expect
+                                       << ", un-bored 64000)");
+    CHECK(vol == doctest::Approx(expect).epsilon(0.01));
+
+    // Validation knows the key in BOTH spellings: params.axis (canonical) and the
+    // refs.axis slot a model borrows from revolve/circular_pattern.
+    json canon;
+    canon["schema"] = "aicad.part/1";
+    canon["id"] = "d";
+    canon["name"] = "AxisSchema";
+    canon["units"] = json{{"system", "MMGS"}};
+    canon["features"] = json::array({
+        json{{"id", "f1"}, {"type", "cylinder"}, {"name", "Spout"}, {"suppressed", false},
+             {"params", {{"radius", 25}, {"height", 60}, {"axis", "x"}, {"centered", false},
+                         {"at", json::array({200, 0, 40})}}},
+             {"refs", json::object()}},
+        json{{"id", "f2"}, {"type", "cylinder"}, {"name", "Datum"}, {"suppressed", false},
+             {"params", {{"radius", 5}, {"height", 10}, {"mode", "cut"}}},
+             {"refs", {{"axis", "axis.x"}}}},
+    });
+    std::vector<std::string> verrs = chudware::doc::validate_document(canon);
+    for (const auto& e : verrs) MESSAGE("unexpected validation error: " << e);
+    CHECK(verrs.empty());
 }
 
 // 2. MULTI-FEATURE PART: square 40x40 -> extrude 25 (base); circle r8 -> extrude 25

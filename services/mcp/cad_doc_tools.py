@@ -235,6 +235,180 @@ def _normalize_sketch_ops(ops: Any) -> Any:
         out.append(op)
     return out
 
+
+# ---------------------------------------------------------------------------
+# Primitive placement/orientation dialect normalizer (model-robustness).
+#
+# The canonical primitive add_feature carries placement + orientation as plain
+# feature-level keys: at / at_offset / axis / centered / mode / merge. Frontier
+# models instead reach for the shape they know from other CAD APIs — a nested
+# `placement:{origin:[…],direction:[…]}` plus `boolean:"union"` — and those keys
+# used to be DROPPED WHOLE: a spout meant to sit at x=200 pointing along +X was
+# built centred on the origin pointing up, buried in the body, and surfaced only
+# as the opaque "cylinder boss added no material". The engine now hard-errors on
+# any unrecognised feature key, so the dialect is rewritten into the canonical
+# keys HERE, before the call — and every dialect key this understands must be
+# FULLY CONSUMED (popped, never left beside the rewritten form), because a
+# leftover key is now a rejected batch. Conservative: primitives only, and only a
+# feature that actually shows a dialect key; canonical ops pass through untouched.
+_PRIMITIVE_TYPES = frozenset({"box", "cylinder", "sphere", "cone", "torus"})
+_AT_ALIASES = ("position", "location", "origin")
+_AXIS_ALIASES = ("direction", "dir", "normal", "orientation")
+_BOOLEAN_ALIASES = ("boolean", "operation")
+_PLACEMENT_AT_KEYS = ("at", "origin", "position", "location", "point")
+_PLACEMENT_AXIS_KEYS = ("axis", "direction", "normal", "dir")
+_PRIM_DIALECT_KEYS = frozenset(
+    ("placement",) + _AT_ALIASES + _AXIS_ALIASES + _BOOLEAN_ALIASES)
+_AXIS_WORDS = frozenset({"x", "+x", "-x", "y", "+y", "-y", "z", "+z", "-z"})
+_BOOLEAN_MODES = {
+    "union": "boss", "add": "boss", "join": "boss", "fuse": "boss",
+    "merge": "boss", "weld": "boss", "boss": "boss",
+    "cut": "cut", "subtract": "cut", "difference": "cut", "remove": "cut",
+}
+_BOOLEAN_NEW_BODY = frozenset({"new", "none", "new_body", "newbody"})
+_BOOLEAN_INTERSECT = frozenset({"intersect", "intersection"})
+_BOOLEAN_VALUES = ('union|add|join|fuse|merge|weld -> mode:"boss"; '
+                   'cut|subtract|difference|remove -> mode:"cut"; '
+                   'new|none|new_body -> merge:false (a separate body)')
+_MISSING = object()
+
+
+def _norm_axis_value(v: Any) -> Any:
+    """Canonicalize an axis word ("+X " -> "+x"); a [x,y,z] vector passes through."""
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in _AXIS_WORDS:
+            return s
+    return v
+
+
+def _primitive_needs_norm(feat: dict, params: dict) -> bool:
+    """True when a primitive carries a dialect key (or an un-canonical axis word)."""
+    for k in _PRIM_DIALECT_KEYS:
+        if k in feat or k in params:
+            return True
+    for src in (feat.get("axis"), params.get("axis")):
+        if isinstance(src, str) and src.strip().lower() != src:
+            return True
+    return False
+
+
+def _normalize_primitive_feature(feat: dict) -> dict:
+    """Rewrite a dialect primitive add_feature into the canonical placement shape.
+
+    placement/position/direction/boolean -> at / axis / mode / merge. Pure: the
+    caller's feature (and its params) are never mutated. When a dialect key and its
+    canonical target disagree the CANONICAL key wins and the dialect key is dropped
+    (the model asked for the same thing twice; honour the documented spelling).
+    """
+    out = dict(feat)
+    params = feat.get("params")
+    new_params = dict(params) if isinstance(params, dict) else {}
+
+    def peek(key: str) -> Any:
+        # `params` is merged into the feature by the engine, so either level counts.
+        if key in out:
+            return out[key]
+        return new_params.get(key, _MISSING)
+
+    def consume(key: str) -> Any:
+        v = peek(key)
+        out.pop(key, None)
+        new_params.pop(key, None)
+        return v
+
+    at_val: Any = _MISSING
+    axis_val: Any = _MISSING
+
+    # placement:{origin|position|location|point:[x,y,z], direction|axis|normal|dir:…}
+    # A non-dict `placement` is NOT consumed — we don't understand it, so let the
+    # engine's unknown-key error name it rather than dropping the model's intent.
+    place = peek("placement")
+    if isinstance(place, dict):
+        consume("placement")
+        for k in _PLACEMENT_AT_KEYS:
+            if place.get(k) is not None:
+                at_val = place[k]
+                break
+        for k in _PLACEMENT_AXIS_KEYS:
+            if place.get(k) is not None:
+                axis_val = place[k]
+                break
+
+    for k in _AT_ALIASES:
+        v = consume(k)
+        if at_val is _MISSING and v is not _MISSING and v is not None:
+            at_val = v
+    for k in _AXIS_ALIASES:
+        v = consume(k)
+        if axis_val is _MISSING and v is not _MISSING and v is not None:
+            axis_val = v
+
+    if at_val is not _MISSING and peek("at") is _MISSING:
+        out["at"] = at_val
+    if axis_val is not _MISSING and peek("axis") is _MISSING:
+        out["axis"] = axis_val
+
+    # boolean|operation -> mode / merge. An unusable value is an ERROR, not a drop:
+    # the model named an operation it believes in, and "intersect" in particular has
+    # no primitive mode at all (it would silently fuse instead of intersecting).
+    for k in _BOOLEAN_ALIASES:
+        v = consume(k)
+        if v is _MISSING or v is None:
+            continue
+        word = str(v).strip().lower()
+        if word in _BOOLEAN_INTERSECT:
+            raise ValueError(
+                f"add_feature {feat.get('type')}: '{k}':'{v}' is not supported — the "
+                f"engine has no intersect mode for primitives. Supported: "
+                f"{_BOOLEAN_VALUES}")
+        if word in _BOOLEAN_MODES:
+            if peek("mode") is _MISSING:
+                out["mode"] = _BOOLEAN_MODES[word]
+        elif word in _BOOLEAN_NEW_BODY:
+            if peek("merge") is _MISSING:
+                out["merge"] = False
+        else:
+            raise ValueError(
+                f"add_feature {feat.get('type')}: unknown '{k}':'{v}'. Supported: "
+                f"{_BOOLEAN_VALUES}")
+
+    # Canonicalize the axis WORD wherever it ended up ("+X" -> "+x"); a [x,y,z]
+    # vector passes through. Feature level is the canonical home (session.cpp's
+    # op_add_feature hoists it into params alongside at/centered/mode/merge).
+    axis_out = peek("axis")
+    if axis_out is not _MISSING and axis_out is not None:
+        if "axis" in out:
+            out["axis"] = _norm_axis_value(axis_out)
+        else:
+            new_params["axis"] = _norm_axis_value(axis_out)
+
+    if isinstance(params, dict) or new_params:
+        out["params"] = new_params
+    return out
+
+
+def _normalize_feature_ops(ops: Any) -> Any:
+    """Normalize dialect primitive placement/orientation ops; return a new list."""
+    if not isinstance(ops, list):
+        return ops
+    out = []
+    for op in ops:
+        try:
+            if (isinstance(op, dict) and op.get("op") == "add_feature"
+                    and isinstance(op.get("feature"), dict)
+                    and op["feature"].get("type") in _PRIMITIVE_TYPES):
+                feat = op["feature"]
+                params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+                if _primitive_needs_norm(feat, params):
+                    op = {**op, "feature": _normalize_primitive_feature(feat)}
+        except ValueError:
+            raise  # an unsupported request (boolean:"intersect") — tell the model
+        except Exception:  # noqa: BLE001 — never let normalization break a valid call
+            pass
+        out.append(op)
+    return out
+
 def register_cad_doc_tools(mcp: FastMCP) -> None:
     """CAD document-lifecycle MCP tools (T-RF8 split of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
 
@@ -421,6 +595,28 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
           Live list: engine doc_list_ops (sourced from core/doc/op_registry — single source).
           Call cad_guide() for worked examples and full param shapes.
 
+        PRIMITIVE PLACEMENT + ORIENTATION (box/cylinder/sphere/cone/torus) — feature-level
+        keys beside "type"/"name"/"params", all optional. An unrecognised key is REJECTED,
+        never silently ignored, so use exactly these spellings:
+          "at":[x,y,z]           where it goes (default: centred on the origin). May instead
+                                 be a geometry query — "at":{"of":"face","side":"top"} places
+                                 it at that face's centroid.
+          "at_offset":[dx,dy,dz] world-axis nudge added on top of "at".
+          "axis":[x,y,z] | "+x"|"-x"|"+y"|"-y"|"+z"|"-z"   which way it POINTS: the primitive's
+                                 natural local +Z is rotated onto "axis" (default "+z" = up).
+                                 This is how you get a sideways cylinder/cone/box without a
+                                 sketch — "centered":false then measures along the ROTATED axis.
+          "centered":false       put the base/corner at "at" instead of the centre (box corner,
+                                 cylinder/cone base); sphere/torus are always centred.
+          "mode":"boss"|"cut"    fuse into (default) or subtract from the current body.
+          "merge":false          start a SEPARATE new body instead of combining.
+          An off-origin sideways boss, end to end:
+          {"op":"add_feature","feature":{"type":"cylinder","name":"DrainSpout",
+              "params":{"radius":{"value":25,"expr":null},"height":{"value":60,"expr":null}},
+              "at":[200,0,40],"axis":[1,0,0],"centered":false,"mode":"boss"}}
+          WRONG: "placement":{"origin":[…],"direction":[…]} / "boolean":"union"
+          RIGHT: "at":[…], "axis":[…], "mode":"boss"
+
         Returns revision, body_count, volume_mm3, and per-feature status (ok / error / warning)
         so you can immediately tell a dropped cut, a failed reference, or a stray extra body.
         VERIFY LOOP (after every mutation): call render_part() or render_views() to SEE the
@@ -471,6 +667,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
             # to the engine's canonical schema before validation.
             ops = _normalize_sketch_ops(ops)
+            # Same, for the primitive placement/orientation dialect models emit
+            # (placement:{origin,direction}, boolean:"union") — rewritten to the
+            # canonical at/axis/mode/merge keys the engine actually accepts.
+            ops = _normalize_feature_ops(ops)
 
             def _apply() -> dict:
                 # Transactional batch: snapshot first so a partial failure rolls the WHOLE batch
@@ -513,12 +713,30 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     fail = [{"id": s.get("id"), "error": s.get("error")} for s in fs
                             if not s.get("ok")]
                     _publish_current(d)  # mirror the rolled-back (or current) state to the app
+                    # The agent card renders `error` TRUNCATED (~160 chars) and never
+                    # reads `failed_features`, so a constant "batch rejected" told the
+                    # model nothing and it resent the identical ops. Carry the engine's
+                    # actual per-feature reasons — named by feature — in `error` itself.
+                    fnames = {}
+                    idmap = r.get("id_map") or {}
+                    for i, o in enumerate(ops):
+                        f = o.get("feature") if isinstance(o, dict) else None
+                        fid = idmap.get("$" + str(i))
+                        if isinstance(f, dict) and f.get("name") and isinstance(fid, str) and fid:
+                            fnames[fid] = str(f["name"])
+                    parts = []
+                    for f in fail:
+                        fid = str(f.get("id") or "?")
+                        why = str(f.get("error") or "").strip() or "no reason reported"
+                        nm = fnames.get(f.get("id"))
+                        parts.append(f"{fid} ({nm}): {why}" if nm else f"{fid}: {why}")
+                    head = ("batch rejected, nothing was kept" if reverted
+                            else "batch failed and rollback failed")
                     fail_result = {
                         "ok": False,
                         "doc_id": d,
                         "rolled_back": reverted,
-                        "error": "batch rejected — no features were kept; fix and resend"
-                                 if reverted else "batch failed and rollback failed",
+                        "error": (head + " — " + "; ".join(parts)) if parts else head,
                         "failed_features": fail,
                         "features": feats,
                     }

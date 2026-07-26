@@ -140,11 +140,25 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
                    {"y_dir", RefForm::SelOrDatum, false}}}},
     {"sketch", {{"entities", "constraints"}, {{"plane", RefForm::SelOrDatum, true},
                                               {"offset", RefForm::SelOrDatum, false}}}},
-    {"box", {{"length", "width", "height"}, {{"at", RefForm::SelOrDatum, false}}}},
-    {"cylinder", {{"radius", "height"}, {{"at", RefForm::SelOrDatum, false}}}},
-    {"sphere", {{"radius"}, {{"at", RefForm::SelOrDatum, false}}}},
-    {"cone", {{"r1", "r2", "height"}, {{"at", RefForm::SelOrDatum, false}}}},
-    {"torus", {{"major_r", "minor_r"}, {{"at", RefForm::SelOrDatum, false}}}},
+    // Primitives: `axis` orients the primitive's natural local +Z (document.cpp's
+    // primitive branch). Its canonical home is params.axis ([x,y,z] or an axis word),
+    // which needs no schema entry — unknown PARAMS are not rejected. The optional ref
+    // slot below is for the other spelling a model reaches for, refs.axis: a reserved
+    // datum ("axis.x") or an explicit {"axis":[x,y,z]} wrapper, exactly as revolve /
+    // circular_pattern accept (AXIS_DIR_SLOTS already whitelists the explicit form).
+    // normalize_feature turns that ref into axis_dir, which the compiler honours — so
+    // without this slot a perfectly buildable primitive was rejected at dry-run with
+    // "unknown ref slot for cylinder".
+    {"box", {{"length", "width", "height"}, {{"at", RefForm::SelOrDatum, false},
+                                             {"axis", RefForm::SelOrDatum, false}}}},
+    {"cylinder", {{"radius", "height"}, {{"at", RefForm::SelOrDatum, false},
+                                         {"axis", RefForm::SelOrDatum, false}}}},
+    {"sphere", {{"radius"}, {{"at", RefForm::SelOrDatum, false},
+                             {"axis", RefForm::SelOrDatum, false}}}},
+    {"cone", {{"r1", "r2", "height"}, {{"at", RefForm::SelOrDatum, false},
+                                       {"axis", RefForm::SelOrDatum, false}}}},
+    {"torus", {{"major_r", "minor_r"}, {{"at", RefForm::SelOrDatum, false},
+                                        {"axis", RefForm::SelOrDatum, false}}}},
     {"extrude", {{"mode"}, {{"profile", RefForm::SelList, true},
                             {"up_to", RefForm::SelOrDatum, false},
                             {"up_to2", RefForm::SelOrDatum, false},
@@ -736,12 +750,27 @@ bool is_query_obj(const json& v) {
 bool is_explicit_axis(const json& v) { return v.is_object() && is_vec(get(v, "axis"), 3); }
 const std::set<string> AXIS_DIR_SLOTS = {"axis", "dir1", "dir2", "pull"};
 
+// `of` is OPTIONAL: picks.cpp::resolve_geom_query defaults an absent (or non-string)
+// `of` to "face", the overwhelmingly common intent — a model writing
+// {"kind":"query","side":"top"} means the top FACE. Rejecting the absence here fired
+// BEFORE that default could apply, so a query that compiles fine was killed at
+// validation in every feature selector slot (fillet edges, shell remove, hole face,
+// draft neutral, and the relational at:{...} on a primitive). Only a PRESENT `of`
+// naming something other than edge/face is an error.
 vector<string> validate_geom_query(const json& q, const string& where) {
     const json& ofj = get(q, "of");
-    string of = ofj.is_string() ? ofj.get<string>() : "";
-    if (of != "edge" && of != "face")
-        return {where + ".of: geometry query must be \"edge\" or \"face\""};
-    return {};
+    if (ofj.is_null()) return {};  // absent -> "face" at compile time
+    if (!ofj.is_string())
+        return {where + ".of: geometry query 'of' must be the string \"face\" or \"edge\" "
+                        "(omit it to default to \"face\")"};
+    // Matched the same way resolve_geom_query matches it: case-insensitively, with an
+    // empty string treated as absent. Validation must never reject a query the compiler
+    // would happily resolve.
+    string of = ofj.get<string>();
+    for (char& c : of) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (of.empty() || of == "edge" || of == "face") return {};
+    return {where + ".of: geometry query must be \"edge\" or \"face\" "
+                    "(omit it to default to \"face\")"};
 }
 
 vector<string> validate_selector(const json& sel, const string& where) {

@@ -74,6 +74,16 @@ long DocRegistry::sniffRevision(const json& result) {
     return -1;
 }
 
+std::string DocRegistry::sniffName(const json& result) {
+    if (!result.is_object()) return {};
+    if (result.contains("name") && result["name"].is_string())
+        return result["name"].get<std::string>();
+    if (result.contains("tree") && result["tree"].is_object() &&
+        result["tree"].contains("name") && result["tree"]["name"].is_string())
+        return result["tree"]["name"].get<std::string>();
+    return {};
+}
+
 int DocRegistry::holdSecs() const {
     if (const char* h = std::getenv("CHUDWARE_HOSTD_HOLD_SECS"); h && *h)
         return std::max(1, std::atoi(h));
@@ -147,6 +157,12 @@ int DocRegistry::rwCountLocked(const DocState& d) const {
 
 void DocRegistry::fanoutLocked(const std::string& docId, const json& evt, int exceptClient,
                                std::vector<PendingEvent>& out) {
+    // Backstop for DocState::internal: an internal doc was never announced to anyone,
+    // so NO event about it may reach a subscriber. Every call site guards too; this
+    // catch-all is what keeps a future one from resurrecting the phantom-tab bug (a
+    // preflight shadow clone mirrored into the GUI as a part tab per AI operation).
+    if (auto it = docs_.find(docId); it != docs_.end() && it->second.internal) return;
+
     const std::string line = evt.dump();
     for (const auto& [cid, ids] : subs_) {
         if (cid == exceptClient) continue;
@@ -167,11 +183,15 @@ void DocRegistry::expireHoldLocked(const std::string& docId, DocState& d,
     if (!d.hold.active || monoMs() < d.hold.deadlineMs) return;
     log().line("edit-hold on %s by %s#%d expired", docId.c_str(), d.hold.kind.c_str(),
                d.hold.clientId);
-    json evt = {{"event", "doc.lease_change"},
-                {"data", {{"doc_id", docId},
-                          {"holder", d.hold.kind},
-                          {"state", "expired"}}}};
-    fanoutLocked(docId, evt, /*exceptClient=*/-1, out);
+    // Internal doc (DocState::internal): the hold still expires below, it is simply
+    // never announced — no client was ever told this doc exists.
+    if (!d.internal) {
+        json evt = {{"event", "doc.lease_change"},
+                    {"data", {{"doc_id", docId},
+                              {"holder", d.hold.kind},
+                              {"state", "expired"}}}};
+        fanoutLocked(docId, evt, /*exceptClient=*/-1, out);
+    }
     d.hold = Hold{};
 }
 
@@ -229,11 +249,15 @@ void DocRegistry::onDaemonClosedDoc(const std::string& docId, const std::string&
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = docs_.find(docId);
         if (it == docs_.end()) return;
-        json evt = {{"event", "doc.closed"},
-                    {"data", {{"doc_id", docId},
-                              {"reason", reason},
-                              {"source_kind", "daemon"}}}};
-        fanoutLocked(docId, evt, /*exceptClient=*/-1, pending);
+        // Internal doc: the registry state still drops below, but a doc nobody was told
+        // about must not produce a doc.closed (DocState::internal).
+        if (!it->second.internal) {
+            json evt = {{"event", "doc.closed"},
+                        {"data", {{"doc_id", docId},
+                                  {"reason", reason},
+                                  {"source_kind", "daemon"}}}};
+            fanoutLocked(docId, evt, /*exceptClient=*/-1, pending);
+        }
         docs_.erase(it);
     }
     flush(pending);
@@ -287,8 +311,9 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
                 if (ait != d.attach.end()) d.attach.erase(ait);
                 if (d.hold.active && d.hold.clientId == clientId) d.hold = Hold{};
                 updateOrphanDeadlineLocked(d);
-                if (wasRw && rwCountLocked(d) == 0) {
+                if (wasRw && rwCountLocked(d) == 0 && !d.internal) {
                     // Last writer left: viewers should treat their mirror as final.
+                    // Internal docs are excluded — no viewer ever mirrored one.
                     json evt = {{"event", "doc.closed"},
                                 {"data", {{"doc_id", docId},
                                           {"reason", "last_writer_detached"},
@@ -309,7 +334,7 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
             } else {
                 const bool fresh = !d.hold.active;
                 d.hold = Hold{true, clientId, kind, monoMs() + (long long)holdSecs() * 1000};
-                if (fresh) {
+                if (fresh && !d.internal) {  // internal docs announce no lease state
                     json evt = {{"event", "doc.lease_change"},
                                 {"data", {{"doc_id", docId},
                                           {"holder", kind},
@@ -323,11 +348,13 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
             if (it != docs_.end() && it->second.hold.active &&
                 it->second.hold.clientId == clientId) {
                 it->second.hold = Hold{};
-                json evt = {{"event", "doc.lease_change"},
-                            {"data", {{"doc_id", docId},
-                                      {"holder", kind},
-                                      {"state", "released"}}}};
-                fanoutLocked(docId, evt, clientId, pending);
+                if (!it->second.internal) {  // internal docs announce no lease state
+                    json evt = {{"event", "doc.lease_change"},
+                                {"data", {{"doc_id", docId},
+                                          {"holder", kind},
+                                          {"state", "released"}}}};
+                    fanoutLocked(docId, evt, clientId, pending);
+                }
             }
             result = json{{"ok", true}};
         } else if (method == "subscribe") {
@@ -456,13 +483,19 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
         // doc_close: drop registry state + tell subscribers.
         if (method == "doc_close") {
             const std::string docId = params.value("doc_id", std::string());
-            if (!docId.empty() && docs_.count(docId)) {
-                json evt = {{"event", "doc.closed"},
-                            {"data", {{"doc_id", docId},
-                                      {"reason", "closed"},
-                                      {"source_kind", kind}}}};
-                fanoutLocked(docId, evt, clientId, pending);
-                docs_.erase(docId);
+            auto it = docId.empty() ? docs_.end() : docs_.find(docId);
+            if (it != docs_.end()) {
+                // Internal doc (DocState::internal): drop the state silently. A client
+                // that was never told the doc opened must not be told it closed — the
+                // preflight clone is minted and closed inside one add_features call.
+                if (!it->second.internal) {
+                    json evt = {{"event", "doc.closed"},
+                                {"data", {{"doc_id", docId},
+                                          {"reason", "closed"},
+                                          {"source_kind", kind}}}};
+                    fanoutLocked(docId, evt, clientId, pending);
+                }
+                docs_.erase(it);
             }
             flush(pending);
             return;
@@ -497,14 +530,33 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
             d.lastWriterUserId = userId;
             d.lastWriterUserDisplay = userDisplay;
             d.originKind = kind;  // who created it — user (gui) vs AI (mcp/agent)
-            json evt = {{"event", "doc.opened"},
-                        {"data", {{"doc_id", docId},
-                                  {"revision", rev},
-                                  {"source_client", clientId},
-                                  {"source_kind", kind},
-                                  {"origin_kind", kind},
-                                  {"method", method},
-                                  {"user", {{"id", userId}, {"display", userDisplay}}}}}};
+            // {"internal":true} on the MINTING request marks a doc the daemon must never
+            // announce. find() is safe on a null/non-object params and a non-bool value
+            // degrades to false, so a client that never sends the flag behaves as today.
+            const auto iflag = params.find("internal");
+            d.internal = iflag != params.end() && iflag->is_boolean() && iflag->get<bool>();
+            if (d.internal) {
+                // Registered exactly like any other doc (implicit rw attach, origin kind
+                // and GC bookkeeping above are untouched) but silent: the agent preflight
+                // advisor mints a shadow clone of the live part inside a single
+                // add_features call, and mirroring it opened a throwaway GUI part tab for
+                // every operation the AI performed.
+                flush(pending);
+                return;
+            }
+            // "name" lets a subscriber title the doc's tab on the spot instead of
+            // chasing a doc_tree round-trip (which takes the doc's engine lock while
+            // the minting client is still mid-op). Omitted when the minting response
+            // carried no name — subscribers must tolerate its absence.
+            json data = {{"doc_id", docId},
+                         {"revision", rev},
+                         {"source_client", clientId},
+                         {"source_kind", kind},
+                         {"origin_kind", kind},
+                         {"method", method},
+                         {"user", {{"id", userId}, {"display", userDisplay}}}};
+            if (const std::string nm = sniffName(result); !nm.empty()) data["name"] = nm;
+            json evt = {{"event", "doc.opened"}, {"data", data}};
             fanoutLocked(docId, evt, clientId, pending);
             flush(pending);
             return;
@@ -536,30 +588,35 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                 d.lastWriterMethod = method;
                 d.lastWriterUserId = userId;
                 d.lastWriterUserDisplay = userDisplay;
-                json data = {{"doc_id", docId},
-                             {"revision", rev},
-                             {"source_client", clientId},
-                             {"source_kind", kind},
-                             {"method", method},
-                             {"user", {{"id", userId}, {"display", userDisplay}}}};
-                if (result.contains("tess") && result["tess"].is_object() &&
-                    result["tess"].contains("aicm_path"))
-                    data["aicm_path"] = result["tess"]["aicm_path"];
-                // Push the immutable revision snapshot with the mesh path. Additive fields let GUI
-                // viewers prewarm inactive-tab caches without a serialized follow-up doc_tree call.
-                if (result.contains("tree") && result["tree"].is_object())
-                    data["tree"] = result["tree"];
-                if (result.contains("owner_map") && result["owner_map"].is_object())
-                    data["owner_map"] = result["owner_map"];
-                if (result.contains("datums") && result["datums"].is_array())
-                    data["datums"] = result["datums"];
-                if (result.contains("rebuild") && result["rebuild"].is_object())
-                    data["rebuild"] = result["rebuild"];
-                if (result.contains("rebuild") && result["rebuild"].is_object() &&
-                    result["rebuild"].contains("feature_status"))
-                    data["feature_status"] = result["rebuild"]["feature_status"];
-                fanoutLocked(docId, json{{"event", "doc.changed"}, {"data", data}},
-                             clientId, pending);
+                // No doc.changed for an internal doc (DocState::internal): no subscriber
+                // was told it opened, and the payload below copies the whole tree.
+                if (!d.internal) {
+                    json data = {{"doc_id", docId},
+                                 {"revision", rev},
+                                 {"source_client", clientId},
+                                 {"source_kind", kind},
+                                 {"method", method},
+                                 {"user", {{"id", userId}, {"display", userDisplay}}}};
+                    if (result.contains("tess") && result["tess"].is_object() &&
+                        result["tess"].contains("aicm_path"))
+                        data["aicm_path"] = result["tess"]["aicm_path"];
+                    // Push the immutable revision snapshot with the mesh path. Additive
+                    // fields let GUI viewers prewarm inactive-tab caches without a
+                    // serialized follow-up doc_tree call.
+                    if (result.contains("tree") && result["tree"].is_object())
+                        data["tree"] = result["tree"];
+                    if (result.contains("owner_map") && result["owner_map"].is_object())
+                        data["owner_map"] = result["owner_map"];
+                    if (result.contains("datums") && result["datums"].is_array())
+                        data["datums"] = result["datums"];
+                    if (result.contains("rebuild") && result["rebuild"].is_object())
+                        data["rebuild"] = result["rebuild"];
+                    if (result.contains("rebuild") && result["rebuild"].is_object() &&
+                        result["rebuild"].contains("feature_status"))
+                        data["feature_status"] = result["rebuild"]["feature_status"];
+                    fanoutLocked(docId, json{{"event", "doc.changed"}, {"data", data}},
+                                 clientId, pending);
+                }
             }
         } else if (a.lastSeenRev < 0) {
             a.lastSeenRev = d.revision;  // first touch via a rev-less response
@@ -574,9 +631,13 @@ void DocRegistry::notifyHistoryCleared(const std::string& docId, int /*sourceCli
     std::vector<PendingEvent> pending;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        json evt = {{"event", "doc.history_cleared"},
-                    {"data", {{"doc_id", docId}}}};
-        fanoutLocked(docId, evt, /*exceptClient=*/-1, pending);
+        // An unknown doc still fans out (the registry may have dropped it while mirrors
+        // are still open); an internal one never does — see DocState::internal.
+        if (auto it = docs_.find(docId); it == docs_.end() || !it->second.internal) {
+            json evt = {{"event", "doc.history_cleared"},
+                        {"data", {{"doc_id", docId}}}};
+            fanoutLocked(docId, evt, /*exceptClient=*/-1, pending);
+        }
     }
     flush(pending);
 }
@@ -595,7 +656,9 @@ void DocRegistry::onDisconnect(int clientId, const std::string& kind) {
             if (heldHere) d.hold = Hold{};
             if (ait != d.attach.end()) d.attach.erase(ait);
             updateOrphanDeadlineLocked(d);
-            if (heldHere || wasRw) {
+            // Internal docs (DocState::internal) hold no announced lease: nobody was
+            // ever told they exist, so there is no lease state to correct.
+            if ((heldHere || wasRw) && !d.internal) {
                 json evt = {{"event", "doc.lease_change"},
                             {"data", {{"doc_id", docId},
                                       {"holder", kind},
@@ -607,7 +670,7 @@ void DocRegistry::onDisconnect(int clientId, const std::string& kind) {
             // is final so they can auto-close (mirrors the detach_doc path).
             // Without this, a crashed/killed agent leaves its live view stuck open
             // forever (the GUI's ro attach also blocks GC, so no other event fires).
-            if (wasRw && rwCountLocked(d) == 0) {
+            if (wasRw && rwCountLocked(d) == 0 && !d.internal) {  // internal: no mirror
                 json evt = {{"event", "doc.closed"},
                             {"data", {{"doc_id", docId},
                                       {"reason", "last_writer_detached"},
@@ -625,15 +688,25 @@ void DocRegistry::annotateDocList(json& result) {
     if (!result.is_object() || !result.contains("docs") || !result["docs"].is_array())
         return;
     std::lock_guard<std::mutex> lk(mtx_);
+    // An INTERNAL doc (a preflight shadow clone) is dropped from the listing entirely, not
+    // just annotated. Suppressing its doc.opened fanout is not enough on its own: the GUI
+    // also mirrors every doc it finds in doc_list at bootstrap and reconnect
+    // (host/src/core/engine_events.cpp tryBootstrap), so a bootstrap landing inside the
+    // clone's sub-second lifetime would still open the throwaway part tab this flag exists
+    // to prevent. A doc no client was ever told about must not appear in the roster either.
+    json kept = json::array();
     for (auto& e : result["docs"]) {
-        if (!e.is_object()) continue;
+        if (!e.is_object()) { kept.push_back(std::move(e)); continue; }
         const std::string id = e.value("doc_id", std::string());
-        if (id.empty()) continue;
+        if (id.empty()) { kept.push_back(std::move(e)); continue; }
         auto it = docs_.find(id);
+        if (it != docs_.end() && it->second.internal) continue;
         e["origin_kind"] = (it != docs_.end() && !it->second.originKind.empty())
                                ? it->second.originKind
                                : std::string("unknown");
+        kept.push_back(std::move(e));
     }
+    result["docs"] = std::move(kept);
 }
 
 bool DocRegistry::hasOtherRwWriter(const std::string& docId, int clientId) {

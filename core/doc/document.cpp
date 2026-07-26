@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -918,6 +919,32 @@ std::string json_key_list(const json& o) {
         s += it.key();
     }
     return s;
+}
+
+// A primitive's `axis` value: an explicit [x,y,z] vector OR an axis WORD. Matches the
+// spellings picks.cpp::parse_axis_vec accepts and ADDS the SIGN — for a placement the
+// direction matters (axis:"-x" grows the primitive toward -X), where a parallel/
+// perpendicular pick filter only cares about the axis LINE and can ignore it. Returns
+// nullopt when the value is neither form (the caller raises a naming error); the result
+// is NOT normalized, so the caller can still reject a zero-length vector.
+std::optional<Eigen::Vector3d> parse_signed_axis(const json& j) {
+    if (j.is_array() && j.size() >= 3 && j[0].is_number() && j[1].is_number() &&
+        j[2].is_number())
+        return Eigen::Vector3d(j[0].get<double>(), j[1].get<double>(), j[2].get<double>());
+    if (j.is_string()) {
+        std::string s;
+        for (char c : j.get<std::string>()) {
+            const unsigned char u = static_cast<unsigned char>(c);
+            if (!std::isspace(u)) s += static_cast<char>(std::tolower(u));
+        }
+        if (s == "x" || s == "+x") return Eigen::Vector3d(1, 0, 0);
+        if (s == "-x")             return Eigen::Vector3d(-1, 0, 0);
+        if (s == "y" || s == "+y") return Eigen::Vector3d(0, 1, 0);
+        if (s == "-y")             return Eigen::Vector3d(0, -1, 0);
+        if (s == "z" || s == "+z" || s == "vertical") return Eigen::Vector3d(0, 0, 1);
+        if (s == "-z")             return Eigen::Vector3d(0, 0, -1);
+    }
+    return std::nullopt;
 }
 
 // SCHEMA CONVERGENCE (docs/CPP_MIGRATION.md): accept BOTH the host's canonical
@@ -2946,11 +2973,12 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
             } else if (type == "box" || type == "cylinder" || type == "sphere" ||
                        type == "cone" || type == "torus") {
-                // Base primitives, centered on the origin by default. An optional `at`
-                // [x,y,z] param MOVES the primitive so a boss/cut/hole can sit off-origin
-                // (e.g. a cylinder cut at a corner = an off-center hole) — see the
-                // placement block after the solid is built. Port of
-                // engine/doc/features/primitives.py.
+                // Base primitives, centered on the origin and built along their natural
+                // local +Z by default. An optional `at` [x,y,z] param MOVES the primitive
+                // and an optional `axis` ORIENTS it, so a boss/cut/hole can sit off-origin
+                // pointing any direction (e.g. a cylinder cut at a corner = an off-center
+                // hole; axis:[1,0,0] = a cross-bore) — see the orientation/placement block
+                // after the solid is built. Port of engine/doc/features/primitives.py.
                 TopoDS_Shape solid;
                 if (type == "box") {
                     // Validate the box dims UP FRONT (Bug A6): a 0/negative length, width
@@ -3012,18 +3040,57 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (solid.IsNull())
                     throw std::runtime_error(type + " produced an empty solid");
 
-                // PLACEMENT: an `at` [x,y,z] point translates the centered primitive so a
-                // boss/cut/hole can sit off-origin. It stays a NORMAL, auditable feature —
-                // `at` and `centered` are plain editable params (shown in the tree,
-                // patchable via edit_feature); there is no hidden/baked transform. With
-                // `centered:false` the primitive's natural base/corner sits at `at`
-                // (SolidWorks convention): box corner, cylinder/cone base center; sphere/
-                // torus have no corner so they stay centered on `at`.
+                // ORIENTATION + PLACEMENT. `axis`, `at`, `at_offset` and `centered` stay
+                // NORMAL, auditable feature params — plain editable values shown in the
+                // tree and patchable via edit_feature; there is no hidden or baked
+                // transform. An `at` [x,y,z] point translates the centered primitive so a
+                // boss/cut/hole can sit off-origin, and `axis` rotates the primitive's
+                // natural local +Z onto an arbitrary direction so a sideways cylinder no
+                // longer needs a sketch+extrude. With `centered:false` the primitive's
+                // natural base/corner sits at `at` (SolidWorks convention): box corner,
+                // cylinder/cone base center; sphere/torus have no corner so they stay
+                // centered on `at`.
+                //
+                // NORMATIVE ORDER: build centred -> rotate local +Z onto `axis` about the
+                // ORIGIN -> add the `centered:false` base offset ALONG THE ROTATED AXIS ->
+                // translate by `at` -> add `at_offset`. `axis` defaults to [0,0,1], where
+                // the rotation is skipped outright so every pre-existing primitive keeps
+                // bit-identical topology. A sphere is rotation-invariant, so it accepts
+                // `axis` as a documented geometric no-op rather than erroring.
                 {
+                    // (1) The requested axis. `axis` is the canonical feature-level key
+                    // (session.cpp hoists it into params, normalize_feature merges params
+                    // back to the top level — exactly how `at`/`centered` arrive). `axis_dir`
+                    // is what normalize_feature leaves behind when the model routed the
+                    // direction through the refs.axis slot instead (a reserved datum
+                    // "axis.x", or an explicit {"axis":[x,y,z]} wrapper) — honour that form
+                    // too rather than dropping it silently.
+                    Eigen::Vector3d paxis(0, 0, 1);
+                    // An explicit null means "not specified" (same tolerance `plane`/
+                    // `offset` already give), not a malformed direction.
+                    const bool has_axis = feat.contains("axis") && !feat.at("axis").is_null();
+                    const bool has_axis_dir =
+                        feat.contains("axis_dir") && !feat.at("axis_dir").is_null();
+                    const char* akey = has_axis ? "axis" : has_axis_dir ? "axis_dir" : nullptr;
+                    if (akey) {
+                        const json& av = feat.at(akey);
+                        std::optional<Eigen::Vector3d> pa = parse_signed_axis(av);
+                        if (!pa)
+                            throw std::runtime_error(
+                                type + ": axis must be [x,y,z] or one of \"x\", \"+x\", "
+                                "\"-x\", \"y\", \"+y\", \"-y\", \"z\", \"+z\", \"-z\" (got " +
+                                av.dump() + ")");
+                        if (!pa->allFinite() || !(pa->norm() > 1e-9))
+                            throw std::runtime_error(
+                                type + ": axis " + av.dump() + " is zero-length or "
+                                "non-finite — give a real direction, e.g. axis:[1,0,0]");
+                        paxis = pa->normalized();
+                    }
+
                     Eigen::Vector3d at(0, 0, 0);
                     bool placed = false;
                     auto at_it = feat.find("at");
-                    // RELATIONAL placement: `at` may be a geometry QUERY ({"of":"face",
+                    // (2) RELATIONAL placement: `at` may be a geometry QUERY ({"of":"face",
                     // "side":"top"}) instead of a coordinate — place the primitive at the
                     // centroid of the matched face/edge on the current body, so a model can
                     // say "a boss on the top face" with no coordinates.
@@ -3046,6 +3113,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                              (*at_it)[2].get<double>());
                         placed = true;
                     }
+                    // (3) The `centered:false` base offset, measured on the UNROTATED
+                    // centred solid's bbox — so the default-axis numbers are bit-identical
+                    // to before — and then carried through the rotation with the body.
+                    Eigen::Vector3d base_off(0, 0, 0);
+                    bool has_base = false;
                     if (!feat.value("centered", true)) {
                         Bnd_Box bb;
                         BRepBndLib::Add(solid, bb);
@@ -3053,18 +3125,41 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             double xmn, ymn, zmn, xmx, ymx, zmx;
                             bb.Get(xmn, ymn, zmn, xmx, ymx, zmx);
                             if (type == "box") {
-                                at.x() += (xmx - xmn) / 2.0;
-                                at.y() += (ymx - ymn) / 2.0;
-                                at.z() += (zmx - zmn) / 2.0;
+                                base_off = Eigen::Vector3d((xmx - xmn) / 2.0, (ymx - ymn) / 2.0,
+                                                           (zmx - zmn) / 2.0);
                             } else if (type == "cylinder" || type == "cone") {
-                                at.z() += (zmx - zmn) / 2.0;
+                                base_off.z() = (zmx - zmn) / 2.0;
                             }
-                            placed = true;
+                            has_base = true;
                         }
                     }
-                    // Optional `at_offset:[dx,dy,dz]` — a world-axis nudge on top of either
-                    // an absolute or a relational `at` (e.g. a boss centred on the top face
-                    // then raised: at={of:face,side:top}, at_offset:[0,0,10]).
+                    // (4) Rotate local +Z onto `axis` about the origin, BEFORE any
+                    // translation, and carry the base offset through the same rotation so
+                    // "base sits at `at`" still holds on the rotated axis. The default +Z
+                    // takes no transform at all (identity fast path). The antiparallel case
+                    // (-Z) has a degenerate cross product, so spin a half turn about +X.
+                    const double cosang = paxis.z();  // paxis is unit; dot with +Z
+                    if (cosang < 1.0 - 1e-12) {
+                        Eigen::Vector3d rot_axis(1, 0, 0);
+                        double angle = PI;
+                        if (cosang > -1.0 + 1e-12) {
+                            rot_axis = Eigen::Vector3d(0, 0, 1).cross(paxis).normalized();
+                            angle = std::acos(std::max(-1.0, std::min(1.0, cosang)));
+                        }
+                        solid = ::geom::rotate_copy(solid, Eigen::Vector3d::Zero(), rot_axis,
+                                                    angle);
+                        if (solid.IsNull())
+                            throw std::runtime_error(type +
+                                                     ": axis rotation produced an empty solid");
+                        base_off = Eigen::AngleAxisd(angle, rot_axis) * base_off;
+                    }
+                    if (has_base) {
+                        at += base_off;
+                        placed = true;
+                    }
+                    // (5) Optional `at_offset:[dx,dy,dz]` — a world-axis nudge on top of
+                    // either an absolute or a relational `at` (e.g. a boss centred on the
+                    // top face then raised: at={of:face,side:top}, at_offset:[0,0,10]).
                     if (feat.contains("at_offset") && feat.at("at_offset").is_array() &&
                         feat.at("at_offset").size() >= 3 && feat.at("at_offset")[0].is_number()) {
                         const json& o = feat.at("at_offset");

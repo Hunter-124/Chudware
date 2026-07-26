@@ -22,6 +22,10 @@
 //     the registry pushes {"event":"doc.changed",...} to every OTHER
 //     subscribed client, doc.opened on mint, doc.closed on doc_close/last-rw
 //     detach, doc.lease_change on hold grant/release/expiry.
+//     EXCEPTION — internal docs: a doc minted with {"internal":true} (the agent
+//     preflight advisor's shadow clone) is registered like any other but NEVER
+//     produces a single event, so no mirror ever opens a tab for it. See
+//     DocState::internal.
 //   * _foreign_edits piggyback (postCall): when a client's call touches a doc
 //     another client advanced since this client's last touch, the registry
 //     appends "_foreign_edits":[...] into the RESULT object.
@@ -161,6 +165,14 @@ private:
         // Kind of the client that minted this doc (gui|mcp|agent|test). Immutable
         // once set — the origin of ownership (user vs AI). Empty = unknown.
         std::string originKind;
+        // Internal doc: minted with {"internal":true} and deliberately invisible on
+        // the wire — the registry NEVER fans out doc.opened/doc.changed/doc.closed
+        // (nor lease_change/history_cleared) for it. WHY: the agent preflight advisor
+        // mints a shadow clone of the live part inside a single add_features call and
+        // closes it a few RPCs later; mirroring that clone made the GUI open a
+        // throwaway part tab for every operation the AI performed. Registration,
+        // attach/rw counting and doc-GC are unaffected — only the fanout is skipped.
+        bool internal = false;
         // Doc-GC: when > 0, no client is attached and the doc closes once this
         // deadline passes without a new attach (zombie-doc prevention).
         long long orphanDeadlineMs = 0;
@@ -172,13 +184,20 @@ private:
 
     static bool isReadOnlyMethod(const std::string& method);
     static long sniffRevision(const nlohmann::json& result);
+    // Display name of the doc a minting call just created, read out of the SAME
+    // place doc_list reports it from: the document's own "name" field. doc_new /
+    // parts_make put it at the top level; every ops_response carries the whole
+    // doc as "tree". Empty when the response carries neither (the GUI then falls
+    // back to its placeholder + async doc_tree backfill).
+    static std::string sniffName(const nlohmann::json& result);
     int holdSecs() const;
     // Start/refresh the GC countdown when `d` has no attachments; clear it when
     // it does. Agent/mcp-origin docs get a longer grace (CHUDWARE_DOC_GC_AGENT_GRACE_S).
     // No-op when doc-GC is disabled.
     static void updateOrphanDeadlineLocked(DocState& d);
     int rwCountLocked(const DocState& d) const;
-    // Queue an event for every subscriber of `docId` except `exceptClient`.
+    // Queue an event for every subscriber of `docId` except `exceptClient`. Drops the
+    // event outright when the doc is internal (see DocState::internal).
     void fanoutLocked(const std::string& docId, const nlohmann::json& evt, int exceptClient,
                       std::vector<PendingEvent>& out);
     void flush(std::vector<PendingEvent>& pending);

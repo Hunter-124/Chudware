@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -1250,11 +1251,161 @@ def _resolve_appearance(material: Union[str, dict, list, tuple]) -> dict:
     return dict(_APPEARANCE_PRESETS[key])
 
 
+# ------------------------------------------------------------------ free-text geometry queries
+# The engine's query grammar (core/doc/picks.cpp — resolve_geom_query plus parse_side /
+# canon_surf / parse_axis_vec) is a handful of TOKENS, not prose. `_as_face_query` used to hand
+# the engine whatever string it was given as `side`, so a model that wrote a sentence got back
+#     geom query: bad 'side' 'outer cylindrical wall face at bottom near x=200,y=0'
+# — a dead end for a query whose intent the grammar expresses perfectly
+# ({"of":"face","surf":"cylinder","side":"bottom","pick":"outer"}). We now PARSE the sentence
+# into that grammar and only ever emit tokens picks.cpp accepts; when nothing is extractable we
+# raise a teaching error rather than guess, because a `side` full of prose teaches nothing.
+
+# Word -> parse_side() token. parse_side also takes the signed axes (+x/-x/+y/-y/+z/-z) verbatim.
+# The word->axis convention is the host's named views: top=+Z, right=+X, front=-Y, back=+Y.
+_QSIDE_WORDS = {
+    "top": "top", "upper": "top", "uppermost": "top", "up": "top",
+    "bottom": "bottom", "lower": "bottom", "lowermost": "bottom", "down": "bottom",
+    "underside": "bottom",
+    "left": "left", "right": "right",
+    "front": "front", "back": "back", "rear": "back",
+}
+_QSIDE_AXIS_RE = re.compile(r"[+-][xyz]")
+
+# Word -> canon_surf() token, per topology kind. "round" is the engine's CURVED CATEGORY (any
+# non-planar face / non-line edge), not a single kernel type — canon_surf resolves it per kind,
+# so the face and edge tables must stay separate ("flat" is meaningless for an edge).
+_QSURF_FACE = {
+    "flat": "plane", "planar": "plane", "plane": "plane",
+    "round": "round", "rounded": "round", "curved": "round",
+    "cylindrical": "cylinder", "cylinder": "cylinder",
+    "conical": "cone", "cone": "cone",
+    "spherical": "sphere", "sphere": "sphere",
+    "toroidal": "torus", "torus": "torus",
+    "bspline": "bspline",
+}
+_QSURF_EDGE = {
+    "straight": "line", "linear": "line", "line": "line",
+    "round": "round", "rounded": "round", "curved": "round",
+    "circular": "circle", "circle": "circle",
+    "elliptical": "ellipse", "ellipse": "ellipse",
+    "bspline": "bspline",
+}
+
+# Word -> pick token: largest/biggest/longest = max measure, smallest/shortest = min,
+# inner/outer classify coaxial round faces by concavity (bore vs boss).
+_QPICK_WORDS = {
+    "largest": "largest", "biggest": "largest", "longest": "longest",
+    "smallest": "smallest", "shortest": "shortest",
+    "outer": "outer", "outermost": "outer", "outside": "outer",
+    "inner": "inner", "innermost": "inner", "inside": "inner", "bore": "inner",
+}
+
+# parse_axis_vec() filters on |dot|, so the sign is irrelevant — every spelling folds to a letter.
+_QAXIS_WORDS = {"x": "x", "+x": "x", "-x": "x", "y": "y", "+y": "y", "-y": "y",
+                "z": "z", "+z": "z", "-z": "z", "vertical": "z"}
+_QAXIS_FILLER = {"to", "the", "a", "an", "of", "with", "along", "axis", "axes",
+                 "direction", "dir", "vector", "world", "global"}
+
+# Signed axis tokens stay whole ("+z"); everything else is a bare word. Digits never tokenise, so
+# a trailing "near x=200,y=0" contributes nothing (a bare "x" is not a side — parse_side needs a
+# sign), and it can never leak into an emitted value.
+_QTOKEN_RE = re.compile(r"[+-][xyz](?![a-z0-9])|[a-z]+")
+
+_QVOCAB_HELP = (
+    '{"of":"face"|"edge" (default face), '
+    '"side":top/bottom/left/right/front/back or +x/-x/+y/-y/+z/-z, '
+    '"surf": faces flat/round/cylindrical/conical/spherical/toroidal, edges straight/round/'
+    'circular, "pick":largest/smallest/longest/shortest/inner/outer, '
+    '"parallel"|"perpendicular":"x"|"y"|"z", "near":[x,y,z], "count":N}'
+)
+
+
+def _q_next_axis(toks: list[str], i: int) -> Optional[str]:
+    """The axis letter qualifying toks[i] ("parallel to the -z axis" -> "z"), skipping filler.
+
+    None when no axis follows, so a phrase like "perpendicular to the top face" emits NO
+    parallel/perpendicular key — the engine silently ignores an unparseable one, and a filter
+    that vanishes without a word is exactly the failure mode this module exists to prevent.
+    """
+    for t in toks[i + 1:i + 5]:
+        if t in _QAXIS_WORDS:
+            return _QAXIS_WORDS[t]
+        if t not in _QAXIS_FILLER:
+            return None
+    return None
+
+
 def _as_face_query(q: Union[str, dict]) -> dict:
-    """Accept a full geometry query dict OR a bare side word ("top", "+z") -> a face query."""
+    """Accept a geometry-query dict (returned untouched) OR free text -> a structured query.
+
+    Free text is parsed into the engine's token grammar: a bare side word ("top", "+z") still
+    means {"of":"face","side":"top"}, and "outer cylindrical wall face at bottom" becomes
+    {"of":"face","surf":"cylinder","side":"bottom","pick":"outer"}. Raises ValueError naming the
+    vocabulary when the text carries no recognised token.
+    """
     if isinstance(q, dict):
         return q
-    return {"of": "face", "side": str(q)}
+
+    text = str(q).strip().lower()
+    # Bare side word / signed axis — the original fast path, same result as before.
+    if text in _QSIDE_WORDS:
+        return {"of": "face", "side": _QSIDE_WORDS[text]}
+    if _QSIDE_AXIS_RE.fullmatch(text):
+        return {"of": "face", "side": text}
+
+    toks = _QTOKEN_RE.findall(text)
+    tokset = set(toks)
+    # An explicit "face"/"edge" mention is itself an extraction: {"of":"edge"} is a valid query
+    # (every edge), so "all the edges" must resolve rather than raise.
+    named_kind = bool(tokset & {"face", "faces", "edge", "edges"})
+    of = "edge" if tokset & {"edge", "edges"} else "face"
+    surf_words = _QSURF_EDGE if of == "edge" else _QSURF_FACE
+
+    side = surf = pick = None
+    for t in toks:
+        if side is None and (t in _QSIDE_WORDS or _QSIDE_AXIS_RE.fullmatch(t)):
+            side = _QSIDE_WORDS.get(t, t)
+        if surf is None and t in surf_words:
+            surf = surf_words[t]
+        if pick is None and t in _QPICK_WORDS:
+            pick = _QPICK_WORDS[t]
+
+    # Orientation. A FACE's axis is its NORMAL while an EDGE's axis is its DIRECTION, so
+    # vertical/horizontal swap keys between the two: a vertical wall face has a normal
+    # PERPENDICULAR to Z, whereas a vertical edge runs PARALLEL to Z.
+    orient: dict = {}
+    for i, t in enumerate(toks):
+        if t in ("parallel", "perpendicular"):
+            ax = _q_next_axis(toks, i)
+            if ax:
+                orient = {t: ax}
+                break
+        elif t in ("vertical", "upright"):
+            orient = {"perpendicular" if of == "face" else "parallel": "z"}
+            break
+        elif t == "horizontal":
+            orient = {"parallel" if of == "face" else "perpendicular": "z"}
+            break
+
+    if not (side or surf or pick or orient or named_kind):
+        raise ValueError(
+            f"Can't read {q!r} as a geometry query — the grammar is TOKENS, not prose. "
+            f"Pass a dict {_QVOCAB_HELP}, e.g. "
+            '{"of":"face","surf":"cylinder","side":"bottom","pick":"outer"} or the bare side '
+            'word "top". For open-ended exploration call describe_part (the named face/edge '
+            "roster with stable sids), then hover(sid) on one of them.")
+
+    out = {"of": of}
+    if surf:
+        out["surf"] = surf
+    if side:
+        out["side"] = side
+    if pick:
+        out["pick"] = pick
+    out.update(orient)
+    return out
+
 
 # --------------------------------------------------------------------------- close-up inspection
 # doc_render_view / doc_render_png only accept a WHOLE-PART camera direction (no bbox/eye

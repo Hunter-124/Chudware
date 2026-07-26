@@ -587,6 +587,38 @@ std::optional<Eigen::Vector3d> parse_axis_vec(const nlohmann::json& j) {
     return std::nullopt;
 }
 
+// Shared tail for EVERY geom-query error: the FULL query grammar, not just the one field
+// that was rejected. A model that guessed one key wrong has no other way to discover the
+// vocabulary — the old errors named only the offending field, so the model retried with a
+// different wrong guess instead of learning the shape. Also names the escape hatch — the
+// REAL agent-facing exploration tools (describe_part -> a named face/edge roster with stable
+// sids, hover(sid) -> one element's card) — for when the "query" was really a prose
+// description. describe_faces is a C++ symbol, NOT a tool: naming it would cost the model
+// another failed call, which is the exact failure class this grammar exists to end.
+constexpr const char* kQueryGrammar =
+    " | query keys: of(face|edge, default face), side(top|bottom|left|right|front|back|"
+    "+x|-x|+y|-y|+z|-z), surf, parallel, perpendicular, pick, near, count, index. Example: "
+    "{\"of\":\"face\",\"side\":\"top\"}. For a free-text description call describe_part / "
+    "hover(sid) instead.";
+
+// Echo a REJECTED string value back inside an error message: capped so a pasted sentence
+// can't bloat the error, and cut on a UTF-8 code-point boundary because the message is
+// serialised back to the caller as JSON (nlohmann throws on invalid UTF-8).
+std::string clip_echo(const std::string& s, std::size_t max_len = 60) {
+    if (s.size() <= max_len) return s;
+    std::size_t n = max_len;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
+    return s.substr(0, n) + "...";
+}
+
+// Is a rejected `side` value a natural-language DESCRIPTION rather than a mistyped side
+// word? Every legal token is one short word ("bottom", "+x"), so a space or real length
+// means the model wrote prose ("outer cylindrical wall face at bottom near x=200") and must
+// be pointed at describe_part — repeating the side vocabulary at it teaches nothing.
+bool side_is_free_text(const std::string& s) {
+    return s.size() > 24 || s.find(' ') != std::string::npos;
+}
+
 }  // namespace
 
 bool is_geom_query(const nlohmann::json& v) {
@@ -595,10 +627,27 @@ bool is_geom_query(const nlohmann::json& v) {
 
 QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q) {
     QueryPicks out;
-    const std::string of = q.value("of", std::string());
+    // `of` DEFAULTS TO "face". A live model called query_geometry with {"side":"+x"} and hit
+    // the dead end `'of' must be "edge" or "face" (got '')` — nothing in that message says
+    // the fix is to add of:"face". Faces are what a query overwhelmingly means (side / surf /
+    // pick / parallel all read as face predicates), and is_geom_query already accepts an
+    // of-less {"kind":"query"} object, so the of-less form reached here only to be rejected.
+    // Absent / null / empty `of` -> faces; a PRESENT value that isn't face|edge (matched
+    // case-insensitively) is still an error, now carrying the whole grammar.
+    std::string of_raw;
+    if (q.contains("of") && !q["of"].is_null()) {
+        if (!q["of"].is_string()) {
+            out.error = std::string("geom query: 'of' must be the string \"face\" or \"edge\"") +
+                        kQueryGrammar;
+            return out;
+        }
+        of_raw = q["of"].get<std::string>();
+    }
+    const std::string of = of_raw.empty() ? std::string("face") : lc(of_raw);
     const bool want_face = (of == "face");
     if (of != "edge" && of != "face") {
-        out.error = "geom query: 'of' must be \"edge\" or \"face\" (got '" + of + "')";
+        out.error = "geom query: 'of' must be \"edge\" or \"face\" (got '" + clip_echo(of_raw) +
+                    "')" + kQueryGrammar;
         return out;
     }
     const TopAbs_ShapeEnum kind = want_face ? TopAbs_FACE : TopAbs_EDGE;
@@ -694,10 +743,12 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     if (q.contains("surf") && q["surf"].is_string()) {
         surf_f = canon_surf(q["surf"].get<std::string>(), want_face);
         if (surf_f.empty()) {
-            out.error = "geom query: unknown 'surf' '" + q["surf"].get<std::string>() +
+            out.error = "geom query: unknown 'surf' '" + clip_echo(q["surf"].get<std::string>()) +
                         (want_face ? "' (faces: flat/round/curved, cylindrical/conical/spherical/"
                                      "toroidal, or plane/cylinder/cone/sphere/torus)"
-                                   : "' (edges: straight/round/curved or line/circle/ellipse/bspline)");
+                                   : "' (edges: straight/round/curved or line/circle/ellipse/"
+                                     "bspline)") +
+                        kQueryGrammar;
             return out;
         }
     }
@@ -744,8 +795,18 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     if (q.contains("side") && q["side"].is_string()) {
         std::optional<Eigen::Vector3d> dir = parse_side(q["side"].get<std::string>());
         if (!dir) {
-            out.error = "geom query: bad 'side' '" + q["side"].get<std::string>() +
-                        "' (use top/bottom/left/right/front/back or +x/-x/+y/-y/+z/-z)";
+            const std::string bad = q["side"].get<std::string>();
+            if (side_is_free_text(bad)) {
+                out.error = "geom query: 'side' got a free-text description ('" +
+                            clip_echo(bad) + "'), not a side word. Use one of top/bottom/left/"
+                            "right/front/back or +x/-x/+y/-y/+z/-z, or call describe_part to "
+                            "list the actual faces and pick one by sid." +
+                            kQueryGrammar;
+                return out;
+            }
+            out.error = "geom query: bad 'side' '" + clip_echo(bad) +
+                        "' (use top/bottom/left/right/front/back or +x/-x/+y/-y/+z/-z)" +
+                        kQueryGrammar;
             return out;
         }
         constexpr double kDirWeight = 0.25;

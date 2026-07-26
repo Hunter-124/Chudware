@@ -895,3 +895,120 @@ TEST_CASE("I3 side on rounded parts: top cap wins, curved face faces the side") 
         CHECK(cy(front, 0) < cy(back, 0));
     }
 }
+
+// (T-QG) The geom-query DIALECT gate. An LLM writes these queries, so the two ways it
+//        actually fails are a MISSING `of` and a PROSE `side` — both used to dead-end:
+//        1. `of` now DEFAULTS to "face". A live model called query_geometry with
+//           {"side":"+x"} and got `'of' must be "edge" or "face" (got '')`, a message that
+//           names no fix. Faces are what a query overwhelmingly means.
+//        2. Every rejection carries the FULL grammar, so one wrong guess teaches the whole
+//           vocabulary instead of prompting another wrong guess.
+//        3. A prose `side` gets a free-text-SPECIFIC message pointing at describe_part, with
+//           the echoed string truncated so a pasted sentence can't bloat the error.
+TEST_CASE("T-QG: geom query defaults of:face and teaches the grammar on rejection") {
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
+
+    // Corner box [0..40][0..30][0..20] — the same reference body the WORDS test uses.
+    TopoDS_Shape box = geom::make_box(40.0, 30.0, 20.0);
+    auto has = [](const std::string& hay, const char* needle) {
+        return hay.find(needle) != std::string::npos;
+    };
+
+    // --- 1. of-DEFAULTING: the EXACT live failure {"side":"+x"} must resolve to a face. ---
+    {
+        QueryPicks r = resolve_geom_query(box, json{{"side", "+x"}});
+        CHECK_MESSAGE(r.error.empty(), "T-QG: {\"side\":\"+x\"} must resolve, got: " << r.error);
+        REQUIRE(r.faces.size() == 1);  // the +X face
+        CHECK(r.edges.empty());        // defaulted to FACES, not edges
+        CHECK(r.selectors.at(0)["centroid"][0].get<double>() ==
+              doctest::Approx(40.0).epsilon(0.01));
+    }
+
+    // An of-less query with no other key is still a face query (all 6 box faces), and the
+    // other face-meaningful keys resolve of-less too.
+    {
+        QueryPicks all = resolve_geom_query(box, json::object());
+        CHECK(all.error.empty());
+        CHECK(all.faces.size() == 6);
+
+        QueryPicks flat = resolve_geom_query(box, json{{"surf", "flat"}});
+        CHECK(flat.error.empty());
+        CHECK(flat.faces.size() == 6);  // every box face is planar
+
+        // 40x30 = 1200 mm² beats 40x20 and 30x20; the two co-planar-area faces co-rank.
+        QueryPicks big = resolve_geom_query(box, json{{"pick", "largest"}});
+        CHECK(big.error.empty());
+        REQUIRE(big.faces.size() == 2);
+        for (const auto& s : big.selectors)
+            CHECK(s["area_or_len"].get<double>() == doctest::Approx(1200.0).epsilon(0.01));
+    }
+
+    // `of` stays case-insensitive-exact, and an EXPLICIT of is untouched by the default.
+    {
+        CHECK(resolve_geom_query(box, json{{"of", "FACE"}}).faces.size() == 6);
+        QueryPicks edges = resolve_geom_query(box, json{{"of", "edge"}});
+        CHECK(edges.error.empty());
+        CHECK(edges.edges.size() == 12);
+        CHECK(edges.faces.empty());
+    }
+
+    // --- 2. a PRESENT but invalid `of` is STILL an error — now with the grammar. ---
+    {
+        QueryPicks r = resolve_geom_query(box, json{{"of", "solid"}, {"side", "top"}});
+        REQUIRE_FALSE(r.error.empty());
+        CHECK(r.faces.empty());
+        CHECK(has(r.error, "solid"));        // names the rejected value...
+        CHECK(has(r.error, "query keys:"));  // ...and the whole accepted grammar
+        CHECK(has(r.error, "describe_part"));
+        MESSAGE("T-QG of:solid error: " << r.error);
+    }
+    // A NON-STRING `of` errors cleanly instead of throwing a nlohmann type_error.
+    {
+        QueryPicks r = resolve_geom_query(box, json{{"of", 3}});
+        REQUIRE_FALSE(r.error.empty());
+        CHECK(has(r.error, "query keys:"));
+    }
+
+    // --- 3. a FREE-TEXT `side` gets its own message pointing at describe_part. -----------
+    {
+        const std::string prose = "outer cylindrical wall face at bottom near x=200,y=0";
+        QueryPicks r = resolve_geom_query(box, json{{"of", "face"}, {"side", prose}});
+        REQUIRE_FALSE(r.error.empty());
+        CHECK(r.faces.empty());
+        CHECK(has(r.error, "got a free-text description"));
+        CHECK(has(r.error, "describe_part"));  // the REAL exploration tool...
+        CHECK_FALSE(has(r.error, "describe_faces"));  // ...not the C++-only symbol
+        CHECK(has(r.error, "query keys:"));
+        MESSAGE("T-QG free-text side error: " << r.error);
+    }
+    // The echo is TRUNCATED — a pasted paragraph must not become the error message.
+    {
+        const std::string huge(4000, 'q');
+        QueryPicks r = resolve_geom_query(box, json{{"side", huge}});
+        REQUIRE_FALSE(r.error.empty());
+        CHECK(has(r.error, "got a free-text description"));
+        CHECK_MESSAGE(r.error.find(std::string(100, 'q')) == std::string::npos,
+                      "T-QG: the echoed side value must be clipped");
+        CHECK_MESSAGE(r.error.size() < 800, "T-QG: error length " << r.error.size());
+    }
+    // A SHORT unrecognised side word keeps the original teaching message (NOT the free-text
+    // one) and gains the grammar tail.
+    {
+        QueryPicks r = resolve_geom_query(box, json{{"side", "sideways"}});
+        REQUIRE_FALSE(r.error.empty());
+        CHECK(has(r.error, "bad 'side'"));
+        CHECK_FALSE(has(r.error, "got a free-text description"));
+        CHECK(has(r.error, "query keys:"));
+    }
+
+    // --- 4. the `surf` rejection carries the grammar too (and proves the of-less path
+    //        landed on the FACE vocabulary). ----------------------------------------------
+    {
+        QueryPicks r = resolve_geom_query(box, json{{"surf", "shiny"}});
+        REQUIRE_FALSE(r.error.empty());
+        CHECK(has(r.error, "shiny"));
+        CHECK(has(r.error, "faces:"));  // face branch — `of` defaulted
+        CHECK(has(r.error, "query keys:"));
+    }
+}

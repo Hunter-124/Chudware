@@ -981,20 +981,76 @@ if(CHUDWARE_WITH_OCCT)
 
   # --- Heavy from-source third-party sub-deps (opt-in per platform) -----------
   # On Windows each of these auto-provisions (builds from source / fetches a wheel-
-  # matched binary). No Linux/macOS provisioning path exists yet (Fedora has no
-  # nglib-capable Netgen, no rhino3dm, and only an older lib3mf), so they DEFAULT
-  # OFF off-Windows and the dependent code is compiled out (doc/formats.cpp already
-  # #ifdef-guards CHUDWARE_WITH_LIB3MF / CHUDWARE_WITH_OPENNURBS; the Netgen mesher path
-  # is gated below). The OCCT geometry/document kernel itself needs none of them.
-  # Flip any ON once a system package or Linux provisioning is wired up.
+  # matched binary). Off-Windows they used to default hard OFF, which is wrong for a
+  # tree that has ALREADY provisioned one: the artifacts sit in third_party/ and cost
+  # nothing to link, so a present dependency now defaults ON (see _def_* below).
+  # Nothing provisioned and not Windows -> OFF, so a fresh checkout never pays an
+  # unasked from-source build; opt in with -DCHUDWARE_WITH_<DEP>=ON.
+  # The dependent code is #ifdef-guarded either way (doc/formats.cpp for
+  # LIB3MF/OPENNURBS, libchudware.cpp + the chudware_mesh target for NETGEN).
+
+  # Provisioned-artifact probes — "is this dependency already built in-tree?"
+  file(GLOB _have_netgen
+       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/netgen/install/lib/libnglib.so"
+       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/netgen/install/lib64/libnglib.so"
+       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/netgen/install/lib/nglib.lib")
+  file(GLOB _have_lib3mf
+       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lib3mf/*/lib/lib3mf.so"
+       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lib3mf/*/lib/lib3mf.lib")
+  file(GLOB _have_opennurbs
+       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/opennurbs/*/lib/*opennurbs*")
+
+  # --- One-time migration of pre-rebrand caches (605645b7) --------------------
+  # The Billet / AI-CAD -> Chudware rename renamed AICAD_WITH_* to CHUDWARE_WITH_*.
+  # CMake does NOT rename cache entries: every existing build tree kept its ON value
+  # under the now-DEAD AICAD_WITH_* name while the renamed option silently took its
+  # off-Windows OFF default. Whole features were compiled out of libchudware with no
+  # error and no warning — the FEA surface (sim_mesh / sim_run_static / sim_run_modal
+  # / sim_run_fatigue / sim_run_thermal) simply became "unknown method" at runtime.
+  #
+  # Adopt the legacy value once, but only auto-enable when the dependency is actually
+  # provisioned, so the migration can never turn a working configure into a surprise
+  # third-party build. A legacy ON we cannot honor warns loudly instead of vanishing.
+  # The dead entry is dropped either way, so this never re-fires.
+  foreach(_f NETGEN LIB3MF OPENNURBS)
+    if(DEFINED AICAD_WITH_${_f})
+      string(TOLOWER "${_f}" _fl)
+      set(_want "${AICAD_WITH_${_f}}")
+      if(_want AND NOT WIN32 AND NOT _have_${_fl})
+        message(WARNING
+          "[chudware] pre-rebrand cache had AICAD_WITH_${_f}=ON, but nothing is "
+          "provisioned under third_party/${_fl}. Leaving CHUDWARE_WITH_${_f} at its "
+          "default; pass -DCHUDWARE_WITH_${_f}=ON to build it from source.")
+      else()
+        set(CHUDWARE_WITH_${_f} "${_want}" CACHE BOOL
+            "migrated from AICAD_WITH_${_f}" FORCE)
+        message(STATUS
+          "[chudware] migrated AICAD_WITH_${_f}=${_want} -> CHUDWARE_WITH_${_f}")
+      endif()
+      unset(AICAD_WITH_${_f} CACHE)  # drop the dead pre-rebrand entry
+    endif()
+  endforeach()
+
   if(WIN32)
     set(_aicad_subdep_default ON)
   else()
     set(_aicad_subdep_default OFF)
   endif()
-  option(CHUDWARE_WITH_NETGEN    "Netgen/nglib FEA tet mesher (sim/mesher.cpp, fea_run)" ${_aicad_subdep_default})
-  option(CHUDWARE_WITH_LIB3MF    "lib3mf 3MF reader/writer (doc/formats.cpp)"            ${_aicad_subdep_default})
-  option(CHUDWARE_WITH_OPENNURBS "openNURBS Rhino .3dm reader/writer (doc/formats.cpp)"  ${_aicad_subdep_default})
+  set(_def_netgen    ${_aicad_subdep_default})
+  set(_def_lib3mf    ${_aicad_subdep_default})
+  set(_def_opennurbs ${_aicad_subdep_default})
+  if(_have_netgen)
+    set(_def_netgen ON)
+  endif()
+  if(_have_lib3mf)
+    set(_def_lib3mf ON)
+  endif()
+  if(_have_opennurbs)
+    set(_def_opennurbs ON)
+  endif()
+  option(CHUDWARE_WITH_NETGEN    "Netgen/nglib FEA tet mesher (sim/mesher.cpp, fea_run)" ${_def_netgen})
+  option(CHUDWARE_WITH_LIB3MF    "lib3mf 3MF reader/writer (doc/formats.cpp)"            ${_def_lib3mf})
+  option(CHUDWARE_WITH_OPENNURBS "openNURBS Rhino .3dm reader/writer (doc/formats.cpp)"  ${_def_opennurbs})
 
   # --- P50: Netgen / nglib tet mesher (LGPL-2.1 — commercial-safe) -----------
   # BUILD Netgen from source against OUR OCCT (no prebuilt SDK exists); see

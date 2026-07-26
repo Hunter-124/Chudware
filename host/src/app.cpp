@@ -1815,10 +1815,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // the center and leaves Viewport as a floating orphan. Use a versioned ini so
   // stale dock layouts cannot override buildDefaultLayout. v4: overlay layout —
   // stale v3 entries carry docked flags/placements for the now-floating
-  // FeatureManager/Copilot columns. The ini is ALSO the columns' width
-  // persistence (ImGui saves floating windows' Pos/Size by name), so column
-  // width survives restarts with zero new code.
-  static std::string iniPath = appdataAppDir() + "/imgui_gui_v4.ini";
+  // FeatureManager/Copilot columns. v5 (manufacture overhaul): the CAM detail
+  // window moved OUT of the central node into a bottom split of it, so the 3D
+  // viewport stays visible while machining. A v4 ini pins "CAM" back into the
+  // central node and silently reinstates the old cover-the-viewport behavior —
+  // exactly the bug this change fixes — so the schema must roll. The ini is ALSO
+  // the columns' width persistence (ImGui saves floating windows' Pos/Size by
+  // name), so column width survives restarts with zero new code.
+  static std::string iniPath = appdataAppDir() + "/imgui_gui_v5.ini";
   io.IniFilename = shot ? nullptr : iniPath.c_str();
 
   float xs = 1.0f, ys = 1.0f;
@@ -5695,8 +5699,19 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Publish the overlay band (the full-width viewport region the pinned glass
     // columns anchor to) BEFORE any panel draws — drawLeftPane (layout.cpp) and
     // the Copilot column (ui/copilot/) read it via ui::overlayBand().
+    //
+    // The band STOPS at the docked CAM detail editor. Those columns are full-height
+    // overlays with no knowledge of the dockspace, so once CAM took a bottom split of
+    // the central node they painted straight over it (the Job Manager's "Generate
+    // G-code" footer landed on top of CAM's status strip, and the Copilot composer
+    // over its G-code pane). camDockTopY() is 0 whenever CAM is not docked-and-visible,
+    // which leaves every other workspace's band exactly as before.
+    float bandBottom = vp->Pos.y + vp->Size.y - statusH;
+    if (const float camTop = ui::camDockTopY())
+      if (camTop > vp->Pos.y + dockTopY && camTop < bandBottom)
+        bandBottom = camTop;
     ui::setOverlayBand(vp->Pos.x, vp->Pos.y + dockTopY, vp->Pos.x + vp->Size.x,
-                       vp->Pos.y + vp->Size.y - statusH);
+                       bandBottom);
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
     ImGui::SetNextWindowSize(
         ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));

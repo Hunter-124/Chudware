@@ -131,5 +131,28 @@ inline float reProgressH()    { return px(8.0f); }    // stage progress bar thic
 // the default WindowPadding) and a grid card mixed an 8-px pad, a 6-px text margin and a centred
 // title, so nothing in the workspace shared a left edge.
 inline float partsPadX()      { return px(12.0f); }
+
+// ---- CAM / Manufacture workspace (ui/cam/) ----------------------------------------------------
+// The Manufacture tab was the last workspace still sizing itself from raw pixel literals:
+// cam_panel.cpp carried ~40 of them (a 240-px tree column, five 120-px fields, a 720x480 window)
+// and did not include this header at all, so the whole tab mis-scaled at HiDPI and none of its
+// surfaces shared an edge with the rest of the shell. The rhythm below deliberately mirrors the
+// copilot-menu and reveng tokens (4-px grid, 8-dp card corner) so Manufacture reads as the same
+// product as the modeling tabs. Every CAM panel MUST size itself from here — no fresh literals.
+inline float camDetailFrac()  { return 0.34f; }        // CAM detail dock height, fraction of the
+                                                       // central node (UNSCALED — a dock ratio)
+inline float camGutter()      { return px(10.0f); }    // pane content inset (matches partsPadX rhythm)
+inline float camRowPadX()     { return px(10.0f); }    // inside a row/card, horizontal
+inline float camRowPadY()     { return px(6.0f); }     // inside a row/card, vertical
+inline float camRowGap()      { return px(4.0f); }     // between sibling rows
+inline float camRowRound()    { return rounding(6.0f); }
+inline float camChipRound()   { return rounding(5.0f); }
+inline float camSectionGap()  { return px(12.0f); }    // above a section header
+inline float camHeadGap()     { return px(5.0f); }     // below a section header rule
+inline float camFieldW()      { return px(120.0f); }   // numeric / combo field width
+inline float camBtnH()        { return px(28.0f); }    // toolbar / action button height
+inline float camBtnGap()      { return px(6.0f); }     // between toolbar buttons
+inline float camTreeIndent()  { return px(12.0f); }    // per-level tree indent
+inline float camCaptionGap()  { return px(3.0f); }     // row -> its sub-caption ("extracted stock ...")
 }  // namespace metrics
 }  // namespace ui

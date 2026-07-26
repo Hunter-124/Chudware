@@ -50,6 +50,14 @@ struct OverlayBand {
 void setOverlayBand(float minX, float minY, float maxX, float maxY);
 const OverlayBand& overlayBand();
 
+// Bottom edge available to the pinned glass columns. The CAM detail editor is docked into a
+// BOTTOM SPLIT of the central node (buildDefaultLayout), and the pinned columns are full-height
+// overlays that know nothing about the dockspace — so without this they paint straight over the
+// CAM panel (the Job Manager's footer button landed on top of CAM's status strip). Returns the
+// docked CAM window's top Y when it actually rendered docked last frame, else 0 (= no clamp).
+// app.cpp folds it into the band it publishes via setOverlayBand.
+float camDockTopY();
+
 // "Reset layout" (title_bar.cpp -> st.resetLayout -> app.cpp rebuild branch) must also restore the
 // pinned columns' default width/collapse state, or the menu item breaks its promise. app.cpp calls
 // resetOverlayColumns() in the rebuild branch; each column consumes its one-shot flag on its next

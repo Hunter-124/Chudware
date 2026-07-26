@@ -49,9 +49,18 @@ export function extraModels(provider: string): Model<Api>[] {
 		}));
 	} else if (provider === "kimi-code") {
 		// Subscription endpoint only accepts `kimi-for-coding` on the wire.
+		//
+		// cost MUST be set explicitly. Every bundled `kimi-code` model carries
+		// {input:0, output:0, cacheRead:0} because it is a subscription plan, so a clone
+		// that only retargets id/name/context INHERITS those zeros — and the GUI then
+		// renders the row as "free"/$0 (host/src/ui/copilot/settings.cpp treats
+		// costIn==0 && costOut==0 as free) and the Metrics view prices every K3 turn at
+		// $0. This is the same underlying Moonshot model as the `moonshot` entry above,
+		// so it gets the same real per-Mtok economics; that keeps all three K3 rows
+		// (moonshot / kimi-code / zenmux) agreeing instead of one silently reading $0.
 		push(clone("kimi-code", "kimi-for-coding", {
 			id: "kimi-k3", requestModelId: "kimi-for-coding", name: "Kimi K3",
-			contextWindow: K3_CONTEXT,
+			contextWindow: K3_CONTEXT, cost: K3_COST,
 		}));
 	} else if (provider === "zenmux") {
 		push(clone("zenmux", "moonshotai/kimi-k2.7-code", {

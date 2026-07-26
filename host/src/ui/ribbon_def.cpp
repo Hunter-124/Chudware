@@ -500,29 +500,35 @@ static const RibbonCmd kCmds[] = {
     { "cam_set_stock",     "Stock",       "stock",           "Manufacture", "Job",       false, nullptr, false },
     { "cam_add_tool",      "Tool",        "curve_helix",     "Manufacture", "Job",       false, nullptr, false },
     // --- Group: 2.5D Milling ---
+    // CAM overhaul: operation FAMILIES fold into split buttons (same pattern as Features▸3D Body,
+    // where extrude_cut sits under extrude_boss). The parent stays big=true and keeps its own
+    // action on a plain click; each variant keeps big=false and points sub_of at the parent, so it
+    // is reached through the parent's flyout instead of eating another slot in the band. This is
+    // what stops the Manufacture tab overflowing (and degrading Output) at uiScale >= 1.25.
+    // No cmd_id was renamed, added or removed — cam_panel.cpp's camHandleCommand switch is intact.
     { "cam_op_face",       "Face",        "cam_face",        "Manufacture", "2.5D",      true,  nullptr, false },
     { "cam_op_contour",    "Contour",     "cam_contour2d",   "Manufacture", "2.5D",      true,  nullptr, false },
     { "cam_op_pocket",     "Pocket",      "cam_pocket2d",    "Manufacture", "2.5D",      true,  nullptr, false },
-    { "cam_op_adaptive",   "Adaptive",    "cam_adaptive2d",  "Manufacture", "2.5D",      false, nullptr, false },
-    { "cam_op_slot",       "Slot",        "cam_slot",        "Manufacture", "2.5D",      false, nullptr, false },
-    { "cam_op_chamfer",    "Chamfer",     "cam_chamfer2d",   "Manufacture", "2.5D",      false, nullptr, false },
-    { "cam_op_engrave",    "Engrave",     "cam_engrave",     "Manufacture", "2.5D",      false, nullptr, false },
+    { "cam_op_adaptive",   "Adaptive",    "cam_adaptive2d",  "Manufacture", "2.5D",      false, "cam_op_pocket",       false },
+    { "cam_op_slot",       "Slot",        "cam_slot",        "Manufacture", "2.5D",      false, "cam_op_pocket",       false },
+    { "cam_op_chamfer",    "Chamfer",     "cam_chamfer2d",   "Manufacture", "2.5D",      false, "cam_op_contour",      false },
+    { "cam_op_engrave",    "Engrave",     "cam_engrave",     "Manufacture", "2.5D",      false, "cam_op_contour",      false },
     // --- Group: Holes ---
     { "cam_op_drill",      "Drill",       "cam_drill",       "Manufacture", "Holes",     true,  nullptr, false },
-    { "cam_op_thread",     "Thread Mill", "cam_thread_mill", "Manufacture", "Holes",     true,  nullptr, false },
+    { "cam_op_thread",     "Thread Mill", "cam_thread_mill", "Manufacture", "Holes",     false, "cam_op_drill",        false },
     // --- Group: 3D Milling ---
     { "cam_op_parallel3d", "Parallel",    "cam_parallel3d",  "Manufacture", "3D",        true,  nullptr, false },
-    { "cam_op_waterline3d","Waterline",   "cam_waterline3d", "Manufacture", "3D",        true,  nullptr, false },
-    { "cam_op_scallop3d",  "Scallop",     "cam_scallop3d",   "Manufacture", "3D",        false, nullptr, false },
-    { "cam_op_pocket3d",   "3D Pocket",   "cam_pocket3d",    "Manufacture", "3D",        false, nullptr, false },
+    { "cam_op_waterline3d","Waterline",   "cam_waterline3d", "Manufacture", "3D",        false, "cam_op_parallel3d",   false },
+    { "cam_op_scallop3d",  "Scallop",     "cam_scallop3d",   "Manufacture", "3D",        false, "cam_op_parallel3d",   false },
+    { "cam_op_pocket3d",   "3D Pocket",   "cam_pocket3d",    "Manufacture", "3D",        false, "cam_op_parallel3d",   false },
     // --- Group: Turning ---
     { "cam_op_turn_rough", "Rough",       "cam_turn_rough",  "Manufacture", "Turning",   true,  nullptr, false },
-    { "cam_op_turn_finish","Finish",      "cam_turn_finish", "Manufacture", "Turning",   false, nullptr, false },
-    { "cam_op_turn_face",  "Face",        "cam_turn_face",   "Manufacture", "Turning",   false, nullptr, false },
-    { "cam_op_turn_part",  "Part Off",    "cam_turn_part",   "Manufacture", "Turning",   false, nullptr, false },
+    { "cam_op_turn_finish","Finish",      "cam_turn_finish", "Manufacture", "Turning",   false, "cam_op_turn_rough",   false },
+    { "cam_op_turn_face",  "Face",        "cam_turn_face",   "Manufacture", "Turning",   false, "cam_op_turn_rough",   false },
+    { "cam_op_turn_part",  "Part Off",    "cam_turn_part",   "Manufacture", "Turning",   false, "cam_op_turn_rough",   false },
     // --- Group: Cutting ---
     { "cam_op_laser",      "Laser/Plasma","cam_cut2d",       "Manufacture", "Cutting",   true,  nullptr, false },
-    { "cam_op_probe",      "Probe",       "cam_probe",       "Manufacture", "Cutting",   false, nullptr, false },
+    { "cam_op_probe",      "Probe",       "cam_probe",       "Manufacture", "Cutting",   false, "cam_op_laser",        false },
     // --- Group: Output ---
     { "cam_generate",      "Generate",    "ok_check",        "Manufacture", "Output",    true,  nullptr, false },
     { "cam_simulate",      "Simulate",    "study_static",    "Manufacture", "Output",    true,  nullptr, false },

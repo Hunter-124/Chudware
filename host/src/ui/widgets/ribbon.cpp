@@ -16,6 +16,7 @@
 #include "../layout.h"        // ui::setEvalRibbonDock (Evaluate-tab inspector dock strip)
 #include "../web_capabilities.h"  // ui::webGapReason (T-RF12: WASM-build ribbon gating)
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -452,6 +453,51 @@ static RibbonGroup& ribbon_findOrAddGroup(std::vector<RibbonGroup>& groups,
     return groups.back();
 }
 
+// ---------------------------------------------------------------------------
+// Per-tab group ORDER (left -> right)
+// ---------------------------------------------------------------------------
+// Groups are emitted in the order they first appear in ribbon_def.cpp's table, which is
+// APPEND-ONLY ("never reorder or delete existing rows") — so a tab's visual priority is welded to
+// whatever order its rows happened to be appended in. That matters twice over: the LEFTMOST group
+// is where the eye lands, and the RIGHTMOST group is the first one the overflow passes degrade or
+// hide.
+//
+// A tab that needs a different story registers it HERE rather than reordering table rows. Listed
+// groups are emitted first, in the listed order; any group of that tab that is not listed keeps
+// its table order and follows them. Tabs with no entry are untouched (zero behavior change).
+struct TabGroupOrder {
+    const char*        tab;
+    const char* const* groups;
+    int                count;
+};
+// Manufacture: the machining workflow, left to right. Job -> operation families (2.5D / Holes /
+// 3D / Turning / Cutting) -> Output (Generate / Simulate / Post G-code — what the user is actually
+// after) -> Reference last, because ref geometry is a helper, not a step toward G-code.
+static const char* const kManufactureGroupOrder[] = {
+    "Job", "2.5D", "Holes", "3D", "Turning", "Cutting", "Output", "Reference",
+};
+static const TabGroupOrder kTabGroupOrder[] = {
+    {"Manufacture", kManufactureGroupOrder,
+     (int)(sizeof(kManufactureGroupOrder) / sizeof(kManufactureGroupOrder[0]))},
+};
+
+// Reorder `groups` for `tabName` per kTabGroupOrder. Stable, so unlisted groups keep table order.
+static void ribbon_orderGroups(std::vector<RibbonGroup>& groups, const char* tabName) {
+    const TabGroupOrder* order = nullptr;
+    for (const auto& t : kTabGroupOrder)
+        if (std::strcmp(t.tab, tabName) == 0) { order = &t; break; }
+    if (!order) return;
+    auto rank = [order](const RibbonGroup& g) {
+        for (int i = 0; i < order->count; ++i)
+            if (std::strcmp(order->groups[i], g.label) == 0) return i;
+        return order->count;   // unlisted -> after every listed group, in table order
+    };
+    std::stable_sort(groups.begin(), groups.end(),
+                     [&rank](const RibbonGroup& a, const RibbonGroup& b) {
+                         return rank(a) < rank(b);
+                     });
+}
+
 // Prefer stacking `childId` directly under `parentId` in the small-button column packer.
 // Pulls the pair to the front of the smCmds list so rowsPerCol packing places child in the
 // same column under parent (e.g. Sketch▸Draw: "Rotate Ent." under "Move Ent.").
@@ -547,18 +593,17 @@ static float ribbon_captionMinW(const RibbonGroup& grp) {
     return ImGui::CalcTextSize(grp.label).x + kGroupPadX * s * 2.0f;
 }
 
-// Compute natural width (screen px) of a group at a given collapse level.
-// Width is derived from the ACTUAL content extent so left and right padding match:
+// Content extent (screen px) of a group at a given collapse level — the width its BUTTONS occupy,
+// padding included, BEFORE the caption-width floor:
 //   padX | [big buttons with inter-gaps only] | [inter-zone gap] | [small cols] | padX
 // Previously every big button contributed a trailing 2dp gap (including the last), and an
 // extra kGroupPadX was reserved between big and small zones that the draw path never spent —
 // that piled dead space on the RIGHT of the group pill.
-static float ribbon_groupNaturalW(const RibbonGroup& grp, CollapseLevel level) {
+static float ribbon_groupContentW(const RibbonGroup& grp, CollapseLevel level) {
     float s = ui::uiScale;
     if (level == COL_HIDDEN) return 0.0f;
 
     const float padX = kGroupPadX * s;
-    float content;
     if (level == COL_BIG) {
         // big-button column: buttons laid out left-to-right; gap ONLY between buttons
         float bigColW = 0.0f;
@@ -570,13 +615,18 @@ static float ribbon_groupNaturalW(const RibbonGroup& grp, CollapseLevel level) {
         float smW = ribbon_smZoneW(grp, {});
         // Inter-zone gap matches the inter-button gap (2dp), only when both zones are present.
         const float midGap = (bigColW > 0.0f && smW > 0.0f) ? 2.0f * s : 0.0f;
-        content = padX + bigColW + midGap + smW + padX;
-    } else {
-        // COL_SMALL / COL_LABEL: big cmds degrade into the small-row stack alongside existing smCmds
-        float smW = ribbon_smZoneW(grp, grp.bigCmds);
-        content = padX + smW + padX;
+        return padX + bigColW + midGap + smW + padX;
     }
+    // COL_SMALL / COL_LABEL: big cmds degrade into the small-row stack alongside existing smCmds
+    return padX + ribbon_smZoneW(grp, grp.bigCmds) + padX;
+}
 
+// Natural width (screen px) of a group: its content extent, floored at the caption width so
+// captions like "Dimension" never truncate. The draw pass centers the content in any slack the
+// floor introduces (see `startX` in drawRibbon).
+static float ribbon_groupNaturalW(const RibbonGroup& grp, CollapseLevel level) {
+    if (level == COL_HIDDEN) return 0.0f;
+    float content = ribbon_groupContentW(grp, level);
     // Defect 2: never narrower than the caption (unless the label is hidden at COL_LABEL).
     if (level != COL_LABEL)
         content = ImMax(content, ribbon_captionMinW(grp));
@@ -797,6 +847,36 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"display_hlr",         "Show edges with hidden lines removed."},
         {"display_hlv",         "Show edges with hidden lines shown dashed."},
         {"display_wireframe",   "Show the model as a wireframe."},
+        // --- Manufacture (CAM): job setup, operation families, output ---
+        {"cam_new_job",       "Start an empty CAM job for the active part."},
+        {"cam_extract",       "Build a CAM job from the part: stock, setup, and candidate features."},
+        {"cam_add_setup",     "Add a machining setup — work offset, orientation, and safe heights."},
+        {"cam_set_stock",     "Define the raw stock the toolpaths cut away from."},
+        {"cam_add_tool",      "Add a cutting tool to the job's tool library."},
+        {"cam_op_face",       "Face the top of the stock flat to a target depth."},
+        {"cam_op_contour",    "Profile around a contour, one side of the selected geometry."},
+        {"cam_op_chamfer",    "Break a sharp edge with a chamfer tool along the contour."},
+        {"cam_op_engrave",    "Trace text or curves at a single depth with a V or engraving bit."},
+        {"cam_op_pocket",     "Clear a closed pocket down to depth with stepover passes."},
+        {"cam_op_adaptive",   "High-efficiency adaptive clearing with constant tool engagement."},
+        {"cam_op_slot",       "Cut a slot along its centerline in stepped-down passes."},
+        {"cam_op_drill",      "Drill the selected holes with a peck or standard cycle."},
+        {"cam_op_thread",     "Mill an internal or external thread with a thread mill."},
+        {"cam_op_parallel3d", "3D finish in parallel passes at a chosen stepover and angle."},
+        {"cam_op_waterline3d","3D finish in constant-Z levels — best on steep walls."},
+        {"cam_op_scallop3d",  "3D finish at constant scallop height over blended surfaces."},
+        {"cam_op_pocket3d",   "Rough a 3D cavity level by level down to the surface."},
+        {"cam_op_turn_rough", "Rough a turned profile in stepped depth-of-cut passes."},
+        {"cam_op_turn_finish","Finish pass along the turned profile to final size."},
+        {"cam_op_turn_face",  "Face the end of the bar stock square."},
+        {"cam_op_turn_part",  "Part the finished piece off the bar."},
+        {"cam_op_laser",      "2D laser, plasma, or waterjet cut along the selected contours."},
+        {"cam_op_probe",      "Probe a feature to set the work offset before cutting."},
+        {"cam_generate",      "Generate toolpaths for every operation in the job."},
+        {"cam_simulate",      "Run the material-removal simulation over the generated toolpaths."},
+        {"cam_post",          "Post the toolpaths to G-code for the selected controller dialect."},
+        {"cam_show3d",        "Toggle the toolpath backplot in the 3D viewport."},
+        {"cam_flavor",        "Choose the post-processor dialect the G-code is written for."},
     };
     for (const auto& t : tips)
         if (std::strcmp(t.id, cmd_id) == 0) return t.tip;
@@ -1049,6 +1129,15 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     }
 
     if (hasDrop) {
+        // Split affordance: a hairline across the TOP of the drop strip, inset from both button
+        // edges by the shared split inset, so a split button reads as split before its flyout is
+        // ever opened. Color is the border role at reduced alpha — theme role, no literal.
+        float dvc[4];
+        ui::Palette::withAlpha(ui::palette.border, dvc, enabled ? 0.55f : 0.28f);
+        const float dvInset = ui::metrics::ribbonSplitInset();
+        dl->AddLine(ImVec2(snap(p0.x + dvInset),      snap(p0.y + mainH)),
+                    ImVec2(snap(p0.x + bw - dvInset), snap(p0.y + mainH)),
+                    ui::Palette::toU32(dvc), ui::metrics::stroke(1.0f));
         // Dropdown arrow: bottom strip, tucked to the RIGHT (under the icon, right side). Its own
         // strip sits below the caption block, so it never overlaps the text.
         float ax = snap(p0.x + bw - 8.0f * s);
@@ -1249,7 +1338,8 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         // Content rect is [p0.x, p0.x+mainW] × [p0.y, p0.y+rowH] — same as the main hit strip.
         const float matPad   = matRgb ? 6.0f * s : 0.0f;
         const float contentW = matPad + iconSz + 4.0f * s + ImGui::CalcTextSize(label).x;
-        const float xoff     = snap(ImMax(2.0f * s, (mainW - contentW) * 0.5f));
+        const float xoff     = snap(ImMax(ui::metrics::ribbonSmSplitInset(),
+                                          (mainW - contentW) * 0.5f));
         float ix = snap(p0.x + xoff + matPad);
         float iy = snap(p0.y + (rowH - iconSz) * 0.5f);
         ribbon_icon(dl, iconName, ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz, enabled,
@@ -1863,6 +1953,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         else if (!smallIsHidden(*cp)) grp.smCmds.push_back(cp);
     }
 
+    // Emit groups in this tab's declared workflow order (kTabGroupOrder) instead of the order
+    // their rows happen to sit in the append-only command table. No-op for tabs with no entry.
+    ribbon_orderGroups(groups, srcTabName);
+
     // Sketch▸Draw: stack "Rotate Ent." under "Move Ent." (same column) to save horizontal space.
     for (auto& g : groups) {
         if (g.label && std::strcmp(g.label, "Draw") == 0)
@@ -1873,8 +1967,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     // Available body width. Reserve the overflow chevron up front so it never lands off-edge once
     // any group has to be hidden. (The sketch Finish/Cancel controls now live inline in the Sketch
     // group's New-Sketch slot, so no right-edge cluster width is reserved anymore.)
-    float chevronW  = 22.0f * s;  // reserved for overflow '»' button
-    float availW    = vp->Size.x - 8.0f * s - chevronW;
+    float chevronW  = 22.0f * s;                // reserved for overflow '»' button
+    float bodyW     = vp->Size.x - 8.0f * s;    // ##RibbonBody child width == the clip edge
+    float availW    = bodyW - chevronW;
 
     // Compute natural widths at COL_BIG (per-column small-zone measuring — defect 1)
     std::vector<float> natW(groups.size());
@@ -1908,6 +2003,26 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         }
     }
 
+    // Hard fit guard. The two passes above balance MEASURED widths against availW; this walks the
+    // exact left-to-right run the draw loop will use and hides everything from the first group
+    // whose right edge would land past the body child's clip edge. The pill and caption are painted
+    // into the PARENT (unclipped) draw list while the buttons live in the clipped ##RibbonBody
+    // child, so a group that only half fits would show its chrome over cut-off labels. Anything
+    // that does not fit WHOLE belongs to the overflow chevron.
+    {
+        float run = 0.0f;
+        bool  cut = false;
+        for (int gi = 0; gi < (int)groups.size(); ++gi) {
+            if (!cut && groups[gi].collapse != COL_HIDDEN && run + natW[gi] <= availW) {
+                run += natW[gi];
+                continue;
+            }
+            cut = true;
+            groups[gi].collapse = COL_HIDDEN;
+            natW[gi]            = 0.0f;
+        }
+    }
+
     // Determine if we need the chevron
     bool anyHidden = false;
     for (const auto& g : groups) if (g.collapse == COL_HIDDEN) { anyHidden = true; break; }
@@ -1928,11 +2043,20 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##RibbonBody",
-                      ImVec2(vp->Size.x - 8.0f * s, bodyH2 + 2.0f * s),
+                      ImVec2(bodyW, bodyH2 + 2.0f * s),
                       false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
+
+    // Clip the group CHROME to the body child's rect. Pill / divider / caption are drawn into the
+    // parent ribbon draw list (so they composite BEHIND the buttons, which belong to this child),
+    // and that list is NOT clipped by the child — chrome could otherwise paint past the very edge
+    // that cuts the button labels. Same rect, same fate: chrome and content appear together or not
+    // at all. Popped immediately after the group loop.
+    const ImVec2 bodyClipMin = ImGui::GetWindowPos();
+    const ImVec2 bodyClipMax(bodyClipMin.x + bodyW, bodyClipMin.y + bodyH2 + 2.0f * s);
+    dl->PushClipRect(bodyClipMin, bodyClipMax, true);
 
     float curX = 0.0f;
 
@@ -1948,6 +2072,12 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         const float padY     = ribbon_groupPadY();
         const float contentH = ribbon_contentH();
         const float contentY = padY;
+        // Centering: grpW is floored at the caption width (ribbon_captionMinW), so a group whose
+        // caption is wider than its buttons gets a pill wider than its content. Left-aligning the
+        // tiles in that pill leaves them visibly off the caption's axis — center the whole content
+        // block in the slack instead, so pill, caption and tiles share one center line.
+        const float slack    = ImMax(0.0f, grpW - ribbon_groupContentW(grp, grp.collapse));
+        const float startX   = curX + kGroupPadX * s + snap(slack * 0.5f);
 
         // --- Liquid-glass group background (drawn into the ribbon window's draw list) ---
         // The button widgets render into the ##RibbonBody child window, which composites ON TOP of
@@ -1996,7 +2126,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             // Inter-button gap ONLY between bigs (not after the last). When a small zone follows,
             // a matching 2dp mid-gap separates the zones — same math as ribbon_groupNaturalW so
             // left/right pill padding stays equal.
-            float bx = curX + kGroupPadX * s;
+            float bx = startX;
             for (int bi = 0; bi < (int)grp.bigCmds.size(); ++bi) {
                 const auto* cmd = grp.bigCmds[bi];
                 if (bi > 0) bx += 2.0f * s;
@@ -2063,7 +2193,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 }
             }
             auto cols = ribbon_packColumns(widths, rowsPerCol);
-            float sx = curX + kGroupPadX * s;
+            float sx = startX;
             for (const auto& col : cols) {
                 // Top-align partial columns (same rule as the big-layout small zone).
                 float sy = contentY;
@@ -2148,6 +2278,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         curX += grpW;
     }
 
+    dl->PopClipRect();   // group-chrome clip pushed right after BeginChild
+
     // Evaluate-tab inspector dock: publish the dead space to the RIGHT of the last group so the
     // Zebra / Symmetry windows pin INSIDE the ribbon strip (Hunter red-pen: dock, don't float).
     // curX is the last group's right edge (child-local); the child spans vp->Size.x - 8*s.
@@ -2182,15 +2314,19 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
 
                 // One row renderer for big + small overflowed commands (the two loops were
                 // byte-identical apart from the button id, which PushID(cmd_id) scopes anyway).
-                auto overflowRow = [&](const ui::RibbonCmd* cmd) {
+                // `indent` steps in a folded split-button variant so it reads as belonging to the
+                // parent above it — without listing subs here, a group that overflows would make
+                // every folded variant unreachable.
+                auto overflowRow = [&](const ui::RibbonCmd* cmd, float indent) {
                     bool enabled = ribbon_cmdEnabled(cmd);
                     ImVec2 cp0 = ImGui::GetCursorScreenPos();
-                    float rowH   = snap(28.0f * s);
-                    float iconSz = snap(20.0f * s);
-                    float padX   = snap(8.0f * s);
-                    float gapX   = snap(6.0f * s);
+                    float rowH   = snap(ui::metrics::px(28.0f));
+                    float iconSz = snap(ui::metrics::px(20.0f));
+                    float pad    = snap(ui::metrics::U(2));
+                    float gapX   = snap(ui::metrics::px(6.0f));
+                    float padX   = pad + indent;
                     float popW   = padX + iconSz + gapX +
-                                   ImGui::CalcTextSize(cmd->label).x + padX;
+                                   ImGui::CalcTextSize(cmd->label).x + pad;
 
                     ImGui::PushID(cmd->cmd_id);
                     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
@@ -2226,8 +2362,13 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     }
                     ImGui::PopID();
                 };
-                for (const auto* cmd : grp.bigCmds) overflowRow(cmd);
-                for (const auto* cmd : grp.smCmds)  overflowRow(cmd);
+                for (const auto* cmd : grp.bigCmds) {
+                    overflowRow(cmd, 0.0f);
+                    for (const auto* sc : grp.subCmds)
+                        if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
+                            overflowRow(sc, ui::metrics::U(3));
+                }
+                for (const auto* cmd : grp.smCmds) overflowRow(cmd, 0.0f);
                 ImGui::Separator();
             }
             ImGui::EndPopup();

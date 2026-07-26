@@ -1,7 +1,8 @@
 // Chudware overlay layout + the pinned FeatureManager glass column — see layout.h.
 //
-// Overlay redesign: buildDefaultLayout() builds ONE splitless central node (Viewport / ECAD / CAM
-// tabbed) so the 3D surface spans the full dockspace; drawLeftPane() renders the SolidWorks-style
+// Overlay redesign: buildDefaultLayout() builds a central node (Viewport / ECAD tabbed) so the 3D
+// surface spans the full dockspace, plus ONE bottom split holding the CAM detail editor (the
+// Manufacture workspace needs 3D and toolpath/G-code visible at once); drawLeftPane() renders the
 // tabbed manager as a pinned full-height rounded glass column over the viewport's left edge, with
 // an invisible right-edge resize and a collapse-to-pill affordance. Command dialogs float (they
 // z-sort above the docked central node).
@@ -46,13 +47,24 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     // Wave N/O: ECAD shares the central node with the Viewport (tabbed). Dock ECAD FIRST so the
     // Viewport is the default-active tab (3D is the primary view); the ECAD tab pops forward on its
     // own (SetNextWindowFocus) when an ECAD document is loaded.
-    ImGui::DockBuilderDockWindow("ECAD", root);
-    // CAM (Manufacture workspace) shares the central node too, tabbed with the Viewport. Docked
-    // before the Viewport so 3D stays the default-active tab; the CAM tab pops forward on its own
-    // (SetNextWindowFocus in drawCamManager) when the user enters the Manufacture workspace.
-    ImGui::DockBuilderDockWindow("CAM", root);
-    ImGui::DockBuilderDockWindow("Viewport", root);
-    ImGui::DockBuilderDockWindow("Viewport###Viewport", root);
+    //
+    // CAM is DIFFERENT (Hunter red-pen, manufacture overhaul): it used to share the central node
+    // too, so selecting it REPLACED the 3D view — and the detail-editor path additionally forced
+    // it undocked (SetNextWindowDockID(0)) so it floated as a slab over the viewport. Both are
+    // wrong for machining: the operator sets up stock/WCS, scrubs the toolpath playhead and reads
+    // the posted G-code *while watching the part*. CAM therefore gets a BOTTOM SPLIT of the
+    // central region — 3D above, CAM detail below — and can never tab over or float above the
+    // viewport. The node collapses on its own while the panel is hidden (drawCamManager returns
+    // before Begin), so non-Manufacture workspaces still get an edge-to-edge viewport.
+    ImGuiID central = root;
+    const ImGuiID camNode =
+        ImGui::DockBuilderSplitNode(central, ImGuiDir_Down, ui::metrics::camDetailFrac(),
+                                    nullptr, &central);
+    ImGui::DockBuilderDockWindow("CAM", camNode);
+
+    ImGui::DockBuilderDockWindow("ECAD", central);
+    ImGui::DockBuilderDockWindow("Viewport", central);
+    ImGui::DockBuilderDockWindow("Viewport###Viewport", central);
 
     ImGui::DockBuilderFinish(root);
 }
@@ -71,6 +83,16 @@ void setOverlayBand(float minX, float minY, float maxX, float maxY) {
     g_overlayBand.valid = (maxX > minX && maxY > minY);
 }
 const OverlayBand& overlayBand() { return g_overlayBand; }
+
+// See layout.h. Read off the CAM window itself rather than the dock node: a docked window that
+// did not submit this frame (drawCamManager returns before Begin while the panel is hidden) stays
+// in the node's window list, so the node rect alone would keep clamping the band after the panel
+// was closed. WasActive + DockIsActive is true only when it really painted in its dock node.
+float camDockTopY() {
+    ImGuiWindow* w = ImGui::FindWindowByName("CAM");
+    if (!w || !w->WasActive || !w->DockIsActive) return 0.0f;
+    return w->Pos.y;
+}
 
 // Floating command dialogs (Evaluate / assembly / Cut List / Design Table…) lost their docked
 // rightBottom slot with the overlay layout; give them a sane first-open anchor: top-right inside

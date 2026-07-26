@@ -880,7 +880,10 @@ void ScenarioRunner::tick(AppState& st) {
                         ui::camPlayTotalTime());
             std::fflush(stdout);
         }
-        ui::camFloatForShot();                     // float so the headless capture shows the tree
+        // No camFloatForShot() here: CAM now owns a bottom split of the central node, so this
+        // scenario captures the REAL Manufacture arrangement — 3D viewport with toolpaths, tool
+        // marker and transport HUD on top, CAM detail (status strip + Toolpaths/Simulate/
+        // Operation/G-code) docked underneath. That is the regression shot worth having.
         st.showRibbon = true; st.ribbonTab = AppState::RT_Manufacture;
         st.activeWorkspace = AppState::Workspace::Manufacture;   // viewport playhead + HUD gate
         st.wantFocusViewport = 0;                  // let the CAM tab stay forward
@@ -2207,8 +2210,12 @@ void ScenarioRunner::runWorkspaces(AppState& st) {
         st.activeWorkspace = kWS[wsStep].ws;
         std::printf("workspaces: switching to %s (step %d)\n", kWS[wsStep].name, wsStep);
         std::fflush(stdout);
-        // Manufacture: float the CAM panel so the docked-tab race doesn't leave it hidden
-        // behind an empty Viewport slot in the headless capture (same technique as the cam scenario).
+        // Manufacture: float the CAM panel for THIS sweep only. The sweep drives eight
+        // workspaces through one process without ever loading a CAM job, and its central slot
+        // renders empty (a pre-existing capture limitation of this scenario, noted since the
+        // sweep was written), so a correctly docked-but-empty CAM panel captures as nothing.
+        // The docked arrangement is proven instead by CHUDWARE_SHOT=cam, which builds a real
+        // job + part and no longer floats.
         if (kWS[wsStep].ws == WS::Manufacture) ui::camFloatForShot();
         wsCapture = wsSavePath + "/workspace_" + kWS[wsStep].name + ".png";
         wsSettle  = kSettle;

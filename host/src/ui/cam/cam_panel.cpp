@@ -24,6 +24,8 @@
 #include "../../mesh.h"        // Mesh — playhead remnant-stock mesh
 #include "../feature_tree.h"   // fmRowPill / fmTreeIcon / fmSectionDivider — the ratified FM row
                                // styling, reused so the Manufacture tree matches the FeatureManager
+#include "../metrics.h"        // ui::metrics — the single sizing authority; this file has no
+                               // raw pixel literals, every dimension comes from a cam* token
 
 namespace ui {
 
@@ -33,8 +35,8 @@ struct CamUI {
     CamMirror mirror;
     std::string docId;                 // cam job doc id ("" = no job)
     bool show = false;
-    int  focusFrames = 0;              // >0: keep popping the CAM tab forward (set by camLoadJob)
     bool floatForShot = false;         // shot-only: float the panel so a headless capture sees it
+    bool gcodeTabFocus = false;        // one-shot: select the G-code tab (a post just produced one)
     bool backplot = true;              // draw toolpaths in the 3D viewport
     int selSetup = 0;
     int selOp = -1;
@@ -52,7 +54,6 @@ struct CamUI {
     int  generatedRev = -1;            // mirror revision at the last successful cam_generate
     int  genWarnings  = 0;             // warning count from that generate (op status)
     bool flavorPopup  = false;         // ribbon "Flavor" clicked: open the dialect popup
-    bool floatUndock  = false;         // one-shot: float (undock) the detail panel on next open
     int  selKind = 0;                  // visual tree selection: 0=none 1=job 2=jobsetup 3=stock
                                        // 4=setup 5=op 6=tool 7=models
     int  selTool = -1;                 // selected Tools row (selKind==6); separate from selOp
@@ -432,6 +433,9 @@ void doPost(AppState& st) {
         }
         g.gcode = r.result.value("gcode", std::string());
         writeGcodeFile(dialect);
+        // The operator posted to GET the G-code — put it in front of them instead of leaving the
+        // panel on whichever tab happened to be active.
+        if (!g.gcode.empty()) g.gcodeTabFocus = true;
         if (g.pipeStage == 3) {
             g.pipeStage = 0;
             g.status = "pipeline done: generated + simulated + posted " + dialect;
@@ -511,41 +515,56 @@ void doAudit(AppState& st) {
 }
 
 // ---- 2D backplot canvas (top view) ----
+// A flat companion to the REAL backplot: the 3D viewport ABOVE this panel already draws the
+// classified segments with the playhead split (viewport_panel.cpp). Same palette roles here, so
+// the two read as one drawing — rapid / lead / plunge / cut / arc.
 void drawBackplot(AppState& /*st*/) {
     const CamBackplot& bp = g.mirror.backplot();
+    const ui::Palette& pal = ui::palette;
+    const float pad = ui::metrics::camGutter();
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    if (avail.y < 80) avail.y = 200;
-    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    avail.y = std::max(avail.y, ui::metrics::px(120.0f));
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), IM_COL32(24, 26, 30, 255));
+    dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y),
+                      ui::Palette::toU32(pal.statusBg), ui::metrics::camRowRound());
     if (bp.empty()) {
-        dl->AddText(ImVec2(p0.x + 10, p0.y + 10), IM_COL32(160, 160, 160, 255),
-                    "No toolpaths. Add operations, then Generate.");
+        // Purposeful empty state, centered in the canvas: name the next step instead of a void.
+        const char* msg = "No toolpaths yet — add operations on the Manufacture ribbon, then Generate.";
+        const ImVec2 tw = ImGui::CalcTextSize(msg);
+        dl->AddText(ImVec2(std::max(p0.x + pad, p0.x + (avail.x - tw.x) * 0.5f),
+                           p0.y + (avail.y - tw.y) * 0.5f),
+                    ui::Palette::toU32(pal.textDisabled), msg);
         ImGui::Dummy(avail);
         return;
     }
-    float w = bp.maxx - bp.minx, h = bp.maxy - bp.miny;
+    float w = bp.maxx - bp.minx, h = bp.maxy - bp.miny;   // model millimetres, not pixels
     if (w < 1e-3f) w = 1; if (h < 1e-3f) h = 1;
-    float pad = 12.0f;
-    float sx = (avail.x - 2 * pad) / w, sy = (avail.y - 2 * pad) / h;
-    float s = std::min(sx, sy);
-    float ox = p0.x + pad - bp.minx * s;
-    float oy = p0.y + avail.y - pad + bp.miny * s;  // flip Y for screen
-    auto line = [&](const std::vector<float>& v, ImU32 col, float th) {
+    // The extents read-out gets its own band at the top; the drawing is then CENTERED in what is
+    // left (it used to be bottom-left anchored and ran straight through the read-out).
+    const float headH = ImGui::GetTextLineHeight() + ui::metrics::camHeadGap();
+    const float innerW = std::max(avail.x - 2.0f * pad, 1.0f);
+    const float innerH = std::max(avail.y - 2.0f * pad - headH, 1.0f);
+    const float s = std::min(innerW / w, innerH / h);
+    const float ox = p0.x + pad + (innerW - w * s) * 0.5f - bp.minx * s;
+    const float oy = p0.y + pad + headH + (innerH + h * s) * 0.5f + bp.miny * s;  // flip Y
+    auto line = [&](const std::vector<float>& v, const float col[4], float th) {
+        const ImU32 c = ui::Palette::toU32(col);
         for (size_t i = 0; i + 5 < v.size(); i += 6) {
             ImVec2 a(ox + v[i] * s, oy - v[i + 1] * s);
             ImVec2 b(ox + v[i + 3] * s, oy - v[i + 4] * s);
-            dl->AddLine(a, b, col, th);
+            dl->AddLine(a, b, c, th);
         }
     };
-    line(bp.rapid,  IM_COL32(200, 60, 60, 120), 1.0f);   // rapid = faint red
-    line(bp.lead,   IM_COL32(80, 200, 120, 200), 1.5f);  // lead = green
-    line(bp.plunge, IM_COL32(80, 180, 220, 220), 1.5f);  // plunge = cyan
-    line(bp.cut,    IM_COL32(90, 150, 240, 255), 1.6f);  // cut = blue
-    line(bp.arc,    IM_COL32(150, 130, 240, 255), 1.6f); // arc = violet
+    line(bp.rapid,  pal.camRapid,  ui::metrics::stroke(1.0f));
+    line(bp.lead,   pal.camLead,   ui::metrics::stroke(1.5f));
+    line(bp.plunge, pal.camPlunge, ui::metrics::stroke(1.5f));
+    line(bp.cut,    pal.camCut,    ui::metrics::stroke(1.6f));
+    line(bp.arc,    pal.camArc,    ui::metrics::stroke(1.6f));
     char info[96];
     std::snprintf(info, sizeof(info), "XY %.1f x %.1f mm   Z %.1f..%.1f", w, h, bp.minz, bp.maxz);
-    dl->AddText(ImVec2(p0.x + 8, p0.y + 8), IM_COL32(150, 160, 170, 255), info);
+    dl->AddText(ImVec2(p0.x + ui::metrics::camRowPadX(), p0.y + ui::metrics::camRowPadY()),
+                ui::Palette::toU32(pal.textDim), info);
     ImGui::Dummy(avail);
 }
 
@@ -826,6 +845,8 @@ bool camStockBoxSegments(std::vector<float>& out) {
 }
 
 // Bottom-center transport bar over the viewport (drawn in screen space by viewport_panel).
+// This IS the simulation UI: playback happens in the 3D view, so the bar only carries transport
+// plus a read-out. Height comes from the frame metric, so it never mis-scales at HiDPI.
 void camDrawSimHud(AppState& st, const ImVec2& vpMin, const ImVec2& vpSize) {
     if (!camSimHudActive()) return;
     double total = g.mirror.backplot().totalTime;
@@ -834,8 +855,11 @@ void camDrawSimHud(AppState& st, const ImVec2& vpMin, const ImVec2& vpSize) {
         g.playT += ImGui::GetIO().DeltaTime * g.playSpeed;
         if (g.playT >= total) { g.playT = total; g.playing = false; }
     }
-    const float w = 420.0f, h = 56.0f;
-    ImVec2 pos(vpMin.x + (vpSize.x - w) * 0.5f, vpMin.y + vpSize.y - h - 14.0f);
+    const ImGuiStyle& sty = ImGui::GetStyle();
+    const float w = ui::metrics::px(420.0f);
+    const float h = ImGui::GetFrameHeight() + sty.WindowPadding.y * 2.0f;
+    ImVec2 pos(vpMin.x + (vpSize.x - w) * 0.5f,
+               vpMin.y + vpSize.y - h - ui::metrics::camSectionGap());
     ImGui::SetNextWindowPos(pos);
     ImGui::SetNextWindowSize(ImVec2(w, h));
     ImGui::SetNextWindowBgAlpha(0.55f);
@@ -843,31 +867,48 @@ void camDrawSimHud(AppState& st, const ImVec2& vpMin, const ImVec2& vpSize) {
                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
                              ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
     if (ImGui::Begin("##cam_sim_hud", nullptr, flags)) {
-        if (ImGui::SmallButton(g.playing ? "Pause" : "Play")) g.playing = !g.playing;
-        ImGui::SameLine();
-        float tf = (float)g.playT;
-        ImGui::SetNextItemWidth(w - 150.0f);
-        if (ImGui::SliderFloat("##camt", &tf, 0.0f, (float)total, "")) g.playT = tf;
-        ImGui::SameLine();
-        int mm = (int)(g.playT / 60), ss = (int)g.playT % 60;
-        ImGui::Text("%d:%02d", mm, ss);
+        // Measure the trailing read-outs FIRST so the scrub slider can be given exactly the room
+        // that is left (the old hardcoded "w - 150" clipped them at any non-default font scale).
+        char tbuf[16];
+        std::snprintf(tbuf, sizeof(tbuf), "%d:%02d", (int)(g.playT / 60), (int)g.playT % 60);
+        double pct = 0;
+        if (!g.simFrameT.empty() && g.simFrameT.back() > 0)
+            pct = 100.0 * std::min(1.0, g.playT / g.simFrameT.back());
+        char pbuf[24];
+        std::snprintf(pbuf, sizeof(pbuf), "%.0f%%", pct);
         const float speeds[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f};
         const char* labels[] = {"0.25x", "0.5x", "1x", "2x", "4x"};
         int cur = 2;
-        for (int i = 0; i < 5; ++i) if (std::fabs(speeds[i] - g.playSpeed) < 0.01f) cur = i;
-        ImGui::SetNextItemWidth(70.0f);
+        for (int i = 0; i < IM_ARRAYSIZE(speeds); ++i)
+            if (std::fabs(speeds[i] - g.playSpeed) < 0.01f) cur = i;
+        const float speedW = ui::metrics::px(64.0f);
+        float tailW = ImGui::CalcTextSize(tbuf).x + speedW + ImGui::CalcTextSize(pbuf).x +
+                      sty.ItemSpacing.x * 3.0f;
+        if (g.framesClamped) tailW += ImGui::CalcTextSize("(!) clamped").x + sty.ItemSpacing.x;
+
+        if (ImGui::Button(g.playing ? "Pause" : "Play")) g.playing = !g.playing;
+        ImGui::SameLine();
+        float tf = (float)g.playT;
+        ImGui::SetNextItemWidth(-tailW);
+        if (ImGui::SliderFloat("##camt", &tf, 0.0f, (float)total, "")) g.playT = tf;
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(tbuf);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(speedW);
         if (ImGui::BeginCombo("##camspeed", labels[cur])) {
-            for (int i = 0; i < 5; ++i)
+            for (int i = 0; i < IM_ARRAYSIZE(speeds); ++i)
                 if (ImGui::Selectable(labels[i], i == cur)) g.playSpeed = speeds[i];
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        // machined % interpolated between frame times
-        double pct = 0;
-        if (!g.simFrameT.empty() && g.simFrameT.back() > 0)
-            pct = 100.0 * std::min(1.0, g.playT / g.simFrameT.back());
-        ImGui::Text("machined %.0f%%", pct);
-        if (g.framesClamped) { ImGui::SameLine(); ImGui::TextDisabled("(!) frames clamped"); }
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", pbuf);
+        if (g.framesClamped) {
+            ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("(!) clamped");
+        }
     }
     ImGui::End();
 }
@@ -877,16 +918,6 @@ void camDebugSetPlayhead(float frac) {
     double total = g.mirror.backplot().totalTime;
     if (frac < 0) frac = 0; if (frac > 1) frac = 1;
     g.playT = total * frac;
-}
-
-void camEnsureVisible() { g.show = true; }
-
-void camRequestFocus() {
-    g.show = true;
-    // Keep focusFrames non-zero every frame the Manufacture workspace is active so the CAM window
-    // wins the docked-tab race against the Viewport window in the shared central dock node.
-    // Set to 3 each frame so it's always non-zero (drawCamManager decrements by 1 per frame).
-    g.focusFrames = 3;
 }
 
 // Shot-only hook: make the CAM panel float (undock + centre) so a headless screenshot of the
@@ -956,43 +987,43 @@ void camLoadJob(AppState& st, const std::string& docId) {
             });
         }
     });
-    g.show = true;
-    g.focusFrames = 10;  // surface the CAM tab for a few frames even if the panel was already
-                         // open in the background (out-competes a one-off viewport focus grab)
+    g.show = true;   // reveal the docked detail panel (bottom split, directly under the 3D view)
 }
 
-// ---- the panel ----
+// ---- the panel --------------------------------------------------------------------------------
+// The CAM window is docked into a BOTTOM SPLIT of the central node (buildDefaultLayout), so the 3D
+// viewport — which already renders the stock box, the classified toolpaths, the remnant-stock sim
+// frames and the transport HUD — stays visible ABOVE it. This panel therefore carries ONLY what the
+// 3D view and the ribbon cannot: the flat backplot, the sim report, the operation form and the
+// posted G-code. It deliberately does NOT re-list New Job / Extract / add-operation / Generate /
+// Simulate / Post — those are Manufacture-ribbon commands routed through camHandleCommand — and it
+// does NOT re-draw the job tree, which is drawCamTreeBody in the pinned left column.
 void drawCamManager(AppState& st) {
+    // Visible by default in the Manufacture workspace: the point of the workspace is "generate,
+    // then read the G-code right under the 3D view". Edge-triggered on workspace entry, so a panel
+    // the operator deliberately closed stays closed while they keep working in Manufacture.
+    const bool camWs = (st.activeWorkspace == AppState::Workspace::Manufacture);
+    static bool prevCamWs = false;
+    if (camWs && !prevCamWs) g.show = true;
+    prevCamWs = camWs;
     if (!g.show) return;
     refreshDialects(st);
-    // Pop the CAM tab forward the frame the workspace first becomes visible (the user switched to
-    // the Manufacture ribbon), so the docked CAM editor surfaces instead of staying behind the
-    // Viewport tab. Mirrors the ECAD panel. Docked into the central node by buildDefaultLayout.
-    // Shot-only (set via camFloatForShot() from the CHUDWARE_SHOT=cam scenario): float the panel
-    // (undock + centre) so a headless capture sees the populated workspace — a central-node-docked
-    // tab won't surface over the full-bleed 3D in an offscreen render. No-op in normal use.
+
+    // Shot-only (camFloatForShot(), CHUDWARE_SHOT=cam / =workspaces): float + centre the panel so
+    // an offscreen capture shows the populated workspace, which a short bottom-split node cannot.
+    // Sized as a fraction of the main viewport, so it stays centred at any DPI / capture size.
+    // NEVER taken in normal use — the docked path below sets no position, size or dock id.
     if (g.floatForShot) {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        const ImVec2 sz(vp->WorkSize.x * 0.62f, vp->WorkSize.y * 0.58f);
         ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
-        ImGui::SetNextWindowPos(ImVec2(330, 210), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(660, 470), ImGuiCond_Always);
-    } else if (g.floatUndock) {
-        // Opened as the DETAIL editor from the Manufacture workspace tree: float it (undock)
-        // so it never steals the central dock node from the 3D viewport in that workspace.
-        ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
-        ImGui::SetNextWindowPos(ImVec2(360, 220), ImGuiCond_Appearing);
-        ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_Appearing);
-        g.floatUndock = false;
-    } else {
-        ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + (vp->WorkSize.x - sz.x) * 0.5f,
+                                       vp->WorkPos.y + (vp->WorkSize.y - sz.y) * 0.5f),
+                                ImGuiCond_Always);
+        ImGui::SetNextWindowSize(sz, ImGuiCond_Always);
     }
-    static bool prevShown = false;
-    if (g.focusFrames > 0 || (g.show && !prevShown)) ImGui::SetNextWindowFocus();  // applies to the Begin below
-    prevShown = g.show;
-    if (g.focusFrames > 0) g.focusFrames--;
-    // The global theme makes window title bars fully transparent (a clean look for docked panels),
-    // but a FLOATING CAM window then reads as see-through at the top. Give this window an opaque
-    // title bar and a solid (fully opaque) border so it stands on its own whether floating or
-    // docked. Pushed before Begin (window decoration colours are read there) and popped right after.
+    // The global theme makes window title bars fully transparent (clean for docked panels); give
+    // this one an opaque title bar + solid border so it reads as its own surface under the 3D view.
     const ui::Palette& pal = ui::palette;
     const ImVec4 titleOpaque(pal.headerBg[0], pal.headerBg[1], pal.headerBg[2], 1.0f);
     float camBorder[4]; ui::Palette::withAlpha(pal.border, camBorder, 1.0f);
@@ -1003,121 +1034,93 @@ void drawCamManager(AppState& st) {
     ImGui::PopStyleColor(3);
     if (!camOpen) { ImGui::End(); return; }
 
-    // toolbar — long RPCs (extract/generate/sim/post) disable action buttons + show spinner.
     const bool busy = camBusy();
-    if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button("New Job")) camHandleCommand(st, "cam_new_job");
-    ImGui::SameLine(); if (ImGui::Button("Extract Part")) camHandleCommand(st, "cam_extract");
-    ImGui::SameLine(); if (ImGui::Button("Add Setup")) camHandleCommand(st, "cam_add_setup");
-    ImGui::SameLine(); if (ImGui::Button("Add Tool")) camHandleCommand(st, "cam_add_tool");
-    ImGui::Separator();
-    // operation buttons
-    auto opBtn = [&](const char* label, const char* cmd) {
-        if (ImGui::Button(label)) camHandleCommand(st, cmd);
-        ImGui::SameLine();
-    };
-    opBtn("Face", "cam_op_face"); opBtn("Contour", "cam_op_contour"); opBtn("Pocket", "cam_op_pocket");
-    opBtn("Adaptive", "cam_op_adaptive"); opBtn("Drill", "cam_op_drill"); opBtn("3D Parallel", "cam_op_parallel3d");
-    opBtn("Waterline", "cam_op_waterline3d"); opBtn("Turn", "cam_op_turn_rough");
-    if (ImGui::Button("Laser")) camHandleCommand(st, "cam_op_laser");
-    ImGui::Separator();
-    if (ImGui::Button("Generate")) doGenerate(st);
-    ImGui::SameLine(); if (ImGui::Button("Simulate")) doSimulate(st);
-    ImGui::SameLine(); if (ImGui::Button("Run: Generate > Simulate > Post")) doPipeline(st);
-    ImGui::SameLine(); ImGui::Checkbox("Show in 3D", &g.backplot);
-    ImGui::SameLine(); ImGui::Checkbox("Stock box", &g.showStock);
-    ImGui::SameLine(); ImGui::TextDisabled("|");
-    ImGui::SameLine(); ImGui::SetNextItemWidth(120);
-    if (!g.dialects.empty()) {
-        std::vector<const char*> items;
-        for (auto& d : g.dialects) items.push_back(d.c_str());
-        ImGui::Combo("##post", &g.postIdx, items.data(), (int)items.size());
-        ImGui::SameLine(); if (ImGui::Button("Post")) doPost(st);
-    }
-    if (busy) ImGui::EndDisabled();
-    if (busy) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("|");
-        ImGui::SameLine();
-        // Disabled text, not accent: a busy note in the toolbar is chrome, not a call to action.
-        busyLabel("working...", ImGui::GetColorU32(ImGuiCol_TextDisabled));
-    }
-    if (!g.status.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", g.status.c_str()); }
 
-    ImGui::Separator();
-    ImGui::Columns(2, "cam_cols");
-    ImGui::SetColumnWidth(0, 240);
-
-    // ---- LEFT: tree ----
-    ImGui::BeginChild("cam_tree");
-    ImGui::TextDisabled("Job: %s  (rev %d)", g.mirror.name().c_str(), g.mirror.revision());
-    const auto& setups = g.mirror.setups();
-    for (int si = 0; si < (int)setups.size(); ++si) {
-        const auto& s = setups[si];
-        ImGui::PushID(si);
-        bool open = ImGui::TreeNodeEx(s.name.c_str(), (si == g.selSetup ? ImGuiTreeNodeFlags_DefaultOpen : 0) |
-                                                          ImGuiTreeNodeFlags_OpenOnArrow);
-        if (ImGui::IsItemClicked()) g.selSetup = si;
-        if (open) {
-            ImGui::TextDisabled("machine: %s", s.machine.c_str());
-            for (int oi = 0; oi < (int)s.ops.size(); ++oi) {
-                const auto& o = s.ops[oi];
-                std::string lbl = o.name.empty() ? o.type : o.name;
-                lbl += "  [T" + std::to_string(o.tool_number) + "]";
-                if (o.suppressed) lbl += " (off)";
-                if (ImGui::Selectable(lbl.c_str(), si == g.selSetup && oi == g.selOp)) {
-                    g.selSetup = si; g.selOp = oi; g.loadedOpFor = -1;
-                }
-            }
-            ImGui::TreePop();
+    // ---- status / view strip ---------------------------------------------------------------
+    // One row, and only what has no ribbon home: the two viewport-overlay toggles, the post
+    // dialect, and the job status right-aligned.
+    {
+        ImGui::Checkbox("Show in 3D", &g.backplot);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Draw the generated toolpaths over the part in the 3D view above");
+        ImGui::SameLine(0, ui::metrics::camBtnGap());
+        ImGui::Checkbox("Stock box", &g.showStock);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Outline the active setup's stock in the 3D view above");
+        ImGui::SameLine(0, ui::metrics::camSectionGap());
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("Post");
+        ImGui::SameLine(0, ui::metrics::camBtnGap());
+        if (g.dialects.empty()) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(currentDialect().c_str());
+        } else {
+            std::vector<const char*> items;
+            items.reserve(g.dialects.size());
+            for (const auto& d : g.dialects) items.push_back(d.c_str());
+            ImGui::SetNextItemWidth(ui::metrics::camFieldW());
+            ImGui::Combo("##cam_dialect", &g.postIdx, items.data(), (int)items.size());
         }
-        ImGui::PopID();
+        // Status / busy note, right-aligned when it fits; otherwise it simply trails the combo.
+        const char* note = g.status.empty() ? (busy ? "working..." : nullptr) : g.status.c_str();
+        if (note) {
+            float noteW = ImGui::CalcTextSize(note).x;
+            if (busy) noteW += ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemInnerSpacing.x;
+            const float rightX = ImGui::GetContentRegionMax().x - noteW;
+            ImGui::SameLine(0, ui::metrics::camSectionGap());
+            if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
+            ImGui::AlignTextToFramePadding();
+            if (busy) busyLabel(note, ImGui::GetColorU32(ImGuiCol_TextDisabled));
+            else      ImGui::TextDisabled("%s", note);
+        }
     }
     ImGui::Separator();
-    ImGui::TextDisabled("Tools");
-    for (const auto& t : g.mirror.tools())
-        ImGui::BulletText("T%d %s  \xC3\x98%.2f", t.number, t.type.c_str(), t.diameter);
-    ImGui::EndChild();
 
-    // ---- RIGHT: tabs ----
-    ImGui::NextColumn();
+    // ---- detail tabs (full width — the job tree is the pinned left column) -------------------
     if (ImGui::BeginTabBar("cam_tabs")) {
         if (ImGui::BeginTabItem("Toolpaths")) { drawBackplot(st); ImGui::EndTabItem(); }
+
         if (ImGui::BeginTabItem("Simulate")) {
             if (busy) ImGui::BeginDisabled();
             if (ImGui::Button("Run Material-Removal Sim")) doSimulate(st);
-            ImGui::SameLine(); ImGui::Checkbox("Gouge", &g.optGouge);
-            ImGui::SameLine(); ImGui::Checkbox("Rapids", &g.optRapid);
-            ImGui::SameLine(); ImGui::Checkbox("Holder", &g.optHolder);
-            ImGui::SameLine(); ImGui::SetNextItemWidth(110);
+            ImGui::SameLine(0, ui::metrics::camBtnGap()); ImGui::Checkbox("Gouge", &g.optGouge);
+            ImGui::SameLine(0, ui::metrics::camBtnGap()); ImGui::Checkbox("Rapids", &g.optRapid);
+            ImGui::SameLine(0, ui::metrics::camBtnGap()); ImGui::Checkbox("Holder", &g.optHolder);
+            ImGui::SameLine(0, ui::metrics::camSectionGap());
+            ImGui::SetNextItemWidth(ui::metrics::camFieldW());
             ImGui::SliderFloat("Resolution", &g.optRes, 0.2f, 2.0f, "%.1f mm");
             if (busy) ImGui::EndDisabled();
+            ImGui::TextDisabled("Frames play back in the 3D view above — use the transport bar.");
+            ImGui::Dummy(ImVec2(0.0f, ui::metrics::camHeadGap()));
             drawSimSummary();
-            ImGui::TextDisabled("Frames play back in the 3D viewport — use the transport bar.");
             ImGui::EndTabItem();
         }
+
         if (ImGui::BeginTabItem("Operation")) {
-            // Minimal op parameter form: the four CuttingDB fields, autofilled from the
-            // core cam_feeds table for the setup material + op tool, applied via update_operation.
+            // Minimal op parameter form: the four CuttingDB fields, autofilled from the core
+            // cam_feeds table for the setup material + op tool, applied via update_operation.
             const bool haveOp = g.selSetup >= 0 && g.selSetup < (int)g.mirror.setups().size() &&
                                 g.selOp >= 0 && g.selOp < (int)g.mirror.setups()[g.selSetup].ops.size();
             if (!haveOp) {
-                ImGui::TextDisabled("Select an operation in the tree to edit its parameters.");
+                ImGui::TextDisabled("Select an operation in the Manufacture tree to edit it.");
             } else {
                 const auto& op = g.mirror.setups()[g.selSetup].ops[g.selOp];
-                ImGui::Text("%s  [T%d]", (op.name.empty() ? op.type.c_str() : op.name.c_str()), op.tool_number);
-                if (g.loadedOpFor != g.selOp) {
-                    // reset buffers on op switch; autofill (or a future read-back) populates them
-                    g.loadedOpFor = g.selOp;
-                }
-                ImGui::SetNextItemWidth(120); ImGui::InputFloat("Stepover (mm)", &g.fStepover, 0, 0, "%.2f");
-                ImGui::SetNextItemWidth(120); ImGui::InputFloat("Stepdown (mm)", &g.fStepdown, 0, 0, "%.2f");
-                ImGui::SetNextItemWidth(120); ImGui::InputFloat("Feed (mm/min)", &g.fFeed, 0, 0, "%.0f");
-                ImGui::SetNextItemWidth(120); ImGui::InputFloat("RPM", &g.fRpm, 0, 0, "%.0f");
+                ImGui::Text("%s  [T%d]", (op.name.empty() ? op.type.c_str() : op.name.c_str()),
+                            op.tool_number);
+                // reset buffers on op switch; autofill (or a future read-back) populates them
+                if (g.loadedOpFor != g.selOp) g.loadedOpFor = g.selOp;
+                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camHeadGap()));
+                const float fw = ui::metrics::camFieldW();
+                ImGui::SetNextItemWidth(fw); ImGui::InputFloat("Stepover (mm)", &g.fStepover, 0, 0, "%.2f");
+                ImGui::SetNextItemWidth(fw); ImGui::InputFloat("Stepdown (mm)", &g.fStepdown, 0, 0, "%.2f");
+                ImGui::SetNextItemWidth(fw); ImGui::InputFloat("Feed (mm/min)", &g.fFeed, 0, 0, "%.0f");
+                ImGui::SetNextItemWidth(fw); ImGui::InputFloat("RPM", &g.fRpm, 0, 0, "%.0f");
+                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camHeadGap()));
+                const ImVec2 btn(0.0f, ui::metrics::camBtnH());
                 if (busy) ImGui::BeginDisabled();
-                if (ImGui::Button("Autofill from tables")) doFeedsAutofill(st);
-                ImGui::SameLine();
-                if (ImGui::Button("Apply to operation")) {
+                if (ImGui::Button("Autofill from tables", btn)) doFeedsAutofill(st);
+                ImGui::SameLine(0, ui::metrics::camBtnGap());
+                if (ImGui::Button("Apply to operation", btn)) {
                     nlohmann::json upd = nlohmann::json::object();
                     if (g.fStepover > 0) upd["stepover"] = g.fStepover;
                     if (g.fStepdown > 0) upd["stepdown"] = g.fStepdown;
@@ -1133,20 +1136,37 @@ void drawCamManager(AppState& st) {
             }
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("G-code")) {
+
+        // G-code is the fast path the operator is here for: a post selects this tab automatically.
+        ImGuiTabItemFlags gcFlags = 0;
+        if (g.gcodeTabFocus) { gcFlags = ImGuiTabItemFlags_SetSelected; g.gcodeTabFocus = false; }
+        if (ImGui::BeginTabItem("G-code", nullptr, gcFlags)) {
+            const ImVec2 btn(0.0f, ui::metrics::camBtnH());
+            const bool haveGcode = !g.gcode.empty();
             if (busy) ImGui::BeginDisabled();
-            if (ImGui::Button("Post")) doPost(st);
+            if (ImGui::Button("Post", btn)) doPost(st);
             if (busy) ImGui::EndDisabled();
-            ImGui::SameLine();
-            const bool canDl = !g.gcode.empty();
-            if (!canDl) ImGui::BeginDisabled();
-            if (ImGui::Button("Download NC")) downloadGcode();
-            if (!canDl) ImGui::EndDisabled();
-            ImGui::SameLine();
+            ImGui::SameLine(0, ui::metrics::camBtnGap());
+            if (!haveGcode) ImGui::BeginDisabled();
+            if (ImGui::Button("Download NC", btn)) downloadGcode();
+            if (!haveGcode) ImGui::EndDisabled();
+            ImGui::SameLine(0, ui::metrics::camBtnGap());
             if (g.auditInflight) ImGui::BeginDisabled();
-            if (ImGui::Button("Audit")) doAudit(st);
+            if (ImGui::Button("Audit", btn)) doAudit(st);
             if (g.auditInflight) ImGui::EndDisabled();
+            ImGui::SameLine(0, ui::metrics::camSectionGap());
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("dialect: %s", currentDialect().c_str());
+#ifndef __EMSCRIPTEN__
+            // Desktop: show the temp .nc path the operator can grab. Hidden on web (no local path).
+            if (!g.gcodePath.empty()) {
+                ImGui::SameLine(0, ui::metrics::camSectionGap());
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextDisabled("-> %s", g.gcodePath.c_str());
+            }
+#endif
             if (!g.audit.empty()) {
+                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camHeadGap()));
                 const bool aok = g.audit.value("ok", false);
                 const float* col = aok ? ui::palette.statusOk : ui::palette.statusErr;
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], col[3]));
@@ -1184,21 +1204,36 @@ void drawCamManager(AppState& st) {
                     ImGui::PopStyleColor();
                 }
             }
-#ifndef __EMSCRIPTEN__
-            // Desktop: show the temp .nc path the operator can grab. Hidden on web (no local path).
-            if (!g.gcodePath.empty()) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("-> %s", g.gcodePath.c_str());
-            }
-#endif
             ImGui::Separator();
-            ImGui::InputTextMultiline("##gcode", g.gcode.data(), g.gcode.size() + 1,
-                                      ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+            if (haveGcode) {
+                ImGui::InputTextMultiline("##gcode", g.gcode.data(), g.gcode.size() + 1,
+                                          ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+            } else {
+                // Purposeful empty state naming the NEXT step, centered — never a blank box.
+                const bool noJob    = g.docId.empty();
+                const bool noSetup  = !noJob && g.mirror.setups().empty();
+                const char* headline = noJob   ? "No CAM job yet."
+                                     : noSetup ? "No machining setup yet."
+                                               : "No G-code yet.";
+                const char* next = noJob   ? "Manufacture ribbon: New Job, then Extract Part."
+                                 : noSetup ? "Manufacture ribbon: Add Setup, then add an operation."
+                                           : "Add operations, then Generate → Post.";
+                auto centered = [](const char* t, bool dim) {
+                    const float slack = (ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(t).x)
+                                        * 0.5f;
+                    if (slack > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + slack);
+                    if (dim) ImGui::TextDisabled("%s", t);
+                    else     ImGui::TextUnformatted(t);
+                };
+                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camSectionGap()));
+                centered(headline, false);
+                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camCaptionGap()));
+                centered(next, true);
+            }
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
     }
-    ImGui::Columns(1);
     ImGui::End();
 }
 
@@ -1211,19 +1246,42 @@ void drawCamManager(AppState& st) {
 // editor. NO RPCs on this per-frame path (refreshDialects is async + cooldown-guarded).
 namespace {
 
-void camTreeOpenDetail() { g.show = true; g.focusFrames = 3; g.floatUndock = true; }
+// The FeatureManager tree-icon logical size (feature_tree.h fmTreeIcon default). Row glyphs this
+// file paints by hand must use the SAME logical size so they line up with the atlas icons.
+constexpr float kTreeIconDp = 16.0f;
+
+// Double-click / "Open in editor" on a tree row: reveal the docked detail panel (bottom split of
+// the central node). It never floats over the 3D view any more, so there is nothing else to do.
+void camTreeOpenDetail() { g.show = true; }
+
+// A tree row's sub-caption — the job row's "extracted stock + 0 hole(s)" line. Dim and wrapped,
+// separated from the row by exactly one camCaptionGap (replacing, not stacking on, ItemSpacing.y)
+// and left-aligned to the row's LABEL text at `labelX`, never to the pill's left edge.
+void camRowCaption(float labelX, const std::string& text, bool busy) {
+    if (text.empty() && !busy) return;
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - ImGui::GetStyle().ItemSpacing.y +
+                         ui::metrics::camCaptionGap());
+    ImGui::SetCursorPosX(labelX);
+    const char* t = text.empty() ? "working..." : text.c_str();
+    if (busy) {
+        busyLabel(t, ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    } else {
+        ImGui::PushTextWrapPos(0.0f);   // wrap at the content region's right edge
+        ImGui::TextDisabled("%s", t);
+        ImGui::PopTextWrapPos();
+    }
+}
 
 }  // namespace
 
 void drawCamTreeBody(AppState& st) {
-    const float S = ui::uiScale;
     refreshDialects(st);   // async + guarded; feeds the flavor popup + Job Setup row
     fmRowStripeReset();
 
     // Compact vertical rhythm (match FeatureManager): tighten ItemSpacing.y only so the job tree
     // (setups/operations/tools) doesn't read "double spaced". RAII so it unwinds on early returns.
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * S));
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::camRowGap()));
     struct SpacingPop { ~SpacingPop() { ImGui::PopStyleVar(); } } spacingPop;
 
     // Ribbon "Flavor" dropdown: opened here (this body draws every frame in Manufacture) at the
@@ -1280,12 +1338,17 @@ void drawCamTreeBody(AppState& st) {
         ImGui::PopStyleVar();
         return clicked;
     };
+    // The FM row contract (feature_tree.cpp treeIcon + fmRowPill): a 6dp FramePadding.x inset, a
+    // 16dp glyph, then a 4dp gap before the label. Captured here so the "(nothing yet)" notes and
+    // the sub-captions line up with the rows' LABEL column instead of the pill's left edge.
+    const float kIconGap    = ui::metrics::U(1);
+    const float kLabelInset = ui::metrics::U(1.5f) + ui::metrics::px(kTreeIconDp) + kIconGap;
     auto leafRow = [&](const char* id, const char* icon, const char* fb,
                        const std::string& label, bool selected) -> bool {
         ImGui::PushID(id);
         FmRowRect rr = fmRowPill(selected);
-        fmTreeIcon(icon, fb);
-        ImGui::SameLine(0, 4.0f * S);
+        fmTreeIcon(icon, fb, kTreeIconDp);
+        ImGui::SameLine(0, kIconGap);
         bool clicked = leafSelectable(label);
         const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
         fmRowPillEnd(rr, selected);
@@ -1293,24 +1356,43 @@ void drawCamTreeBody(AppState& st) {
         if (dbl) camTreeOpenDetail();
         return clicked;
     };
+    // A dim "(nothing here yet — do X)" note under a branch. Indented to the label column and
+    // WRAPPED, not pilled: the pinned column is narrow and a frame-height pill would clip the
+    // actionable half of the hint (which is the half that gets the user to G-code).
+    auto emptyNote = [&](const char* text) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + kLabelInset);
+        ImGui::PushTextWrapPos(0.0f);   // wrap at the content region's right edge
+        ImGui::TextDisabled("%s", text);
+        ImGui::PopTextWrapPos();
+    };
 
     // ---- Job root ----
+    // ImGuiTreeNodeFlags_FramePadding is REQUIRED inside an fmRowPill: without it a TreeNodeEx is
+    // TEXT height drawn at the row TOP, so the label sat ~4dp above the vertically-centered icon
+    // inside the frame-height pill — the mis-proportioned "CAM Job (rev N)" row. With it the node
+    // IS pill height and ImGui centers the label on the pushed 4dp FramePadding.y, exactly like
+    // featureRow() in feature_tree.cpp. SpanFullWidth matches the FM rows' hit box too.
     const bool jobSel = (g.selKind == 1);
     bool jobOpen = false;
+    float jobLabelX = 0.0f;
     {
         FmRowRect rr = fmRowPill(jobSel);
-        fmTreeIcon("new_doc", "J");
-        ImGui::SameLine(0, 4.0f * S);
+        fmTreeIcon("new_doc", "J", kTreeIconDp);
+        ImGui::SameLine(0, kIconGap);
+        // ImGui reserves FontSize + 2*FramePadding.x for the collapse arrow ahead of the label.
+        jobLabelX = ImGui::GetCursorPosX() + ImGui::GetFontSize() +
+                    ImGui::GetStyle().FramePadding.x * 2.0f;
         std::string jobLbl = (g.mirror.name().empty() ? std::string("CAM Job") : g.mirror.name())
                              + "  (rev " + std::to_string(g.mirror.revision()) + ")";
         jobOpen = ImGui::TreeNodeEx("##cam_job",
             ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow |
-            ImGuiTreeNodeFlags_SpanAvailWidth, "%s", jobLbl.c_str());
+            ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding,
+            "%s", jobLbl.c_str());
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) g.selKind = 1;
         if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) camTreeOpenDetail();
         fmRowPillEnd(rr, jobSel);
         if (!jobOpen) {
-            if (!g.status.empty()) { ImGui::Spacing(); ImGui::TextDisabled("%s", g.status.c_str()); }
+            camRowCaption(jobLabelX, g.status, camBusy());
             return;
         }
     }
@@ -1345,21 +1427,21 @@ void drawCamTreeBody(AppState& st) {
         ImGui::PushID("cam_stock");
         FmRowRect rr = fmRowPill(stockSel);
         {
-            const float px     = 16.0f * S;
+            const float gpx    = ui::metrics::px(kTreeIconDp);
             const float insetX = ImGui::GetStyle().FramePadding.x;
             const float rowH   = ImGui::GetFrameHeight();
             ImVec2 p0 = ImGui::GetCursorScreenPos();
-            ImGui::Dummy(ImVec2(insetX + px, rowH));
+            ImGui::Dummy(ImVec2(insetX + gpx, rowH));
             ImDrawList* dl = ImGui::GetWindowDrawList();
             // Match the secondary-ink weight of the atlas row glyphs without reaching into
             // feature_tree.cpp's (file-static) fmSurf(): the current Text colour at ~0.85 alpha.
             ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text); tc.w *= 0.85f;
             const ImU32 ink = ImGui::ColorConvertFloat4ToU32(tc);
-            const float th = std::max(1.0f, 1.2f * S);
+            const float th = ui::metrics::stroke(1.2f);
             // chudware box: a front face + a back face pushed up-right, joined at the 4 corners.
-            const float x0 = p0.x + insetX, y0 = p0.y + (rowH - px) * 0.5f;
-            const float d  = px * 0.28f;                 // isometric depth offset
-            const float fw = px - d, fh = px - d;        // front-face extent (leaves room for depth)
+            const float x0 = p0.x + insetX, y0 = p0.y + (rowH - gpx) * 0.5f;
+            const float d  = gpx * 0.28f;                // isometric depth offset
+            const float fw = gpx - d, fh = gpx - d;      // front-face extent (leaves room for depth)
             ImVec2 fTL(x0, y0 + d),        fBR(x0 + fw, y0 + d + fh);
             ImVec2 fTR(fBR.x, fTL.y),      fBL(fTL.x, fBR.y);
             ImVec2 bTL(fTL.x + d, fTL.y - d), bTR(fTR.x + d, fTR.y - d), bBR(fBR.x + d, fBR.y - d);
@@ -1370,7 +1452,7 @@ void drawCamTreeBody(AppState& st) {
             dl->AddLine(bTL, bTR, ink, th);                          // back top edge
             dl->AddLine(bTR, bBR, ink, th);                          // back right edge
         }
-        ImGui::SameLine(0, 4.0f * S);
+        ImGui::SameLine(0, kIconGap);
         if (leafSelectable(lbl)) g.selKind = 3;
         const bool stockDbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
         fmRowPillEnd(rr, stockSel);
@@ -1384,12 +1466,13 @@ void drawCamTreeBody(AppState& st) {
         const bool setupSel = (g.selKind == 4 && g.selSetup == si);
         ImGui::PushID(si);
         FmRowRect rr = fmRowPill(setupSel);
-        fmTreeIcon("ref_csys", "W");
-        ImGui::SameLine(0, 4.0f * S);
+        fmTreeIcon("ref_csys", "W", kTreeIconDp);
+        ImGui::SameLine(0, kIconGap);
         std::string lbl = s.name + "  —  " + (s.machine.empty() ? "mill" : s.machine);
         const bool open = ImGui::TreeNodeEx("##cam_setup",
             (si == g.selSetup ? ImGuiTreeNodeFlags_DefaultOpen : 0) |
-            ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth,
+            ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth |
+            ImGuiTreeNodeFlags_FramePadding,
             "%s", lbl.c_str());
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
             g.selKind = 4; g.selSetup = si; g.selOp = -1;
@@ -1428,13 +1511,17 @@ void drawCamTreeBody(AppState& st) {
                 }
                 ImGui::PushID(oi);
                 FmRowRect orr = fmRowPill(opSel);
-                fmTreeIcon(("cam_" + o.type).c_str(), "o", 16.0f, o.suppressed ? 0.45f : 1.0f);
-                ImGui::SameLine(0, 4.0f * S);
+                fmTreeIcon(("cam_" + o.type).c_str(), "o", kTreeIconDp,
+                           o.suppressed ? 0.45f : 1.0f);
+                ImGui::SameLine(0, kIconGap);
                 if (leafSelectable(ol)) {
                     g.selKind = 5; g.selSetup = si; g.selOp = oi; g.loadedOpFor = -1;
                 }
                 if (badge) {
-                    ImGui::SameLine(0, 6.0f * S);
+                    // Selectable leaves the line's text baseline at 0 — without this the badge
+                    // rides the top of the pill while the label is centered.
+                    ImGui::SameLine(0, ui::metrics::camBtnGap());
+                    ImGui::AlignTextToFramePadding();
                     ImGui::TextColored(ImVec4(badgeCol[0], badgeCol[1], badgeCol[2], badgeCol[3]), "%s", badge);
                 }
                 const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
@@ -1453,20 +1540,12 @@ void drawCamTreeBody(AppState& st) {
                 ImGui::PopID();
                 if (dbl) camTreeOpenDetail();
             }
-            if (s.ops.empty()) {
-                FmRowRect err = fmRowPill(false);
-                ImGui::TextDisabled("   (no operations — add from the ribbon)");
-                fmRowPillEnd(err, false);
-            }
+            if (s.ops.empty()) emptyNote("(no operations — add from the ribbon)");
             ImGui::TreePop();
         }
         ImGui::PopID();
     }
-    if (setups.empty()) {
-        FmRowRect err = fmRowPill(false);
-        ImGui::TextDisabled("   (no machining setup — Add Setup on the ribbon)");
-        fmRowPillEnd(err, false);
-    }
+    if (setups.empty()) emptyNote("(no machining setup — Add Setup on the ribbon)");
 
     // ---- Tools (job tool library) ----
     fmSectionDivider("Tools");
@@ -1482,44 +1561,29 @@ void drawCamTreeBody(AppState& st) {
             g.selKind = 6; g.selTool = ti;
         }
     }
-    if (tools.empty()) {
-        FmRowRect err = fmRowPill(false);
-        ImGui::TextDisabled("   (no tools — Add Tool on the ribbon)");
-        fmRowPillEnd(err, false);
-    }
+    if (tools.empty()) emptyNote("(no tools — Add Tool on the ribbon)");
 
     // ---- Models (the part docs the toolpaths are computed from) ----
     fmSectionDivider("Models");
     if (!g.sourceModel.empty()) {
         if (leafRow("cam_model", "part", "M", g.sourceModel, g.selKind == 7)) g.selKind = 7;
     } else {
-        FmRowRect err = fmRowPill(false);
-        ImGui::TextDisabled("   (none — Extract Part pulls the active part)");
-        fmRowPillEnd(err, false);
+        emptyNote("(none — Extract Part pulls the active part)");
     }
 
-    // ---- status footer ----
-    if (g.docId.empty() == false && !g.mirror.setups().empty()) {
-        ImGui::Spacing();
+    if (jobOpen) ImGui::TreePop();   // balance the ##cam_job TreeNodeEx (the footer sits outside)
+
+    // ---- footer: one full-width call to action, then the status line ----
+    if (!g.docId.empty() && !g.mirror.setups().empty()) {
+        ImGui::Dummy(ImVec2(0.0f, ui::metrics::camSectionGap()));
         if (camBusy()) ImGui::BeginDisabled();
-        if (ImGui::Button("Run: Generate > Simulate > Post")) doPipeline(st);
+        if (ImGui::Button("Generate G-code", ImVec2(-FLT_MIN, ui::metrics::camBtnH())))
+            doPipeline(st);
         if (camBusy()) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Run the whole pipeline: generate toolpaths, simulate, then post");
     }
-    if (camBusy() || !g.status.empty()) {
-        // FM chrome convention: Spacing alone separates — no orphaned hairline.
-        ImGui::Spacing();
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-        if (camBusy()) {
-            // Disabled text, not accent — matches the toolbar busy note above.
-            busyLabel(g.status.empty() ? "working..." : g.status.c_str(),
-                      ImGui::GetColorU32(ImGuiCol_TextDisabled));
-        } else {
-            ImGui::TextDisabled("%s", g.status.c_str());
-        }
-        ImGui::PopTextWrapPos();
-    }
-
-    if (jobOpen) ImGui::TreePop();   // balance the ##cam_job TreeNodeEx opened above
+    camRowCaption(ImGui::GetCursorPosX(), g.status, camBusy());
 
     if (!pendingOps.empty()) applyOps(st, pendingOps);   // after the walk — mirror reload safe
 }

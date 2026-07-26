@@ -584,6 +584,317 @@ from services.mcp.reveng_build_tools import register_reveng_build_tools
 register_reveng_session_tools(_reg.view(mcp, "reveng"))
 register_reveng_build_tools(_reg.view(mcp, "reveng"))
 
+# ---------------------------------------------------------------------------
+# Argument teaching (bench evidence: ~40 recorded run failures were "unexpected
+# keyword argument" / opaque pydantic dumps, plus a silent-drop class that never
+# failed at all). ONE wrapper at the FastMCP dispatch seam, so all 389 tools get
+# it without touching a single tool module.
+#
+# Seam: ``FastMCP._tool_manager.call_tool``. Both entry points funnel through it —
+# the wire path (``Server.call_tool`` handler registered in FastMCP.__init__ with
+# ``validate_input=False`` -> ``FastMCP.call_tool`` -> ``self._tool_manager.call_tool``,
+# see mcp/server/fastmcp/server.py:308,343-346) and every in-process
+# ``server.mcp.call_tool(...)`` caller. Wrapping ``Tool.fn`` instead would be too
+# late: FastMCP's generated arg model has pydantic's default ``extra="ignore"``
+# (mcp/server/fastmcp/utilities/func_metadata.py ArgModelBase), so an invented
+# kwarg is stripped BEFORE fn ever runs — that is exactly bug (b) below.
+#
+# Two failures this fixes:
+#  (a) opaque validation: fit_calc(shaft_diameter=10) used to raise
+#      "2 validation errors ... nominal Field required" — it named the MISSING
+#      field but never the invented one, and never listed what fit_calc accepts.
+#  (b) silent drop: add_features(doc_id=..., ops=[], operation="union") returned
+#      ok:True with `operation` discarded. The model's intent vanished silently.
+#
+# A correct call is untouched: no unknown key + no validation error means we hand
+# the exact same arguments to the exact same original with the same
+# ``convert_result`` flag, and return its result object unmodified.
+import json as _json
+import inspect as _inspect
+
+from pydantic import ValidationError as _ValidationError
+from mcp.server.fastmcp.exceptions import ToolError as _ToolError
+
+_ARG_TEACHING = os.environ.get("CHUDWARE_MCP_ARG_TEACHING", "1").strip() != "0"
+# tool name -> (tool object identity, metadata dict). Re-derived if the registry
+# swaps the Tool out from under us; otherwise this is one dict hit per call.
+_ARG_META_CACHE: dict[str, tuple] = {}
+
+
+def _norm_arg(name: str) -> str:
+    """Fold an argument name for matching: case, underscores and dashes are noise."""
+    return name.replace("_", "").replace("-", "").replace(" ", "").lower()
+
+
+def _param_type(schema: dict, wire: str) -> str:
+    prop = (schema.get("properties") or {}).get(wire) or {}
+    t = prop.get("type")
+    if isinstance(t, str):
+        return t
+    for variant in prop.get("anyOf") or ():
+        vt = variant.get("type")
+        if isinstance(vt, str) and vt != "null":
+            return vt
+    return "any"
+
+
+def _arg_meta(tool) -> dict:
+    """Per-tool parameter metadata, cached (hot path must stay a dict lookup)."""
+    cached = _ARG_META_CACHE.get(tool.name)
+    if cached is not None and cached[0] is tool:
+        return cached[1]
+
+    fields = tool.fn_metadata.arg_model.model_fields
+    names: list[str] = []
+    required: list[str] = []
+    norm_of: dict[str, str] = {}
+    by_norm: dict[str, str] = {}
+    listing: list[str] = []
+    for fname, finfo in fields.items():
+        # func_metadata aliases params that shadow a BaseModel attribute
+        # (field_json/alias="json"); the alias is the on-the-wire name.
+        wire = finfo.alias or fname
+        names.append(wire)
+        req = finfo.is_required()
+        if req:
+            required.append(wire)
+        nk = _norm_arg(wire)
+        norm_of[wire] = nk
+        by_norm[nk] = wire if nk not in by_norm else ""  # "" marks a collision
+        listing.append(f"{wire} ({'required' if req else 'optional'}, "
+                       f"{_param_type(tool.parameters, wire)})")
+
+    # A tool taking **kwargs genuinely accepts anything — never second-guess it.
+    varkw = False
+    try:
+        for p in _inspect.signature(_inspect.unwrap(tool.fn)).parameters.values():
+            if p.kind is _inspect.Parameter.VAR_KEYWORD:
+                varkw = True
+                break
+    except (TypeError, ValueError):  # builtins / unintrospectable callables
+        pass
+
+    meta = {
+        "names": names,
+        "accepted": frozenset(names),
+        "required": required,
+        "norm_of": norm_of,
+        "by_norm": {k: v for k, v in by_norm.items() if v},
+        "listing": listing,
+        "varkw": varkw,
+    }
+    _ARG_META_CACHE[tool.name] = (tool, meta)
+    return meta
+
+
+def _resolve_unknown(supplied: str, meta: dict, taken: set) -> str | None:
+    """Map an unknown argument onto a real parameter — ONLY when unambiguous.
+
+    1. exact match ignoring case/underscores  (docId -> doc_id)
+    2. the supplied name is an affix of exactly one free parameter, or vice versa
+       (shaft_diameter -> diameter).  Both sides need >=3 folded chars so a stray
+       `id` cannot capture `doc_id`.
+    """
+    nk = _norm_arg(supplied)
+    exact = meta["by_norm"].get(nk)
+    if exact is not None:
+        return exact if exact not in taken else None
+    if len(nk) < 3:
+        return None
+    hits = []
+    for wire in meta["names"]:
+        if wire in taken:
+            continue
+        pk = meta["norm_of"][wire]
+        if len(pk) < 3:
+            continue
+        if (nk.startswith(pk) or nk.endswith(pk)
+                or pk.startswith(nk) or pk.endswith(nk)):
+            hits.append(wire)
+            if len(hits) > 1:
+                return None  # ambiguous
+    return hits[0] if hits else None
+
+
+def _short_val(v) -> str:
+    r = repr(v)
+    return r if len(r) <= 40 else r[:37] + "..."
+
+
+def _corrected_call(tool_name: str, meta: dict, known: dict, dropped=()) -> str:
+    """The call the model should have written."""
+    parts = []
+    for wire in meta["names"]:
+        if wire in known:
+            parts.append(f"{wire}={_short_val(known[wire])}")
+        elif wire in meta["required"]:
+            parts.append(f"{wire}=...")
+    call = f"{tool_name}({', '.join(parts)})"
+    if dropped:
+        call += "   # drop " + ", ".join(repr(d) for d in dropped)
+    return call
+
+
+def _unknown_arg_payload(tool_name, meta, known, unresolved) -> dict:
+    s = "s" if len(unresolved) > 1 else ""
+    bad = ", ".join(repr(u) for u in unresolved)
+    return {
+        "ok": False,
+        "error": (f"{tool_name}: unknown argument{s} {bad} — not a parameter of "
+                  f"{tool_name}(), and not close enough to exactly one to guess. "
+                  f"Rejected rather than silently dropped."),
+        "unknown_arguments": list(unresolved),
+        "parameters": meta["listing"],
+        "required": list(meta["required"]),
+        "hint": _corrected_call(tool_name, meta, known, unresolved),
+    }
+
+
+def _validation_payload(tool, meta, arguments, exc) -> dict | None:
+    """Rewrite a pydantic arg-model failure into the teaching shape.
+
+    Returns None when *exc* is not an argument-validation failure (a tool body
+    that raises must keep propagating untouched).
+    """
+    cause = exc.__cause__
+    if not isinstance(cause, _ValidationError):
+        return None
+    if getattr(cause, "title", None) != tool.fn_metadata.arg_model.__name__:
+        return None  # some pydantic model INSIDE the tool blew up — not our business
+    try:
+        errs = cause.errors(include_url=False)
+    except TypeError:  # pragma: no cover - older pydantic
+        errs = cause.errors()
+
+    missing, detail = [], []
+    for e in errs:
+        arg = ".".join(str(p) for p in e.get("loc") or ()) or "<root>"
+        if e.get("type") == "missing":
+            missing.append(arg)
+        detail.append({"argument": arg, "problem": e.get("msg"), "type": e.get("type")})
+
+    if missing:
+        why = "missing required argument(s): " + ", ".join(missing)
+    else:
+        why = "; ".join(f"{d['argument']}: {d['problem']}" for d in detail)
+    return {
+        "ok": False,
+        "error": f"{tool.name}: invalid arguments — {why}",
+        "supplied": list(arguments),
+        "missing_required": missing,
+        "parameters": meta["listing"],
+        "required": list(meta["required"]),
+        "hint": _corrected_call(tool.name, meta, arguments),
+        "detail": detail,
+    }
+
+
+def _emit_payload(tool, payload: dict, convert_result: bool):
+    """Return *payload* in whatever shape this tool's own results take.
+
+    355 of 389 tools are ``-> str`` (wrap_output, {"result": string}); the other 34
+    declare no output schema (images/content blocks). Feeding the wrong one to
+    ``convert_result`` would trip the output model, so try the tool's native shape
+    first and fall back.
+    """
+    fm = tool.fn_metadata
+    as_text = _json.dumps(payload, indent=2)
+    if not convert_result:
+        return as_text if fm.wrap_output else payload
+    for candidate in ((as_text, payload) if fm.wrap_output else (payload, as_text)):
+        try:
+            return fm.convert_result(candidate)
+        except Exception:  # noqa: BLE001 - try the other shape
+            continue
+    raise _ToolError(as_text)  # last resort: the teaching text still reaches the model
+
+
+def _annotate_interpreted(result, notes: list[str]):
+    """Echo the canonical spelling back in the result so the model learns it."""
+    line = "; ".join(notes)
+    if isinstance(result, str):
+        stripped = result.lstrip()
+        if stripped.startswith("{"):
+            try:
+                obj = _json.loads(stripped)
+            except ValueError:
+                obj = None
+            if isinstance(obj, dict):
+                obj["interpreted"] = notes
+                return _json.dumps(obj, indent=2)
+        return f"{result}\n\n[interpreted] {line}"
+    if isinstance(result, dict):
+        return {**result, "interpreted": notes}
+    if isinstance(result, (list, tuple)):
+        return [*result, f"[interpreted] {line}"]
+    return [result, f"[interpreted] {line}"]
+
+
+def _install_arg_teaching(server) -> None:
+    """Wrap ``ToolManager.call_tool`` — the one seam both dispatch paths cross."""
+    # A stubbed FastMCP (test_mcp_freshness patches the module) has no manager —
+    # teaching is a bonus layer, never a hard import dependency.
+    manager = getattr(server, "_tool_manager", None)
+    if manager is None or getattr(manager, "_chudware_arg_teaching", False):
+        return
+    original = manager.call_tool
+
+    async def call_tool(name, arguments, context=None, convert_result=False):
+        tool = manager.get_tool(name)
+        if tool is None:
+            return await original(name, arguments, context=context,
+                                  convert_result=convert_result)
+        meta = _arg_meta(tool)
+        notes: list[str] = []
+        if arguments and not meta["varkw"] and not meta["accepted"].issuperset(arguments):
+            known, unresolved = {}, []
+            for k, v in arguments.items():
+                if k in meta["accepted"]:
+                    known[k] = v
+                else:
+                    unresolved.append(k)
+            taken = set(known)
+            still_unknown = []
+            for k in unresolved:
+                target = _resolve_unknown(k, meta, taken)
+                if target is None:
+                    still_unknown.append(k)
+                else:
+                    known[target] = arguments[k]
+                    taken.add(target)
+                    notes.append(f"interpreted {k!r} as {target!r}")
+            if still_unknown:
+                return _emit_payload(
+                    tool, _unknown_arg_payload(name, meta, known, still_unknown),
+                    convert_result)
+            arguments = known
+
+        try:
+            result = await original(name, arguments, context=context,
+                                    convert_result=convert_result and not notes)
+        except _ToolError as exc:
+            payload = _validation_payload(tool, meta, arguments, exc)
+            if payload is None:
+                raise
+            return _emit_payload(tool, payload, convert_result)
+
+        if notes:
+            annotated = _annotate_interpreted(result, notes)
+            if not convert_result:
+                return annotated
+            try:
+                return tool.fn_metadata.convert_result(annotated)
+            except Exception:  # noqa: BLE001 - never lose a good result over a note
+                return tool.fn_metadata.convert_result(result)
+        return result
+
+    manager.call_tool = call_tool
+    manager._chudware_arg_teaching = True
+
+
+if _ARG_TEACHING:
+    _install_arg_teaching(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

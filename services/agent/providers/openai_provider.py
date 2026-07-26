@@ -28,6 +28,15 @@ def _normalize_base_url(base_url: str | None) -> str | None:
     return u
 
 
+# Effort spellings that mean "the top rung this model offers". Older config.json pins and
+# shared role configs use them interchangeably, so each family's mapper folds them onto
+# whatever its own highest real rung is (kimi-k3 -> "max"; low|medium|high families ->
+# "high"). Nothing is clamped away — a model's full ladder stays available.
+_TOP_RUNG_ALIASES = frozenset({
+    "max", "maximum", "xhigh", "x-high", "extra_high", "extra-high", "ultra", "highest",
+})
+
+
 def wire_reasoning_effort(name: str, model: str, base_url: str | None,
                           level: str | None) -> dict:
     """Per-provider/model reasoning-effort -> OpenAI-compatible ``create()`` kwargs.
@@ -36,7 +45,9 @@ def wire_reasoning_effort(name: str, model: str, base_url: str | None,
     set and an unsupported value 400s, so we gate + remap (verified vs live docs 2026-07):
       OpenAI gpt-5*/o1/o3/o4       reasoning_effort: low|medium|high   (gpt-4*: omit)
       xAI grok-4.5/4.3/-fast/3-mini reasoning_effort: low|medium|high  (original grok-4: omit)
-      Moonshot kimi-k3            reasoning_effort: "max" only         (kimi-k2.x: omit)
+      Moonshot kimi-k3            reasoning_effort: low|high|max  (NO medium rung, so a
+                                  medium selection maps to high, the nearest real rung)
+      Moonshot kimi-k2.x          omit — thinking by default, no effort dial
       DeepSeek reasoner/v4        reasoning_effort: high|max -> "high" (deepseek-chat: omit)
       Alibaba Qwen (DashScope)    extra_body={"enable_thinking": True}  (bool; no level)
       OpenRouter                  extra_body={"reasoning":{"effort":...}}
@@ -57,6 +68,19 @@ def wire_reasoning_effort(name: str, model: str, base_url: str | None,
             return "low"
         return "high"  # xhigh / max / any other on-value
 
+    def kimi_k3() -> str:
+        """kimi-k3's wire ladder is low|high|max — there is no "medium" rung.
+
+        The full ladder is honoured, `max` included. A "medium" inherited from a shared
+        role config written for a low|medium|high model maps to "high", the nearest real
+        rung above low, rather than being dropped.
+        """
+        if lvl in ("low", "minimal"):
+            return "low"
+        if lvl in _TOP_RUNG_ALIASES:
+            return "max"
+        return "high"
+
     if any(h in b for h in ("localhost", "127.0.0.1", "::1", "0.0.0.0")):
         return {}
     # Endpoint-identified services win over model-name heuristics so a vendor-prefixed
@@ -64,7 +88,7 @@ def wire_reasoning_effort(name: str, model: str, base_url: str | None,
     if "openrouter" in b:
         return {"extra_body": {"reasoning": {"effort": lmh()}}}
     if p == "moonshot" or "moonshot.ai" in b:
-        return {"reasoning_effort": "max"} if "kimi-k3" in m else {}
+        return {"reasoning_effort": kimi_k3()} if "kimi-k3" in m else {}
     if p in ("xai", "xai-sub") or "x.ai" in b:
         return {} if m in ("grok-4", "grok-4-0709") else {"reasoning_effort": lmh()}
     if "deepseek.com" in b:
@@ -77,7 +101,7 @@ def wire_reasoning_effort(name: str, model: str, base_url: str | None,
         return {"reasoning_effort": lmh()} if m.startswith(("gpt-5", "o1", "o3", "o4")) else {}
     # No endpoint match: fall back to model-name heuristics (bare provider name / empty base).
     if m.startswith("kimi"):
-        return {"reasoning_effort": "max"} if "kimi-k3" in m else {}
+        return {"reasoning_effort": kimi_k3()} if "kimi-k3" in m else {}
     if m.startswith("grok"):
         return {} if m in ("grok-4", "grok-4-0709") else {"reasoning_effort": lmh()}
     if m.startswith("deepseek"):

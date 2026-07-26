@@ -33,39 +33,19 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Optional
 
-# Mirrors mcp_server/ledger_tools.py VALID_KINDS (the tool this shadows).
-# T-DP1 additive: the four design-pipeline stage kinds (contract design_pipeline.md §4).
-_LEDGER_NOTE_KINDS = {"brief", "decision", "dimension", "question",
-                      "requirement", "stage", "artifact", "note",
-                      "feature", "geometry_spec", "linkage", "build_node",
-                      # mega-2 / grok45-2: criterion_result is a real ledger kind
-                      # (T-W30); accept it on the note path too.
-                      "criterion_result"}
-
-# Model-facing aliases → canonical kinds (mega-2 live: kind=verdict from DELIVER;
-# grok45-2: review_verdict / audit / deliverables_manifest).
-_LEDGER_NOTE_KIND_ALIASES: dict[str, str] = {
-    "verdict": "decision",
-    "review_verdict": "decision",
-    "audit": "decision",
-    "ruling": "decision",
-    "plan_ruling": "decision",
-    "spec": "decision",
-    # mega-3 residual: intake/organize models write kind=manifest_confirm
-    "manifest_confirm": "decision",
-    "confirm": "decision",
-    "confirmation": "decision",
-    "deliverables_manifest": "artifact",
-    "manifest": "artifact",
-    "report": "artifact",
-    "battery": "artifact",
-    "criterion": "criterion_result",
-    "ac_result": "criterion_result",
-    "acceptance": "criterion_result",
-    "assumption": "decision",
-    "verification": "artifact",
-    "verification_result": "artifact",
-}
+# Ledger section / kind vocabulary lives in ONE place (services.agent.ledger_vocab)
+# so this mission-scoped shadow and services/mcp/ledger_tools.py cannot drift —
+# they had already drifted (plan_ruling existed only here), and a model that
+# learned a spelling from one path hit "unknown kind" on the other.
+from services.agent.ledger_vocab import (  # noqa: E402
+    KIND_ALIASES as _LEDGER_NOTE_KIND_ALIASES,
+    LEDGER_NOTE_KINDS as _LEDGER_NOTE_KINDS,
+    SECTION_ALIASES as _LEDGER_GET_SECTION_ALIASES,
+    kind_error as _ledger_kind_error,
+    resolve_kind as _resolve_ledger_kind,
+    resolve_section as _resolve_ledger_section,
+    section_error as _ledger_section_error,
+)
 
 
 def _coerce_ledger_payload(payload: Any) -> dict:
@@ -99,41 +79,6 @@ def _coerce_ledger_payload(payload: Any) -> dict:
             return {"items": list(payload)}
     return {"value": payload}
 
-# Model-facing section aliases → canonical ledger state keys (mega-3 residual:
-# interfaces / results / notes thrash after Fixer2 all/events/manifest).
-_LEDGER_GET_SECTION_ALIASES: dict[str, str] = {
-    "interfaces": "dimensions",
-    "interface": "dimensions",
-    "fits": "dimensions",
-    "results": "artifacts",
-    "result": "artifacts",
-    "outcomes": "artifacts",
-    "notes": "stage_log",
-    "note": "stage_log",
-    "log": "stage_log",
-    "plan": "build_nodes",
-    "acceptance": "artifacts",
-    "acceptance_criteria": "artifacts",
-    "ac": "artifacts",
-    "mission_brief": "brief",
-    "mission brief": "brief",
-    "criterion_result": "criterion_results",
-    "criterion_results": "criterion_results",
-    "ac_results": "criterion_results",
-    "verification": "criterion_results",
-    "verifications": "criterion_results",
-    # mega-24 thrash: models capitalise section names (Decisions, Dimensions, Bom)
-    "decisions": "decisions",
-    "dimensions": "dimensions",
-    "requirements": "requirements",
-    "artifacts": "artifacts",
-    "features": "features",
-    "bom": "artifacts",
-    "bill_of_materials": "artifacts",
-    "airframe components": "artifacts",
-    "airframe_components": "artifacts",
-    "components": "artifacts",
-}
 
 # T-DP1: kinds that require a `provenance` field on write (the "never recall a
 # number" rule) — dimension (contract §2) + geometry_spec (contract §3.2/§4).
@@ -304,36 +249,26 @@ class MissionDispatch:
         led = self._ledger(run_id)
         if led is None:
             return {"ok": False, "error": "no ledger bound to this mission run"}
-        # Alias full-ledger section names → rendered ledger (omit section).
-        if section in ("all", "*", "full", "entire", "everything"):
+        # Resolve the model's spelling to a canonical section (shared vocabulary):
+        # normalises decoration/case/separators, walks path-like values
+        # ("/project/mission-123/design/specs/" → "specs" → geometry_specs), then
+        # aliases and plural variants.  Only a value nothing resolves is rejected.
+        if section is not None and str(section).strip():
+            resolved = _resolve_ledger_section(section)
+            if resolved is None:
+                return _ledger_section_error(section)
+            # "all"/"*"/"full ledger" → no section, render the whole thing.
+            section = None if resolved == "all" else resolved
+        else:
             section = None
         # mega-2: models ask for section="events" (raw event log).
-        if section in ("events", "event_log", "history"):
+        if section == "events":
             return {
                 "ok": True, "run_id": led.run_id, "section": "events",
                 "data": list(led.events),
                 "event_count": len(led.events),
             }
         if section:
-            # mega-3: alias model-facing section names before allow-list.
-            # mega-24: casefold so Decisions/Dimensions/Bom resolve.
-            sec_key = str(section).strip()
-            sec_low = sec_key.lower()
-            section = (
-                _LEDGER_GET_SECTION_ALIASES.get(sec_low)
-                or _LEDGER_GET_SECTION_ALIASES.get(sec_key)
-                or sec_low
-            )
-            allowed = {"brief", "requirements", "decisions", "dimensions",
-                       "questions", "stage_log", "artifacts", "criterion_results",
-                       # T-DP1 design-pipeline sections (contract §4/§9)
-                       "features", "geometry_specs", "linkages", "build_nodes",
-                       # mega-2: intake manifest surface (also under artifacts)
-                       "manifest", "events"}
-            if section not in allowed:
-                return {"ok": False, "error": f"unknown section {section!r}",
-                        "allowed": sorted(allowed) + ["all"],
-                        "aliases": dict(_LEDGER_GET_SECTION_ALIASES)}
             if section == "manifest":
                 arts = led.state.get("artifacts") or []
                 manifests = [a for a in arts
@@ -370,18 +305,15 @@ class MissionDispatch:
         led = self._ledger(run_id)
         if led is None:
             return {"ok": False, "error": "no ledger bound to this mission run"}
-        # Normalize model aliases before allow-list (mega-2 kind=verdict, etc.).
+        # Resolve the model's spelling to a canonical kind (shared vocabulary):
+        # normalisation + aliases + plural variants (mega-2 kind=verdict,
+        # measured kind=design_spec).  Only an unresolvable kind is rejected, and
+        # the rejection now carries did_you_mean alongside the full valid set.
         raw_kind = (kind or "note").strip().lower() if isinstance(kind, str) else "note"
-        kind = _LEDGER_NOTE_KIND_ALIASES.get(raw_kind, raw_kind)
-        if kind not in _LEDGER_NOTE_KINDS:
-            return {
-                "ok": False,
-                "error": f"unknown kind {raw_kind!r}",
-                "valid_kinds": sorted(
-                    _LEDGER_NOTE_KINDS | set(_LEDGER_NOTE_KIND_ALIASES)
-                ),
-                "aliased_to": dict(_LEDGER_NOTE_KIND_ALIASES),
-            }
+        resolved_kind = _resolve_ledger_kind(raw_kind)
+        if resolved_kind is None:
+            return _ledger_kind_error(kind if isinstance(kind, str) else raw_kind)
+        kind = resolved_kind
         body = _coerce_ledger_payload(payload)
         body.update({k: v for k, v in extra.items() if not k.startswith("_")})
         # Stash original alias for audit when we remapped.

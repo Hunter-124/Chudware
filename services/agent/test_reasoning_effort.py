@@ -25,10 +25,34 @@ def test_xai_grok_passthrough_original_grok4_omit():
     assert w("xai", "grok-4", "https://api.x.ai/v1", "high") == {}
 
 
-def test_moonshot_kimi_k3_only_max_k2_omit():
-    assert w("moonshot", "kimi-k3", "https://api.moonshot.ai/v1", "low") == {"reasoning_effort": "max"}
-    assert w("moonshot", "kimi-k3", "https://api.moonshot.ai/v1", "high") == {"reasoning_effort": "max"}
-    assert w("moonshot", "kimi-k2.6", "https://api.moonshot.ai/v1", "high") == {}
+def test_moonshot_kimi_k3_honours_caller_effort():
+    # kimi-k3's real wire ladder is low|high|max. There is no medium rung, so a medium
+    # inherited from a shared low|medium|high role config maps to high (the nearest real
+    # rung above low) rather than being dropped. Nothing is clamped away.
+    k3 = "https://api.moonshot.ai/v1"
+    assert w("moonshot", "kimi-k3", k3, "low") == {"reasoning_effort": "low"}
+    assert w("moonshot", "kimi-k3", k3, "minimal") == {"reasoning_effort": "low"}
+    assert w("moonshot", "kimi-k3", k3, "medium") == {"reasoning_effort": "high"}
+    assert w("moonshot", "kimi-k3", k3, "med") == {"reasoning_effort": "high"}
+    assert w("moonshot", "kimi-k3", k3, "high") == {"reasoning_effort": "high"}
+    assert w("moonshot", "kimi-k3", k3, "max") == {"reasoning_effort": "max"}
+    assert w("moonshot", "kimi-k3", k3, "off") == {}
+
+
+def test_moonshot_kimi_k3_top_rung_aliases_reach_max():
+    # Every "give me the most" spelling lands on this model's genuine top rung.
+    k3 = "https://api.moonshot.ai/v1"
+    for raw in ("max", "MAX", " Max ", "maximum", "xhigh", "x-high", "extra_high",
+                "ultra", "highest"):
+        assert w("moonshot", "kimi-k3", k3, raw) == {"reasoning_effort": "max"}
+
+
+def test_moonshot_kimi_k2x_thinks_by_default_no_effort():
+    # K2.6/K2.7 reason natively and expose no dial — sending reasoning_effort is wrong.
+    k3 = "https://api.moonshot.ai/v1"
+    for mid in ("kimi-k2.6", "kimi-k2.7", "kimi-k2.7-code", "kimi-for-coding"):
+        assert w("moonshot", mid, k3, "high") == {}
+        assert w("moonshot", mid, k3, "low") == {}
 
 
 def test_deepseek_reasoner_high_only_chat_omit():
@@ -62,6 +86,9 @@ def test_local_endpoint_omits_even_reasoning_model():
 
 def test_model_name_fallback_when_base_url_unknown():
     # Bare provider name / empty base_url: fall back to model-name heuristics.
-    assert w("moonshot", "kimi-k3", "", "high") == {"reasoning_effort": "max"}
+    assert w("moonshot", "kimi-k3", "", "high") == {"reasoning_effort": "high"}
+    assert w("moonshot", "kimi-k3", "", "medium") == {"reasoning_effort": "high"}
+    assert w("moonshot", "kimi-k3", "", "max") == {"reasoning_effort": "max"}
+    assert w("moonshot", "kimi-k2.7", "", "high") == {}
     assert w("xai", "grok-4.5", "", "low") == {"reasoning_effort": "low"}
     assert w("openai", "gpt-5.6", "", "high") == {"reasoning_effort": "high"}

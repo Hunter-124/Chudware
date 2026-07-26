@@ -339,9 +339,97 @@ class TestHeuristics(unittest.TestCase):
         self.assertTrue(row["vision"])
 
     def test_gemini_efforts(self):
+        # Gemini exposes the full dial including "max" — the harness advertises exactly
+        # what the provider accepts and does not clamp the ladder.
         efforts = mc.reasoning_efforts_for("gemini", "gemini-2.5-flash")
         self.assertEqual(efforts, ["off", "low", "medium", "high", "max"])
         self.assertEqual(mc.reasoning_efforts_for("gemini", "gemini-2.0-flash"), [])
+
+
+class TestReasoningEffortLadders(unittest.TestCase):
+    """Family effort ladders — Kimi coverage plus a regression table for everything else."""
+
+    # (provider, model_id) -> ladder. Frozen baseline: these must not drift.
+    BASELINE = {
+        ("anthropic", "claude-opus-4-5"): ["low", "medium", "high"],
+        ("anthropic", "claude-sonnet-5"): ["low", "medium", "high"],
+        ("openai", "gpt-5"): ["low", "medium", "high"],
+        ("openai", "gpt-5.2"): ["low", "medium", "high"],
+        ("openai", "o3"): ["low", "medium", "high"],
+        ("gemini", "gemini-2.5-pro"): ["off", "low", "medium", "high", "max"],
+        ("xai", "grok-4.5"): ["off", "low", "medium", "high"],
+        ("xai", "grok-4"): ["off", "low", "medium", "high"],
+        ("xai", "grok-code-fast-1"): ["off", "low", "medium", "high"],
+        ("moonshot", "kimi-k2-thinking"): ["off", "low", "medium", "high"],
+        ("cursor", "gpt-5"): ["low", "medium", "high"],
+        ("cursor", "claude-sonnet-5"): ["low", "medium", "high"],
+        ("zenmux", "anthropic/claude-opus-4.5"): ["low", "medium", "high"],
+        ("openrouter", "anthropic/claude-opus-4.5"): ["low", "medium", "high"],
+        ("cloud", "deepseek-reasoner"): ["off", "low", "medium", "high"],
+        ("cloud", "qwen3-max"): ["off", "low", "medium", "high"],
+        ("openrouter", "deepseek/deepseek-r1"): ["off", "low", "medium", "high"],
+        ("local", "qwen3-32b"): ["off", "low", "medium", "high"],
+        ("local", "deepseek-r1-distill"): ["off", "low", "medium", "high"],
+        ("llamacpp", "qwen3-30b-a3b"): ["off", "low", "medium", "high"],
+        # Correct to have NO dial — including the families deliberately left untouched
+        # (router-prefixed gpt-5, gpt-oss, GLM): they stay dial-less by decision.
+        ("openai", "gpt-4.1"): [],
+        ("cloud", "deepseek-chat"): [],
+        ("local", "llama-3.3-70b"): [],
+        ("cursor", "composer-1"): [],
+        ("zenmux", "openai/gpt-5"): [],
+        ("cloud", "openai/gpt-5"): [],
+        ("openrouter", "z-ai/glm-4.6"): [],
+        ("llamacpp", "gpt-oss-20b"): [],
+    }
+
+    def test_baseline_ladders_unchanged(self):
+        for (provider, model), expected in self.BASELINE.items():
+            with self.subTest(provider=provider, model=model):
+                self.assertEqual(mc.reasoning_efforts_for(provider, model), expected)
+
+    def test_kimi_k3_low_high_max(self):
+        # K3's wire ladder is exactly low|high|max — no medium rung, and "max" is real,
+        # so the GUI offers all three rather than a clamped subset or a 4th that 400s.
+        for provider in ("moonshot", "kimi-code", "kimi-sub"):
+            for model in ("kimi-k3", "kimi-k3-256k", "kimi-k3-1m"):
+                with self.subTest(provider=provider, model=model):
+                    self.assertEqual(mc.reasoning_efforts_for(provider, model),
+                                     ["low", "high", "max"])
+
+    def test_kimi_k3_router_qualified_id_resolves(self):
+        # zenmux / openrouter ship the same model under a vendor-prefixed id.
+        self.assertEqual(mc.reasoning_efforts_for("zenmux", "moonshotai/kimi-k3"),
+                         ["low", "high", "max"])
+        self.assertEqual(mc.reasoning_efforts_for("openrouter", "moonshotai/kimi-k3-free"),
+                         ["low", "high", "max"])
+
+    def test_kimi_k2x_has_no_dial(self):
+        # K2.6 / K2.7 think by default and expose no effort options.
+        for model in ("kimi-k2.6", "kimi-k2.7", "kimi-k2.7-code", "kimi-for-coding",
+                      "moonshotai/kimi-k2.7-code"):
+            with self.subTest(model=model):
+                self.assertEqual(mc.reasoning_efforts_for("moonshot", model), [])
+
+    def test_every_advertised_rung_is_a_real_wire_value(self):
+        """A ladder may only offer rungs the provider actually accepts.
+
+        The harness does not clamp effort — but it must not invent a rung either. An
+        advertised level that 400s is worse than not offering it, so each family's
+        ladder is checked against the vocabulary its wire mapper recognises.
+        """
+        known = {"off", "low", "medium", "high", "max"}
+        probes = list(self.BASELINE) + [
+            ("moonshot", "kimi-k3"), ("kimi-code", "kimi-k3"), ("moonshot", "kimi-k2.7"),
+            ("gemini", "gemini-2.5-flash"), ("openai", "o4-mini"),
+        ]
+        for provider, model in probes:
+            for reasoning in (None, True, False):
+                ladder = mc.reasoning_efforts_for(provider, model, reasoning=reasoning)
+                self.assertFalse(set(ladder) - known,
+                                 f"{provider}/{model} advertises an unknown rung: {ladder}")
+                self.assertEqual(len(ladder), len(set(ladder)),
+                                 f"{provider}/{model} has a duplicate rung: {ladder}")
 
 
 class TestConfigConsumesCatalog(unittest.TestCase):

@@ -1078,8 +1078,20 @@ TEST_CASE("openai_reasoning_patch: per-provider/model reasoning-effort gating") 
     CHECK(openai_reasoning_patch("xai", "grok-4.5", "https://api.x.ai/v1", "low")
               .value("reasoning_effort", std::string()) == "low");
     CHECK(openai_reasoning_patch("xai", "grok-4", "https://api.x.ai/v1", "high").empty());
-    // Moonshot: kimi-k3 -> only "max"; kimi-k2.6 -> omit (uses `thinking`).
+    // Moonshot kimi-k3 takes low|high|max and HONOURS the caller — it used to be
+    // hardcoded to "max" regardless of the user's setting, so the dial did nothing.
+    // There is no medium rung, so medium maps to high (the nearest real rung above
+    // low). kimi-k2.6 omits reasoning_effort entirely (it uses `thinking`).
     CHECK(openai_reasoning_patch("moonshot", "kimi-k3", "https://api.moonshot.ai/v1", "low")
+              .value("reasoning_effort", std::string()) == "low");
+    CHECK(openai_reasoning_patch("moonshot", "kimi-k3", "https://api.moonshot.ai/v1", "medium")
+              .value("reasoning_effort", std::string()) == "high");
+    CHECK(openai_reasoning_patch("moonshot", "kimi-k3", "https://api.moonshot.ai/v1", "high")
+              .value("reasoning_effort", std::string()) == "high");
+    CHECK(openai_reasoning_patch("moonshot", "kimi-k3", "https://api.moonshot.ai/v1", "max")
+              .value("reasoning_effort", std::string()) == "max");
+    // Same through the model-name fallback arm (bare provider / empty base_url).
+    CHECK(openai_reasoning_patch("", "kimi-k3", "", "max")
               .value("reasoning_effort", std::string()) == "max");
     CHECK(openai_reasoning_patch("moonshot", "kimi-k2.6", "https://api.moonshot.ai/v1", "high")
               .empty());

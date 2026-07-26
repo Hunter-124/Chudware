@@ -568,6 +568,20 @@ def reasoning_efforts_for(provider: str, model_id: str, *, reasoning: bool | Non
         if "build" in m:
             return []
         return ["off", "low", "medium", "high"]
+    # Moonshot / Kimi Code. Router catalogs (zenmux, openrouter) ship the SAME model as
+    # `moonshotai/kimi-k3`, so this one arm matches on the bare id; every other family
+    # keeps matching the full id exactly as before. `kimi-k2-thinking` is a distinct id
+    # that keeps the generic think ladder below, so it is excluded here.
+    kimi = m.rsplit("/", 1)[-1]
+    if kimi.startswith("kimi") and "think" not in kimi:
+        # K3's real wire ladder is low|high|max — there is NO medium rung, so the GUI
+        # offers exactly the three the endpoint accepts rather than a fourth that would
+        # 400. wire_reasoning_effort maps a medium inherited from a shared role config
+        # onto "high", the nearest real rung above low.
+        if "kimi-k3" in kimi:
+            return ["low", "high", "max"]
+        # K2.x (k2.6 / k2.7 / -code) think by default and expose no effort dial.
+        return []
     if p == "openai" or m.startswith("gpt") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"):
         if re.match(r"o[0-9]", m) or "gpt-5" in m or "o1" in m or "o3" in m or "o4" in m:
             return ["low", "medium", "high"]

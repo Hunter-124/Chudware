@@ -27,6 +27,8 @@ Return type mirrors the ``AgentResult`` duck-type node_runner expects:
 """
 from __future__ import annotations
 
+import difflib
+import inspect
 import json
 import logging
 import re
@@ -2715,9 +2717,404 @@ def resolver_for(mission_dispatch: Any | None = None) -> Callable[[str], Any]:
             fn = mission_dispatch.resolve(tool)
             if fn is not None:
                 return fn
-        from services.agent.reviewer_exec import _resolve_fn
-        return _resolve_fn(tool)
+        return _bind_tool(tool)
     return _resolve
+
+
+# ---------------------------------------------------------------------------
+# Dispatch chokepoint: tool BINDING and argument RECONCILIATION
+# ---------------------------------------------------------------------------
+# Two failure classes dominated the recorded bench ledgers and both died right
+# here, in _dispatch_tool._call:
+#
+#   1. "tool 'X' could not be resolved".  reviewer_exec._resolve_fn walks a
+#      HAND-MAINTAINED list of MCP module keys, so a tool living in a module
+#      nobody remembered to add was advertised to the model and then unbindable
+#      — and the KeyError said nothing the model could act on.  The fallback
+#      below binds against the REAL server registry (mcp_server.server, the same
+#      catalog the tools are advertised from), so the gap cannot reopen when a
+#      new *_tools.py module lands.  When a name still cannot be bound, the
+#      error says whether it is UNKNOWN (model invented it) or KNOWN-BUT-UNBOUND
+#      (harness gap / wrong context) and offers the closest real names.
+#
+#   2. TypeError("... got an unexpected keyword argument 'shaft_diameter'") —
+#      the raw Python error names the offence but never the cure.
+#      _reconcile_kwargs maps unambiguous synonyms (and SAYS it did), and
+#      otherwise returns a teaching error listing the real parameter set.
+
+# fn -> signature digest.  Every tool call hits this, so it must be a dict hit.
+_SIG_CACHE: dict[Any, dict] = {}
+# name -> callable (directly callable) | None (registered but not callable here).
+_SERVER_TOOL_CACHE: dict[str, Any] | None = None
+_KNOWN_TOOLS_CACHE: frozenset[str] | None = None
+
+
+def _directly_callable(fn: Any) -> bool:
+    """True when the agent's SYNC dispatcher can actually invoke *fn*.
+
+    An ``async def`` tool, or one taking the FastMCP ``Context`` (e.g. ask_user,
+    which raises an MCP elicitation), cannot be called from here — binding it
+    would return an un-awaited coroutine or blow up on a missing ``ctx``.  Those
+    are reported as known-but-unbound instead of being fake-bound."""
+    if fn is None or inspect.iscoroutinefunction(fn):
+        return False
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    for p in params:
+        if p.name == "ctx" or "context" in str(p.annotation).lower():
+            return False
+    return True
+
+
+def _server_tools() -> dict[str, Any]:
+    """The live MCP server registry as ``name -> callable | None`` (cached).
+
+    This is the SAME registry the tools are advertised from, so anything the
+    model can be handed resolves here — no per-module allow-list to forget.
+    Imported lazily (only on a resolver miss) because it builds every tool
+    module; a hit costs one dict lookup afterwards."""
+    global _SERVER_TOOL_CACHE
+    if _SERVER_TOOL_CACHE is None:
+        out: dict[str, Any] = {}
+        try:
+            from mcp_server.server import mcp as _srv  # noqa: PLC0415
+            for name, entry in getattr(_srv._tool_manager, "_tools", {}).items():
+                fn = getattr(entry, "fn", None)
+                out[str(name)] = fn if _directly_callable(fn) else None
+        except Exception:  # noqa: BLE001 — registry absent → no fallback, no crash
+            out = {}
+        _SERVER_TOOL_CACHE = out
+    return _SERVER_TOOL_CACHE
+
+
+def _known_tool_names() -> frozenset[str]:
+    """Every tool name this harness ADVERTISES anywhere (cached).
+
+    Union of the MCP server registry, the verify battery's check table, every
+    role card's tool_allowlist (where the mission-scoped names like delegate /
+    part_search live) and the turn-level meta tools.  Used to tell an invented
+    name apart from a real one the dispatcher failed to bind."""
+    global _KNOWN_TOOLS_CACHE
+    if _KNOWN_TOOLS_CACHE is None:
+        names: set[str] = set(_server_tools())
+        try:
+            from services.verify.battery import CHECKS  # noqa: PLC0415
+            names |= set(CHECKS)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from services.agent.roles import load_all_roles  # noqa: PLC0415
+            for card in load_all_roles().values():
+                names |= {t.tool for t in card.tool_allowlist if t.tool}
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from services.agent.tool_categories import META_TOOLS  # noqa: PLC0415
+            names |= set(META_TOOLS)
+        except Exception:  # noqa: BLE001
+            pass
+        _KNOWN_TOOLS_CACHE = frozenset(names)
+    return _KNOWN_TOOLS_CACHE
+
+
+def _bind_tool(tool: str) -> Any:
+    """Resolve *tool* to a callable, or None.  Resolution order:
+
+      1. reviewer_exec._resolve_fn — the battery singleton + curated modules
+         (already-imported, cheapest, and the run-scoped behaviour tests pin);
+      2. the full MCP server registry (lazy, closes the module-coverage class);
+      3. design_recipe, which is implemented in-process, not as an MCP tool.
+    """
+    from services.agent.reviewer_exec import _resolve_fn  # noqa: PLC0415
+    fn = _resolve_fn(tool)
+    if fn is not None:
+        return fn
+    fn = _server_tools().get(tool)
+    if fn is not None:
+        return fn
+    if tool == "design_recipe":
+        try:
+            from services.agent.design_recipe import design_recipe  # noqa: PLC0415
+            return design_recipe
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _unresolved_tool_error(tool: str) -> dict:
+    """Teaching error for a tool nothing could bind.
+
+    States UNKNOWN vs KNOWN-BUT-UNBOUND explicitly — the model must react
+    differently (pick another name vs. stop retrying, it is a harness gap)."""
+    server = _server_tools()
+    bindable = sorted(n for n, f in server.items() if f is not None)
+    # Suggest OTHER names — echoing the failed name back teaches nothing.
+    pool = sorted(n for n in _known_tool_names() if n != tool)
+    close = difflib.get_close_matches(tool, pool, n=6, cutoff=0.6)
+    if not close:
+        close = difflib.get_close_matches(tool, [b for b in bindable if b != tool],
+                                          n=6, cutoff=0.45)
+    # Only claim "did you mean" on a near-certain match; a weak difflib hit
+    # pointed at an unrelated tool is worse than no suggestion.
+    strong = difflib.get_close_matches(tool, pool, n=1, cutoff=0.8)
+    if tool in server and server[tool] is None:
+        return {
+            "ok": False,
+            "status": "known_but_unbound",
+            "harness_bug": True,
+            # Keeps the literal "could not be resolved" marker: the bench
+            # taxonomy (tools/flywheel/bench/gym/taxonomy.py) and reviewer_exec's
+            # provision-absence check both key off it to attribute this to the
+            # HARNESS, not to model misuse.
+            "error": (
+                f"tool '{tool}' could not be resolved in this context: it EXISTS "
+                f"in the tool registry but cannot be bound here — it is an async "
+                f"/ interactive tool (it needs an MCP Context, e.g. to elicit an "
+                f"answer from the user) and this agent turn dispatches tools "
+                f"synchronously. This is a HARNESS BINDING GAP, not your mistake "
+                f"— retrying the same call will fail identically. Achieve the "
+                f"goal another way, or state in your handoff that '{tool}' is "
+                f"unavailable here."
+            ),
+            "closest_tools": close,
+        }
+    if tool in _known_tool_names():
+        return {
+            "ok": False,
+            "status": "known_but_unbound",
+            "harness_bug": True,
+            "error": (
+                f"tool '{tool}' is ADVERTISED to you but could not be resolved in "
+                f"this run: it is a mission-scoped tool (it needs a live mission "
+                f"run — ledger, run_id, delegation tree) and this turn has no "
+                f"mission context. This is a HARNESS BINDING GAP, not your "
+                f"mistake — retrying the same call will fail identically. "
+                f"Continue with the tools that do bind and say so in your handoff."
+            ),
+            "closest_tools": close,
+        }
+    return {
+        "ok": False,
+        "status": "unknown_tool",
+        "error": (
+            f"tool '{tool}' is not a tool in this harness (no such name is "
+            f"registered). You invented or mistyped the name — the call was NOT "
+            f"made. Use one of the closest real names below, or call "
+            f"list_tool_categories() to see what is available."
+        ),
+        "closest_tools": close,
+        "hint": (f"did you mean {strong[0]}(...)?" if strong else
+                 "call list_tool_categories() to see the available tool packs"),
+    }
+
+
+def _signature_spec(fn: Any) -> dict:
+    """Cached ``inspect.signature`` digest of a tool callable.
+
+    ``var_kw`` True means "pass args through untouched" — the function accepts
+    ``**kwargs`` (or has positional-only params, which keyword reconciliation
+    cannot help with), so there is nothing to reconcile."""
+    spec = _SIG_CACHE.get(fn)
+    if spec is not None:
+        return spec
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        spec = {"var_kw": True, "params": (), "required": frozenset(), "ann": {}}
+    else:
+        var_kw = False
+        names: list[str] = []
+        required: set[str] = set()
+        ann: dict[str, str] = {}
+        for p in sig.parameters.values():
+            if p.kind is inspect.Parameter.VAR_KEYWORD:
+                var_kw = True
+            elif p.kind is inspect.Parameter.VAR_POSITIONAL:
+                continue
+            elif p.kind is inspect.Parameter.POSITIONAL_ONLY:
+                var_kw = True  # not addressable by keyword at all
+            else:
+                names.append(p.name)
+                if p.default is inspect.Parameter.empty:
+                    required.add(p.name)
+                ann[p.name] = ("" if p.annotation is inspect.Parameter.empty
+                               else str(p.annotation).lower())
+        spec = {"var_kw": var_kw, "params": tuple(names),
+                "required": frozenset(required), "ann": ann}
+    if len(_SIG_CACHE) < 4096:
+        _SIG_CACHE[fn] = spec
+    return spec
+
+
+def _norm_arg(name: str) -> str:
+    return str(name).lower().replace("_", "").replace("-", "")
+
+
+def _annotation_admits(ann: str, value: Any) -> bool:
+    """True when *value* is plausibly what annotation *ann* asks for.
+
+    The synonym mapper's safety catch: describe_project(run_id="m1") must NOT be
+    rewritten to run=<str> when ``run`` is annotated ``Optional[dict]`` — a
+    silently wrong call is worse than an honest teaching error.  Ambiguous or
+    absent annotations admit everything (we only ever REFUSE on a clear clash)."""
+    if not ann or value is None:
+        return True
+    kinds = {
+        "dict": ("dict" in ann or "mapping" in ann),
+        "list": ("list" in ann or "sequence" in ann or "tuple" in ann),
+        "str": ("str" in ann),
+        "num": ("int" in ann or "float" in ann),
+        "bool": ("bool" in ann),
+    }
+    hit = [k for k, v in kinds.items() if v]
+    if len(hit) != 1:
+        return True  # union / unannotated / unrecognised → cannot judge
+    kind = hit[0]
+    if kind == "dict":
+        return isinstance(value, dict)
+    if kind == "list":
+        return isinstance(value, (list, tuple))
+    if kind == "bool":
+        return isinstance(value, bool)
+    if kind == "str":
+        return isinstance(value, str)
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        try:
+            float(value)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _map_arg_name(supplied: str, value: Any, spec: dict, used: set[str]) -> str | None:
+    """Map a supplied argument name onto a real parameter, or None.
+
+    Only UNAMBIGUOUS mappings are made: an exact match ignoring case and
+    underscores, or an affix relation (one name is a prefix/suffix of the other,
+    e.g. shaft_diameter → diameter) that exactly ONE free parameter satisfies
+    and whose annotation admits the supplied value."""
+    free = [p for p in spec["params"] if p not in used]
+    ns = _norm_arg(supplied)
+    if not ns:
+        return None
+    exact = [p for p in free if _norm_arg(p) == ns]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    affix = []
+    for p in free:
+        np = _norm_arg(p)
+        if min(len(np), len(ns)) < 3:
+            continue  # 1–2 char names collide by accident, never by intent
+        if ns.startswith(np) or ns.endswith(np) or np.startswith(ns) or np.endswith(ns):
+            affix.append(p)
+    if len(affix) != 1:
+        return None
+    target = affix[0]
+    return target if _annotation_admits(spec["ann"].get(target, ""), value) else None
+
+
+def _bad_kwargs_error(tool: str, spec: dict, supplied: dict,
+                      unmapped: list[str], config_keys: set[str]) -> dict:
+    """Teaching error for argument names that are not parameters of *tool*."""
+    params = spec["params"]
+    req = spec["required"]
+    good = {k: v for k, v in supplied.items() if k in params}
+    corrected = [f"{k}={v!r}" for k, v in good.items()]
+    corrected += [f"{p}=<{p}>" for p in params if p in req and p not in good]
+    payload = {
+        "ok": False,
+        "status": "unknown_argument",
+        "error": (
+            f"{tool}() got unknown argument(s) "
+            f"{', '.join(repr(u) for u in unmapped)} — no parameter of that name "
+            f"and no unambiguous synonym. The call was NOT made (nothing was "
+            f"dropped silently). Re-issue it using only the accepted parameters."
+        ),
+        "accepted_params": [
+            f"{p} (required)" if p in req else f"{p} (optional)" for p in params
+        ],
+        "unknown_params": list(unmapped),
+        "hint": f"{tool}({', '.join(corrected)})",
+    }
+    from_config = [u for u in unmapped if u in config_keys]
+    if from_config:
+        # Not the model's mistake: a param_default the user configured is not a
+        # parameter of this tool. Say so, or the model burns the turn rephrasing.
+        payload["from_config"] = from_config
+        payload["error"] += (
+            f" NOTE: {', '.join(repr(c) for c in from_config)} came from "
+            f"agent.tool_options param_defaults (Settings → AI → Tools), NOT "
+            f"from your call — you cannot fix it by rephrasing; report it."
+        )
+    try:
+        from services.agent.tool_hints import hint_for  # noqa: PLC0415
+        extra = hint_for(tool)
+        if extra:
+            payload["tool_hint"] = extra
+    except Exception:  # noqa: BLE001
+        pass
+    return payload
+
+
+def _reconcile_kwargs(tool: str, fn: Any, supplied: dict,
+                      config_keys: set[str] | None = None) -> tuple[dict, list[str], dict | None]:
+    """Reconcile *supplied* against *fn*'s real signature.
+
+    Returns ``(kwargs, notes, error)``. ``error`` non-None means DO NOT CALL —
+    it is the teaching payload to hand back to the model."""
+    spec = _signature_spec(fn)
+    if spec["var_kw"] or not supplied:
+        return supplied, [], None
+    params = spec["params"]
+    kwargs: dict[str, Any] = {}
+    notes: list[str] = []
+    unmapped: list[str] = []
+    used = {k for k in supplied if k in params}
+    for name, value in supplied.items():
+        if name in params:
+            kwargs[name] = value
+            continue
+        target = _map_arg_name(name, value, spec, used)
+        if target is None:
+            unmapped.append(name)
+            continue
+        kwargs[target] = value
+        used.add(target)
+        notes.append(f"interpreted {name!r} as {target!r}")
+    if unmapped:
+        return {}, [], _bad_kwargs_error(tool, spec, supplied, unmapped,
+                                         config_keys or set())
+    return kwargs, notes, None
+
+
+def _attach_arg_notes(result: Any, notes: list[str]) -> Any:
+    """Surface applied synonym mappings in the tool result so the model LEARNS
+    the canonical parameter name instead of re-guessing next call."""
+    note = "; ".join(notes)
+    _log_mod.info("tool arg reconciliation: %s", note)
+    if isinstance(result, dict):
+        out = dict(result)
+        out.setdefault("arg_interpretation", note)
+        return out
+    if isinstance(result, str) and result.lstrip().startswith("{"):
+        try:
+            obj = json.loads(result)
+        except Exception:  # noqa: BLE001
+            return result
+        if isinstance(obj, dict):
+            obj.setdefault("arg_interpretation", note)
+            try:
+                return json.dumps(obj, default=str)
+            except Exception:  # noqa: BLE001
+                return result
+    return result
 
 
 def _dispatch_tool(
@@ -2733,14 +3130,16 @@ def _dispatch_tool(
     Uses the reviewer_exec resolver (which extends battery._get_fn to the intake /
     verify modules), so ANY §16-ish tool resolves through ONE process-wide registry.
     Applies agent.tool_options (param_defaults, max_calls_per_turn, timeout_s) and
-    appends tool_hints on failure. Raises on unresolved tool or dispatch failure —
-    the caller feeds the error back to the model (never a fabricated success).
+    appends tool_hints on failure. An unresolvable tool or an unknown argument
+    name returns a TEACHING error payload (ok:false + the closest real names /
+    the real parameter set) instead of a bare KeyError/TypeError; a genuine
+    tool-side failure still raises, and the caller feeds it back to the model
+    (never a fabricated success).
     If *_inner* is provided it is called instead of the default resolver (used when
     the turn supplied a custom tool_dispatch). If *_loop_guard* (a ToolCallLoopGuard,
     see tool_loop_guard.py) is provided and this exact (tool, args) pair repeats the
     immediately-prior successful call past its threshold, the call is refused
     (RuntimeError with a corrective message) rather than dispatched again."""
-    from services.agent.reviewer_exec import _resolve_fn
 
     if _loop_guard is not None:
         detection = _loop_guard.check(tool, args)
@@ -2778,6 +3177,9 @@ def _dispatch_tool(
         _call_counts[tool] = n + 1
 
     merged = dict(opts.get("param_defaults") or {})
+    # Names the MODEL did not supply — a bad one here is a Settings bug, and the
+    # teaching error must say so rather than blame the call.
+    config_keys = set(merged) - set(args or {})
     if args:
         merged.update(args)  # call args win
 
@@ -2797,13 +3199,17 @@ def _dispatch_tool(
         if _inner is not None:
             # Custom turn tool_dispatch has signature (tool, args).
             return _inner(tool, merged or {})
-        fn = _resolve_fn(tool)
+        fn = _bind_tool(tool)
         if fn is None:
-            if tool == "design_recipe":
-                from services.agent.design_recipe import design_recipe as _dr  # noqa: PLC0415
-                return _dr(**(merged or {}))
-            raise KeyError(f"tool {tool!r} could not be resolved")
-        return fn(**(merged or {}))
+            # A dead end teaches nothing: say unknown-vs-unbound and name the
+            # closest real tools instead of raising a bare KeyError.
+            return _unresolved_tool_error(tool)
+        kwargs, notes, arg_error = _reconcile_kwargs(tool, fn, merged or {},
+                                                     config_keys)
+        if arg_error is not None:
+            return arg_error
+        result = fn(**kwargs)
+        return _attach_arg_notes(result, notes) if notes else result
 
     def _call_with_timeout() -> Any:
         """Run ``_call`` on a worker thread and give up after *timeout_f*.
@@ -5906,8 +6312,7 @@ def _resolve_tool_dispatch(dispatch: Callable | None = None) -> Callable | None:
 
     def _dispatch(tool: str, args: dict) -> Any:
         try:
-            from services.agent import reviewer_exec as _re  # noqa: PLC0415
-            fn = _re._resolve_fn(tool)
+            fn = _bind_tool(tool)
         except Exception:  # noqa: BLE001
             fn = None
         if fn is None:

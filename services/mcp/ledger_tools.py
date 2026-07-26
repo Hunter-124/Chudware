@@ -31,46 +31,35 @@ def register_ledger_tools(mcp) -> None:
         the rendering budget (default 800).
         """
         from services.agent.ledger import Ledger, ledger_render
+        from services.agent.ledger_vocab import (
+            resolve_section as _resolve_section,
+            section_error as _section_error,
+        )
 
         ledger = Ledger.load(run_id)
-        # mega-2: models pass section="all" meaning full render, not a named key.
-        if section in ("all", "*", "full", "entire", "everything"):
+        # Resolve the model's spelling to a canonical section (shared vocabulary
+        # with services/agent/mission_dispatch.py — the mission-scoped shadow of
+        # this tool): normalises decoration/case/separators, walks path-like
+        # values ("/project/mission-123/design/specs/" → "specs" →
+        # geometry_specs), then aliases and plural variants.  "all"/"*"/"full"
+        # mean the whole rendered ledger.  Only an unresolvable value errors, and
+        # the error carries did_you_mean plus the full accepted set.
+        if section is not None and str(section).strip():
+            resolved = _resolve_section(section)
+            if resolved is None:
+                return _section_error(section)
+            section = None if resolved == "all" else resolved
+        else:
             section = None
-        if section in ("events", "event_log", "history"):
+        # mega-2: models ask for section="events" (raw event log).
+        if section == "events":
             return {
                 "ok": True, "run_id": run_id, "section": "events",
                 "data": list(ledger.events),
                 "event_count": len(ledger.events),
             }
         if section:
-            # mega-3 residual: interfaces/results/notes model thrash.
-            _SECTION_ALIASES = {
-                "interfaces": "dimensions", "interface": "dimensions",
-                "fits": "dimensions",
-                "results": "artifacts", "result": "artifacts",
-                "outcomes": "artifacts",
-                "notes": "stage_log", "note": "stage_log", "log": "stage_log",
-                "plan": "build_nodes",
-                "acceptance": "artifacts", "acceptance_criteria": "artifacts",
-                "ac": "artifacts",
-                "mission_brief": "brief",
-                "criterion_result": "criterion_results",
-                "criterion_results": "criterion_results",
-                "ac_results": "criterion_results",
-                "verification": "criterion_results",
-                "verifications": "criterion_results",
-            }
-            section = _SECTION_ALIASES.get(section, section)
-            # Return raw state section as JSON (no token budget needed)
             state = ledger.state
-            allowed = {"brief", "requirements", "decisions", "dimensions",
-                       "questions", "stage_log", "artifacts", "criterion_results",
-                       "features", "geometry_specs", "linkages", "build_nodes",
-                       "manifest", "events"}
-            if section not in allowed:
-                return {"ok": False, "error": f"unknown section {section!r}",
-                        "allowed": sorted(allowed) + ["all"],
-                        "aliases": dict(_SECTION_ALIASES)}
             if section == "manifest":
                 arts = state.get("artifacts") or []
                 manifests = [a for a in arts
@@ -162,29 +151,21 @@ def register_ledger_tools(mcp) -> None:
         table / user answer) — contract rule.
         """
         from services.agent.ledger import Ledger
+        from services.agent.ledger_vocab import (
+            kind_error as _kind_error,
+            resolve_kind as _resolve_kind,
+        )
 
-        VALID_KINDS = {"brief", "decision", "dimension", "question",
-                       "requirement", "stage", "artifact", "note",
-                       "feature", "geometry_spec", "linkage", "build_node",
-                       "criterion_result"}
-        KIND_ALIASES = {
-            "verdict": "decision", "review_verdict": "decision",
-            "audit": "decision", "ruling": "decision", "spec": "decision",
-            "manifest_confirm": "decision", "confirm": "decision",
-            "confirmation": "decision",
-            "deliverables_manifest": "artifact", "manifest": "artifact",
-            "report": "artifact", "battery": "artifact",
-            "criterion": "criterion_result", "ac_result": "criterion_result",
-            "acceptance": "criterion_result",
-            "assumption": "decision",
-            "verification": "artifact", "verification_result": "artifact",
-        }
-        raw_kind = (kind or "").strip().lower() if isinstance(kind, str) else ""
-        kind = KIND_ALIASES.get(raw_kind, raw_kind)
-        if kind not in VALID_KINDS:
-            return {"ok": False, "error": f"unknown kind {raw_kind!r}",
-                    "valid_kinds": sorted(VALID_KINDS | set(KIND_ALIASES)),
-                    "aliased_to": KIND_ALIASES}
+        # Shared vocabulary with services/agent/mission_dispatch.py (the
+        # mission-scoped shadow of this tool): normalisation + aliases + plural
+        # variants resolve the spellings models actually emit (verdict,
+        # design_spec, …); only an unresolvable kind is rejected, with
+        # did_you_mean alongside the full valid set.
+        raw_kind = (kind or "note").strip().lower() if isinstance(kind, str) else "note"
+        resolved_kind = _resolve_kind(raw_kind)
+        if resolved_kind is None:
+            return _kind_error(kind if isinstance(kind, str) else raw_kind)
+        kind = resolved_kind
 
         # mega-24: models (esp. leaves) send payload as a JSON string.
         if isinstance(payload, str):

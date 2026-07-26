@@ -533,3 +533,170 @@ class TestModelMatchDispatch:
         out = md.reverse_engineer_product(url="https://a/x")
         assert out["ok"] is True and out["session_id"] == "s1"
         assert seen["url"] == "https://a/x"
+
+# ---------------------------------------------------------------------------
+# ledger vocabulary — shared section/kind resolution (services.agent.ledger_vocab)
+#
+# Measured: 27 `ledger_get unknown section` + 24 `ledger_note unknown kind`
+# across 93 recorded bench runs.  Both checks already returned the accepted set,
+# so the vocabulary — not the error shape — was the defect.
+# ---------------------------------------------------------------------------
+
+def _mcp_ledger_tools():
+    """The MCP twins of ledger_get/ledger_note, registered on a fake FastMCP."""
+    tools: dict = {}
+
+    class _FakeMCP:
+        def tool(self, *a, **kw):  # noqa: ARG002
+            def deco(fn):
+                tools[fn.__name__] = fn
+                return fn
+            return deco
+
+    from services.mcp.ledger_tools import register_ledger_tools
+    register_ledger_tools(_FakeMCP())
+    return tools
+
+
+class TestLedgerVocabulary:
+    @pytest.mark.parametrize("section,canonical", [
+        # the measured failure: a path-like section from a design-stage model
+        ("/project/mission-123/design/specs/", "geometry_specs"),
+        ("ledger/decisions", "decisions"),
+        # measured (bench-live C1): section="specifications"
+        ("specifications", "geometry_specs"),
+        ("state.artifacts", "artifacts"),
+        # decoration / case / separator thrash
+        ("  Design Specs  ", "geometry_specs"),
+        ("'stage-log'", "stage_log"),
+        ("Build Nodes", "build_nodes"),
+        ("ledger_decisions", "decisions"),
+        ("requirements_list", "requirements"),
+        # singular⇄plural
+        ("decision", "decisions"),
+        ("question", "questions"),
+        ("criterion_results", "criterion_results"),
+        # widened synonyms
+        ("deliverables", "artifacts"),
+        ("open_questions", "questions"),
+        ("constraints", "requirements"),
+        ("objective", "brief"),
+        # measured: a qualifier bolted onto a real word (head is never used
+        # alone — "design_specifications" is specs, not the whole ledger)
+        ("design_specifications", "geometry_specs"),
+        ("mission_specifications", "geometry_specs"),
+    ])
+    def test_section_spellings_resolve(self, md, section, canonical):
+        got = md.ledger_get(section=section)
+        assert got["ok"] is True, got
+        assert got["section"] == canonical
+
+    @pytest.mark.parametrize("section", [
+        "/runs/x/ALL/", "Full Ledger", "everything", "*",
+        # measured (bench-live C1): "design" is not one section — render it all
+        # rather than guess wrong.
+        "design",
+    ])
+    def test_whole_ledger_spellings_render(self, md, section):
+        got = md.ledger_get(section=section)
+        assert got["ok"] is True and "rendered" in got
+
+    @pytest.mark.parametrize("kind,canonical", [
+        # the measured failure
+        ("design_spec", "decision"),
+        ("Design Spec", "decision"),
+        ("specifications", "decision"),
+        ("requirements", "requirement"),
+        ("open_question", "question"),
+        ("milestone", "stage"),
+        ("observation", "note"),
+        ("test_result", "criterion_result"),
+        ("deliverable", "artifact"),
+        # measured (bench ledgers): audit_findings / verify_result / error
+        ("audit_findings", "note"),
+        ("verify_result", "artifact"),
+        ("error", "note"),
+    ])
+    def test_kind_spellings_resolve(self, md, kind, canonical):
+        out = md.ledger_note(kind=kind, payload={"id": "K1", "text": "t"})
+        assert out["ok"] is True, out
+        assert out["kind"] == canonical
+        assert out.get("aliased_from") == kind.strip().lower()
+
+    def test_nonsense_section_still_errors_with_teaching_payload(self, md):
+        got = md.ledger_get(section="florble_gorb")
+        assert got["ok"] is False
+        # pre-existing keys survive (consumers read them) …
+        assert "decisions" in got["allowed"] and "all" in got["allowed"]
+        assert got["aliases"]["interfaces"] == "dimensions"
+        # … and the new fuzzy suggestion list is present.
+        assert "did_you_mean" in got and isinstance(got["did_you_mean"], list)
+        assert "hint" in got
+
+    def test_deliverable_id_as_section_is_named_in_the_hint(self, md):
+        """Measured: models pass a deliverable id ("DL1") where a section goes."""
+        got = md.ledger_get(section="DL1")
+        assert got["ok"] is False
+        assert "deliverable" in got["hint"] and "allowed" in got["hint"]
+
+    def test_near_miss_section_suggests_the_real_one(self, md):
+        got = md.ledger_get(section="decisons")
+        assert got["ok"] is False
+        assert "decisions" in got["did_you_mean"]
+        assert "decisions" in got["hint"]
+
+    def test_nonsense_kind_still_errors_with_teaching_payload(self, md):
+        out = md.ledger_note(kind="florble_gorb", payload={"text": "x"})
+        assert out["ok"] is False
+        assert "decision" in out["valid_kinds"] and "verdict" in out["valid_kinds"]
+        assert out["aliased_to"]["verdict"] == "decision"
+        assert isinstance(out["did_you_mean"], list) and "hint" in out
+
+    def test_near_miss_kind_suggests_the_real_one(self, md):
+        out = md.ledger_note(kind="dimensionn", payload={"text": "x"})
+        assert out["ok"] is False
+        assert "dimension" in out["did_you_mean"]
+
+    def test_no_geometry_spec_write_without_provenance(self, md):
+        """Widening the vocabulary must not slip past a real check."""
+        out = md.ledger_note(kind="geo_spec", payload={"id": "G1"})
+        assert out["ok"] is False and "provenance" in out["error"]
+
+    def test_tables_are_the_shared_ones(self):
+        """mission_dispatch and ledger_vocab cannot drift — same objects."""
+        from services.agent import ledger_vocab as lv
+        from services.agent import mission_dispatch as mdisp
+
+        assert mdisp._LEDGER_NOTE_KIND_ALIASES is lv.KIND_ALIASES
+        assert mdisp._LEDGER_NOTE_KINDS is lv.LEDGER_NOTE_KINDS
+        assert mdisp._LEDGER_GET_SECTION_ALIASES is lv.SECTION_ALIASES
+        # every alias target is a real section / kind (no invented vocabulary)
+        assert set(lv.SECTION_ALIASES.values()) <= lv.LEDGER_SECTIONS | {"all"}
+        assert set(lv.KIND_ALIASES.values()) <= lv.LEDGER_NOTE_KINDS
+
+    @pytest.mark.parametrize("section", [
+        "/project/mission-123/design/specs/", "Decisions", "bom", "events",
+        "florble_gorb", "nonsense",
+    ])
+    def test_mcp_twin_resolves_sections_identically(self, md, section, cache_root):
+        mine = md.ledger_get(section=section)
+        theirs = _mcp_ledger_tools()["ledger_get"](run_id="vocab_parity",
+                                                   section=section)
+        assert mine["ok"] == theirs["ok"], (mine, theirs)
+        assert mine.get("section") == theirs.get("section")
+        if not mine["ok"]:
+            assert mine["did_you_mean"] == theirs["did_you_mean"]
+            assert mine["allowed"] == theirs["allowed"]
+
+    @pytest.mark.parametrize("kind", ["design_spec", "verdict", "florble_gorb"])
+    def test_mcp_twin_resolves_kinds_identically(self, md, kind, cache_root):
+        payload = {"id": "P1", "stage": "spec", "text": "t", "rationale": "r"}
+        mine = md.ledger_note(kind=kind, payload=dict(payload))
+        theirs = _mcp_ledger_tools()["ledger_note"](run_id="vocab_parity_kind",
+                                                    kind=kind,
+                                                    payload=dict(payload))
+        assert mine["ok"] == theirs["ok"], (mine, theirs)
+        assert mine.get("kind") == theirs.get("kind")
+        if not mine["ok"]:
+            assert mine["did_you_mean"] == theirs["did_you_mean"]
+            assert mine["valid_kinds"] == theirs["valid_kinds"]

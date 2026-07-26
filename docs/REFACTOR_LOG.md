@@ -4268,3 +4268,29 @@ is keyed by profile but that keying is cosmetic today.
 Live end-to-end after all three passes: local search 0.15 s cold / 0.00 s warm; 12 part
 thumbnails 8.82 s cold, 0.6 ms warm; six vendor favicons 364 ms cold with 6/6 returned —
 including thk / traceparts / 3dcontentcentral, which never rendered before.
+
+## The agent's current part is its own (2026-07-26)
+
+An agent that had just created a part could not build into it: `add_features` with no
+`doc_id` died with "Ambiguous: 2 parts are open, so there is no single current part" the
+moment the desktop app had its untitled Part1 open. `cad_common._doc` was throwing away a
+perfectly good process-local `_CUR` claim whenever `doc_list` reported more than one
+document — but the other documents belong to other clients and other processes, so an
+omitted `doc_id` can never have meant them. The claim is now authoritative regardless of
+what else is open, a claim on a document that has since been closed is dropped and
+re-resolved instead of forwarded as a dead handle, and the remaining ambiguity error (no
+claim yet, several open) points at `new_part` rather than at one of the user's parts. The
+concurrency hazard the old guard was really protecting against — a sub-agent's `new_part`
+silently redirecting its parent's next edit — is now handled where it belongs:
+`cad_common.doc_scope()` (a subshell-cwd for the current part) wraps
+`MissionDispatch._run_subagent`. DAG nodes deliberately do NOT get a scope; they are peers
+sharing one mission part, not nested. Second half of the same failure: a `revolve` whose
+profile was a bare point list `[[335,0],…]` slipped past `_normalize_profile_feature`
+(which only recognised `{"points":…}`) and resurfaced from the kernel as
+"refs.profile: required for revolve". `_is_inline_geometry` now catches the list form and
+the teaching error spells out the two-op sketch+revolve batch, naming a datum plane that
+CONTAINS the axis (`plane.top`/`plane.right`/`plane.front` for `axis.x`/`y`/`z` — verified
+live across all nine combinations; revolving about a plane's own normal is rejected as
+zero-volume). Files: `services/mcp/cad_common.py`, `services/mcp/cad_doc_tools.py`,
+`services/agent/mission_dispatch.py`, `services/agent/prompts/shared/cheatsheets/
+revolve.md`, new `services/mcp/test_current_part.py`.

@@ -711,6 +711,16 @@ class MissionDispatch:
         return node
 
     def _run_subagent(self, node: dict, brief: str) -> dict:
+        """Run a sub-agent turn with its OWN current part.
+
+        The parts it creates or opens are current for IT; ours is restored when it
+        returns, so a sub-agent can never silently redirect our next edit into a
+        document we never asked for."""
+        from services.mcp.cad_common import doc_scope  # noqa: PLC0415
+        with doc_scope():
+            return self._run_subagent_turn(node, brief)
+
+    def _run_subagent_turn(self, node: dict, brief: str) -> dict:
         """Run one bounded synchronous sub-agent turn for an approved node.
 
         The turn IS the sub-agent's session: its replies land in the registry

@@ -1375,6 +1375,29 @@ _PROFILE_SOURCE_KEYS = ("profile", "sketch", "section", "profile_sketch", "sketc
 _AXIS_SOURCE_TYPES = frozenset({"revolve", "circular_pattern", "surf_revolve", "helix"})
 
 
+def _is_inline_geometry(v: Any) -> bool:
+    """True when a profile source carries COORDINATES instead of naming a sketch.
+
+    A sketch is named ("Profile", "f1", "$0"); anything holding numbers is geometry
+    the model inlined. Both shapes it writes count: {"points": …}/{"entities": …} and
+    the bare point list [[335,0],[345,0],…] — the second used to slip through and
+    resurface as the unhelpful "refs.profile: required for revolve"."""
+    if isinstance(v, dict):
+        return bool(v.get("points") or v.get("entities"))
+    if isinstance(v, list):
+        return any(isinstance(p, (list, tuple)) and len(p) >= 2
+                   and all(isinstance(c, (int, float)) and not isinstance(c, bool)
+                           for c in p[:2])
+                   for p in v)
+    return False
+
+
+# The datum plane to sketch a profile on for a revolve about each axis: the plane must
+# CONTAIN the axis (revolving about a plane's own NORMAL sweeps nothing and the engine
+# rejects it as a zero-volume solid). Verified live against all nine combinations.
+_PLANE_CONTAINING = {"axis.x": "plane.top", "axis.y": "plane.right", "axis.z": "plane.front"}
+
+
 def _normalize_profile_feature(feat: dict, ftype: str, notes: list) -> dict:
     """`params.sketch:"Profile"` + `params.axis:"Z"` -> the refs the engine requires."""
     out, params, peek, consume = _split_two_levels(feat)
@@ -1387,12 +1410,19 @@ def _normalize_profile_feature(feat: dict, ftype: str, notes: list) -> dict:
             v = peek(k)
             if v is _MISSING or v is None:
                 continue
-            if isinstance(v, dict) and (v.get("points") or v.get("entities")):
+            if _is_inline_geometry(v):
+                av = peek("axis")
+                plane = _PLANE_CONTAINING.get(
+                    _norm_datum(av) if isinstance(av, str) else "", "plane.top")
                 raise ValueError(
                     f'{ftype} "{label}": params.{k} carries INLINE geometry. A profile is '
-                    f'always a sketch feature: add {{"op":"add_feature","feature":'
-                    f'{{"type":"sketch",…}}}} earlier in the same batch and reference it as '
-                    f'refs.profile=[{{"kind":"region","sketch":"$<its index>","hint_index":0}}].')
+                    f"always a sketch FEATURE, so this needs two ops in the same batch — "
+                    f'{{"op":"add_feature","feature":{{"type":"sketch","name":"{label}Profile",'
+                    f'"params":{{"plane":"{plane}","entities":[{{"type":"line","p1":[x1,y1],'
+                    f'"p2":[x2,y2]}}, …closing the loop]}}}}}} first, then this {ftype} with '
+                    f'refs.profile=[{{"kind":"region","sketch":"$<index of that sketch op>",'
+                    f'"hint_index":0}}] and no params.{k}. Sketch coordinates are 2D on that '
+                    f'plane — "{plane}" is one that CONTAINS the axis, which a revolve needs.')
             if isinstance(v, str) and v.strip():
                 consume(k)
                 slot = "sections" if ftype == "loft" else "profile"

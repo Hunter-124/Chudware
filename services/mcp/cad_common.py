@@ -5,6 +5,7 @@ Imported by the cad_*_tools family modules; re-exported through the cad_tools fa
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -23,6 +24,22 @@ from .core_bridge import CoreError
 # The "current part" so single-argument calls just work (every tool also takes an explicit
 # doc_id). Mirrors the old server's _STATE, but the doc lives in the C++ core, not here.
 _CUR: dict = {"doc_id": None}
+
+
+@contextlib.contextmanager
+def doc_scope():
+    """Run nested work with its OWN current part, like a subshell's cwd.
+
+    Whatever the nested agent creates or opens is current for IT; the caller's
+    current part is restored on the way out. Without this a sub-agent's last
+    new_part() would silently redirect its parent's next edit into a document
+    the parent never asked for."""
+    saved = _CUR["doc_id"]
+    try:
+        yield
+    finally:
+        _CUR["doc_id"] = saved
+
 
 # doc_id STABILITY across an autosave-recovery (Issue 1). When a transport timeout kills the
 # server and it restarts, recovery reopens each autosaved .step+ — which the engine assigns a
@@ -234,18 +251,20 @@ def _doc(doc_id: Optional[str]) -> str:
         """The "which document did you mean?" error — always naming every open doc."""
         if candidates is None:
             return _doc_error(
-                f"Ambiguous: {len(docs)} parts are open, so there is no single current part. "
-                "Pass doc_id= explicitly (required whenever multiple parts/agents are active).",
+                f"You have not created or opened a part yet, and {len(docs)} are already "
+                "open here, so there is nothing to pick unambiguously.",
                 docs, code="doc_ambiguous",
-                hint=f'e.g. doc_id="{docs[0].get("doc_id")}" — an open part\'s name works too.')
+                hint=('call new_part(name="…") to work in your own part (its doc_id then '
+                      'becomes your default), or name the one you mean, e.g. '
+                      f'doc_id="{docs[0].get("doc_id")}" — an open part\'s name works too.'))
         return _doc_error(
             f"Ambiguous doc_id={supplied!r}: {len(candidates)} open parts answer to that name "
             f"({_doc_listing(candidates)}), so it does not identify one document.",
             docs, code="doc_ambiguous",
             hint=f'pass the id of the one you mean, e.g. doc_id="{candidates[0].get("doc_id")}".')
 
-    # An explicit doc_id is always honoured — this is the required form when several agents /
-    # subagents work in parallel, so each addresses its OWN part and can never touch another's.
+    # An explicit doc_id always wins over the current part — the way to address a document
+    # other than the one you are working in.
     if doc_id:
         raw = str(doc_id).strip()
         if not listed:
@@ -317,38 +336,42 @@ def _doc(doc_id: Optional[str]) -> str:
                   f'"{near[0].get("name")}")?' if len(near) == 1 else
                   "pass one of the ids above, or the exact name of an open part."))
 
-    d = _CUR["doc_id"]
-    if not d:
-        # Nothing claimed by this process. Adopt the open part when there is exactly one —
-        # unambiguous, and it makes every read/measure/edit tool act on the part the user is
-        # actually looking at instead of demanding a redundant new_part().
-        if len(docs) == 1:
-            d = docs[0]["doc_id"]
-            _CUR["doc_id"] = d
-            return _resolve_alias(d)
-        if not docs:
-            if not listed:
-                raise _doc_error(
-                    "No current part, and the engine's document list is unavailable "
-                    "(doc_list failed), so nothing can be resolved for you.",
-                    docs, code="no_current_part",
-                    hint='pass doc_id= explicitly, or call new_part(name="…") first.')
-            # Zero documents open is NOT "you forgot to pass doc_id" — there is nothing to
-            # address yet, so say so plainly instead of implying a missing argument.
-            raise _doc_error(
-                "No current part: ZERO documents are open in this engine session, so no "
-                "doc_id would work either.",
-                docs, code="no_open_documents",
-                hint='call new_part(name="…") first; it returns the doc_id to pass.')
+    # The current part is whatever THIS process last created or opened, and that claim is
+    # authoritative however many other documents happen to be open. The app's untitled
+    # "Part1" and another agent's part in another process are not ours: an omitted doc_id
+    # cannot have meant either, so counting them was only ever a way to reject a call we
+    # could already answer. A sub-agent sharing this process is scoped by `doc_scope()`,
+    # so its part never becomes its parent's.
+    d = _resolve_alias(_CUR["doc_id"]) if _CUR["doc_id"] else None
+    if d and listed and d not in {e.get("doc_id") for e in docs}:
+        # Our part is gone — closed in the app, or reaped by doc-GC. Holding the dead
+        # handle only defers the failure to a confusing "no such document"; drop it and
+        # resolve from what is actually open.
+        _CUR["doc_id"] = None
+        d = None
+    if d:
+        return d
+    if len(docs) == 1:
+        # Nothing claimed, one part open: adopt it, so every read/measure/edit tool acts on
+        # the part the user is actually looking at instead of demanding a redundant
+        # new_part().
+        _CUR["doc_id"] = docs[0]["doc_id"]
+        return _resolve_alias(_CUR["doc_id"])
+    if docs:
         raise _ambiguous()
-    # Concurrency guard: with one document open `_CUR` is an unambiguous convenience. But when
-    # MORE than one part is open — exactly the multi-subagent case — an omitted doc_id is
-    # ambiguous: whichever agent last created or opened a part moved `_CUR`, so relying on the
-    # default silently edits the WRONG part (and republishes it to the viewport twice). Turn that
-    # silent clobber into a loud, fixable error so parallel agents are forced to be explicit.
-    if len(docs) > 1:
-        raise _ambiguous()
-    return _resolve_alias(d)
+    if not listed:
+        raise _doc_error(
+            "No current part, and the engine's document list is unavailable "
+            "(doc_list failed), so nothing can be resolved for you.",
+            docs, code="no_current_part",
+            hint='pass doc_id= explicitly, or call new_part(name="…") first.')
+    # Zero documents open is NOT "you forgot to pass doc_id" — there is nothing to
+    # address yet, so say so plainly instead of implying a missing argument.
+    raise _doc_error(
+        "No current part: ZERO documents are open in this engine session, so no "
+        "doc_id would work either.",
+        docs, code="no_open_documents",
+        hint='call new_part(name="…") first; it returns the doc_id to pass.')
 
 
 def _dumps(obj: Any) -> str:

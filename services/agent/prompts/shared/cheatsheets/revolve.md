@@ -15,7 +15,7 @@ Example B - revolve 180 degrees (half):
 ]
 
 3 common mistakes:
-1. The axis must lie OUTSIDE the profile region (offset the profile from the axis), or the revolve fails.
+1. The axis must lie OUTSIDE the profile region (offset the profile from the axis), or the revolve fails. It must also lie IN the sketch's plane: revolving about a plane's own NORMAL sweeps nothing and is rejected as zero-volume. Sketch on `plane.top` for `axis.x`, `plane.right` for `axis.y`, `plane.front` for `axis.z`.
 2. `angle` is a dim object; 360 makes a full body, smaller angles make a wedge.
 3. profile is an ARRAY of selectors; axis is a SINGLE selector, not an array.
 

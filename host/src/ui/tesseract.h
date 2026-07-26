@@ -9,24 +9,22 @@
 // PURE DRAW: no ImGui item, no layout, no state. The caller owns the cursor, the hit box and the
 // tint; this only appends lines to `dl`. Cheap enough for a per-frame header mark (32 edges).
 //
-// Three animation styles are offered (user-selectable, Settings -> Appearance -> Brand mark):
+// Two animation styles are offered (user-selectable, Settings -> Appearance -> Brand mark). Both
+// use a perspective 4D -> 3D projection, so the mark always reads as the familiar nested
+// "cube inside a cube" turning itself inside out:
 //
-//   SimpleRotation  A tesseract in a SIMPLE 4D rotation: one invariant plane stays fixed and its
-//                   orthogonal complement turns. The fixed plane is the one bisecting the figure
-//                   from front-left to back-right and from top to bottom, i.e. span{ (1,0,1,0),
+//   EightCell       An 8-cell in a SIMPLE 4D rotation: one invariant plane stays fixed and its
+//                   orthogonal complement turns. The fixed plane bisects the figure from
+//                   front-left to back-right and from top to bottom, i.e. span{ (1,0,1,0),
 //                   (0,1,0,0) }; the rotating plane is therefore span{ (1,0,-1,0), (0,0,0,1) }.
-//                   Perspective 4D -> 3D projection, so the mark reads as the familiar
-//                   "inner cube turning itself inside out".
+//                   Modelled on the reference animation at
+//                   https://commons.wikimedia.org/wiki/File:8-cell-simple.gif — the camera and
+//                   the 4D eye distance below were fitted against its frames, not guessed.
 //
 //   DoubleRotation  A DOUBLE rotation: two independent turns in two orthogonal 4D planes (xy and
 //                   zw) at incommensurate rates, so the two planes never realign, the motion has
 //                   no short loop, and — unlike a simple rotation — no direction of the figure
-//                   stays fixed through it. Perspective 4D -> 3D projection.
-//
-//   EightCell       The same simple rotation as the first style, but with an ORTHOGRAPHIC
-//                   4D -> 3D projection. Dropping the perspective divide collapses the two
-//                   bounding cubes onto each other instead of nesting them, which is the classic
-//                   "8-cell" reading: eight cubic cells sliding through one another.
+//                   stays fixed through it.
 // -------------------------------------------------------------------------------------------------
 
 #include "imgui.h"
@@ -34,10 +32,9 @@
 namespace ui {
 
 enum class TesseractAnim : int {
-    SimpleRotation = 0,
+    EightCell      = 0,
     DoubleRotation = 1,
-    EightCell      = 2,
-    Count          = 3,
+    Count          = 2,
 };
 
 // Short UI label for a style (Settings picker). Never null; unknown values clamp to the first.
@@ -45,9 +42,11 @@ const char* tesseractAnimName(TesseractAnim anim);
 // One-line description for the same picker (tooltip / caption under the preview).
 const char* tesseractAnimBlurb(TesseractAnim anim);
 
-// Clamp an arbitrary int (a persisted setting) onto a valid style.
+// Clamp an arbitrary int (a persisted setting) onto a valid style. Callers loading a config
+// written before the styles were reduced to two must migrate the value FIRST — see
+// loadSettings(): a bare clamp would silently turn the old 8-cell into the double rotation.
 inline TesseractAnim tesseractAnimFromInt(int v) {
-    if (v < 0 || v >= (int)TesseractAnim::Count) return TesseractAnim::SimpleRotation;
+    if (v < 0 || v >= (int)TesseractAnim::Count) return TesseractAnim::EightCell;
     return (TesseractAnim)v;
 }
 

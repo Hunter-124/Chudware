@@ -533,7 +533,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 say.clear();               // never "Saying · Working" — the dots carry it
             // The silent window is the one place with NO streamed content, so a static glyph
             // makes a slow provider and a hung app look identical. Cycle the dot count off
-            // GetTime() (same technique as drawForgingAnimation) and, once the wait is long
+            // GetTime() (same technique as drawBusyMark) and, once the wait is long
             // enough to worry about, add an elapsed readout. Dots are padded to a fixed width
             // so only the dots move, not the readout after them.
             const int dots = 1 + (int)((long long)(ImGui::GetTime() * 2.5) % 3);

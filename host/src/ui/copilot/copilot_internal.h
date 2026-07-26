@@ -94,7 +94,7 @@ ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf);
 ImU32  modeBorderColor(int mode);
 void   modeAccentRgb(int mode, float out[3]);
 void   drawStatusGlyph(const std::string& status, float box);
-void   drawForgingAnimation(float box);
+void   drawBusyMark(float box);
 GlassBubble beginGlassBubble(float width, ui::GlassLevel level, float rounding);
 ImRect  endGlassBubble(const GlassBubble& b);
 

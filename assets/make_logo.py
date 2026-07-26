@@ -65,12 +65,14 @@ def _face_grad(img, poly, c1, c2):
 
 
 # ---- brand mark: a tesseract (4-cube) projected 4D -> 3D -> 2D -------------------------------
-# The pose mirrors host/src/ui/tesseract.cpp, TesseractAnim::SimpleRotation frozen at theta = 0:
-# the icon in a user's taskbar is a still of the mark that turns inside the product. The fit
-# constants are DERIVED here the same way the C++ derives them rather than pasted in as magic
-# numbers, so the two stay in step if the camera or projection ever moves.
+# The pose mirrors host/src/ui/tesseract.cpp, TesseractAnim::EightCell frozen at theta = 0: the
+# icon in a user's taskbar is a still of the mark that turns inside the product. The camera and
+# the 4D eye multiplier below MUST match kCamYaw / kCamPitch / the Pass A factor in tesseract.cpp
+# or the icon stops being the same object as the logo. The fit constants are DERIVED here the
+# same way the C++ derives them rather than pasted in as magic numbers.
 
-_CAM_YAW, _CAM_PITCH = 0.55, 0.32
+_CAM_YAW, _CAM_PITCH = 0.35, 0.22
+_D4_FACTOR = 1.63
 _INV_SQRT2 = 0.7071067811865476
 
 # 16 vertices (+-1, +-1, +-1, +-1); 32 edges = the pairs differing in exactly one coordinate.
@@ -106,7 +108,7 @@ def _fit(samples=96):
     a full turn exactly fill the unit disc. Mirrors fitStyle() in ui/tesseract.cpp."""
     turn = [_rotate4(v, s / samples * 2 * math.pi)
             for s in range(samples) for v in _VERTS]
-    d4 = max(abs(p[3]) for p in turn) * 2.4      # eye at 2.4x the deepest vertex
+    d4 = max(abs(p[3]) for p in turn) * _D4_FACTOR
     cams = []
     for p in turn:
         k = d4 / (d4 - p[3])
@@ -133,11 +135,10 @@ def draw_mark(img, cx, cy, r, spark=True, on_light=False, ss=SS):
     final_r = r / ss
     small = final_r <= 11.0
     near, far = (TEAL_MID, (10, 78, 70)) if on_light else (TEAL_HI, TEAL_DK)
-    # Small tiers deepen the 4D perspective. At 16 px the two cells sit only ~1 px apart under
-    # the normal eye distance and fuse into a solid patch; halving d4 shrinks the far cell until
-    # the cube-in-cube silhouette is actually readable. Same figure, stronger foreshortening.
-    if small:
-        d4 *= 0.5
+    # The small tiers used to halve d4 to force the two cells apart, back when the shared eye
+    # distance was a slack 2.4x and they sat ~1 px apart at 16 px. _D4_FACTOR is 1.63 now, which
+    # already separates them; halving on top of that drives the near cell's divide to 0.41 and
+    # blows it out of frame as a lopsided blob. The reduced edge set alone carries these sizes.
     fill_r = r * (1.10 if small else 1.0)
 
     pts, dep = [], []

@@ -434,13 +434,11 @@ void drawStatusGlyph(const std::string& status, float box) {
     ImGui::Dummy(ImVec2(box, box));
 }
 
-// The "AI is working" busy affordance for the chat column. It was a hammer striking an anvil;
-// it is the brand mark turning in place now, so the composer and the copilot header show the
-// same object moving the same way while a run is live. (Name kept: single call site in
-// composer.cpp's prelude.)
-// ImDrawList-only, driven by GetTime(); colors via palette / chatSurf (theme lint).
+// The "AI is working" busy affordance for the chat column: the brand mark turning in place, so
+// the composer and the copilot header show the same object moving the same way while a run is
+// live. ImDrawList-only, driven by GetTime(); colors via palette / chatSurf (theme lint).
 // Sized to `box` (logical height of the glyph cell). Caller places it with Dummy/SetCursor.
-void drawForgingAnimation(float box) {
+void drawBusyMark(float box) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     ImDrawList* dl = ImGui::GetWindowDrawList();

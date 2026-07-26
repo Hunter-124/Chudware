@@ -463,12 +463,16 @@ void loadSettings(Settings& s) {
                         g.dynamicColor = go["dynamic_color"].get<bool>() ? 1 : 0;
                 }
             }
-            // Brand-mark animation style. 0..2 map to ui::TesseractAnim SimpleRotation /
-            // DoubleRotation / EightCell; clamp so a hand-edited config can't select a
-            // nonexistent style (the draw would fall back silently and the picker would
-            // show nothing selected).
-            int ba = app.is_object() ? app.value("brand_anim", 0) : 0;
-            s.brandAnim = (ba < 0 || ba > 2) ? 0 : ba;
+            // Brand-mark animation style: 0 = ui::TesseractAnim::EightCell (the default),
+            // 1 = DoubleRotation.
+            //
+            // MIGRATION. Configs written before the styles were reduced to two encode
+            // 0 = SimpleRotation, 1 = DoubleRotation, 2 = EightCell. SimpleRotation is gone and
+            // the surviving 8-cell IS that same bisecting-plane rotation, so both 0 and 2 land on
+            // the new 0. A bare range clamp would map the old 2 onto DoubleRotation instead —
+            // silently swapping the style of every user who had picked the 8-cell.
+            const int ba = app.is_object() ? app.value("brand_anim", 0) : 0;
+            s.brandAnim = (ba == 1) ? 1 : 0;
         }
         // T-G21: pinned-column vertical-collapse state.
         s.fmCollapsed = j.value("fm_collapsed", false);

@@ -1593,8 +1593,8 @@ static bool modeMenuRow(const char* iconName, const char* label, bool selected,
 }
 
 
-// Prelude row above the prompt: Agent/Plan/Swarm/Edit/Ask dropdown (left) + busy forging
-// glyph (inline, only while a run is active) + context meter (right).
+// Prelude row above the prompt: Agent/Plan/Swarm/Edit/Ask dropdown (left) + busy mark
+// (inline, only while a run is active) + context meter (right).
 // Permissions live only in the Settings overlay (not the composer).
 static void drawComposerPrelude(AppState& st, bool busy) {
 
@@ -1726,16 +1726,16 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     }
     ImGui::PopStyleColor(3);
 
-    // Busy forging glyph — centered in the gap between the mode dropdown and the right-hand
+    // Busy mark — centered in the gap between the mode dropdown and the right-hand
     // gauge cluster. Hidden the instant Stop is pressed (aiTurnActive honors stopRequested)
     // so the animation never keeps playing after a stop.
     // Note: `busy` is job.running and can lag past Stop — always gate on the run's stopRequested.
     // Use `tmx` (mode chip screen rect captured above) — GetItemRectMax after the
     // popup is no longer the mode button.
     {
-        auto* forgeRun = st.runIfExists(st.activeConvId());
-        const bool forging = !(forgeRun && forgeRun->stopRequested.load()) &&
-                             (busy || activeConversationRunning(st));
+        auto* markRun = st.runIfExists(st.activeConvId());
+        const bool showBusyMark = !(markRun && markRun->stopRequested.load()) &&
+                                  (busy || activeConversationRunning(st));
         const float meterRoomFull = ImGui::GetContentRegionAvail().x;
         const float meterW = measureContextMeter(st, meterRoomFull);
         const float rowRightScreen = ImGui::GetWindowPos().x + ImGui::GetContentRegionMax().x;
@@ -1748,17 +1748,17 @@ static void drawComposerPrelude(AppState& st, bool busy) {
         const float usageW = usageRingCluster(st, usageBudget, /*draw=*/false);
         const float clusterW = usageW > 0.0f ? usageW + clusterGap + meterW : meterW;
         const float meterLeftScreen = rowRightScreen - clusterW;
-        if (forging) {
+        if (showBusyMark) {
             const float midScreen = (tmx.x + meterLeftScreen) * 0.5f;
-            float hammerScreenX = midScreen - segH * 0.5f;
+            float markScreenX = midScreen - segH * 0.5f;
             // Keep clear of the mode chip; fall back if the row is narrow.
-            if (hammerScreenX < tmx.x + 4.0f * sc)
-                hammerScreenX = tmx.x + 8.0f * sc;
-            if (hammerScreenX + segH > meterLeftScreen - 4.0f * sc)
-                hammerScreenX = ImMax(tmx.x + 4.0f * sc, meterLeftScreen - segH - 4.0f * sc);
+            if (markScreenX < tmx.x + 4.0f * sc)
+                markScreenX = tmx.x + 8.0f * sc;
+            if (markScreenX + segH > meterLeftScreen - 4.0f * sc)
+                markScreenX = ImMax(tmx.x + 4.0f * sc, meterLeftScreen - segH - 4.0f * sc);
             ImGui::SameLine(0, 0.0f);
-            ImGui::SetCursorScreenPos(ImVec2(hammerScreenX, tmn.y));
-            drawForgingAnimation(segH);  // match prelude chip height
+            ImGui::SetCursorScreenPos(ImVec2(markScreenX, tmn.y));
+            drawBusyMark(segH);  // match prelude chip height
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("AI is working\xe2\x80\xa6");
         }
@@ -2075,7 +2075,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
 // async ask/sim calls (which set the back message running without a job), and any streaming
 // message. Drives the composer's send<->stop swap and the message queue.
 // stopRequested is UI-terminal: once the user hits Stop we soft-finalize the bubble and must
-// immediately leave the streaming chrome (stop button + forging animation). run->running may
+// immediately leave the streaming chrome (stop button + busy mark). run->running may
 // stay true until the worker unwinds — the drain discards that stale result and clears the flag.
 // Everything here is scoped to the VIEWED conversation: a background run in another conversation
 // must never make the visible composer look busy.
@@ -2239,7 +2239,7 @@ static void requestStopRun(AppState& st) {
             it->running = false;
             it->liveStatus = "Stopped";
             it->errKind = ERR_NONE;  // user stop is not an error card
-            // Finalize any live stream boxes so the forging animation / streaming chrome stops.
+            // Finalize any live stream boxes so the busy mark / streaming chrome stops.
             finalizeStoppedTurnActivity(*it);
             if (it->text.empty())
                 it->text = "Stopped.";

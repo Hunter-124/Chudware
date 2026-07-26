@@ -6,11 +6,16 @@ from mcp.server.fastmcp import Image
 from typing import Optional
 from typing import Union
 import os
+import math
 
 from .cad_common import (
+    _annotate_render,
     _apply_emphasis_overlay,
     _auto_section_for_target,
     _camera_dir_for_target,
+    _crop_frame,
+    _doc_mesh,
+    _mesh_render_frame,
     _captioned_render,
     _crop_png_to_rect,
     _crop_rect_for_target,
@@ -20,6 +25,7 @@ from .cad_common import (
     _normalize_view_list,
     _orbit_view_dirs,
     _palette_caption_block,
+    _render_annotation_caption,
     _resolve_inspect_target,
     _target_bbox,
     _target_is_internal,
@@ -29,6 +35,76 @@ from .cad_common import (
     _vnorm,
     cb,
 )
+
+
+def _annotated_view_tiles(d: str, view_list: list, highlight=None, annotate: bool = True,
+                          part_bb: Optional[dict] = None, target_bb: Optional[dict] = None,
+                          matches: Optional[list] = None, zoom_factor: float = 1.25) -> tuple:
+    """Render each view on its own, overlay the mesh annotation, return (tiles, labels, infos).
+
+    The native doc_render_contact_sheet RPC tiles inside the engine, so there is no per-tile
+    image to draw B-rep edges or a highlight onto. Rendering view-by-view costs ~11 ms of
+    engine time per tile and buys every tile the same annotation a single render_part gets.
+    When `target_bb` is given each tile is cropped to the target first and the overlay is
+    reprojected through the CROPPED frame (_crop_frame), so edges stay 1 px crisp instead of
+    being smeared by the upscale."""
+    cropping = bool(target_bb and part_bb)
+    tiles, labels, infos = [], [], []
+    for v in view_list:
+        try:
+            vd = _camera_dir_for_target(matches or [], v if v != "auto" else "auto")
+        except Exception:  # noqa: BLE001
+            vd = _vnorm((1.0, 1.0, 0.8))
+        png_full = _tmp(".png")
+        r = cb.call("doc_render_view", {"doc_id": d, "out_path": png_full,
+                                        "view": {"dir": list(vd)}, "annotate": bool(annotate)})
+        if not r.get("ok") or not os.path.exists(png_full):
+            continue
+        png_tile, frame = png_full, None
+        if cropping:
+            rect = _crop_rect_for_target(part_bb, target_bb, vd,
+                                         margin=0.18, zoom_factor=zoom_factor)
+            png_tile = _tmp(".png")
+            _crop_png_to_rect(png_full, rect, png_tile)
+            mesh = _doc_mesh(d)
+            if mesh is not None:
+                frame = _crop_frame(_mesh_render_frame(mesh, vd), rect)
+        info = None
+        if annotate or highlight is not None:
+            png_tile, info = _annotate_render(
+                png_tile, d, vd, highlight=highlight, edges=bool(annotate),
+                callouts=bool(annotate) and not cropping,
+                scale=bool(annotate) and not cropping, frame=frame)
+        tiles.append(png_tile)
+        labels.append(v if isinstance(v, str) else "custom")
+        infos.append(info)
+    return tiles, labels, infos
+
+
+def _merge_annotation_infos(infos: list) -> Optional[dict]:
+    """Fold per-tile annotation info into ONE record for a sheet caption: a feature is
+    "visible" if any tile saw it, and only a feature no tile could see is reported hidden."""
+    live = [i for i in infos if i and i.get("available")]
+    if not live:
+        return None
+    out = dict(live[0])
+    out["callouts"] = sorted({c for i in live for c in (i.get("callouts") or [])})
+    out["callouts_omitted"] = sorted({c for i in live for c in (i.get("callouts_omitted") or [])
+                                      if c not in out["callouts"]})
+    seen = set(out["callouts"])
+    out["hidden_features"] = sorted({h for i in live for h in (i.get("hidden_features") or [])
+                                     if h not in seen})
+    out["hidden_faces"] = min(int(i.get("hidden_faces") or 0) for i in live)
+    out["hidden_face_list"] = []
+    merged_hl = []
+    for k, h in enumerate(live[0].get("highlights") or []):
+        h = dict(h)
+        h["visible"] = any((i.get("highlights") or [{}] * (k + 1))[k].get("visible")
+                           for i in live if len(i.get("highlights") or []) > k)
+        merged_hl.append(h)
+    out["highlights"] = merged_hl
+    return out
+
 
 def register_cad_render_tools(mcp: FastMCP) -> None:
     """CAD render + close-up inspection MCP tools (T-RF8 split of cad_tools.py): render_part, contact_sheet, render_views, inspect_part, look_around, inspect_feature."""
@@ -40,6 +116,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     target: Optional[Union[str, dict]] = None,
                     emphasize: Optional[Union[str, dict, list]] = None,
                     emphasis_mode: str = "emphasis",
+                    highlight: Optional[Union[str, dict, list]] = None,
                     annotate: bool = True) -> list:
         """Render the current part to an ANNOTATED image and return it so you can SEE the result.
 
@@ -57,6 +134,14 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         Use render_views(...) for the full 6-ortho+iso labelled grid, or contact_sheet(...) for a
         smaller multi-angle sheet.
 
+        highlight (optional — point AT something without changing the framing):
+          a feature NAME ("Boss"), a feature id ("f2"), a sid ("F58db6d"), a geometry-query
+          dict, or a LIST of any of those. Each highlighted target is painted in a colour
+          RESERVED for emphasis (magenta, then violet / hot-pink / purple / white — none of
+          which the side palette can produce), outlined, and connected by a leader line to a
+          label naming it. Unlike `emphasize`, the camera does NOT re-frame or crop, so you
+          keep the whole part in view; the caption names every highlight and its colour.
+
         Feature emphasis (optional — manufacturing-feature VLM legibility):
           target / emphasize: plain-word face/edge query or feature id ("f2") whose owned faces
             render with EMPHASIS — high-contrast fill + glow outline; the rest of the part is
@@ -64,13 +149,23 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
           emphasis_mode: "emphasis" (default — shared high-contrast colour) or "per_face"
             (each target face a distinct deterministic colour for disambiguation; legend in caption).
 
+        annotate=True (default) additionally overlays, from the engine's own tessellation:
+          * the B-rep EDGES with real hidden-line removal, so a fillet, a chamfer, a shallow
+            pocket or two coincident faces actually read against the flat shading;
+          * feature CALLOUTS — id + name on a leader line for the features visible in frame
+            (capped for legibility; the caption names any that were omitted);
+          * a SCALE BAR + exact bbox, so you can tell a 4 mm part from a 400 mm one.
+        annotate=False suppresses all of that (and the engine's own tint/gizmo/labels) for a
+        clean product shot; an explicit `highlight` is still drawn because you asked for it.
+
         VERIFY LOOP: call after every mutation-adjacent change (add_features / edit / delete) so
         you can SEE whether the op landed; pair with measure/inspect_feature and verify_battery
         before declaring done.
 
-        Returns [image, caption]: the PNG followed by a one-paragraph TEXT caption (resolved
-        view, bbox, principal visible labelled faces, and when emphasis is active the palette
-        metadata so non-vision models still know which colour maps to which sid).
+        Returns [image, caption]: the PNG followed by a SELF-SUFFICIENT text caption — part name
+        and bbox, the features visible in this view as id+name, what is highlighted and in what
+        colour, the side-palette colour key, and an explicit note of what this camera CANNOT see
+        plus the tool to call for it. A model that reads only the caption still knows the scene.
         """
         d = _doc(doc_id)
         png = _tmp(".png")
@@ -145,6 +240,23 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             if emp_matches:
                 view_dir = _vnorm((1.0, 1.0, 0.8))
 
+        # Mesh-accurate overlay: B-rep edges (hidden-line removed), explicit `highlight`
+        # targets, feature callouts and a scale bar, reprojected through the SAME camera the
+        # engine just rendered. Runs on the FULL frame — before the emphasis crop, so a
+        # target-framed render keeps its edges — and degrades to a no-op if the tessellation
+        # or numpy is unavailable. Callouts/scale are suppressed when the image is about to be
+        # cropped and rescaled (their placement and the bar length would no longer be true).
+        cropping = bool(emp_matches) and view_dir is not None
+        ann_info = None
+        if annotate or highlight is not None:
+            render_dir = view_dir if view_dir is not None else _vnorm((1.0, 1.0, 0.8))
+            png, ann_info = _annotate_render(
+                png, d, render_dir,
+                highlight=highlight,
+                edges=bool(annotate),
+                callouts=bool(annotate) and not cropping,
+                scale=bool(annotate) and not cropping)
+
         caption_extra = ""
         if emp_matches and view_dir is not None:
             try:
@@ -174,46 +286,69 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                         f"{'s' if len(emp_matches) != 1 else ''})."
                     ) + caption_extra
 
-        result = _captioned_render(png, d, [view_name])
-        if caption_extra:
-            if isinstance(result, list) and len(result) == 2:
-                result = [result[0], (result[1] or "") + caption_extra]
-            else:
-                result = [result, caption_extra.strip()]
-        return result
+        result = _captioned_render(png, d, [view_name], annotations=ann_info,
+                                   extra=caption_extra.strip())
+        if isinstance(result, list) and len(result) == 2:
+            return result
+        return [result, caption_extra.strip()]
 
 
 
     @mcp.tool()
     def contact_sheet(doc_id: Optional[str] = None,
-                      views: Optional[list] = None) -> list:
+                      views: Optional[list] = None,
+                      highlight: Optional[Union[str, dict, list]] = None,
+                      annotate: bool = True) -> list:
         """Render SEVERAL labelled views tiled into ONE image — the fastest multi-angle self-check.
 
-        Each tile is colour-coded + headed with its view name and the part's bounding-box
-        dimensions, so you can read orientation and scale at a glance and catch a feature that's
-        right from one side but wrong from another.
+        Each tile is colour-coded, headed with its view name and the part's bounding-box
+        dimensions, and (with annotate=True) carries the B-rep EDGE outline with hidden lines
+        removed, feature CALLOUTS and a SCALE BAR — so you can read orientation, scale and
+        which feature is which at a glance, and catch a feature that's right from one side but
+        wrong from another.
 
         views: a list of view specs, each either a named view ("front"/"back"/"top"/"bottom"/
         "left"/"right"/"iso") or a custom-camera dict ({"azimuth","elevation"} or {"dir":[x,y,z]} —
         see render_part). Omit for the standard set: front + right + top + iso.
         Prefer render_views() for the full manufacturing 6-ortho+iso grid.
 
+        highlight: same target vocabulary as render_part — a feature NAME ("Boss"), a feature id
+        ("f2"), a sid ("F58db6d"), a geometry-query dict, or a list of those. The target is
+        painted in a reserved emphasis colour and labelled IN EVERY TILE, which is the fastest
+        way to see which views actually show it.
+
+        annotate=False falls back to the engine's own tiled sheet with no overlay.
+
         VERIFY LOOP: use after mutations when a single iso is not enough to confirm a feature
         on a back/bottom face. Pair with verify_battery before declaring done.
 
-        Returns [image, caption]: the tiled PNG followed by a one-paragraph TEXT caption
-        (resolved views, bbox, principal visible labelled faces per view) for non-vision models
-        or a quick text digest alongside the picture.
+        Returns [image, caption]: the tiled PNG followed by a SELF-SUFFICIENT text caption —
+        views, part name and bbox, features seen across the sheet, what is highlighted and in
+        what colour, the side-palette colour key, and what no tile could see.
         """
         d = _doc(doc_id)
-        png = _tmp(".png")
         view_list = views or ["front", "right", "top", "iso"]
-        r = cb.call("doc_render_contact_sheet",
-                    {"doc_id": d, "out_path": png, "views": views or []})
-        if not r.get("ok") or not os.path.exists(png):
-            raise ValueError(
-                f"Contact sheet failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
-        return _captioned_render(png, d, view_list)
+        if not annotate and highlight is None:
+            png = _tmp(".png")
+            r = cb.call("doc_render_contact_sheet",
+                        {"doc_id": d, "out_path": png, "views": views or []})
+            if not r.get("ok") or not os.path.exists(png):
+                raise ValueError(
+                    f"Contact sheet failed: "
+                    f"{r.get('reason', r.get('error', 'no bodies to render'))}")
+            return _captioned_render(png, d, view_list)
+
+        tiles, labels, infos = _annotated_view_tiles(d, view_list, highlight=highlight,
+                                                     annotate=annotate)
+        if not tiles:
+            raise ValueError("Contact sheet failed: no bodies to render")
+        out = _tmp(".png")
+        _tile_pngs_grid(tiles, out, labels=labels,
+                        cols=max(1, int(math.ceil(math.sqrt(len(tiles))))))
+        return _captioned_render(out, d, labels,
+                                 annotations=_merge_annotation_infos(infos),
+                                 extra=f"Contact sheet, {len(tiles)} tiles: "
+                                       + ", ".join(labels) + ".")
 
 
 
@@ -221,6 +356,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
     def render_views(doc_id: Optional[str] = None,
                      views: Optional[list] = None,
                      target: Optional[Union[str, dict]] = None,
+                     highlight: Optional[Union[str, dict, list]] = None,
                      annotate: bool = True) -> list:
         """Multi-view contact sheet — 6 orthographic + iso by default, each tile labelled.
 
@@ -233,34 +369,50 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         target (optional): when set, each tile is framed/cropped to the target AABB + margin
         (feature-focused multi-view). Plain-word face/edge query or feature id ("f2").
 
-        annotate: pass face labels / triad through to the underlying render (default True).
+        highlight (optional): same target vocabulary as render_part — a feature NAME ("Boss"),
+        a feature id ("f2"), a sid ("F58db6d"), a query dict, or a list of those. Painted in a
+        reserved emphasis colour and labelled in EVERY tile, so you can see at a glance which
+        of the seven views actually show it. Unlike `target` it does not change the framing.
+
+        annotate (default True): face labels / triad in the engine render, PLUS the B-rep edge
+        outline (hidden lines removed), feature callouts and a scale bar on every tile.
+        annotate=False gives the engine's plain tiled sheet.
 
         VERIFY LOOP: call after mutations when you need full angular coverage; pair with
         inspect_feature for a single emphasized close-up and verify_battery before done.
 
-        Returns [image, caption]. Caption lists the resolved view names + part bbox (+ target
-        dims when framed). Tiles are headed with their view name so the grid is self-describing.
+        Returns [image, caption]. The caption is self-sufficient: resolved views, part name and
+        bbox, the features seen across the sheet, what is highlighted and in what colour, the
+        side-palette colour key, and what no view could see plus the tool to call for it.
         """
         d = _doc(doc_id)
         view_list = _normalize_view_list(views)
-        # Prefer the native contact-sheet RPC when there is no target framing (fast path).
         if target is None:
-            png = _tmp(".png")
-            r = cb.call("doc_render_contact_sheet",
-                        {"doc_id": d, "out_path": png, "views": view_list})
-            if not r.get("ok") or not os.path.exists(png):
-                raise ValueError(
-                    f"render_views failed: {r.get('reason', r.get('error', 'no bodies'))}")
-            # Engine may expand empty defaults differently — pin caption to our list.
-            names = r.get("views") or [
-                (v if isinstance(v, str) else "custom") for v in view_list
-            ]
-            result = _captioned_render(png, d, list(names))
-            extra = (f" render_views grid ({len(names)} tiles: "
-                     + ", ".join(str(n) for n in names) + ").")
-            if isinstance(result, list) and len(result) == 2:
-                return [result[0], (result[1] or "") + extra]
-            return [result, extra.strip()]
+            # Native engine sheet only when there is nothing to overlay (it tiles internally,
+            # so there is no per-tile image to draw edges or a highlight onto).
+            if not annotate and highlight is None:
+                png = _tmp(".png")
+                r = cb.call("doc_render_contact_sheet",
+                            {"doc_id": d, "out_path": png, "views": view_list})
+                if not r.get("ok") or not os.path.exists(png):
+                    raise ValueError(
+                        f"render_views failed: {r.get('reason', r.get('error', 'no bodies'))}")
+                names = r.get("views") or [
+                    (v if isinstance(v, str) else "custom") for v in view_list
+                ]
+                return _captioned_render(png, d, list(names),
+                                         extra=f"render_views grid ({len(names)} tiles: "
+                                               + ", ".join(str(n) for n in names) + ").")
+            tiles, labels, infos = _annotated_view_tiles(d, view_list, highlight=highlight,
+                                                         annotate=annotate)
+            if not tiles:
+                raise ValueError("render_views failed: no bodies to render")
+            out = _tmp(".png")
+            _tile_pngs_grid(tiles, out, labels=labels, cols=3)
+            return _captioned_render(out, d, labels,
+                                     annotations=_merge_annotation_infos(infos),
+                                     extra=f"render_views grid ({len(tiles)} tiles: "
+                                           + ", ".join(labels) + ").")
 
         # Target-framed path: per-view render + crop + tile with labels.
         resolved = _resolve_inspect_target(d, target)
@@ -270,26 +422,9 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         if not part_bb or not part_bb.get("size"):
             raise ValueError("no part bounding box — build geometry first")
 
-        tile_paths = []
-        labels = []
-        for v in view_list:
-            try:
-                vd = _camera_dir_for_target(matches, v if v != "auto" else "auto")
-            except Exception:  # noqa: BLE001
-                vd = _vnorm((1.0, 1.0, 0.8))
-            png_full = _tmp(".png")
-            r = cb.call("doc_render_view", {
-                "doc_id": d, "out_path": png_full,
-                "view": {"dir": list(vd)}, "annotate": bool(annotate),
-            })
-            if not r.get("ok") or not os.path.exists(png_full):
-                continue
-            rect = _crop_rect_for_target(part_bb, target_bb, vd,
-                                        margin=0.18, zoom_factor=1.25)
-            png_tile = _tmp(".png")
-            _crop_png_to_rect(png_full, rect, png_tile)
-            tile_paths.append(png_tile)
-            labels.append(v if isinstance(v, str) else "custom")
+        tile_paths, labels, infos = _annotated_view_tiles(
+            d, view_list, highlight=highlight, annotate=annotate,
+            part_bb=part_bb, target_bb=target_bb, matches=matches)
         if not tile_paths:
             raise ValueError("render_views: every tile render failed")
         out = _tmp(".png")
@@ -297,10 +432,13 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         _tile_pngs_grid(tile_paths, out, labels=labels, cols=3)
         caption = (
             f"render_views of {resolved.get('label')!r}: {len(tile_paths)} labelled tiles "
-            f"({', '.join(labels)}). "
+            f"({', '.join(labels)}), each cropped to the target. "
             + _inspect_caption(d, resolved, target_bb, _camera_dir_for_target(matches, "auto"),
                                method="crop", n_matches=len(matches))
         )
+        ann = _merge_annotation_infos(infos)
+        if ann:
+            caption += " " + _render_annotation_caption("target-framed grid", ann)
         return [Image(path=out), caption]
 
 

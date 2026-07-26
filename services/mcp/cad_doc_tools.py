@@ -388,26 +388,363 @@ def _normalize_primitive_feature(feat: dict) -> dict:
     return out
 
 
-def _normalize_feature_ops(ops: Any) -> Any:
-    """Normalize dialect primitive placement/orientation ops; return a new list."""
+# ---------------------------------------------------------------------------
+# Dimension dialect: unit suffixes, diameter->radius, box `size` (model-robustness).
+#
+# The engine's MODEL SPACE IS MILLIMETRES — `units.system` ("MMGS"/"IPS") is a display
+# setting read by the drawing formatter, never a geometry scale — and a dimension may
+# reach it as a bare number, a numeric string, {"value":N,"expr":null}, or an EXPRESSION
+# string evaluated by core/util/expr.cpp ("width/2"). What it cannot parse is the way a
+# person actually states a size: "25mm", "1in", '2.5"' all die in the expression lexer as
+# «syntax error in '25mm': trailing tokens». The same run also loses a cylinder spelled by
+# `diameter` (the single most common way to describe a shaft or a bore) and a box spelled
+# by `size:[l,w,h]`, both hard-rejected as a missing required param.
+#
+# All three are rewritten HERE, before the call, so the engine's grammar stays closed and
+# still receives a clean number. Conservative on purpose:
+#   * a string is converted ONLY when it is ENTIRELY a number plus a unit suffix — a real
+#     expression ("width/2"), a bare number ("25") and a size code ("M8") pass through
+#     untouched for the engine to evaluate;
+#   * `diameter` is rewritten PER FEATURE TYPE, only where the engine wants a radius.
+#     hole and bolt_circle take a REAL `diameter` param (core/doc/validate.cpp) — halving
+#     it there would silently drill a bore at half size, so those types are never touched;
+#   * every rewrite is ECHOED back in the response (`interpreted`) so the model learns the
+#     canonical spelling instead of leaning on the alias forever.
+_UNIT_TO_MM = {
+    "mm": 1.0, "millimeter": 1.0, "millimeters": 1.0, "millimetre": 1.0, "millimetres": 1.0,
+    "cm": 10.0, "centimeter": 10.0, "centimeters": 10.0, "centimetre": 10.0,
+    "centimetres": 10.0,
+    "m": 1000.0, "meter": 1000.0, "meters": 1000.0, "metre": 1000.0, "metres": 1000.0,
+    "in": 25.4, "inch": 25.4, "inches": 25.4, '"': 25.4, "\u201d": 25.4, "\u2033": 25.4,
+    "ft": 304.8, "foot": 304.8, "feet": 304.8, "'": 304.8, "\u2019": 304.8, "\u2032": 304.8,
+    "thou": 0.0254, "mil": 0.0254, "mils": 0.0254,
+    "um": 0.001, "\u00b5m": 0.001, "\u03bcm": 0.001, "micron": 0.001, "microns": 0.001,
+}
+# <number><unit>, the WHOLE string. `[^\W\d_]+` is the unicode letter run (so "µm" works);
+# the alternation adds the prime marks, which are not letters.
+_UNIT_NUM_RE = re.compile(
+    r"^\s*(?P<n>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+    r"\s*(?P<u>[^\W\d_]+|[\"'\u2019\u201d\u2032\u2033])\s*$")
+# The compound imperial form a person speaks: 5'6", 5 ft 6 in.
+_FT_IN_RE = re.compile(
+    r"^\s*(?P<ft>\d+(?:\.\d*)?)\s*(?:'|\u2019|\u2032|ft|foot|feet)"
+    r"\s*(?P<in>\d+(?:\.\d*)?)\s*(?:\"|\u201d|\u2033|in|inch|inches)?\s*$")
+# Params whose value is TEXT, never a dimension — a text feature that embosses the literal
+# string "25mm" must not have it silently turned into the number 25.
+_NON_DIM_KEYS = frozenset({
+    "type", "name", "id", "text", "font", "label", "title", "note", "comment",
+    "description", "code", "source", "script", "style", "end", "standard", "tap",
+    "mode", "align", "material", "appearance", "system", "unit", "units", "format",
+    "plane", "size", "of", "side", "surf", "pick", "op",
+})
+# diameter -> radius, PER PRIMITIVE TYPE (the engine's radius params, validate.cpp).
+# Deliberately absent: hole and bolt_circle, whose `diameter` is the real param.
+_DIAMETER_ALIASES = {
+    "cylinder": {"diameter": "radius", "dia": "radius", "d": "radius"},
+    "sphere": {"diameter": "radius", "dia": "radius", "d": "radius"},
+    "cone": {"d1": "r1", "d2": "r2", "diameter": "r1", "dia": "r1",
+             "base_diameter": "r1", "bottom_diameter": "r1", "top_diameter": "r2"},
+    "torus": {"major_diameter": "major_r", "outer_diameter": "major_r", "od": "major_r",
+              "minor_diameter": "minor_r", "tube_diameter": "minor_r",
+              "diameter": "major_r"},
+}
+_SIZE_KEYS = ("size", "dimensions", "dims")
+_BOX_DIMS = ("length", "width", "height")
+_MAX_INTERPRETED_NOTES = 8
+
+
+def _clean_num(x: float) -> Union[int, float]:
+    """Kill binary-float noise from a unit conversion; hand back an int when it is one."""
+    v = round(x, 9)
+    return int(v) if v == int(v) and abs(v) < 1e15 else v
+
+
+def _dim_mm(s: Any) -> Optional[Union[int, float]]:
+    """A plain "<number><unit>" string -> millimetres. None for anything else.
+
+    None means "not a unit literal" — a bare number, an expression ("width/2"), a size
+    code ("M8"), a word. Those are the engine's business, not ours.
+    """
+    if not isinstance(s, str) or not s.strip():
+        return None
+    m = _UNIT_NUM_RE.match(s)
+    if m:
+        factor = _UNIT_TO_MM.get(m.group("u").lower())
+        if factor is None:
+            return None
+        return _clean_num(float(m.group("n")) * factor)
+    m = _FT_IN_RE.match(s)
+    if m:
+        return _clean_num(float(m.group("ft")) * 304.8 + float(m.group("in")) * 25.4)
+    return None
+
+
+def _is_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_dim_object(v: Any) -> bool:
+    """The canonical dim shape {"value":…,"expr":…} (± an explicit unit field)."""
+    return (isinstance(v, dict) and ("value" in v or "expr" in v)
+            and not (set(v) - {"value", "expr", "unit", "units"}))
+
+
+def _convert_units(val: Any, notes: list, label: str, key: str = "", depth: int = 0):
+    """Recursively convert unit-suffixed dimension strings to mm. -> (value, changed).
+
+    Pure: an unchanged subtree is returned BY IDENTITY, so a canonical op round-trips
+    byte-for-byte and no caller dict is ever copied for nothing.
+    """
+    if depth > 6:
+        return val, False
+    where = f"{label}{key}" if key else label.rstrip(".")
+
+    if isinstance(val, str):
+        mm = _dim_mm(val)
+        if mm is None:
+            return val, False
+        notes.append(f"{where}: interpreted {val!r} as {mm} (document units are mm)")
+        return mm, True
+
+    if _is_dim_object(val):
+        expr = val.get("expr")
+        if isinstance(expr, str):
+            mm = _dim_mm(expr)
+            if mm is not None:
+                notes.append(
+                    f"{where}: interpreted expr {expr!r} as the value {mm} (mm)")
+                return {"value": mm, "expr": None}, True
+            return val, False  # a REAL expression — the engine evaluates it
+        unit = val.get("unit") or val.get("units")
+        if isinstance(unit, str) and _is_num(val.get("value")):
+            factor = _UNIT_TO_MM.get(unit.strip().lower())
+            if factor is not None:
+                mm = _clean_num(float(val["value"]) * factor)
+                notes.append(f"{where}: interpreted {val['value']} {unit} as {mm} (mm)")
+                return {"value": mm, "expr": None}, True
+        if isinstance(val.get("value"), str):
+            mm = _dim_mm(val["value"])
+            if mm is not None:
+                notes.append(
+                    f"{where}: interpreted {val['value']!r} as {mm} (document units are mm)")
+                out = {k: v for k, v in val.items() if k not in ("unit", "units")}
+                out["value"] = mm
+                return out, True
+        return val, False
+
+    if isinstance(val, list):
+        new: list = []
+        changed = False
+        for item in val:
+            nv, ch = _convert_units(item, notes, label, key, depth + 1)
+            changed = changed or ch
+            new.append(nv)
+        return (new, True) if changed else (val, False)
+
+    if isinstance(val, dict):
+        new = {}
+        changed = False
+        for k, v in val.items():
+            if str(k).strip().lower() in _NON_DIM_KEYS:
+                new[k] = v
+                continue
+            nv, ch = _convert_units(v, notes, label, str(k), depth + 1)
+            changed = changed or ch
+            new[k] = nv
+        return (new, True) if changed else (val, False)
+
+    return val, False
+
+
+def _feat_label(feat: dict, ftype: str) -> str:
+    """"Boss" / "cylinder" — names the feature a note is about."""
+    name = feat.get("name")
+    return name if isinstance(name, str) and name else (ftype or "feature")
+
+
+def _split_two_levels(feat: dict):
+    """(feature copy, params copy) plus peek/consume over BOTH levels.
+
+    `params` is merged into the feature by session.cpp::op_add_feature, so a model may put
+    a dimension at either level and mean the same thing.
+    """
+    out = dict(feat)
+    params = feat.get("params")
+    new_params = dict(params) if isinstance(params, dict) else {}
+
+    def peek(key: str) -> Any:
+        if key in out:
+            return out[key]
+        return new_params.get(key, _MISSING)
+
+    def consume(key: str) -> Any:
+        v = peek(key)
+        out.pop(key, None)
+        new_params.pop(key, None)
+        return v
+
+    return out, new_params, peek, consume
+
+
+def _halve(v: Any):
+    """diameter value -> radius value, preserving the shape it arrived in. None = can't."""
+    if _is_num(v):
+        return _clean_num(float(v) / 2.0)
+    if isinstance(v, str):
+        mm = _dim_mm(v)
+        if mm is not None:
+            return _clean_num(float(mm) / 2.0)
+        try:
+            return _clean_num(float(v.strip()) / 2.0)
+        except (TypeError, ValueError):
+            # A real expression ("shaft_d"): halve it AS an expression, still the engine's job.
+            return {"value": 0.0, "expr": f"({v.strip()})/2"}
+    if _is_dim_object(v):
+        expr = v.get("expr")
+        if isinstance(expr, str) and expr.strip():
+            mm = _dim_mm(expr)
+            if mm is None:
+                return {"value": 0.0, "expr": f"({expr.strip()})/2"}
+            return {"value": _clean_num(float(mm) / 2.0), "expr": None}
+        inner = _halve(v.get("value"))
+        if inner is None:
+            return None
+        return {"value": inner, "expr": None} if not isinstance(inner, dict) else inner
+    return None
+
+
+def _normalize_primitive_dims(feat: dict, ftype: str, notes: list) -> dict:
+    """box `size` shorthand + diameter->radius aliases. Pure; identity when nothing applies."""
+    aliases = _DIAMETER_ALIASES.get(ftype, {})
+    size_key = next((k for k in _SIZE_KEYS
+                     if k in feat or (isinstance(feat.get("params"), dict)
+                                      and k in feat["params"])), None) if ftype == "box" else None
+    hits = [k for k in aliases
+            if k in feat or (isinstance(feat.get("params"), dict) and k in feat["params"])]
+    if not hits and not size_key:
+        return feat
+
+    label = _feat_label(feat, ftype)
+    out, new_params, peek, consume = _split_two_levels(feat)
+
+    if size_key:
+        v = consume(size_key)
+        dims: Optional[list] = None
+        if isinstance(v, list) and len(v) == 3:
+            dims = list(v)
+        elif isinstance(v, list) and len(v) == 1:
+            dims = [v[0]] * 3
+        elif _is_num(v) or isinstance(v, str) or _is_dim_object(v):
+            dims = [v] * 3
+        if dims is None:
+            # An unusable shape — hand it back so the engine names it rather than guessing.
+            new_params[size_key] = v
+        else:
+            written = []
+            for name, dv in zip(_BOX_DIMS, dims):
+                if peek(name) is not _MISSING:
+                    continue  # an explicit length/width/height wins over the shorthand
+                # Convert a unit literal HERE so the split reads as one rewrite
+                # ("size '1in' as a 25.4 cube") instead of one note per side.
+                mm = _dim_mm(dv)
+                new_params[name] = dv if mm is None else mm
+                written.append(f"{name} {new_params[name]}")
+            if written:
+                shape = "a cube" if len(set(map(str, dims))) == 1 else "l/w/h"
+                notes.append(f"{label}: interpreted {size_key} {v!r} as {shape}: "
+                             + ", ".join(written) + " — a box takes length/width/height")
+
+    for key in sorted(hits):
+        target = aliases[key]
+        v = consume(key)
+        if v is _MISSING or v is None:
+            continue
+        if peek(target) is not _MISSING:
+            notes.append(f"{label}: ignored {key} (the canonical {target} was also given)")
+            continue
+        r = _halve(v)
+        if r is None:
+            new_params[key] = v  # unusable — let the engine report it
+            continue
+        new_params[target] = r
+        shown = r.get("expr") if isinstance(r, dict) and r.get("expr") else (
+            r["value"] if isinstance(r, dict) else r)
+        given = v["value"] if _is_dim_object(v) and "value" in v else v
+        notes.append(f"{label}: interpreted {key} {given!r} as {target} {shown!r} "
+                     f"— a {ftype} is dimensioned by radius, not diameter")
+
+    if isinstance(feat.get("params"), dict) or new_params:
+        out["params"] = new_params
+    return out
+
+
+def _normalize_feature_dims(feat: dict, ftype: str, notes: list) -> dict:
+    """Every dimension dialect on one feature: box size, then units, then diameter.
+
+    ORDER MATTERS. `size:["40mm",…]` must be split before the unit pass can see its
+    elements, and `diameter:"50mm"` must already be the number 50 before it is halved.
+    """
+    out = feat
+    if ftype in _PRIMITIVE_TYPES:
+        out = _normalize_primitive_dims(out, ftype, notes)
+    converted, changed = _convert_units(out, notes, _feat_label(feat, ftype) + ".")
+    if changed:
+        out = converted
+    if ftype in _PRIMITIVE_TYPES:
+        out = _normalize_primitive_dims(out, ftype, notes)
+    return out
+
+
+def _normalize_feature_ops(ops: Any, notes: Optional[list] = None) -> Any:
+    """Normalize dialect primitive placement/orientation + dimension ops; return a new list.
+
+    `notes` (optional) collects a plain-English line per rewrite, echoed to the model as
+    `interpreted` so it learns the canonical spelling.
+    """
     if not isinstance(ops, list):
         return ops
+    sink = notes if isinstance(notes, list) else []
     out = []
     for op in ops:
         try:
-            if (isinstance(op, dict) and op.get("op") == "add_feature"
-                    and isinstance(op.get("feature"), dict)
-                    and op["feature"].get("type") in _PRIMITIVE_TYPES):
+            if isinstance(op, dict) and op.get("op") == "add_feature" and isinstance(
+                    op.get("feature"), dict):
                 feat = op["feature"]
+                ftype = str(feat.get("type") or "").strip().lower()
                 params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
-                if _primitive_needs_norm(feat, params):
-                    op = {**op, "feature": _normalize_primitive_feature(feat)}
+                new = feat
+                if ftype in _PRIMITIVE_TYPES and _primitive_needs_norm(feat, params):
+                    new = _normalize_primitive_feature(feat)
+                new = _normalize_feature_dims(new, ftype, sink)
+                if new is not feat:
+                    op = {**op, "feature": new}
+            elif (isinstance(op, dict) and op.get("op") == "edit_feature"
+                    and isinstance(op.get("params"), dict)):
+                # An edit carries bare params (no feature wrapper) and no type, so only the
+                # type-independent unit pass applies — never the per-type diameter alias.
+                label = str(op.get("id") or "edit_feature") + "."
+                conv, changed = _convert_units(op["params"], sink, label)
+                if changed:
+                    op = {**op, "params": conv}
         except ValueError:
             raise  # an unsupported request (boolean:"intersect") — tell the model
         except Exception:  # noqa: BLE001 — never let normalization break a valid call
             pass
         out.append(op)
     return out
+
+
+def _interpreted_notes(notes: list) -> list:
+    """De-duplicate and cap the echo list (a 20-hole batch must not bury the response)."""
+    seen: list = []
+    for n in notes:
+        if n not in seen:
+            seen.append(n)
+    if len(seen) > _MAX_INTERPRETED_NOTES:
+        extra = len(seen) - _MAX_INTERPRETED_NOTES
+        seen = seen[:_MAX_INTERPRETED_NOTES] + [f"(+{extra} more of the same kind)"]
+    return seen
+
 
 def register_cad_doc_tools(mcp: FastMCP) -> None:
     """CAD document-lifecycle MCP tools (T-RF8 split of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
@@ -568,9 +905,33 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         "height":{"value":20,"expr":null}}}},
            {"op":"add_feature","feature":{"type":"fillet","name":"Round",
               "params":{"radius":{"value":3,"expr":null}},"refs":{"edges":{"of":"edge"}}}}]
-        Dimensions are objects {"value":<n>,"expr":null}. Geometry is addressed in plain words
-        via `refs` (e.g. {"face":{"of":"face","side":"top"}}). Ops in one call may reference an
-        earlier op in the SAME array as "$<index>" (0-based); existing tree features by id ("f1").
+        Geometry is addressed in plain words via `refs` (e.g. {"face":{"of":"face",
+        "side":"top"}}). Ops in one call may reference an earlier op in the SAME array as
+        "$<index>" (0-based); existing tree features by id ("f1").
+
+        DIMENSIONS — write a size in whichever of these is most natural; all are accepted:
+          40                     a bare number, in DOCUMENT UNITS (millimetres)
+          "40"                   the same number as a string
+          {"value":40,"expr":null}   the canonical dim object (what get_part hands back)
+          "40mm" "2.5cm" "1in" '2.5"' "1ft" "5 ft 6 in" "0.5m" "20thou"
+                                 a number plus a unit — converted to mm for you, and the
+                                 conversion is echoed back in the response's `interpreted`
+          {"value":2,"unit":"in"}    the same thing with the unit in its own field
+          "width/2"              an EXPRESSION, evaluated by the engine against the part's
+                                 equations/globals (also {"value":0,"expr":"width/2"}).
+                                 Anything that isn't purely <number><unit> is left alone and
+                                 handed to the expression evaluator, so a real formula is
+                                 never mangled — but a unit inside a formula ("2*10mm") is
+                                 NOT understood: do the arithmetic or use one unit literal.
+        DIMENSION SHORTHAND (rewritten for you, and reported in `interpreted` — prefer the
+        canonical spelling once you know it):
+          "diameter" (or dia/d) on cylinder/sphere -> radius, HALVED. On a cone d1/d2 -> r1/r2;
+            on a torus major_diameter/minor_diameter -> major_r/minor_r.
+            NOT on hole / bolt_circle: those take a REAL "diameter" param and are never halved.
+          "size":[l,w,h] on a box -> length/width/height; "size":40 -> a 40 cube.
+        These forms work on any add_feature params and on edit_feature params (the unit
+        conversion; the per-type diameter alias needs the feature type, so it is add-only).
+        Every rewrite this tool performs comes back as `interpreted`:[…] beside the result.
 
         OP VOCABULARY (closed — do NOT invent names):
           ops (field op=…): add_feature, edit_feature, delete_feature, reorder_feature,
@@ -669,8 +1030,12 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             ops = _normalize_sketch_ops(ops)
             # Same, for the primitive placement/orientation dialect models emit
             # (placement:{origin,direction}, boolean:"union") — rewritten to the
-            # canonical at/axis/mode/merge keys the engine actually accepts.
-            ops = _normalize_feature_ops(ops)
+            # canonical at/axis/mode/merge keys the engine actually accepts — and for the
+            # dimension dialect ("25mm", diameter, box size), whose rewrites are echoed
+            # back as `interpreted` so the model learns the canonical spelling.
+            interpreted: list = []
+            ops = _normalize_feature_ops(ops, interpreted)
+            interpreted = _interpreted_notes(interpreted)
 
             def _apply() -> dict:
                 # Transactional batch: snapshot first so a partial failure rolls the WHOLE batch
@@ -740,6 +1105,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         "failed_features": fail,
                         "features": feats,
                     }
+                    if interpreted:
+                        # The batch failed, so the rewrite is now a SUSPECT: say what we
+                        # read the ops as before the model re-sends the same spelling.
+                        fail_result["interpreted"] = interpreted
                     # T-BL22: rebuild failure -> IP-18 regen_diagnose fix-preview card
                     # (T-H11 seam). Diagnoses the FAILED tree from the ops response (the
                     # doc itself was already rolled back above), logs the model call as an
@@ -774,6 +1143,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     "volume_mm3": r.get("volume"),
                     "features": feats,
                 }
+                if interpreted:
+                    out["interpreted"] = interpreted
                 # GSL Stage 1a — SEMANTIC write-confirmation (W2): say what the op actually did
                 # ("added 2 faces (+2 cylinder); 2 new bore/hole(s); volume 24000→23435") or warn
                 # "no geometry change" so the model isn't left diffing a bare volume number.

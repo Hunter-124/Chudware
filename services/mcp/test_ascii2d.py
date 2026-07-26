@@ -26,6 +26,7 @@ from mcp_server.ascii2d import (
     check_board,
     check_schematic,
     check_sketch_geometry,
+    parse_highlight,
     plan_ascii_edits,
     register_ascii2d_tools,
     render_ascii_3d,
@@ -664,3 +665,210 @@ def test_attach_schematic_readback():
     assert resp["ascii"]
 
 
+
+# ------------------------------------------------- highlight / legend / scale
+
+
+def _hl_sketch() -> dict:
+    """Closed rectangle + two circles, so a highlight has something to pick out."""
+    return {
+        "entities": [
+            {"id": "e1", "type": "line", "p1": [0.0, 0.0], "p2": [0.0, 40.0]},
+            {"id": "e2", "type": "line", "p1": [0.0, 40.0], "p2": [60.0, 40.0]},
+            {"id": "e3", "type": "line", "p1": [60.0, 40.0], "p2": [60.0, 0.0]},
+            {"id": "e4", "type": "line", "p1": [60.0, 0.0], "p2": [0.0, 0.0]},
+            {"id": "e5", "type": "circle", "center": [15.0, 20.0], "radius": 6.0},
+            {"id": "e6", "type": "circle", "center": [45.0, 20.0], "radius": 6.0},
+        ],
+        "constraints": [],
+    }
+
+
+def test_parse_highlight_accepts_every_shape():
+    assert parse_highlight(None) == []
+    assert parse_highlight("") == []
+    assert parse_highlight("e3") == ["e3"]
+    assert parse_highlight("e3, e4;e5") == ["e3", "e4", "e5"]
+    assert parse_highlight(["e3", {"net": "GND"}]) == ["e3", "net:GND"]
+    assert parse_highlight('["e3","net:GND"]') == ["e3", "net:GND"]
+    assert parse_highlight('{"ref":"R1"}') == ["ref:R1"]
+    # duplicates collapse, order preserved
+    assert parse_highlight("e3,e3,e1") == ["e3", "e1"]
+    # box tokens keep their own commas
+    assert parse_highlight("box:0,0,10,10") == ["box:0,0,10,10"]
+
+
+def test_every_render_states_scale_and_origin():
+    """Acceptance: a model must be able to convert a glyph position to coords."""
+    reports = {
+        "sketch": sketch_ascii_report(_hl_sketch(), pitch=2.0),
+        "pcb": board_ascii_report(_crossing_board(), pitch_mm=2.0),
+        "schematic": schematic_ascii_report(_divider_schematic()),
+        "silhouette3d": render_ascii_3d(bbox={"min": [0, 0, 0], "max": [10, 4, 6]},
+                                        view="front", pitch=1.0),
+    }
+    for kind, rep in reports.items():
+        lines = "\n".join(rep["scale"]["lines"])
+        assert "SCALE:" in lines, kind
+        assert "ORIGIN:" in lines, kind
+        assert "CONVERT:" in lines, kind
+        assert lines in rep["ascii_annotated"], kind
+        assert lines in rep["summary"], kind
+    sim = render_sim_ascii(circuit={"devices": [
+        {"kind": "R", "name": "R1", "nodes": ["a", "b"], "params": {"r": "1k"}}],
+        "nodes": ["a", "b"]})
+    sim_scale = "\n".join(sim["scale"]["lines"])
+    assert "SCALE: TOPOLOGICAL" in sim_scale
+    assert "ORIGIN: none" in sim_scale
+    assert sim_scale in sim["ascii_annotated"]
+
+
+def test_every_render_carries_a_legend_and_callouts():
+    for rep in (sketch_ascii_report(_hl_sketch(), pitch=2.0),
+                board_ascii_report(_crossing_board(), pitch_mm=2.0),
+                schematic_ascii_report(_divider_schematic()),
+                render_sim_ascii(spice_text="R1 a b 1k\n.end"),
+                render_ascii_3d(bbox={"min": [0, 0, 0], "max": [10, 4, 6]})):
+        assert rep["legend"] and rep["legend"][0].startswith("LEGEND ")
+        assert "\n".join(rep["legend"]) in rep["ascii_annotated"]
+        assert "CALLOUTS (marker -> id ->" in rep["ascii_annotated"]
+        assert "CALLOUTS (marker -> id ->" in rep["summary"]
+
+
+def test_default_output_shape_unchanged_without_highlight():
+    """The raw drawing must be byte-identical whether or not the extras exist."""
+    sk = _hl_sketch()
+    plain = sketch_ascii_report(sk, pitch=2.0)
+    again = sketch_ascii_report(sk, pitch=2.0)
+    assert plain["ascii"] == again["ascii"]
+    for key in ("ok", "kind", "ascii", "ascii_ruled", "summary", "findings",
+                "pitch", "width", "height", "bbox", "grid", "index", "hint"):
+        assert key in plain, key
+    assert plain["highlight"]["requested"] == []
+    assert plain["callouts"] == [] or all(
+        c["marker"] == "-" for c in plain["callouts"])
+
+
+def test_sketch_highlight_marks_only_the_target():
+    sk = _hl_sketch()
+    plain = sketch_ascii_report(sk, pitch=2.0)
+    marked = sketch_ascii_report(sk, pitch=2.0, highlight="e5")
+    assert marked["ascii"] != plain["ascii"], "highlight must change the drawing"
+    assert "A" in marked["ascii"] and "A" not in plain["ascii"]
+    assert ">A<" in marked["ascii"], "anchor must be bracketed"
+    # e6 (the other circle) keeps its ordinary glyphs
+    assert marked["ascii"].count("A") < plain["ascii"].count("+") + \
+        plain["ascii"].count("-") + plain["ascii"].count("|")
+    ids = [c["id"] for c in marked["callouts"]]
+    assert ids == ["e5"], marked["callouts"]
+    c = marked["callouts"][0]
+    assert c["marker"] == "A" and "r=6.0" in c["desc"]
+    assert c["anchor_cell"] and c["anchor_world"]
+    assert "A -> e5 ->" in marked["ascii_annotated"]
+
+
+def test_sketch_highlight_by_type_and_list_gets_distinct_markers():
+    marked = sketch_ascii_report(_hl_sketch(), pitch=2.0, highlight=["e1", "circle"])
+    markers = {c["marker"] for c in marked["callouts"]}
+    assert markers == {"A", "B"}, marked["callouts"]
+    assert {c["id"] for c in marked["callouts"]} == {"e1", "e5", "e6"}
+    assert "A" in marked["ascii"] and "B" in marked["ascii"]
+
+
+def test_unmatched_highlight_is_reported_not_silently_dropped():
+    marked = sketch_ascii_report(_hl_sketch(), pitch=2.0, highlight="e1,nope9")
+    assert marked["highlight"]["unmatched"] == ["nope9"]
+    assert "REQUESTED BUT NOT FOUND" in marked["ascii_annotated"]
+
+
+def test_board_highlight_marks_footprint_and_net():
+    board = _crossing_board()
+    plain = board_ascii_report(board, layer="F.Cu", pitch_mm=2.0)
+    marked = board_ascii_report(board, layer="F.Cu", pitch_mm=2.0,
+                                highlight="R1,net:A")
+    assert marked["ascii"] != plain["ascii"]
+    ids = {c["id"] for c in marked["callouts"] if c["marker"] != "-"}
+    assert "R1" in ids and "tA" in ids and "v1" in ids, marked["callouts"]
+    by_marker = {c["marker"] for c in marked["callouts"] if c["marker"] != "-"}
+    assert by_marker == {"A", "B"}
+    # the marked track is drawn with its letter, not with a path glyph
+    assert "B" in marked["ascii"]
+
+
+def test_schematic_highlight_marks_symbol_label_and_power():
+    sch = _divider_schematic()
+    plain = schematic_ascii_report(sch)
+    marked = schematic_ascii_report(sch, highlight=["R2", "MID", "GND"])
+    assert marked["ascii"] != plain["ascii"]
+    got = {c["marker"]: c["id"] for c in marked["callouts"] if c["marker"] != "-"}
+    assert got == {"A": "R2", "B": "l1", "C": "pw1"}, marked["callouts"]
+    for mk in ("A", "B", "C"):
+        assert mk in marked["ascii"]
+
+
+def test_sim_highlight_marks_rows_via_gutter():
+    circuit = {"devices": [
+        {"kind": "R", "name": "R1", "nodes": ["in", "mid"], "params": {"r": "10k"}},
+        {"kind": "R", "name": "R2", "nodes": ["mid", "0"], "params": {"r": "10k"}}],
+        "nodes": ["in", "mid", "0"]}
+    results = {"probes": {"V(in)": 5.0, "V(mid)": 2.5}}
+    plain = render_sim_ascii(circuit=circuit, results=results)
+    marked = render_sim_ascii(circuit=circuit, results=results,
+                              highlight="R2,node:mid")
+    assert ">A<" not in plain["ascii"] and ">B<" not in plain["ascii"]
+    assert ">A< R R2 nodes=[mid,0] r=10k" in marked["ascii"]
+    assert ">B< R R1 nodes=[in,mid] r=10k" in marked["ascii"]
+    assert ">B< V(mid) = 2.5" in marked["ascii"]
+    # every payload row keeps the 4-char gutter so columns still line up
+    for line in plain["ascii"].split("\n"):
+        if not line.startswith("["):
+            assert line.startswith("    "), line
+    ids = {c["id"] for c in marked["callouts"]}
+    assert {"R1", "R2", "V(mid)"} <= ids, marked["callouts"]
+
+
+def test_silhouette_highlight_by_polyline_and_box():
+    bb = {"min": [0, 0, 0], "max": [10, 4, 6]}
+    plain = render_ascii_3d(bbox=bb, view="front", pitch=1.0)
+    # no highlight → the p-handles are still enumerated so a model can address them
+    assert any(c["id"] == "p0" for c in plain["callouts"])
+    marked = render_ascii_3d(bbox=bb, view="front", pitch=1.0, highlight="p2")
+    assert marked["ascii"] != plain["ascii"]
+    assert "A" in marked["ascii"]
+    assert [c["id"] for c in marked["callouts"] if c["marker"] == "A"] == ["p2"]
+    boxed = render_ascii_3d(bbox=bb, view="front", pitch=1.0,
+                            highlight="box:-1,-1,1,1")
+    assert [c["id"] for c in boxed["callouts"] if c["marker"] == "A"], boxed["callouts"]
+
+
+def test_registered_tools_expose_highlight_and_round_trip():
+    import inspect
+
+    mcp = _StubMCP()
+    register_ascii2d_tools(mcp)
+    for name in ("render_sketch_ascii", "render_board_ascii",
+                 "render_schematic_ascii", "render_sim_ascii", "render_ascii"):
+        assert "highlight" in inspect.signature(mcp.tools[name]).parameters, name
+
+    out = json.loads(mcp.tools["render_sketch_ascii"](
+        sketch_json=json.dumps(_hl_sketch()), pitch=2.0, highlight="e5"))
+    assert out["ok"] and "A -> e5 ->" in out["ascii_annotated"]
+
+    out = json.loads(mcp.tools["render_board_ascii"](
+        board_json=json.dumps(_crossing_board()), pitch_mm=2.0, highlight="R1"))
+    assert out["ok"] and "A -> R1 ->" in out["ascii_annotated"]
+
+    out = json.loads(mcp.tools["render_schematic_ascii"](
+        sch_json=json.dumps(_divider_schematic()), highlight="R2"))
+    assert out["ok"] and "A -> R2 ->" in out["ascii_annotated"]
+
+    out = json.loads(mcp.tools["render_sim_ascii"](
+        circuit_json=json.dumps({"devices": [
+            {"kind": "R", "name": "R1", "nodes": ["a", "b"], "params": {"r": "1k"}}],
+            "nodes": ["a", "b"]}), highlight="R1"))
+    assert out["ok"] and ">A< R R1" in out["ascii"]
+
+    out = json.loads(mcp.tools["render_ascii"](
+        bbox_json=json.dumps({"min": [0, 0, 0], "max": [10, 4, 6]}),
+        view="front", pitch=1.0, highlight="p1"))
+    assert out["ok"] and "A -> p1 ->" in out["ascii_annotated"]

@@ -135,28 +135,187 @@ def _resolve_alias(doc_id: str) -> str:
     return doc_id
 
 
+# --- doc handle resolution ---------------------------------------------------------------
+# Measured (bench-run ledgers): ~40 tool failures are the agent failing to NAME the document
+# it means — the part's NAME instead of its id ("flanged_bushing_design"), the id with its
+# "doc-" prefix dropped ("cpp00000009"), a whole `new_part(name='flanged_bushing')` call
+# pasted where a handle belongs, or no doc_id at all with several parts open. The engine
+# knows every open doc's id AND name (doc_list), so resolve a supplied handle against that
+# vocabulary instead of forwarding it and letting the engine answer a bare "no such
+# document: <thing>" — which names the offence but never the correction. Whichever way
+# resolution fails, the error carries the open-document set as id="name" pairs so the NEXT
+# turn can just pick one.
+
+_DOC_LIST_MAX = 20  # cap the listing: a shared daemon can hold dozens of docs
+
+# `name=`/`part=` out of a pasted call, quoted or bare: new_part(name='flanged_bushing').
+_DOC_KWARG_NAME_RE = re.compile(
+    r"""\b(?:doc_id|name|part_name|part|title)\s*=\s*(?:['"]([^'"]*)['"]|([^,)\s]+))""")
+_DOC_QUOTED_RE = re.compile(r"""['"]([^'"]+)['"]""")
+
+# An engine-minted handle from a registry doc_list does NOT enumerate: drawings
+# ("dwg-cpp0000003") and ECAD docs ("ecadcpp000000a") are kept in their own C++ registries,
+# so only "doc-" ids are ours to verify. Matches a <namespace>cpp<hex> handle that is not a
+# part/assembly id — a bare "cpp00000009" (the dropped-prefix typo) deliberately does not.
+_FOREIGN_HANDLE_RE = re.compile(r"^(?!doc-)[a-z]{3,8}-?cpp[0-9a-f]{4,}$", re.I)
+
+
+class DocRefError(CoreError, ValueError):
+    """A document handle that could not be resolved to an open document.
+
+    A CoreError so `_err` renders its structured `detail` (the open-document vocabulary plus
+    the corrected call) next to the message, and still a ValueError so every existing
+    `except ValueError` around `_doc` keeps catching it — this used to be a plain one."""
+
+
+def _doc_listing(docs: list, limit: int = _DOC_LIST_MAX) -> str:
+    """The open documents as id="name" pairs — the vocabulary a caller must choose from."""
+    if not docs:
+        return "(none)"
+    out = ", ".join(f'{e.get("doc_id")}="{e.get("name") or ""}"' for e in docs[:limit])
+    if len(docs) > limit:
+        out += f", … +{len(docs) - limit} more (call list_parts() for the full set)"
+    return out
+
+
+def _doc_error(problem: str, docs: list, hint: str, code: str) -> DocRefError:
+    """One teaching shape for every way a doc handle fails: what was wrong (naming the
+    offending value), the FULL open-document set, and the corrected call."""
+    return DocRefError(
+        f"{problem} Open parts: {_doc_listing(docs)}. {hint}",
+        code=code,
+        detail={"open_documents": [{"doc_id": e.get("doc_id"), "name": e.get("name") or ""}
+                                   for e in docs[:_DOC_LIST_MAX]],
+                "hint": hint})
+
+
+def _docs_named(docs: list, value: str) -> list:
+    """Open docs whose NAME is `value` — an exact match wins outright, else case-insensitive."""
+    v = value.strip()
+    exact = [e for e in docs if (e.get("name") or "") == v]
+    if exact:
+        return exact
+    folded = v.casefold()
+    return [e for e in docs if (e.get("name") or "").strip().casefold() == folded]
+
+
+def _doc_near_misses(docs: list, value: str) -> list:
+    """Docs whose name is CLOSE to `value` ("flanged_bushing" for "flanged_bushing_design").
+    Only ever offered as a hint, never auto-resolved: editing the wrong part is worse than
+    an error the model can fix on the next turn."""
+    import difflib  # noqa: PLC0415 — failure path only
+    v = value.strip().casefold()
+    if not v:
+        return []
+    near = [e for e in docs
+            if (n := (e.get("name") or "").strip().casefold()) and (n in v or v in n)]
+    if near:
+        return near
+    by_name = {(e.get("name") or "").strip().casefold(): e for e in docs if e.get("name")}
+    return [by_name[m] for m in difflib.get_close_matches(v, list(by_name), n=3, cutoff=0.72)]
+
+
 def _doc(doc_id: Optional[str]) -> str:
-    # An explicit doc_id is always honoured — this is the required form when several agents /
-    # subagents work in parallel, so each addresses its OWN part and can never touch another's.
-    if doc_id:
-        return _resolve_alias(doc_id)
     # `_CUR` is a single PROCESS-WIDE "current part", and it is only ever set by a doc THIS
     # process created or opened. A part the human already had open in the GUI — or one another
     # client made — never touches it, so trusting `_CUR` alone reports "no current part" while
     # the part sits right there in the viewport. Always ask the engine what is actually open and
-    # reconcile against it.
+    # reconcile against it. The same listing is what resolves an imperfect supplied handle and
+    # what every teaching error below quotes back.
     try:
         docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                 if isinstance(e, dict) and e.get("doc_id")]
-    except Exception:  # noqa: BLE001 — doc_list unavailable: fall back to legacy current-doc behavior
-        docs = []
+        listed = True
+    except Exception:  # noqa: BLE001 — doc_list unavailable: fall back to legacy behavior
+        docs, listed = [], False
 
-    def _ambiguous() -> ValueError:
-        listing = ", ".join(f'{e.get("doc_id")}="{e.get("name", "")}"' for e in docs)
-        return ValueError(
-            f"Ambiguous: {len(docs)} parts are open, so there is no single current part. "
-            "Pass doc_id= explicitly (required whenever multiple parts/agents are active). "
-            f"Open parts: {listing}")
+    def _ambiguous(candidates: Optional[list] = None,
+                   supplied: Optional[str] = None) -> DocRefError:
+        """The "which document did you mean?" error — always naming every open doc."""
+        if candidates is None:
+            return _doc_error(
+                f"Ambiguous: {len(docs)} parts are open, so there is no single current part. "
+                "Pass doc_id= explicitly (required whenever multiple parts/agents are active).",
+                docs, code="doc_ambiguous",
+                hint=f'e.g. doc_id="{docs[0].get("doc_id")}" — an open part\'s name works too.')
+        return _doc_error(
+            f"Ambiguous doc_id={supplied!r}: {len(candidates)} open parts answer to that name "
+            f"({_doc_listing(candidates)}), so it does not identify one document.",
+            docs, code="doc_ambiguous",
+            hint=f'pass the id of the one you mean, e.g. doc_id="{candidates[0].get("doc_id")}".')
+
+    # An explicit doc_id is always honoured — this is the required form when several agents /
+    # subagents work in parallel, so each addresses its OWN part and can never touch another's.
+    if doc_id:
+        raw = str(doc_id).strip()
+        if not listed:
+            # No engine listing to check against: forward the handle unverified (legacy path).
+            return _resolve_alias(raw)
+        ids = {e.get("doc_id"): e for e in docs}
+        folded_ids = {str(k).casefold(): k for k in ids}
+
+        def _lookup(tok: str) -> Optional[str]:
+            """A handle -> a live doc_id: the id itself, an alias of it, the id with its
+            "doc-" prefix dropped or case-mangled, or the part's unique name."""
+            t = tok.strip()
+            if not t:
+                return None
+            a = _resolve_alias(t)
+            if a in ids:
+                return a
+            for cand in (t, f"doc-{t}"):
+                hit = folded_ids.get(cand.casefold())
+                if hit:
+                    return hit
+            named = _docs_named(docs, t)
+            return named[0]["doc_id"] if len(named) == 1 else None
+
+        resolved = _lookup(raw)
+        if resolved:
+            return resolved
+        if _FOREIGN_HANDLE_RE.match(raw):
+            # A drawing / ECAD handle: its registry, not doc_list, is the authority on
+            # whether it is live. Forward it untouched and let that registry answer.
+            return _resolve_alias(raw)
+        same_name = _docs_named(docs, raw)
+        if len(same_name) > 1:
+            raise _ambiguous(same_name, raw)
+        # Source text pasted where a handle belongs ("new_part(name='flanged_bushing')").
+        # Say THAT: "no such document: new_part(name='flanged_bushing')" reads like a lookup
+        # miss when the real mistake is the kind of argument. Never resolve it silently — the
+        # text asks to CREATE a part, so adopting an existing one could edit the wrong doc.
+        if "(" in raw or "=" in raw:
+            m = _DOC_KWARG_NAME_RE.search(raw)
+            guess = ((m.group(1) or m.group(2) or "") if m else "").strip()
+            if not guess:
+                q = _DOC_QUOTED_RE.search(raw)
+                guess = q.group(1).strip() if q else ""
+            inner = _lookup(guess) if guess else None
+            if inner:
+                hint = f'that part is already open — pass doc_id="{inner}".'
+            elif guess:
+                hint = (f'no open part is named "{guess}" — call new_part(name="{guess}") as its '
+                        "own tool call first, then pass the doc_id it returns.")
+            else:
+                hint = ('call new_part(name="…") as its own tool call first, then pass the '
+                        "doc_id it returns.")
+            raise _doc_error(
+                f"doc_id={raw!r} is source text (a call or an argument expression), not a "
+                'document handle: doc_id takes an open document\'s id ("doc-cpp0000000b") or '
+                "its name.",
+                docs, code="doc_id_is_source_text", hint=hint)
+        if not docs:
+            raise _doc_error(
+                f"no such document {raw!r}: ZERO documents are open in this engine session.",
+                docs, code="doc_not_found",
+                hint='call new_part(name="…") first, then pass the doc_id it returns.')
+        near = _doc_near_misses(docs, raw)
+        raise _doc_error(
+            f"no such document {raw!r}: it matches no open document's id or name.",
+            docs, code="doc_not_found",
+            hint=(f'did you mean doc_id="{near[0].get("doc_id")}" (the part named '
+                  f'"{near[0].get("name")}")?' if len(near) == 1 else
+                  "pass one of the ids above, or the exact name of an open part."))
 
     d = _CUR["doc_id"]
     if not d:
@@ -168,7 +327,19 @@ def _doc(doc_id: Optional[str]) -> str:
             _CUR["doc_id"] = d
             return _resolve_alias(d)
         if not docs:
-            raise ValueError("No current part. Call new_part(...) first (or pass doc_id=).")
+            if not listed:
+                raise _doc_error(
+                    "No current part, and the engine's document list is unavailable "
+                    "(doc_list failed), so nothing can be resolved for you.",
+                    docs, code="no_current_part",
+                    hint='pass doc_id= explicitly, or call new_part(name="…") first.')
+            # Zero documents open is NOT "you forgot to pass doc_id" — there is nothing to
+            # address yet, so say so plainly instead of implying a missing argument.
+            raise _doc_error(
+                "No current part: ZERO documents are open in this engine session, so no "
+                "doc_id would work either.",
+                docs, code="no_open_documents",
+                hint='call new_part(name="…") first; it returns the doc_id to pass.')
         raise _ambiguous()
     # Concurrency guard: with one document open `_CUR` is an unambiguous convenience. But when
     # MORE than one part is open — exactly the multi-subagent case — an omitted doc_id is
@@ -215,18 +386,38 @@ def _tmp(suffix: str) -> str:
     return path
 
 
-def _captioned_render(png: str, doc_id: str, views: list) -> Union[Image, list]:
+def _captioned_render(png: str, doc_id: str, views: list,
+                      annotations: Optional[dict] = None,
+                      extra: str = "") -> Union[Image, list]:
     """A2/render-caption wiring: pair a render PNG with a one-paragraph deterministic text
     caption (services.mcp.gsl_tools._scene_caption) so a non-vision model reading the tool
     transcript gets SOME signal from a render it cannot see. `mcp` 1.28.1 flattens a list
     return into [ImageContent, TextContent] (func_metadata._convert_to_content), so a vision
     model still gets the image plus the caption is free extra context either way. Best-effort:
-    any failure (missing gsl_tools, a bad doc_id) degrades to the bare Image exactly as before."""
+    any failure (missing gsl_tools, a bad doc_id) degrades to the bare Image exactly as before.
+
+    annotations: the `info` dict from _annotate_render. When present its self-sufficient block
+    (bbox + scale, features in frame, highlights and their reserved colours, the side-palette
+    colour key, and what this camera CANNOT see plus the tool to call for it) is appended, so
+    the caption alone fully describes the image. `extra` is appended after that."""
+    tail = ""
+    if annotations:
+        try:
+            view_name = ("+".join(str(v) for v in views) + " tiled-sheet"
+                         if views and len(views) > 1
+                         else (str(views[0]) if views else "current"))
+            tail = _render_annotation_caption(view_name, annotations)
+        except Exception:  # noqa: BLE001
+            tail = ""
+    if extra:
+        tail = (tail + " " + extra).strip() if tail else extra.strip()
     try:
         from mcp_server.gsl_tools import _scene_caption
         caption = _scene_caption(doc_id, views)
-        return [Image(path=png), caption]
+        return [Image(path=png), (caption + " " + tail).strip() if tail else caption]
     except Exception:  # noqa: BLE001
+        if tail:
+            return [Image(path=png), tail]
         return Image(path=png)
 
 
@@ -1448,15 +1639,64 @@ def _vsub(a, b) -> tuple:
     return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
 
+# --------------------------------------------------------------- inspect/highlight target words
+# A stable sid as emitted by describe_part / query_geometry: one KIND letter (F face, E edge,
+# V vertex) plus six hex digits — core/doc/selectors.cpp stable_sid().
+_SID_RE = re.compile(r"[fev][0-9a-f]{6}", re.I)
+
+# Every token the geometry grammar recognises, plus the connectives it ignores. A string that
+# carries a token OUTSIDE this set is prose — most often a FEATURE NAME ("Boss") — and must never
+# be shipped to the engine as a `side` value (that is the `geom query: bad 'side' 'Boss'` bug).
+_QKNOWN_TOKENS = (
+    set(_QSIDE_WORDS) | set(_QSURF_FACE) | set(_QSURF_EDGE) | set(_QPICK_WORDS)
+    | set(_QAXIS_WORDS) | set(_QAXIS_FILLER)
+    | {"parallel", "perpendicular", "vertical", "horizontal", "upright",
+       "face", "faces", "edge", "edges", "surface", "surfaces",
+       "feature", "features", "part", "body", "and", "its", "on", "at", "in", "near"}
+)
+
+
+def _query_unknown_tokens(text) -> list:
+    """Words in `text` the geometry grammar has no meaning for (digits never tokenise)."""
+    return [t for t in _QTOKEN_RE.findall(str(text).lower())
+            if t not in _QKNOWN_TOKENS and not _QSIDE_AXIS_RE.fullmatch(t)]
+
+
+def _name_or_query(text, of: Optional[str] = None) -> dict:
+    """Read a leftover phrase as a geometry query when it is built from grammar TOKENS, else as a
+    feature NAME.
+
+    Returns a query dict, or {"feature_name": text} — plus "fallback_query" when the phrase mixes
+    real tokens with unknown words ("outer cylindrical wall face"), so the resolver can try the
+    name first and still fall back to the query instead of dead-ending.
+    """
+    name = " ".join(str(text).strip().split())
+    try:
+        q = dict(_as_face_query(name))
+    except ValueError:
+        return {"feature_name": name}
+    if of:
+        q["of"] = of
+    if _query_unknown_tokens(name):
+        return {"feature_name": name, "fallback_query": q}
+    return q
+
+
 def _parse_inspect_target(target: Union[str, dict]) -> dict:
-    """Normalize an inspect target into either a geom-query dict or a feature-id handle.
+    """Normalize an inspect target into a geom-query dict, a sid handle, a feature handle or a
+    feature NAME.
 
     Accepts:
       * geom-query dict  {"of":"face","side":"top"} / {"of":"edge","parallel":"z"}
-      * bare side word   "top" / "+z"  -> face query
+      * sid string       "F58db6d" / "E1c4a90" — describe_part's stable face/edge handles
       * feature id       "f2" / "F3"   -> {"feature_id": "f2"}
+      * feature name     "Boss"        -> {"feature_name": "Boss"}
+      * bare side word   "top" / "+z"  -> face query
       * plain phrase     "the filleted edge" / "fillet faces" — light NL expansion onto the
-                         same query vocabulary (round faces / circle edges / feature name).
+                         same query vocabulary (round faces / circle edges).
+
+    A phrase the grammar cannot read comes back as a feature NAME, never as a `side` value the
+    engine will reject; _resolve_inspect_target turns the handle into real matches.
     """
     if isinstance(target, dict):
         if target.get("feature_id") or target.get("feature"):
@@ -1467,14 +1707,24 @@ def _parse_inspect_target(target: Union[str, dict]) -> dict:
         # Resolved selector dict (sid/kind/centroid) — pass through for measure / bbox.
         if target.get("kind") in ("face", "edge") and target.get("centroid") is not None:
             return {"selector": target}
+        # Bare {"sid": "F58db6d"} handle — resolved against the live face/edge roster.
+        if target.get("sid"):
+            return {"sid": str(target["sid"]).strip()}
         return dict(target)
 
     s = str(target).strip()
     if not s:
         raise ValueError("inspect target is empty — pass a face/edge query or feature id")
 
-    # Feature id from the tree: f1 / F12.
     import re as _re
+
+    # Stable sid first: "f123456" is a legal sid AND matches the feature-id shape, and a sid is
+    # the more specific reading. _resolve_inspect_target falls back to the feature reading when
+    # no such sid exists in the document.
+    if _SID_RE.fullmatch(s):
+        return {"sid": s}
+
+    # Feature id from the tree: f1 / F12.
     m = _re.fullmatch(r"[fF](\d+)", s)
     if m:
         return {"feature_id": f"f{m.group(1)}"}
@@ -1509,7 +1759,7 @@ def _parse_inspect_target(target: Union[str, dict]) -> dict:
             return {"of": "face", "side": stem}
         if stem in ("round", "rounded", "curved", "cylindrical"):
             return {"of": "face", "surf": "round"}
-        return {"of": "face", "side": stem}
+        return _name_or_query(stem, "face")
     if low_bare.endswith(" edges") or low_bare.endswith(" edge"):
         stem = _re.sub(r"\s+edges?$", "", low_bare).strip()
         if stem in ("vertical", "upright"):
@@ -1520,46 +1770,349 @@ def _parse_inspect_target(target: Union[str, dict]) -> dict:
             return {"of": "edge", "side": stem}
         if stem in ("round", "rounded", "filleted", "circular", "circle"):
             return {"of": "edge", "surf": "circle"}
-        return {"of": "edge", "side": stem}
+        return _name_or_query(stem, "edge")
 
-    # Last resort: treat as a face side word (query_geometry convention).
-    return {"of": "face", "side": s}
+    # Neither a side word nor a grammar phrase → read it as a NAME (the resolver joins it to the
+    # feature tree) instead of emitting a `side` the engine can only reject.
+    return _name_or_query(s)
 
 
-def _feature_owned_matches(doc_id: str, feature_id: str) -> list:
-    """Join doc_tree.owner_map to doc_query matches for a feature's owned faces+edges.
+def _target_feature_roster(doc_id: str) -> tuple:
+    """(features, owner_map) from doc_tree: the feature roster the tree lists ([{id,name,type}])
+    and describe_part's feature->topology join table.
 
-    owner_map keys faces/edges as [body_id, topo_id] (1-based). doc_query enumerates the
-    LAST body in first-encounter order, so topo_id == match_index+1 on that body
-    (same join as gsl_tools.describe_part).
+    Never raises — an unreachable tree degrades to an empty roster so target resolution can still
+    report what it tried instead of masking the real error with an RPC failure.
     """
-    tree = cb.call("doc_tree", {"doc_id": doc_id}) or {}
-    owner_map = tree.get("owner_map") or {}
-    om = owner_map.get(feature_id)
-    if not om:
-        # Also allow matching by feature name (case-insensitive).
-        feats = ((tree.get("tree") or {}).get("features")) or []
-        for f in feats:
-            if isinstance(f, dict) and str(f.get("name", "")).lower() == feature_id.lower():
-                feature_id = f.get("id") or feature_id
-                om = owner_map.get(feature_id)
-                break
-    if not om:
+    try:
+        tree = cb.call("doc_tree", {"doc_id": doc_id}) or {}
+    except Exception:  # noqa: BLE001
+        return [], {}
+    feats = [f for f in (((tree.get("tree") or {}).get("features")) or [])
+             if isinstance(f, dict)]
+    return feats, (tree.get("owner_map") or {})
+
+
+def _roster_text(feats: list, limit: int = 12) -> str:
+    """`f1="Plate", f2="Boss"` — the id+name list every target error quotes so a model that
+    guessed a name once can see the real ones and retry without another exploration call."""
+    if not feats:
+        return "(none — this document's tree lists no features yet)"
+    bits = [f'{f.get("id")}="{f.get("name")}"' for f in feats[:limit]]
+    if len(feats) > limit:
+        bits.append(f"+{len(feats) - limit} more")
+    return ", ".join(bits)
+
+
+def _norm_feature_name(text) -> str:
+    """Fold a feature name for comparison: lowercase, collapsed whitespace, no leading article
+    and no trailing "feature" — so "  the Boss feature " matches the feature named "Boss"."""
+    s = " ".join(str(text or "").strip().lower().split())
+    s = re.sub(r"^(?:the|a|an)\s+", "", s)
+    s = re.sub(r"\s+feature$", "", s)
+    return s.strip()
+
+
+def _features_named(feats: list, text) -> list:
+    """Every feature whose name folds to `text` (case-insensitive, whitespace tolerant)."""
+    want = _norm_feature_name(text)
+    if not want:
+        return []
+    return [f for f in feats if _norm_feature_name(f.get("name")) == want]
+
+
+def _sid_match(doc_id: str, sid: str) -> Optional[dict]:
+    """The live doc_query match carrying this stable sid, or None.
+
+    The sid's first letter IS its kind (F face / E edge / V vertex — stable_sid), so only that
+    roster is scanned. Vertices aren't queryable, so a V sid never matches.
+    """
+    want = str(sid).strip().lower()
+    for of in {"f": ("face",), "e": ("edge",)}.get(want[:1], ("face", "edge")):
+        try:
+            res = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": of}}) or {}
+        except Exception:  # noqa: BLE001
+            continue
+        for m in res.get("matches") or []:
+            if str(m.get("sid") or "").lower() == want:
+                return m
+    return None
+
+
+def _resolve_feature_ref(doc_id: str, ref, feats: Optional[list] = None,
+                         what: str = "target") -> tuple:
+    """(feature_id, feature_name, feats) for a feature id ("f2"/"F2") or NAME ("Boss").
+
+    Name matching is case-insensitive, whitespace-tolerant, and ignores a leading article or a
+    trailing "feature". Every failure TEACHES: the candidate list when a name is shared by
+    several features, otherwise the whole id+name roster plus the describe_part sid pointer —
+    a name must never reach the engine's side parser.
+    """
+    if feats is None:
+        feats, _om = _target_feature_roster(doc_id)
+    s = " ".join(str(ref or "").strip().split())
+    if not s:
         raise ValueError(
-            f"No feature {feature_id!r} in the tree owner_map — use get_part / describe_part "
-            f"to list feature ids (f1, f2, …).")
+            f"empty {what} — name a feature (id f1, f2, … or its name), a face/edge sid from "
+            f"describe_part(doc_id), or pass a geometry query {_QVOCAB_HELP}.")
 
+    m = re.fullmatch(r"[fF](\d+)", s)
+    if m:
+        fid = f"f{m.group(1)}"
+        for f in feats:
+            if str(f.get("id")) == fid:
+                return fid, f.get("name"), feats
+        raise ValueError(
+            f"No feature {fid!r} in this document. Features: {_roster_text(feats)}. "
+            f"If you meant one face/edge rather than a feature, describe_part(doc_id) lists "
+            f"every sid (F58db6d / E1c4a90 style).")
+
+    hits = _features_named(feats, s)
+    if len(hits) == 1:
+        return str(hits[0].get("id")), hits[0].get("name"), feats
+    if len(hits) > 1:
+        cands = ", ".join(f'{h.get("id")}="{h.get("name")}"' for h in hits)
+        raise ValueError(
+            f"Feature name {s!r} is ambiguous — {len(hits)} features share it: {cands}. "
+            f"Pick one by id.")
+    raise ValueError(
+        f"Can't resolve {what} {s!r}: no feature has that name, and it is neither a face/edge "
+        f"sid (F58db6d / E1c4a90 — describe_part(doc_id) lists them) nor a geometry-query "
+        f"phrase. Features in this part: {_roster_text(feats)}. Geometry queries take "
+        f"{_QVOCAB_HELP}.")
+
+
+# ------------------------------------------------- what a feature actually CREATED (vs re-cut)
+# A boolean CUT re-creates every face its tool solid passes through, and OCCT attributes those
+# REGENERATED faces to the CUTTING feature. So doc_tree's owner_map hands an 8 mm through-bore
+# the plate's whole 9399 mm^2 bottom face — a caller that frames or tints "the bore" lights up
+# the entire part. The kernel's real provenance (CompileResult::tool_recs, the pre-boolean tool
+# solid per feature) never leaves C++: doc_query's per-face `owner_feature` is hardcoded null
+# (core/doc/picks.cpp), and eval_feature_overlap only reports pairwise common VOLUME between
+# tool solids, never per-face membership. So the tool footprint is reconstructed here from the
+# feature's OWN surviving faces, which is exact enough to be decisive:
+#
+#   a subtractive tool is a prism/revolve along an axis. Its LATERAL faces (the hole wall, the
+#   pocket walls) run ALONG that axis and are always genuinely new. Its CAP faces run ACROSS it
+#   and are either the tool's own floor — which fits INSIDE the lateral footprint — or a
+#   pre-existing neighbour the tool merely punched through, which does not.
+#
+# Nothing here can invent geometry: it only ever drops faces from the owner_map join, never
+# returns an empty set, and leaves additive features exactly as they were.
+
+# Feature types that remove material outright — no `mode` param to read.
+_SUBTRACTIVE_TYPES = frozenset({"hole", "bolt_circle"})
+# Types that REPLAY another feature's tool, so their add/cut role is the seed's role.
+_SEEDED_TYPES = frozenset({"linear_pattern", "circular_pattern", "curve_pattern",
+                           "sketch_pattern", "table_pattern", "pattern", "mirror"})
+
+
+def _feature_seed_ids(feat: dict) -> list:
+    """Feature ids a pattern/mirror replays (params.seed / refs.seed / refs.features / a body
+    selector's owner_feature) — a pattern of a cut is itself subtractive."""
+    out: list = []
+    for src in (feat.get("params") or {}, feat.get("refs") or {}):
+        if not isinstance(src, dict):
+            continue
+        for key in ("seed", "seeds", "feature", "features"):
+            v = src.get(key)
+            cands = v if isinstance(v, list) else [v]
+            for c in cands:
+                if isinstance(c, str):
+                    out.append(c)
+                elif isinstance(c, dict):
+                    o = c.get("owner_feature") or c.get("feature")
+                    if isinstance(o, str):
+                        out.append(o)
+    return out
+
+
+def _feature_is_subtractive(feat, feats: Optional[list] = None, _depth: int = 0) -> bool:
+    """True when this feature REMOVES material, so the kernel re-created — and mis-attributed
+    to it — the neighbour faces its tool passed through."""
+    if not isinstance(feat, dict) or _depth > 4:
+        return False
+    ftype = str(feat.get("type") or "").strip().lower()
+    if ftype in _SUBTRACTIVE_TYPES:
+        return True
+    params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+    if str(params.get("mode") or "").strip().lower() in ("cut", "subtract", "remove"):
+        return True
+    if ftype == "boolean":
+        return str(params.get("op") or "").strip().lower() in ("cut", "subtract", "difference")
+    if ftype in _SEEDED_TYPES and feats:
+        by_id = {str(f.get("id")): f for f in feats if isinstance(f, dict)}
+        return any(_feature_is_subtractive(by_id.get(s), feats, _depth + 1)
+                   for s in _feature_seed_ids(feat))
+    return False
+
+
+def _perp_basis(axis) -> tuple:
+    """Two unit vectors spanning the plane perpendicular to `axis`."""
+    a = _vnorm(axis)
+    seed = (1.0, 0.0, 0.0) if abs(a[0]) < 0.9 else (0.0, 1.0, 0.0)
+    u = _vnorm(_vcross(a, seed))
+    return u, _vnorm(_vcross(a, u))
+
+
+def _face_world_points(doc_id: str, match: dict) -> list:
+    """A face's real triangulation nodes in world space, or [] when the engine can't give them.
+
+    Deliberately NOT _match_point_cloud: that synthesises a seed BOX from area_or_len when the
+    tessellation is missing, and a made-up box must never decide whether a face is inside the
+    cut footprint."""
+    try:
+        fp = cb.call("doc_face_points", {"doc_id": doc_id, "selector": match}) or {}
+    except Exception:  # noqa: BLE001
+        return []
+    return [(float(p[0]), float(p[1]), float(p[2]))
+            for p in (fp.get("points") or [])
+            if isinstance(p, (list, tuple)) and len(p) >= 3]
+
+
+def _cut_axis_survivors(matches: list, clouds: list, axis) -> Optional[tuple]:
+    """({kept indices}, dropped_area) reading `axis` as the tool's extrusion/revolution axis,
+    or None when that reading explains nothing (no lateral wall, no cap, or nothing to drop)."""
+    a = _vnorm(axis)
+    lateral: list = []
+    caps: list = []
+    for i, m in enumerate(matches):
+        if str(m.get("surf") or "").strip().lower() != "plane":
+            lateral.append(i)          # a cylinder/cone/spline wall is never a pierced cap
+            continue
+        n = _vnorm(m.get("normal") or m.get("axis") or (0.0, 0.0, 1.0))
+        (caps if abs(_vdot(n, a)) > 0.7 else lateral).append(i)
+    if not lateral or not caps:
+        return None
+
+    u, v = _perp_basis(a)
+    us = [_vdot(p, u) for i in lateral for p in clouds[i]]
+    vs = [_vdot(p, v) for i in lateral for p in clouds[i]]
+    if len(us) < 3:
+        return None
+    ulo, uhi, vlo, vhi = min(us), max(us), min(vs), max(vs)
+    # 2% of the footprint absorbs tessellation chord error on a curved wall.
+    tol = max(1e-6, 0.02 * max(uhi - ulo, vhi - vlo, 1.0))
+
+    keep = set(lateral)
+    dropped = 0.0
+    for i in caps:
+        inside = all(ulo - tol <= _vdot(p, u) <= uhi + tol
+                     and vlo - tol <= _vdot(p, v) <= vhi + tol for p in clouds[i])
+        if inside:
+            keep.add(i)              # the tool's own floor / counterbore shoulder
+        else:
+            dropped += abs(float(matches[i].get("area_or_len") or 0.0))
+    if dropped <= 0.0:
+        return None
+    return keep, dropped
+
+
+def _dedupe_axes(axes: list) -> list:
+    """Unique directions, sign-insensitive (an axis and its reverse describe the same prism)."""
+    out: list = []
+    for a in axes:
+        if not any(abs(_vdot(a, b)) > 0.999 for b in out):
+            out.append(a)
+    return out
+
+
+def _created_face_matches(doc_id: str, feat, matches: list,
+                          feats: Optional[list] = None) -> list:
+    """The subset of a feature's owner_map FACE matches that the feature actually CREATED.
+
+    Additive features are returned untouched — a boss ADDS its faces, so owner_map is right.
+    For a subtractive feature (mode cut, type hole/bolt_circle, boolean cut, or a pattern/mirror
+    of one) the tool axis is recovered from the feature's own faces — a curved wall states its
+    axis outright, an all-planar pocket yields candidate axes as the cross products of its wall
+    normals — and the reading that explains the MOST regenerated area wins. Faces across that
+    axis are kept only when they fit inside the lateral walls' footprint, so a blind hole keeps
+    its floor and a through-bore keeps only its wall.
+
+    Conservative by construction: same dicts, same doc_query order, never empty, and any
+    ambiguity (one face, missing tessellation, no axis that explains anything) returns `matches`
+    unchanged rather than guessing.
+    """
+    if len(matches) < 2 or not _feature_is_subtractive(feat, feats):
+        return matches
+    if any((m.get("kind") or "face") != "face" for m in matches):
+        return matches
+
+    clouds = [_face_world_points(doc_id, m) for m in matches]
+    if any(len(c) < 3 for c in clouds):
+        return matches                # no real geometry to judge with — leave the join alone
+
+    cands = []
+    for m in matches:
+        if str(m.get("surf") or "").strip().lower() == "plane":
+            continue
+        ax = _v3(m.get("axis"))
+        if _vdot(ax, ax) > 1e-12:
+            cands.append(_vnorm(ax))
+    if not cands:
+        # All-planar tool (box cut / rectangular pocket or slot): the axis is perpendicular to
+        # two non-parallel wall normals.
+        normals = [_vnorm(m.get("normal") or m.get("axis") or (0.0, 0.0, 1.0)) for m in matches]
+        for i in range(len(normals)):
+            for j in range(i + 1, len(normals)):
+                c = _vcross(normals[i], normals[j])
+                if _vdot(c, c) > 0.04:          # >~11 deg apart
+                    cands.append(_vnorm(c))
+
+    best = None
+    for ax in _dedupe_axes(cands):
+        got = _cut_axis_survivors(matches, clouds, ax)
+        if got is not None and (best is None or got[1] > best[1]):
+            best = got
+    if best is None:
+        return matches
+    kept = [m for i, m in enumerate(matches) if i in best[0]]
+    return kept or matches
+
+
+def _owned_matches_for(doc_id: str, fid: str, label: str, owner_map: dict,
+                       feats: Optional[list] = None) -> list:
+    """doc_query matches for the geometry a feature owns — its FACES, exactly the set
+    describe_part's feature_groups reports, falling back to owned edges only for a feature that
+    ended up with no surviving face.
+
+    owner_map keys each feature's topology as [body_id, topo_id] (1-based); doc_query enumerates
+    the LAST body in first-encounter order, so topo_id == match_index + 1 on that body — the same
+    join describe_part uses (gsl_tools._digest). The last body is taken across the WHOLE
+    owner_map, not just this feature's pairs: a feature whose only pairs sit on a superseded body
+    was consumed by a later boolean and owns nothing addressable now, and joining its stale topo
+    ids against the live body would silently frame the WRONG faces.
+
+    Edges are deliberately excluded while faces exist. A fuse RE-CREATES the neighbour edges it
+    splits and the kernel attributes them to the new feature, so a 36 mm boss "owns" the plate's
+    102 mm top edges; framing on those blew the target bbox out past the whole part (151x131x102
+    on a 138x98x33 model) and the close-up degenerated into a whole-part render.
+
+    Owned faces are finally passed through _created_face_matches, which drops the neighbour
+    faces a CUT merely punched through and re-attributed to itself (see that function). `feats`
+    is the doc_tree roster — needed to read the feature's add/cut role, and to follow a
+    pattern/mirror to its seed; without it every feature is treated as additive.
+    """
     last_body = 0
-    for pair in (om.get("faces") or []) + (om.get("edges") or []):
-        if isinstance(pair, list) and len(pair) == 2:
-            last_body = max(last_body, int(pair[0]))
+    for om_any in (owner_map or {}).values():
+        for pair in (om_any.get("faces") or []) + (om_any.get("edges") or []):
+            if isinstance(pair, list) and len(pair) == 2:
+                last_body = max(last_body, int(pair[0]))
     if last_body <= 0:
-        raise ValueError(f"Feature {feature_id!r} owns no faces/edges yet.")
+        raise ValueError(
+            f"{label}: the document tree records no owned topology at all (owner_map is empty). "
+            f"Call describe_part(doc_id) for the face/edge sid roster and inspect by sid.")
 
+    om = (owner_map or {}).get(fid) or {}
     face_topos = {int(p[1]) for p in (om.get("faces") or [])
                   if isinstance(p, list) and len(p) == 2 and int(p[0]) == last_body}
     edge_topos = {int(p[1]) for p in (om.get("edges") or [])
                   if isinstance(p, list) and len(p) == 2 and int(p[0]) == last_body}
+    if not face_topos and not edge_topos:
+        raise ValueError(
+            f"{label} owns no faces/edges on the current body — a later boolean/fillet consumed "
+            f"it, so there is nothing to frame. describe_part(doc_id) marks consumed features "
+            f"and lists the sids that DO still exist.")
 
     out: list = []
     if face_topos:
@@ -1568,7 +2121,10 @@ def _feature_owned_matches(doc_id: str, feature_id: str) -> list:
         for i, m in enumerate(faces):
             if (i + 1) in face_topos:
                 out.append(m)
-    if edge_topos:
+        feat = next((f for f in (feats or [])
+                     if isinstance(f, dict) and str(f.get("id")) == fid), None)
+        out = _created_face_matches(doc_id, feat, out, feats)
+    if not out and edge_topos:
         edges = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "edge"}})
                  .get("matches") or [])
         for i, m in enumerate(edges):
@@ -1576,52 +2132,126 @@ def _feature_owned_matches(doc_id: str, feature_id: str) -> list:
                 out.append(m)
     if not out:
         raise ValueError(
-            f"Feature {feature_id!r} is in the tree but no owned faces/edges resolved "
-            f"(body={last_body}).")
+            f"{label} is in the tree but none of its owned topology resolved on body "
+            f"{last_body} — the model changed under it. Re-read describe_part(doc_id).")
     return out
 
 
-def _resolve_inspect_target(doc_id: str, target: Union[str, dict]) -> dict:
-    """Resolve target → {matches, query, label, kind}.
+def _feature_owned_matches(doc_id: str, feature_id: str) -> list:
+    """Faces+edges owned by a feature named by id ("f2") or NAME ("Boss", case-insensitive)."""
+    feats, owner_map = _target_feature_roster(doc_id)
+    fid, fname, _ = _resolve_feature_ref(doc_id, feature_id, feats, "feature")
+    return _owned_matches_for(doc_id, fid, _feature_label(fid, fname), owner_map, feats)
 
-    For a single-face/edge inspect we keep ALL matches when the target is a feature (so
-    the crop frames the whole feature). For a geom-query we accept 1+ matches and union
-    their bboxes; 0 matches raises a graceful error.
-    """
-    parsed = _parse_inspect_target(target)
-    if "feature_id" in parsed:
-        matches = _feature_owned_matches(doc_id, parsed["feature_id"])
-        return {
-            "matches": matches,
-            "query": parsed,
-            "label": f"feature {parsed['feature_id']}",
-            "kind": "feature",
-            "feature_id": parsed["feature_id"],
-        }
-    if "selector" in parsed:
-        return {
-            "matches": [parsed["selector"]],
-            "query": parsed["selector"],
-            "label": parsed["selector"].get("sid") or "selector",
-            "kind": parsed["selector"].get("kind") or "face",
-        }
 
-    q = parsed if isinstance(parsed, dict) else _as_face_query(parsed)
-    res = cb.call("doc_query", {"doc_id": doc_id, "query": q})
+def _feature_label(fid: str, fname) -> str:
+    """`feature f2 "Boss"` — captions must say WHICH feature, not just an opaque id."""
+    return f'feature {fid} "{fname}"' if fname else f"feature {fid}"
+
+
+def _feature_target_result(doc_id: str, ref, what: str = "inspect target",
+                           feats: Optional[list] = None,
+                           owner_map: Optional[dict] = None) -> dict:
+    """Resolve a feature id/name into the standard {matches, query, label, kind} result."""
+    if feats is None or owner_map is None:
+        feats, owner_map = _target_feature_roster(doc_id)
+    fid, fname, _ = _resolve_feature_ref(doc_id, ref, feats, what)
+    label = _feature_label(fid, fname)
+    return {
+        "matches": _owned_matches_for(doc_id, fid, label, owner_map, feats),
+        "query": {"feature_id": fid},
+        "label": label,
+        "kind": "feature",
+        "feature_id": fid,
+        "feature_name": fname,
+    }
+
+
+def _query_target_result(doc_id: str, q: dict, target) -> dict:
+    """Run a resolved geometry query and pack it as a target result."""
+    res = cb.call("doc_query", {"doc_id": doc_id, "query": q}) or {}
     matches = list(res.get("matches") or [])
     if not matches:
+        feats, _om = _target_feature_roster(doc_id)
         raise ValueError(
-            f"No geometry matched inspect target {target!r} "
-            f"(resolved query {q!r}). Use query_geometry(...) to explore faces/edges, "
-            f"or pass a feature id from the tree (f1, f2, …).")
+            f"No geometry matched inspect target {target!r} (resolved query {q!r}). "
+            f"query_geometry(...) explores faces/edges, describe_part(doc_id) lists every "
+            f"face/edge sid, or name a feature: {_roster_text(feats)}.")
     kind = matches[0].get("kind") or q.get("of") or "face"
-    # Compact label for captions.
     if isinstance(target, str):
         label = target.strip()
     else:
-        label = (q.get("side") or q.get("surf") or kind)
-        label = f"{kind} ({label})"
+        label = f'{kind} ({q.get("side") or q.get("surf") or kind})'
     return {"matches": matches, "query": q, "label": label, "kind": kind}
+
+
+def _resolve_inspect_target(doc_id: str, target: Union[str, dict]) -> dict:
+    """Resolve an inspect / highlight target → {matches, query, label, kind[, feature_id,
+    feature_name]}.
+
+    Accepted, in precedence order:
+      1. geometry-query dict  {"of":"face","side":"top"} / {"of":"edge","parallel":"z"}
+      2. sid string           "F58db6d" / "E1c4a90" — describe_part's stable face/edge handles
+      3. feature id           "f2"
+      4. feature NAME         "Boss" (case-insensitive, surrounding whitespace ignored)
+      5. side/surf word or short phrase — the query grammar ("top", "the filleted edge")
+
+    A feature target keeps ALL its matches so a crop frames the whole feature; a geometry query
+    accepts 1+ matches and unions their bboxes. Nothing fails silently and nothing falls through
+    to the engine's side parser: every miss names the feature roster and points at describe_part
+    for the sid roster.
+    """
+    parsed = _parse_inspect_target(target)
+
+    if "selector" in parsed:
+        sel = parsed["selector"]
+        return {"matches": [sel], "query": sel,
+                "label": sel.get("sid") or "selector", "kind": sel.get("kind") or "face"}
+
+    if "sid" in parsed:
+        sid = str(parsed["sid"])
+        m = _sid_match(doc_id, sid)
+        if m is not None:
+            return {"matches": [m], "query": {"sid": m.get("sid")},
+                    "label": str(m.get("sid") or sid), "kind": m.get("kind") or "face"}
+        # "f123456" is both a legal sid shape and a legal feature-id shape — try the other
+        # reading before giving up.
+        if re.fullmatch(r"[fF]\d+", sid):
+            return _feature_target_result(doc_id, sid)
+        feats, _om = _target_feature_roster(doc_id)
+        extra = (" Vertex sids aren't inspectable — inspect the face or edge that carries it."
+                 if sid[:1].lower() == "v" else "")
+        raise ValueError(
+            f"No face/edge with sid {sid!r} in this document (sids change whenever the model "
+            f"changes).{extra} Call describe_part(doc_id) for the current sid roster, or name a "
+            f"feature: {_roster_text(feats)}.")
+
+    if "feature_id" in parsed:
+        return _feature_target_result(doc_id, parsed["feature_id"])
+
+    if "feature_name" in parsed:
+        try:
+            return _feature_target_result(doc_id, parsed["feature_name"])
+        except ValueError as exc:
+            fb = parsed.get("fallback_query")
+            if not fb:
+                raise
+            # Mixed phrase ("outer cylindrical wall face"): the name lost, so read it as the
+            # geometry query it also parses as.
+            try:
+                return _query_target_result(doc_id, fb, target)
+            except ValueError:
+                raise ValueError(
+                    f"{exc} (Also read as the geometry query {fb!r} — no match.)") from None
+
+    # A string that DID parse as geometry can still be a feature's NAME, and the name wins
+    # (precedence 4 over 5): a model that wrote it got it from the feature tree.
+    if isinstance(target, str):
+        feats, owner_map = _target_feature_roster(doc_id)
+        if _features_named(feats, target):
+            return _feature_target_result(doc_id, target, feats=feats, owner_map=owner_map)
+
+    return _query_target_result(doc_id, parsed, target)
 
 
 def _match_point_cloud(doc_id: str, match: dict) -> list:
@@ -2229,6 +2859,788 @@ def _apply_emphasis_overlay(src_png: str, doc_id: str, matches: list, part_bbox:
     return out_png, palette
 
 
+# --------------------------------------------------------------------------- mesh-accurate render annotation
+# The C++ rasterizer (core/doc/session.cpp render_view_to_rgb) hands back a flat-shaded PNG
+# with NO B-rep edges, no feature identity and no scale reference — a fillet, a chamfer, a
+# shallow pocket or two coincident faces are literally invisible against flat shading, and a
+# model cannot tell a 4 mm part from a 400 mm one. Everything needed to fix that is ALREADY
+# published by the engine: every rebuild writes an AICM tessellation (vertex positions,
+# triangles, per-B-rep-FACE triangle ranges and per-B-rep-EDGE polylines) to the handle in
+# doc_rebuild()["tess"]["aicm_path"]. Reprojecting that mesh through the SAME orthographic
+# frame the C++ renderer uses (bbox centre, 0.85 fit over the projected mesh extents) lets us
+# overlay in Python, pixel-exact against the shaded image:
+#   * depth-tested B-rep edges — real hidden-line removal, not a wireframe smear,
+#   * exact per-face highlight masks with a leader line to a named label,
+#   * feature callouts (id + name) for the features actually visible in frame,
+#   * a scale bar + precise bbox readout.
+# Every step degrades to "no overlay, the engine's render exactly as before" when numpy, the
+# AICM handle or the mesh is unavailable — the annotation layer is never load-bearing.
+
+_EDGE_RGB = (20, 22, 28)          # B-rep edge ink (visible segments)
+_CALLOUT_RGB = (250, 250, 252)    # feature-callout text
+_CALLOUT_BG = (24, 26, 32)
+
+# Highlight colours are RESERVED: none is produced by the renderer's side palette
+# (orient_tint: +Z blue, -Z teal, +X red, -X orange, +Y green, -Y yellow), so "magenta means
+# highlighted" can never be misread as "this face points right".
+_HIGHLIGHT_PALETTE = (
+    ((255, 0, 200), "magenta"),
+    ((160, 70, 255), "violet"),
+    ((255, 80, 140), "hot-pink"),
+    ((120, 0, 190), "purple"),
+    ((255, 255, 255), "white"),
+)
+_SIDE_PALETTE_LEGEND = (
+    "flat faces are tinted by the direction they face — top +Z blue, bottom -Z teal, "
+    "front -Y yellow, back +Y green, right +X red, left -X orange; curved faces stay grey"
+)
+_MAX_CALLOUTS = 5                 # legibility cap; omitted ones are named in the caption
+_CALLOUT_MIN_PIXEL_FRAC = 0.003   # a feature must hold >=0.3% of the frame to earn a callout
+_HLR_TRI_BUDGET = 45000           # above this the depth pass is skipped (caption says so)
+_MESH_CACHE: dict = {}            # doc_id -> (aicm_handle, mesh)
+
+
+def _annot_font(size: int = 13):
+    """A scalable font for overlay labels. Pillow's bundled default is scalable from 10.1;
+    a system sans is preferred when present. Never raises."""
+    from PIL import ImageFont  # noqa: PLC0415
+    for p in ("/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"):
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:  # noqa: BLE001
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:  # noqa: BLE001
+        return ImageFont.load_default()
+
+
+def _aicm_payload(handle: str) -> bytes:
+    """AICM bytes for an engine tess handle: an "aicm-shm:///name" POSIX shared-memory object
+    (8-byte little-endian size header + payload, core/util/aicm_handoff.cpp) or a plain file
+    path (older engine / Windows fallback)."""
+    prefix = "aicm-shm://"
+    if handle.startswith(prefix):
+        name = handle[len(prefix):].lstrip("/")
+        with open(os.path.join("/dev/shm", name), "rb") as f:
+            raw = f.read()
+        if len(raw) < 8:
+            raise ValueError(f"short AICM shm object {name!r}")
+        n = int.from_bytes(raw[:8], "little")
+        return raw[8:8 + n]
+    with open(handle, "rb") as f:
+        return f.read()
+
+
+def _doc_mesh(doc_id: str) -> Optional[dict]:
+    """Current tessellation of `doc_id`, or None when it cannot be read.
+
+    Returns {"pos": (N,3) float64, "idx": (M,3) int32, "tri_face": (M,) int32 (index into
+    "faces", -1 for raw-mesh triangles), "faces": [{body, face_id, first_tri, tri_count,
+    surf_type}] with GLOBAL triangle indices, "edges": [{body, edge_id, pts (K,3)}],
+    "last_body": int}. `face_id`/`edge_id` are the OCCT topo ids, which are exactly the
+    1-based doc_query enumeration index on that body (the same join doc_tree.owner_map and
+    _feature_owned_matches use), so a sid or a feature id maps straight onto mesh geometry.
+    Cached per (doc_id, aicm handle) — the handle carries the revision, so an edit
+    invalidates it automatically."""
+    try:
+        import numpy as np  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        rb = cb.call("doc_rebuild", {"doc_id": doc_id}) or {}
+    except Exception:  # noqa: BLE001
+        return None
+    handle = ((rb.get("tess") or {}).get("aicm_path")) or ""
+    if not handle:
+        return None
+    cached = _MESH_CACHE.get(doc_id)
+    if cached and cached[0] == handle:
+        return cached[1]
+    try:
+        from services.sim.tessellate import read_aicm  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        try:
+            from sim.tessellate import read_aicm  # noqa: PLC0415
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        parsed = read_aicm(_aicm_payload(handle))
+    except Exception:  # noqa: BLE001
+        return None
+
+    bodies = parsed.get("bodies") or []
+    pos_parts, idx_parts, faces, edges = [], [], [], []
+    vbase = 0
+    tbase = 0
+    last_body = 0
+    for b in bodies:
+        p = np.asarray(b.get("pos"), dtype=np.float64).reshape(-1, 3)
+        t = np.asarray(b.get("idx"), dtype=np.int64).reshape(-1, 3)
+        if p.size == 0 or t.size == 0:
+            continue
+        bid = int(b.get("body_id") or 0)
+        last_body = max(last_body, bid)
+        pos_parts.append(p)
+        idx_parts.append(t + vbase)
+        for fr in (b.get("faces") or []):
+            faces.append({"body": bid, "face_id": int(fr["face_id"]),
+                          "first_tri": int(fr["first_tri"]) + tbase,
+                          "tri_count": int(fr["tri_count"]),
+                          "surf_type": int(fr.get("surf_type", 0))})
+        epts = b.get("edge_pts")
+        if epts is not None:
+            epts = np.asarray(epts, dtype=np.float64).reshape(-1, 3)
+            for er in (b.get("edges") or []):
+                a = int(er["first_pt"]); n = int(er["pt_count"])
+                if n >= 2:
+                    edges.append({"body": bid, "edge_id": int(er["edge_id"]),
+                                  "pts": epts[a:a + n]})
+        vbase += p.shape[0]
+        tbase += t.shape[0]
+    if not pos_parts:
+        return None
+
+    pos = np.concatenate(pos_parts, axis=0)
+    idx = np.concatenate(idx_parts, axis=0)
+    tri_face = np.full(idx.shape[0], -1, dtype=np.int32)
+    for fi, fr in enumerate(faces):
+        tri_face[fr["first_tri"]:fr["first_tri"] + fr["tri_count"]] = fi
+    mesh = {"pos": pos, "idx": idx, "tri_face": tri_face, "faces": faces,
+            "edges": edges, "last_body": last_body}
+    _MESH_CACHE.clear()  # one doc's mesh at a time — these arrays are the big allocation
+    _MESH_CACHE[doc_id] = (handle, mesh)
+    return mesh
+
+
+def _mesh_render_frame(mesh: dict, view_dir: tuple,
+                       W: int = _RENDER_W, H: int = _RENDER_H) -> dict:
+    """The EXACT orthographic frame core render_view_to_rgb builds for this mesh.
+
+    Same key set as _part_render_frame (so _world_to_screen works unchanged), but the
+    extents come from the projected MESH vertices, like the C++ does — not from the
+    slightly-inflated doc_bbox, which would put the overlay a pixel or two off."""
+    import numpy as np  # noqa: PLC0415
+    pos = mesh["pos"]
+    lo = pos.min(axis=0); hi = pos.max(axis=0)
+    c = tuple((lo + hi) * 0.5)
+    d = _vnorm(view_dir)
+    up_ref = (0.0, 1.0, 0.0) if abs(d[2]) > 0.985 else (0.0, 0.0, 1.0)
+    r = _vnorm(_vcross(up_ref, d))
+    u = _vnorm(_vcross(d, r))
+    rel = pos - np.asarray(c)
+    us = rel @ np.asarray(r); vs = rel @ np.asarray(u)
+    minu, maxu = float(us.min()), float(us.max())
+    minv, maxv = float(vs.min()), float(vs.max())
+    scale = _RENDER_FIT * min(W / max(maxu - minu, 1e-6), H / max(maxv - minv, 1e-6))
+    return {"center": c, "r": r, "u": u, "d": d, "scale": scale,
+            "cu": 0.5 * (minu + maxu), "cv": 0.5 * (minv + maxv), "W": W, "H": H}
+
+
+def _screen_xyz(pts, frame: dict):
+    """Bulk world -> (sx, sy, depth) through `frame`. depth is dot(p-centre, view_dir):
+    LARGER is nearer the camera, matching the C++ z-buffer test. `scale_y` (only set by
+    _crop_frame) lets the same code project into a cropped-and-rescaled image."""
+    import numpy as np  # noqa: PLC0415
+    p = np.asarray(pts, dtype=np.float64).reshape(-1, 3) - np.asarray(frame["center"])
+    sy_scale = frame.get("scale_y", frame["scale"])
+    su = (p @ np.asarray(frame["r"]) - frame["cu"]) * frame["scale"] + frame["W"] / 2.0
+    sv = frame["H"] / 2.0 - (p @ np.asarray(frame["u"]) - frame["cv"]) * sy_scale
+    return np.stack([su, sv, p @ np.asarray(frame["d"])], axis=-1)
+
+
+def _crop_frame(frame: dict, rect: dict, out_size: tuple = (_RENDER_W, _RENDER_H)) -> dict:
+    """The projection frame of an image that _crop_png_to_rect produced from `frame`.
+
+    The crop is a pure 2D affine on screen space (translate by the rect origin, then scale
+    each axis independently to out_size), so folding it back into the frame keeps the overlay
+    pixel-exact on the CROPPED image instead of drawing 1-px edges that the upscale would
+    smear into 8-px bands."""
+    w2, h2 = int(out_size[0]), int(out_size[1])
+    sx = w2 / max(rect["x1"] - rect["x0"], 1)
+    sy = h2 / max(rect["y1"] - rect["y0"], 1)
+    scale_x = frame["scale"] * sx
+    scale_y = frame["scale"] * sy
+    return dict(frame,
+                scale=scale_x, scale_y=scale_y, W=w2, H=h2,
+                cu=frame["cu"] + ((frame["W"] / 2.0 - rect["x0"]) * sx - w2 / 2.0) / scale_x,
+                cv=frame["cv"] + ((frame["H"] / 2.0 - rect["y0"]) * sy - h2 / 2.0) / scale_y)
+
+
+def _mesh_depth_buffer(mesh: dict, frame: dict) -> Optional[tuple]:
+    """Rasterize the mesh into (depth, face_index) buffers matching the engine's render.
+
+    Reproduces render_view_to_rgb's barycentric span fill and `depth > zbuf` test exactly,
+    so a pixel's winning triangle here is the pixel the engine shaded. Back-facing triangles
+    are culled first (AICM guarantees outward winding, so for a closed solid this is exact
+    and halves the work). Returns (Z, FI, S) or None when the mesh is over the triangle
+    budget — the caller then reports that edges were skipped rather than lying about them."""
+    import numpy as np  # noqa: PLC0415
+    idx = mesh["idx"]
+    if idx.shape[0] > _HLR_TRI_BUDGET:
+        return None
+    W, H = int(frame["W"]), int(frame["H"])
+    pos = mesh["pos"]
+    S = _screen_xyz(pos, frame)
+    d = np.asarray(frame["d"])
+    p0, p1, p2 = pos[idx[:, 0]], pos[idx[:, 1]], pos[idx[:, 2]]
+    front = np.cross(p1 - p0, p2 - p0) @ d > 0.0
+    tri_ids = np.nonzero(front)[0]
+    tri_face = mesh["tri_face"]
+
+    Z = np.full((H, W), -1e30, dtype=np.float64)
+    FI = np.full((H, W), -1, dtype=np.int32)
+    for t in tri_ids:
+        s0, s1, s2 = S[idx[t, 0]], S[idx[t, 1]], S[idx[t, 2]]
+        minx = max(int(math.floor(min(s0[0], s1[0], s2[0]))), 0)
+        maxx = min(int(math.ceil(max(s0[0], s1[0], s2[0]))), W - 1)
+        miny = max(int(math.floor(min(s0[1], s1[1], s2[1]))), 0)
+        maxy = min(int(math.ceil(max(s0[1], s1[1], s2[1]))), H - 1)
+        if maxx < minx or maxy < miny:
+            continue
+        area = (s1[0] - s0[0]) * (s2[1] - s0[1]) - (s2[0] - s0[0]) * (s1[1] - s0[1])
+        if abs(area) < 1e-9:
+            continue
+        fx = np.arange(minx, maxx + 1, dtype=np.float64)[None, :] + 0.5
+        fy = np.arange(miny, maxy + 1, dtype=np.float64)[:, None] + 0.5
+        a0 = ((s1[0] - fx) * (s2[1] - fy) - (s2[0] - fx) * (s1[1] - fy)) / area
+        a1 = ((s2[0] - fx) * (s0[1] - fy) - (s0[0] - fx) * (s2[1] - fy)) / area
+        a2 = 1.0 - a0 - a1
+        inside = (a0 >= 0) & (a1 >= 0) & (a2 >= 0)
+        if not inside.any():
+            continue
+        dep = a0 * s0[2] + a1 * s1[2] + a2 * s2[2]
+        zs = Z[miny:maxy + 1, minx:maxx + 1]
+        upd = inside & (dep > zs)
+        if not upd.any():
+            continue
+        zs[upd] = dep[upd]
+        FI[miny:maxy + 1, minx:maxx + 1][upd] = tri_face[t]
+    return Z, FI, S
+
+
+def _dilate_max3(Z):
+    """3x3 maximum of a depth buffer — the half-pixel slack an edge lying exactly ON a face
+    needs to survive the depth test at a silhouette."""
+    import numpy as np  # noqa: PLC0415
+    P = np.pad(Z, 1, mode="edge")
+    h, w = Z.shape
+    out = P[0:h, 0:w].copy()
+    for a in range(3):
+        for c in range(3):
+            np.maximum(out, P[a:a + h, c:c + w], out=out)
+    return out
+
+
+def _visible_runs(pts, frame: dict, Zmax, eps: float) -> list:
+    """Split a world polyline into the screen-space runs that survive the depth test.
+
+    Each run is a list of (x, y) floats ready for ImageDraw.line. Points are resampled to
+    ~2 px so a long edge disappearing behind a boss is cut at the right place."""
+    import numpy as np  # noqa: PLC0415
+    S = _screen_xyz(pts, frame)
+    if S.shape[0] < 2:
+        return []
+    H, W = Zmax.shape
+    runs: list = []
+    run: list = []
+    for k in range(S.shape[0] - 1):
+        a, b = S[k], S[k + 1]
+        n = max(2, int(math.hypot(b[0] - a[0], b[1] - a[1]) / 2.0) + 2)
+        ts = np.linspace(0.0, 1.0, n)[:, None]
+        seg = a[None, :] * (1.0 - ts) + b[None, :] * ts
+        xi = np.clip(seg[:, 0].astype(np.int64), 0, W - 1)
+        yi = np.clip(seg[:, 1].astype(np.int64), 0, H - 1)
+        onscreen = ((seg[:, 0] >= -2) & (seg[:, 0] < W + 2)
+                    & (seg[:, 1] >= -2) & (seg[:, 1] < H + 2))
+        vis = onscreen & (seg[:, 2] >= Zmax[yi, xi] - eps)
+        for j, v in enumerate(vis):
+            if v:
+                run.append((float(seg[j, 0]), float(seg[j, 1])))
+            elif run:
+                if len(run) > 1:
+                    runs.append(run)
+                run = []
+    if len(run) > 1:
+        runs.append(run)
+    return runs
+
+
+def _mask_anchor(mask) -> Optional[tuple]:
+    """A pixel INSIDE `mask` closest to its centroid — where a leader line should land."""
+    import numpy as np  # noqa: PLC0415
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0:
+        return None
+    cx, cy = float(xs.mean()), float(ys.mean())
+    k = int(np.argmin((xs - cx) ** 2 + (ys - cy) ** 2))
+    return (int(xs[k]), int(ys[k]))
+
+
+def _mask_outline(draw, mask, rgb: tuple, width: int = 2) -> None:
+    """Trace `mask`'s boundary pixels so a highlighted face reads as an outlined region
+    even where the tint is subtle against its own shading."""
+    import numpy as np  # noqa: PLC0415
+    m = mask
+    b = np.zeros_like(m)
+    b[1:, :] |= m[1:, :] & ~m[:-1, :]
+    b[:-1, :] |= m[:-1, :] & ~m[1:, :]
+    b[:, 1:] |= m[:, 1:] & ~m[:, :-1]
+    b[:, :-1] |= m[:, :-1] & ~m[:, 1:]
+    ys, xs = np.nonzero(b)
+    r = max(1, width) - 1
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=rgb)
+
+
+def _place_label(draw, font, anchor: tuple, text: str, rgb: tuple,
+                 W: int, H: int, taken: list) -> tuple:
+    """Draw a leader line from `anchor` to a non-overlapping text chip and record its rect.
+
+    Candidate offsets fan out from the anchor; the first that fits the frame and clears every
+    rect in `taken` wins, so N callouts never stack on top of each other."""
+    try:
+        tb = draw.textbbox((0, 0), text, font=font)
+    except Exception:  # noqa: BLE001
+        tb = (0, 0, 7 * len(text), 12)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    pad = 3
+    bw, bh = tw + 2 * pad, th + 2 * pad
+    ax, ay = anchor
+    best = None
+    for dist in (26, 46, 70, 96, 124):
+        for dx, dy in ((1, -1), (1, 1), (-1, -1), (-1, 1), (1, 0), (-1, 0), (0, -1), (0, 1)):
+            x = ax + dx * dist - (bw if dx < 0 else 0)
+            y = ay + dy * dist - (bh // 2 if dy == 0 else (bh if dy < 0 else 0))
+            x = max(2, min(int(x), W - bw - 2))
+            y = max(2, min(int(y), H - bh - 2))
+            rect = (x, y, x + bw, y + bh)
+            if any(not (rect[2] < o[0] or rect[0] > o[2]
+                        or rect[3] < o[1] or rect[1] > o[3]) for o in taken):
+                continue
+            best = rect
+            break
+        if best:
+            break
+    if best is None:
+        best = (max(2, min(ax + 26, W - bw - 2)), max(2, min(ay - 26, H - bh - 2)))
+        best = (best[0], best[1], best[0] + bw, best[1] + bh)
+    lx = best[0] if best[0] > ax else best[2]
+    ly = (best[1] + best[3]) // 2
+    draw.line([(ax, ay), (lx, ly)], fill=rgb, width=2)
+    draw.line([(ax, ay), (lx, ly)], fill=(0, 0, 0), width=1)
+    draw.ellipse([ax - 3, ay - 3, ax + 3, ay + 3], fill=rgb, outline=(0, 0, 0))
+    draw.rectangle(best, fill=_CALLOUT_BG, outline=rgb)
+    draw.text((best[0] + pad - tb[0], best[1] + pad - tb[1]), text, font=font, fill=rgb)
+    taken.append(best)
+    return best
+
+
+def _nice_step(v: float) -> float:
+    """Round `v` down to the nearest 1/2/5 x 10^n so a scale bar reads as a round number."""
+    if v <= 0:
+        return 1.0
+    e = math.floor(math.log10(v))
+    base = 10.0 ** e
+    for m in (5.0, 2.0, 1.0):
+        if v >= m * base:
+            return m * base
+    return base
+
+
+def _draw_scale_bar(draw, font, frame: dict, size_mm: tuple, W: int, H: int) -> float:
+    """Bottom-right scale bar + exact bbox readout, so the image itself carries scale.
+
+    Returns the bar's length in mm (also reported in the caption)."""
+    mm = _nice_step((0.22 * W) / max(frame["scale"], 1e-9))
+    px = int(round(mm * frame["scale"]))
+    px = max(24, min(px, W // 2))
+    x1, y1 = W - 12, H - 16
+    x0 = x1 - px
+    dims = f"bbox {size_mm[0]:.4g} x {size_mm[1]:.4g} x {size_mm[2]:.4g} mm"
+    label = f"{mm:.4g} mm"
+    draw.rectangle([x0 - 8, y1 - 30, W - 4, H - 4], fill=(24, 26, 32))
+    draw.line([(x0, y1), (x1, y1)], fill=(240, 242, 248), width=2)
+    for x in (x0, x1):
+        draw.line([(x, y1 - 5), (x, y1 + 5)], fill=(240, 242, 248), width=2)
+    draw.text((x0, y1 + 2), label, font=font, fill=(240, 242, 248))
+    try:
+        db = draw.textbbox((0, 0), dims, font=font)
+        draw.text((W - 8 - (db[2] - db[0]), y1 - 26), dims, font=font, fill=(196, 202, 214))
+    except Exception:  # noqa: BLE001
+        draw.text((x0 - 4, y1 - 26), dims, font=font, fill=(196, 202, 214))
+    return mm
+
+
+def _doc_topo_maps(doc_id: str) -> dict:
+    """{"face": [match,...], "edge": [match,...]} in doc_query enumeration order, so index i
+    is topo id i+1 == the AICM face_id/edge_id. Also gives sid -> topo lookups."""
+    out = {"face": [], "edge": [], "face_sid": {}, "edge_sid": {}}
+    for of in ("face", "edge"):
+        try:
+            ms = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": of}})
+                  or {}).get("matches") or []
+        except Exception:  # noqa: BLE001
+            ms = []
+        out[of] = ms
+        out[of + "_sid"] = {str(m.get("sid")): i + 1 for i, m in enumerate(ms) if m.get("sid")}
+    return out
+
+
+def _feature_roster(doc_id: str) -> list:
+    """[{id, name, type, face_topos}] for the LAST body — the doc_tree roster joined to
+    owner_map's feature->topology table (the same join _feature_owned_matches uses), reshaped
+    for the render overlay so a callout can be drawn on the faces a feature actually owns.
+
+    Owned EDGES are deliberately dropped: a fuse re-creates the neighbour edges it splits and
+    the kernel attributes them to the NEW feature, so an edge-derived anchor lands on unrelated
+    geometry. Faces carry the same smear after a CUT, so the owned set is run through
+    _created_face_matches first — a bore is left with its wall, not with the host faces it
+    punched through. The callout still anchors on the SMALLEST visible owned face (the most
+    specific one) for the additive smear that filter deliberately leaves alone."""
+    feats, owner_map = _target_feature_roster(doc_id)
+    body = 0
+    for om in owner_map.values():
+        for pair in (om.get("faces") or []) + (om.get("edges") or []):
+            if isinstance(pair, list) and len(pair) == 2:
+                body = max(body, int(pair[0]))
+    try:
+        face_matches = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
+                        or {}).get("matches") or []
+    except Exception:  # noqa: BLE001
+        face_matches = []
+    out = []
+    for f in feats:
+        if f.get("suppressed"):
+            continue
+        fid = f.get("id")
+        om = owner_map.get(fid) or {}
+        topos = {int(p[1]) for p in (om.get("faces") or [])
+                 if isinstance(p, list) and len(p) == 2 and int(p[0]) == body}
+        if not topos:
+            continue
+        joined = [(t, face_matches[t - 1]) for t in sorted(topos)
+                  if 1 <= t <= len(face_matches)]
+        if len(joined) == len(topos):
+            kept = _created_face_matches(doc_id, f, [m for _t, m in joined], feats)
+            keep_ids = {id(m) for m in kept}
+            topos = {t for t, m in joined if id(m) in keep_ids} or topos
+        out.append({"id": fid, "name": f.get("name") or f.get("type") or fid,
+                    "type": f.get("type"), "face_topos": topos})
+    return out
+
+
+def _resolve_highlight_specs(doc_id: str, highlight) -> list:
+    """Resolve the `highlight` argument to [{label, matches, kind, colour, colour_name}].
+
+    Accepts the batch target vocabulary: a feature name ("Boss"), a feature id ("f2"), a sid
+    ("F58db6d"), a geometry-query dict, or a list of any of those — all through the one
+    resolver every other tool uses (_resolve_inspect_target). An unresolvable entry is
+    reported in the returned record instead of failing the render."""
+    if highlight is None:
+        return []
+    specs = highlight if isinstance(highlight, list) else [highlight]
+    out = []
+    for i, sp in enumerate(specs):
+        rgb, cname = _HIGHLIGHT_PALETTE[i % len(_HIGHLIGHT_PALETTE)]
+        rec = {"spec": sp, "colour": rgb, "colour_name": cname,
+               "matches": [], "label": str(sp), "kind": None, "error": None}
+        try:
+            rsl = _resolve_inspect_target(doc_id, sp)
+            rec["matches"] = list(rsl.get("matches") or [])
+            rec["kind"] = rsl.get("kind")
+            name = rsl.get("feature_name")
+            fid = rsl.get("feature_id")
+            if fid and name:
+                rec["label"] = f"{fid} {name}"
+            elif fid:
+                rec["label"] = str(fid)
+            else:
+                rec["label"] = str(rsl.get("label") or sp)
+        except Exception as e:  # noqa: BLE001
+            rec["error"] = str(e)
+        out.append(rec)
+    return out
+
+
+def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
+                     highlight=None, callouts: bool = True, edges: bool = True,
+                     scale: bool = True, frame: Optional[dict] = None,
+                     out_png: Optional[str] = None) -> tuple:
+    """Overlay B-rep edges, highlights, feature callouts and a scale bar onto a render.
+
+    src_png MUST be the engine render taken along `view_dir` (this reprojects the SAME
+    camera). Pass `frame` (from _crop_frame) when src_png has already been cropped/rescaled.
+    Returns (path, info) where `info` feeds _render_annotation_caption. On any failure the
+    ORIGINAL png path is returned with info["available"] False — the caller's render is never
+    lost to an overlay problem."""
+    info: dict = {"available": False, "edges": False, "hlr": False, "highlights": [],
+                  "callouts": [], "callouts_omitted": [], "hidden_features": [],
+                  "hidden_faces": 0, "scale_bar_mm": None, "bbox_mm": None,
+                  "note": None, "part_name": None}
+    try:
+        import numpy as np  # noqa: PLC0415
+        from PIL import Image as PILImage, ImageDraw  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        info["note"] = f"overlay unavailable ({e})"
+        return src_png, info
+
+    hl_specs = _resolve_highlight_specs(doc_id, highlight)
+    mesh = _doc_mesh(doc_id)
+    if mesh is None:
+        info["note"] = "tessellation unavailable — no edge outline, highlight or callouts"
+        info["highlights"] = [{"label": h["label"], "colour_name": h["colour_name"],
+                               "sids": [], "error": h.get("error") or "no mesh"}
+                              for h in hl_specs]
+        return src_png, info
+
+    try:
+        with PILImage.open(src_png) as im0:
+            im = im0.convert("RGB")
+        W, H = im.size
+        frame = frame or _mesh_render_frame(mesh, view_dir, W, H)
+        lo = mesh["pos"].min(axis=0); hi = mesh["pos"].max(axis=0)
+        info["bbox_mm"] = tuple(float(x) for x in (hi - lo))
+
+        buf = _mesh_depth_buffer(mesh, frame)
+        if buf is None:
+            info["note"] = (f"edge outline skipped — mesh over the depth budget "
+                            f"({mesh['idx'].shape[0]} triangles > {_HLR_TRI_BUDGET})")
+            Z = FI = None
+        else:
+            Z, FI, _S = buf
+            info["hlr"] = True
+
+        arr = np.asarray(im, dtype=np.float64)
+        topo = _doc_topo_maps(doc_id)
+        face_by_topo = {f["face_id"]: i for i, f in enumerate(mesh["faces"])
+                        if f["body"] == mesh["last_body"]}
+        edge_by_topo = {e["edge_id"]: i for i, e in enumerate(mesh["edges"])
+                        if e["body"] == mesh["last_body"]}
+
+        def _topos_for(matches: list) -> tuple:
+            ftop, etop = set(), set()
+            for m in matches or []:
+                sid = str(m.get("sid") or "")
+                if sid in topo["face_sid"]:
+                    ftop.add(topo["face_sid"][sid])
+                elif sid in topo["edge_sid"]:
+                    etop.add(topo["edge_sid"][sid])
+            return ftop, etop
+
+        # ---- highlight fills (tint the exact visible pixels of each target face) --------
+        hl_draw: list = []
+        for h in hl_specs:
+            ftop, etop = _topos_for(h["matches"])
+            fidx = [face_by_topo[t] for t in sorted(ftop) if t in face_by_topo]
+            mask = None
+            if FI is not None and fidx:
+                mask = np.isin(FI, np.asarray(fidx, dtype=np.int32))
+                if mask.any():
+                    rgb = np.asarray(h["colour"], dtype=np.float64)
+                    arr[mask] = arr[mask] * 0.42 + rgb * 0.58
+                else:
+                    mask = None
+            hl_draw.append({"rec": h, "mask": mask, "edge_idx": [edge_by_topo[t]
+                                                                for t in sorted(etop)
+                                                                if t in edge_by_topo],
+                            "face_idx": fidx})
+
+        im = PILImage.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+        draw = ImageDraw.Draw(im)
+        font = _annot_font(13)
+
+        # ---- B-rep edge outline (depth-tested: real hidden-line removal) ---------------
+        if edges and Z is not None:
+            zr = Z[Z > -1e29]
+            span = float(zr.max() - zr.min()) if zr.size else 1.0
+            eps = max(1e-9, span * 0.004)
+            Zmax = _dilate_max3(Z)
+            hl_edge_ids = {i for h in hl_draw for i in h["edge_idx"]}
+            n_runs = 0
+            for ei, e in enumerate(mesh["edges"]):
+                if ei in hl_edge_ids:
+                    continue
+                for run in _visible_runs(e["pts"], frame, Zmax, eps):
+                    draw.line(run, fill=_EDGE_RGB, width=1)
+                    n_runs += 1
+            info["edges"] = n_runs > 0
+            # Highlighted EDGE targets are drawn last, fat, in their reserved colour.
+            for h in hl_draw:
+                for ei in h["edge_idx"]:
+                    for run in _visible_runs(mesh["edges"][ei]["pts"], frame, Zmax, eps):
+                        draw.line(run, fill=h["rec"]["colour"], width=3)
+
+        # ---- highlight outlines + leader labels ---------------------------------------
+        taken: list = []
+        for h in hl_draw:
+            rec = h["rec"]
+            sids = [str(m.get("sid")) for m in (rec["matches"] or []) if m.get("sid")]
+            entry = {"label": rec["label"], "colour_name": rec["colour_name"],
+                     "rgb": list(rec["colour"]), "sids": sids[:8],
+                     "n_subshapes": len(rec["matches"] or []),
+                     "error": rec.get("error"), "visible": False}
+            anchor = None
+            if h["mask"] is not None:
+                _mask_outline(draw, h["mask"], rec["colour"], width=2)
+                anchor = _mask_anchor(h["mask"])
+            if anchor is None and h["edge_idx"]:
+                pts = mesh["edges"][h["edge_idx"][0]]["pts"]
+                S = _screen_xyz(pts, frame)
+                anchor = (int(S[len(S) // 2, 0]), int(S[len(S) // 2, 1]))
+            if anchor is None and rec["matches"]:
+                c = rec["matches"][0].get("centroid")
+                if isinstance(c, (list, tuple)) and len(c) >= 3:
+                    S = _screen_xyz([c], frame)
+                    anchor = (int(S[0, 0]), int(S[0, 1]))
+            if anchor is not None:
+                ax = max(2, min(int(anchor[0]), W - 3))
+                ay = max(2, min(int(anchor[1]), H - 3))
+                _place_label(draw, font, (ax, ay),
+                             f"* {rec['label']}", rec["colour"], W, H, taken)
+                entry["visible"] = h["mask"] is not None or bool(h["edge_idx"])
+            info["highlights"].append(entry)
+
+        # ---- feature callouts (id + name on a leader, largest-first, capped) -----------
+        # A feature that already carries a highlight chip is skipped — two chips naming the
+        # same thing in two colours is worse than one.
+        if callouts and FI is not None:
+            labelled = {str(h["label"]) for h in info["highlights"]}
+            scored = []
+            for f in _feature_roster(doc_id):
+                if f"{f['id']} {f['name']}" in labelled or str(f["id"]) in labelled:
+                    continue
+                per_face = []
+                for t in sorted(f["face_topos"]):
+                    fi = face_by_topo.get(t)
+                    if fi is None:
+                        continue
+                    n = int((FI == fi).sum())
+                    if n:
+                        per_face.append((n, fi))
+                scored.append((sum(n for n, _ in per_face), f, per_face))
+            scored.sort(key=lambda s: -s[0])
+            floor = _CALLOUT_MIN_PIXEL_FRAC * W * H
+            shown = 0
+            for px, f, per_face in scored:
+                tag = f"{f['id']} {f['name']}"
+                if px < floor or not per_face:
+                    info["hidden_features"].append(tag)
+                    continue
+                if shown >= _MAX_CALLOUTS:
+                    info["callouts_omitted"].append(tag)
+                    continue
+                # Anchor on the SMALLEST owned face that still holds a real share of the
+                # frame: after a boolean, owner_map hands a cut feature the big host faces it
+                # punched through, so the largest owned face (or their centroid) would point
+                # the "f3 Bore" label at the middle of the plate instead of at the hole.
+                keep = max(40.0, px * 0.005)
+                cand = [p for p in per_face if p[0] >= keep] or per_face
+                anchor = _mask_anchor(FI == min(cand)[1])
+                if anchor is None:
+                    info["hidden_features"].append(tag)
+                    continue
+                ax = max(2, min(int(anchor[0]), W - 3))
+                ay = max(2, min(int(anchor[1]), H - 3))
+                _place_label(draw, font, (ax, ay), tag, _CALLOUT_RGB, W, H, taken)
+                info["callouts"].append(tag)
+                shown += 1
+
+        # ---- what the camera cannot see ------------------------------------------------
+        if FI is not None:
+            seen = set(np.unique(FI).tolist()) - {-1}
+            hidden = []
+            for i, fr in enumerate(mesh["faces"]):
+                if i in seen or fr["body"] != mesh["last_body"]:
+                    continue
+                m = topo["face"][fr["face_id"] - 1] if fr["face_id"] - 1 < len(topo["face"]) else {}
+                tag = str(m.get("sid") or f"face#{fr['face_id']}")
+                bits = [b for b in (m.get("side"), m.get("surf"), m.get("concavity")) if b]
+                hidden.append(f"{tag}" + (f" ({'/'.join(bits)})" if bits else ""))
+            info["hidden_faces"] = len(hidden)
+            info["hidden_face_list"] = hidden[:8]
+
+        if scale and info["bbox_mm"]:
+            info["scale_bar_mm"] = _draw_scale_bar(draw, _annot_font(12), frame,
+                                                   info["bbox_mm"], W, H)
+
+        out_png = out_png or _tmp(".png")
+        im.save(out_png, format="PNG")
+        info["available"] = True
+        info["part_name"] = _handoff_doc_name(doc_id) or None
+        return out_png, info
+    except Exception as e:  # noqa: BLE001
+        info["note"] = f"overlay failed ({type(e).__name__}: {e})"
+        return src_png, info
+
+
+def _render_annotation_caption(view_name: str, info: dict) -> str:
+    """Self-sufficient caption for an annotated render: a model that reads ONLY this knows
+    what part it is, its size, what is in frame, what is highlighted and in what colour, what
+    the colours mean, what it CANNOT see from here and which tool to call for that."""
+    if not info:
+        return ""
+    bits: list = []
+    if info.get("bbox_mm"):
+        s = info["bbox_mm"]
+        name = info.get("part_name")
+        bits.append(f"Annotated {view_name} view of "
+                    + (f"part {name!r}" if name else "the part")
+                    + f", bbox {s[0]:.4g} x {s[1]:.4g} x {s[2]:.4g} mm"
+                    + (f" (scale bar in image = {info['scale_bar_mm']:.4g} mm)."
+                       if info.get("scale_bar_mm") else "."))
+    if info.get("edges"):
+        bits.append("Dark outlines are the B-rep edges, depth-tested against the "
+                    "tessellation, so hidden lines are removed and only edges you could "
+                    "actually see from this camera are drawn.")
+    elif info.get("note"):
+        bits.append(f"No edge outline: {info['note']}.")
+    hl = info.get("highlights") or []
+    if hl:
+        parts = []
+        for h in hl:
+            if h.get("error"):
+                parts.append(f"{h['label']} could NOT be resolved ({h['error']})")
+                continue
+            sids = ", ".join(h.get("sids") or []) or "no sid"
+            seen = "" if h.get("visible") else ", NOT visible from this camera"
+            parts.append(f"{h['colour_name']} = {h['label']} "
+                         f"[{h.get('n_subshapes', 0)} subshape(s): {sids}]{seen}")
+        bits.append("HIGHLIGHTED: " + "; ".join(parts)
+                    + ". Highlight colours (magenta/violet/hot-pink/purple/white) are "
+                      "reserved for emphasis and are never produced by the side palette.")
+    if info.get("callouts"):
+        bits.append("Labelled features in frame: " + ", ".join(info["callouts"]) + ".")
+    if info.get("callouts_omitted"):
+        bits.append(f"{len(info['callouts_omitted'])} further visible feature(s) were NOT "
+                    f"labelled to keep the image legible: "
+                    + ", ".join(info["callouts_omitted"]) + ".")
+    if info.get("bbox_mm"):
+        bits.append("Colour key: " + _SIDE_PALETTE_LEGEND + ".")
+    cannot = []
+    if info.get("hidden_features"):
+        cannot.append("features with nothing visible here: "
+                      + ", ".join(info["hidden_features"]))
+    if info.get("hidden_faces"):
+        lst = ", ".join(info.get("hidden_face_list") or [])
+        cannot.append(f"{info['hidden_faces']} B-rep face(s) are fully occluded or "
+                      f"back-facing" + (f" ({lst})" if lst else ""))
+    if cannot:
+        where = "in ANY tile of this sheet" if "tiled-sheet" in view_name else "from this camera"
+        bits.append(f"CANNOT BE SEEN {where} — " + "; ".join(cannot)
+                    + ". For those call inspect_feature(target=...) for a framed close-up, "
+                      "inspect_section(...) for a cut through internal geometry, or "
+                      "describe_part() for the full text roster.")
+    else:
+        bits.append("Internal geometry is never visible in a shaded exterior view: use "
+                    "inspect_section(...) or describe_part() to confirm bores and pockets.")
+    return " ".join(bits)
+
+
 def _target_is_internal(matches: list, part_bbox: dict) -> bool:
     """Heuristic: target is internal if it's a bore/hole, or its AABB is strictly inside
     the part AABB with margin (pocket/internal geometry the exterior camera can't see)."""
@@ -2412,6 +3824,10 @@ def _resolve_measure_target(doc_id: str, target: Union[str, dict]) -> tuple:
         ref = ms[0]
         label = resolved.get("label") or (
             target.strip() if isinstance(target, str) else str(ref.get("sid") or "ref"))
+        if len(ms) > 1 and ref.get("sid"):
+            # A feature/multi-match target measures ONE element — say WHICH, so the caption
+            # can't read as "the whole feature is 9345 mm²".
+            label = f'{label} → {ref["sid"]} (1 of {len(ms)})'
         return ref, label
 
 

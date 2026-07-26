@@ -178,6 +178,329 @@ def annotate_ascii_with_rulers(ascii_block: str, *, every: int = 10,
     return "\n".join(out)
 
 
+# ==================================================================== HIGHLIGHT
+# Shared `highlight` target vocabulary + marker / legend / callout plumbing.
+#
+# ONE vocabulary across every 2D render (mirrors the 3D render tools):
+#   "R1"                 bare token — matched against every id/ref/name the
+#                        domain knows (sketch entity id, board refdes, net,
+#                        schematic ref, SPICE device, node, …)
+#   "net:GND"            qualified token — restrict the match to one class
+#   "e3,e4"              comma / semicolon separated list
+#   '["e3", {"id":"e4"}]' JSON list (or a real Python list) of any of the above
+#   {"net": "GND"}       geometry-query style dict → "net:GND"
+#
+# Markers are single letters A,B,C… (I and O skipped — they read as 1 and 0).
+# A highlighted element is drawn with its marker letter in place of its normal
+# glyph, and its anchor cell is bracketed:  >A<
+
+_HL_MARKERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+_HL_NONE = "-"            # callout marker for "notable but not drawn marked"
+_HL_BRACKET_L = ">"
+_HL_BRACKET_R = "<"
+
+_HL_QUALIFIERS: frozenset[str] = frozenset({
+    "id", "ref", "net", "type", "name", "pin", "pad", "node", "device",
+    "label", "power", "wire", "track", "via", "symbol", "entity", "component",
+    "junction", "footprint", "poly", "probe", "value", "libid", "box",
+})
+
+_HL_DICT_KEYS = ("id", "ref", "net", "name", "type", "pin", "pad", "node",
+                 "device", "entity", "target", "sid", "poly", "box")
+
+
+def parse_highlight(highlight: Any) -> list[str]:
+    """Normalize the shared ``highlight`` argument to ordered, de-duped tokens.
+
+    Accepts a bare string, a comma/semicolon list, a JSON list/dict string, a
+    real list/tuple, or a geometry-query style dict. Order is preserved because
+    marker letters are assigned in token order.
+    """
+    out: list[str] = []
+
+    def push(tok: str) -> None:
+        tok = str(tok).strip()
+        if tok and tok not in out:
+            out.append(tok)
+
+    def walk(item: Any) -> None:
+        if item is None:
+            return
+        if isinstance(item, (list, tuple, set)):
+            for sub in item:
+                walk(sub)
+            return
+        if isinstance(item, dict):
+            for key in _HL_DICT_KEYS:
+                val = item.get(key)
+                if val is None:
+                    continue
+                if isinstance(val, (list, tuple)):
+                    push(f"{key}:" + ",".join(str(v) for v in val))
+                else:
+                    push(f"{key}:{val}")
+                return
+            push(json.dumps(item, sort_keys=True, separators=(",", ":")))
+            return
+        text = str(item).strip()
+        if not text:
+            return
+        if text[0] in "[{":
+            try:
+                walk(json.loads(text))
+                return
+            except Exception:
+                pass
+        # box:x0,y0,x1,y1 carries its own commas — never split it
+        if text.lower().startswith("box:"):
+            push(text)
+            return
+        if "," in text or ";" in text:
+            for part in text.replace(";", ",").split(","):
+                push(part)
+            return
+        push(text)
+
+    walk(highlight)
+    return out
+
+
+def _hl_parts(token: str) -> tuple[str, str]:
+    """Split ``"qual:value"`` → ``(qual, value)``; bare tokens → ``("", value)``."""
+    if ":" in token:
+        q, _, v = token.partition(":")
+        ql = q.strip().lower()
+        if ql in _HL_QUALIFIERS:
+            return ql, v.strip()
+    return "", token.strip()
+
+
+class HighlightPlan:
+    """Marker assignment + hit recording for one render.
+
+    Domains build ``(qualifier, value)`` candidate pairs per drawable object and
+    ask :meth:`marker`; a returned letter means "draw this one emphasised".
+    """
+
+    __slots__ = ("tokens", "markers", "callouts", "_matched")
+
+    def __init__(self, highlight: Any = None) -> None:
+        self.tokens: list[str] = parse_highlight(highlight)
+        self.markers: dict[str, str] = {
+            tok: _HL_MARKERS[i % len(_HL_MARKERS)]
+            for i, tok in enumerate(self.tokens)
+        }
+        self.callouts: list[dict] = []
+        self._matched: set[str] = set()
+
+    def __bool__(self) -> bool:
+        return bool(self.tokens)
+
+    def marker(self, cands: Sequence[tuple[str, Any]]) -> Optional[str]:
+        """First requested token matching any ``(qualifier, value)`` candidate."""
+        if not self.tokens:
+            return None
+        low = [(str(q).lower(), str(v).strip().lower())
+               for q, v in cands if v is not None and str(v).strip() != ""]
+        if not low:
+            return None
+        for tok in self.tokens:
+            q, v = _hl_parts(tok)
+            vlow = v.lower()
+            for cq, cv in low:
+                if cv == vlow and (not q or q == cq):
+                    return self.markers[tok]
+        return None
+
+    def note(self, marker: str, ident: str, desc: str, *,
+             anchor: Optional[tuple[int, int]] = None,
+             world: Optional[Sequence[float]] = None,
+             cells: int = 0) -> None:
+        """Record one callout row: ``marker -> id -> description``."""
+        self._matched.add(marker)
+        row: dict[str, Any] = {"marker": marker, "id": str(ident), "desc": desc}
+        if anchor is not None:
+            row["anchor_cell"] = [int(anchor[0]), int(anchor[1])]
+        if world is not None:
+            row["anchor_world"] = [round(float(v), 4) for v in world]
+        if cells:
+            row["cells_painted"] = int(cells)
+        self.callouts.append(row)
+
+    @property
+    def unmatched(self) -> list[str]:
+        """Requested tokens that matched nothing in this render."""
+        return [t for t in self.tokens if self.markers[t] not in self._matched]
+
+    def report(self) -> dict:
+        """Structured highlight state for the render payload."""
+        return {
+            "requested": list(self.tokens),
+            "markers": {t: self.markers[t] for t in self.tokens},
+            "matched": sorted(self._matched),
+            "unmatched": self.unmatched,
+        }
+
+
+def hl_stamp_anchor(grid: list[list[str]], cx: int, cy: int, marker: str,
+                    empty: str = ".") -> None:
+    """Force *marker* at (cx,cy) and bracket it ``>A<`` where the cells are free."""
+    h = len(grid)
+    w = len(grid[0]) if h else 0
+    if not (0 <= cy < h and 0 <= cx < w):
+        return
+    grid[cy][cx] = marker
+    if cx - 1 >= 0 and grid[cy][cx - 1] in (empty, " "):
+        grid[cy][cx - 1] = _HL_BRACKET_L
+    if cx + 1 < w and grid[cy][cx + 1] in (empty, " "):
+        grid[cy][cx + 1] = _HL_BRACKET_R
+
+
+def scale_origin_lines(grid_meta: dict, *, note: str = "") -> list[str]:
+    """SCALE / ORIGIN / CONVERT lines so a glyph position converts back to world."""
+    if not grid_meta:
+        return ["SCALE: unknown (no grid contract for this view).",
+                "ORIGIN: unknown."]
+    pitch = float(grid_meta.get("pitch") or 1.0)
+    unit = str(grid_meta.get("unit") or "mm")
+    bbox = list(grid_meta.get("bbox") or [0.0, 0.0, 0.0, 0.0])
+    xmin, ymin, xmax, ymax = (float(bbox[0]), float(bbox[1]),
+                              float(bbox[2]), float(bbox[3]))
+    w = int(grid_meta.get("width") or 0)
+    h = int(grid_meta.get("height") or 0)
+    x0 = xmin + 0.5 * pitch
+    y0 = ymax - 0.5 * pitch
+    lines = [
+        f"SCALE: 1 character cell = {pitch:.4g} {unit} square "
+        f"(+col = +x / east, +row = -y / south; y is flipped so north is up).",
+        f"ORIGIN: cell (col=0,row=0) centre = world "
+        f"({x0:.4g}, {y0:.4g}) {unit}. Grid {w}x{h} cells covers world "
+        f"x[{xmin:.4g},{xmax:.4g}] y[{ymin:.4g},{ymax:.4g}] {unit}.",
+        f"CONVERT: x = {xmin:.4g} + (col+0.5)*{pitch:.4g} ; "
+        f"y = {ymax:.4g} - (row+0.5)*{pitch:.4g}",
+    ]
+    if note:
+        lines.append(note)
+    return lines
+
+
+def highlight_legend_lines(plan: HighlightPlan, mode: str = "grid") -> list[str]:
+    """Legend rows explaining the emphasis glyphs.
+
+    ``mode``: ``grid`` (raster with text labels — sketch/pcb/schematic),
+    ``plain`` (raster without text labels — the 3D silhouette), or ``rows``
+    (line-oriented views such as the simulation roster).
+    """
+    if not plan:
+        return ["  (no highlight requested — pass highlight='<id>' to emphasise "
+                "one element and get it named in CALLOUTS)"]
+    letters = ", ".join(sorted({plan.markers[t] for t in plan.tokens}))
+    if mode == "rows":
+        return [
+            f"  {_HL_BRACKET_L}{letters}{_HL_BRACKET_R} in the 4-character gutter "
+            f"at the start of a row = that row is HIGHLIGHTED under that marker",
+            "  every marker maps to exactly one requested target — see CALLOUTS "
+            "for the marker -> id map; one target can mark several rows",
+        ]
+    out = [
+        f"  {letters} = HIGHLIGHTED element body — every cell of that element is "
+        f"drawn with its marker letter instead of its normal glyph",
+        f"  {_HL_BRACKET_L}X{_HL_BRACKET_R} = anchor cell of highlighted element X "
+        f"(brackets sit in the two neighbouring cells when free)",
+    ]
+    if mode == "grid":
+        out.append("  marker letters are single characters ON the geometry; "
+                   "multi-character runs of text are id/ref labels, not markers "
+                   "— see CALLOUTS for the marker -> id map")
+    else:
+        out.append("  see CALLOUTS for the marker -> id map")
+    return out
+
+
+def callout_lines(plan: HighlightPlan, extra: Sequence[dict] = ()) -> list[str]:
+    """``marker -> id -> description`` rows (the ASCII analogue of leader lines)."""
+    rows = list(plan.callouts) + list(extra)
+    if not rows:
+        return ["  (nothing highlighted and nothing flagged in this view)"]
+    out: list[str] = []
+    for r in rows:
+        bits = [f"  {r.get('marker') or _HL_NONE} -> {r.get('id') or '?'} -> "
+                f"{r.get('desc') or ''}"]
+        if r.get("anchor_cell"):
+            c = r["anchor_cell"]
+            anchor = f"[anchor cell col={c[0]},row={c[1]}"
+            if r.get("anchor_world"):
+                wpt = r["anchor_world"]
+                anchor += f" = world ({wpt[0]:g},{wpt[1]:g})"
+            bits.append(anchor + "]")
+        elif r.get("anchor_world"):
+            wpt = r["anchor_world"]
+            bits.append(f"[world ({wpt[0]:g},{wpt[1]:g})]")
+        if r.get("cells_painted"):
+            bits.append(f"({r['cells_painted']} cell(s) marked)")
+        out.append(" ".join(bits))
+    return out
+
+
+def annotated_ascii(*, header: str, scale_lines: Sequence[str], drawing: str,
+                    legend: Sequence[str], callouts: Sequence[str]) -> str:
+    """Assemble the self-sufficient plate: header + scale + drawing + legend + callouts."""
+    parts: list[str] = []
+    if header:
+        parts.append(header)
+    parts.extend(scale_lines)
+    parts.append("")
+    parts.append(drawing)
+    parts.append("")
+    parts.extend(legend)
+    parts.append("")
+    parts.append("CALLOUTS (marker -> id -> what it is, with its key numbers):")
+    parts.extend(callouts)
+    return "\n".join(parts)
+
+
+def unmatched_note(plan: HighlightPlan) -> list[dict]:
+    """Honest 'you asked for X and it is not here' rows for the callout list."""
+    return [{"marker": _HL_NONE, "id": tok,
+             "desc": "REQUESTED BUT NOT FOUND in this view — no element with that "
+                     "id/ref/net; check the id list in the summary"}
+            for tok in plan.unmatched]
+
+
+def finding_callouts(findings: Sequence[dict], limit: int = 6) -> list[dict]:
+    """Notable-without-highlight rows: whatever the checkers flagged."""
+    rows: list[dict] = []
+    for f in list(findings)[:limit]:
+        ident = (f.get("net")
+                 or next(iter(f.get("refs") or []), None)
+                 or next(iter(f.get("tracks") or []), None)
+                 or next(iter(f.get("entities") or []), None)
+                 or f.get("id") or f.get("ref"))
+        tail = (f" (NOT marked in the drawing — re-render with "
+                f"highlight='{ident}' to see where it is)" if ident else
+                " (sketch/board-wide finding — it has no single element to mark)")
+        rows.append({
+            "marker": _HL_NONE,
+            "id": str(ident or f.get("code") or "?"),
+            "desc": f"[{f.get('severity', '?')}] {f.get('code')}: "
+                    f"{f.get('message')}{tail}",
+        })
+    return rows
+
+
+def summary_with_annotations(summary: str, scale_lines: Sequence[str],
+                             legend: Sequence[str],
+                             callouts: Sequence[str]) -> str:
+    """Append the self-sufficient scale/legend/callout block to a narrative summary."""
+    parts = [summary.rstrip(), ""]
+    parts.extend(scale_lines)
+    parts.append("")
+    parts.extend(legend)
+    parts.append("")
+    parts.append("CALLOUTS (marker -> id -> what it is, with its key numbers):")
+    parts.extend(callouts)
+    return "\n".join(parts)
+
 
 # =========================================================================== PCB
 # Layer ASCII grid: components as refdes boxes, traces as path chars, vias, pads.
@@ -417,12 +740,37 @@ def _to_cell(x: float, y: float, xmin: float, ymax: float, pitch: float,
     return cx, cy
 
 
+_PCB_LEGEND_BASE = (
+    "  .   = bare board (no copper on this layer in that cell)",
+    "  -   = track running east-west      |   = track running north-south",
+    "  /   = track running SW->NE         \\   = track running NW->SE",
+    "  +   = track corner/junction, or component courtyard border",
+    "  o   = via (spans layers)            #   = pad (copper land)",
+    "  X   = two DIFFERENT nets painted into one cell (clearance collision)",
+    "  ABC (multi-char run on a courtyard top border) = component refdes label",
+)
+
+
+def _fp_pad_ident(ref: str, pad: dict) -> str:
+    num = str(pad.get("number") or pad.get("pin") or pad.get("id") or "?")
+    return f"{ref}.{num}"
+
+
 def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
                              pitch_mm: float = 1.0,
-                             max_dim: int = 80) -> dict:
-    """Render one copper layer of *board* to a deterministic ASCII grid."""
+                             max_dim: int = 80,
+                             highlight: Any = None,
+                             plan: Optional[HighlightPlan] = None) -> dict:
+    """Render one copper layer of *board* to a deterministic ASCII grid.
+
+    ``highlight`` accepts the shared target vocabulary: a refdes ("R1"), a
+    footprint id ("fp1"), a net name ("GND" / "net:GND"), a track/via id
+    ("tA", "v1"), a pad ("R1.1"), or a list of any of those. Matched objects are
+    painted with a marker letter and named in the returned ``callouts``.
+    """
     if pitch_mm <= 0:
         pitch_mm = 1.0
+    hl = plan if plan is not None else HighlightPlan(highlight)
     xmin, ymin, xmax, ymax = _board_bbox(board)
     bw = max(xmax - xmin, pitch_mm)
     bh = max(ymax - ymin, pitch_mm)
@@ -439,6 +787,12 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
     grid = [[_PCB_EMPTY for _ in range(w)] for _ in range(h)]
     net_grid: list[list[Optional[str]]] = [[None for _ in range(w)] for _ in range(h)]
 
+    def force(cx: int, cy: int, ch: str) -> bool:
+        if 0 <= cx < w and 0 <= cy < h:
+            grid[cy][cx] = ch
+            return True
+        return False
+
     # tracks on this layer
     for tr in board.get("tracks") or []:
         if (tr.get("layer") or "F.Cu") != layer:
@@ -450,8 +804,23 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
         x1, y1 = _to_cell(float(p2[0]), float(p2[1]), xmin, ymax, pitch, w, h)
         ch = _trace_char(x0, y0, x1, y1)
         net = tr.get("net") or None
-        for cx, cy in _bresenham(x0, y0, x1, y1):
+        cells = _bresenham(x0, y0, x1, y1)
+        for cx, cy in cells:
             _paint(grid, cx, cy, ch, net_grid, net)
+        mk = hl.marker([("track", tr.get("id")), ("id", tr.get("id")),
+                        ("net", net)])
+        if mk:
+            painted = sum(1 for cx, cy in cells if force(cx, cy, mk))
+            hl_stamp_anchor(grid, x0, y0, mk, empty=_PCB_EMPTY)
+            length = math.hypot(float(p2[0]) - float(p1[0]),
+                                float(p2[1]) - float(p1[1]))
+            hl.note(mk, str(tr.get("id") or "track"),
+                    f"track on {layer} net={net or '(none)'} "
+                    f"({float(p1[0]):g},{float(p1[1]):g})->"
+                    f"({float(p2[0]):g},{float(p2[1]):g})mm "
+                    f"len={length:.3g}mm width={tr.get('width', '?')}mm",
+                    anchor=(x0, y0), world=(float(p1[0]), float(p1[1])),
+                    cells=painted)
 
     # vias (all layers)
     for v in board.get("vias") or []:
@@ -460,6 +829,15 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
             continue
         cx, cy = _to_cell(float(p[0]), float(p[1]), xmin, ymax, pitch, w, h)
         _paint(grid, cx, cy, _PCB_VIA, net_grid, v.get("net"))
+        mk = hl.marker([("via", v.get("id")), ("id", v.get("id")),
+                        ("net", v.get("net"))])
+        if mk:
+            hl_stamp_anchor(grid, cx, cy, mk, empty=_PCB_EMPTY)
+            hl.note(mk, str(v.get("id") or "via"),
+                    f"via net={v.get('net') or '(none)'} at "
+                    f"({float(p[0]):g},{float(p[1]):g})mm "
+                    f"dia={v.get('diameter', '?')}mm",
+                    anchor=(cx, cy), world=(float(p[0]), float(p[1])), cells=1)
 
     # pads + component boxes on this copper layer (top side → F.Cu, bottom → B.Cu)
     side_ok = {"F.Cu": "top", "B.Cu": "bottom"}
@@ -471,6 +849,11 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
             pass
         pos = fp.get("pos") or [0.0, 0.0]
         ox, oy = float(pos[0]), float(pos[1])
+        ref = str(fp.get("ref") or fp.get("id") or "?")
+        fp_mk = hl.marker([("ref", ref), ("footprint", ref),
+                           ("id", fp.get("id")), ("footprint", fp.get("id")),
+                           ("libid", fp.get("fpid")), ("value", fp.get("value"))])
+        n_pads = 0
         for pad in fp.get("pads") or []:
             layers = pad.get("layers") or [layer]
             if layer not in layers and "F.Cu" not in layers and "B.Cu" not in layers:
@@ -483,6 +866,20 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
                 px = py = 0.0
             cx, cy = _to_cell(ox + px, oy + py, xmin, ymax, pitch, w, h)
             _paint(grid, cx, cy, _PCB_PAD, net_grid, pad.get("net"))
+            n_pads += 1
+            ident = _fp_pad_ident(ref, pad)
+            pad_mk = hl.marker([("pad", ident), ("pin", ident),
+                                ("pad", ident.replace(".", ":")),
+                                ("id", ident), ("net", pad.get("net"))])
+            if pad_mk and pad_mk != fp_mk:
+                force(cx, cy, pad_mk)
+                hl.note(pad_mk, ident,
+                        f"pad {ident} net={pad.get('net') or '(none)'} on {layer} "
+                        f"at ({ox + px:g},{oy + py:g})mm "
+                        f"size={pad.get('size') or '?'}mm",
+                        anchor=(cx, cy), world=(ox + px, oy + py), cells=1)
+            elif fp_mk:
+                force(cx, cy, fp_mk)
 
         # stamp refdes into courtyard AABB (deterministic: top-left cell)
         ax0, ay0, ax1, ay1 = _world_fp_aabb(fp)
@@ -490,14 +887,17 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
         c1x, c1y = _to_cell(ax1, ay0, xmin, ymax, pitch, w, h)  # bottom-right
         x_lo, x_hi = min(c0x, c1x), max(c0x, c1x)
         y_lo, y_hi = min(c0y, c1y), max(c0y, c1y)
-        ref = str(fp.get("ref") or fp.get("id") or "?")
         # draw box border with refdes chars inside top edge
         for x in range(x_lo, x_hi + 1):
             for y in range(y_lo, y_hi + 1):
                 edge = (x in (x_lo, x_hi) or y in (y_lo, y_hi))
                 if not edge:
                     continue
-                if 0 <= x < w and 0 <= y < h and grid[y][x] == _PCB_EMPTY:
+                if not (0 <= x < w and 0 <= y < h):
+                    continue
+                if fp_mk:
+                    grid[y][x] = fp_mk
+                elif grid[y][x] == _PCB_EMPTY:
                     grid[y][x] = "+"
         # write refdes on the top border (left-justified, truncate)
         for i, ch in enumerate(ref[: max(1, x_hi - x_lo)]):
@@ -505,6 +905,17 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
             y = y_lo
             if 0 <= x < w and 0 <= y < h:
                 grid[y][x] = ch
+        if fp_mk:
+            ccx, ccy = _to_cell(ox, oy, xmin, ymax, pitch, w, h)
+            hl_stamp_anchor(grid, ccx, ccy, fp_mk, empty=_PCB_EMPTY)
+            hl.note(fp_mk, ref,
+                    f"footprint {ref} fpid={fp.get('fpid') or '?'} "
+                    f"value={fp.get('value')!r} side={side} "
+                    f"origin=({ox:g},{oy:g})mm angle={fp.get('angle', 0)}deg "
+                    f"{n_pads} pad(s) on {layer}, courtyard "
+                    f"{ax1 - ax0:.3g}x{ay1 - ay0:.3g}mm",
+                    anchor=(ccx, ccy), world=(ox, oy),
+                    cells=max(0, (x_hi - x_lo + 1) * 2 + (y_hi - y_lo - 1) * 2))
 
     rows = ["".join(r) for r in grid]
     ascii_block = "\n".join(rows)
@@ -513,6 +924,13 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
         pitch=pitch, width=w, height=h, unit="mm",
         kind="pcb", layer=layer,
     )
+    ruled = annotate_ascii_with_rulers(ascii_block)
+    scale_lines = scale_origin_lines(
+        gmeta, note=f"LAYER: {layer} — only copper on THIS layer is drawn; "
+                    f"vias are drawn on every layer. Other layers are not visible here.")
+    legend = ([f"LEGEND (PCB layer {layer}, one character = one grid cell):"]
+              + list(_PCB_LEGEND_BASE) + highlight_legend_lines(hl))
+    callouts = callout_lines(hl, unmatched_note(hl) if plan is None else ())
     return {
         "layer": layer,
         "pitch_mm": pitch,
@@ -522,7 +940,15 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
         "bbox_mm": [xmin, ymin, xmax, ymax],
         "bbox": [xmin, ymin, xmax, ymax],
         "ascii": ascii_block,
-        "ascii_ruled": annotate_ascii_with_rulers(ascii_block),
+        "ascii_ruled": ruled,
+        "ascii_annotated": annotated_ascii(
+            header=f"[pcb layer {layer} {w}x{h} cells pitch={pitch:.4g}mm]",
+            scale_lines=scale_lines, drawing=ruled,
+            legend=legend, callouts=callouts),
+        "scale": {"pitch_mm": pitch, "unit": "mm", "lines": scale_lines},
+        "legend": legend,
+        "callouts": list(hl.callouts),
+        "highlight": hl.report(),
         "grid": gmeta,
         "index": _board_cell_index(board, layer, xmin, ymax, pitch, w, h),
     }
@@ -844,16 +1270,23 @@ def summarize_board(board: dict, findings: list[dict],
 
 
 def board_ascii_report(board: dict, layer: Optional[str] = None,
-                       pitch_mm: float = 1.0) -> dict:
-    """Full PCB report: per-layer ascii + summary + findings."""
+                       pitch_mm: float = 1.0,
+                       highlight: Any = None) -> dict:
+    """Full PCB report: per-layer ascii + summary + findings.
+
+    ``highlight``: refdes ("R1"), footprint id, net ("net:GND"), track/via id,
+    pad ("R1.1"), or a list. One marker letter per requested token, shared
+    across every rendered layer.
+    """
     layers = [layer] if layer else _copper_layers(board)
     # de-dupe preserve order
     seen: set[str] = set()
     layers = [L for L in layers if not (L in seen or seen.add(L))]  # type: ignore[func-returns-value]
+    hl = HighlightPlan(highlight)
     layer_blocks = []
     ascii_parts = []
     for L in layers:
-        block = render_board_layer_ascii(board, layer=L, pitch_mm=pitch_mm)
+        block = render_board_layer_ascii(board, layer=L, pitch_mm=pitch_mm, plan=hl)
         layer_blocks.append(block)
         ascii_parts.append(f"[layer {L} pitch={block['pitch_mm']:.3g}mm "
                            f"{block['width']}x{block['height']}]\n{block['ascii']}")
@@ -861,24 +1294,49 @@ def board_ascii_report(board: dict, layer: Optional[str] = None,
     summary = summarize_board(board, findings, layers)
     ascii_all = "\n\n".join(ascii_parts)
     primary = layer_blocks[0] if layer_blocks else {}
+    ruled = primary.get("ascii_ruled") or annotate_ascii_with_rulers(
+        primary.get("ascii") or "")
+    gmeta = primary.get("grid") or {}
+    eff_pitch = float(primary.get("pitch_mm") or pitch_mm)
+    scale_lines = scale_origin_lines(
+        gmeta,
+        note=(f"LAYERS: {', '.join(layers) or '(none)'} — each layer block above "
+              f"shares this grid; only copper on that layer is drawn (vias appear "
+              f"on all layers). Requested pitch {pitch_mm:.4g}mm, effective "
+              f"{eff_pitch:.4g}mm after auto-coarsening to fit the width cap."))
+    legend = (["LEGEND (PCB, one character = one grid cell):"]
+              + list(_PCB_LEGEND_BASE) + highlight_legend_lines(hl))
+    extra = unmatched_note(hl) + (finding_callouts(findings) if not hl else [])
+    callouts = callout_lines(hl, extra)
     return {
         "ok": True,
         "kind": "pcb",
         "ascii": ascii_all,
-        "ascii_ruled": primary.get("ascii_ruled") or annotate_ascii_with_rulers(
-            primary.get("ascii") or ""),
-        "summary": summary,
+        "ascii_ruled": ruled,
+        "ascii_annotated": annotated_ascii(
+            header=f"[pcb {'+'.join(layers) or '(no layers)'} "
+                   f"{primary.get('width')}x{primary.get('height')} cells]",
+            scale_lines=scale_lines, drawing=ascii_all,
+            legend=legend, callouts=callouts),
+        "summary": summary_with_annotations(summary, scale_lines, legend, callouts),
         "findings": findings,
         "layers": layer_blocks,
-        "pitch_mm": pitch_mm,
-        "grid": primary.get("grid"),
+        "pitch_mm": eff_pitch,
+        "pitch_mm_requested": pitch_mm,
+        "scale": {"pitch_mm": eff_pitch, "unit": "mm", "lines": scale_lines},
+        "legend": legend,
+        "callouts": list(hl.callouts) + extra,
+        "highlight": hl.report(),
+        "grid": gmeta or None,
         "index": primary.get("index") or {},
         "width": primary.get("width"),
         "height": primary.get("height"),
         "bbox": primary.get("bbox") or primary.get("bbox_mm"),
         "hint": (
             "Use grid + index for cell-addressed edits via apply_ascii_edits "
-            "(kind='pcb'). Col/row are 0-based; row 0 is top of the ASCII block."
+            "(kind='pcb'). Col/row are 0-based; row 0 is top of the ASCII block. "
+            "Pass highlight='R1' / 'net:GND' / ['R1','v1'] to mark one element "
+            "with a letter and get it named in callouts."
         ),
     }
 
@@ -981,11 +1439,42 @@ def _sketch_bbox(polylines: list[list[tuple[float, float]]]
     return (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
 
 
+_SKETCH_LEGEND_BASE = (
+    "  .   = empty sketch plane (no geometry in that cell)",
+    "  -   = entity segment running east-west   |   = running north-south",
+    "  /   = entity segment running SW->NE      \\   = running NW->SE",
+    "  +   = two entities crossing in one cell, a corner, or a point entity",
+    "  e1 e2 … (multi-character run one row ABOVE an entity's start cell)"
+    " = entity id label, first 4 characters",
+)
+
+
+def _sketch_hl_cands(ent: dict) -> list[tuple[str, Any]]:
+    eid = ent.get("id")
+    etype = ent.get("type")
+    cands: list[tuple[str, Any]] = [("entity", eid), ("id", eid),
+                                    ("type", etype)]
+    if eid:
+        # health/closure talks in "e1.start" / "e1.end" — accept those too
+        cands += [("entity", f"{eid}.start"), ("entity", f"{eid}.end"),
+                  ("id", f"{eid}.start"), ("id", f"{eid}.end")]
+    return cands
+
+
 def render_sketch_ascii(entities: list[dict], pitch: float = 0.5,
-                        max_dim: int = 60) -> dict:
-    """ASCII render of sketch entities as control-point polylines."""
+                        max_dim: int = 60,
+                        highlight: Any = None,
+                        plan: Optional[HighlightPlan] = None) -> dict:
+    """ASCII render of sketch entities as control-point polylines.
+
+    ``highlight`` accepts the shared target vocabulary as it applies to a
+    sketch: an entity id ("e3"), an endpoint handle ("e3.end"), an entity type
+    ("circle" — marks every circle), or a list of any of those.
+    """
     if pitch <= 0:
         pitch = 0.5
+    hl = plan if plan is not None else HighlightPlan(highlight)
+    drawn: list[dict] = []
     polys = []
     labels: list[tuple[int, int, str]] = []
     for ent in entities:
@@ -997,6 +1486,7 @@ def render_sketch_ascii(entities: list[dict], pitch: float = 0.5,
         if not pl:
             continue
         polys.append(pl)
+        drawn.append(ent)
 
     xmin, ymin, xmax, ymax = _sketch_bbox(polys)
     bw = max(xmax - xmin, pitch); bh = max(ymax - ymin, pitch)
@@ -1014,28 +1504,36 @@ def render_sketch_ascii(entities: list[dict], pitch: float = 0.5,
         return (_clamp_int((x - xmin) / pitch, 0, w - 1),
                 _clamp_int((ymax - y) / pitch, 0, h - 1))
 
-    for ent, pl in zip(
-            [e for e in entities if isinstance(e, dict) and not e.get("construction")
-             and _entity_polyline(e)],
-            polys):
+    for ent, pl in zip(drawn, polys):
+        mk = hl.marker(_sketch_hl_cands(ent))
+        touched: set[tuple[int, int]] = set()
         if len(pl) == 1:
             cx, cy = cell(pl[0][0], pl[0][1])
-            grid[cy][cx] = "+"
+            grid[cy][cx] = mk or "+"
+            touched.add((cx, cy))
         else:
             for i in range(len(pl) - 1):
                 x0, y0 = cell(pl[i][0], pl[i][1])
                 x1, y1 = cell(pl[i + 1][0], pl[i + 1][1])
                 ch = _trace_char(x0, y0, x1, y1)
                 for cx, cy in _bresenham(x0, y0, x1, y1):
-                    if grid[cy][cx] in (" ", "."):
+                    touched.add((cx, cy))
+                    if mk:
+                        grid[cy][cx] = mk
+                    elif grid[cy][cx] in (" ", "."):
                         grid[cy][cx] = ch
                     elif grid[cy][cx] != ch:
                         grid[cy][cx] = "+"
         # label near first point
         eid = str(ent.get("id") or "")
+        acx, acy = cell(pl[0][0], pl[0][1])
         if eid and pl:
-            cx, cy = cell(pl[0][0], pl[0][1])
-            labels.append((cx, max(0, cy - 1), eid[:4]))
+            labels.append((acx, max(0, acy - 1), eid[:4]))
+        if mk:
+            hl_stamp_anchor(grid, acx, acy, mk, empty=" ")
+            hl.note(mk, eid or (ent.get("type") or "entity"),
+                    _entity_nl(ent), anchor=(acx, acy),
+                    world=pl[0], cells=len(touched))
 
     for cx, cy, lab in labels:
         for i, ch in enumerate(lab):
@@ -1056,9 +1554,7 @@ def render_sketch_ascii(entities: list[dict], pitch: float = 0.5,
     )
     # entity index at first-point cells
     index: dict[str, list[dict]] = {}
-    for ent in entities:
-        if not isinstance(ent, dict) or ent.get("construction"):
-            continue
+    for ent in drawn:
         pl = _entity_polyline(ent)
         if not pl:
             continue
@@ -1071,9 +1567,28 @@ def render_sketch_ascii(entities: list[dict], pitch: float = 0.5,
             "p1": list(pl[0]),
             "p2": list(pl[-1]) if len(pl) > 1 else list(pl[0]),
         })
+    n_constr = sum(1 for e in entities
+                   if isinstance(e, dict) and e.get("construction"))
+    ruled = annotate_ascii_with_rulers(ascii_block)
+    scale_lines = scale_origin_lines(
+        gmeta,
+        note=(f"HIDDEN: construction geometry is NOT drawn "
+              f"({n_constr} construction entit(y/ies) skipped); curves are drawn "
+              f"as sampled polylines, so a small radius can collapse to one cell."))
+    legend = (["LEGEND (sketch, one character = one grid cell):"]
+              + list(_SKETCH_LEGEND_BASE) + highlight_legend_lines(hl))
+    callouts = callout_lines(hl, unmatched_note(hl) if plan is None else ())
     return {
         "ascii": ascii_block,
-        "ascii_ruled": annotate_ascii_with_rulers(ascii_block),
+        "ascii_ruled": ruled,
+        "ascii_annotated": annotated_ascii(
+            header=f"[sketch {w}x{h} cells pitch={pitch:.4g}mm]",
+            scale_lines=scale_lines, drawing=ruled,
+            legend=legend, callouts=callouts),
+        "scale": {"pitch": pitch, "unit": "mm", "lines": scale_lines},
+        "legend": legend,
+        "callouts": list(hl.callouts),
+        "highlight": hl.report(),
         "pitch": pitch,
         "width": w,
         "height": h,
@@ -1699,24 +2214,45 @@ def live_board_readback(doc_id: str = "", **kwargs: Any) -> Optional[dict]:
 
 def sketch_ascii_report(sketch: dict, *, pitch: float = 0.5,
                         health: Optional[dict] = None,
-                        near_tol: float = 1e-2) -> dict:
-    """Full sketch report from a dict with entities/constraints (and optional health)."""
+                        near_tol: float = 1e-2,
+                        highlight: Any = None) -> dict:
+    """Full sketch report from a dict with entities/constraints (and optional health).
+
+    ``highlight``: entity id ("e3"), endpoint handle ("e3.end"), entity type
+    ("circle"), or a list of any of those.
+    """
     entities = list(sketch.get("entities") or [])
     constraints = list(sketch.get("constraints") or [])
     if health is None and isinstance(sketch.get("health"), dict):
         health = sketch["health"]
-    rendered = render_sketch_ascii(entities, pitch=pitch)
+    hl = HighlightPlan(highlight)
+    rendered = render_sketch_ascii(entities, pitch=pitch, plan=hl)
     findings = check_sketch_geometry(entities, near_tol=near_tol, health=health)
     summary = summarize_sketch(entities, constraints, findings, health=health)
+    scale_lines = rendered["scale"]["lines"]
+    legend = rendered["legend"]
+    extra = unmatched_note(hl) + (finding_callouts(findings) if not hl else [])
+    callout_txt = callout_lines(hl, extra)
     return {
         "ok": True,
         "kind": "sketch",
         "ascii": rendered["ascii"],
         "ascii_ruled": rendered.get("ascii_ruled") or annotate_ascii_with_rulers(
             rendered["ascii"]),
-        "summary": summary,
+        "ascii_annotated": annotated_ascii(
+            header=f"[sketch {rendered['width']}x{rendered['height']} cells "
+                   f"pitch={rendered['pitch']:.4g}mm]",
+            scale_lines=scale_lines, drawing=rendered["ascii_ruled"],
+            legend=legend, callouts=callout_txt),
+        "summary": summary_with_annotations(summary, scale_lines, legend,
+                                            callout_txt),
         "findings": findings,
         "pitch": rendered["pitch"],
+        "pitch_requested": pitch,
+        "scale": rendered["scale"],
+        "legend": legend,
+        "callouts": list(hl.callouts) + extra,
+        "highlight": hl.report(),
         "width": rendered["width"],
         "height": rendered["height"],
         "bbox": rendered["bbox"],
@@ -1724,7 +2260,9 @@ def sketch_ascii_report(sketch: dict, *, pitch: float = 0.5,
         "index": rendered.get("index") or {},
         "hint": (
             "Use grid + index for cell-addressed sketch edits via apply_ascii_edits "
-            "(kind='sketch'). Prefer entity ids from the summary when available."
+            "(kind='sketch'). Prefer entity ids from the summary when available. "
+            "Pass highlight='e3' (or a list) to mark one entity with a letter and "
+            "get it named in callouts."
         ),
     }
 
@@ -1843,11 +2381,30 @@ def _sch_cell_index(sch: dict, xmin: float, ymax: float, pitch: float,
     return {k: v for k, v in sorted(cells.items())}
 
 
+_SCH_LEGEND_BASE = (
+    "  .   = empty sheet",
+    "  -   = wire running east-west        |   = wire running north-south",
+    "  /   = wire running SW->NE           \\   = wire running NW->SE",
+    "  +   = wire crossing/corner, or the border of a symbol box",
+    "  *   = junction (wires electrically joined here)",
+    "  L   = net label anchor, followed by up to 6 characters of its text",
+    "  P   = power port anchor, followed by up to 4 characters of its net name",
+    "  R1 U2 … on a symbol box top border = refdes; the row below it = value",
+)
+
+
 def render_schematic_ascii(sch: dict, pitch_mm: float = 2.54,
-                           max_dim: int = 80) -> dict:
-    """Deterministic schematic sheet ASCII grid with cell index + rulers."""
+                           max_dim: int = 80,
+                           highlight: Any = None,
+                           plan: Optional[HighlightPlan] = None) -> dict:
+    """Deterministic schematic sheet ASCII grid with cell index + rulers.
+
+    ``highlight``: symbol ref ("R1") or id ("s1"), wire id ("w2"), junction id,
+    label text ("MID"), power/net name ("GND" / "net:GND"), or a list.
+    """
     if pitch_mm <= 0:
         pitch_mm = 2.54
+    hl = plan if plan is not None else HighlightPlan(highlight)
     xmin, ymin, xmax, ymax = _sch_bbox(sch)
     bw = max(xmax - xmin, pitch_mm)
     bh = max(ymax - ymin, pitch_mm)
@@ -1878,36 +2435,74 @@ def render_schematic_ascii(sch: dict, pitch_mm: float = 2.54,
         pts = wire.get("pts") or []
         if len(pts) < 2:
             continue
+        mk = hl.marker([("wire", wire.get("id")), ("id", wire.get("id")),
+                        ("net", wire.get("net"))])
+        touched = 0
+        first: Optional[tuple[int, int]] = None
         for i in range(len(pts) - 1):
             a, b = pts[i], pts[i + 1]
             x0, y0 = _to_cell(float(a[0]), float(a[1]), xmin, ymax, pitch, w, h)
             x1, y1 = _to_cell(float(b[0]), float(b[1]), xmin, ymax, pitch, w, h)
+            if first is None:
+                first = (x0, y0)
             ch = _trace_char(x0, y0, x1, y1)
             for cx, cy in _bresenham(x0, y0, x1, y1):
-                paint(cx, cy, ch)
+                paint(cx, cy, mk or ch, force=bool(mk))
+                touched += 1
+        if mk and first is not None:
+            hl_stamp_anchor(grid, first[0], first[1], mk, empty=_SCH_EMPTY)
+            ends = f"({float(pts[0][0]):g},{float(pts[0][1]):g})->" \
+                   f"({float(pts[-1][0]):g},{float(pts[-1][1]):g})mm"
+            hl.note(mk, str(wire.get("id") or "wire"),
+                    f"wire {ends} {len(pts)} point(s)"
+                    + (f" net={wire.get('net')}" if wire.get("net") else ""),
+                    anchor=first,
+                    world=(float(pts[0][0]), float(pts[0][1])), cells=touched)
 
     for j in sch.get("junctions") or []:
         pos = j.get("pos") or [0, 0]
         cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
-        paint(cx, cy, _SCH_JUNCT, force=True)
+        mk = hl.marker([("junction", j.get("id")), ("id", j.get("id"))])
+        paint(cx, cy, mk or _SCH_JUNCT, force=True)
+        if mk:
+            hl_stamp_anchor(grid, cx, cy, mk, empty=_SCH_EMPTY)
+            hl.note(mk, str(j.get("id") or "junction"),
+                    f"junction at ({float(pos[0]):g},{float(pos[1]):g})mm",
+                    anchor=(cx, cy), world=(float(pos[0]), float(pos[1])), cells=1)
 
     for lb in sch.get("labels") or []:
         pos = lb.get("pos") or [0, 0]
         cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
-        paint(cx, cy, _SCH_LABEL, force=True)
+        mk = hl.marker([("label", lb.get("id")), ("id", lb.get("id")),
+                        ("label", lb.get("text")), ("net", lb.get("text")),
+                        ("name", lb.get("text"))])
+        paint(cx, cy, mk or _SCH_LABEL, force=True)
         text = str(lb.get("text") or "")[:6]
         for i, ch in enumerate(text):
             if 0 <= cx + 1 + i < w and grid[cy][cx + 1 + i] == _SCH_EMPTY:
                 grid[cy][cx + 1 + i] = ch
+        if mk:
+            hl.note(mk, str(lb.get("id") or lb.get("text") or "label"),
+                    f"net label {lb.get('text')!r} scope={lb.get('scope', 'local')} "
+                    f"at ({float(pos[0]):g},{float(pos[1]):g})mm",
+                    anchor=(cx, cy), world=(float(pos[0]), float(pos[1])), cells=1)
 
     for pw in sch.get("power") or []:
         pos = pw.get("pos") or [0, 0]
         cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
-        paint(cx, cy, _SCH_POWER, force=True)
+        mk = hl.marker([("power", pw.get("id")), ("id", pw.get("id")),
+                        ("power", pw.get("net")), ("net", pw.get("net")),
+                        ("name", pw.get("net"))])
+        paint(cx, cy, mk or _SCH_POWER, force=True)
         net = str(pw.get("net") or "")[:4]
         for i, ch in enumerate(net):
             if 0 <= cx + 1 + i < w and grid[cy][cx + 1 + i] == _SCH_EMPTY:
                 grid[cy][cx + 1 + i] = ch
+        if mk:
+            hl.note(mk, str(pw.get("id") or pw.get("net") or "power"),
+                    f"power port net={pw.get('net')!r} at "
+                    f"({float(pos[0]):g},{float(pos[1]):g})mm",
+                    anchor=(cx, cy), world=(float(pos[0]), float(pos[1])), cells=1)
 
     # symbols as small boxes with refdes
     for sym in sch.get("symbols") or []:
@@ -1918,12 +2513,19 @@ def render_schematic_ascii(sch: dict, pitch_mm: float = 2.54,
         cx, cy = _to_cell(ox, oy, xmin, ymax, pitch, w, h)
         x_lo, x_hi = max(0, cx - half), min(w - 1, cx + half)
         y_lo, y_hi = max(0, cy - half), min(h - 1, cy + half)
+        ref = str(sym.get("ref") or sym.get("id") or "?")
+        mk = hl.marker([("ref", ref), ("symbol", ref), ("id", sym.get("id")),
+                        ("symbol", sym.get("id")), ("libid", sym.get("libid")),
+                        ("value", sym.get("value"))])
         for x in range(x_lo, x_hi + 1):
             for y in range(y_lo, y_hi + 1):
                 edge = x in (x_lo, x_hi) or y in (y_lo, y_hi)
-                if edge and grid[y][x] == _SCH_EMPTY:
+                if not edge:
+                    continue
+                if mk:
+                    grid[y][x] = mk
+                elif grid[y][x] == _SCH_EMPTY:
                     grid[y][x] = "+"
-        ref = str(sym.get("ref") or sym.get("id") or "?")
         for i, ch in enumerate(ref[: max(1, x_hi - x_lo)]):
             x = x_lo + i
             if 0 <= x < w:
@@ -1933,8 +2535,17 @@ def render_schematic_ascii(sch: dict, pitch_mm: float = 2.54,
             for i, ch in enumerate(val[: max(1, x_hi - x_lo)]):
                 x = x_lo + i
                 y = min(h - 1, y_lo + 1)
-                if 0 <= x < w and grid[y][x] in (_SCH_EMPTY, "+"):
+                if 0 <= x < w and grid[y][x] in (_SCH_EMPTY, "+", mk or "\0"):
                     grid[y][x] = ch
+        if mk:
+            hl_stamp_anchor(grid, cx, cy, mk, empty=_SCH_EMPTY)
+            hl.note(mk, ref,
+                    f"symbol {ref} libid={sym.get('libid') or '?'} "
+                    f"value={sym.get('value')!r} at ({ox:g},{oy:g})mm "
+                    f"angle={sym.get('angle', 0)}deg "
+                    f"box cols {x_lo}..{x_hi} rows {y_lo}..{y_hi}",
+                    anchor=(cx, cy), world=(ox, oy),
+                    cells=max(0, (x_hi - x_lo + 1) * 2 + (y_hi - y_lo - 1) * 2))
 
     ascii_block = "\n".join("".join(r) for r in grid)
     gmeta = make_grid_meta(
@@ -1942,9 +2553,27 @@ def render_schematic_ascii(sch: dict, pitch_mm: float = 2.54,
         pitch=pitch, width=w, height=h, unit="mm", kind="schematic",
     )
     index = _sch_cell_index(sch, xmin, ymax, pitch, w, h)
+    ruled = annotate_ascii_with_rulers(ascii_block)
+    scale_lines = scale_origin_lines(
+        gmeta,
+        note=("HIDDEN: symbol pins and bodies are NOT drawn to shape — every "
+              "symbol is a fixed ~2.54mm half-size box around its origin, so "
+              "boxes may overlap even when the real symbols do not. Connectivity "
+              "comes from the wire/junction geometry, not from the boxes."))
+    legend = (["LEGEND (schematic sheet, one character = one grid cell):"]
+              + list(_SCH_LEGEND_BASE) + highlight_legend_lines(hl))
+    callouts = callout_lines(hl, unmatched_note(hl) if plan is None else ())
     return {
         "ascii": ascii_block,
-        "ascii_ruled": annotate_ascii_with_rulers(ascii_block),
+        "ascii_ruled": ruled,
+        "ascii_annotated": annotated_ascii(
+            header=f"[schematic {w}x{h} cells pitch={pitch:.4g}mm]",
+            scale_lines=scale_lines, drawing=ruled,
+            legend=legend, callouts=callouts),
+        "scale": {"pitch_mm": pitch, "unit": "mm", "lines": scale_lines},
+        "legend": legend,
+        "callouts": list(hl.callouts),
+        "highlight": hl.report(),
         "pitch_mm": pitch,
         "pitch": pitch,
         "width": w,
@@ -2089,19 +2718,41 @@ def summarize_schematic(sch: dict, findings: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def schematic_ascii_report(sch: dict, pitch_mm: float = 2.54) -> dict:
-    rendered = render_schematic_ascii(sch, pitch_mm=pitch_mm)
+def schematic_ascii_report(sch: dict, pitch_mm: float = 2.54,
+                           highlight: Any = None) -> dict:
+    """Full schematic report: sheet ASCII + cell index + checks.
+
+    ``highlight``: symbol ref/id, wire id, junction id, label text, power net,
+    or a list of any of those.
+    """
+    hl = HighlightPlan(highlight)
+    rendered = render_schematic_ascii(sch, pitch_mm=pitch_mm, plan=hl)
     findings = check_schematic(sch)
     summary = summarize_schematic(sch, findings)
+    scale_lines = rendered["scale"]["lines"]
+    legend = rendered["legend"]
+    extra = unmatched_note(hl) + (finding_callouts(findings) if not hl else [])
+    callout_txt = callout_lines(hl, extra)
     return {
         "ok": True,
         "kind": "schematic",
         "ascii": rendered["ascii"],
         "ascii_ruled": rendered["ascii_ruled"],
-        "summary": summary,
+        "ascii_annotated": annotated_ascii(
+            header=f"[schematic {rendered['width']}x{rendered['height']} cells "
+                   f"pitch={rendered['pitch_mm']:.4g}mm]",
+            scale_lines=scale_lines, drawing=rendered["ascii_ruled"],
+            legend=legend, callouts=callout_txt),
+        "summary": summary_with_annotations(summary, scale_lines, legend,
+                                            callout_txt),
         "findings": findings,
         "pitch_mm": rendered["pitch_mm"],
+        "pitch_mm_requested": pitch_mm,
         "pitch": rendered["pitch"],
+        "scale": rendered["scale"],
+        "legend": legend,
+        "callouts": list(hl.callouts) + extra,
+        "highlight": hl.report(),
         "width": rendered["width"],
         "height": rendered["height"],
         "bbox": rendered["bbox"],
@@ -2111,7 +2762,8 @@ def schematic_ascii_report(sch: dict, pitch_mm: float = 2.54) -> dict:
             "READ the ruled ASCII + index before the next schematic edit. "
             "Use apply_ascii_edits(kind='schematic', edits=[...]) to move/swap "
             "symbols, delete wires, or place labels/power at cell coords. "
-            "Call render_schematic_ascii before declaring the schematic done."
+            "Call render_schematic_ascii before declaring the schematic done. "
+            "Pass highlight='R1' / 'net:GND' / ['R1','w2'] to mark one element."
         ),
     }
 
@@ -2204,19 +2856,55 @@ def attach_schematic_readback(response: dict, sch: dict, **kwargs: Any) -> dict:
 # SPICE deck + circuit device roster as deterministic plaintext (not a 2D grid).
 
 
+_SIM_LEGEND_BASE = (
+    "  [circuit devices=N nodes=M] = section header: SPICE device roster",
+    "  [spice_deck]                = section header: raw deck text as solved",
+    "  [netlist components=N nets=M] = section header: components + net membership",
+    "  [results]                   = section header: solved values",
+    "  <kind> <name> nodes=[a,b] k=v = one device: element type, instance name,",
+    "        ORDERED node list (order is the SPICE pin order), then parameters",
+    "  net NAME: R1.1,R2.2         = net membership written as refdes.pin",
+    "  key = value                 = one solved probe (volts unless noted)",
+)
+
+
+def _sim_probe_cands(key: str) -> list[tuple[str, Any]]:
+    k = str(key)
+    cands: list[tuple[str, Any]] = [("probe", k), ("node", k), ("name", k),
+                                    ("id", k)]
+    low = k.lower()
+    if low.startswith(("v(", "i(")) and low.endswith(")"):
+        inner = k[2:-1]
+        cands += [("probe", inner), ("node", inner), ("name", inner),
+                  ("id", inner)]
+    return cands
+
+
 def render_sim_ascii(circuit: Optional[dict] = None,
                      spice_text: str = "",
                      netlist: Optional[dict] = None,
-                     results: Optional[dict] = None) -> dict:
+                     results: Optional[dict] = None,
+                     highlight: Any = None) -> dict:
     """Deterministic plaintext of a SPICE circuit / deck for non-vision models.
 
     Not a spatial grid — simulation state is topological. Returns a stable
     multi-section ASCII block + summary + findings.
+
+    ``highlight``: device/instance name ("R1"), a node ("n1" / "node:GND"), a
+    netlist component ref, a net name, a probe key ("V(mid)"), or a list. Marked
+    rows carry a ``>A<`` gutter; every row has a 4-character gutter so columns
+    line up whether or not anything is highlighted.
     """
+    hl = HighlightPlan(highlight)
     lines: list[str] = []
     findings: list[dict] = []
     devices = []
     nodes: list[str] = []
+
+    def row(text: str, marker: Optional[str] = None) -> None:
+        gut = f"{_HL_BRACKET_L}{marker}{_HL_BRACKET_R} " if marker else "    "
+        lines.append(gut + text)
+
     if circuit and isinstance(circuit, dict):
         devices = list(circuit.get("devices") or [])
         nodes = list(circuit.get("nodes") or [])
@@ -2234,7 +2922,18 @@ def render_sim_ascii(circuit: Optional[dict] = None,
             else:
                 ptxt = str(params)
             ntxt = ",".join(str(n) for n in nlist)
-            lines.append(f"  {kind} {name} nodes=[{ntxt}] {ptxt}".rstrip())
+            cands: list[tuple[str, Any]] = [
+                ("device", name), ("name", name), ("id", name), ("ref", name),
+                ("type", kind),
+            ]
+            cands += [("node", n) for n in nlist]
+            mk = hl.marker(cands)
+            row(f"{kind} {name} nodes=[{ntxt}] {ptxt}".rstrip(), mk)
+            if mk:
+                hl.note(mk, str(name),
+                        f"{kind} device {name} on nodes [{ntxt}]"
+                        + (f" with {ptxt}" if ptxt else "")
+                        + f" [circuit view line {len(lines)}]")
         if not devices:
             findings.append({
                 "code": "no_devices",
@@ -2247,7 +2946,14 @@ def render_sim_ascii(circuit: Optional[dict] = None,
         deck_lines = [ln.rstrip() for ln in str(spice_text).splitlines()]
         while deck_lines and not deck_lines[-1]:
             deck_lines.pop()
-        lines.extend(deck_lines if deck_lines else ["  (empty deck)"])
+        for ln in (deck_lines or ["(empty deck)"]):
+            head = ln.split()[0] if ln.split() else ""
+            mk = hl.marker([("device", head), ("name", head), ("id", head),
+                            ("ref", head)]) if head else None
+            row(ln, mk)
+            if mk:
+                hl.note(mk, head, f"SPICE deck card: {ln.strip()!r} "
+                                  f"[deck view line {len(lines)}]")
     if netlist and isinstance(netlist, dict):
         comps = netlist.get("components") or []
         nets = netlist.get("nets") or {}
@@ -2255,18 +2961,30 @@ def render_sim_ascii(circuit: Optional[dict] = None,
         for c in comps[:40]:
             if not isinstance(c, dict):
                 continue
-            lines.append(
-                f"  {c.get('ref') or '?'} libid={c.get('libid') or '?'} "
-                f"value={c.get('value')!r}"
-            )
+            ref = c.get("ref") or "?"
+            mk = hl.marker([("component", ref), ("ref", ref), ("id", ref),
+                            ("name", ref), ("libid", c.get("libid")),
+                            ("value", c.get("value"))])
+            row(f"{ref} libid={c.get('libid') or '?'} value={c.get('value')!r}", mk)
+            if mk:
+                hl.note(mk, str(ref),
+                        f"netlist component {ref} libid={c.get('libid') or '?'} "
+                        f"value={c.get('value')!r} "
+                        f"[netlist view line {len(lines)}]")
         for nname in sorted(nets)[:40]:
             members = nets[nname] or []
             mtxt = ",".join(
                 f"{m.get('ref')}.{m.get('pin')}" if isinstance(m, dict) else str(m)
                 for m in members[:8]
             )
-            lines.append(f"  net {nname}: {mtxt}"
-                         + (f" +{len(members)-8}" if len(members) > 8 else ""))
+            mk = hl.marker([("net", nname), ("name", nname), ("node", nname),
+                            ("id", nname)])
+            row(f"net {nname}: {mtxt}"
+                + (f" +{len(members)-8}" if len(members) > 8 else ""), mk)
+            if mk:
+                hl.note(mk, str(nname),
+                        f"net {nname} with {len(members)} member pin(s): {mtxt}"
+                        f" [netlist view line {len(lines)}]")
     if results and isinstance(results, dict):
         lines.append("[results]")
         # common shapes: op voltages, probes
@@ -2274,13 +2992,15 @@ def render_sim_ascii(circuit: Optional[dict] = None,
         if isinstance(probes, dict):
             for k in sorted(probes):
                 v = probes[k]
-                if isinstance(v, (int, float)):
-                    lines.append(f"  {k} = {v:.6g}")
-                else:
-                    lines.append(f"  {k} = {v}")
+                mk = hl.marker(_sim_probe_cands(k))
+                row(f"{k} = {v:.6g}" if isinstance(v, (int, float))
+                    else f"{k} = {v}", mk)
+                if mk:
+                    hl.note(mk, str(k),
+                            f"solved probe {k} = {v} [results view line {len(lines)}]")
         elif isinstance(probes, list):
             for item in probes[:40]:
-                lines.append(f"  {item}")
+                row(str(item))
     ascii_block = "\n".join(lines) if lines else "(empty simulation view)"
     summary_bits = []
     if devices:
@@ -2294,19 +3014,44 @@ def render_sim_ascii(circuit: Optional[dict] = None,
     summary = "Simulation: " + (", ".join(summary_bits) if summary_bits else "empty") + "."
     if findings:
         summary += " " + "; ".join(f.get("message", "") for f in findings[:4])
+    scale_lines = [
+        "SCALE: TOPOLOGICAL view — this is NOT a spatial drawing and has no "
+        "mm-per-character scale. One text row = one device, net, deck card or "
+        "probe; row order is the section order below, alphabetical within nets "
+        "and probes.",
+        "ORIGIN: none — no coordinate frame exists here. Component positions "
+        "live in the schematic; use render_schematic_ascii for geometry.",
+        "GUTTER: every payload row starts with a 4-character marker gutter; "
+        "'    ' = not highlighted, '>A< ' = highlighted with marker A. Section "
+        "headers start at column 0. Payload text begins at column 4.",
+    ]
+    legend = (["LEGEND (simulation, plaintext topology):"]
+              + list(_SIM_LEGEND_BASE) + highlight_legend_lines(hl, mode="rows"))
+    extra = unmatched_note(hl) + (finding_callouts(findings) if not hl else [])
+    callout_txt = callout_lines(hl, extra)
     return {
         "ok": True,
         "kind": "sim",
         "ascii": ascii_block,
-        "summary": summary,
+        "ascii_annotated": annotated_ascii(
+            header=f"[sim view {len(lines)} row(s)]",
+            scale_lines=scale_lines, drawing=ascii_block,
+            legend=legend, callouts=callout_txt),
+        "summary": summary_with_annotations(summary, scale_lines, legend,
+                                            callout_txt),
         "findings": findings,
+        "scale": {"kind": "topological", "unit": None, "lines": scale_lines},
+        "legend": legend,
+        "callouts": list(hl.callouts) + extra,
+        "highlight": hl.report(),
         "device_count": len(devices),
         "node_count": len(nodes),
         "grid": None,  # topological, not spatial
         "hint": (
             "Simulation view is topological (device/node list + SPICE deck), not a "
             "2D grid. Edit the schematic (render_schematic_ascii / apply_ascii_edits "
-            "kind='schematic') then re-run ecad_simulate."
+            "kind='schematic') then re-run ecad_simulate. Pass highlight='R1' or "
+            "'node:mid' to mark the rows you are reasoning about."
         ),
     }
 
@@ -2985,7 +3730,8 @@ def apply_ascii_edits(kind: str, edits: Sequence[dict], *,
 
 
 def _project_polylines_ascii(polylines: list[list[tuple[float, float]]],
-                             pitch: float = 1.0, max_dim: int = 70) -> dict:
+                             pitch: float = 1.0, max_dim: int = 70,
+                             markers: Optional[dict[int, str]] = None) -> dict:
     xmin, ymin, xmax, ymax = _sketch_bbox(polylines)
     bw = max(xmax - xmin, pitch); bh = max(ymax - ymin, pitch)
     w = max(1, int(math.ceil(bw / pitch)) + 1)
@@ -2996,32 +3742,54 @@ def _project_polylines_ascii(polylines: list[list[tuple[float, float]]],
         w = max(1, int(math.ceil(bw / pitch)) + 1)
         h = max(1, int(math.ceil(bh / pitch)) + 1)
     grid = [["." for _ in range(w)] for _ in range(h)]
+    marks = markers or {}
+    anchors: list[tuple[int, int]] = []
+    painted: list[int] = []
 
     def cell(x: float, y: float) -> tuple[int, int]:
         return (_clamp_int((x - xmin) / pitch, 0, w - 1),
                 _clamp_int((ymax - y) / pitch, 0, h - 1))
 
-    for pl in polylines:
-        if len(pl) < 2:
-            if pl:
-                cx, cy = cell(pl[0][0], pl[0][1])
-                grid[cy][cx] = "+"
+    for pi, pl in enumerate(polylines):
+        mk = marks.get(pi)
+        if not pl:
+            anchors.append((0, 0))
+            painted.append(0)
             continue
-        for i in range(len(pl) - 1):
-            x0, y0 = cell(pl[i][0], pl[i][1])
-            x1, y1 = cell(pl[i + 1][0], pl[i + 1][1])
-            ch = _trace_char(x0, y0, x1, y1)
-            for cx, cy in _bresenham(x0, y0, x1, y1):
-                if grid[cy][cx] == ".":
-                    grid[cy][cx] = ch
-                elif grid[cy][cx] != ch:
-                    grid[cy][cx] = "+"
+        acx, acy = cell(pl[0][0], pl[0][1])
+        anchors.append((acx, acy))
+        touched: set[tuple[int, int]] = set()
+        if len(pl) < 2:
+            grid[acy][acx] = mk or "+"
+            touched.add((acx, acy))
+        else:
+            for i in range(len(pl) - 1):
+                x0, y0 = cell(pl[i][0], pl[i][1])
+                x1, y1 = cell(pl[i + 1][0], pl[i + 1][1])
+                ch = _trace_char(x0, y0, x1, y1)
+                for cx, cy in _bresenham(x0, y0, x1, y1):
+                    touched.add((cx, cy))
+                    if mk:
+                        grid[cy][cx] = mk
+                    elif grid[cy][cx] == ".":
+                        grid[cy][cx] = ch
+                    elif grid[cy][cx] != ch:
+                        grid[cy][cx] = "+"
+        painted.append(len(touched))
+    for pi, mk in marks.items():
+        if 0 <= pi < len(anchors):
+            hl_stamp_anchor(grid, anchors[pi][0], anchors[pi][1], mk, empty=".")
     return {
         "ascii": "\n".join("".join(r) for r in grid),
         "pitch": pitch,
         "width": w,
         "height": h,
         "bbox": [xmin, ymin, xmax, ymax],
+        "anchors": anchors,
+        "painted": painted,
+        "grid": make_grid_meta(xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax,
+                               pitch=pitch, width=w, height=h, unit="mm",
+                               kind="silhouette3d"),
     }
 
 
@@ -3117,12 +3885,48 @@ def silhouette_from_bbox(bbox: dict | list | tuple, view: str = "front"
     return [[proj[i], proj[j]] for i, j in edges]
 
 
+_SIL_LEGEND_BASE = (
+    "  .   = empty (nothing projected into that cell)",
+    "  -   = edge running east-west on the page   |   = running north-south",
+    "  /   = edge running SW->NE                  \\   = running NW->SE",
+    "  +   = two edges in one cell, a corner, or a degenerate single-point edge",
+    "  NOTE: this is a wireframe silhouette — hidden-line removal is only as good",
+    "        as the source, and nothing encodes depth. A far edge and a near edge",
+    "        look identical.",
+)
+
+
+def _sil_box_marker(plan: HighlightPlan,
+                    pl: Sequence[tuple[float, float]]) -> Optional[str]:
+    """Match a ``box:x0,y0,x1,y1`` token against a projected polyline."""
+    for tok in plan.tokens:
+        q, v = _hl_parts(tok)
+        if q != "box":
+            continue
+        try:
+            x0, y0, x1, y1 = (float(t) for t in v.split(","))
+        except Exception:
+            continue
+        lo_x, hi_x = min(x0, x1), max(x0, x1)
+        lo_y, hi_y = min(y0, y1), max(y0, y1)
+        if any(lo_x <= px <= hi_x and lo_y <= py <= hi_y for px, py in pl):
+            return plan.markers[tok]
+    return None
+
+
 def render_ascii_3d(polylines: Optional[list] = None,
                     bbox: Any = None,
                     view: str = "front",
                     pitch: float = 1.0,
-                    source: str = "experimental") -> dict:
-    """Experimental single-view silhouette ASCII for non-vision models."""
+                    source: str = "experimental",
+                    highlight: Any = None) -> dict:
+    """Experimental single-view silhouette ASCII for non-vision models.
+
+    ``highlight`` for this view is a **polyline handle** — "p3" (or the bare
+    index "3"), or a projected-plane region "box:x0,y0,x1,y1" which marks every
+    polyline with a point inside it. Feature ids/sids do NOT survive hidden-line
+    projection, so the callout list enumerates the p-handles instead.
+    """
     if polylines:
         pls = []
         for pl in polylines:
@@ -3142,13 +3946,60 @@ def render_ascii_3d(polylines: Optional[list] = None,
             "experimental": True,
         }
 
-    rendered = _project_polylines_ascii(pls, pitch=pitch)
+    hl = HighlightPlan(highlight)
+    marks: dict[int, str] = {}
+    for i, pl in enumerate(pls):
+        mk = hl.marker([("poly", f"p{i}"), ("id", f"p{i}"), ("poly", str(i)),
+                        ("name", f"p{i}")]) or _sil_box_marker(hl, pl)
+        if mk:
+            marks[i] = mk
+
+    rendered = _project_polylines_ascii(pls, pitch=pitch, markers=marks)
+    anchors = rendered["anchors"]
+    for i, mk in sorted(marks.items()):
+        pl = pls[i]
+        length = sum(math.hypot(pl[k + 1][0] - pl[k][0], pl[k + 1][1] - pl[k][1])
+                     for k in range(len(pl) - 1))
+        hl.note(mk, f"p{i}",
+                f"silhouette polyline {i}: {len(pl)} point(s) "
+                f"({pl[0][0]:g},{pl[0][1]:g})->({pl[-1][0]:g},{pl[-1][1]:g}) "
+                f"on the {view} projection plane, projected length {length:.4g}",
+                anchor=anchors[i], world=pl[0], cells=rendered["painted"][i])
+
+    gmeta = rendered["grid"]
     summary = (
         f"[EXPERIMENTAL] 3D silhouette ASCII (view={view}, source={source}). "
         f"Grid {rendered['width']}x{rendered['height']} at pitch={rendered['pitch']:.3g}. "
         f"{len(pls)} polyline(s). Lossy — for 'is there a hole?' class questions, "
         f"not dimensions. Prefer describe_part / multi-view render when available."
     )
+    scale_lines = scale_origin_lines(
+        gmeta,
+        note=(f"PROJECTION: coordinates are on the {view} PROJECTION PLANE "
+              f"(screen x/y after projecting the model), not model x/y/z; depth "
+              f"along the view direction is discarded. Source={source}: "
+              + ("outline of the model's axis-aligned bounding box only — the "
+                 "real shape is NOT drawn."
+                 if source == "bbox_wireframe" else
+                 "hidden-line-removed visible edges.")))
+    legend = ([f"LEGEND (3D silhouette, view={view}, one char = one cell):"]
+              + list(_SIL_LEGEND_BASE) + highlight_legend_lines(hl, mode="plain"))
+    inventory: list[dict] = []
+    if not hl:
+        for i, pl in enumerate(pls[:8]):
+            inventory.append({
+                "marker": _HL_NONE, "id": f"p{i}",
+                "desc": f"polyline {i}: ({pl[0][0]:g},{pl[0][1]:g})->"
+                        f"({pl[-1][0]:g},{pl[-1][1]:g}) — re-render with "
+                        f"highlight='p{i}' to mark it",
+                "anchor_cell": list(anchors[i]),
+            })
+        if len(pls) > 8:
+            inventory.append({"marker": _HL_NONE, "id": f"p8..p{len(pls) - 1}",
+                              "desc": f"+{len(pls) - 8} more polyline(s) not listed"})
+    extra = unmatched_note(hl) + inventory
+    callout_txt = callout_lines(hl, extra)
+    ruled = annotate_ascii_with_rulers(rendered["ascii"])
     return {
         "ok": True,
         "kind": "silhouette3d",
@@ -3156,8 +4007,22 @@ def render_ascii_3d(polylines: Optional[list] = None,
         "view": view,
         "source": source,
         "ascii": rendered["ascii"],
-        "summary": summary,
+        "ascii_ruled": ruled,
+        "ascii_annotated": annotated_ascii(
+            header=f"[silhouette3d view={view} source={source} "
+                   f"{rendered['width']}x{rendered['height']} cells]",
+            scale_lines=scale_lines, drawing=ruled,
+            legend=legend, callouts=callout_txt),
+        "summary": summary_with_annotations(summary, scale_lines, legend,
+                                            callout_txt),
         "findings": [],
+        "scale": {"pitch": rendered["pitch"], "unit": "mm",
+                  "lines": scale_lines},
+        "legend": legend,
+        "callouts": list(hl.callouts) + extra,
+        "highlight": hl.report(),
+        "polyline_count": len(pls),
+        "grid": gmeta,
         "pitch": rendered["pitch"],
         "width": rendered["width"],
         "height": rendered["height"],
@@ -3234,11 +4099,14 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def render_board_ascii(doc_id: str = "", layer: str = "",
                            pitch_mm: float = 1.0,
-                           board_json: str = "") -> str:
+                           board_json: str = "",
+                           highlight: str = "") -> str:
         """Per-layer ASCII grid of a PCB + net connectivity summary + checks.
 
         Renders components as refdes boxes, traces as path characters (- | / \\),
         vias as 'o', pads as '#', and marks same-cell different-net collisions as 'X'.
+        Every response carries a LEGEND (what each glyph means), a SCALE/ORIGIN
+        block (mm per cell + the cell->world formula) and a CALLOUT list.
 
         Call this (full render) before declaring a board done. Board mutation tools
         (place/route/zone/autoplace/autoroute/board_from_schematic) already append a
@@ -3251,9 +4119,17 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
           pitch_mm: world-mm per ASCII cell (auto-coarsened to keep width ≤ 80).
           board_json: optional full board document JSON string — when set, skips
             the live session (useful for offline / unit tests).
+          highlight: element(s) to emphasise — refdes ('R1'), footprint id ('fp1'),
+            net ('GND' or 'net:GND'), track/via id ('tA', 'v1'), pad ('R1.1'), or a
+            comma-separated / JSON list ('R1,net:GND'). Each matched element is
+            painted with its own marker letter (A, B, C…), its anchor cell is
+            bracketed '>A<', and it is named in ``callouts``.
 
-        Returns JSON: {ok, ascii, summary, findings, layers}.
-        Findings codes: unconnected_net, trace_crossing, courtyard_overlap.
+        Returns JSON: {ok, ascii, ascii_ruled, ascii_annotated, summary, findings,
+        layers, scale, legend, callouts, highlight, grid, index}.
+        ``ascii_annotated`` is the self-sufficient plate: scale + drawing + legend
+        + callouts. Findings codes: unconnected_net, trace_crossing,
+        courtyard_overlap.
         """
         try:
             if board_json:
@@ -3261,7 +4137,8 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
             else:
                 board = _load_board(doc_id)
             report = board_ascii_report(
-                board, layer=(layer or None), pitch_mm=float(pitch_mm) or 1.0)
+                board, layer=(layer or None), pitch_mm=float(pitch_mm) or 1.0,
+                highlight=highlight)
             return _dumps(report)
         except Exception as e:  # noqa: BLE001
             return _err(str(e),
@@ -3271,27 +4148,36 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def render_schematic_ascii(doc_id: str = "", pitch_mm: float = 2.54,
-                               sch_json: str = "") -> str:
+                               sch_json: str = "",
+                               highlight: str = "") -> str:
         """ASCII grid of an electrical schematic sheet + cell index + checks.
 
         Symbols render as refdes boxes, wires as path characters, power ports as
         'P'+net, labels as 'L'+text, junctions as '*'. Returns a stable ``grid``
         contract (origin/pitch/y-flip) and per-cell ``index`` so models can target
-        edits via apply_ascii_edits(kind='schematic', ...).
+        edits via apply_ascii_edits(kind='schematic', ...). Every response carries
+        a LEGEND, a SCALE/ORIGIN block and a CALLOUT list.
 
         Args:
           doc_id: open schematic session id (default: current sch).
           pitch_mm: world-mm per ASCII cell (default 2.54 = one pin grid).
           sch_json: optional full schematic document JSON — offline / unit tests.
+          highlight: element(s) to emphasise — symbol ref ('R1') or id ('s1'),
+            wire id ('w2'), junction id, label text ('MID'), power net
+            ('GND' / 'net:GND'), or a comma-separated / JSON list. Matched
+            elements are drawn with a marker letter, anchor bracketed '>A<', and
+            named in ``callouts``.
 
-        Returns JSON: {ok, ascii, ascii_ruled, summary, findings, grid, index}.
+        Returns JSON: {ok, ascii, ascii_ruled, ascii_annotated, summary, findings,
+        scale, legend, callouts, highlight, grid, index}.
         """
         try:
             if sch_json:
                 sch = json.loads(sch_json) if isinstance(sch_json, str) else sch_json
             else:
                 sch = _load_schematic(doc_id)
-            return _dumps(schematic_ascii_report(sch, pitch_mm=float(pitch_mm) or 2.54))
+            return _dumps(schematic_ascii_report(
+                sch, pitch_mm=float(pitch_mm) or 2.54, highlight=highlight))
         except Exception as e:  # noqa: BLE001
             return _err(str(e),
                         hint="Pass sch_json=... or open a schematic with "
@@ -3300,17 +4186,25 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def render_sim_ascii(doc_id: str = "", spice_text: str = "",
                          circuit_json: str = "", netlist_json: str = "",
-                         results_json: str = "") -> str:
+                         results_json: str = "",
+                         highlight: str = "") -> str:
         """Deterministic plaintext of a SPICE circuit / deck / sim results.
 
         Topological (not a 2D grid): device roster, optional SPICE deck text,
         netlist components/nets, and probe results. Use after ecad_simulate or
         pass offline JSON. For spatial schematic edits use render_schematic_ascii.
+        Every response carries a LEGEND (what each section and row means), a
+        SCALE block (states that this view has no spatial scale and explains the
+        4-character marker gutter) and a CALLOUT list.
 
         Args:
           doc_id: open schematic — when set, builds netlist + SPICE circuit live.
           spice_text: optional raw SPICE deck.
           circuit_json / netlist_json / results_json: offline payloads.
+          highlight: row(s) to emphasise — device/instance name ('R1'), node
+            ('mid' / 'node:mid'), netlist component ref, net name, probe key
+            ('V(mid)'), or a comma-separated / JSON list. Marked rows get a
+            '>A<' gutter and are named in ``callouts``.
         """
         try:
             circuit = json.loads(circuit_json) if circuit_json else None
@@ -3330,7 +4224,8 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
                     if not (circuit or spice_text or netlist):
                         raise
             return _dumps(_render_sim_ascii_impl(circuit=circuit, spice_text=spice_text,
-                                           netlist=netlist, results=results))
+                                           netlist=netlist, results=results,
+                                           highlight=highlight))
         except Exception as e:  # noqa: BLE001
             return _err(str(e),
                         hint="Pass circuit_json/spice_text or open a schematic.")
@@ -3390,13 +4285,16 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
     def render_sketch_ascii(sketch: str = "", doc_id: Optional[str] = None,
                             pitch: float = 0.5,
                             sketch_json: str = "",
-                            near_tol: float = 0.01) -> str:
+                            near_tol: float = 0.01,
+                            highlight: str = "") -> str:
         """ASCII/plaintext rendering of sketch entities + dimensions/constraints + checks.
 
         Lines/arcs/circles/splines are drawn as control-point polylines. Dimensions and
         constraints are narrated in English. Checks flag open profiles, near-coincident
         endpoints, and under-dimensioned entities (wraps sketch_health when a live
-        doc/sketch id is available — does not re-solve).
+        doc/sketch id is available — does not re-solve). Every response carries a
+        LEGEND (what each glyph means), a SCALE/ORIGIN block (units per cell + the
+        cell->world formula) and a CALLOUT list.
 
         Call this (full render) before declaring a sketch done. Sketch mutation batches
         via add_features already append a compact auto-readback — READ that first after
@@ -3409,8 +4307,15 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
           sketch_json: optional offline payload
             ``{"entities":[...], "constraints":[...], "health"?:{...}}``.
           near_tol: endpoint snap tolerance for open/near-coincident checks (mm).
+          highlight: entity/entities to emphasise — entity id ('e3'), an endpoint
+            handle from sketch_health ('e3.end'), an entity type ('circle' marks
+            every circle), or a comma-separated / JSON list ('e1,e3'). Matched
+            entities are drawn with a marker letter instead of their normal path
+            glyph, anchor bracketed '>A<', and named in ``callouts``.
 
-        Returns JSON: {ok, ascii, summary, findings, ...}.
+        Returns JSON: {ok, ascii, ascii_ruled, ascii_annotated, summary, findings,
+        scale, legend, callouts, highlight, grid, index}. ``ascii_annotated`` is
+        the self-sufficient plate: scale + drawing + legend + callouts.
         """
         try:
             health = None
@@ -3423,7 +4328,8 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
                 return _err("sketch id or sketch_json required",
                             hint="render_sketch_ascii(sketch='s1') or pass sketch_json")
             report = sketch_ascii_report(data, pitch=float(pitch) or 0.5,
-                                         health=health, near_tol=float(near_tol))
+                                         health=health, near_tol=float(near_tol),
+                                         highlight=highlight)
             return _dumps(report)
         except Exception as e:  # noqa: BLE001
             return _err(str(e),
@@ -3433,13 +4339,16 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
     def render_ascii(doc_id: Optional[str] = None, view: str = "front",
                      pitch: float = 1.0,
                      bbox_json: str = "",
-                     polylines_json: str = "") -> str:
+                     polylines_json: str = "",
+                     highlight: str = "") -> str:
         """[EXPERIMENTAL] Single-view silhouette ASCII of a 3D part for non-vision models.
 
         Prefers HLR visible edges from the drawing projector when the core is available;
         falls back to an axis-aligned bbox wireframe. Lossy — good for coarse shape
         questions, not dimensions. Prefer describe_part / render_part when vision or
-        GSL text is available.
+        GSL text is available. Every response carries a LEGEND, a SCALE/ORIGIN block
+        (projection-plane units per cell + the cell->world formula) and a CALLOUT
+        list enumerating the addressable silhouette polylines.
 
         Args:
           doc_id: part document id (default: current part).
@@ -3447,8 +4356,15 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
           pitch: model-units per ASCII cell.
           bbox_json: optional offline bbox ``{"min":[x,y,z],"max":[x,y,z]}``.
           polylines_json: optional offline 2D/3D polylines JSON list.
+          highlight: polyline handle(s) to emphasise — 'p3' (or the bare index
+            '3'), a projected-plane region 'box:x0,y0,x1,y1', or a
+            comma-separated / JSON list. Feature ids/sids do NOT survive
+            hidden-line projection, so p-handles (listed in ``callouts``) are the
+            addressable elements here; use inspect_feature / render_part with a
+            feature name when you need feature-level emphasis in 3D.
 
-        Returns JSON: {ok, experimental:true, ascii, summary, view, source}.
+        Returns JSON: {ok, experimental:true, ascii, ascii_ruled, ascii_annotated,
+        summary, scale, legend, callouts, highlight, grid, view, source}.
         """
         try:
             if polylines_json:
@@ -3456,12 +4372,14 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
                     else polylines_json
                 return _dumps(render_ascii_3d(polylines=pls, view=view,
                                               pitch=float(pitch) or 1.0,
-                                              source="polylines"))
+                                              source="polylines",
+                                              highlight=highlight))
             if bbox_json:
                 bb = json.loads(bbox_json) if isinstance(bbox_json, str) else bbox_json
                 return _dumps(render_ascii_3d(bbox=bb, view=view,
                                               pitch=float(pitch) or 1.0,
-                                              source="bbox_wireframe"))
+                                              source="bbox_wireframe",
+                                              highlight=highlight))
 
             # live path: try HLR drawing views, then measure bbox
             from mcp_server.cad_tools import _doc  # noqa: PLC0415
@@ -3507,10 +4425,11 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
                         experimental=True)
                 return _dumps(render_ascii_3d(bbox=bb, view=view,
                                               pitch=float(pitch) or 1.0,
-                                              source="bbox_wireframe"))
+                                              source="bbox_wireframe",
+                                              highlight=highlight))
             return _dumps(render_ascii_3d(polylines=pls2, view=view,
                                           pitch=float(pitch) or 1.0,
-                                          source=source))
+                                          source=source, highlight=highlight))
         except Exception as e:  # noqa: BLE001
             return _err(str(e), experimental=True,
                         hint="[EXPERIMENTAL] Pass bbox_json / polylines_json offline.")

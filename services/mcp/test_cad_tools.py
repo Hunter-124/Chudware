@@ -1728,6 +1728,196 @@ def test_normalize_feature_ops_leaves_a_canonical_op_alone():
     assert _normalize_feature_ops(ops) == expect
 
 
+# ------------------------------------------------------------------ LLM dimension dialect
+# The same live run also lost three ways a person states a SIZE: a unit suffix ("25mm" dies
+# in the engine's expression lexer as «trailing tokens»), a cylinder spelled by `diameter`,
+# and a box spelled by `size:[l,w,h]` — the last two hard-rejected as a missing required
+# param. _normalize_feature_ops rewrites all three into the engine's grammar and echoes what
+# it read back as `interpreted`. The danger case is `diameter`, which is a REAL param on hole
+# and bolt_circle: halving it there would silently drill a bore at half size.
+
+
+def _norm_dims(feature: dict):
+    """Normalize one add_feature op; return (flattened feature, interpreted notes)."""
+    from mcp_server.cad_doc_tools import _normalize_feature_ops
+
+    notes: list = []
+    feat = _normalize_feature_ops([{"op": "add_feature", "feature": feature}], notes)[0]["feature"]
+    flat = {k: v for k, v in feat.items() if k != "params"}
+    flat.update(feat.get("params") or {})
+    return flat, notes
+
+
+def test_dim_unit_suffix_converts_to_millimetres():
+    """<number><unit> becomes the mm number the engine's expression grammar can take."""
+    from mcp_server.cad_doc_tools import _dim_mm
+
+    assert _dim_mm("25mm") == 25
+    assert _dim_mm("2.5cm") == 25
+    assert _dim_mm("0.5 m") == 500
+    assert _dim_mm("1in") == 25.4
+    assert _dim_mm('2.5"') == 63.5
+    assert _dim_mm("1ft") == 304.8
+    assert _dim_mm("2'") == 609.6
+    assert _dim_mm("5'6\"") == 1676.4      # the compound imperial form people speak
+    assert _dim_mm("20thou") == 0.508
+    assert _dim_mm("-3mm") == -3
+
+
+def test_dim_unit_suffix_leaves_everything_else_for_the_engine():
+    """Only a WHOLE number+unit string converts — an expression must reach the evaluator."""
+    from mcp_server.cad_doc_tools import _dim_mm
+
+    for s in ("width/2", "25", "2*10", "M8", "1e3", "3d", "", "top", "shaft_d"):
+        assert _dim_mm(s) is None, s
+
+
+def test_normalize_dims_converts_units_and_reports_them():
+    """A unit-suffixed param lands as a number; the rewrite is echoed, not silent."""
+    flat, notes = _norm_dims({"type": "box", "name": "Blk",
+                              "params": {"length": "1in", "width": 30, "height": cb.dim(20)}})
+    assert flat["length"] == 25.4 and flat["width"] == 30 and flat["height"] == cb.dim(20)
+    assert any("1in" in n and "25.4" in n for n in notes), notes
+    # the unit may also arrive in its own field, or inside the dim object's value
+    flat, _ = _norm_dims({"type": "box", "name": "B",
+                          "params": {"length": {"value": 2, "unit": "in"},
+                                     "width": {"value": "3cm", "expr": None}, "height": 5}})
+    assert flat["length"] == {"value": 50.8, "expr": None}, flat
+    assert flat["width"] == {"value": 30, "expr": None}, flat
+
+
+def test_normalize_dims_never_touches_an_expression():
+    """`expr` is the engine's job: "width/2" reaches it byte-for-byte, in either spelling."""
+    from mcp_server.cad_doc_tools import _normalize_feature_ops
+
+    ops = [{"op": "add_feature", "feature": {
+        "type": "cylinder", "name": "E",
+        "params": {"radius": {"value": 0, "expr": "width/2"}, "height": "width/4"}}}]
+    expect = json.loads(json.dumps(ops))
+    notes: list = []
+    assert _normalize_feature_ops(ops, notes) == expect
+    assert notes == []
+
+
+def test_normalize_diameter_to_radius_per_primitive():
+    """diameter -> radius (HALVED), with the engine's real param name per primitive."""
+    flat, notes = _norm_dims({"type": "cylinder", "name": "Shaft",
+                              "params": {"diameter": 50, "height": 10}})
+    assert flat["radius"] == 25 and "diameter" not in flat, flat
+    assert any("diameter 50" in n and "radius 25" in n for n in notes), notes
+
+    flat, _ = _norm_dims({"type": "sphere", "name": "S", "params": {"dia": "1in"}})
+    assert flat["radius"] == 12.7, flat          # unit converted BEFORE the halving
+
+    flat, _ = _norm_dims({"type": "cone", "name": "C",
+                          "params": {"d1": 40, "d2": 10, "height": 10}})
+    assert flat["r1"] == 20 and flat["r2"] == 5, flat
+
+    flat, _ = _norm_dims({"type": "torus", "name": "T",
+                          "params": {"major_diameter": 100, "minor_diameter": 10}})
+    assert flat["major_r"] == 50 and flat["minor_r"] == 5, flat
+
+    # A feature-LEVEL diameter is consumed too: the engine hard-rejects an unknown
+    # feature key on a primitive, so leaving it beside the rewrite is a rejected batch.
+    flat, _ = _norm_dims({"type": "cylinder", "name": "X", "diameter": 8,
+                          "params": {"height": 10}})
+    assert flat["radius"] == 4 and "diameter" not in flat, flat
+
+    # A non-numeric diameter is halved AS AN EXPRESSION — still the engine's to evaluate.
+    flat, _ = _norm_dims({"type": "cylinder", "name": "Y",
+                          "params": {"diameter": "shaft_d", "height": 10}})
+    assert flat["radius"] == {"value": 0.0, "expr": "(shaft_d)/2"}, flat
+
+
+def test_normalize_diameter_never_rewrites_a_hole_or_bolt_circle():
+    """hole/bolt_circle take a REAL `diameter`: halving it would silently drill half-size."""
+    for ftype, extra in (("hole", {"style": "simple", "end": "through_all"}),
+                         ("bolt_circle", {"count": 4, "pcd": 40})):
+        flat, notes = _norm_dims({"type": ftype, "name": "H",
+                                  "params": {"diameter": 10, **extra}})
+        assert flat["diameter"] == 10, (ftype, flat)
+        assert "radius" not in flat, (ftype, flat)
+        assert notes == [], (ftype, notes)
+    # the unit pass still applies there — it changes the SPELLING, never the size
+    flat, notes = _norm_dims({"type": "hole", "name": "H",
+                              "params": {"diameter": "0.25in", "style": "simple"}})
+    assert flat["diameter"] == 6.35 and "radius" not in flat, flat
+    assert notes and "6.35" in notes[0], notes
+
+
+def test_normalize_box_size_shorthand():
+    """size:[l,w,h] -> the three named dims; a scalar size is a cube."""
+    flat, notes = _norm_dims({"type": "box", "name": "Blk", "params": {"size": [40, 30, 20]}})
+    assert (flat["length"], flat["width"], flat["height"]) == (40, 30, 20), flat
+    assert "size" not in flat, flat
+    assert any("length 40" in n and "width 30" in n for n in notes), notes
+
+    flat, _ = _norm_dims({"type": "box", "name": "Cube", "params": {"size": "1in"}})
+    assert (flat["length"], flat["width"], flat["height"]) == (25.4, 25.4, 25.4), flat
+
+    # An explicit named dim WINS over the shorthand; `size` is still consumed.
+    flat, _ = _norm_dims({"type": "box", "name": "B",
+                          "params": {"size": [40, 30, 20], "height": 5}})
+    assert flat["height"] == 5 and flat["length"] == 40 and "size" not in flat, flat
+
+    # Only a box: `size` on a thread is the fastener code "M8", not a dimension.
+    flat, notes = _norm_dims({"type": "thread", "name": "T", "params": {"size": "M8"}})
+    assert flat["size"] == "M8" and notes == [], (flat, notes)
+
+
+def test_engine_builds_from_the_dimension_dialect():
+    """END TO END: diameter, size and unit strings build the geometry they NAME.
+
+    Measured, not assumed — a diameter-50 cylinder must have a radius-25 B-rep face, and
+    a hole drilled by diameter 10 must have a radius-5 bore (the alias must not halve it).
+    """
+    # cylinder by diameter -> radius 25 (query the real B-rep face, not the volume)
+    doc = _call("new_part", {"name": "dialect_dia"})[0]["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "Shaft",
+                                          "params": {"diameter": 50, "height": 10}}}]})
+    assert r.get("ok"), r
+    assert any("radius 25" in n for n in r.get("interpreted") or []), r
+    q, _ = _call("query_geometry", {"doc_id": doc, "query": {"of": "face", "surf": "cylinder"}})
+    assert [m["radius"] for m in q["matches"]] == [25.0], q
+
+    # box by size:[l,w,h] -> 40x30x20 = 24000 mm^3
+    box = _call("new_part", {"name": "dialect_size"})[0]["doc_id"]
+    r, _ = _call("add_features", {"doc_id": box, "ops": [
+        {"op": "add_feature", "feature": {"type": "box", "name": "Blk",
+                                          "params": {"size": [40, 30, 20]}}}]})
+    assert r.get("ok"), r
+    assert abs(r["volume_mm3"] - 24000.0) < 1e-6, r
+
+    # unit-suffixed cubes: "25mm" == "2.5cm", and 1in is 25.4mm on a side
+    for spelling, side in (("25mm", 25.0), ("2.5cm", 25.0), ("1in", 25.4)):
+        cube = _call("new_part", {"name": "dialect_unit"})[0]["doc_id"]
+        r, _ = _call("add_features", {"doc_id": cube, "ops": [
+            {"op": "add_feature", "feature": {
+                "type": "box", "name": "C",
+                "params": {"length": spelling, "width": spelling, "height": spelling}}}]})
+        assert r.get("ok"), (spelling, r)
+        assert abs(r["volume_mm3"] - side ** 3) < 1e-6, (spelling, r)
+        _call("close_part", {"doc_id": cube})
+
+    # a hole drilled BY DIAMETER keeps its diameter: a 10 bore is radius 5, not 2.5
+    plate = _call("new_part", {"name": "dialect_hole"})[0]["doc_id"]
+    r, _ = _call("add_features", {"doc_id": plate, "ops": [
+        {"op": "add_feature", "feature": {"type": "box", "name": "P",
+                                          "params": {"length": 60, "width": 60, "height": 10}}},
+        {"op": "add_feature", "feature": {
+            "type": "hole", "name": "H",
+            "params": {"diameter": 10, "style": "simple", "end": "through_all"},
+            "refs": {"face": {"of": "face", "side": "top"}}}}]})
+    assert r.get("ok"), r
+    assert not r.get("interpreted"), r  # nothing was rewritten on a hole
+    q, _ = _call("query_geometry", {"doc_id": plate, "query": {"of": "face", "surf": "cylinder"}})
+    assert [m["radius"] for m in q["matches"]] == [5.0], q
+
+    for did in (doc, box, plate):
+        _call("close_part", {"doc_id": did})
+
+
 def test_as_face_query_parses_a_phrase_into_the_grammar():
     """Free text becomes STRUCTURED query keys — the whole sentence never lands in `side`."""
     from mcp_server.cad_common import _as_face_query

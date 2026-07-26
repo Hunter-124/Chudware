@@ -42,6 +42,7 @@ def _extract_palette(caption: str) -> dict:
     raise AssertionError(f"unbalanced palette_json in caption: {caption!r}")
 
 from services.mcp import cad_tools as ct  # noqa: E402
+from services.mcp import cad_common as cc  # noqa: E402  _resolve_highlight_specs/_feature_roster
 from services.mcp import cad_render_tools as ct_render  # noqa: E402  T-RF8: inspect/render tools moved
 
 
@@ -92,6 +93,40 @@ def fillet_face_match():
         "area_or_len": 94.25,
         "radius": 3.0,
     }
+
+
+@pytest.fixture
+def boss_doc():
+    """A fake cb.call for a plate+boss document: two live features on body 2 plus one
+    consumed feature whose topology only exists on the superseded body 1."""
+    faces = [
+        {"kind": "face", "surf": "plane", "side": "top", "sid": "Fdaab8d",
+         "centroid": [0.0, 0.0, 7.5], "normal": [0.0, 0.0, 1.0], "area_or_len": 9600.0},
+        {"kind": "face", "surf": "cylinder", "side": None, "sid": "F2474b8",
+         "centroid": [0.0, 0.0, 17.5], "axis": [0.0, 0.0, 1.0], "area_or_len": 2200.0,
+         "radius": 18.0},
+    ]
+    tree = {
+        "owner_map": {
+            "f1": {"faces": [[2, 1]], "edges": []},
+            "f2": {"faces": [[2, 2]], "edges": []},
+            "f3": {"faces": [[1, 5]], "edges": []},
+        },
+        "tree": {"features": [
+            {"id": "f1", "name": "Plate", "type": "box"},
+            {"id": "f2", "name": "Boss", "type": "cylinder"},
+            {"id": "f3", "name": "Ghost", "type": "cylinder"},
+        ]},
+    }
+
+    def call(method, params):
+        if method == "doc_tree":
+            return tree
+        if method == "doc_query":
+            return {"matches": faces if params["query"].get("of") == "face" else []}
+        raise AssertionError(method)
+
+    return call
 
 
 # --------------------------------------------------------------------------- parse / resolve
@@ -173,6 +208,259 @@ class TestResolveTarget:
         )
         with pytest.raises(ValueError, match="No feature"):
             ct._resolve_inspect_target("doc-1", "f99")
+
+    def test_feature_name_resolves(self, monkeypatch, boss_doc):
+        """A feature NAME is a first-class target — it used to fall into the engine's side
+        parser and die with `geom query: bad 'side' 'Boss'`."""
+        monkeypatch.setattr(ct.cb, "call", boss_doc)
+        for target in ("Boss", "boss", "  BOSS  ", "the Boss feature"):
+            r = ct._resolve_inspect_target("doc-1", target)
+            assert r["kind"] == "feature", target
+            assert r["feature_id"] == "f2"
+            assert r["feature_name"] == "Boss"
+            assert [m["sid"] for m in r["matches"]] == ["F2474b8"]
+            assert "Boss" in r["label"]
+
+    def test_sid_resolves_to_one_element(self, monkeypatch, boss_doc):
+        monkeypatch.setattr(ct.cb, "call", boss_doc)
+        r = ct._resolve_inspect_target("doc-1", "Fdaab8d")
+        assert r["kind"] == "face"
+        assert r["label"] == "Fdaab8d"
+        assert len(r["matches"]) == 1 and r["matches"][0]["sid"] == "Fdaab8d"
+
+    def test_unknown_sid_lists_features(self, monkeypatch, boss_doc):
+        monkeypatch.setattr(ct.cb, "call", boss_doc)
+        with pytest.raises(ValueError, match="No face/edge with sid") as e:
+            ct._resolve_inspect_target("doc-1", "Fdead99")
+        assert 'f2="Boss"' in str(e.value)
+
+    def test_unknown_name_teaches_the_roster(self, monkeypatch, boss_doc):
+        monkeypatch.setattr(ct.cb, "call", boss_doc)
+        with pytest.raises(ValueError) as e:
+            ct._resolve_inspect_target("doc-1", "Bracket")
+        msg = str(e.value)
+        assert "bad 'side'" not in msg          # never the old dead end
+        assert 'f1="Plate"' in msg and 'f2="Boss"' in msg
+        assert "describe_part" in msg
+
+    def test_ambiguous_name_lists_candidates(self, monkeypatch, fillet_face_match):
+        tree = {"owner_map": {"f2": {"faces": [[1, 1]]}, "f3": {"faces": [[1, 1]]}},
+                "tree": {"features": [{"id": "f2", "name": "Pin", "type": "cylinder"},
+                                      {"id": "f3", "name": "pin", "type": "cylinder"}]}}
+        monkeypatch.setattr(
+            ct.cb, "call",
+            lambda method, params: tree if method == "doc_tree" else {"matches": [fillet_face_match]})
+        with pytest.raises(ValueError, match="ambiguous") as e:
+            ct._resolve_inspect_target("doc-1", "Pin")
+        assert 'f2="Pin"' in str(e.value) and 'f3="pin"' in str(e.value)
+
+    def test_consumed_feature_says_so(self, monkeypatch, boss_doc):
+        """f3 exists in the tree but owns topology only on a superseded body."""
+        monkeypatch.setattr(ct.cb, "call", boss_doc)
+        with pytest.raises(ValueError, match="owns no faces/edges on the current body"):
+            ct._resolve_inspect_target("doc-1", "Ghost")
+
+
+# ------------------------------------------------- what a CUT actually created (vs re-cut)
+# A boolean CUT re-creates every face its tool passes through and OCCT credits those faces to
+# the CUTTING feature, so doc_tree's owner_map hands an 8 mm bore the plate's whole top and
+# bottom face. Every number below is a live engine capture of a 120x80x15 plate + r18 boss +
+# r8 through-bore at x=-30 (doc_query face order == owner_map topo_id - 1).
+
+
+def _rect_points(z, x0, x1, y0, y1):
+    return [[x, y, z] for x in (x0, (x0 + x1) * 0.5, x1) for y in (y0, (y0 + y1) * 0.5, y1)]
+
+
+def _cyl_points(cx, cy, r, z0, z1, n=16):
+    return [[cx + r * math.cos(2 * math.pi * i / n), cy + r * math.sin(2 * math.pi * i / n), z]
+            for i in range(n) for z in (z0, (z0 + z1) * 0.5, z1)]
+
+
+def _disc_points(cx, cy, r, z, n=16):
+    return [[cx + r * f * math.cos(2 * math.pi * i / n),
+             cy + r * f * math.sin(2 * math.pi * i / n), z]
+            for i in range(n) for f in (0.0, 0.5, 1.0)]
+
+
+def _fake_doc(faces, owner_map, features, points_by_sid):
+    """A cb.call stand-in serving doc_tree / doc_query(face) / doc_face_points."""
+    def call(method, params):
+        if method == "doc_tree":
+            return {"owner_map": owner_map, "tree": {"features": features}}
+        if method == "doc_query":
+            return {"matches": faces if params["query"].get("of") == "face" else []}
+        if method == "doc_face_points":
+            return {"points": points_by_sid.get((params.get("selector") or {}).get("sid"), [])}
+        raise AssertionError(method)
+    return call
+
+
+def _plate_boss_bore(points_by_sid=None):
+    faces = [
+        {"kind": "face", "surf": "plane", "side": "left", "sid": "F8665dc",
+         "centroid": [-60.0, 0.0, 0.0], "normal": [-1.0, 0.0, 0.0], "area_or_len": 1200.0},
+        {"kind": "face", "surf": "plane", "side": "front", "sid": "F647760",
+         "centroid": [0.0, -40.0, 0.0], "normal": [0.0, -1.0, 0.0], "area_or_len": 1800.0},
+        {"kind": "face", "surf": "plane", "side": "top", "sid": "F742d7a",
+         "centroid": [0.719701, 0.0, 7.5], "normal": [0.0, 0.0, 1.0], "area_or_len": 8381.06205},
+        {"kind": "face", "surf": "plane", "side": "back", "sid": "Fce09e7",
+         "centroid": [0.0, 40.0, 0.0], "normal": [0.0, 1.0, 0.0], "area_or_len": 1800.0},
+        {"kind": "face", "surf": "plane", "side": "bottom", "sid": "Fd83900",
+         "centroid": [0.64176, 0.0, -7.5], "normal": [0.0, 0.0, -1.0], "area_or_len": 9398.93807},
+        {"kind": "face", "surf": "plane", "side": "right", "sid": "Ffdb76d",
+         "centroid": [60.0, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "area_or_len": 1200.0},
+        {"kind": "face", "surf": "cylinder", "side": "top", "sid": "F704662",
+         "centroid": [-30.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0],
+         "radius": 8.0, "area_or_len": 753.982237, "concavity": "bore"},
+        {"kind": "face", "surf": "cylinder", "side": "top", "sid": "Fddd31d",
+         "centroid": [0.0, 0.0, 12.5], "axis": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0],
+         "radius": 18.0, "area_or_len": 1130.973355, "concavity": "boss"},
+        {"kind": "face", "surf": "plane", "side": "top", "sid": "Fe8aa5d",
+         "centroid": [0.0, 0.0, 17.5], "normal": [0.0, 0.0, 1.0], "area_or_len": 1017.87602},
+    ]
+    owner_map = {
+        "f1": {"bodies": [1], "faces": [[1, 1], [1, 2], [1, 4], [1, 6]], "edges": []},
+        "f2": {"bodies": [1], "faces": [[1, 8], [1, 9]], "edges": []},
+        "f3": {"bodies": [1], "faces": [[1, 3], [1, 5], [1, 7]], "edges": []},
+    }
+    features = [
+        {"id": "f1", "name": "Plate", "type": "box",
+         "params": {"length": 120, "width": 80, "height": 15}},
+        {"id": "f2", "name": "Boss", "type": "cylinder",
+         "params": {"radius": 18, "height": 10, "mode": "boss", "at": [0, 0, 12.5]}},
+        {"id": "f3", "name": "Bore", "type": "cylinder",
+         "params": {"radius": 8, "height": 60, "mode": "cut", "at": [-30, 0, 0]}},
+    ]
+    if points_by_sid is None:
+        points_by_sid = {
+            "F8665dc": _rect_points(0.0, -60.0, -60.0, -40.0, 40.0),
+            "F647760": _rect_points(0.0, -60.0, 60.0, -40.0, -40.0),
+            "F742d7a": _rect_points(7.5, -60.0, 60.0, -40.0, 40.0),
+            "Fce09e7": _rect_points(0.0, -60.0, 60.0, 40.0, 40.0),
+            "Fd83900": _rect_points(-7.5, -60.0, 60.0, -40.0, 40.0),
+            "Ffdb76d": _rect_points(0.0, 60.0, 60.0, -40.0, 40.0),
+            "F704662": _cyl_points(-30.0, 0.0, 8.0, -7.5, 7.5),
+            "Fddd31d": _cyl_points(0.0, 0.0, 18.0, 7.5, 17.5),
+            "Fe8aa5d": _disc_points(0.0, 0.0, 18.0, 17.5),
+        }
+    return _fake_doc(faces, owner_map, features, points_by_sid)
+
+
+class TestFeatureCreatedFaces:
+    def test_through_bore_keeps_only_its_wall(self, monkeypatch):
+        """The r8 bore owns the plate's 8381 mm2 top and 9399 mm2 bottom in owner_map. It
+        CREATED neither — it only pierced them. Its own face is the 754 mm2 wall."""
+        monkeypatch.setattr(ct.cb, "call", _plate_boss_bore())
+        ms = ct._feature_owned_matches("doc-1", "Bore")
+        assert [m["sid"] for m in ms] == ["F704662"]
+        assert ms[0]["area_or_len"] == pytest.approx(753.98, abs=0.01)
+
+    def test_additive_boss_is_untouched(self, monkeypatch):
+        """A boss ADDS its faces, so owner_map is already right — the filter must not fire."""
+        monkeypatch.setattr(ct.cb, "call", _plate_boss_bore())
+        ms = ct._feature_owned_matches("doc-1", "Boss")
+        assert [m["sid"] for m in ms] == ["Fddd31d", "Fe8aa5d"]
+
+    def test_render_highlight_masks_only_the_bore_wall(self, monkeypatch):
+        """render_part(highlight=["Boss","f3"]) used to tint the whole plate violet."""
+        monkeypatch.setattr(ct.cb, "call", _plate_boss_bore())
+        specs = cc._resolve_highlight_specs("doc-1", ["Boss", "f3"])
+        assert [s["error"] for s in specs] == [None, None]
+        assert [m["sid"] for m in specs[0]["matches"]] == ["Fddd31d", "Fe8aa5d"]
+        assert [m["sid"] for m in specs[1]["matches"]] == ["F704662"]
+
+    def test_callout_roster_drops_the_pierced_faces(self, monkeypatch):
+        monkeypatch.setattr(ct.cb, "call", _plate_boss_bore())
+        roster = {r["id"]: sorted(r["face_topos"]) for r in cc._feature_roster("doc-1")}
+        assert roster["f3"] == [7]              # was [3, 5, 7]
+        assert roster["f2"] == [8, 9]
+        assert roster["f1"] == [1, 2, 4, 6]
+
+    def test_no_tessellation_leaves_the_join_alone(self, monkeypatch):
+        """Without real face points there is nothing to judge with, so the owner_map join
+        must survive intact rather than be guessed at."""
+        monkeypatch.setattr(ct.cb, "call", _plate_boss_bore(points_by_sid={}))
+        ms = ct._feature_owned_matches("doc-1", "Bore")
+        assert [m["sid"] for m in ms] == ["F742d7a", "Fd83900", "F704662"]
+
+    def test_blind_hole_keeps_its_floor(self, monkeypatch):
+        """The floor fits INSIDE the wall footprint, so it is the tool's own face."""
+        faces = [
+            {"kind": "face", "surf": "plane", "side": "top", "sid": "Ftop",
+             "centroid": [0.0, 0.0, 7.5], "normal": [0.0, 0.0, 1.0], "area_or_len": 9398.9},
+            {"kind": "face", "surf": "cylinder", "side": "top", "sid": "Fwall",
+             "centroid": [-30.0, 0.0, 3.5], "axis": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0],
+             "radius": 8.0, "area_or_len": 402.12, "concavity": "bore"},
+            {"kind": "face", "surf": "plane", "side": "top", "sid": "Ffloor",
+             "centroid": [-30.0, 0.0, -0.5], "normal": [0.0, 0.0, 1.0], "area_or_len": 201.06},
+        ]
+        call = _fake_doc(
+            faces,
+            {"f1": {"faces": [[1, 1]], "edges": []},
+             "f2": {"faces": [[1, 1], [1, 2], [1, 3]], "edges": []}},
+            [{"id": "f1", "name": "Plate", "type": "box", "params": {}},
+             {"id": "f2", "name": "Blind", "type": "hole",
+              "params": {"style": "simple", "end": "blind"}}],
+            {"Ftop": _rect_points(7.5, -60.0, 60.0, -40.0, 40.0),
+             "Fwall": _cyl_points(-30.0, 0.0, 8.0, -0.5, 7.5),
+             "Ffloor": _disc_points(-30.0, 0.0, 8.0, -0.5)})
+        monkeypatch.setattr(ct.cb, "call", call)
+        assert [m["sid"] for m in ct._feature_owned_matches("doc-1", "Blind")] == \
+            ["Fwall", "Ffloor"]
+
+    def test_rectangular_pocket_drops_only_the_host_face(self, monkeypatch):
+        """An all-planar cut has no curved wall to state the tool axis — it is recovered from
+        the wall normals, and the reading that explains the most regenerated area wins."""
+        faces = [
+            {"kind": "face", "surf": "plane", "side": "top", "sid": "Fhost",
+             "centroid": [0.0, 0.0, 7.5], "normal": [0.0, 0.0, 1.0], "area_or_len": 9000.0},
+            {"kind": "face", "surf": "plane", "side": "left", "sid": "Fwx0",
+             "centroid": [-10.0, 0.0, 5.0], "normal": [1.0, 0.0, 0.0], "area_or_len": 150.0},
+            {"kind": "face", "surf": "plane", "side": "right", "sid": "Fwx1",
+             "centroid": [10.0, 0.0, 5.0], "normal": [-1.0, 0.0, 0.0], "area_or_len": 150.0},
+            {"kind": "face", "surf": "plane", "side": "front", "sid": "Fwy0",
+             "centroid": [0.0, -15.0, 5.0], "normal": [0.0, 1.0, 0.0], "area_or_len": 100.0},
+            {"kind": "face", "surf": "plane", "side": "back", "sid": "Fwy1",
+             "centroid": [0.0, 15.0, 5.0], "normal": [0.0, -1.0, 0.0], "area_or_len": 100.0},
+            {"kind": "face", "surf": "plane", "side": "top", "sid": "Ffloor",
+             "centroid": [0.0, 0.0, 2.5], "normal": [0.0, 0.0, 1.0], "area_or_len": 600.0},
+        ]
+        call = _fake_doc(
+            faces,
+            {"f1": {"faces": [[1, 1]], "edges": []},
+             "f2": {"faces": [[1, i] for i in range(1, 7)], "edges": []}},
+            [{"id": "f1", "name": "Plate", "type": "box", "params": {}},
+             {"id": "f2", "name": "Pocket", "type": "box",
+              "params": {"length": 20, "width": 30, "height": 10, "mode": "cut"}}],
+            {"Fhost": _rect_points(7.5, -60.0, 60.0, -40.0, 40.0),
+             "Fwx0": _rect_points(5.0, -10.0, -10.0, -15.0, 15.0),
+             "Fwx1": _rect_points(5.0, 10.0, 10.0, -15.0, 15.0),
+             "Fwy0": _rect_points(5.0, -10.0, 10.0, -15.0, -15.0),
+             "Fwy1": _rect_points(5.0, -10.0, 10.0, 15.0, 15.0),
+             "Ffloor": _rect_points(2.5, -10.0, 10.0, -15.0, 15.0)})
+        monkeypatch.setattr(ct.cb, "call", call)
+        assert [m["sid"] for m in ct._feature_owned_matches("doc-1", "Pocket")] == \
+            ["Fwx0", "Fwx1", "Fwy0", "Fwy1", "Ffloor"]
+
+    def test_subtractive_role_follows_a_pattern_seed(self):
+        feats = [
+            {"id": "f1", "name": "Plate", "type": "box", "params": {}},
+            {"id": "f2", "name": "Bore", "type": "hole", "params": {"style": "simple"}},
+            {"id": "f3", "name": "Boss", "type": "cylinder", "params": {"mode": "boss"}},
+            {"id": "f4", "name": "Row", "type": "linear_pattern",
+             "params": {"count1": 3}, "refs": {"features": ["f2"]}},
+            {"id": "f5", "name": "Bosses", "type": "linear_pattern",
+             "params": {"count1": 3}, "refs": {"features": ["f3"]}},
+        ]
+        by_id = {f["id"]: f for f in feats}
+        assert ct._feature_is_subtractive(by_id["f2"], feats)
+        assert ct._feature_is_subtractive(by_id["f4"], feats)   # pattern of a cut
+        assert not ct._feature_is_subtractive(by_id["f1"], feats)
+        assert not ct._feature_is_subtractive(by_id["f3"], feats)
+        assert not ct._feature_is_subtractive(by_id["f5"], feats)
+        assert ct._feature_is_subtractive(
+            {"id": "f6", "type": "boolean", "params": {"op": "cut"}}, feats)
 
 
 # --------------------------------------------------------------------------- camera / crop math
@@ -412,17 +700,30 @@ class TestInspectToolsE2E:
             # Default 7 views (6 ortho + iso) tiled — wider than a single render.
             assert im.size[0] >= 512 and im.size[1] >= 400
         assert "render_views" in caption
-        # Default path hits the contact-sheet RPC once.
-        assert any(m == "doc_render_contact_sheet" for m, _ in calls)
+        # Annotated default (annotate=True) renders view-BY-view, because the engine's
+        # doc_render_contact_sheet tiles internally and leaves no per-tile image to draw the
+        # B-rep edge outline / callouts / scale bar onto.
+        assert not any(m == "doc_render_contact_sheet" for m, _ in calls)
+        assert sum(1 for m, _ in calls if m == "doc_render_view") >= 7
         # Caption names the standard views.
         for name in ("front", "back", "top", "iso"):
             assert name in caption.lower()
+
+    def test_render_views_unannotated_uses_native_sheet(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        """annotate=False keeps the one-RPC engine sheet — no overlay to draw, no reason to
+        pay for a render per view."""
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        tool_fn = self._tool("render_views")
+        tool_fn(doc_id="doc-test", annotate=False)
+        assert any(m == "doc_render_contact_sheet" for m, _ in calls)
+        assert not any(m == "doc_render_view" for m, _ in calls)
 
     def test_render_views_custom_list(
             self, monkeypatch, top_face_match, part_bbox, tmp_path):
         calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
         tool_fn = self._tool("render_views")
-        result = tool_fn(doc_id="doc-test", views=["front", "top", "iso"])
+        result = tool_fn(doc_id="doc-test", views=["front", "top", "iso"], annotate=False)
         img, caption = result
         assert os.path.exists(getattr(img, "path", img))
         cs = [p for m, p in calls if m == "doc_render_contact_sheet"]

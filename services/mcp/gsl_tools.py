@@ -64,36 +64,171 @@ _NON_BODY_FEATURE_TYPES = {"sketch", "plane", "axis", "point", "csys"}
 
 _SIDE_AXIS = {"top": "z", "bottom": "z", "right": "x", "left": "x", "front": "y", "back": "y"}
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+_SIDE_OF = {("x", 1): "right", ("x", -1): "left", ("y", 1): "back", ("y", -1): "front",
+            ("z", 1): "top", ("z", -1): "bottom"}
+_OPPOSITE_SIDE = {"top": "bottom", "bottom": "top", "left": "right", "right": "left",
+                  "front": "back", "back": "front"}
+_AXIS_SIDE_WORD = {"+x": "right", "-x": "left", "+y": "back", "-y": "front",
+                   "+z": "top", "-z": "bottom"}
+# A feature has to sit at least this fraction of the part's extent off centre before we call
+# it a side. Below it the feature is central (a through hole down the axis) and gets NO side,
+# which is honest, instead of a coin-flip one that its own faces then contradict.
+_SIDE_ECCENTRICITY = 0.05
 
 
-def _feature_placement(owned: list, bbox: dict) -> Optional[dict]:
-    """Where a feature's SURVIVING faces sit: mean centroid, the dominant principal side among
-    them (top/bottom/right/left/front/back), and offsets from the part bbox on the two axes
-    PERPENDICULAR to that side (e.g. a boss on the top face is placed by its X/Y offset from the
-    bbox corner). Falls back to axis "z" (offsets on X/Y) when no owned face has a clear
-    principal-axis side — e.g. a through-hole's cylindrical bore wall, whose normal is radial."""
+def _bbox_bounds(bbox: dict):
+    """(min, max) as 3-lists, or None when doc_bbox gave us nothing usable."""
+    bmin, bmax = bbox.get("min"), bbox.get("max")
+    if (isinstance(bmin, list) and isinstance(bmax, list) and
+            len(bmin) == 3 and len(bmax) == 3):
+        return bmin, bmax
+    return None
+
+
+def _centroid_side(centroid: list, bmin: list, bmax: list) -> Optional[str]:
+    """The principal side a point sits on, by its LARGEST relative offset from the part
+    centre. This is the single derivation every reported side comes from, so a +X feature
+    can never read "left"."""
+    best, best_rel = None, _SIDE_ECCENTRICITY
+    for a, i in _AXIS_INDEX.items():
+        size = bmax[i] - bmin[i]
+        if size <= 1e-9:
+            continue
+        rel = (centroid[i] - 0.5 * (bmin[i] + bmax[i])) / size
+        if abs(rel) > best_rel:
+            best, best_rel = _SIDE_OF[(a, 1 if rel > 0 else -1)], abs(rel)
+    return best
+
+
+def _authored_side(ft: Optional[dict]) -> Optional[str]:
+    """The side the AUTHOR placed the feature on, from its refs ({"face":{"side":"top"}} or
+    "plane.top"). Used only for a feature whose centroid is dead-centre — a through hole
+    carries no positional cue, but the hole was still drilled into a named face."""
+    if not isinstance(ft, dict):
+        return None
+    refs = ft.get("refs") or {}
+    for key in ("face", "plane", "start", "from", "sketch"):
+        ref = refs.get(key)
+        s = None
+        if isinstance(ref, dict):
+            s = ref.get("side")
+        elif isinstance(ref, str):
+            s = ref
+        if not isinstance(s, str):
+            continue
+        s = s.strip().lower()
+        if s.startswith("plane."):
+            s = s[6:]
+        if s in _SIDE_AXIS:
+            return s
+        if s in _AXIS_SIDE_WORD:
+            return _AXIS_SIDE_WORD[s]
+    return None
+
+
+def _pick_anchor(fid: str, neighbors, rank: dict, areas: dict) -> Optional[str]:
+    """The feature this one SITS ON: the largest feature it touches that came BEFORE it and
+    is at least as big as it. A parent hosts its children, never the reverse — a 165 mm body
+    is not "on" the 25 mm spout welded to it, and a plate is not "on" its own boss. When
+    nothing earlier and larger touches the feature we return None and describe it absolutely
+    rather than invent a relationship."""
+    mine = rank.get(fid)
+    if mine is None:
+        return None
+    my_area = areas.get(fid, 0.0)
+    best = None
+    for other in neighbors:
+        r = rank.get(other)
+        if r is None or r >= mine:
+            continue
+        a = areas.get(other, 0.0)
+        if a < my_area:
+            continue
+        if best is None or (a, -r) > (best[0], -best[1]):
+            best = (a, r, other)
+    return best[2] if best else None
+
+
+def _face_side_vote(owned: list) -> Optional[str]:
+    """The side the feature's own PLANAR faces point to, weighted by area — the same face
+    records planar_caps reports, so a side taken from here can never disagree with it.
+    A feature whose two opposite sides are the same size (a plain box) is symmetric about
+    that axis and gets NO side rather than a coin flip."""
+    by_side: dict = defaultdict(float)
+    for f in owned:
+        if f.get("surf") == "plane" and f.get("side"):
+            by_side[f["side"]] += f.get("area_or_len") or 0.0
+    if not by_side:
+        return None
+    top_side, top_area = min(by_side.items(), key=lambda kv: (-kv[1], kv[0]))
+    if by_side.get(_OPPOSITE_SIDE[top_side], 0.0) >= top_area * 0.99:
+        return None
+    return top_side
+
+
+def _side_contradicts(side: str, centroid: list, bounds) -> bool:
+    """True when the centroid puts the feature meaningfully on the OPPOSITE side."""
+    if not side or not bounds:
+        return False
+    bmin, bmax = bounds
+    i = _AXIS_INDEX[_SIDE_AXIS[side]]
+    size = bmax[i] - bmin[i]
+    if size <= 1e-9:
+        return False
+    rel = (centroid[i] - 0.5 * (bmin[i] + bmax[i])) / size
+    return abs(rel) > _SIDE_ECCENTRICITY and _SIDE_OF[
+        (_SIDE_AXIS[side], 1 if rel > 0 else -1)] != side
+
+
+def _feature_placement(owned: list, bbox: dict, ft: Optional[dict] = None,
+                       anchor: Optional[str] = None) -> Optional[dict]:
+    """Where a feature's OWN faces sit: mean centroid, the principal side it is on
+    (top/bottom/right/left/front/back), the feature it sits on, and offsets from the part
+    bbox on the two axes PERPENDICULAR to that side (a boss on the top face is placed by its
+    X/Y offset from the bbox corner).
+
+    `side` has ONE derivation, and it is cross-checked against the centroid printed beside
+    it, so the two halves of this record can never contradict each other: the area-dominant
+    side among the feature's own planar faces wins (those are exactly the planar_caps
+    records), unless the centroid puts the feature on the opposite side; then the centroid's
+    own side; then the face the author placed the feature on (a centred through-hole has no
+    positional cue but was still drilled into a named face); then no side at all, which is
+    honest, rather than a coin flip its own faces then contradict."""
     if not owned:
         return None
     n = len(owned)
-    cx = sum((f.get("centroid") or [0, 0, 0])[0] for f in owned) / n
-    cy = sum((f.get("centroid") or [0, 0, 0])[1] for f in owned) / n
-    cz = sum((f.get("centroid") or [0, 0, 0])[2] for f in owned) / n
-    centroid = [cx, cy, cz]
-    sides = [f.get("side") for f in owned if f.get("side")]
-    dominant = max(set(sides), key=sides.count) if sides else None
-    axis = _SIDE_AXIS.get(dominant, "z")
+    centroid = [sum((f.get("centroid") or [0, 0, 0])[i] for f in owned) / n for i in range(3)]
+    bounds = _bbox_bounds(bbox)
+
+    side = _face_side_vote(owned)
+    if side is not None and _side_contradicts(side, centroid, bounds):
+        side = None
+    if side is None and bounds:
+        side = _centroid_side(centroid, *bounds)
+    if side is None:
+        authored = _authored_side(ft)
+        if authored and not _side_contradicts(authored, centroid, bounds):
+            side = authored
+    # Final cross-check: never report a side no planar face of ours faces while one faces
+    # the opposite way — that is the exact contradiction planar_caps used to expose.
+    planar_sides = {f.get("side") for f in owned
+                    if f.get("surf") == "plane" and f.get("side")}
+    if side and planar_sides and side not in planar_sides and \
+            _OPPOSITE_SIDE[side] in planar_sides:
+        side = None
+
+    axis = _SIDE_AXIS.get(side, "z")
     perp = [a for a in ("x", "y", "z") if a != axis]
-    bmin, bmax = bbox.get("min"), bbox.get("max")
     offsets = None
-    if (isinstance(bmin, list) and isinstance(bmax, list) and
-            len(bmin) == 3 and len(bmax) == 3):
+    if bounds:
+        bmin, bmax = bounds
         offsets = {}
         for a in perp:
             i = _AXIS_INDEX[a]
             offsets[a] = {"from_min_mm": round(centroid[i] - bmin[i], 2),
                           "from_max_mm": round(bmax[i] - centroid[i], 2)}
-    return {"centroid": [round(c, 2) for c in centroid], "side": dominant,
-           "offsets": offsets, "n_faces": n}
+    return {"centroid": [round(c, 2) for c in centroid], "side": side,
+            "offsets": offsets, "n_faces": n, "anchor": anchor}
 
 
 def _feature_group_line(fg: dict) -> str:
@@ -102,22 +237,116 @@ def _feature_group_line(fg: dict) -> str:
     if fg.get("consumed"):
         return f'feature {fg["id"]} owns no surviving faces (consumed by later ops)'
     label = f'{fg["id"]} {fg.get("name") or ""} [{fg.get("type")}]'.replace("  ", " ").strip()
+    if fg.get("unattributed"):
+        return (f'{label}: owns no face of its own — the {fg.get("attributed_faces", 0)} '
+                'face(s) the kernel credited to it were re-created from earlier features')
     pl = fg.get("placement")
     if not pl:
         return f'{label}: {fg["faces"]} face(s)'
-    touches = pl.get("touches") or []
-    touch_txt = f' of {", ".join(touches)}' if touches else ""
     side = pl.get("side")
-    if side:
-        where = f'on {side} face{touch_txt}'
+    host = pl.get("anchor_label") or pl.get("anchor")
+    if side and host:
+        where = f'on the {side} face of {host}'
+    elif side:
+        where = f'on the {side} side of the part'
+    elif host:
+        where = f'centered in {host}'
     else:
-        where = f'no clear reference face{touch_txt} (curved/through feature)'
+        where = 'spans the part (no host feature)'
     off = pl.get("offsets")
     if off:
         off_txt = " / ".join(
             f'{off[a]["from_min_mm"]:.0f} mm from -{a.upper()} edge' for a in sorted(off))
         return f'{label} ({fg["faces"]} face(s)): {where}, centered {off_txt}'
     return f'{label} ({fg["faces"]} face(s)): {where}'
+
+
+# ------------------------------------------------- feature -> face attribution, de-smeared
+# doc_tree's owner_map credits every face a boolean REGENERATED to the feature that ran the
+# boolean, so a small cut ends up owning the large planar face it merely pierced (measured:
+# an r8 through-bore in a 120x80x15 plate owns the plate's whole 9398 mm^2 bottom face; a
+# 25 mm spout fused onto a 165 mm bucket owns the bucket's 309048 mm^2 outer wall). The
+# engine's real tool solid (CompileResult::tool_recs) never leaves C++ — the one RPC over it,
+# eval_feature_overlap, returns pairwise VOLUMES, not per-face membership — so we discriminate
+# geometrically from the tool the feature AUTHORED:
+#
+#     a feature's tool cannot create a face larger than the tool's own cross-section.
+#
+# That is a one-way test: it only ever removes a face the owner demonstrably could NOT have
+# made, never a face it could. A removed face is re-credited to the latest EARLIER feature
+# whose tool could have made it, and left unowned when none could — faces are conserved, never
+# duplicated, and a feature left with nothing is labelled, not back-filled. Feature types with
+# no analytic cross-section (extrude/revolve/loft/sweep/shell/fillet/...) get no scale and so
+# keep every face the kernel gave them.
+_TOOL_SCALE_EPS = 1.02  # slack for tessellation/imprint noise on an exact-size match
+
+
+def _dim_num(v) -> Optional[float]:
+    """A dimension param's number, from {"value":..,"expr":..} or a bare number."""
+    if isinstance(v, dict):
+        v = v.get("value")
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _feature_tool_scale(ft: dict) -> Optional[dict]:
+    """{"radius": largest curved radius this tool can produce (0.0 = none at all),
+        "plane_area": largest planar face this tool can produce}, from the AUTHORED params.
+    None for a feature type whose tool has no analytic cross-section — such a feature is
+    unconstrained and keeps whatever the kernel attributed to it."""
+    if not isinstance(ft, dict):
+        return None
+    t = (ft.get("type") or "").lower()
+    p = ft.get("params") or {}
+
+    def _radius(*keys) -> Optional[float]:
+        vals = [_dim_num(p.get(k)) for k in keys]
+        vals = [v for v in vals if v is not None]
+        return max(vals) if vals else None
+
+    if t == "box":
+        length, width, height = (_dim_num(p.get(k)) for k in ("length", "width", "height"))
+        if None in (length, width, height):
+            return None
+        # A box tool's boundary is entirely planar: it cannot author a curved face.
+        return {"radius": 0.0,
+                "plane_area": max(length * width, length * height, width * height)}
+    if t in ("cylinder", "sphere"):
+        r = _radius("radius")
+        if r is None:
+            d = _dim_num(p.get("diameter"))
+            r = d / 2.0 if d is not None else None
+    elif t == "cone":
+        r = _radius("radius", "radius1", "radius2", "radius_bottom", "radius_top")
+    elif t == "torus":
+        major, minor = _radius("radius", "major_radius"), _radius("radius2", "minor_radius")
+        r = (major + minor) if (major is not None and minor is not None) else None
+    elif t in ("hole", "bolt_circle"):
+        # The widest authored diameter wins: a counterbore/countersink is wider than the drill.
+        ds = [_dim_num(v) for k, v in p.items() if "diameter" in str(k).lower()]
+        ds = [d for d in ds if d is not None]
+        rs = [_dim_num(v) for k, v in p.items() if str(k).lower().endswith("radius")]
+        rs = [x for x in rs if x is not None] + [d / 2.0 for d in ds]
+        r = max(rs) if rs else None
+    else:
+        return None
+    if r is None or r <= 0.0:
+        return None
+    return {"radius": r, "plane_area": math.pi * r * r}
+
+
+def _tool_scale_accepts(scale: Optional[dict], f: dict) -> bool:
+    """Could this feature's tool have created this face? Necessary condition only."""
+    if not scale:
+        return True
+    if (f.get("surf") or "plane") != "plane":
+        r, rt = f.get("radius"), scale.get("radius")
+        if r is None or rt is None:
+            return True  # no size cue on either side — keep, never guess a face away
+        return r <= rt * _TOOL_SCALE_EPS + 1e-6
+    a, pa = f.get("area_or_len"), scale.get("plane_area")
+    if a is None or pa is None:
+        return True
+    return a <= pa * _TOOL_SCALE_EPS + 1e-6
 
 
 def _digest(doc_id: str) -> dict:
@@ -174,12 +403,38 @@ def _digest(doc_id: str) -> dict:
         for pair in om.get("faces", []) or []:
             if isinstance(pair, list) and len(pair) == 2 and pair[0] == last_body:
                 owner_by_topo[pair[1]] = fid
-    faces_by_owner: dict = defaultdict(list)
-    ord_owner = [owner_by_topo.get(i + 1) for i in range(len(faces))]
+
+    # De-smear (see the attribution note above): a face whose owner's tool could not have
+    # created it goes back to the latest EARLIER feature whose tool could. `order`/`rank` are
+    # the solid-feature tree order; a sketch/datum is never a candidate owner.
+    order = [ft.get("id") for ft in feats
+             if isinstance(ft, dict) and ft.get("id")
+             and ft.get("type") not in _NON_BODY_FEATURE_TYPES]
+    rank = {fid: i for i, fid in enumerate(order)}
+    scales = {ft["id"]: _feature_tool_scale(ft) for ft in feats
+              if isinstance(ft, dict) and ft.get("id") in rank}
+    attributed: dict = defaultdict(int)
+    ord_owner: list = [None] * len(faces)
+    reattributed = 0
     for i, f in enumerate(faces):
-        fo = ord_owner[i]
-        if fo:
-            faces_by_owner[fo].append(f)
+        claimed = owner_by_topo.get(i + 1)
+        if not claimed:
+            continue
+        attributed[claimed] += 1
+        if claimed not in rank or _tool_scale_accepts(scales.get(claimed), f):
+            ord_owner[i] = claimed
+            continue
+        for j in range(rank[claimed] - 1, -1, -1):
+            if _tool_scale_accepts(scales.get(order[j]), f):
+                ord_owner[i] = order[j]
+                reattributed += 1
+                break
+    faces_by_owner: dict = defaultdict(list)
+    for i, f in enumerate(faces):
+        if ord_owner[i]:
+            faces_by_owner[ord_owner[i]].append(f)
+    area_by_owner = {fid: sum(f.get("area_or_len") or 0.0 for f in fl)
+                     for fid, fl in faces_by_owner.items()}
 
     # "touches": bridge adjacency edges across owner sets. doc_query's face-match order IS
     # doc_adjacency's `ord` numbering (both walk the same TopExp_Explorer order), so index i
@@ -201,6 +456,8 @@ def _digest(doc_id: str) -> dict:
     except Exception:  # noqa: BLE001
         pass
 
+    names = {ft["id"]: ft.get("name") for ft in feats
+             if isinstance(ft, dict) and ft.get("id") in rank}
     feat_summary = []
     for ft in feats:
         if not isinstance(ft, dict):
@@ -210,11 +467,21 @@ def _digest(doc_id: str) -> dict:
             continue
         owned = faces_by_owner.get(fid, [])
         entry = {"id": fid, "name": ft.get("name"), "type": ft.get("type"), "faces": len(owned)}
+        # Honest bookkeeping: the raw owner_map count stays visible whenever we changed it.
+        if attributed.get(fid, 0) != len(owned):
+            entry["attributed_faces"] = attributed.get(fid, 0)
         if owned:
-            placement = _feature_placement(owned, bbox)
+            anchor = _pick_anchor(fid, touches.get(fid, ()), rank, area_by_owner)
+            placement = _feature_placement(owned, bbox, ft, anchor)
             if placement is not None:
                 placement["touches"] = sorted(touches.get(fid, []))
+                if anchor:
+                    placement["anchor_label"] = f'{anchor} {names.get(anchor) or ""}'.strip()
                 entry["placement"] = placement
+        elif attributed.get(fid, 0):
+            # Every face the kernel gave it belongs to an earlier feature — say so, rather
+            # than keep a face it demonstrably did not create.
+            entry["unattributed"] = True
         else:
             entry["consumed"] = True
         feat_summary.append(entry)
@@ -225,6 +492,7 @@ def _digest(doc_id: str) -> dict:
         "faces": len(faces), "edges": len(edges),
         "symmetry": part_symmetry,
         "feature_groups": feat_summary,
+        "reattributed_faces": reattributed,
         "instances": instanced,
         "bores": bores,
         "planar_caps": caps,
@@ -245,6 +513,10 @@ def _outline_text(d: dict) -> str:
         lines.append("Features (placement narrative, one line each):")
         for fg in d["feature_groups"]:
             lines.append(f'  - {_feature_group_line(fg)}')
+        if d.get("reattributed_faces"):
+            lines.append(f'    ({d["reattributed_faces"]} face(s) the kernel credited to a '
+                         'boolean were re-credited to the earlier feature that authored the '
+                         'surface they lie on)')
     if d.get("instances"):
         lines.append("Repeated/instanced groups (likely patterns - address as a set):")
         for g in d["instances"]:
@@ -1390,12 +1662,17 @@ def register_gsl_tools(mcp: FastMCP) -> None:
     def describe_part(doc_id: Optional[str] = None) -> str:
         """Compact, NAMED outline of the part — use INSTEAD of dumping every face on a complex part.
 
-        Returns the bounding box, the feature groups WITH a placement narrative (which face each
-        feature sits on, its offset from the part bbox on the two perpendicular axes, and which
-        other features it touches via adjacency), any detected symmetry/instanced patterns (e.g.
-        "6-fold rotational about +Z" with the blade faces collapsed to one line), the bores/holes
-        and flat faces by side, and a stable `sid` for every addressable face/edge. A feature that
-        owns no surviving faces (fully consumed by a later boolean) is called out explicitly.
+        Returns the bounding box, the feature groups WITH a placement narrative (the side of the
+        part each feature sits on, the EARLIER, larger feature it sits on — a boss is on its
+        plate, never the plate on its boss — and its offset from the part bbox on the two
+        perpendicular axes), any detected symmetry/instanced patterns (e.g. "6-fold rotational
+        about +Z" with the blade faces collapsed to one line), the bores/holes and flat faces by
+        side, and a stable `sid` for every addressable face/edge. A feature that owns no surviving
+        faces (fully consumed by a later boolean) is called out explicitly. Face counts are the
+        faces a feature can be shown to have CREATED: the kernel credits every face a boolean
+        regenerated to the feature that ran it, so a face too large for a feature's own tool is
+        re-credited to the earlier feature that authored the surface, and the raw kernel count
+        stays visible as `attributed_faces`.
         Token cost scales with the number of DISTINCT feature roles, not the raw face count — a
         68-face impeller describes in a few hundred tokens. Drill into one entity with hover(sid).
         """

@@ -1618,6 +1618,226 @@ def test_assembly_tools_end_to_end(tmp_path):
     _call("close_part", {"doc_id": plate})
 
 
+# ------------------------------------------------------------------ LLM placement dialect
+# A live run died on the op below: the model spelled a cylinder's placement the way most CAD
+# APIs do — placement:{origin,direction} + boolean:"union" — and the engine's now-CLOSED
+# primitive vocabulary rejected all three keys outright. cad_doc_tools._normalize_feature_ops
+# rewrites that dialect into the canonical at/axis/mode BEFORE the call. The unit tests lock
+# the rewrite; the engine tests lock the build it unblocks.
+
+
+def _dialect_spout_op() -> dict:
+    """The VERBATIM failing op, rebuilt fresh on every call.
+
+    A shared module-level literal would be laundered by the first test that normalizes it
+    (or handed to the engine twice), so the purity test could never fail.
+    """
+    return {"op": "add_feature", "feature": {
+        "type": "cylinder", "name": "DrainSpout",
+        "params": {"radius": {"value": 25, "expr": None},
+                   "height": {"value": 60, "expr": None}},
+        "placement": {"origin": [200, 0, 40], "direction": [1, 0, 0]},
+        "boolean": "union"}}
+
+
+def _dialect_cyl(**extra) -> dict:
+    """A minimal canonical cylinder feature plus the dialect key(s) under test."""
+    return {"type": "cylinder", "name": "C",
+            "params": {"radius": cb.dim(5), "height": cb.dim(10)}, **extra}
+
+
+def _norm_feature(feature: dict) -> dict:
+    """Normalize one add_feature op; return the rewritten feature FLATTENED as the engine
+    sees it (session.cpp::op_add_feature hoists every non-structural key into params, an
+    existing params entry winning), so an assertion doesn't care which level a key landed at.
+    """
+    from mcp_server.cad_doc_tools import _normalize_feature_ops
+
+    feat = _normalize_feature_ops([{"op": "add_feature", "feature": feature}])[0]["feature"]
+    flat = {k: v for k, v in feat.items() if k != "params"}
+    flat.update(feat.get("params") or {})
+    return flat
+
+
+def test_normalize_feature_ops_rewrites_the_live_placement_dialect():
+    """The exact op from the live failure becomes canonical at/axis/mode."""
+    flat = _norm_feature(_dialect_spout_op()["feature"])
+    assert flat["at"] == [200, 0, 40], flat
+    assert flat["axis"] == [1, 0, 0], flat
+    assert flat["mode"] == "boss", flat
+    # CONSUMED, not left beside the rewrite — a leftover dialect key is itself a rejected batch.
+    assert "placement" not in flat and "boolean" not in flat, flat
+    # The genuine params survive untouched.
+    assert flat["radius"] == {"value": 25, "expr": None}, flat
+    assert flat["height"] == {"value": 60, "expr": None}, flat
+
+
+def test_normalize_feature_ops_does_not_mutate_the_caller_ops():
+    """Pure: the caller's list, op and nested feature/params dicts come back untouched."""
+    from mcp_server.cad_doc_tools import _normalize_feature_ops
+
+    op = _dialect_spout_op()
+    before = json.loads(json.dumps(op))
+    ops = [op]
+    out = _normalize_feature_ops(ops)
+    assert op == before, op
+    assert "placement" in op["feature"] and "boolean" in op["feature"], op
+    assert "at" not in op["feature"] and "mode" not in op["feature"], op
+    assert ops == [before], ops
+    assert out is not ops and out[0] is not op
+    assert out[0]["feature"]["at"] == [200, 0, 40], out  # the copy really was rewritten
+
+
+def test_normalize_feature_ops_alias_table():
+    """Every dialect alias maps to its canonical key and is consumed."""
+    for key in ("position", "location", "origin"):
+        flat = _norm_feature(_dialect_cyl(**{key: [1, 2, 3]}))
+        assert flat["at"] == [1, 2, 3] and key not in flat, (key, flat)
+    for key in ("direction", "dir", "normal", "orientation"):
+        flat = _norm_feature(_dialect_cyl(**{key: [0, 1, 0]}))
+        assert flat["axis"] == [0, 1, 0] and key not in flat, (key, flat)
+    for key in ("boolean", "operation"):
+        for word in ("union", "fuse"):
+            flat = _norm_feature(_dialect_cyl(**{key: word}))
+            assert flat["mode"] == "boss" and key not in flat, (key, word, flat)
+        for word in ("cut", "subtract", "difference"):
+            flat = _norm_feature(_dialect_cyl(**{key: word}))
+            assert flat["mode"] == "cut" and key not in flat, (key, word, flat)
+        flat = _norm_feature(_dialect_cyl(**{key: "new_body"}))
+        assert flat["merge"] is False and "mode" not in flat and key not in flat, (key, flat)
+
+
+def test_normalize_feature_ops_rejects_intersect():
+    """The engine has no primitive intersect mode: say so instead of silently fusing."""
+    with pytest.raises(ValueError) as exc:
+        _norm_feature(_dialect_cyl(boolean="intersect"))
+    msg = str(exc.value)
+    assert "intersect" in msg, msg
+    assert 'mode:"boss"' in msg and 'mode:"cut"' in msg, msg  # names the supported values
+
+
+def test_normalize_feature_ops_leaves_a_canonical_op_alone():
+    """An op already in the documented spelling round-trips byte-for-byte."""
+    from mcp_server.cad_doc_tools import _normalize_feature_ops
+
+    ops = [{"op": "add_feature", "feature": {
+        "type": "cylinder", "name": "Spout",
+        "params": {"radius": cb.dim(25), "height": cb.dim(60)},
+        "at": [200, 0, 40], "axis": [1, 0, 0], "mode": "boss", "centered": False}}]
+    expect = json.loads(json.dumps(ops))
+    assert _normalize_feature_ops(ops) == expect
+
+
+def test_as_face_query_parses_a_phrase_into_the_grammar():
+    """Free text becomes STRUCTURED query keys — the whole sentence never lands in `side`."""
+    from mcp_server.cad_common import _as_face_query
+
+    assert _as_face_query("outer cylindrical wall face at bottom near x=200,y=0") == {
+        "of": "face", "surf": "cylinder", "side": "bottom", "pick": "outer"}
+    assert _as_face_query("top") == {"of": "face", "side": "top"}
+    assert _as_face_query("all the edges") == {"of": "edge"}  # a kind alone is a valid query
+    with pytest.raises(ValueError) as exc:
+        _as_face_query("please make the thing look nicer")
+    assert "geometry query" in str(exc.value) and '"of"' in str(exc.value), str(exc.value)
+    q = {"of": "face", "surf": "cylinder", "side": "bottom"}
+    assert _as_face_query(q) is q  # a dict is identity, never re-parsed
+
+
+def test_add_features_accepts_the_live_placement_dialect_end_to_end():
+    """The op that killed a live run now BUILDS: a drain spout on a tank wall.
+
+    The block is 340 long, so its +X wall sits at x=170 — exactly where the (centred, the
+    verbatim op says nothing about `centered`) 60mm spout starts. The boss therefore lands
+    flush on the wall and adds its WHOLE volume, with no overlap to guess at.
+    """
+    r, _ = _call("new_part", {"name": "dialect_tank"})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Tank", {"length": cb.dim(340), "width": cb.dim(200),
+                                "height": cb.dim(200)})]})
+    assert r["ok"], r
+    m0, _ = _call("measure_part", {"doc_id": doc})
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [_dialect_spout_op()]})
+    assert r["ok"] is True, r
+    assert not r.get("failed_features"), r
+    assert all(f["ok"] for f in r["features"]), r
+    m1, _ = _call("measure_part", {"doc_id": doc})
+    delta = m1["mass"]["volume_mm3"] - m0["mass"]["volume_mm3"]
+    expect = math.pi * 25.0 * 25.0 * 60.0
+    assert abs(delta - expect) / expect < 0.01, (delta, expect)
+
+
+def test_dialect_spout_is_oriented_and_off_origin():
+    """at/axis are HONOURED, not merely accepted — assert what a dropped placement would break.
+
+    Only the spout is built, with centered:false so its BASE sits at [200,0,40] and it runs
+    60mm along +X. A 50-dia x 60 cylinder's axial inertia is the smallest of the three, so
+    principal_axes[0] IS its spin axis: +-X here, +-Z (and a COM at the origin) if `axis`/`at`
+    had been ignored.
+    """
+    r, _ = _call("new_part", {"name": "dialect_spout"})
+    doc = r["doc_id"]
+    op = _dialect_spout_op()
+    op["feature"]["centered"] = False
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [op]})
+    assert r["ok"] is True, r
+    m, _ = _call("measure_part", {"doc_id": doc})
+    com = m["mass"]["com"]
+    assert abs(com[0] - 230.0) < 1e-3, com  # base 200 + half the 60mm length along +X
+    assert abs(com[1]) < 1e-3 and abs(com[2] - 40.0) < 1e-3, com
+    moments = m["mass"]["principal_moments"]
+    assert moments[0] < moments[1], moments  # axes[0] is the axial (spin) direction
+    ax = m["mass"]["principal_axes"][0]
+    assert abs(abs(ax[0]) - 1.0) < 1e-6, (ax, moments)
+    assert abs(ax[1]) < 1e-6 and abs(ax[2]) < 1e-6, ax
+
+
+def test_rolled_back_batch_error_carries_the_engine_reason():
+    """A rolled-back batch reports WHY, per feature, in `error` itself.
+
+    The agent card truncates `error` and never reads `failed_features`, so the old constant
+    ("no features were kept; fix and resend") left the model nothing actionable and it resent
+    the identical ops.
+    """
+    r, _ = _call("new_part", {"name": "buried_boss"})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Block", {"length": cb.dim(100), "width": cb.dim(100),
+                                 "height": cb.dim(100)})]})
+    assert r["ok"], r
+    # A small centred cylinder boss is buried inside the block: it adds no material, which is
+    # a genuine engine rebuild failure (not a schema rejection), so the batch rolls back.
+    bad, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("cylinder", "InnerPin", {"radius": cb.dim(5), "height": cb.dim(10)})]})
+    assert bad["ok"] is False and bad["rolled_back"] is True, bad
+    err = bad["error"]
+    assert "added no material" in err, err   # the engine's ACTUAL reason
+    assert "InnerPin" in err, err            # named with the feature the model wrote
+    assert bad["failed_features"][0]["id"] in err, bad
+    assert "no features were kept" not in err and "fix and resend" not in err, err
+
+
+def test_query_geometry_echoes_the_resolved_query():
+    """query_geometry reports ok + the RESOLVED query, and defaults `of` to "face"."""
+    doc = _new_plate_with_hole()
+    # No `of` at all — resolve_geom_query defaults it to "face" instead of erroring.
+    r, _ = _call("query_geometry", {"doc_id": doc, "query": {"side": "+x"}})
+    assert r["ok"] is True, r
+    assert r["query"] == {"side": "+x"}, r  # a dict query is echoed verbatim
+    assert r["count"] >= 1 and all(m.get("kind") == "face" for m in r["matches"]), r
+    # A phrase is normalised into the grammar, and the echo shows what was actually asked.
+    r, _ = _call("query_geometry", {"doc_id": doc, "query": "the flat top face"})
+    assert r["ok"] is True, r
+    q = r["query"]
+    assert isinstance(q, dict), r
+    assert q["of"] == "face" and q["side"] == "top", r  # a side WORD, not the sentence
+    assert r["count"] >= 1, r
+    # An empty result is called out rather than looking like a silent success.
+    r, _ = _call("query_geometry", {"doc_id": doc, "query": {"of": "face", "surf": "sphere"}})
+    assert r["ok"] is True and not r.get("matches"), r
+    assert "no face/edge matched" in r["note"], r
+
+
 if __name__ == "__main__":
     import sys
 

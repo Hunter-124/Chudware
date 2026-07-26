@@ -3307,3 +3307,338 @@ TEST_CASE("eval_section_props accepts origin+normal plane on a box") {
 }
 
 
+// ============================================================================
+// op_add_feature TOTAL HOIST + CLOSED-VOCABULARY regression tests
+// (core/doc/session.cpp::op_add_feature).
+//
+// op_add_feature used to copy only type/name/suppressed/params/refs/folder into the
+// stored feature and hoist a hand-maintained WHITELIST of options (mode, merge,
+// centered, at, at_offset, offset, body, copy, positions) into params. EVERY other
+// top-level key was SILENTLY DROPPED, so each newly-invented option repeated the same
+// wrong-geometry-with-no-error bug once (W1's `positions`, T-1's `body`, ...). Two
+// contracts replaced that whitelist:
+//
+//   (a) TOTAL HOIST — every NON-STRUCTURAL top-level key is hoisted into params
+//       (structural = type/name/id/suppressed/params/refs/folder), with an existing
+//       params entry always winning. The flat and the nested spelling are therefore
+//       equivalent for every feature type, present and future.
+//   (b) NO SILENT DROPS — a key outside the PRIMITIVE closed vocabulary (box|cylinder|
+//       sphere|cone|torus only) and the always-wrong dialect keys (placement, boolean,
+//       operation, before, after) on ANY feature type are rejected with
+//       OpError("invalid_op") carrying the canonical spelling. Non-primitives keep the
+//       PERMISSIVE hoist — re-tightening that into a second whitelist is exactly the
+//       whack-a-mole that dropped `transform` + `translate`.
+// ============================================================================
+
+namespace {
+
+// The document's world AABB centre — the observable that proves a placement/move
+// actually happened rather than being dropped and quietly no-op'ing.
+json doc_center(const std::string& doc_id) {
+    return chudware::doc::doc_bbox(doc_id).at("center");
+}
+
+// Apply `ops` and return the OpError message. An EMPTY string means the batch did NOT
+// throw (every rejection message below is non-empty), so callers assert on !empty().
+std::string apply_err(const std::string& doc_id, const json& ops) {
+    try {
+        chudware::doc::doc_apply_ops(doc_id, -1, ops, false);
+    } catch (const chudware::doc::OpError& e) {
+        return std::string(e.what());
+    }
+    return std::string();
+}
+
+json feature_count_tree(const std::string& doc_id) {
+    return chudware::doc::doc_tree(doc_id).at("tree").at("features");
+}
+
+}  // namespace
+
+// (a) TOTAL HOIST, generic. `translate` was NEVER in the old whitelist, so a transform
+//     written flat used to lose its motion entirely: the feature stored a bare
+//     {type, body} and recorded the body at its current pose. Both spellings must now
+//     produce byte-identical geometry — and it must be the MOVED geometry.
+TEST_CASE("hoist: flat transform body+translate equals the params-nested spelling") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const double S = 10.0, DX = 25.0;
+
+    // The SAME 10mm cube and the SAME +25X move, written the two ways.
+    auto build = [&](const char* name, const json& xform) -> std::string {
+        json nr = doc_new("part", name);
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature",
+                json{{"type", "box"}, {"name", "Blk"},
+                     {"params", {{"length", dimv(S)}, {"width", dimv(S)},
+                                 {"height", dimv(S)}}}}}},
+            json{{"op", "add_feature"}, {"feature", xform}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        for (const json& st : resp.at("rebuild").at("feature_status"))
+            CHECK_MESSAGE(st.value("ok", false),
+                          name << " feature failed: " << status_err(st));
+        return id;
+    };
+
+    const std::string flat = build("HoistFlatXform",
+        json{{"type", "transform"}, {"name", "Move"},
+             {"body", "$0"}, {"translate", json::array({DX, 0.0, 0.0})}});
+    const std::string nested = build("HoistNestedXform",
+        json{{"type", "transform"}, {"name", "Move"},
+             {"params", {{"body", "$0"}, {"translate", json::array({DX, 0.0, 0.0})}}}});
+
+    const json cf = doc_center(flat), cn = doc_center(nested);
+    MESSAGE("flat centre=" << cf.dump() << "  nested centre=" << cn.dump());
+    // Same feature, two spellings -> identical placement.
+    for (int k = 0; k < 3; ++k)
+        CHECK(near_abs(cf[k].get<double>(), cn[k].get<double>(), 1e-9));
+    // ...and the move REALLY happened: a dropped translate leaves the cube at the origin,
+    // which would make the equality above pass for the wrong reason.
+    CHECK(near_abs(cf[0].get<double>(), DX, 1e-6));
+    CHECK(near_abs(cf[1].get<double>(), 0.0, 1e-6));
+    CHECK(near_abs(cf[2].get<double>(), 0.0, 1e-6));
+}
+
+// (b) TOTAL HOIST, precedence. params is the CANONICAL home, so when the same key is
+//     spelled both ways the params value is the one applied and the top-level duplicate
+//     is discarded (never merged, never last-write-wins).
+TEST_CASE("hoist: a params entry beats the same key at the feature top level") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const double S = 10.0;
+
+    json nr = doc_new("part", "HoistPrecedence");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "box"}, {"name", "Blk"},
+                 {"params", {{"length", dimv(S)}, {"width", dimv(S)}, {"height", dimv(S)}}}}}},
+        // `translate` spelled BOTH ways with DIFFERENT, distinguishable motions: params
+        // says +40Z, the top level says +100X. The cube must rise, not slide.
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "transform"}, {"name", "Move"},
+                 {"translate", json::array({100.0, 0.0, 0.0})},
+                 {"params", {{"body", "$0"},
+                             {"translate", json::array({0.0, 0.0, 40.0})}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    for (const json& st : resp.at("rebuild").at("feature_status"))
+        CHECK_MESSAGE(st.value("ok", false), "feature failed: " << status_err(st));
+
+    // The stored feature keeps the params value verbatim — the top-level one is dropped.
+    const json& feats = resp.at("tree").at("features");
+    REQUIRE(feats.size() == 2);
+    CHECK(feats[1].at("params").at("translate") == json::array({0.0, 0.0, 40.0}));
+
+    const json c = doc_center(id);
+    MESSAGE("precedence centre=" << c.dump() << " (params +40Z must win over top-level +100X)");
+    CHECK(near_abs(c[0].get<double>(), 0.0, 1e-6));   // the top-level 100 was NOT applied
+    CHECK(near_abs(c[1].get<double>(), 0.0, 1e-6));
+    CHECK(near_abs(c[2].get<double>(), 40.0, 1e-6));  // the params 40 WAS applied
+}
+
+// (c) A PRIMITIVE has a small CLOSED vocabulary, so an unrecognised key is a typo and is
+//     rejected outright — with the offender NAMED and the whole accept-list quoted, so
+//     the model can fix it in one turn instead of shipping silently-wrong geometry.
+TEST_CASE("primitive vocabulary: an unknown key on a cylinder is rejected, never ignored") {
+    using chudware::doc::doc_new;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    json nr = doc_new("part", "PrimUnknownKey");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "cylinder"}, {"name", "Boss"},
+                 {"params", {{"radius", dimv(5)}, {"height", dimv(10)}}},
+                 {"zzz_typo", json::array({1, 2, 3})}}}},
+    });
+    const std::string msg = apply_err(id, ops);
+    MESSAGE("primitive unknown key: " << msg);
+    REQUIRE_MESSAGE(!msg.empty(),
+                    "an unknown key on a primitive must throw OpError, not be ignored");
+    CHECK(msg.find("zzz_typo") != std::string::npos);            // names the offender
+    CHECK(msg.find("A cylinder accepts:") != std::string::npos);  // ...and the vocabulary
+    CHECK(msg.find("at_offset") != std::string::npos);
+    CHECK(msg.find("centered") != std::string::npos);
+    CHECK(msg.find("merge") != std::string::npos);
+    // The rejected batch is a clean no-op: no half-built feature is left behind.
+    CHECK(feature_count_tree(id).empty());
+}
+
+// (d) The DIALECT keys models actually invent. Each error must name the key AND spell out
+//     its canonical replacement — a live run burned three turns on placement+boolean being
+//     inert (the cylinder built at the origin, buried, "boss added no material").
+TEST_CASE("primitive dialect: placement/boolean are rejected with the canonical spelling") {
+    using chudware::doc::doc_new;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    SUBCASE("placement -> at + axis") {
+        json nr = doc_new("part", "DialectPlacement");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature",
+                json{{"type", "cylinder"}, {"name", "Spout"},
+                     {"params", {{"radius", dimv(5)}, {"height", dimv(20)}}},
+                     {"placement", {{"origin", json::array({200.0, 0.0, 40.0})},
+                                    {"direction", json::array({1.0, 0.0, 0.0})}}}}}},
+        });
+        const std::string msg = apply_err(id, ops);
+        MESSAGE("placement: " << msg);
+        REQUIRE_MESSAGE(!msg.empty(), "placement on a primitive must be rejected");
+        CHECK(msg.find("placement") != std::string::npos);
+        CHECK(msg.find("at:[x,y,z]") != std::string::npos);    // the position fix
+        CHECK(msg.find("axis:[x,y,z]") != std::string::npos);  // the direction fix
+        CHECK(feature_count_tree(id).empty());
+    }
+
+    SUBCASE("boolean -> mode + merge") {
+        json nr = doc_new("part", "DialectBoolean");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature",
+                json{{"type", "cylinder"}, {"name", "Spout"},
+                     {"params", {{"radius", dimv(5)}, {"height", dimv(20)}}},
+                     {"boolean", "union"}}}},
+        });
+        const std::string msg = apply_err(id, ops);
+        MESSAGE("boolean: " << msg);
+        REQUIRE_MESSAGE(!msg.empty(), "boolean on a primitive must be rejected");
+        CHECK(msg.find("boolean") != std::string::npos);
+        CHECK(msg.find("mode:\"boss\"") != std::string::npos);
+        CHECK(msg.find("mode:\"cut\"") != std::string::npos);
+        CHECK(msg.find("merge:false") != std::string::npos);
+        CHECK(feature_count_tree(id).empty());
+    }
+}
+
+// (e) The dialect check is TYPE-INDEPENDENT: `placement` is wrong on a fillet too, even
+//     though a fillet keeps the permissive open-ended param set. The message must NOT
+//     claim a fixed accept-list for a non-primitive (that clause is primitives-only).
+TEST_CASE("dialect keys are type-independent: placement on a fillet is rejected too") {
+    using chudware::doc::doc_new;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    json nr = doc_new("part", "DialectFillet");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "box"}, {"name", "Blk"},
+                 {"params", {{"length", dimv(20)}, {"width", dimv(20)},
+                             {"height", dimv(20)}}}}}},
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "fillet"}, {"name", "Rnd"},
+                 {"params", {{"radius", dimv(2)}}},
+                 {"refs", {{"edges", json::array({json{{"of", "edge"}}})}}},
+                 {"placement", {{"origin", json::array({0.0, 0.0, 0.0})}}}}}},
+    });
+    const std::string msg = apply_err(id, ops);
+    MESSAGE("fillet placement: " << msg);
+    REQUIRE_MESSAGE(!msg.empty(), "placement must be rejected on a NON-primitive too");
+    CHECK(msg.find("fillet") != std::string::npos);
+    CHECK(msg.find("placement") != std::string::npos);
+    CHECK(msg.find("at:[x,y,z]") != std::string::npos);
+    // Primitives-only clause: a fillet's params are open-ended, so no accept-list.
+    CHECK(msg.find("accepts:") == std::string::npos);
+    // Atomic rejection — even the good box from op 0 was not kept.
+    CHECK(feature_count_tree(id).empty());
+}
+
+// (f) The PERMISSIVE hoist is the guard against re-tightening (b) into a second whitelist.
+//     A non-primitive carrying a key the compiler never reads must still apply cleanly:
+//     the key rides into params and is ignored, and the feature's real options still work.
+TEST_CASE("permissive hoist: a novel key on a non-primitive still applies cleanly") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const double S = 10.0, DX = 7.0;
+    const char* kNote = "annotation the transform compiler never reads";
+
+    json nr = doc_new("part", "PermissiveHoist");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "box"}, {"name", "Blk"},
+                 {"params", {{"length", dimv(S)}, {"width", dimv(S)}, {"height", dimv(S)}}}}}},
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "transform"}, {"name", "Move"},
+                 {"body", "$0"}, {"translate", json::array({DX, 0.0, 0.0})},
+                 {"zzz_note", kNote}}}},
+    });
+    json resp;
+    REQUIRE_NOTHROW(resp = doc_apply_ops(id, -1, ops, false));
+    for (const json& st : resp.at("rebuild").at("feature_status"))
+        CHECK_MESSAGE(st.value("ok", false), "feature failed: " << status_err(st));
+
+    // Hoisted (not dropped, not rejected) and inert.
+    const json& feats = resp.at("tree").at("features");
+    REQUIRE(feats.size() == 2);
+    CHECK(feats[1].at("params").value("zzz_note", std::string()) == std::string(kNote));
+    // ...and the real option beside it still moved the body.
+    const json c = doc_center(id);
+    CHECK(near_abs(c[0].get<double>(), DX, 1e-6));
+    CHECK(near_abs(c[1].get<double>(), 0.0, 1e-6));
+    CHECK(near_abs(c[2].get<double>(), 0.0, 1e-6));
+}
+
+// (g) `before`/`after` order the OP, not the feature. Inside "feature" they are inert
+//     (the insert silently appends), so they are rejected with the message that names
+//     their real home — while the LEGITIMATE spelling beside "op" keeps working.
+TEST_CASE("add_feature: before/after belong beside \"op\", not inside \"feature\"") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const double S = 10.0;
+
+    json nr = doc_new("part", "OpOrderKeys");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json base = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "box"}, {"name", "First"},
+                 {"params", {{"length", dimv(S)}, {"width", dimv(S)}, {"height", dimv(S)}}}}}},
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "box"}, {"name", "Last"},
+                 {"params", {{"length", dimv(S)}, {"width", dimv(S)}, {"height", dimv(S)},
+                             {"at", json::array({60.0, 0.0, 0.0})}, {"merge", false}}}}}},
+    });
+    json bresp = doc_apply_ops(id, -1, base, false);
+    for (const json& st : bresp.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(st.value("ok", false), "base feature failed: " << status_err(st));
+    const std::string f_last = bresp.at("id_map").at("$1").get<std::string>();
+
+    // (1) INSIDE "feature" -> rejected, and the message points at the right home.
+    for (const char* k : {"before", "after"}) {
+        json bad_feat = json{{"type", "cylinder"}, {"name", "Nope"},
+                             {"params", {{"radius", dimv(3)}, {"height", dimv(10)},
+                                         {"merge", false}}}};
+        bad_feat[k] = f_last;
+        const std::string msg =
+            apply_err(id, json::array({json{{"op", "add_feature"}, {"feature", bad_feat}}}));
+        MESSAGE("'" << std::string(k) << "' inside feature: " << msg);
+        REQUIRE_MESSAGE(!msg.empty(),
+                        "'" << std::string(k) << "' inside \"feature\" must be rejected");
+        CHECK(msg.find(k) != std::string::npos);
+        CHECK(msg.find("beside \"op\"") != std::string::npos);
+        CHECK(msg.find("not inside \"feature\"") != std::string::npos);
+    }
+    REQUIRE(feature_count_tree(id).size() == 2);  // neither rejection inserted anything
+
+    // (2) The LEGITIMATE placement — beside "op" — still orders the insertion.
+    json good = json::array({
+        json{{"op", "add_feature"}, {"before", f_last}, {"feature",
+            json{{"type", "cylinder"}, {"name", "Middle"},
+                 {"params", {{"radius", dimv(3)}, {"height", dimv(10)},
+                             {"at", json::array({30.0, 0.0, 0.0})}, {"merge", false}}}}}},
+    });
+    json okresp = doc_apply_ops(id, -1, good, false);
+    for (const json& st : okresp.at("rebuild").at("feature_status"))
+        CHECK_MESSAGE(st.value("ok", false), "insert failed: " << status_err(st));
+    const json& feats = okresp.at("tree").at("features");
+    REQUIRE(feats.size() == 3);
+    CHECK(feats[0].value("name", std::string()) == "First");
+    CHECK(feats[1].value("name", std::string()) == "Middle");  // inserted BEFORE Last
+    CHECK(feats[2].value("name", std::string()) == "Last");
+}

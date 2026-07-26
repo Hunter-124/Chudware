@@ -221,11 +221,16 @@ TEST_CASE("resolve_review_provider: disabled or absent yields null") {
 TEST_CASE("apply_experimental: offline refuses a cloud review endpoint, falls back silently") {
     // Offline + a non-loopback review base_url => resolve_review_provider returns {error}; the
     // main (local) provider must be left WITHOUT a review_provider rather than leaking egress.
+    // The key is present on purpose so the refusal proves the OFFLINE guard, not the
+    // missing-credential guard below.
     json cfg = json{
         {"offline_mode", true},
         {"experimental",
          {{"vision_review",
-           {{"enabled", true}, {"base_url", "https://api.example.com/v1"}, {"model", "x"}}}}}};
+           {{"enabled", true},
+            {"base_url", "https://api.example.com/v1"},
+            {"api_key", "sk-test"},
+            {"model", "x"}}}}}};
     json rp = resolve_review_provider(cfg, json::object());
     REQUIRE(rp.is_object());
     CHECK(rp.contains("error"));  // refused before any network use
@@ -233,6 +238,73 @@ TEST_CASE("apply_experimental: offline refuses a cloud review endpoint, falls ba
                      {"supports_vision", true}};
     json out = apply_experimental(main, cfg, json::object());
     CHECK_FALSE(out.contains("review_provider"));  // skipped -> review uses the safe main provider
+}
+
+TEST_CASE("resolve_review_provider: cloud endpoint with no key refuses instead of 401ing") {
+    // A remote vision endpoint with no resolvable credential used to be handed the literal
+    // "lm-studio" placeholder, which the service rejected as HTTP 401 -> stop_reason
+    // provider_auth. Refuse here so apply_experimental skips the split instead.
+    json cfg = json{
+        {"experimental",
+         {{"vision_review",
+           {{"enabled", true},
+            {"base_url", "https://api.moonshot.ai/v1"},
+            {"model", "kimi-k3"}}}}}};
+    json rp = resolve_review_provider(cfg, json::object());
+    REQUIRE(rp.is_object());
+    CHECK(rp.contains("error"));
+    json main = json{{"name", "gemini"}, {"supports_vision", true}};
+    CHECK_FALSE(apply_experimental(main, cfg, json::object()).contains("review_provider"));
+}
+
+TEST_CASE("resolve_review_provider: moonshot endpoint routes native and borrows keys.moonshot") {
+    // The Settings row carries no key of its own; the Kimi credential lives in keys.moonshot
+    // (NOT keys.cloud_compat), and the endpoint must resolve as the first-class "moonshot"
+    // provider so the wire-id aliases and the kimi reasoning ladder apply.
+    json cfg = json{
+        {"keys", {{"moonshot", "sk-moon"}, {"cloud_compat", ""}}},
+        {"experimental",
+         {{"vision_review",
+           {{"enabled", true},
+            {"base_url", "https://api.moonshot.ai/v1"},
+            {"model", "kimi-k3"}}}}}};
+    json rp = resolve_review_provider(cfg, json::object());
+    REQUIRE(rp.is_object());
+    CHECK_FALSE(rp.contains("error"));
+    CHECK(rp.value("name", std::string()) == "moonshot");
+    CHECK(rp.value("api_key", std::string()) == "sk-moon");
+    CHECK(rp.value("model", std::string()) == "kimi-k3");
+    CHECK(rp.value("supports_vision", false) == true);
+    CHECK(rp.value("offline_safe", true) == false);  // cloud
+}
+
+TEST_CASE("resolve_review_provider: generic cloud endpoint borrows keys.cloud_compat") {
+    json cfg = json{
+        {"keys", {{"cloud_compat", "sk-cloud"}}},
+        {"experimental",
+         {{"vision_review",
+           {{"enabled", true},
+            {"base_url", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
+            {"model", "qwen3-vl-plus"}}}}}};
+    json rp = resolve_review_provider(cfg, json::object());
+    REQUIRE(rp.is_object());
+    CHECK_FALSE(rp.contains("error"));
+    CHECK(rp.value("name", std::string()) == "openai");
+    CHECK(rp.value("api_key", std::string()) == "sk-cloud");
+}
+
+TEST_CASE("resolve_review_provider: an explicit row key wins over the keys.* fallback") {
+    json cfg = json{
+        {"keys", {{"moonshot", "sk-moon"}}},
+        {"experimental",
+         {{"vision_review",
+           {{"enabled", true},
+            {"base_url", "https://api.moonshot.ai/v1"},
+            {"api_key", "sk-explicit"},
+            {"model", "kimi-k3"}}}}}};
+    json rp = resolve_review_provider(cfg, json::object());
+    REQUIRE(rp.is_object());
+    CHECK(rp.value("api_key", std::string()) == "sk-explicit");
 }
 
 TEST_CASE("cloud OpenAI-compatible (DashScope/DeepSeek): offline ITAR refuses, online resolves") {

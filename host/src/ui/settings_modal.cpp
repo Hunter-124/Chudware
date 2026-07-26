@@ -3096,7 +3096,18 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                        "protection for cloud providers.");
         }
         ImGui::TableNextColumn();
-        ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
+        // Moved out of the retired Experimental tab: a modeling-behaviour preference, so it
+        // belongs beside the other run preferences (and rides along into the AI workspace's
+        // Options view, which shares this grid).
+        if (ImGui::Checkbox("Editable feature sequence",
+                            &settings.expCadSequenceMode))
+            changed = true;
+        helpMarker("Nudges the modeler to build the part as an ordered sequence of "
+                   "individually editable features (sketch -> extrude/revolve/loft/sweep -> "
+                   "fillet/chamfer/hole/pattern) that reconstructs a clean design history, "
+                   "rather than one fused monolithic solid \xe2\x80\x94 the DeepCAD / CAD-Coder "
+                   "command-sequence direction. Saved under config.json "
+                   "experimental.cad_sequence_mode.");
         ImGui::EndTable();
     }
 
@@ -3162,6 +3173,99 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::EndTable();
     }
     return changed;
+}
+
+// Settings -> AI -> Roles: the command-model / vision-model split (Seek-CAD style). Moved here
+// from the retired Experimental tab — it IS a model-role assignment, so it belongs beside the
+// other per-role pickers rather than in a separate tab.
+static void drawVisionRoutingSection(AppState& st, float sc) {
+    Settings& settings = st.settings;
+
+    // Command model = the active main provider/model (emits + parses the CAD ops). Chosen in
+    // Settings -> Providers / the composer's model chip; shown read-only so both routes are
+    // visible side by side. The cloud-compat slot hosts many services, so name the SERVICE
+    // (Moonshot / DeepSeek / ...) instead of the generic "OpenRouter / Cloud API" slot label.
+    ImGui::TextUnformatted("Command model (sends & parses CAD ops)");
+    helpMarker("The model that drives the agent loop: understands the request, plans, and "
+               "emits/parses the CAD operations. Pick it in Settings -> Providers or the "
+               "composer's model chip. Shown here so you can see both routes side by side.");
+    {
+        const char* provLabel =
+            ui::providerLabelForEndpoint(settings.provider, settings.baseUrl);
+        char cm[600];
+        std::snprintf(cm, sizeof(cm), "   %s  \xc2\xb7  %s", provLabel,
+                      settings.model[0] ? settings.model : "(default)");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                                                    ui::palette.accent[2], 1));
+        ImGui::TextUnformatted(cm);
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Dummy(ImVec2(0, 6 * sc));
+    ImGui::Checkbox("Route vision & spatial reasoning through a separate model",
+                    &settings.expVisionReview);
+    helpMarker("When on, a vision model judges the rendered viewport during the review/fix "
+               "stages (spatial awareness), while the command model above plans and emits ops "
+               "— the Seek-CAD split. It can be local (ITAR-safe) or a cloud vision model. "
+               "When off, the command model handles vision too (if it supports images). "
+               "Refused under Offline mode if cloud.");
+    dimText("Command model emits ops; this vision model sees the screenshot and drives fixes.");
+    if (!settings.expVisionReview) return;
+
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::TextUnformatted("Vision / spatial model");
+    // Vision-capable presets: cloud (Qwen-VL / Kimi) + local.
+    std::vector<const char*> vlabels;
+    std::vector<const ui::LocalPreset*> vps;
+    vlabels.push_back("(custom / type below)");
+    vps.push_back(nullptr);
+    for (const auto& p : ui::cloudPresets())
+        if (p.vision) { vlabels.push_back(p.label.c_str()); vps.push_back(&p); }
+    for (const auto& p : ui::localPresets())
+        if (p.vision) { vlabels.push_back(p.label.c_str()); vps.push_back(&p); }
+    int vsel = 0;
+    for (int i = 1; i < (int)vps.size(); ++i)
+        if (vps[i] && vps[i]->id == settings.expVisionModel) vsel = i;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##expvispreset", &vsel, vlabels.data(), (int)vlabels.size()) && vsel > 0 &&
+        vps[vsel]) {
+        const ui::LocalPreset* p = vps[vsel];
+        std::strncpy(settings.expVisionModel, p->id.c_str(), sizeof(settings.expVisionModel) - 1);
+        std::strncpy(settings.expVisionBaseUrl, p->baseUrl.c_str(),
+                     sizeof(settings.expVisionBaseUrl) - 1);
+        // Prefill the credential from the preset's OWN service slot. Blanket-copying cloudKey
+        // here shipped an EMPTY key for every Moonshot pick (the Kimi credential lives in
+        // keys.moonshot), and the core then fell back to the "lm-studio" placeholder — a
+        // guaranteed HTTP 401 that surfaced as stop_reason=provider_auth.
+        const char* svc = ui::cloudServiceKey(p->baseUrl);
+        const char* src = "";
+        if (!ui::baseUrlIsLoopback(p->baseUrl)) {
+            if (std::strcmp(svc, "moonshot") == 0) src = settings.moonshotKey;
+            else src = settings.cloudKey;
+        }
+        std::memset(settings.expVisionKey, 0, sizeof(settings.expVisionKey));
+        std::strncpy(settings.expVisionKey, src, sizeof(settings.expVisionKey) - 1);
+    }
+    ImGui::TextUnformatted("Model id");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##expvismodel", settings.expVisionModel, sizeof(settings.expVisionModel));
+    ImGui::TextUnformatted("Endpoint (base URL)");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##expvisbase", settings.expVisionBaseUrl, sizeof(settings.expVisionBaseUrl));
+    ImGui::TextUnformatted("API key (blank for a local endpoint)");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##expviskey", settings.expVisionKey, sizeof(settings.expVisionKey),
+                     ImGuiInputTextFlags_Password);
+    helpMarker("Local: LM Studio / Ollama / vLLM (loopback, no key needed). Cloud: a vision "
+               "model endpoint + its API key (refused under Offline mode).");
+    // A remote endpoint with no key can only 401, and the core then SKIPS the split silently
+    // (review falls back to the command model). Say so here instead of letting it look enabled.
+    if (!settings.expVisionKey[0] && !ui::baseUrlIsLoopback(settings.expVisionBaseUrl)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+        ImGui::TextWrapped("No API key for this cloud vision endpoint — the split is skipped "
+                           "and the command model handles vision.");
+        ImGui::PopStyleColor();
+    }
 }
 
 // ---- agent.* memory/learning knobs (config.json) -----------------------------
@@ -4332,8 +4436,8 @@ static void drawSettingsContextTab(AppState& st, float S) {
 }  // namespace (skills/context editors)
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
-// Tab indices: 0=Appearance 1=General 2=AI 3=Providers 4=Benchmarks 5=Prompts
-// 6=Experimental (Agent tab merged into AI)
+// Tab indices: 0=Appearance 1=General 2=AI 3=Providers. Benchmarks / Prompts / Agent /
+// Experimental were absorbed by AI, so every one of their rows targets tab 2.
 // One entry per prominent field/section; labels mirror the modal's visible text.
 const SettingsEntry kSettingsEntries[] = {
     // Appearance (tab 0)
@@ -4433,13 +4537,17 @@ const SettingsEntry kSettingsEntries[] = {
     { "Run behavior",             "AI",           2 },
     { "Maintenance",              "AI",           2 },
     { "Max subagent nesting",     "AI",           2 },
-    // Experimental (tab 6 — Agent tab removed)
-    { "Vision review model",      "Experimental",  4 },
-    { "Model routing",            "Experimental",  4 },
-    { "Seek-CAD split",           "Experimental",  4 },
-    { "Parametric sequence mode", "Experimental",  4 },
-    { "CAD sequence mode",        "Experimental",  4 },
-    { "Feature sequence",         "Experimental",  4 },
+    // Vision routing + parametric sequence (absorbed from the retired Experimental tab)
+    { "Vision review model",      "AI",           2 },
+    { "Vision routing",           "AI",           2 },
+    { "Vision & spatial routing", "AI",           2 },
+    { "Spatial model",            "AI",           2 },
+    { "Seek-CAD split",           "AI",           2 },
+    { "Parametric sequence mode", "AI",           2 },
+    { "CAD sequence mode",        "AI",           2 },
+    { "Feature sequence",         "AI",           2 },
+    { "Monolithic solid",         "AI",           2 },
+    { "Experimental",             "AI",           2 },
 };
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
@@ -4523,11 +4631,35 @@ void drawSettingsModal(AppState& st, bool busy) {
             st.pendingPromptRole.clear();
             jumpToPrompts = true;
         }
+        // Which AI sub-tab a jump should land on (-1 = leave the last one selected). Declared
+        // out here because the legacy-index remap below runs BEFORE the tab bar is built.
+        static int s_aiSubJump = -1;
         // openSettingsTab: jump to a specific tab requested by the command search widget.
         int jumpToTab = -1;
         if (st.openSettingsTab >= 0) {
             jumpToTab          = st.openSettingsTab;
             st.openSettingsTab = -1;
+        }
+        // Tabs are 0=Appearance 1=General 2=AI 3=Providers. Every retired tab index folds onto
+        // AI and selects the sub-tab that absorbed it: Benchmarks(4), Prompts(5), Agent(6),
+        // Experimental(7 — its two knobs now live on Roles and Harness). This MUST run before
+        // the tab bar: when it sat after, a legacy index selected nothing on the frame it
+        // arrived and the jump was silently dropped.
+        if (jumpToTab >= 4) {
+            if (jumpToTab == 4) s_aiSubJump = 5;       // Benchmarks
+            else if (jumpToTab == 5) s_aiSubJump = 2;  // Prompts
+            else if (jumpToTab == 7) s_aiSubJump = 1;  // Experimental -> Roles
+            jumpToTab = 2;
+        }
+        if (jumpToPrompts) {
+            s_aiSubJump = 2;
+            jumpToTab = 2;
+        }
+        // wantSettings (screenshot/automation shot) opens the AI tab.
+        static bool s_wantSettingsTabDone = false;
+        if (st.wantSettings && !s_wantSettingsTabDone) {
+            s_wantSettingsTabDone = true;
+            if (jumpToTab < 0) jumpToTab = 2;
         }
 
         // Sticky tab bar: fixed header region (tabs) + scrolling body per tab.
@@ -4938,16 +5070,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
-            // ---- AI tab: unified hub ----
-            // Tab indices: 0=Appearance 1=General 2=AI 3=Providers 4=Experimental
-            static int s_aiSubJump = -1;
+            // ---- AI tab: unified hub (absorbed Benchmarks / Prompts / Agent / Experimental) ----
+            // Tab indices: 0=Appearance 1=General 2=AI 3=Providers. s_aiSubJump is resolved
+            // above, before the tab bar, so a jump lands on the right sub-tab the same frame.
             if (ImGui::BeginTabItem("AI", nullptr,
-                                    (jumpToTab == 2 || jumpToPrompts) ? ImGuiTabItemFlags_SetSelected
-                                                                     : ImGuiTabItemFlags_None)) {
+                                    (jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
+                                                     : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_ai");
-                if (jumpToPrompts && s_aiSubJump < 0) s_aiSubJump = 2;  // Prompts sub-tab
-                if (jumpToTab == 4 && s_aiSubJump < 0) s_aiSubJump = 5;  // Benchmarks
-                if (jumpToTab == 5 && s_aiSubJump < 0) s_aiSubJump = 2;  // Prompts (legacy)
 
                 if (ImGui::BeginTabBar("##ai_sub", ImGuiTabBarFlags_FittingPolicyScroll)) {
                     auto subFlags = [](int idx) {
@@ -4980,8 +5109,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                     if (ImGui::BeginTabItem("Roles", nullptr, subFlags(1))) {
                         // Model pickers first (compact table).
                         settingsGlassSectionBegin("##ai_model_roles", "Model roles");
-                drawModelRolesSection(st, sc);
-                settingsGlassSectionEnd();
+                        drawModelRolesSection(st, sc);
+                        settingsGlassSectionEnd();
+
+                        settingsGlassSectionBegin("##ai_vision_routing",
+                                                  "Vision & spatial routing");
+                        drawVisionRoutingSection(st, sc);
+                        settingsGlassSectionEnd();
                         ImGui::Dummy(ImVec2(0, 8.0f * sc));
                         {
                             static bool s_efOpen = false;
@@ -5743,117 +5877,6 @@ void drawSettingsModal(AppState& st, bool busy) {
             }
 
             // --- end C22b marked block ---
-            // Agent tab removed — run behavior lives on AI. wantSettings shot jumps to AI.
-            static bool s_wantSettingsTabDone = false;
-            bool wantSettingsSel = st.wantSettings && !s_wantSettingsTabDone;
-            if (wantSettingsSel) s_wantSettingsTabDone = true;
-            // Legacy: Agent(6)/Prompts(5)/Benchmarks(4) → AI(2). Experimental is tab 4.
-            if (wantSettingsSel && jumpToTab < 0) jumpToTab = 2;
-            if (jumpToTab == 4 || jumpToTab == 5 || jumpToTab == 6) {
-                if (jumpToTab == 4) s_aiSubJump = 5;  // Benchmarks (after Behavior fold)
-                if (jumpToTab == 5) s_aiSubJump = 2;  // Prompts
-                jumpToTab = 2;
-            }
-            if (jumpToTab == 7) jumpToTab = 4;
-
-            // ---- Experimental tab: research-backed opt-in AI features ----
-            if (ImGui::BeginTabItem("Experimental", nullptr,
-                                    (jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
-                settingsTabBodyBegin("##tab_experimental");
-                dimText("Opt-in, default-off features from the model/provider research. All run "
-                        "fully local (ITAR-safe) and are additive — off = the standard copilot.");
-
-                // --- Model routing: command model vs. vision/spatial model ---
-                settingsSectionHeader("Model routing", /*first=*/true);
-
-                // Command model = the active main provider/model (emits + parses the CAD ops). It's
-                // chosen in the AI tab / composer picker; shown here read-only for clarity.
-                ImGui::TextUnformatted("Command model (sends & parses CAD ops)");
-                helpMarker("The model that drives the agent loop: understands the request, plans, and "
-                           "emits/parses the CAD operations. Pick it in the AI tab or the composer's "
-                           "model chip. Shown here so you can see both routes side by side.");
-                {
-                    char cm[600];
-                    std::snprintf(cm, sizeof(cm), "   %s  \xc2\xb7  %s",
-                                  ui::providerLabel(settings.provider),
-                                  settings.model[0] ? settings.model : "(default)");
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.accent[0],
-                                          ui::palette.accent[1], ui::palette.accent[2], 1));
-                    ImGui::TextUnformatted(cm);
-                    ImGui::PopStyleColor();
-                }
-
-                ImGui::Dummy(ImVec2(0, 6 * sc));
-                ImGui::Checkbox("Route vision & spatial reasoning through a separate model",
-                                &settings.expVisionReview);
-                helpMarker("When on, a vision model judges the rendered viewport during the "
-                           "review/fix stages (spatial awareness), while the command model above "
-                           "plans and emits ops — the Seek-CAD split. It can be local (ITAR-safe) or "
-                           "a cloud vision model (e.g. Qwen-VL). When off, the command model handles "
-                           "vision too (if it supports images). Refused under Offline mode if cloud.");
-                dimText("Command model emits ops; this vision model sees the screenshot and drives fixes.");
-                if (settings.expVisionReview) {
-                    ImGui::Dummy(ImVec2(0, 2 * sc));
-                    ImGui::TextUnformatted("Vision / spatial model");
-                    // Vision-capable presets: cloud (Qwen-VL via OpenRouter/DashScope) + local.
-                    std::vector<const char*> vlabels;
-                    std::vector<const ui::LocalPreset*> vps;
-                    vlabels.push_back("(custom / type below)");
-                    vps.push_back(nullptr);
-                    for (const auto& p : ui::cloudPresets()) if (p.vision) { vlabels.push_back(p.label.c_str()); vps.push_back(&p); }
-                    for (const auto& p : ui::localPresets()) if (p.vision) { vlabels.push_back(p.label.c_str()); vps.push_back(&p); }
-                    int vsel = 0;
-                    for (int i = 1; i < (int)vps.size(); ++i)
-                        if (vps[i] && vps[i]->id == settings.expVisionModel) vsel = i;
-                    ImGui::SetNextItemWidth(-1);
-                    if (ImGui::Combo("##expvispreset", &vsel, vlabels.data(), (int)vlabels.size()) &&
-                        vsel > 0 && vps[vsel]) {
-                        const ui::LocalPreset* p = vps[vsel];
-                        std::strncpy(settings.expVisionModel, p->id.c_str(), sizeof(settings.expVisionModel) - 1);
-                        std::strncpy(settings.expVisionBaseUrl, p->baseUrl.c_str(), sizeof(settings.expVisionBaseUrl) - 1);
-                        // Cloud vision preset => prefill the cloud key; local => clear (optional key).
-                        bool isCloud = std::strcmp(ui::cloudServiceKey(p->baseUrl), "cloud") != 0 ||
-                                       p->baseUrl.rfind("http://localhost", 0) != 0;
-                        std::strncpy(settings.expVisionKey,
-                                     isCloud && settings.cloudKey[0] ? settings.cloudKey : "",
-                                     sizeof(settings.expVisionKey) - 1);
-                    }
-                    ImGui::TextUnformatted("Model id");
-                    ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##expvismodel", settings.expVisionModel,
-                                     sizeof(settings.expVisionModel));
-                    ImGui::TextUnformatted("Endpoint (base URL)");
-                    ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##expvisbase", settings.expVisionBaseUrl,
-                                     sizeof(settings.expVisionBaseUrl));
-                    ImGui::TextUnformatted("API key (blank for a local endpoint)");
-                    ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##expviskey", settings.expVisionKey, sizeof(settings.expVisionKey),
-                                     ImGuiInputTextFlags_Password);
-                    helpMarker("Local: LM Studio / Ollama / vLLM (loopback, no key needed). Cloud: a "
-                               "vision model endpoint + its API key (refused under Offline mode).");
-                }
-
-                // --- Parametric sequence mode (DeepCAD / CAD-Coder direction) ---
-                settingsSectionHeader("Parametric sequence mode (experimental)");
-                ImGui::Checkbox("Prefer an editable feature sequence over a monolithic solid",
-                                &settings.expCadSequenceMode);
-                helpMarker("Nudges the modeler to build the part as an ordered sequence of "
-                           "individually editable features (sketch → extrude/revolve/loft/sweep → "
-                           "fillet/chamfer/hole/pattern) that reconstructs a clean design history, "
-                           "rather than one fused solid — inspired by the DeepCAD / CAD-Coder "
-                           "command-sequence research. Prompt-level steering today; a dedicated "
-                           "sequence-generation model is future work (see docs/EXPERIMENTAL_AI.md).");
-                dimText("Keeps generated parts editable as a real feature tree, not a dead solid.");
-
-                ImGui::Dummy(ImVec2(0, 8 * sc));
-                dimText(("Saved to " + configPath() + " under \"experimental\". Open-weight "
-                         "model presets for your main provider live under AI → Local.")
-                            .c_str());
-                settingsTabBodyEnd();
-                ImGui::EndTabItem();
-            }
             ImGui::EndTabBar();
         }
         ImGui::EndChild();

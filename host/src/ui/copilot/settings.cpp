@@ -142,17 +142,11 @@ void refreshModelAvailability(AppState& st, bool force) {
     // Previously this early-returned whenever a cloud provider (OpenRouter / DashScope / ...) was
     // active — st.settings.baseUrl is then a remote URL — which is exactly why local models were
     // invisible until the user "poked around in settings" and selected Local.
-    auto isLoopback = [](const char* u) {
-        std::string v = u ? u : "";
-        return v.find("localhost") != std::string::npos ||
-               v.find("127.0.0.1") != std::string::npos ||
-               v.find("0.0.0.0") != std::string::npos || v.find("[::1]") != std::string::npos;
-    };
     // When the active base_url IS loopback, probe it (honors a custom local port). Otherwise a
     // cloud provider is active, so its base_url isn't the local one — fall back to the default LM
     // Studio endpoint so local discovery still happens. (A non-default local port is only
     // auto-found while the Local provider is the active one; the default covers the common case.)
-    const bool activeLoopback = isLoopback(s.baseUrl);
+    const bool activeLoopback = ui::baseUrlIsLoopback(s.baseUrl);
     dispatch(ui::PROV_LOCAL,
              activeLoopback ? s.baseUrl : "http://localhost:1234/v1",
              activeLoopback ? s.apiKey : "",
@@ -1918,11 +1912,7 @@ void drawModelDropdown(AppState& st, bool busy) {
                 // Point base_url back at the local endpoint so the run hits LM Studio, not the cloud
                 // (a local model id sent to the cloud 403s). Preserve an already-loopback base_url so
                 // a custom local port survives.
-                std::string bu = st.settings.baseUrl;
-                bool loop = bu.find("localhost") != std::string::npos ||
-                            bu.find("127.0.0.1") != std::string::npos ||
-                            bu.find("0.0.0.0") != std::string::npos ||
-                            bu.find("[::1]") != std::string::npos;
+                bool loop = ui::baseUrlIsLoopback(st.settings.baseUrl);
                 if (!loop)
                     std::strncpy(st.settings.baseUrl,
                                  lp == ui::PROV_LLAMACPP ? "http://127.0.0.1:1234/v1"

@@ -94,6 +94,17 @@ inline const char* providerCatKey(int provider) {
     }
 }
 
+// True when a base URL points at this machine (LM Studio / Ollama / vLLM / managed llama.cpp).
+// Loopback endpoints need no credential; every other endpoint is a cloud service whose key must
+// come from the matching keys.* slot. Substring match, not a URL parse: base URLs here are
+// user-typed and may lack a scheme, and a host that merely CONTAINS "localhost" is still local.
+inline bool baseUrlIsLoopback(const std::string& base_url) {
+    return base_url.find("localhost") != std::string::npos ||
+           base_url.find("127.0.0.1") != std::string::npos ||
+           base_url.find("0.0.0.0") != std::string::npos ||
+           base_url.find("[::1]") != std::string::npos;
+}
+
 // Map a cloud base URL to its service category key (OpenRouter / Alibaba / DeepSeek / generic).
 inline const char* cloudServiceKey(const std::string& base_url) {
     if (base_url.find("openrouter.ai") != std::string::npos) return "openrouter";
@@ -101,6 +112,34 @@ inline const char* cloudServiceKey(const std::string& base_url) {
     if (base_url.find("deepseek.com") != std::string::npos) return "deepseek";
     if (base_url.find("moonshot.ai") != std::string::npos) return "moonshot";
     return "cloud";
+}
+
+// Cloud-slot service key -> the wire provider NAME the core's resolve_provider(name, cfg, env)
+// expects. "alibaba" is the picker/category identity; its resolve_provider id is the bridge
+// catalog's "alibaba-coding-plan". "moonshot" keeps its first-class NATIVE branch
+// (core/agent/config.cpp), and an unclassified cloud endpoint stays the generic OpenAI-compatible
+// descriptor keyed by base_url. Everything else is already an OMP bridge id. Exhaustive over
+// cloudServiceKey()'s range — literals only, so the result never dangles.
+inline const char* cloudServiceWireName(const std::string& key) {
+    if (key == "openrouter") return "openrouter";
+    if (key == "alibaba") return "alibaba-coding-plan";
+    if (key == "deepseek") return "deepseek";
+    if (key == "moonshot") return "moonshot";
+    if (key == "amazon-bedrock") return "amazon-bedrock";
+    if (key == "azure") return "azure";
+    if (key == "google-antigravity") return "google-antigravity";
+    if (key == "aimlapi") return "aimlapi";
+    return "openai";
+}
+
+// True when the cloud slot's OWN api-key field holds this service's credential. False for the
+// bridge-catalog services signed in under Settings -> Providers: their credential lives in the
+// bridge's AuthStorage, and forwarding an unrelated key from the SHARED cloud slot would defeat
+// the bridge's own lookup (vendor/omp/bridge/src/bridge.ts handleComplete falls back to
+// authStorage.getApiKey only when no apiKey is passed).
+inline bool cloudServiceUsesLocalKey(const std::string& key) {
+    return key != "amazon-bedrock" && key != "azure" && key != "google-antigravity" &&
+           key != "aimlapi";
 }
 
 inline const char* categoryLabel(const std::string& key) {
@@ -117,6 +156,16 @@ inline const char* categoryLabel(const std::string& key) {
     if (key == "kimi-code") return "Kimi Code (subscription)";
     if (key == "zenmux") return "ZenMux";
     return "Cloud API";
+}
+
+// providerLabel() for a slot, refined by its endpoint. PROV_CLOUDCOMPAT is ONE slot shared by
+// every base_url-keyed service, so its generic "OpenRouter / Cloud API" label reads as a lie
+// whenever the active endpoint is Moonshot / DeepSeek / DashScope — name the real service
+// instead. Every other slot has a fixed identity and falls through to providerLabel().
+inline const char* providerLabelForEndpoint(int provider, const char* base_url) {
+    if (provider == PROV_CLOUDCOMPAT && base_url && base_url[0])
+        return categoryLabel(cloudServiceKey(base_url));
+    return providerLabel(provider);
 }
 
 // The built-in catalog of KNOWN cloud models. Local/llama.cpp models are discovered live

@@ -1308,10 +1308,20 @@ void ScenarioRunner::runAppearance(AppState& st) {
             std::fflush(stdout);
             apSettle = kSettle; ++apStep; break;
         }
-        case 1: {  // open Settings jumped to the Appearance tab (first tab, index 0)
+        case 1: {  // open Settings, jumped to the Appearance tab (index 0) by default.
+            // CHUDWARE_SHOT_SETTINGS_TAB overrides the target index so this scenario doubles as
+            // the capture path for any Settings tab (including the retired indices, which the
+            // modal folds onto AI + the sub-tab that absorbed them).
+            const char* tabEnv = std::getenv("CHUDWARE_SHOT_SETTINGS_TAB");
+            int tab = 0;
+            if (tabEnv && tabEnv[0]) {
+                char* end = nullptr;
+                long v = std::strtol(tabEnv, &end, 10);
+                if (end != tabEnv && v >= 0 && v < 32) tab = (int)v;
+            }
             st.openSettings = true;
-            st.openSettingsTab = 0;
-            std::printf("appearance: settings modal opened on Appearance tab\n");
+            st.openSettingsTab = tab;
+            std::printf("appearance: settings modal opened on tab %d\n", tab);
             std::fflush(stdout);
             apSettle = kSettle * 2; ++apStep; break;  // let the modal + glass preview settle
         }

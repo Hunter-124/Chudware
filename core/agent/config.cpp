@@ -686,9 +686,10 @@ json resolve_review_provider(const json& cfg, const json& env) {
     bool enabled = vr.contains("enabled") && vr["enabled"].is_boolean() && vr["enabled"].get<bool>();
     if (!enabled) return json(nullptr);
 
-    // The review judge is a LOCAL OpenAI-compatible vision endpoint (the Seek-CAD use case: a
-    // self-hosted Qwen2.5-VL). Synthesize the minimal cfg resolve_provider expects and reuse ALL of
-    // its offline-safety logic — so an offline run still refuses a non-loopback review endpoint.
+    // The review judge is an OpenAI-compatible vision endpoint: either LOCAL (the Seek-CAD use
+    // case: a self-hosted Qwen2.5-VL) or a cloud vision model. Synthesize the minimal cfg
+    // resolve_provider expects and reuse ALL of its offline-safety logic — so an offline run
+    // still refuses a non-loopback review endpoint.
     std::string base_url = vr.contains("base_url") && vr["base_url"].is_string() &&
                                    !vr["base_url"].get<std::string>().empty()
                                ? vr["base_url"].get<std::string>()
@@ -697,18 +698,52 @@ json resolve_review_provider(const json& cfg, const json& env) {
                                 !vr["model"].get<std::string>().empty()
                             ? vr["model"].get<std::string>()
                             : std::string("qwen2.5-vl-7b-instruct");
-    std::string api_key = vr.contains("api_key") && vr["api_key"].is_string() &&
-                                  !vr["api_key"].get<std::string>().empty()
+    std::string api_key = vr.contains("api_key") && vr["api_key"].is_string()
                               ? vr["api_key"].get<std::string>()
-                              : std::string("lm-studio");
+                              : std::string();
+
+    // Classify the endpoint. A recognised cloud service routes through its OWN provider name so
+    // the native branch applies (Moonshot: wire-id alias normalization + the kimi-k3 reasoning
+    // ladder), and its credential is looked up in that service's `keys.*` slot when the vision
+    // row carries none of its own. Without this, a Moonshot vision endpoint was resolved as
+    // generic "openai" and handed the literal "lm-studio" placeholder below — a guaranteed HTTP
+    // 401 that surfaced as stop_reason=provider_auth.
+    const std::string b = lower(base_url);
+    auto has = [&](const char* needle) { return b.find(needle) != std::string::npos; };
+    const bool loopback = host_is_loopback(base_url);
+    std::string name = "openai";
+    const char* key_slot = nullptr;
+    if (has("moonshot.ai")) {
+        name = "moonshot";
+        key_slot = "moonshot";
+    } else if (!loopback) {
+        // OpenRouter / DashScope / DeepSeek / any other OpenAI-compatible cloud endpoint: the
+        // generic descriptor keyed by base_url is correct, but the credential still comes from
+        // the shared cloud slot when the vision row has none.
+        key_slot = has("openrouter.ai") ? "openrouter" : "cloud_compat";
+    }
+    if (api_key.empty() && key_slot && cfg.contains("keys") && cfg["keys"].is_object() &&
+        cfg["keys"].contains(key_slot) && cfg["keys"][key_slot].is_string())
+        api_key = cfg["keys"][key_slot].get<std::string>();
+    if (api_key.empty()) {
+        if (!loopback)
+            // A remote endpoint with no resolvable credential can only 401. Refuse here so
+            // apply_experimental SKIPS the split and review falls back to the main provider,
+            // instead of killing the run with an opaque provider_auth.
+            return json{{"error", "vision review endpoint '" + base_url +
+                                      "' has no API key (Settings -> AI -> Roles -> Vision & "
+                                      "spatial routing, or the matching provider key)"}};
+        api_key = "lm-studio";  // loopback servers ignore it but require the header
+    }
+
     json sub = json{
-        {"provider", "openai"},
+        {"provider", name},
         {"model", model},
         {"api_key", api_key},
         {"offline_mode", offline_enabled(cfg)},  // inherit the ambient ITAR guard
         {"openai", {{"base_url", base_url}, {"vision", true}}},
     };
-    return resolve_provider(std::string("openai"), sub, env);
+    return resolve_provider(name, sub, env);
 }
 
 json apply_experimental(json resolved_main, const json& cfg, const json& env) {

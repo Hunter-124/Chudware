@@ -319,7 +319,10 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     }
     // Provider name from the shared registry (covers every ProviderIndex incl. bridge
     // providers like ZenMux); the old hardcoded 0-6 chain mislabeled newer slots "Local".
-    const char* provName = ui::providerLabel(st.settings.provider);
+    // Endpoint-refined so the shared cloud slot names the ACTUAL service (Moonshot / DeepSeek /
+    // DashScope) instead of reading "OpenRouter / Cloud API" for all of them.
+    const char* provName =
+        ui::providerLabelForEndpoint(st.settings.provider, st.settings.baseUrl);
     std::string ptxt = std::string(provName) + "  /  " +
                        (st.settings.model[0] ? st.settings.model : "default") +
                        (st.settings.planMode ? "   [plan mode]" : "");

@@ -1,12 +1,12 @@
-// Chudware Settings modal (Appearance / General / AI / Providers / Experimental)
-// and the About modal. AI absorbs Prompts, Benchmarks, Tools, Roles.
+// Chudware Settings modal (Appearance / General / AI / Providers) and the About modal.
+// AI absorbs Prompts, Benchmarks, Tools, Roles, and the retired Experimental tab.
 #pragma once
 
 struct AppState;
 
 // Search-table entry for the unified command search (command_search.cpp).
 // One entry per notable settings field / section across the Settings tabs.
-// Tab indices: 0=Appearance 1=General 2=AI 3=Providers 4=Experimental
+// Tab indices: 0=Appearance 1=General 2=AI 3=Providers
 struct SettingsEntry {
     const char* label;     // search-visible text (what the user types to find this)
     const char* tab;       // Settings tab name, shown dim on the right in the search row

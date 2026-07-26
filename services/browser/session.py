@@ -69,13 +69,16 @@ def _env_float(name: str, default: float) -> float:
 #: best-effort — a chatty page that never idles just gets snapshotted at the
 #: deadline (still far better than the pre-render empty shell).
 #:
-#: This is NOT a Python sleep: it rides to the CEF daemon as ``settle_ms`` and is
-#: burned there by an unconditional ``pump(settle_ms)`` (cef_headless.cpp). The
-#: daemon's fetch reply carries no DOM-ready signal and its protocol has no poll
-#: verb, so this side cannot early-out of it — Python-side "poll until the HTML
-#: stops growing" would cost one full re-navigation per poll, strictly worse.
-#: Shortening the default would silently truncate the SPA adapters that need the
-#: whole dwell, so the default stands at 8.0s and the env var is how you tune it.
+#: This is NOT a Python sleep: it rides to the CEF daemon as ``settle_ms``. Since
+#: the daemon gained an adaptive dwell (cef_headless.cpp), it is a CEILING rather
+#: than a fixed cost — the daemon probes the serialized DOM every 100 ms and ends
+#: the dwell early once the content hash has been byte-identical for
+#: ``CHUDWARE_CEF_QUIET_MS`` (2000) AND CEF reported main-frame load-end AND
+#: ``CHUDWARE_CEF_MIN_SETTLE_MS`` (400) elapsed. A quiet page therefore costs far
+#: less than 8 s while a chatty SPA still gets the whole window, so the default
+#: stays at 8.0s: lowering it can only truncate the adapters that need it, and no
+#: longer buys anything on the pages that do not. ``CHUDWARE_CEF_ADAPTIVE_SETTLE=0``
+#: restores the old flat pump.
 DEFAULT_RENDER_SETTLE_S = _env_float("CHUDWARE_BROWSER_SETTLE_S", 8.0)
 
 #: Opt-in per-fetch timing breakdown (``CHUDWARE_BROWSER_TIMING=1``). Resolved

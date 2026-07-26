@@ -4218,3 +4218,53 @@ settle work is tracked separately.
 
 Gates: `./build.sh` green, `check.py` 6/6, 352 passed / 1 skipped, `gui_lint theme|icons` clean,
 `CHUDWARE_SHOT` smoke clean for parts/workspaces/m1/asm/drawing/plm.
+
+### CEF daemon concurrency + adaptive settle (2026-07-26)
+
+The measurement in V3.1 blamed the CEF daemon, and it was right. Six-site concurrent fan-out:
+**51.36 s -> 3.30 s (15.6x)**, measured back-to-back on one binary with cache-busted URLs.
+Sequential throughput improved 247.7 s -> 75.2 s (3.3x) from the settle change alone.
+
+**Thread model, established before editing.** `cef_app.cpp:261-263` runs
+`multi_threaded_message_loop=0` + `external_message_pump=1` + `--single-process`, and
+`cef_app.h:115-117` restricts `CefDoMessageLoopWork()` to the main application thread — so K
+worker threads each pumping their own browser is FORBIDDEN and was not implemented. But
+`cef_request_context.h:101-105` explicitly contemplates N concurrent browsers under
+`--single-process` (they share the first request context; what is fatal is N live *contexts*).
+So: one pumping thread, N browsers.
+
+**Accept loop.** `cef_daemon.cpp` no longer runs a request to completion before accepting the
+next. `cef_headless.cpp` gained a cooperative API (`headless_fetch_start/poll/take`,
+`headless_pump`) whose `FetchJob` is a non-blocking state machine that never pumps itself; the
+daemon pumps ONCE per turn for the whole in-flight set and answers each connection from its own
+`IpcConn`. Browser pool is now per-profile `vector<PoolEntry>`. Concurrency capped at
+`CHUDWARE_CEF_MAX_INFLIGHT` (6, clamped 1..16); past that requests queue. Every connection is
+answered exactly once — success, nav failure, per-request deadline, queue timeout, or "no
+browser" — all in the pre-existing failure shape. An aborted job's browser is parked 5 s before
+reuse, which is the only path by which one request could ever observe another's DOM.
+`headless_interact`/`headless_login_probe` take an exclusive slot and are always released dirty.
+
+**Adaptive settle.** The originally specified early-out (HTML *length* stable across two 100 ms
+slices) was proven UNSAFE and rejected: against a page appending DOM at t=200/1500/3000 ms it
+returned at 0.60 s having silently dropped two thirds of the content. Shipped instead: probe
+every 100 ms through the SAME `CefFrame::GetSource` path the final capture uses (one extraction
+— on early-out the probe's HTML *is* the returned document), track an FNV-1a 64 content hash,
+and end early only when the hash has been unchanged for `CHUDWARE_CEF_QUIET_MS` (2000) AND CEF
+reported main-frame load-end AND `CHUDWARE_CEF_MIN_SETTLE_MS` (400) elapsed. The ceiling remains
+exactly `settle_ms`, so no adapter that needs the full dwell can be truncated. Same test after
+the fix: 5.20 s adaptive vs 8.17 s flat, byte-identical 348-char document with all four markers.
+
+**Verification.** Per-site marker assertions ("Example Domain", "IANA-managed Reserved
+Domains", …) plus distinct SHA1s at concurrency 1/2/6 — 6/6 OK, zero duplicate bodies, so no
+cross-request mixing. `CHUDWARE_CEF_MAX_INFLIGHT=1 CHUDWARE_CEF_ADAPTIVE_SETTLE=0` reproduces
+the old 50-52 s, confirming the restructure did not change serial semantics. 30-fetch leak
+check: RSS/fd growth is PRE-EXISTING (control within 7% RSS / 12% fd) — Chromium cache/socket
+pooling in a long-lived reused browser, not a per-request leak.
+
+Known pre-existing (flagged, not introduced): per-profile cookie isolation in the daemon is an
+illusion under `--single-process` — CEF ignores every request context after the first. The pool
+is keyed by profile but that keying is cosmetic today.
+
+Live end-to-end after all three passes: local search 0.15 s cold / 0.00 s warm; 12 part
+thumbnails 8.82 s cold, 0.6 ms warm; six vendor favicons 364 ms cold with 6/6 returned —
+including thk / traceparts / 3dcontentcentral, which never rendered before.

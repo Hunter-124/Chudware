@@ -16,7 +16,9 @@ import base64
 import hashlib
 import json
 import os
+import sqlite3
 import threading
+import time
 import urllib.request
 from typing import Any, Callable
 
@@ -363,6 +365,45 @@ def _filter_items(records: list[dict], p: dict, facet_defs: list[dict]) -> list[
     return items
 
 
+# ---- index status ------------------------------------------------------------------
+
+_INDEX_STATUS_FALLBACK: dict[str, Any] = {
+    "building": False, "built": True, "count": -1, "source": "unknown", "age_s": 0.0,
+}
+
+
+def _index_status() -> dict:
+    """Best-effort ``{building, built, count, source, age_s}`` from the parts hub.
+
+    Defensive on purpose: ``PartsHub.index_status`` is a newer addition, so an older
+    hub (or any bootstrap failure) reports the "assume ready, count unknown" fallback
+    rather than sinking the search that asked.
+    """
+    out = dict(_INDEX_STATUS_FALLBACK)
+    try:
+        from services.parts import _get_hub
+        fn = getattr(_get_hub(), "index_status", None)
+        if fn is None:
+            return out
+        st = fn()
+        if isinstance(st, dict):
+            for k in ("building", "built", "count", "source", "age_s"):
+                if k in st:
+                    out[k] = st[k]
+    except Exception:  # noqa: BLE001 — status is advisory, never fatal
+        return dict(_INDEX_STATUS_FALLBACK)
+    return out
+
+
+def _parts_index_status(params: dict, _emit: Callable) -> dict:
+    """Worker method ``parts_index_status`` → parts-index build/freshness state.
+
+    Lets the GUI paint a "building index…" affordance instead of an empty pane while
+    the FTS index warms."""
+    return {"ok": True, **_index_status()}
+
+
+
 def _parts_search(params: dict, _emit: Callable) -> dict:
     """Instant local parts search.
 
@@ -402,8 +443,11 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
         records, notices = _split_notices(records)
         items = _filter_items(records, p, rt["facet_defs"])
         has_live = any(i["source"] == "live" for i in items)
+        idx = _index_status()
         return {"ok": True, "count": len(items), "has_live": has_live,
-                "results": items, "notices": notices}
+                "results": items, "notices": notices,
+                "index_building": bool(idx.get("building", False)),
+                "index_count": int(idx.get("count", -1))}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_search failed: {exc}"}
 
@@ -420,22 +464,228 @@ _live_jobs: dict[str, dict] = {}
 _live_lock = threading.Lock()
 _LIVE_JOB_CAP = 8  # keep the most-recent N jobs; drop stale tokens
 
+# ---- live vendor result cache -----------------------------------------------------
+#
+# A live fan-out is seconds per vendor. Re-running the same query 30s later used to
+# re-scrape everything, so the pane felt broken on a back-and-forth browse. This is a
+# bounded on-disk cache of the RAW record list each vendor returned, keyed on
+# (site, vendor_query, limit) — deliberately NOT on the GUI post-filters, so changing
+# price/material/vendor/source filters on the same query is still a cache hit and the
+# filters are re-applied fresh on every read.
+#
+# Every operation here is exception-proof: any sqlite/FS/JSON problem degrades to
+# "no cache" (scrape as before), never to a failed search.
+
+_VENDOR_CACHE_TABLE = "vendor_results"
+_VENDOR_CACHE_TRIM_EVERY_S = 60.0
+_vendor_cache_lock = threading.Lock()
+_vendor_cache_ready = False
+_vendor_cache_last_trim = 0.0
+
+
+def _vendor_cache_enabled() -> bool:
+    """Kill switch: ``CHUDWARE_VENDOR_CACHE=0`` disables reads *and* writes."""
+    v = str(os.environ.get("CHUDWARE_VENDOR_CACHE", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _vendor_cache_env_num(name: str, default: float) -> float:
+    try:
+        val = float(str(os.environ.get(name, "")).strip())
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
+def _vendor_cache_ttl_s() -> float:
+    return _vendor_cache_env_num("CHUDWARE_VENDOR_CACHE_TTL_S", 900.0)
+
+
+def _vendor_cache_max_rows() -> int:
+    return int(_vendor_cache_env_num("CHUDWARE_VENDOR_CACHE_MAX_ROWS", 2000.0))
+
+
+def _vendor_cache_path() -> Any:
+    from services import paths
+    cache_dir = paths.ROOT / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "vendor_results.sqlite"
+
+
+def _vendor_cache_conn() -> Any:
+    """Open a short-lived connection, creating the schema once per process.
+
+    One connection per operation: cache hits/misses happen at most once per vendor
+    scrape, and the fan-out runs on daemon threads where a shared sqlite handle
+    would need its own thread-affinity dance for no measurable gain.
+    """
+    global _vendor_cache_ready
+    conn = sqlite3.connect(str(_vendor_cache_path()), timeout=2.0)
+    if not _vendor_cache_ready:
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {_VENDOR_CACHE_TABLE} ("
+            "key TEXT PRIMARY KEY, site TEXT, query TEXT, "
+            "records_json TEXT, ts REAL, last_used REAL)")
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{_VENDOR_CACHE_TABLE}_last_used "
+            f"ON {_VENDOR_CACHE_TABLE}(last_used)")
+        conn.commit()
+        _vendor_cache_ready = True
+    return conn
+
+
+def _vendor_cache_key(site: str, query: str, limit: int) -> str:
+    return hashlib.blake2b(f"{site}\n{query}\n{limit}".encode("utf-8"),
+                           digest_size=16).hexdigest()
+
+
+def _vendor_cache_get(site: str, query: str, limit: int) -> list[dict] | None:
+    """Fresh cached records for this vendor query, or None (miss/expired/disabled)."""
+    if not _vendor_cache_enabled():
+        return None
+    key = _vendor_cache_key(site, query, limit)
+    try:
+        with _vendor_cache_lock:
+            conn = _vendor_cache_conn()
+            try:
+                row = conn.execute(
+                    f"SELECT records_json, ts FROM {_VENDOR_CACHE_TABLE} WHERE key=?",
+                    (key,)).fetchone()
+                if row is None:
+                    return None
+                now = time.time()
+                if now - float(row[1]) > _vendor_cache_ttl_s():
+                    conn.execute(f"DELETE FROM {_VENDOR_CACHE_TABLE} WHERE key=?", (key,))
+                    conn.commit()
+                    return None
+                recs = json.loads(row[0])
+                if not isinstance(recs, list):
+                    return None
+                conn.execute(f"UPDATE {_VENDOR_CACHE_TABLE} SET last_used=? WHERE key=?",
+                             (now, key))
+                conn.commit()
+                return [r for r in recs if isinstance(r, dict)]
+            finally:
+                conn.close()
+    except Exception:  # noqa: BLE001 — cache is an optimisation, never a failure mode
+        return None
+
+
+def _vendor_cache_put(site: str, query: str, limit: int, records: list[dict]) -> None:
+    """Store the raw records a vendor returned. Silent no-op on any failure."""
+    if not _vendor_cache_enabled():
+        return
+    global _vendor_cache_last_trim
+    key = _vendor_cache_key(site, query, limit)
+    try:
+        blob = json.dumps(records, separators=(",", ":"), default=str)
+    except Exception:  # noqa: BLE001 — unserialisable record → just don't cache it
+        return
+    try:
+        now = time.time()
+        with _vendor_cache_lock:
+            conn = _vendor_cache_conn()
+            try:
+                conn.execute(
+                    f"INSERT INTO {_VENDOR_CACHE_TABLE} "
+                    "(key, site, query, records_json, ts, last_used) VALUES (?,?,?,?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET records_json=excluded.records_json, "
+                    "ts=excluded.ts, last_used=excluded.last_used",
+                    (key, site, query, blob, now, now))
+                conn.commit()
+                # LRU trim, at most once a minute and only ever after a write.
+                if now - _vendor_cache_last_trim >= _VENDOR_CACHE_TRIM_EVERY_S:
+                    _vendor_cache_last_trim = now
+                    cap = _vendor_cache_max_rows()
+                    (rows,) = conn.execute(
+                        f"SELECT COUNT(*) FROM {_VENDOR_CACHE_TABLE}").fetchone()
+                    if int(rows) > cap:
+                        conn.execute(
+                            f"DELETE FROM {_VENDOR_CACHE_TABLE} WHERE key IN "
+                            f"(SELECT key FROM {_VENDOR_CACHE_TABLE} "
+                            "ORDER BY last_used ASC LIMIT ?)", (int(rows) - cap,))
+                        conn.commit()
+            finally:
+                conn.close()
+    except Exception:  # noqa: BLE001
+        return
+
+
+def vendor_cache_stats() -> dict:
+    """Diagnostics for the live-vendor result cache (rows, freshness, bounds)."""
+    ttl = _vendor_cache_ttl_s()
+    out: dict[str, Any] = {"ok": True, "enabled": _vendor_cache_enabled(),
+                           "ttl_s": ttl, "max_rows": _vendor_cache_max_rows(),
+                           "rows": 0, "fresh": 0, "stale": 0, "sites": {},
+                           "bytes": 0, "path": ""}
+    try:
+        path = _vendor_cache_path()
+        out["path"] = str(path)
+        out["bytes"] = path.stat().st_size if path.exists() else 0
+        cutoff = time.time() - ttl
+        with _vendor_cache_lock:
+            conn = _vendor_cache_conn()
+            try:
+                (rows,) = conn.execute(
+                    f"SELECT COUNT(*) FROM {_VENDOR_CACHE_TABLE}").fetchone()
+                (fresh,) = conn.execute(
+                    f"SELECT COUNT(*) FROM {_VENDOR_CACHE_TABLE} WHERE ts>=?",
+                    (cutoff,)).fetchone()
+                out["rows"] = int(rows)
+                out["fresh"] = int(fresh)
+                out["stale"] = int(rows) - int(fresh)
+                out["sites"] = {str(s): int(n) for s, n in conn.execute(
+                    f"SELECT site, COUNT(*) FROM {_VENDOR_CACHE_TABLE} GROUP BY site")}
+            finally:
+                conn.close()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"vendor cache unavailable: {exc}",
+                "hint": "The cache is optional — searches still work without it."}
+    return out
+
+
+def vendor_cache_purge(site: str | None = None) -> int:
+    """Drop cached vendor results (one site, or all). Returns rows deleted, 0 on error."""
+    try:
+        with _vendor_cache_lock:
+            conn = _vendor_cache_conn()
+            try:
+                if site:
+                    cur = conn.execute(
+                        f"DELETE FROM {_VENDOR_CACHE_TABLE} WHERE site=?", (site,))
+                else:
+                    cur = conn.execute(f"DELETE FROM {_VENDOR_CACHE_TABLE}")
+                conn.commit()
+                return int(cur.rowcount or 0)
+            finally:
+                conn.close()
+    except Exception:  # noqa: BLE001
+        return 0
+
 
 def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
     from services.parts import search as _search
-    # Flip this vendor's inline status to "loading" before the blocking scrape starts.
+    # Cache probe first (cheap, off-lock): a hit skips the scrape entirely, so this
+    # vendor never flashes "loading" and goes straight to "done".
+    cached = _vendor_cache_get(site, rt["vendor_query"], limit)
     with _live_lock:
         if job.get("cancelled"):
             return  # superseded/evicted before this site even started — skip the scrape
         v = job.get("vendors", {}).get(site)
         if v is not None:
-            v["status"] = "loading"
+            v["status"] = "done" if cached is not None else "loading"
     site_status = "done"
-    try:
-        recs = _search(rt["vendor_query"], domain="catalog", limit=limit, sites=[site])
-    except Exception:  # noqa: BLE001 — one vendor failing must not sink the others
-        recs = []
-        site_status = "error"
+    if cached is not None:
+        recs = cached
+    else:
+        try:
+            recs = _search(rt["vendor_query"], domain="catalog", limit=limit, sites=[site])
+        except Exception:  # noqa: BLE001 — one vendor failing must not sink the others
+            recs = []
+            site_status = "error"
+        else:
+            # Only a clean scrape is cacheable; an exception path must stay uncached.
+            _vendor_cache_put(site, rt["vendor_query"], limit, recs)
     with _live_lock:
         if job.get("cancelled"):
             return  # cancelled while the scrape was in flight — don't bother parsing
@@ -1098,6 +1348,7 @@ GUI_WORKER_METHODS: dict[str, Callable] = {
     "parts_list_categories": _parts_list_categories,
     "parts_taxonomy":        _parts_taxonomy,
     "parts_search":          _parts_search,
+    "parts_index_status":    _parts_index_status,
     "parts_search_live_start": _parts_search_live_start,
     "parts_search_live_poll":  _parts_search_live_poll,
     "parts_match_model":     _parts_match_model,

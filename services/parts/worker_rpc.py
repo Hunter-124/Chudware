@@ -77,7 +77,10 @@ WORKER_METHODS: dict[str, Callable] = {
 }
 
 # GUI-shaped methods for the Parts Library workspace (host/src/ui/parts/) —
-# categories, filtered search, vendor login/status, fetch queue, thumbnails.
+# categories, filtered search (``parts_search``), index build state
+# (``parts_index_status``), vendor login/status, fetch queue, thumbnails. The
+# ``parts_*`` table itself lives in gui_rpc.GUI_WORKER_METHODS (one source of
+# truth) and is merged into WORKER_METHODS here.
 try:
     from .gui_rpc import GUI_WORKER_METHODS as _GUI_METHODS
     WORKER_METHODS.update(_GUI_METHODS)

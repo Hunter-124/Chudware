@@ -1,7 +1,15 @@
 """SQLite FTS5 search index for the parts library — aicad.parts/1 (T-P1).
 
-Uses only stdlib sqlite3 (FTS5 module). The index is an in-memory database rebuilt
-from provider enumerations; it is also the lookup store for get() calls.
+Uses only stdlib sqlite3 (FTS5 module). The live index is always an in-memory
+database (fast, lock-free reads); it is also the lookup store for get() calls.
+
+Persistence (T-PL4)
+-------------------
+When constructed with a ``path`` the index can be snapshotted to / restored from
+an on-disk sqlite file, keyed by a caller-supplied *fingerprint* of everything
+that could change the record set.  :meth:`load_if_fresh` restores a matching
+snapshot with ZERO provider enumeration; :meth:`persist` writes one atomically.
+Both degrade to "no cache" on any error — a broken cache never breaks search.
 
 Schema
 ------
@@ -9,6 +17,9 @@ parts_fts (FTS5 virtual table):
     part_id TEXT, domain TEXT, title TEXT, standard TEXT, designation TEXT, text TEXT
 parts_meta (regular table):
     part_id TEXT PRIMARY KEY, record_json TEXT
+parts_cache_meta (regular table):
+    key TEXT PRIMARY KEY, value TEXT   -- fingerprint, built_at, record_count,
+                                       -- schema_version
 
 Ranking (contracts/parts.md §4):
     1. Exact designation match  (+1000)
@@ -17,10 +28,20 @@ Ranking (contracts/parts.md §4):
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
+import os
 import sqlite3
 import time
+from pathlib import Path
 from typing import Iterator
+
+log = logging.getLogger(__name__)
+
+# Bumped by hand whenever the on-disk table layout changes. A snapshot written
+# by a different schema version is discarded rather than migrated.
+_SCHEMA_VERSION = 1
 
 
 _CREATE_FTS = """
@@ -43,22 +64,50 @@ CREATE TABLE IF NOT EXISTS parts_meta (
 );
 """
 
+_CREATE_CACHE_META = """
+CREATE TABLE IF NOT EXISTS parts_cache_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
 _CREATE_IDX = "CREATE INDEX IF NOT EXISTS idx_parts_meta_domain ON parts_meta(domain);"
+
+
+def _new_memory_db() -> sqlite3.Connection:
+    """A fresh in-memory db shared across threads.
+
+    ``cached_statements=0`` is REQUIRED: PartsHub hands one index to many
+    worker threads, and pysqlite's per-connection statement cache is not
+    re-entrant — two threads running the same SQL would otherwise trample each
+    other's cursor ("another row available" / garbled rows).
+    """
+    conn = sqlite3.connect(":memory:", check_same_thread=False, cached_statements=0)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 class PartsIndex:
     """In-memory SQLite FTS5 index over all indexed CatalogProvider records.
 
     Rebuilt idempotently via :meth:`rebuild`; thread-safe for concurrent reads
-    after build (sqlite3 WAL is not needed since this is always :memory:).
+    after build (sqlite3 WAL is not needed since the live db is always
+    ``:memory:``).
+
+    ``path`` (optional) enables the on-disk snapshot cache: :meth:`persist`
+    writes the current index there atomically and :meth:`load_if_fresh`
+    restores it when the caller's fingerprint still matches.  ``None`` (the
+    default) is the historical pure in-memory behaviour.
     """
 
-    def __init__(self) -> None:
-        self._conn: sqlite3.Connection = sqlite3.connect(":memory:", check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+    def __init__(self, path: str | Path | None = None) -> None:
+        self._path: Path | None = Path(path).expanduser() if path else None
+        self._conn: sqlite3.Connection = _new_memory_db()
         self._build_schema()
         self._record_count: int = 0
         self._built_at: float = 0.0
+        self._fingerprint: str = ""
+        self._loaded_from_cache: bool = False
 
     # ------------------------------------------------------------------
     # Schema
@@ -69,37 +118,167 @@ class PartsIndex:
             self._conn.execute(_CREATE_META)
             self._conn.execute(_CREATE_IDX)
             self._conn.execute(_CREATE_FTS)
+            self._conn.execute(_CREATE_CACHE_META)
 
     # ------------------------------------------------------------------
     # Index population
     # ------------------------------------------------------------------
 
     def rebuild(self, record_iter: Iterator[dict]) -> int:
-        """Clear the index and repopulate from ``record_iter``. Returns count."""
-        conn = self._conn
+        """Clear the index and repopulate from ``record_iter``. Returns count.
+
+        Populates a NEW in-memory db and swaps it in only once the walk
+        completed: concurrent readers keep a consistent index throughout (and a
+        provider blowing up mid-walk leaves the previous index intact).
+        """
+        conn = _new_memory_db()
         with conn:
-            conn.execute("DELETE FROM parts_meta")
-            # For a plain FTS5 table, DROP and recreate is the reliable way to clear.
-            conn.execute("DROP TABLE IF EXISTS parts_fts")
+            conn.execute(_CREATE_META)
+            conn.execute(_CREATE_IDX)
             conn.execute(_CREATE_FTS)
+            conn.execute(_CREATE_CACHE_META)
 
         count = 0
         batch: list[tuple] = []
-        for rec in record_iter:
-            row = _record_to_row(rec)
-            if row is None:
-                continue
-            batch.append(row)
-            count += 1
-            if len(batch) >= 500:
+        try:
+            for rec in record_iter:
+                row = _record_to_row(rec)
+                if row is None:
+                    continue
+                batch.append(row)
+                count += 1
+                if len(batch) >= 500:
+                    _insert_batch(conn, batch)
+                    batch.clear()
+            if batch:
                 _insert_batch(conn, batch)
-                batch.clear()
-        if batch:
-            _insert_batch(conn, batch)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                conn.close()
+            raise
 
+        # Publish atomically; the outgoing connection is dropped, not closed,
+        # so an in-flight search finishes against its own snapshot.
+        self._conn = conn
         self._record_count = count
         self._built_at = time.time()
+        self._fingerprint = ""
+        self._loaded_from_cache = False
         return count
+
+    # ------------------------------------------------------------------
+    # On-disk snapshot cache
+    # ------------------------------------------------------------------
+
+    def load_if_fresh(self, fingerprint: str) -> bool:
+        """Restore the on-disk snapshot when it matches ``fingerprint``.
+
+        Returns True when the live index now holds the cached records (zero
+        provider enumeration needed).  A missing file, a schema/fingerprint
+        mismatch, a corrupt db or ANY error returns False — and best-effort
+        deletes the unusable file so the next :meth:`persist` starts clean.
+        The live index is left untouched on failure.
+        """
+        path = self._path
+        if path is None or not fingerprint:
+            return False
+        if not path.is_file():
+            return False
+
+        src: sqlite3.Connection | None = None
+        fresh: sqlite3.Connection | None = None
+        try:
+            src = sqlite3.connect(_read_only_uri(path), uri=True)
+            meta = {
+                str(k): str(v) for k, v in
+                src.execute("SELECT key, value FROM parts_cache_meta").fetchall()
+            }
+            if meta.get("schema_version") != str(_SCHEMA_VERSION):
+                raise _CacheMiss("schema_version mismatch")
+            if meta.get("fingerprint") != fingerprint:
+                raise _CacheMiss("fingerprint mismatch")
+            # Probe both stores so a truncated file / missing FTS5 module fails
+            # here rather than on the first user search.
+            count = int(src.execute("SELECT count(*) FROM parts_meta").fetchone()[0])
+            src.execute("SELECT part_id FROM parts_fts LIMIT 1").fetchone()
+
+            fresh = _new_memory_db()
+            src.backup(fresh)
+            # Sanity: the restored copy must answer the same queries.
+            fresh.execute("SELECT count(*) FROM parts_meta").fetchone()
+        except Exception as exc:  # noqa: BLE001 — a bad cache is never fatal
+            if not isinstance(exc, _CacheMiss):
+                log.debug("parts index cache unusable at %s: %s", path, exc)
+            with contextlib.suppress(Exception):
+                if fresh is not None:
+                    fresh.close()
+            with contextlib.suppress(Exception):
+                if src is not None:
+                    src.close()
+            self._discard_cache_file()
+            return False
+
+        with contextlib.suppress(Exception):
+            src.close()
+        # Swap the live connection WITHOUT closing the old one: a concurrent
+        # reader may still be iterating it. Dropping our reference lets sqlite3
+        # close it once that last cursor goes away.
+        self._conn = fresh
+        self._record_count = count
+        self._built_at = _as_float(meta.get("built_at"), time.time())
+        self._fingerprint = fingerprint
+        self._loaded_from_cache = True
+        return True
+
+    def persist(self, fingerprint: str) -> None:
+        """Atomically snapshot the live index to ``path`` under ``fingerprint``.
+
+        Builds into ``<path>.tmp`` via :meth:`sqlite3.Connection.backup` then
+        ``os.replace``s it into place.  Every OSError / sqlite error is
+        swallowed: failing to write the cache must never break search.
+        """
+        path = self._path
+        if path is None or not fingerprint:
+            return
+        tmp = path.with_suffix(".tmp")
+        dest: sqlite3.Connection | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            dest = sqlite3.connect(str(tmp))
+            self._conn.backup(dest)
+            with dest:
+                dest.execute(_CREATE_CACHE_META)
+                dest.executemany(
+                    "INSERT OR REPLACE INTO parts_cache_meta (key, value) VALUES (?, ?)",
+                    [
+                        ("schema_version", str(_SCHEMA_VERSION)),
+                        ("fingerprint", str(fingerprint)),
+                        ("built_at", repr(float(self._built_at or time.time()))),
+                        ("record_count", str(int(self._record_count))),
+                    ],
+                )
+            dest.close()
+            dest = None
+            os.replace(tmp, path)
+            self._fingerprint = fingerprint
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            log.debug("parts index cache write failed for %s: %s", path, exc)
+        finally:
+            if dest is not None:
+                with contextlib.suppress(Exception):
+                    dest.close()
+            if tmp.exists():
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+
+    def _discard_cache_file(self) -> None:
+        """Best-effort removal of an unusable snapshot (never raises)."""
+        if self._path is None:
+            return
+        with contextlib.suppress(OSError):
+            self._path.unlink()
 
     # ------------------------------------------------------------------
     # Search
@@ -222,10 +401,41 @@ class PartsIndex:
     def built_at(self) -> float:
         return self._built_at
 
+    @property
+    def cache_path(self) -> Path | None:
+        """The on-disk snapshot location, or None for a pure in-memory index."""
+        return self._path
+
+    @property
+    def fingerprint(self) -> str:
+        """Fingerprint of the last successful load/persist ("" when unknown)."""
+        return self._fingerprint
+
+    @property
+    def loaded_from_cache(self) -> bool:
+        """True when the current contents came from the on-disk snapshot."""
+        return self._loaded_from_cache
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class _CacheMiss(Exception):
+    """Internal: an expected (non-error) snapshot rejection."""
+
+
+def _read_only_uri(path: Path) -> str:
+    """sqlite3 read-only URI for ``path`` (handles spaces / odd characters)."""
+    return path.absolute().as_uri() + "?mode=ro"
+
+
+def _as_float(value: object, default: float) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
 
 def _normalize_domains(domain: str | list | tuple | None) -> list[str] | None:
     """Coerce a domain filter (str | list[str] | None) to a non-empty list or None."""

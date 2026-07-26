@@ -4125,3 +4125,51 @@ still wins. Also added `guardrail_blocked` to `node_runner._RETRY_REASONS` (anot
 satisfy a guardrail, so it is a retry, not an escalate). 36 tests in
 `services/agent/test_harness_integrity.py`; suites 2643 passed with the same 4 pre-existing
 failures as the stashed baseline; `scripts/check.py` 6/6 PASS.
+
+## Parts Library V3 — colour-coded liquid glass + three-layer caching (2026-07-26)
+
+Two efforts in one pass across `host/src/ui/parts/*` and `services/parts` + `services/browser`.
+
+**GUI.** `parts_widgets.h/.cpp` gained the workspace's colour vocabulary: `categoryTint(id)`
+(19 hand-picked taxonomy-root hues, children inheriting via the `root.child` id prefix, an
+FNV-1a hash hue for anything unmapped), `glassRow(...)` (borderRow's contract over a
+`glassCardWash` gradient + a 3dp hue rail + a hue `glassSelectionGlow`), and the
+`glassFieldBegin()`/`glassFieldEnd(tint)` pair that puts a gradient *behind* a framed ImGui
+widget by splitting the window draw list. Every pane now draws with them: the Categories tree
+(roots 32dp/emphasis 1.0, children 26dp/0.5, hue-tinted depth guides, the app pill scrollbar,
+and a `fitLabel()` ellipsis so a long root label can no longer run under the chevron — the
+"Adhesives & Consumables" clip), the Filters pane (all seven framed widgets, one tint derived
+from the selected category, a card wash behind the global block, a `statusErr` wash on a live
+Clear-all, and an `emptyState` filling the old dead zone), the vendor footer (one glass band,
+glowing status dots, an accent-gradient Connect pill, status-coloured queue rows), the results
+list/grid (per-domain wash, unified source badge, shimmering in-flight thumbnails) and the
+search bar (glass input/combo, gradient Search pill).
+
+**Caching.** Three independent, bounded, fail-open layers. (1) `PartsIndex` persists to
+`ROOT/cache/parts_index.sqlite`; `PartsHub._provider_fingerprint()` is a stat-only blake2b over
+adapter data files plus `(count, max_mtime_ns, total_size)` of the watched library folder, so a
+newly dropped part *always* invalidates the snapshot — measured 135 ms cold vs 1.3 ms warm on
+436 records, with `revalidate()` rate-limited to `CHUDWARE_PARTS_REVALIDATE_S` (20 s) so a
+long-lived worker notices new files without hammering the disk. `rebuild()` now swaps a fresh
+in-memory db in rather than DROPping the live one, and in-memory connections use
+`cached_statements=0` (both fixed pre-existing multi-thread crashes). (2)
+`services/browser/page_cache.py` sits in front of `browser_fetch` — the single chokepoint for
+all ~90 supplier adapters — with gzipped sharded blobs, sqlite metadata, a 6 h TTL, a 512 MiB
+LRU cap evicted only off the read path, and `last_used` touches batched to one UPDATE per 5 s.
+A hit returns before the profile lock and rate limiter; failures/challenges/4xx are never
+stored. (3) `gui_rpc.py` caches raw live-vendor records per `(site, query, limit)` for 15 min,
+*before* `_split_notices`/`_filter_items`, so a re-search with different filters is still a hit.
+
+**Progressive paint.** `resultsPreamble` no longer blocks when rows are already in hand — it
+draws a 2dp indeterminate bar and lets the existing rows render. New `parts_index_status` RPC +
+additive `index_building`/`index_count` on `parts_search` let the workspace show
+"Indexing catalog… N parts so far" and auto-re-run the query the moment indexing finishes; the
+first 2 s of a live fan-out poll at 0.15 s instead of 0.4 s.
+
+Env: `CHUDWARE_PARTS_INDEX_CACHE`, `CHUDWARE_PARTS_REVALIDATE_S`, `CHUDWARE_PAGE_CACHE{,_TTL_S,_MAX_MB}`,
+`CHUDWARE_VENDOR_CACHE{,_TTL_S,_MAX_ROWS}`. Gates: `./build.sh` green, `scripts/check.py` 6/6,
+313 passed / 1 skipped across `services/parts` + the browser session/hardening/page-cache
+suites, `gui_lint --rule theme|icons` clean, `CHUDWARE_SHOT=parts` smoke clean. The three
+`test_adapters.py::test_mcmaster_acquire_*` failures are pre-existing (proven against a
+`git stash` baseline of `session.py`) — they stub `browser_fetch` but the adapter now routes
+through the untouched `browser_interact`.

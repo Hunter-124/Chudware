@@ -72,6 +72,37 @@ float chipWidth(const char* label);   // exact footprint — use this for wrap a
 float chipPadX();
 float chipHeight();
 
+// ---- colour-coded liquid glass (Parts Library V3) -------------------------------------
+// The Parts Library used to be the one workspace with no colour of its own: every category,
+// every filter field and every card was the same slate-on-slate frame, so the eye had nothing
+// to navigate by. These three helpers give it the app's shared liquid-glass language
+// (ui::glassCardWash / ui::coloredRowWash) with a per-category hue.
+
+// Stable accent colour (RGB 0..1, never null) for a taxonomy id. The 19 taxonomy roots get
+// hand-picked hues; a child inherits its root's hue via the id prefix before the first '.'
+// ("fasteners.bolts_screws" -> the Fasteners hue), and an unmapped id falls back to a
+// deterministic hash hue so vendor/synthetic nodes still differ from each other.
+const float* categoryTint(const std::string& id);
+
+// Liquid-glass row. Same interaction contract as borderRow (returns clicked, selection =
+// accent border) but with a RESTING colour-coded surface: the shared glassCardWash gradient
+// in `tint` plus a 3dp left rail in the same hue. `emphasis` scales the wash alpha —
+// 1.0 for a taxonomy root, ~0.5 for a child row — so depth reads as weight, not just indent.
+bool glassRow(const char* strId, const char* label, const char* icon, bool selected,
+              ImVec2 size, const float tint[3], float emphasis = 1.0f,
+              float rounding = 7.f);
+
+// Liquid-glass background for a FRAMED WIDGET (InputText / InputFloat / Combo). ImGui paints
+// ImGuiCol_FrameBg before the widget's own text, so a gradient can only go behind it by
+// splitting the draw list: glassFieldBegin() makes the stock frame transparent and opens
+// channel 1 for the widget, glassFieldEnd() paints the gradient into channel 0 from the
+// widget's REAL item rect and hover/active state, then merges. Always pair them.
+//   glassFieldBegin();
+//   changed = ImGui::InputTextWithHint(...);
+//   glassFieldEnd(tint);
+void glassFieldBegin();
+void glassFieldEnd(const float tint[3], float rounding = 6.f);
+
 // Dim field label on the pane's content line (partsPadX). Plain TextDisabled would sit a
 // frame padding left of the widget it labels — the "label and body don't line up" defect.
 void fieldLabel(const char* text);

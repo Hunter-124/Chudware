@@ -22,19 +22,38 @@ Provider-overlap deduplication (T-P3, contract-additive):
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Iterator
 
 from .registry import ProviderRegistry
 from .index import PartsIndex
 
+log = logging.getLogger(__name__)
+
 # Overall wall-clock budget for the synchronous live-vendor fan-out (seconds).
 # Override with CHUDWARE_PARTS_LIVE_BUDGET_S. Per-site budget defaults to the same
 # value (CHUDWARE_PARTS_LIVE_SITE_BUDGET_S) so one stall cannot dominate the call.
 _DEFAULT_LIVE_BUDGET_S = 4.0
+
+# ── Persistent index cache (T-PL4) ───────────────────────────────────────────
+
+# Bumped BY HAND whenever adapter code changes the shape/content of emitted
+# PartRecords. It is mixed into the fingerprint, so bumping it invalidates every
+# user's on-disk snapshot without touching their data files.
+_INDEX_CODE_VERSION = 1
+
+# Default seconds between cheap stat-only revalidations during search().
+_DEFAULT_REVALIDATE_S = 20.0
+
+# Hard cap on dirents visited while fingerprinting the watched library folder.
+# Beyond this the signature is marked "partial" (still stable, just coarser).
+_FP_WALK_LIMIT = 20000
 
 
 class PartsHub:
@@ -42,9 +61,14 @@ class PartsHub:
 
     def __init__(self) -> None:
         self._registry = ProviderRegistry()
-        self._index = PartsIndex()
+        self._index = PartsIndex(_index_cache_path())
         self._lock = threading.Lock()
         self._index_built = False
+        # Index provenance/telemetry (feeds index_status() → parts_index_status RPC).
+        self._index_source = "none"      # "none" | "cache" | "fresh"
+        self._index_building = False
+        self._index_fingerprint = ""
+        self._last_revalidate = 0.0      # time.monotonic() of the last stat sweep
         # Optional peer package diagnostic (browser adapters). Local FTS still
         # works when this is set; never silent-swallow on the public status API.
         self.browser_bootstrap_error: str | None = None
@@ -117,17 +141,114 @@ class PartsHub:
                 return
             self._build_index_locked()
 
-    def _build_index_locked(self) -> int:
-        """Must be called with self._lock held. Returns record count."""
-        count = self._index.rebuild(self._iter_all_records())
-        self._index_built = True
-        return count
+    def _build_index_locked(self, *, force: bool = False) -> int:
+        """Must be called with self._lock held. Returns record count.
+
+        Tries the on-disk snapshot first (``force=False``): a fingerprint hit
+        restores the whole FTS index with ZERO provider ``iter_records()``
+        calls. A miss falls back to the full enumeration and re-persists.
+        """
+        self._index_building = True
+        try:
+            fingerprint = self._provider_fingerprint()
+            self._index_fingerprint = fingerprint
+            self._last_revalidate = time.monotonic()
+            if not force and fingerprint and self._index.load_if_fresh(fingerprint):
+                self._index_built = True
+                self._index_source = "cache"
+                return self._index.record_count
+            count = self._index.rebuild(self._iter_all_records())
+            self._index_built = True
+            self._index_source = "fresh"
+            self._index.persist(fingerprint)
+            return count
+        finally:
+            self._index_building = False
 
     def rebuild_index(self) -> int:
-        """Force a full index rebuild. Returns record count."""
+        """Force a full index rebuild (skips the snapshot). Returns record count."""
         with self._lock:
             self._index_built = False
-            return self._build_index_locked()
+            return self._build_index_locked(force=True)
+
+    # ── Persistent-cache validity ────────────────────────────────────────
+
+    def _provider_fingerprint(self) -> str:
+        """Cheap signature of everything that could change the index.
+
+        Stats only — never enumerates a single record. Inputs:
+          * ``_INDEX_CODE_VERSION`` (hand-bumped when record shapes change),
+          * the ``provider_id`` (or class path) of every registered indexable
+            provider, in registration order,
+          * ``(size, st_mtime_ns)`` of every file-backed data source: the
+            ``*.blt.yaml`` bolt/bearing tables, ``taxonomy.json``, the
+            structural section + lumber tables, the vendor_parts
+            ``index.json`` registry, and any ``CHUDWARE_KICAD_SYM_PATH`` libs,
+          * ``(count, max_mtime_ns, total_size)`` of the watched parts-library
+            folder, walked with ``os.scandir`` and capped at
+            ``_FP_WALK_LIMIT`` dirents (beyond which it is marked ``partial``).
+
+        Dropping a new STEP file into the watched folder moves at least the
+        count and max mtime, so a new part can never be silently missed.
+        """
+        h = hashlib.blake2b(digest_size=16)
+        h.update(f"code={_INDEX_CODE_VERSION}\n".encode())
+        for provider in self._registry.iter_indexable():
+            pid = getattr(provider, "provider_id", None)
+            if not pid:
+                cls = type(provider)
+                pid = f"{cls.__module__}.{cls.__qualname__}"
+            h.update(f"p={pid}\n".encode("utf-8", "replace"))
+        for label, path in _fingerprint_sources():
+            _hash_stat(h, label, path)
+        count, max_mtime_ns, total_size, partial = _library_walk_signature(
+            _watched_library_root())
+        h.update(
+            f"lib={count}:{max_mtime_ns}:{total_size}:{int(partial)}\n".encode())
+        return h.hexdigest()
+
+    def revalidate(self) -> bool:
+        """Recompute the (stat-only) fingerprint; invalidate a stale index.
+
+        Returns True when the index was invalidated — the next search rebuilds.
+        Safe to call at any time; never raises.
+        """
+        try:
+            fingerprint = self._provider_fingerprint()
+        except Exception as exc:  # noqa: BLE001 — revalidation is best-effort
+            log.debug("parts index revalidation failed: %s", exc)
+            return False
+        with self._lock:
+            self._last_revalidate = time.monotonic()
+            if not self._index_built or not self._index_fingerprint:
+                return False
+            if fingerprint == self._index_fingerprint:
+                return False
+            self._index_built = False
+            return True
+
+    def _maybe_revalidate(self) -> None:
+        """Rate-limited :meth:`revalidate` — at most once per interval."""
+        interval = _revalidate_interval_s()
+        if interval <= 0 or not self._index_built:
+            return
+        if (time.monotonic() - self._last_revalidate) < interval:
+            return
+        self.revalidate()
+
+    def index_status(self) -> dict:
+        """Snapshot of index state for the ``parts_index_status`` RPC.
+
+        Lock-free by design: it must answer instantly while a build is running.
+        """
+        built_at = self._index.built_at
+        return {
+            "built": bool(self._index_built),
+            "building": bool(self._index_building),
+            "count": int(self._index.record_count),
+            "source": self._index_source,
+            "age_s": round(max(0.0, time.time() - built_at), 3) if built_at else 0.0,
+        }
 
     def _iter_all_records(self) -> Iterator[dict]:
         """Yield all PartRecord dicts from indexable providers."""
@@ -168,7 +289,13 @@ class PartsHub:
         carry source:"live" and are NEVER indexed. Timed-out sites surface as
         notice stubs (no part_id/title) so callers can render honest per-site
         timeout notices. ``include_live=False`` does ZERO network.
+
+        A stat-only revalidation runs at most every
+        ``CHUDWARE_PARTS_REVALIDATE_S`` seconds (default 20, 0 disables) so a
+        long-lived worker notices files dropped into the watched library
+        without hammering the disk on every keystroke.
         """
+        self._maybe_revalidate()
         self._ensure_index()
         results = self._index.search(query, domain=domain, limit=limit)
         if results:
@@ -352,6 +479,160 @@ def _live_budget_s() -> float:
 def _live_site_budget_s(overall: float) -> float:
     """Per-site wait slice (capped by the overall budget)."""
     return min(overall, _env_float("CHUDWARE_PARTS_LIVE_SITE_BUDGET_S", overall))
+
+
+# ── Persistent index cache: location, revalidation, fingerprint inputs ───────
+
+_CACHE_OFF = frozenset({"0", "off", "false", "no", "none", "disabled"})
+
+
+def _index_cache_path() -> Path | None:
+    """Where to snapshot the FTS index, or None to stay purely in-memory.
+
+    ``CHUDWARE_PARTS_INDEX_CACHE=0`` (or off/false/no/none) disables
+    persistence; any other value is used verbatim as the snapshot path.
+    Default: ``<app data root>/cache/parts_index.sqlite``.
+    """
+    raw = os.environ.get("CHUDWARE_PARTS_INDEX_CACHE")
+    if raw is not None:
+        value = raw.strip()
+        if value.lower() in _CACHE_OFF or not value:
+            return None
+        path = Path(value).expanduser()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.debug("parts index cache dir unusable (%s): %s", path.parent, exc)
+            return None
+        return path
+    try:
+        from services import paths as _paths
+        path = Path(_paths.ROOT) / "cache" / "parts_index.sqlite"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    except Exception as exc:  # noqa: BLE001 — no cache is always survivable
+        log.debug("parts index cache unavailable: %s", exc)
+        return None
+
+
+def _revalidate_interval_s() -> float:
+    """Seconds between stat-only revalidations in search(). 0 disables."""
+    raw = os.environ.get("CHUDWARE_PARTS_REVALIDATE_S")
+    if raw is None or str(raw).strip() == "":
+        return _DEFAULT_REVALIDATE_S
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_REVALIDATE_S
+
+
+def _hash_stat(h: "hashlib._Hash", label: str, path: Path | str) -> None:
+    """Mix ``(size, st_mtime_ns)`` of ``path`` into ``h``; missing → sentinel."""
+    try:
+        st = os.stat(path)
+        h.update(f"{label}={st.st_size}:{st.st_mtime_ns}\n".encode("utf-8", "replace"))
+    except OSError:
+        h.update(f"{label}=-\n".encode("utf-8", "replace"))
+
+
+def _fingerprint_sources() -> list[tuple[str, Path]]:
+    """Every file-backed data source behind an indexable provider.
+
+    Import failures are swallowed per-source: a source we cannot locate simply
+    stops contributing (the code version + the remaining sources still guard
+    correctness), it never breaks the build.
+    """
+    out: list[tuple[str, Path]] = []
+
+    # Bolts + bearings clean-room YAML tables (BoltsAdapter).
+    try:
+        from .bolts_loader import DATA_DIR as _BOLTS_DIR
+        for name in sorted(os.listdir(_BOLTS_DIR)):
+            if name.endswith((".yaml", ".yml")):
+                out.append((f"bolts/{name}", Path(_BOLTS_DIR) / name))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Taxonomy routing tree (domain/site routing feeds the searchable set).
+    try:
+        from .taxonomy import TAXONOMY_PATH
+        out.append(("taxonomy", Path(TAXONOMY_PATH)))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Structural sections + lumber tables (StructuralSectionsAdapter).
+    try:
+        from .adapters import structural_sections_adapter as _ss
+        for attr in ("_AISC_PATH", "_LUMBER_PATH"):
+            src = getattr(_ss, attr, None)
+            if src is not None:
+                out.append((f"structural{attr.lower()}", Path(src)))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Vendor-part registry JSON — the LocalLibraryAdapter's whole record set.
+    try:
+        from .vendor_parts import INDEX as _VENDOR_INDEX
+        out.append(("vendor_index", Path(_VENDOR_INDEX)))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # User-supplied KiCad symbol libraries (EcadKicadAdapter, env-pointed).
+    for lib in (p.strip() for p in
+                os.environ.get("CHUDWARE_KICAD_SYM_PATH", "").split(os.pathsep)):
+        if lib:
+            out.append((f"kicad/{lib}", Path(lib).expanduser()))
+
+    return out
+
+
+def _watched_library_root() -> Path | None:
+    """The watched parts-library folder — WITHOUT creating it."""
+    try:
+        from services import paths as _paths
+        return Path(_paths.PARTS_LIBRARY)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _library_walk_signature(root: Path | None) -> tuple[int, int, int, bool]:
+    """``(file_count, max_mtime_ns, total_size, partial)`` for a folder tree.
+
+    Pure ``os.scandir`` traversal: stat metadata only, file contents are NEVER
+    read or hashed. Symlinked directories are not followed (no cycles) and the
+    sweep stops after ``_FP_WALK_LIMIT`` dirents, flagging ``partial``.
+    """
+    if root is None:
+        return (0, 0, 0, False)
+    count = 0
+    max_mtime_ns = 0
+    total_size = 0
+    visited = 0
+    partial = False
+    stack: list[Path | str] = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    visited += 1
+                    if visited > _FP_WALK_LIMIT:
+                        return (count, max_mtime_ns, total_size, True)
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    count += 1
+                    total_size += st.st_size
+                    if st.st_mtime_ns > max_mtime_ns:
+                        max_mtime_ns = st.st_mtime_ns
+        except OSError:
+            continue
+    return (count, max_mtime_ns, total_size, partial)
+
 
 # ── Provider-overlap deduplication (T-P3 — contract-additive) ────────────────
 

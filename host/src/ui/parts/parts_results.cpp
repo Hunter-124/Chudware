@@ -8,6 +8,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <string>
 
 #include "imgui.h"
 
@@ -114,6 +115,32 @@ void badgeInline(const char* label, const float role[4]) {
     ImGui::Dummy(ImVec2(badgeW(label), lh));
 }
 
+// ---- source pills --------------------------------------------------------------------
+// ONE badge system, two roles. A LIVE vendor hit names the vendor it came from (amber:
+// off-library, often shipping no model); a local hit reads "library" (accent). The old
+// code drew a pill only for live results, so a local row carried no source marker at all
+// and the two kinds were told apart only by what was missing.
+std::string sourceBadgeLabel(const PartsItem& item) {
+    if (item.source != "live") return "library";
+    return item.vendor.empty() ? "live" : item.vendor;
+}
+
+const float* sourceBadgeRole(const PartsItem& item) {
+    return item.source == "live" ? palette.statusWarn : palette.accent;
+}
+
+// A vendor name is unbounded where the old fixed "live" tag could not overflow, so the
+// label is shrunk (whole UTF-8 code points) until the PILL — not the text — fits `maxW`.
+std::string fitBadgeLabel(std::string s, float maxW) {
+    if (badgeW(s.c_str()) <= maxW) return s;
+    while (s.size() > 1 && badgeW((s + "\xe2\x80\xa6").c_str()) > maxW) {
+        do { s.pop_back(); } while (!s.empty() &&
+                                    ((unsigned char)s.back() & 0xC0) == 0x80);
+    }
+    s += "\xe2\x80\xa6";
+    return s;
+}
+
 // One unbounded line of compact action buttons from the cursor — LIST view only, where the
 // table cell does the clipping. The grid does NOT use this: it draws one primary pill plus a
 // "…" overflow popup so its hover band can never grow past a single text line.
@@ -165,11 +192,51 @@ static void itemTooltip(const PartsItem& item) {
     itemTooltipAt(item, ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal));
 }
 
+// Indeterminate progress bar for the "more results are still landing" state: 2dp of accent
+// riding at the top of the results region. There is no completion fraction to report (each
+// vendor answers independently), so the bar reports MOTION — the point is that the rows
+// already on screen are live and more are coming, not a percentage.
+static void resultsProgressBar() {
+    const float  sc = ui::uiScale;
+    const float  h  = std::max(2.0f * sc, 2.0f);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float  w  = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+    const ImVec2 p1(p0.x + w, p0.y + h);
+    ImDrawList*  dl = ImGui::GetWindowDrawList();
+    const float  r  = h * 0.5f;
+
+    float track[4], head[4];
+    Palette::withAlpha(palette.accent, track, 0.16f);
+    Palette::withAlpha(palette.accent, head,  0.92f);
+    dl->AddRectFilled(p0, p1, Palette::toU32(track), r);
+
+    const float seg  = std::max(56.0f * sc, w * 0.30f);
+    const float span = w + seg;   // the head enters off the left and exits off the right
+    const float x0   = p0.x - seg + std::fmod((float)ImGui::GetTime() * 0.9f, 1.0f) * span;
+    dl->PushClipRect(p0, p1, true);
+    dl->AddRectFilled(ImVec2(x0, p0.y), ImVec2(x0 + seg, p1.y), Palette::toU32(head), r);
+    dl->PopClipRect();
+
+    ImGui::Dummy(ImVec2(w, h + 2.0f * sc));   // reserve the strip: results start below it
+}
+
 // Searching / error / empty preamble, shared by both renderers so a backend failure can
 // never be misreported as "No results" in one view but not the other. Returns true when it
 // painted a state and the caller must return without drawing results; each renderer passes
 // its own empty-state copy.
+//
+// PROGRESSIVE LOAD: a search still in flight does NOT block a result set we already hold.
+// The old code returned true on `searching` and threw the whole list away for a spinner, so
+// a streaming vendor fan-out showed nothing until the slowest vendor answered — the results
+// were in memory and the user was watching a spinner. The blocking states are now reserved
+// for "we have literally nothing to show"; with rows in hand the only chrome is the slim
+// bar above them, and the rows stay fully interactive (hover, tooltip, actions, insert)
+// while the rest arrive.
 static bool resultsPreamble(const char* noResultsSub, const char* promptSub) {
+    if (!S().results.empty() && (S().searching || S().liveSearching)) {
+        resultsProgressBar();
+        return false;
+    }
     if (S().searching) { spinner("Searching"); return true; }
     if (!S().searchErr.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text,
@@ -268,9 +335,16 @@ void drawResultsList(AppState& st) {
             ImGuiHoveredFlags_AllowWhenOverlappedByItem | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
         ImVec2 rMin = ImGui::GetItemRectMin();
         ImVec2 rMax = ImGui::GetItemRectMax();
+        // Domain colour: the SAME hue the grid card and the category tree use, so a
+        // fastener reads as a fastener in every view. Painted from the row-spanning
+        // Selectable's rect (SpanAllColumns → the item rect already covers every column)
+        // before any cell content draws, so the wash can never sit on top of the text.
+        const float* tint = categoryTint(item.domain);
+        ui::coloredRowWash(dl, rMin, rMax, 5.0f, tint, hovered ? 0.26f : 0.11f,
+                           /*selected=*/false);
         if (hovered) {
-            // Border treatment (hover): treeHover wash + accentMid border, inset 0.5px.
-            dl->AddRectFilled(rMin, rMax, Palette::toU32(palette.treeHover), 4.0f * sc);
+            // Hover reads as the brighter wash above + the border treatment; the old flat
+            // treeHover fill is gone — a grey slab over the hue undid the colour coding.
             dl->AddRect(ImVec2(rMin.x + 0.5f, rMin.y + 0.5f),
                         ImVec2(rMax.x - 0.5f, rMax.y - 0.5f),
                         Palette::toU32(palette.accentMid), 4.0f * sc, 0, 1.0f * sc);
@@ -292,6 +366,14 @@ void drawResultsList(AppState& st) {
             dl->AddImage((ImTextureID)(intptr_t)th->second.tex,
                          ImVec2(c.x - dw * 0.5f, c.y - dh * 0.5f),
                          ImVec2(c.x + dw * 0.5f, c.y + dh * 0.5f));
+        } else if (S().thumbBusy.count(item.id) != 0) {
+            // Loading, not missing. A shimmering tinted block says "an image is coming";
+            // the static glyph below says "this part has no photo". Without the split, a
+            // row mid-fetch is indistinguishable from a row that will never have one.
+            const float ph = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 2.0f);
+            ui::glassCardWash(dl, ImVec2(rowPos.x, rowPos.y + (rowH - iconSz) * 0.5f),
+                              ImVec2(rowPos.x + iconSz, rowPos.y + (rowH + iconSz) * 0.5f),
+                              4.0f, tint, 0.14f + 0.20f * ph, 0.55f);
         } else {
             partIconDraw(dl, ImVec2(rowPos.x + iconSz * 0.5f, rowPos.y + rowH * 0.5f),
                          iconSz, item.domain);
@@ -302,10 +384,11 @@ void drawResultsList(AppState& st) {
             badgeInline("saved", palette.statusOk);
             ImGui::SameLine();
         }
-        if (item.source == "live") {
-            badgeInline("live", palette.accent);
-            ImGui::SameLine();
-        }
+        // Source pill: the vendor's name (amber) for a live hit, "library" (accent) for a
+        // local one. Capped so a long vendor can never shove the part name out of the cell.
+        badgeInline(fitBadgeLabel(sourceBadgeLabel(item), 96.0f * sc).c_str(),
+                    sourceBadgeRole(item));
+        ImGui::SameLine();
         ImGui::TextUnformatted(item.name.c_str());   // table clipping ellipsizes naturally
 
         auto dimCell = [&](int col, const char* text) {
@@ -416,8 +499,12 @@ void drawResultsGrid(AppState& st) {
         // (and with it the BeginPopup call) the instant the pointer left the card to reach it.
         const bool hov = ImGui::IsMouseHoveringRect(p0, p1) || ImGui::IsPopupOpen("##more");
 
-        // Resting glass surface stays; hover reads by BORDER, not a stronger wash.
+        // Resting frosted surface + the DOMAIN's colour wash on top, so the grid reads as
+        // colour-coded groups instead of 40 identical slate tiles. Hover brightens the same
+        // wash (never a different surface) and adds the border.
         ui::glassRowBackground(dl, p0, p1, cardRound, false, false, 0.20f);
+        const float* tint = categoryTint(item.domain);
+        ui::glassCardWash(dl, p0, p1, cardRound, tint, hov ? 0.22f : 0.12f);
         borderCardRect(dl, p0, p1, /*selected=*/false, hov, cardRound);
 
         dl->PushClipRect(p0, p1, true);
@@ -444,6 +531,14 @@ void drawResultsGrid(AppState& st) {
             const ImVec2 i0(cx + (contentW - dw) * 0.5f, p0.y + pad * 0.5f + (imgH - dh) * 0.5f);
             dl->AddImage((ImTextureID)(intptr_t)th->second.tex, i0,
                          ImVec2(i0.x + dw, i0.y + dh));
+        } else if (S().thumbBusy.count(item.id) != 0) {
+            // Shimmering placeholder while the thumbnail request is in flight — same
+            // loading-vs-imageless distinction the list row makes, so switching views
+            // never changes what a card means. thumbFailed items fall through to the glyph.
+            const float ph = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 2.0f);
+            ui::glassCardWash(dl, ImVec2(cx, p0.y + pad * 0.5f),
+                              ImVec2(cx + contentW, p0.y + imgH - pad * 0.5f),
+                              6.0f, tint, 0.12f + 0.22f * ph, 0.45f);
         } else {
             partIconDraw(dl, ImVec2(cx + contentW * 0.5f, p0.y + imgH * 0.5f + 4.0f * sc),
                          std::min(52.0f * sc, contentW), item.domain);
@@ -457,8 +552,13 @@ void drawResultsGrid(AppState& st) {
             ui::drawIconGlass(dl, "check",
                               ImVec2(cx + badgeH() * 0.5f, markY + badgeH() * 0.5f),
                               badgeH(), Palette::toU32(palette.statusOk), 0);
-        if (item.source == "live")
-            drawBadge(dl, ImVec2(p1.x - pad - badgeW("live"), markY), "live", palette.accent);
+        // Source pill, one system for both kinds (see sourceBadgeLabel): live hits name
+        // their VENDOR in amber, local hits read "library" in accent.
+        {
+            const std::string sb = fitBadgeLabel(sourceBadgeLabel(item), contentW * 0.72f);
+            drawBadge(dl, ImVec2(p1.x - pad - badgeW(sb.c_str()), markY), sb.c_str(),
+                      sourceBadgeRole(item));
+        }
 
         // ---- text lines: all three start on the content line, ellipsized to contentW ----
         auto contentText = [&](float y, const char* t, ImU32 colU32) {

@@ -16,6 +16,7 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"
+#include "ui/icons.h"      // hasIconSdf/getIcon/drawIconGlass — the CTA pill draws its own glyph
 #include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
 
 #include "parts_internal.h"
@@ -166,22 +167,29 @@ void drawVendorStrip(AppState& st, float paneW) {
         ImGui::GetTime() - S().lastHealthPoll > 2.0)
         pollHealthStatus(st);
 
-    // Full-bleed 1px rule in the pane's border role. The stock ImGui separator that used
-    // to sit here read as a leftover divider from a different design language than the
-    // accent header rules every other section in this workspace is closed with.
+    // Full-bleed liquid-glass band behind the WHOLE footer. A bare 1px border rule used to
+    // sit here and the strip read as a loose stack of controls dropped under a grey line.
+    // The footer is ONE section, so it gets one tinted surface in the app's shared glass
+    // language (accent hue, low alpha) closed by an accent hairline as its section edge.
+    // Painted before the footer's widgets so it stays behind them.
     {
-        ImDrawList* dl  = ImGui::GetWindowDrawList();
-        const ImVec2 rp = ImGui::GetCursorScreenPos();
-        const float  y  = rp.y + 0.5f;
-        dl->AddLine(ImVec2(rp.x, y), ImVec2(rp.x + ImGui::GetContentRegionAvail().x, y),
-                    Palette::toU32(palette.border), 1.0f);
+        ImDrawList*  dl    = ImGui::GetWindowDrawList();
+        const ImVec2 p0    = ImGui::GetCursorScreenPos();
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        if (avail.y > 1.0f)
+            ui::glassCardWash(dl, p0, ImVec2(p0.x + avail.x, p0.y + avail.y), 8.0f,
+                              palette.accent, 0.14f);
+        float edge[4];
+        Palette::withAlpha(palette.accent, edge, 0.35f);
+        dl->AddLine(ImVec2(p0.x, p0.y + 0.5f), ImVec2(p0.x + avail.x, p0.y + 0.5f),
+                    Palette::toU32(edge), 1.0f);
     }
     ImGui::Dummy(ImVec2(0.0f, 6.0f * sc));
 
     // -- status dot row + "N/M signed in" + health summary ----------------------------
     // One inset scope: the dots, the count and the health line are plain content, so they
     // sit on the pane's TEXT line with the filter labels and the section header above them.
-    // The rule above and the borderRows below stay full-bleed on the pane gutter.
+    // The glass band above and the borderRows below stay full-bleed on the pane gutter.
     {
         ContentInset inset;
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -224,6 +232,12 @@ void drawVendorStrip(AppState& st, float paneW) {
             auto& v = S().vendors[(size_t)i];
             const float* role = v.loggedIn ? palette.statusOk : palette.textDisabled;
             if (!v.loginError.empty()) role = palette.statusErr;
+            // Soft glow ring under the filled dot: a signed-in vendor reads as LIT instead
+            // of as a flat 7px pip lost in the band.
+            float glow[4];
+            Palette::withAlpha(role, glow, 0.28f);
+            dl->AddCircle(ImVec2(x + d * 0.5f, cy), d * 0.5f * 1.6f, Palette::toU32(glow),
+                          0, 1.5f * sc);
             dl->AddCircleFilled(ImVec2(x + d * 0.5f, cy), d * 0.5f, Palette::toU32(role));
             // Invisible hover target per dot for the tooltip.
             ImGui::SetCursorScreenPos(ImVec2(x, cy - d * 0.5f));
@@ -295,20 +309,49 @@ void drawVendorStrip(AppState& st, float paneW) {
     // -- buttons -------------------------------------------------------------------------
     // Anything the callee would refuse is drawn disabled and says why.
     const bool wizardOpen = browserPanelActive();
-    // Primary CTA. borderRow paints hover/selection treatment only, so the resting accent
-    // surface has to come from here — without it this row was pixel-identical to the two
-    // secondary buttons below it and the pane had no visible primary action.
+    // Primary CTA — accent gradient pill. borderRow paints hover/selection treatment only,
+    // so this used to be a flat accentSoft rect that was pixel-identical to the two
+    // secondary buttons below it and the pane had no visible primary action. Same
+    // InvisibleButton click contract, same startLoginWizard(st) action, same wizard gating.
     {
-        ImDrawList* dl  = ImGui::GetWindowDrawList();
+        ImDrawList*  dl = ImGui::GetWindowDrawList();
         const ImVec2 c0 = ImGui::GetCursorScreenPos();
-        const ImVec2 c1(c0.x + ImGui::GetContentRegionAvail().x, c0.y + 22.0f * sc);
-        dl->AddRectFilled(c0, c1, Palette::toU32(palette.accentSoft), 6.0f * sc);
+        const float  w  = ImGui::GetContentRegionAvail().x;
+        const float  h  = 22.0f * sc;
+        const ImVec2 c1(c0.x + w, c0.y + h);
+
+        ImGui::BeginDisabled(wizardOpen);
+        const bool clicked = ImGui::InvisibleButton("##connect_vendors", ImVec2(w, h));
+        const bool hovered = ImGui::IsItemHovered();
+        ImGui::EndDisabled();
+
+        ui::glassCardWash(dl, c0, c1, 7.0f, palette.accent, hovered ? 0.42f : 0.30f);
+        float brd[4];
+        Palette::withAlpha(palette.accent, brd, hovered ? 0.95f : 0.70f);
+        dl->AddRect(ImVec2(c0.x + 0.5f, c0.y + 0.5f), ImVec2(c1.x - 0.5f, c1.y - 0.5f),
+                    Palette::toU32(brd), 7.0f * sc, 0, 1.0f * sc);
+
+        // Icon + centred label, laid out exactly like borderRow(centerText=true).
+        const char*  icon     = "browser_panel";
+        const char*  label    = "Connect vendor accounts";
+        const float  iconSz   = 18.0f * sc;
+        const float  iconGap  = 6.0f * sc;
+        const bool   haveIcon = ui::hasIconSdf(icon) || ui::getIcon(icon).valid;
+        const ImVec2 ts       = ImGui::CalcTextSize(label);
+        float x = c0.x + (w - (ts.x + (haveIcon ? iconSz + iconGap : 0.0f))) * 0.5f;
+        if (haveIcon) {
+            const ImU32 icol = ui::hasIconSdf(icon) ? Palette::toU32(palette.text)
+                                                    : IM_COL32(255, 255, 255, 255);
+            ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, c0.y + h * 0.5f), iconSz,
+                              icol, 0);
+            x += iconSz + iconGap;
+        }
+        dl->PushClipRect(c0, c1, true);
+        dl->AddText(ImVec2(x, c0.y + (h - ts.y) * 0.5f), Palette::toU32(palette.text), label);
+        dl->PopClipRect();
+
+        if (clicked) startLoginWizard(st);
     }
-    ImGui::BeginDisabled(wizardOpen);
-    if (borderRow("##connect_vendors", "Connect vendor accounts", "browser_panel",
-                  /*selected=*/false, ImVec2(0, 22.0f * sc), /*centerText=*/true))
-        startLoginWizard(st);
-    ImGui::EndDisabled();
     gatedRowFeedback(wizardOpen, "The sign-in wizard is already open.");
 
     const float half = (ImGui::GetContentRegionAvail().x - 4.0f * sc) * 0.5f;
@@ -350,7 +393,16 @@ void drawVendorSignInList(AppState& st) {
     } else {
         for (auto& v : S().vendors) {
             ImGui::PushID(v.id.c_str());
-            borderRowSurface(false, 2.0f);
+            // Row rect measured exactly as borderRowSurface measures it, so a failed
+            // sign-in can be washed red over the WHOLE row: a broken vendor has to be
+            // visible without reading the state word at the bottom of the row.
+            const ImVec2 rmn = ImGui::GetCursorScreenPos();
+            const ImVec2 rmx(rmn.x + ImGui::GetContentRegionAvail().x,
+                             rmn.y + ImGui::GetFrameHeight() * 2.0f);
+            borderRowSurface(false, 2.0f, 7.0f);
+            if (!v.loginError.empty())
+                ui::glassCardWash(ImGui::GetWindowDrawList(), rmn, rmx, 7.0f,
+                                  palette.statusErr, 0.18f);
             ContentInset inset;   // row content, inside the full-bleed surface above
             ImGui::BeginGroup();
 
@@ -432,7 +484,7 @@ void drawApiProviders(AppState& st) {
     }
     for (auto& a : S().apiProviders) {
         ImGui::PushID(a.id.c_str());
-        borderRowSurface(false, a.editing ? (2.2f + (float)a.fields.size()) : 1.6f);
+        borderRowSurface(false, a.editing ? (2.2f + (float)a.fields.size()) : 1.6f, 7.0f);
         ContentInset inset;   // row content, inside the full-bleed surface above
         ImGui::BeginGroup();
 
@@ -510,7 +562,17 @@ void drawDownloadQueue(AppState& st) {
     ImGui::Spacing();
     for (auto& q : S().queue) {
         ImGui::PushID(q.id.c_str());
-        borderRowSurface(false, 1.8f);
+        // Status-coloured wash over the row rect (measured as borderRowSurface measures
+        // it): the queue is scanned, not read, so state has to be a colour first.
+        const float* qt = q.status == "done"    ? palette.statusOk
+                        : q.status == "running" ? palette.accent
+                        : q.status == "error"   ? palette.statusErr
+                                                : palette.statusWarn;
+        const ImVec2 qmn = ImGui::GetCursorScreenPos();
+        const ImVec2 qmx(qmn.x + ImGui::GetContentRegionAvail().x,
+                         qmn.y + ImGui::GetFrameHeight() * 1.8f);
+        borderRowSurface(false, 1.8f, 7.0f);
+        ui::coloredRowWash(ImGui::GetWindowDrawList(), qmn, qmx, 6.0f, qt, 0.28f);
         ContentInset inset;   // row content, inside the full-bleed surface above
         ImGui::BeginGroup();
         std::string label = q.query;

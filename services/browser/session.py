@@ -660,28 +660,45 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
 def browser_fetch(url: str, site: str, *,
                   render_settle: float = DEFAULT_RENDER_SETTLE_S,
                   min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
+                  no_cache: bool = False,
                   _cef: Any | None = None) -> dict:
     """Fetch ``url`` HEADLESS under ``site``'s saved session, via our own CEF
     Chromium daemon (:mod:`.cef_client`) — no Playwright, no CDP automation tell.
+
+    Served from the bounded on-disk page cache (:mod:`.page_cache`) when a fresh
+    entry exists: the lookup happens BEFORE the profile lock and the rate limiter,
+    so a repeat search neither contends with a live fetch nor spends its per-site
+    request budget. A hit is the original success payload plus ``cached: True`` and
+    ``age_s``. Only successes are ever cached — failures, challenge pages and
+    HTTP>=400 responses are re-fetched every time. Pass ``no_cache=True`` to skip
+    both the lookup and the store (default off, so existing callers are unchanged);
+    ``CHUDWARE_PAGE_CACHE=0`` disables the cache process-wide.
 
     Returns the §6 failure shape (never raises) when the CEF daemon is
     unavailable or navigation fails. A missing profile is auto-created (anonymous
     browsing of public catalogs is allowed — login-gated content still degrades to
     login_required via the adapters).
     """
+    if not no_cache:
+        from . import page_cache  # lazy: keep import cheap for non-browser callers
+        hit = page_cache.get(url, site)
+        if hit is not None:
+            return hit
     profiles.ensure_profile(site)
     lock = profiles.profile_lock(site)
     if not lock.acquire(blocking=False):
         return _busy(site)
     try:
         return _browser_fetch_locked(url, site, render_settle=render_settle,
-                                     min_interval=min_interval, cef=_cef)
+                                     min_interval=min_interval, cef=_cef,
+                                     no_cache=no_cache)
     finally:
         lock.release()
 
 
 def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
-                          min_interval: float, cef: Any | None = None) -> dict:
+                          min_interval: float, cef: Any | None = None,
+                          no_cache: bool = False) -> dict:
     ceiling = ratelimit.reserve_request(site)
     if ceiling is not None:
         return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
@@ -732,8 +749,14 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
                             f"(browser_login('{site}')) usually helps")
 
     profiles.save_meta(site, last_used_ts=time.time())
-    return {"ok": True, "url": url, "status": status, "content": content,
-            "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}
+    payload = {"ok": True, "url": url, "status": status, "content": content,
+               "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}
+    # Only this branch is cacheable — every fail(...) above (busy / fetch failed /
+    # challenge / bot-walled / http_error) must be re-fetched next time.
+    if not no_cache:
+        from . import page_cache  # lazy, as above
+        page_cache.put(url, site, payload)
+    return payload
 
 
 def browser_interact(url: str, site: str, script: str, *,

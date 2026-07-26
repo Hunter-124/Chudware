@@ -43,6 +43,28 @@ PartsState& S() {
 // attempts on a 1.5s-doubling backoff capped at 15s covers ~75s of Python-sidecar boot.
 constexpr int kTaxonomyMaxAttempts = 8;
 
+// ---- catalog index build state (parts_index_status) ----------------------------
+// The Python side keeps a persisted FTS index of the local catalog; on a cold cache it is
+// (re)built in the background and `parts_search` answers from whatever is indexed SO FAR,
+// reporting the build through two additive response fields. These file-local statics track
+// it so the workspace can say so honestly and — crucially — re-run the user's query by
+// itself the moment the build lands, instead of showing a short list forever.
+static bool   g_indexBuilding        = false;  // backend is still building the index
+static int    g_indexCount           = 0;      // parts indexed so far
+static bool   g_indexPolling         = false;  // parts_index_status in flight (single-flight)
+static double g_lastIndexPoll        = 0.0;
+static bool   g_researchOnIndexReady = false;  // re-run doSearch when the build finishes
+// Cleared the first time parts_index_status fails. Without this latch an old worker that
+// somehow reported `index_building` but had no status RPC would spin: clear-on-failure →
+// auto re-search → the search re-arms `index_building` → poll → clear → … Once the RPC is
+// known missing the whole feature stands down for the session.
+static bool   g_indexStatusSupported = true;
+
+// Live fan-out start time. The first vendor usually lands inside the first couple of
+// seconds, and making its rows wait on the steady-state 0.4 s tick was the single biggest
+// chunk of perceived latency in a live search — so the poll bursts first, then settles.
+static double g_liveStartedAt = 0.0;
+
 // ---- async loaders -------------------------------------------------------------
 
 void loadCategories(AppState& st) {
@@ -297,6 +319,12 @@ void doSearch(AppState& st) {
         S().searchDone = true;
         if (!r.ok) { S().searchErr = r.err; return; }
         if (!r.result.is_object()) return;
+        // Catalog index build (additive fields; absent on an older worker → false/0). While
+        // the index builds these rows are only a prefix of the catalog, so arm an automatic
+        // re-search: the user should never have to press Search twice for a cold cache.
+        g_indexBuilding = g_indexStatusSupported && r.result.value("index_building", false);
+        g_indexCount    = r.result.value("index_count", 0);
+        if (g_indexBuilding) g_researchOnIndexReady = true;
         if (!r.result.value("ok", false)) {
             S().searchErr = r.result.value("reason", "search failed");
             return;
@@ -449,6 +477,7 @@ static void drawLiveVendorStrip(AppState& st) {
 
 void startLiveSearch(AppState& st) {
     S().liveVendors.clear();       // fresh fan-out — drop the previous search's vendor strip
+    g_liveStartedAt = ImGui::GetTime();   // burst-poll window for the first vendor's rows
     nlohmann::json p;
     fillSearchParams(p);
     // The local layer returns long before this fan-out resolves, so S().searching is already
@@ -794,16 +823,46 @@ void drawPartsLibraryWorkspace(AppState& st) {
         doSearch(st);
     }
 
-    // Drive the streaming live-vendor poll (~2.5 Hz) while a fan-out is in flight so
-    // results paint as each vendor lands, without a per-frame RPC.
-    if (S().liveSearching && !S().livePolling &&
-        ImGui::GetTime() - S().lastLivePoll > 0.4)
-        pollLiveSearch(st);
+    // Drive the streaming live-vendor poll while a fan-out is in flight so results paint as
+    // each vendor lands, without a per-frame RPC. The first two seconds run at ~6.7 Hz (the
+    // first vendor typically lands inside that window and its rows should not sit waiting on
+    // a 0.4 s tick), then the cadence settles to ~2.5 Hz for the long tail.
+    if (S().liveSearching && !S().livePolling) {
+        const double now      = ImGui::GetTime();
+        const double interval = (now - g_liveStartedAt < 2.0) ? 0.15 : 0.4;
+        if (now - S().lastLivePoll > interval) pollLiveSearch(st);
+    }
 
     if (!st.workerStarted) {
         emptyState("parts_all", "Parts Library unavailable",
                    "The Chudware worker service is not running.");
         return;
+    }
+
+    // Catalog index build → poll ~1 Hz until it lands, then silently re-run the query.
+    // Tolerant by construction: transport failure, `ok:false`, or a worker with no
+    // parts_index_status at all all resolve to "not building" rather than pinning the
+    // workspace in the indexing state forever.
+    if (g_indexStatusSupported && g_indexBuilding && !g_indexPolling &&
+        ImGui::GetTime() - g_lastIndexPoll > 1.0) {
+        g_indexPolling  = true;
+        g_lastIndexPoll = ImGui::GetTime();
+        st.rpc.call("parts_index_status", {}, [&st](const core::RpcResult& r) {
+            g_indexPolling = false;
+            if (!(r.ok && r.result.is_object() && r.result.value("ok", false))) {
+                g_indexStatusSupported = false;   // stand down for the session
+                g_indexBuilding        = false;   // never leave the bar spinning
+                g_researchOnIndexReady = false;
+                return;
+            }
+            const bool wasBuilding = g_indexBuilding;
+            g_indexBuilding = r.result.value("building", false);
+            g_indexCount    = r.result.value("count", g_indexCount);
+            if (wasBuilding && !g_indexBuilding && g_researchOnIndexReady) {
+                g_researchOnIndexReady = false;
+                doSearch(st);   // the query already on screen, now over the full index
+            }
+        });
     }
 
     // Layout: [taxonomy tree 240px] | [results flex] | [filters + vendor strip 260px].
@@ -846,6 +905,10 @@ void drawPartsLibraryWorkspace(AppState& st) {
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 5 * sc));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(6 * sc, 6 * sc));
 
+        // Every field on this row wears the workspace accent as its liquid-glass hue; the
+        // per-category hues belong to the panes, not to the toolbar.
+        const float barTint[3] = {palette.accent[0], palette.accent[1], palette.accent[2]};
+
         // Sort combo width = widest entry + frame padding + arrow button.
         static const char* kSortItems[] = {
             "Relevance", "Price: low to high", "Price: high to low", "Name"};
@@ -887,6 +950,7 @@ void drawPartsLibraryWorkspace(AppState& st) {
 
         // Both in-field affordances sit in the frame padding: widening FramePadding.x for the
         // input ONLY is the one way to move ImGui's own text/hint origin clear of them.
+        parts::glassFieldBegin();
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(26.0f * sc, 5 * sc));
         ImGui::SetNextItemWidth(inputW);
         bool hit = ImGui::InputTextWithHint("##parts_q",
@@ -911,20 +975,40 @@ void drawPartsLibraryWorkspace(AppState& st) {
                 ui::drawIconGlass(dl, "cancel_x", xCenter, 12.0f * sc, Palette::toU32(xc), 0);
             }
         }
+        // Closed only HERE, after the magnifier/clear-x decoration: glassFieldBegin splits the
+        // window draw list and those two are painted into the widget's channel, so merging
+        // earlier would bury them under the field's own gradient.
+        parts::glassFieldEnd(barTint);
         if (clearHit) {
             S().searchBuf[0] = '\0';
             doSearch(st);
         }
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
-        bool go = ImGui::Button("Search");
-        ImGui::PopStyleColor(2);
+        // Accent liquid-glass pill. A flat accent Button read as a solid slab next to the
+        // glass fields; the wash + hairline border puts it in the same material.
+        bool go = false;
+        {
+            ImDrawList*  dl = ImGui::GetWindowDrawList();
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            go = ImGui::InvisibleButton("##parts_go", ImVec2(searchW, frameH));
+            const bool  hov = ImGui::IsItemHovered();
+            const ImVec2 p1(p0.x + searchW, p0.y + frameH);
+            ui::glassCardWash(dl, p0, p1, 6.0f, barTint, hov ? 0.48f : 0.34f, 0.35f);
+            float br[4];
+            Palette::withAlpha(palette.accent, br, hov ? 0.95f : 0.70f);
+            dl->AddRect(ImVec2(p0.x + 0.5f, p0.y + 0.5f), ImVec2(p1.x - 0.5f, p1.y - 0.5f),
+                        Palette::toU32(br), 6.0f * sc, 0, 1.0f * sc);
+            const ImVec2 ts = ImGui::CalcTextSize("Search");
+            dl->AddText(ImVec2(p0.x + (searchW - ts.x) * 0.5f, p0.y + (frameH - ts.y) * 0.5f),
+                        Palette::toU32(palette.text), "Search");
+        }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(sortW);
-        if (ImGui::Combo("##sort", &S().sortMode, kSortItems, IM_ARRAYSIZE(kSortItems))) {
+        parts::glassFieldBegin();
+        const bool sortChanged =
+            ImGui::Combo("##sort", &S().sortMode, kSortItems, IM_ARRAYSIZE(kSortItems));
+        parts::glassFieldEnd(barTint);
+        if (sortChanged) {
             st.settings.partsSortMode = S().sortMode;
             saveSettings(st.settings);
             applyResultSort();   // cosmetic — never re-run the local + vendor fan-out
@@ -936,9 +1020,17 @@ void drawPartsLibraryWorkspace(AppState& st) {
         // always present and the active one is accent-filled.
         auto viewSegment = [&](const char* id, bool wantGrid, const char* tip) {
             const bool on = (S().gridView == wantGrid);
+            // The active segment is an accent liquid-glass tile, painted below from the item
+            // rect so it shares the material of the fields on this row; ImGui's own frame
+            // goes fully transparent for it. Inactive keeps the stock button surface.
             float bg[4], bgHov[4];
-            Palette::withAlpha(on ? palette.accentSoft : palette.button,        bg,    on ? 1.0f : 0.80f);
-            Palette::withAlpha(on ? palette.accentMid  : palette.buttonHovered, bgHov, 1.0f);
+            if (on) {
+                bg[0] = bg[1] = bg[2] = bg[3] = 0.0f;
+                bgHov[0] = bgHov[1] = bgHov[2] = bgHov[3] = 0.0f;
+            } else {
+                Palette::withAlpha(palette.button,        bg,    0.80f);
+                Palette::withAlpha(palette.buttonHovered, bgHov, 1.0f);
+            }
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(bg[0], bg[1], bg[2], bg[3]));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(bgHov[0], bgHov[1], bgHov[2], bgHov[3]));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(bgHov[0], bgHov[1], bgHov[2], bgHov[3]));
@@ -951,6 +1043,14 @@ void drawPartsLibraryWorkspace(AppState& st) {
             ImDrawList*  dl = ImGui::GetWindowDrawList();
             const ImVec2 a  = ImGui::GetItemRectMin();
             const ImVec2 b  = ImGui::GetItemRectMax();
+            if (on) {
+                const bool segHov = ImGui::IsItemHovered();
+                ui::glassCardWash(dl, a, b, 6.0f, barTint, segHov ? 0.44f : 0.34f, 0.35f);
+                float sbr[4];
+                Palette::withAlpha(palette.accent, sbr, segHov ? 0.90f : 0.62f);
+                dl->AddRect(ImVec2(a.x + 0.5f, a.y + 0.5f), ImVec2(b.x - 0.5f, b.y - 0.5f),
+                            Palette::toU32(sbr), 6.0f * sc, 0, 1.0f * sc);
+            }
             const ImVec2 c((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
             const ImU32  gcol = Palette::toU32(on ? palette.accent : palette.textDim);
             if (wantGrid) {
@@ -1006,6 +1106,39 @@ void drawPartsLibraryWorkspace(AppState& st) {
         } else if (S().liveSearching && !S().results.empty()) {
             ImGui::SameLine();
             ImGui::TextDisabled("· loading more from vendors…");
+        }
+        // Cold catalog: the rows below are only what is indexed so far. Say so with an
+        // indeterminate bar — an index build has no honest percentage — and note that the
+        // search re-runs itself (see g_researchOnIndexReady) the moment it completes.
+        if (g_indexBuilding) {
+            ContentInset inset;
+            ImDrawList*  dl   = ImGui::GetWindowDrawList();
+            const float  barW = ImGui::GetContentRegionAvail().x;
+            const float  barH = 2.0f * sc;
+            const ImVec2 b0   = ImGui::GetCursorScreenPos();
+            const ImVec2 b1(b0.x + barW, b0.y + barH);
+            float track[4];
+            Palette::withAlpha(palette.border, track, 0.45f);
+            dl->AddRectFilled(b0, b1, Palette::toU32(track), barH * 0.5f);
+            const float segW = barW * 0.28f;
+            float t = (float)ImGui::GetTime() * 0.75f;
+            t -= (float)(long)t;                       // fractional part (t >= 0)
+            const float sx = b0.x - segW + t * (barW + segW);
+            const float xa = std::max(sx, b0.x);
+            const float xb = std::min(sx + segW, b1.x);
+            if (xb > xa)
+                dl->AddRectFilled(ImVec2(xa, b0.y), ImVec2(xb, b1.y),
+                                  Palette::toU32(palette.accent), barH * 0.5f);
+            ImGui::Dummy(ImVec2(barW, barH));
+            char idxMsg[96];
+            std::snprintf(idxMsg, sizeof(idxMsg), "Indexing catalog… %d part%s so far",
+                          g_indexCount, g_indexCount == 1 ? "" : "s");
+            if (S().fonts && S().fonts->body) ImGui::PushFont(S().fonts->body);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 0.95f));
+            ImGui::TextUnformatted(idxMsg);
+            ImGui::PopStyleColor();
+            if (S().fonts && S().fonts->body) ImGui::PopFont();
         }
         // Subtle one-line hint for per-site skip notices (login_required stubs).
         if (!S().notices.empty()) {

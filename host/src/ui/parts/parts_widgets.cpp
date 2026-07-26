@@ -3,7 +3,10 @@
 #include "parts_widgets.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <map>
+#include <string>
 
 #include "gl_compat.h"
 
@@ -370,6 +373,164 @@ bool chipToggle(const char* strId, const char* label, bool active) {
                                       : (hovered ? palette.text : palette.textDim)),
                 label);
     return clicked;
+}
+
+// ---- colour-coded liquid glass -------------------------------------------------------
+
+namespace {
+
+// One hue per taxonomy root. Picked as a spread around the wheel with the app's teal accent
+// kept for Fasteners (the default landing category) so the pane still reads as Chudware and
+// not as a paint chart. Saturation/value are deliberately uniform: only HUE encodes identity,
+// so no category ever looks more important than another.
+struct CatTint { const char* id; float rgb[3]; };
+constexpr CatTint kCatTints[] = {
+    {"fasteners",             {0.176f, 0.831f, 0.749f}},  // teal
+    {"bearings_motion",       {0.380f, 0.690f, 0.980f}},  // sky
+    {"structural_stock",      {0.620f, 0.680f, 0.780f}},  // steel
+    {"drivetrain",            {0.960f, 0.640f, 0.310f}},  // amber
+    {"wheels_tires_casters",  {0.560f, 0.780f, 0.400f}},  // moss
+    {"tools",                 {0.930f, 0.520f, 0.420f}},  // clay
+    {"electronics",           {0.560f, 0.520f, 0.960f}},  // indigo
+    {"fluid_power",           {0.300f, 0.760f, 0.870f}},  // cyan
+    {"hardware_misc",         {0.760f, 0.700f, 0.520f}},  // brass
+    {"adhesives_consumables", {0.890f, 0.560f, 0.720f}},  // rose
+    {"safety",                {0.960f, 0.760f, 0.300f}},  // hazard yellow
+    {"electric_motors",       {0.450f, 0.620f, 0.950f}},  // cobalt
+    {"motion_control",        {0.640f, 0.820f, 0.560f}},  // sage
+    {"power_supplies",        {0.880f, 0.640f, 0.380f}},  // copper
+    {"batteries",             {0.520f, 0.860f, 0.640f}},  // mint
+    {"seals_gaskets",         {0.700f, 0.560f, 0.880f}},  // lilac
+    {"electromechanical",     {0.480f, 0.740f, 0.840f}},  // slate cyan
+    {"vendors",               {0.820f, 0.780f, 0.420f}},  // gold
+    {"custom_fab",            {0.900f, 0.480f, 0.560f}},  // magenta
+};
+
+// Deterministic hue for an id with no entry above (vendor leaves, synthetic nodes). FNV-1a
+// over the id keeps the colour stable across sessions — a category that changed colour on
+// every launch would be worse than no colour at all.
+void hashTint(const std::string& id, float out[3]) {
+    unsigned h = 2166136261u;
+    for (unsigned char c : id) { h ^= c; h *= 16777619u; }
+    const float hue = (float)(h % 360u) / 360.0f;
+    ImGui::ColorConvertHSVtoRGB(hue, 0.52f, 0.86f, out[0], out[1], out[2]);
+}
+
+}  // namespace
+
+const float* categoryTint(const std::string& id) {
+    // A child inherits its root's hue: the tree is a colour-coded MAP, and a branch whose
+    // children each had their own colour would destroy the grouping the colour exists for.
+    const std::string root = id.substr(0, id.find('.'));
+    for (const auto& t : kCatTints)
+        if (root == t.id) return t.rgb;
+    // Cache hashed tints so the returned pointer stays valid for the caller's frame (and
+    // beyond) — callers hand it straight to glassCardWash as a float[3].
+    static std::map<std::string, std::array<float, 3>> cache;
+    auto it = cache.find(root);
+    if (it == cache.end()) {
+        std::array<float, 3> rgb{};
+        hashTint(root, rgb.data());
+        it = cache.emplace(root, rgb).first;
+    }
+    return it->second.data();
+}
+
+bool glassRow(const char* strId, const char* label, const char* icon, bool selected,
+              ImVec2 size, const float tint[3], float emphasis, float rounding) {
+    const float sc = ui::uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (size.x <= 0.0f) size.x = ImGui::GetContentRegionAvail().x;
+    if (size.y <= 0.0f) size.y = ImGui::GetFrameHeight();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 p1(p0.x + size.x, p0.y + size.y);
+
+    const bool clicked = ImGui::InvisibleButton(strId, size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held    = ImGui::IsItemActive();
+
+    // Resting wash, brighter on hover and brighter still when selected. The three levels are
+    // one multiplier on ONE gradient so a row can never change its shape as it changes state.
+    float wash = 0.13f * emphasis;
+    if (hovered) wash = 0.22f * emphasis;
+    if (held)    wash = 0.28f * emphasis;
+    if (selected) wash = std::max(wash, 0.30f * emphasis);
+    ui::glassCardWash(dl, p0, p1, rounding, tint, wash, 0.28f);
+
+    // Left rail in the category hue: at a glance the pane reads as coloured bands even where
+    // the wash itself is nearly invisible against a bright backdrop.
+    float rail[4] = {tint[0], tint[1], tint[2], selected ? 0.95f : (hovered ? 0.80f : 0.55f)};
+    const float railW = 3.0f * sc;
+    dl->AddRectFilled(p0, ImVec2(p0.x + railW, p1.y), Palette::toU32(rail), rounding * sc,
+                      ImDrawFlags_RoundCornersLeft);
+
+    // Selection stays the app's border language, but in the row's OWN hue so the tree keeps
+    // its colour coding while selected (an accent-teal border over a rose row read as a bug).
+    if (selected) {
+        float glow[4] = {tint[0], tint[1], tint[2], 1.0f};
+        ui::glassSelectionGlow(dl, p0, p1, rounding, glow);   // dp — helper scales itself
+    }
+
+    // ---- content (same geometry as borderRow so the two never drift) ----
+    const float iconSz  = 18.0f * sc;
+    const float iconGap = 6.0f * sc;
+    const float padX    = ui::metrics::partsPadX();
+    const bool haveIcon = icon && icon[0] && (ui::hasIconSdf(icon) || ui::getIcon(icon).valid);
+    float x = p0.x + padX;
+    if (haveIcon) {
+        // The glyph carries the hue, the label stays high-contrast text: tinting BOTH turned
+        // a low-emphasis child row into unreadable coloured-on-dark text.
+        ImU32 icol = IM_COL32(255, 255, 255, 255);
+        if (ui::hasIconSdf(icon)) {
+            float ic[4] = {tint[0], tint[1], tint[2], selected ? 1.0f : 0.92f};
+            icol = Palette::toU32(ic);
+        }
+        ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, p0.y + size.y * 0.5f),
+                          iconSz, icol, 0);
+        x += iconSz + iconGap;
+    }
+    if (label && label[0]) {
+        const float textH = ImGui::GetTextLineHeight();
+        dl->PushClipRect(p0, ImVec2(p1.x - padX, p1.y), true);
+        dl->AddText(ImVec2(x, p0.y + (size.y - textH) * 0.5f),
+                    Palette::toU32(palette.text), label);
+        dl->PopClipRect();
+    }
+    return clicked;
+}
+
+void glassFieldBegin() {
+    // Transparent stock frame — the gradient painted by glassFieldEnd IS the frame. Border
+    // goes too: glassFieldEnd draws a hue-tinted one that tracks hover/active.
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  ImVec4(0, 0, 0, 0));
+    ImGui::GetWindowDrawList()->ChannelsSplit(2);
+    ImGui::GetWindowDrawList()->ChannelsSetCurrent(1);
+}
+
+void glassFieldEnd(const float tint[3], float rounding) {
+    const float sc = ui::uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetItemRectMin();
+    const ImVec2 p1 = ImGui::GetItemRectMax();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active  = ImGui::IsItemActive();
+
+    dl->ChannelsSetCurrent(0);
+    // Opaque base first: the field must not read as a hole punched in the pane, and the
+    // wash alone is far too faint to seat text on.
+    dl->AddRectFilled(p0, p1, Palette::toU32(active ? palette.frameBgActive
+                                            : hovered ? palette.frameBgHovered
+                                                      : palette.frameBg),
+                      rounding * sc);
+    ui::glassCardWash(dl, p0, p1, rounding, tint,
+                      active ? 0.26f : (hovered ? 0.20f : 0.13f), 0.25f);
+    float br[4] = {tint[0], tint[1], tint[2], active ? 0.90f : (hovered ? 0.62f : 0.34f)};
+    dl->AddRect(ImVec2(p0.x + 0.5f, p0.y + 0.5f), ImVec2(p1.x - 0.5f, p1.y - 0.5f),
+                Palette::toU32(br), rounding * sc, 0, (active ? 1.5f : 1.0f) * sc);
+    dl->ChannelsMerge();
+    ImGui::PopStyleColor(3);
 }
 
 void fieldLabel(const char* text) {

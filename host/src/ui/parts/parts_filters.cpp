@@ -4,6 +4,10 @@
 // text → InputTextWithHint. Every change stamps S().filterDirtyAt; the workspace loop fires
 // doSearch once 0.35 s after the last change (debounce — no Apply button). The pane's fixed
 // footer is the compact vendor strip (parts_vendors.cpp).
+// V3: every framed widget in the pane wears the shared liquid-glass frame (glassFieldBegin /
+// glassFieldEnd) in ONE hue taken from the selected category, and the global block sits on a
+// hue-tinted card, so the filters read as part of the branch being browsed instead of a grey
+// box bolted to its side.
 #include <algorithm>
 #include <cfloat>
 #include <cstdio>
@@ -45,7 +49,9 @@ int activeFilterCount() {
     return n;
 }
 
-void drawFacetWidgets(const TaxNode& node) {
+// `tint` is the pane hue (see drawFiltersBlock) — every framed facet widget wears it, so a
+// facet group and the global block above it read as one coloured surface.
+void drawFacetWidgets(const TaxNode& node, const float* tint) {
     const float sc = ui::uiScale;
     // Same explicit rhythm as the global block above (see drawFiltersBlock): a label hugs
     // the field it names, the next facet starts a real gap away.
@@ -71,16 +77,24 @@ void drawFacetWidgets(const TaxNode& node) {
             // 0 also means "omit this end" to the search serializer, which is why the two ends
             // are driven by separate drags instead of DragFloatRange2 — the stock widget hard-
             // ties min <= max, which pins min at an unset (0) max and kills min-only queries.
-            const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
-            ImGui::SetNextItemWidth((ImGui::GetContentRegionAvail().x - gap) * 0.5f);
-            if (ImGui::DragFloat("##rmin", &fv.rmin, 0.25f, 0.0f,
-                                 fv.rmax > 0.0f ? fv.rmax : FLT_MAX, fmtMin,
-                                 ImGuiSliderFlags_AlwaysClamp))
-                markDirty();
+            const float gap  = ImGui::GetStyle().ItemInnerSpacing.x;
+            const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+            // glassFieldEnd reads the widget's REAL item rect and hover/active state, so it
+            // must follow its own widget immediately — markDirty() waits until after.
+            glassFieldBegin();
+            ImGui::SetNextItemWidth(half);
+            const bool minChanged = ImGui::DragFloat("##rmin", &fv.rmin, 0.25f, 0.0f,
+                                                     fv.rmax > 0.0f ? fv.rmax : FLT_MAX, fmtMin,
+                                                     ImGuiSliderFlags_AlwaysClamp);
+            glassFieldEnd(tint);
+            if (minChanged) markDirty();
             ImGui::SameLine(0.0f, gap);
+            glassFieldBegin();
             ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::DragFloat("##rmax", &fv.rmax, 0.25f, 0.0f, FLT_MAX, fmtMax,
-                                 ImGuiSliderFlags_AlwaysClamp)) {
+            const bool maxChanged = ImGui::DragFloat("##rmax", &fv.rmax, 0.25f, 0.0f, FLT_MAX,
+                                                     fmtMax, ImGuiSliderFlags_AlwaysClamp);
+            glassFieldEnd(tint);
+            if (maxChanged) {
                 // Dragging max down past min drags min with it rather than inverting the range.
                 if (fv.rmax > 0.0f && fv.rmax < fv.rmin) fv.rmin = fv.rmax;
                 markDirty();
@@ -114,9 +128,12 @@ void drawFacetWidgets(const TaxNode& node) {
                 ImGui::PopID();
             }
         } else {  // "text" (and anything unknown degrades to a substring box)
+            glassFieldBegin();
             ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::InputTextWithHint("##text", "contains…", fv.text, sizeof(fv.text)))
-                markDirty();
+            const bool changed =
+                ImGui::InputTextWithHint("##text", "contains…", fv.text, sizeof(fv.text));
+            glassFieldEnd(tint);
+            if (changed) markDirty();
         }
 
         ImGui::Dummy(ImVec2(0, gapField));
@@ -159,6 +176,15 @@ void drawFiltersBlock(AppState& st, float paneW) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(ImGui::GetStyle().ItemSpacing.x, 3.0f * sc));
 
+    // ---- pane hue ----------------------------------------------------------------
+    // ONE colour for the whole pane, taken from the category being browsed, so the filters
+    // read as part of that branch rather than a separate grey box beside it. categoryTint()
+    // hashes an unmapped id, but an EMPTY id is not a category at all — nothing is selected —
+    // so that case falls back to the app accent instead of a hash of "".
+    const float accentTint[3] = {palette.accent[0], palette.accent[1], palette.accent[2]};
+    const float* tint = S().selectedCategory.empty() ? accentTint
+                                                     : categoryTint(S().selectedCategory);
+
     // "N active" in the header: a filter that scrolled out of view (or one set on a facet of
     // a category the user has since collapsed) is still visible from the top of the pane.
     const int activeCount = activeFilterCount();
@@ -168,6 +194,25 @@ void drawFiltersBlock(AppState& st, float paneW) {
                   activeCount > 0 ? activeBuf : nullptr);
 
     // ---- global filters ---------------------------------------------------------
+    // The four global fields sit on ONE hue-tinted liquid-glass card so they read as a group.
+    // The gradient must be painted BEFORE the block — painted after, it would cover its own
+    // labels — and the deferred-channel idiom (plmCardBegin/plmCardEnd in ui/plm/plm_pages.cpp)
+    // is unavailable here because glassFieldBegin already owns this draw list's single channel
+    // split and ImDrawListSplitter cannot nest. So the block measures its own height at the
+    // end and the card is painted from that number on the next frame: the group is fixed in
+    // content, so it is exact from frame two and self-corrects on a DPI or font change. Height
+    // 0 (first frame only) simply skips the paint.
+    static float s_globalCardH = 0.0f;
+    const float  cardPad  = 6.0f * sc;
+    const ImVec2 cardTop  = ImGui::GetCursorScreenPos();
+    const float  cardW    = ImGui::GetContentRegionAvail().x;
+    if (s_globalCardH > 0.0f)
+        ui::glassCardWash(ImGui::GetWindowDrawList(),
+                          ImVec2(cardTop.x - cardPad, cardTop.y - cardPad * 0.5f),
+                          ImVec2(cardTop.x + cardW + cardPad,
+                                 cardTop.y + s_globalCardH + cardPad * 0.5f),
+                          8.0f, tint, 0.13f, 0.45f);
+
     fieldLabel("Price (USD)");
     ImGui::Dummy(ImVec2(0, gapLabel));
     // Both ends split the content width that is actually left, minus the separator and its
@@ -186,17 +231,24 @@ void drawFiltersBlock(AppState& st, float paneW) {
     // clean. FramePadding.x is widened by exactly the glyph so the value never sits under it.
     const float curW = ImGui::CalcTextSize("$").x;
     auto priceField = [&](const char* id, float* v) {
-        const ImGuiStyle& sty = ImGui::GetStyle();
+        // Captured BY VALUE: GetStyle() returns a reference whose FramePadding the PushStyleVar
+        // below mutates, and the "$" belongs at the BASE inset, not the widened one.
+        const float basePadX = ImGui::GetStyle().FramePadding.x;
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                            ImVec2(sty.FramePadding.x + curW + 2.0f * sc, sty.FramePadding.y));
+                            ImVec2(basePadX + curW + 2.0f * sc,
+                                   ImGui::GetStyle().FramePadding.y));
+        glassFieldBegin();
         ImGui::SetNextItemWidth(fieldW);
         const bool changed = ImGui::InputFloat(id, v, 0, 0, "%.2f");
         ImGui::PopStyleVar();
         const ImVec2 r0 = ImGui::GetItemRectMin();
+        const float  rh = ImGui::GetItemRectSize().y;
+        // Still on glassFieldBegin's FOREGROUND channel (1): glassFieldEnd paints the gradient
+        // into channel 0, so a "$" emitted after the merge would be buried under the frame.
         ImGui::GetWindowDrawList()->AddText(
-            ImVec2(r0.x + ImGui::GetStyle().FramePadding.x,
-                   r0.y + (ImGui::GetItemRectSize().y - ImGui::GetTextLineHeight()) * 0.5f),
+            ImVec2(r0.x + basePadX, r0.y + (rh - ImGui::GetTextLineHeight()) * 0.5f),
             Palette::toU32(palette.textDim), "$");
+        glassFieldEnd(tint);
         if (changed) *v = std::max(0.0f, *v);   // 0 = "this end unset" to the serializer
         return changed;
     };
@@ -218,25 +270,32 @@ void drawFiltersBlock(AppState& st, float paneW) {
     ImGui::Dummy(ImVec2(0, gapField));
     fieldLabel("Vendor");
     ImGui::Dummy(ImVec2(0, gapLabel));
+    glassFieldBegin();
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::InputTextWithHint("##fven", "any vendor",
-                                 S().vendorBuf, sizeof(S().vendorBuf)))
-        markDirty();
+    const bool venChanged = ImGui::InputTextWithHint("##fven", "any vendor",
+                                                     S().vendorBuf, sizeof(S().vendorBuf));
+    glassFieldEnd(tint);
+    if (venChanged) markDirty();
 
     ImGui::Dummy(ImVec2(0, gapField));
     fieldLabel("Material");
     ImGui::Dummy(ImVec2(0, gapLabel));
+    glassFieldBegin();
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::InputTextWithHint("##fmat", "steel, brass, nylon…",
-                                 S().materialBuf, sizeof(S().materialBuf)))
-        markDirty();
+    const bool matChanged = ImGui::InputTextWithHint("##fmat", "steel, brass, nylon…",
+                                                     S().materialBuf, sizeof(S().materialBuf));
+    glassFieldEnd(tint);
+    if (matChanged) markDirty();
 
     ImGui::Dummy(ImVec2(0, gapField));
     fieldLabel("Source");
     ImGui::Dummy(ImVec2(0, gapLabel));
+    glassFieldBegin();
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::Combo("##fsrc", &S().sourceFilter, "All\0Local library\0Live vendors\0"))
-        markDirty();
+    const bool srcChanged =
+        ImGui::Combo("##fsrc", &S().sourceFilter, "All\0Local library\0Live vendors\0");
+    glassFieldEnd(tint);
+    if (srcChanged) markDirty();
 
     ImGui::Dummy(ImVec2(0, gapField));
     // Right-aligned clear, dead until something is actually set. SmallButton clipped its own
@@ -245,6 +304,15 @@ void drawFiltersBlock(AppState& st, float paneW) {
     const float clearX0 = ImGui::GetCursorPosX();
     ImGui::SetCursorPosX(std::max(clearX0,
         clearX0 + ImGui::GetContentRegionAvail().x - chipWidth("Clear all")));
+    // A resettable filter set is an ACTION, not a label: the live chip gets a statusErr wash
+    // UNDER its own pill (chipToggle paints straight into the draw list, so "under" means a
+    // local two-channel split — legal here, no glass field is open inside it).
+    ImDrawList* clearDl = ImGui::GetWindowDrawList();
+    const bool  clearLive = activeCount > 0;
+    if (clearLive) {
+        clearDl->ChannelsSplit(2);
+        clearDl->ChannelsSetCurrent(1);
+    }
     ImGui::BeginDisabled(activeCount == 0);
     if (chipToggle("##reset", "Clear all", /*active=*/false)) {
         S().priceMin = S().priceMax = 0.0f;
@@ -255,25 +323,51 @@ void drawFiltersBlock(AppState& st, float paneW) {
         markDirty();
     }
     ImGui::EndDisabled();
-    // chipToggle paints straight into the draw list, so BeginDisabled's style alpha never
-    // reaches it — same wash the vendor strip uses on its gated rows, otherwise a dead chip
-    // is pixel-identical to a live one.
-    if (activeCount == 0) {
+    const ImVec2 c0 = ImGui::GetItemRectMin(), c1 = ImGui::GetItemRectMax();
+    if (clearLive) {
+        clearDl->ChannelsSetCurrent(0);
+        const float err[3] = {palette.statusErr[0], palette.statusErr[1], palette.statusErr[2]};
+        // glassCardWash takes a LOGICAL dp radius — divide the pill radius back out of uiScale.
+        ui::glassCardWash(clearDl, c0, c1, (c1.y - c0.y) * 0.5f / sc, err, 0.22f, 0.5f);
+        clearDl->ChannelsMerge();
+    } else {
+        // chipToggle paints straight into the draw list, so BeginDisabled's style alpha never
+        // reaches it — same wash the vendor strip uses on its gated rows, otherwise a dead chip
+        // is pixel-identical to a live one.
         float wash[4];
         Palette::withAlpha(palette.panelBg, wash, 0.55f);
-        const ImVec2 c0 = ImGui::GetItemRectMin(), c1 = ImGui::GetItemRectMax();
-        ImGui::GetWindowDrawList()->AddRectFilled(c0, c1, Palette::toU32(wash),
-                                                  (c1.y - c0.y) * 0.5f);
+        clearDl->AddRectFilled(c0, c1, Palette::toU32(wash), (c1.y - c0.y) * 0.5f);
     }
+    // Height of the global block, for NEXT frame's card (see s_globalCardH above).
+    s_globalCardH = ImGui::GetCursorScreenPos().y - cardTop.y;
 
     // ---- per-selection facets (from the selected taxonomy node) ------------------
+    bool drewFacets = false;
     if (S().taxonomyIsTree && !S().selectedCategory.empty()) {
         const TaxNode* node = findTaxNode(S().taxonomyRoot, S().selectedCategory);
         if (node && !node->facets.empty()) {
             sectionHeader(node->label.c_str(), /*firstInPane=*/false,
                           node->icon.empty() ? partIcon(node->id) : node->icon.c_str());
-            drawFacetWidgets(*node);
+            drawFacetWidgets(*node, tint);
+            drewFacets = true;
         }
+    }
+    // No facet region left the bottom two thirds of the pane as a blank slab above the vendor
+    // strip — the pane looked broken rather than empty. Say what would go there instead. Held
+    // back while the taxonomy is still in flight (the region is about to be filled) and while
+    // a stale facet value is still narrowing the search, since claiming "no extra filters"
+    // while one is active would be a lie.
+    // emptyState() spends 35% of the REMAINING height centring itself, so it is only honest
+    // when there is a gap to fill: below one empty-state's worth of room there is no dead
+    // zone, and the leading Dummy would go negative and drag the cursor back up the pane.
+    if (!drewFacets && !S().taxonomyLoading &&
+        ImGui::GetContentRegionAvail().y > 96.0f * sc) {
+        bool anyFacetValue = false;
+        for (const auto& kv : S().facetValues)
+            if (kv.second.active()) { anyFacetValue = true; break; }
+        if (!anyFacetValue)
+            emptyState("filter_funnel", "No extra filters here",
+                       "Pick a category to filter by its own specs.");
     }
 
     // The scroll child ends flush against the fixed vendor-strip footer, so the last facet

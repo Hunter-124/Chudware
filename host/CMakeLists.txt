@@ -205,6 +205,7 @@ set(CHUDWARE_CORE_SOURCES
   src/core/engine_events.cpp
   # --- end Phase 4 ---
   src/ui_theme.cpp
+  src/ui/tesseract.cpp  # brand mark: live 4D tesseract projection (copilot logo + Appearance preview)
   src/win_chrome.cpp
   src/stb_impl.cpp
   # --- C14: ribbon widgets + command table + icon loader ---

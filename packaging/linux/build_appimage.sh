@@ -239,7 +239,9 @@ EOF
 chmod +x "$APPDIR/AppRun"
 # The staged binary is usr/bin/Chudware (with an Chudware compat symlink), matching the
 # .desktop's Exec=Chudware.
-cp "$REPO/packaging/linux/Chudware.desktop" "$APPDIR/Chudware.desktop"
+# Lowercase on disk — a capital-C path here silently failed and left the AppDir with no
+# .desktop, so nothing bound the staged Chudware.png as the AppImage's icon.
+cp "$REPO/packaging/linux/chudware.desktop" "$APPDIR/Chudware.desktop"
 cp "$REPO/assets/logo_icon.png" "$APPDIR/Chudware.png"
 ln -sf Chudware.png "$APPDIR/.DirIcon"
 

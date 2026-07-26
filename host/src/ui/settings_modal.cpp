@@ -36,6 +36,7 @@
 #include "ui/provider_logos.h"  // ui::drawProviderLogo/providerBrandColor (Providers list badges)
 #include "provider_usage.h"  // ui::UsageAccount/UsageWindow + THE subscription_* poller
 #include "metrics.h"  // ui::metrics::px/stroke — DPI-scaled Settings gutter + usage rings
+#include "tesseract.h"  // ui::drawTesseract + TesseractAnim — Appearance > Brand mark picker
 
 
 // ---- C22b prompt editor state ----
@@ -289,6 +290,17 @@ static const nlohmann::json* optionalJsonArr(const nlohmann::json& obj, const ch
     auto it = obj.find(key);
     if (it == obj.end() || !it->is_array()) return nullptr;
     return &(*it);
+}
+// A rate-limit reset stamp: ISO-8601 from the Python worker, but the omp bridge sends it as a
+// NUMBER of milliseconds since the epoch. optionalJsonString() saw the number, returned empty,
+// and the countdown never rendered. ui::usageResetCountdown() reads both forms, so keep the ms
+// value verbatim as its decimal digits.
+static std::string optionalJsonStamp(const nlohmann::json& obj, const char* key) {
+    auto it = obj.find(key);
+    if (it == obj.end()) return {};
+    if (it->is_string()) return it->get<std::string>();
+    if (it->is_number()) return std::to_string((long long)it->get<double>());
+    return {};
 }
 
 // Shorten a long account id / UUID for the primary label (never a full 36-char UUID).
@@ -975,7 +987,7 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
                         sw.usedFraction = (float)it->get<double>();
                         sw.hasFraction = true;
                     }
-                    sw.resetsAt = optionalJsonString(w, "resetsAt");
+                    sw.resetsAt = optionalJsonStamp(w, "resetsAt");
                     sw.status = optionalJsonString(w, "status");
                     if (sw.status.empty()) sw.status = "unknown";
                     d.usage.push_back(std::move(sw));
@@ -1888,16 +1900,15 @@ static void pollBenchCategories(AppState& st, bool force) {
 }
 
 // Wire provider name used by role/ranking RPCs (matches routing / config conventions).
-// For PROV_CLOUDCOMPAT, Moonshot presets map to first-class "moonshot"; others stay "openrouter".
+// PROV_CLOUDCOMPAT is a single slot hosting many services discriminated by base_url, so the
+// preset's own base_url picks the wire id (moonshot stays native; every other preset resolves
+// to its real OMP-bridge id) exactly the way composer.cpp::agentProviderOverride does. Emitting
+// a blanket "openrouter" here assigned roles to a provider the user never picked.
 static const char* roleProviderWire(int prov, const std::string& model = {}) {
     if (prov == ui::PROV_CLOUDCOMPAT) {
-        // Moonshot is first-class ("moonshot"); other cloud presets stay "openrouter".
-        for (const auto& p : ui::cloudPresets()) {
-            if (p.id == model &&
-                std::strcmp(ui::cloudServiceKey(p.baseUrl), "moonshot") == 0)
-                return "moonshot";
-        }
-        return "openrouter";
+        for (const auto& p : ui::cloudPresets())
+            if (p.id == model) return ui::cloudServiceWireName(ui::cloudServiceKey(p.baseUrl));
+        return "openai";  // unknown/custom base_url — generic OpenAI-compatible transport
     }
     switch (prov) {
         case ui::PROV_ANTHROPIC:   return "anthropic";
@@ -1907,7 +1918,7 @@ static const char* roleProviderWire(int prov, const std::string& model = {}) {
         case ui::PROV_GEMINI:      return "gemini";
         case ui::PROV_XAI:         return "xai";
         case ui::PROV_CURSOR:      return "cursor";
-        case ui::PROV_KIMISUB:     return "kimi-sub";
+        case ui::PROV_KIMISUB:     return "kimi-code";  // bridge id; "kimi-sub" has no resolver
         default: return "local";
     }
 }
@@ -1918,11 +1929,13 @@ static int roleProviderFromWire(const std::string& w) {
     if (w == "local") return ui::PROV_LOCAL;
     if (w == "llamacpp") return ui::PROV_LLAMACPP;
     if (w == "gemini") return ui::PROV_GEMINI;
-    if (w == "openrouter" || w == "cloud" || w == "cloudcompat" || w == "moonshot")
+    if (w == "openrouter" || w == "cloud" || w == "cloudcompat" || w == "moonshot" ||
+        w == "deepseek" || w == "alibaba-coding-plan" || w == "amazon-bedrock" || w == "azure" ||
+        w == "google-antigravity" || w == "aimlapi")
         return ui::PROV_CLOUDCOMPAT;
     if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
     if (w == "cursor" || w == "cursor-sub") return ui::PROV_CURSOR;
-    if (w == "kimi-sub") return ui::PROV_KIMISUB;
+    if (w == "kimi-code" || w == "kimi-sub") return ui::PROV_KIMISUB;  // kimi-sub: legacy config
     return -1;
 }
 
@@ -4545,6 +4558,66 @@ void drawSettingsModal(AppState& st, bool busy) {
                     applyThemeNow(st, isLight);
                 dimText("Switches the whole UI between the dark and light palettes. "
                         "Saved immediately.");
+
+                settingsSectionHeader("Brand mark");
+                dimText("The copilot logo is a live 3D projection of a rotating tesseract "
+                        "(a 4-cube) — this picks how it turns. Saved immediately.");
+                ImGui::Dummy(ImVec2(0, 4 * sc));
+                {
+                    // Each card is a hit box with the figure painted over it, so the preview is
+                    // the SAME renderer the header uses — what you see here is what ships.
+                    ImDrawList* bdl = ImGui::GetWindowDrawList();
+                    const float capPad = 8.0f * sc;
+                    const float lineH  = ImGui::GetTextLineHeight();
+                    // Width comes from the WIDEST style name, not a round literal: at 96dp the
+                    // captions ran past the card and had to be clipped mid-word.
+                    float labelW = 0.0f;
+                    for (int i = 0; i < (int)ui::TesseractAnim::Count; ++i)
+                        labelW = std::max(labelW,
+                            ImGui::CalcTextSize(ui::tesseractAnimName((ui::TesseractAnim)i)).x);
+                    const float cardW = std::max(96.0f * sc, labelW + capPad * 2.0f);
+                    const float cardH = 96.0f * sc;
+                    const float capOff = cardH - lineH - 7.0f * sc;   // caption baseline, card-relative
+                    const float figSz  = std::min(cardW, capOff) - 10.0f * sc;
+                    const double now   = ImGui::GetTime();
+                    for (int i = 0; i < (int)ui::TesseractAnim::Count; ++i) {
+                        if (i) ImGui::SameLine(0.0f, 8.0f * sc);
+                        char cid[24];
+                        std::snprintf(cid, sizeof(cid), "##brandanim%d", i);
+                        const ImVec2 mn = ImGui::GetCursorScreenPos();
+                        ImGui::InvisibleButton(cid, ImVec2(cardW, cardH));
+                        const bool sel = (settings.brandAnim == i);
+                        if (ImGui::IsItemClicked()) {
+                            settings.brandAnim = i;
+                            saveSettings(settings);   // matches the theme/glass immediate-save path
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s",
+                                ui::tesseractAnimBlurb((ui::TesseractAnim)i));
+                        const ImVec2 mx(mn.x + cardW, mn.y + cardH);
+                        const float* bg = sel ? ui::palette.accentSoft : ui::palette.button;
+                        bdl->AddRectFilled(mn, mx, ui::Palette::toU32(bg),
+                                           ui::metrics::rounding(8.0f));
+                        if (sel)
+                            bdl->AddRect(mn, mx, ui::Palette::toU32(ui::palette.accent),
+                                         ui::metrics::rounding(8.0f), 0,
+                                         ui::metrics::stroke(1.5f));
+                        // Figure sits above the caption: centre it in the space left over the
+                        // one text line so the mark never overlaps its own label.
+                        const float capY = mn.y + capOff;
+                        ui::drawTesseract(bdl,
+                                          ImVec2((mn.x + mx.x) * 0.5f, (mn.y + capY) * 0.5f),
+                                          figSz, now, (ui::TesseractAnim)i,
+                                          ui::Palette::toU32(ui::palette.text));
+                        const char* nm = ui::tesseractAnimName((ui::TesseractAnim)i);
+                        const ImVec2 ts = ImGui::CalcTextSize(nm);
+                        bdl->AddText(ImVec2((mn.x + mx.x) * 0.5f - ts.x * 0.5f, capY),
+                                     ui::Palette::toU32(sel ? ui::palette.text
+                                                            : ui::palette.textDim),
+                                     nm);
+                    }
+                }
+                ImGui::Dummy(ImVec2(0, 4 * sc));
 
                 settingsSectionHeader("Liquid Glass");
                 dimText("Per-surface styling for the glass panels floating over the viewport. "

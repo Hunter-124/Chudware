@@ -132,12 +132,20 @@ def build(out: Path, skip_wheels: bool, with_python: bool, make_zip: bool) -> di
               "--target chudware-hostd) — payload ships without the engine daemon", file=sys.stderr)
         manifest["components"]["hostd"] = False
 
-    # brand + font assets (loaded by the GUI from <exedir>/assets)
-    assets_src = REPO / "host" / "assets"
+    # Brand + font assets, loaded by the GUI from <exedir>/assets — including logo_icon.png,
+    # which IS the runtime GLFW window/taskbar icon. This read `REPO/"host"/"assets"` for its
+    # whole life; that path has never existed (the assets live at the repo root), so the guard
+    # below was always false and every Windows payload shipped with no assets/ at all — the
+    # installed app fell back to a blank window icon and no wordmark.
+    assets_src = REPO / "assets"
     if assets_src.exists():
         shutil.copytree(assets_src, dst / "assets", dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("Rubik-VF.ttf", "make_logo.py", "__pycache__"))
         manifest["components"]["assets"] = True
+    else:
+        print(f"warning: {assets_src} not found — payload ships without brand/font assets",
+              file=sys.stderr)
+        manifest["components"]["assets"] = False
 
     stage_app(dst)
     manifest["components"]["app"] = True

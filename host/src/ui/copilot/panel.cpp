@@ -2,9 +2,11 @@
 //
 // A PINNED, full-height, rounded liquid-glass column overlaid on the viewport's right edge with
 // ~12dp margins (geometry from ui::viewportBackdrop(); invisible left-edge drag zone to resize;
-// the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (outline
-// cube + status + Sessions + settings gear), the conversation log with a per-turn transparent
-// activity timeline (what the AI is doing / thinking, expandable), and a bottom composer (compact
+// the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (the
+// live animated tesseract brand mark, tinted by run status — its animation style comes from
+// Settings -> Appearance -> Brand mark — plus status + Sessions + settings gear), the
+// conversation log with a per-turn transparent activity timeline (what the AI is doing /
+// thinking, expandable), and a bottom composer (compact
 // Agent/Plan/Swarm/Edit/Ask dropdown + context meter; transparent prompt with in-box send;
 // graduated-width segmented model/thinking/paperclip/cube/New toolbar — model biggest, icons
 // smallest). Header gear swaps the chat area for a compact AI-settings overlay (horizontal top
@@ -18,6 +20,7 @@
 // that let the full-page AI workspace embed the SAME chat state + send path.
 
 #include "copilot_internal.h"
+#include "ui/tesseract.h"  // ui::drawTesseract — the animated 4-cube brand mark in the header
 
 namespace ui {
 
@@ -159,15 +162,21 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     // ---- Row 1: [Tasks] .. centered Chudware .. [Artifacts]  (clears leftInset) ----
     {
         const float logoGap = 3.0f * sc;
-        const float cubeSz = std::min(lh, wordLh) * 0.95f;
+        // The mark is a 32-edge figure, not a 12-edge cube glyph: measured against rendered
+        // filmstrips, its nested-cell structure only resolves from ~28 px up, so it is sized off
+        // the wordmark's line height rather than clamped under it. Row 1 grows to match (rowH1).
+        const float markSz = wordLh * 1.5f;
         if (wordF) ImGui::PushFont(wordF);
         const float wmW = ImGui::CalcTextSize("Chudware").x;
         if (wordF) ImGui::PopFont();
-        const float logoW = cubeSz + logoGap + wmW;
+        const float logoW = markSz + logoGap + wmW;
         ImGui::Dummy(ImVec2(0, 6.0f * sc));
         const float rowTop1 = ImGui::GetCursorPosY();
         const float bh = lh + 4.0f * sc;
-        auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (wordLh - h) * 0.5f); };
+        // Row 1 is as tall as its tallest occupant — the brand mark — and everything in it
+        // (tasks chip, mark, wordmark, artifacts chip) centres on that, not on wordLh alone.
+        const float rowH1 = std::max(wordLh, markSz);
+        auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (rowH1 - h) * 0.5f); };
 
         int tlDone = 0, tlTotal = 0;
         copilotTaskProgress(st, tlDone, tlTotal);
@@ -204,13 +213,17 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         logoLeft = std::min(logoLeft, colW - rightInset - artW - logoW - 6.0f * sc);
         ImGui::SameLine(logoLeft);
         {
-            IconUV cube = ui::getIcon("context_cube", 20);
-            cy1(cubeSz);
-            if (cube.valid) {
-                ImGui::Image(cube.texId, ImVec2(cubeSz, cubeSz), cube.uv0, cube.uv1, statusTint);
-            } else {
-                ImGui::Dummy(ImVec2(cubeSz, cubeSz));
-            }
+            // Brand mark: a live 4D tesseract painted straight onto the window draw list. The
+            // Dummy reserves EXACTLY the box the old atlas cube occupied, so logoW and the
+            // centring clamps above stay valid, and it is the item that carries the tooltip.
+            cy1(markSz);
+            ImGui::Dummy(ImVec2(markSz, markSz));
+            const ImVec2 mkMin = ImGui::GetItemRectMin(), mkMax = ImGui::GetItemRectMax();
+            ui::drawTesseract(ImGui::GetWindowDrawList(),
+                              ImVec2((mkMin.x + mkMax.x) * 0.5f, (mkMin.y + mkMax.y) * 0.5f),
+                              markSz, ImGui::GetTime(),
+                              ui::tesseractAnimFromInt(st.settings.brandAnim),
+                              ImGui::ColorConvertFloat4ToU32(statusTint));
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", statusTip);
             ImGui::SameLine(0, logoGap);
         }
@@ -230,7 +243,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Session Artifacts \xc2\xb7 subagents, plan, documents");
-        ImGui::SetCursorPosY(rowTop1 + wordLh);
+        ImGui::SetCursorPosY(rowTop1 + rowH1);
     }
 
     // ---- Row 2: Chat | Sessions | Settings (equal gaps; left edge = leftInset) ----
@@ -1241,17 +1254,24 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         s_lastViewId = viewId;
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-        // Chat keeps the tight gutter (bubbles/cards need the column width); the MENU views get the
-        // shared cpMenuGutter so Sessions/Tasks/Artifacts/Settings all start on one left edge.
+        // Horizontal gutter is ASYMMETRIC: the pill scrollbar is clipped to this child, so the
+        // right side must reserve a full kChatScrollbarLane for it or bubbles run under the bar.
+        // ImGui's WindowPadding is symmetric, so push the WIDE (right) value and pull the LEFT
+        // edge back with a negative Indent below. Chat keeps its tight left gutter (bubbles/cards
+        // need the column width); the MENU views keep the shared cpMenuGutter so
+        // Sessions/Tasks/Artifacts/Settings all start on one left edge.
+        const float padL = overlayOpen ? ui::metrics::cpMenuGutter() : 3.0f * ui::uiScale;
+        const float padR = std::max(padL, ui::metrics::px(ui::kChatScrollbarLane));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                             overlayOpen
-                                ? ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(4.0f))
-                                : ImVec2(3.0f * ui::uiScale, 2.0f * ui::uiScale));
+                                ? ImVec2(padR, ui::metrics::px(4.0f))
+                                : ImVec2(padR, 2.0f * ui::uiScale));
         // Never open a menu mid-scroll. SetNextWindowScroll (not SetScrollY) so the reset lands on
         // THIS frame instead of flashing one frame at the previous view's offset; -1 leaves X alone.
         if (viewChanged) ImGui::SetNextWindowScroll(ImVec2(-1.0f, 0.0f));
         ImGui::BeginChild(viewId, ImVec2(0, chatH), ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoScrollbar);
+        if (padR > padL) ImGui::Indent(padL - padR);   // negative: pull the LEFT edge back to padL
         if (st.showAISettingsOverlay) {
             drawAISettingsBody(st, busy);
         } else if (st.showTaskList) {
@@ -1264,12 +1284,13 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back
             chatLogStickToBottom("copilot.panel");
         }
+        if (padR > padL) ImGui::Unindent(padL - padR);  // undo before the scrollbar/window reads
         // The top fade is a SCROLL AFFORDANCE, not chat decoration: every scrolled view gets it, so
         // a scrolled menu never looks like it simply starts mid-content.
         const bool  logScrolled = ImGui::GetScrollY() > 0.5f;
         const ImVec2 logP0 = ImGui::GetWindowPos();
         const float  logVisW = ImGui::GetWindowSize().x;
-        // Chat scrollbar: 6px, sitting ON the right edge rather than inset in its drag strip.
+        // Chat scrollbar: 9px, sitting ON the right edge of the lane reserved by padR above.
         ui::drawWindowPillScrollbarV(chatSurf(), ui::kChatScrollbar);
         ImGui::EndChild();
 

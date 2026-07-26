@@ -463,6 +463,12 @@ void loadSettings(Settings& s) {
                         g.dynamicColor = go["dynamic_color"].get<bool>() ? 1 : 0;
                 }
             }
+            // Brand-mark animation style. 0..2 map to ui::TesseractAnim SimpleRotation /
+            // DoubleRotation / EightCell; clamp so a hand-edited config can't select a
+            // nonexistent style (the draw would fall back silently and the picker would
+            // show nothing selected).
+            int ba = app.is_object() ? app.value("brand_anim", 0) : 0;
+            s.brandAnim = (ba < 0 || ba > 2) ? 0 : ba;
         }
         // T-G21: pinned-column vertical-collapse state.
         s.fmCollapsed = j.value("fm_collapsed", false);
@@ -808,7 +814,12 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
             if (g.dynamicColor      != def.dynamicColor)      go["dynamic_color"] = (g.dynamicColor == 1);
             if (!go.empty()) glassJ[kGlassGroupKey[gi]] = go;
         }
-        if (!glassJ.empty()) j["appearance"] = {{"glass", glassJ}};
+        // "appearance" now carries two independent keys, so build the object incrementally:
+        // either may be absent, and a wholly default config still writes no block at all.
+        nlohmann::json appJ = nlohmann::json::object();
+        if (!glassJ.empty()) appJ["glass"] = glassJ;
+        if (s.brandAnim != 0) appJ["brand_anim"] = s.brandAnim;
+        if (!appJ.empty()) j["appearance"] = appJ;
     }
     // T-G21: pinned-column vertical-collapse state.
     j["fm_collapsed"] = s.fmCollapsed;
@@ -877,17 +888,35 @@ void setWindowIcon(GLFWwindow* win, const std::string& path) {
     static const int kSizes[] = {16, 32, 48, 64, 128, 256};
     static const int kCount   = (int)(sizeof(kSizes) / sizeof(kSizes[0]));
 
+    // assets/appicon/<N>.png — the brand mark rendered NATIVELY at each size (assets/make_logo.py
+    // make_icon_set). The mark is a wireframe tesseract: resampling the 256 master down to 16/24
+    // smears its 32 edges into a patch, whereas the native render picks draw_mark's reduced
+    // small-size treatment and stays legible. Fall back to resampling `path` per size when the
+    // set is absent (older/partial installs), so this never regresses to a missing icon.
+    const std::string dir = std::filesystem::path(path).parent_path().string();
+
     GLFWimage imgs[kCount];
     unsigned char* bufs[kCount] = {};
     int nImgs = 0;
 
     for (int i = 0; i < kCount; ++i) {
-        int s = kSizes[i];
+        const int s = kSizes[i];
+        int nw = 0, nh = 0, nc = 0;
+        unsigned char* native =
+            stbi_load((dir + "/appicon/" + std::to_string(s) + ".png").c_str(),
+                      &nw, &nh, &nc, 4);
+        if (native && nw == s && nh == s) {
+            imgs[nImgs] = {s, s, native};
+            bufs[nImgs] = native;   // stbi buffer; freed with free() like the malloc'd ones
+            ++nImgs;
+            continue;
+        }
+        if (native) stbi_image_free(native);
         if (s > w || s > h) continue;   // don't upscale
         unsigned char* buf = (unsigned char*)malloc(s * s * 4);
         if (!buf) continue;
         stbir_resize_uint8_srgb(src, w, h, 0, buf, s, s, 0, STBIR_RGBA);
-        imgs[nImgs]  = {s, s, buf};
+        imgs[nImgs] = {s, s, buf};
         bufs[nImgs] = buf;
         ++nImgs;
     }

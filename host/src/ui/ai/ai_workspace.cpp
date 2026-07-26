@@ -1788,11 +1788,17 @@ void drawAiWorkspace(AppState& st) {
     const ImU32  hairline = ui::Palette::toU32(palette.glassBorder);
 
     // ---- left: main chat ----------------------------------------------------------
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
+    // Horizontal gutter is ASYMMETRIC: the pill scrollbar is clipped to this child, so the right
+    // side must reserve a full kChatScrollbarLane or the chat runs under the bar. ImGui's
+    // WindowPadding is symmetric, so push the WIDE (right) value and pull the LEFT edge back to
+    // the shared cpMenuGutter with a negative Indent below.
+    const float padL = ui::metrics::cpMenuGutter();
+    const float padR = std::max(padL, ui::metrics::px(ui::kChatScrollbarLane));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padR, ui::metrics::px(8.0f)));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##ai_ws_conv", ImVec2(chatW, 0),
                       ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+    if (padR > padL) ImGui::Indent(padL - padR);   // negative: pull the LEFT edge back to padL
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
     // Liquid-glass slab behind the conversation (same recipe as the view pane); the same
@@ -1804,7 +1810,8 @@ void drawAiWorkspace(AppState& st) {
         adaptivePanel(panelId("ai_ws_conv_glass"), cRect, GlassGroup::Global);
     glassPanel(ImGui::GetWindowDrawList(), cRect, GlassLevel::Thin, rowRoundDp(), convSurf);
     drawChatCenter(st, busy, canRun);   // log + composer (same state/send path as the dock)
-    drawWindowPillScrollbarV(convSurf, ui::kChatScrollbar);  // same 6px right-edge bar as the dock
+    if (padR > padL) ImGui::Unindent(padL - padR);  // undo before the scrollbar geometry read
+    drawWindowPillScrollbarV(convSurf, ui::kChatScrollbar);  // same 9px right-edge bar as the dock
     ImGui::EndChild();
 
     ImGui::SameLine(0.0f, gap);

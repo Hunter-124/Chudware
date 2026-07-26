@@ -471,9 +471,16 @@ struct PillScrollbarStyle {
     bool flushRight = false;   // true: pill sits ON the right edge instead of band-centred
 };
 
-// The copilot/agent chat's bar: 6px, sitting ON the right edge. Shared by the docked copilot
+// The copilot/agent chat's bar: 9px, sitting ON the right edge. Shared by the docked copilot
 // panel and the AI tab's conversation pane so the same chat never looks different in two hosts.
-inline constexpr PillScrollbarStyle kChatScrollbar{6.0f, true};
+// The pill is drawn INSIDE the host child's clip rect, so the host MUST reserve a right-hand
+// lane for it (see kChatScrollbarLane) or content runs under the bar.
+inline constexpr PillScrollbarStyle kChatScrollbar{9.0f, true};
+
+// Right-hand gutter, in LOGICAL px, that a chat scroll child must reserve for kChatScrollbar:
+// the 9px pill plus 4px of clearance so bubbles/cards never touch or slide under it. Callers
+// scale it with ui::metrics::px().
+inline constexpr float kChatScrollbarLane = 13.0f;
 
 // FeatureManager-style custom vertical scrollbar for the CURRENT window/child. Call just before
 // EndChild; reads GetScrollY/GetScrollMaxY + the window rect, draws the pill overlay on the right

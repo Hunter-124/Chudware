@@ -204,6 +204,11 @@ struct Settings {
     // "fm_collapsed" / "copilot_collapsed".
     bool fmCollapsed = false;
     bool copilotCollapsed = false;
+
+    // Animation style of the copilot brand mark (the live tesseract logo). Plain int, not
+    // ui::TesseractAnim, so core/ stays free of the UI header; the UI clamps it on read via
+    // ui::tesseractAnimFromInt. Serialized "appearance.brand_anim" (omitted when 0).
+    int brandAnim = 0;
 };
 
 std::string appdataDir();

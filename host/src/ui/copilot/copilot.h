@@ -2,8 +2,10 @@
 //
 // The docked host is a PINNED, full-height, rounded liquid-glass column overlaid on the
 // viewport's right edge (~12dp margins; the only docked layout — no docked fallback). Slim
-// header (outline cube + status + Sessions), conversation log with a per-turn transparent
-// activity timeline (what the AI is doing / thinking, expandable) whose cards are translucent
+// header (the live animated tesseract brand mark, tinted by run status, its animation style
+// chosen in Settings -> Appearance -> Brand mark, + status + Sessions), conversation log with
+// a per-turn transparent activity timeline (what the AI is doing / thinking, expandable) whose
+// cards are translucent
 // adaptive glass bubbles over the live viewport backdrop (GlassGroup::Copilot, host contract
 // H5), and a bottom composer (prelude: compact Agent/Plan/Swarm/Edit/Ask dropdown + context
 // meter; transparent prompt with in-box send; graduated segmented toolbar: model biggest,

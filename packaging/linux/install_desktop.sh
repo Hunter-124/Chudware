@@ -16,6 +16,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$REPO/host/build-linux/bin/chudware"
 ICON_SRC="$REPO/assets/logo_icon.png"
+# Natively-rendered per-size app icons (assets/make_logo.py make_icon_set). Preferred over
+# resizing ICON_SRC: the wireframe tesseract mark loses its inner cell when the 256 master is
+# squeezed to 16/32, so the shell's small slots get the art drawn for that size instead.
+ICON_SET="$REPO/assets/appicon"
 DOC_ICON_SRC="$REPO/assets/doc_icon.png"
 # freedesktop icon name for the native document MIME type (application/vnd.chudware.stepplus,
 # registered by services/installer/setup_file_assoc.py): the MIME with '/' -> '-'.
@@ -36,6 +40,10 @@ install_icon() {
   local dir="$ICONS/${size}x${size}/apps"
   mkdir -p "$dir"
   local dest="$dir/Chudware.png"
+  if [ -f "$ICON_SET/${size}.png" ]; then
+    cp "$ICON_SET/${size}.png" "$dest"
+    return
+  fi
   if command -v magick >/dev/null 2>&1; then
     magick "$ICON_SRC" -resize "${size}x${size}" "$dest"
   elif command -v convert >/dev/null 2>&1; then

@@ -34,7 +34,7 @@ static void failJobFromEscapedException(const std::shared_ptr<JobState>& job, co
 // Runs agent_run_v2 on a background thread. Orchestrator events arrive via the EventFn
 // callback with kind = "run_started" / "stage_started" / etc.  We push them into
 // job->events with an "orch_" prefix (kind field) so the main thread drain can distinguish
-// them from legacy iteration events and route them to the ActivityPanel.
+// them from legacy iteration events and route them to the Agent Workflow DAG store.
 void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
                       const std::string& convId, const std::string& docKey,
                       const std::string& request, const std::string& docId, bool cam,
@@ -75,7 +75,7 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
 
         // The onEvent callback is called on the worker thread for each streamed event.
         // We package it as an AgentEvent with kind = "orch_<original_kind>" so the GL thread
-        // drain (in app.cpp) can identify and route it to the ActivityPanel.
+        // drain (in app.cpp) can identify and route it to the Agent Workflow DAG store.
         WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
             AgentEvent e;
             // The worker emits events.md §3 kinds; we prefix them "orch_" for routing.

@@ -24,7 +24,7 @@ void drawAiWorkspace(AppState& st);
 
 // Phase 2 (M9/M10) — live Agent Workflow DAG feed, ONE tree PER CONVERSATION.
 // Called ONCE per streamed orchestrator event from the app.cpp JobState.events GL-thread drain
-// (the same drain that routes ActivityPanel + feedTurnActivity). `convId` is the conversation
+// (the same drain that routes feedTurnActivity). `convId` is the conversation
 // whose run emitted the event (the drain iterates st.runs, keyed by conversation id); `kind` is
 // the raw event kind with the "orch_" prefix already stripped (e.g. "agent.tool_call",
 // "run_started"); `data` is the parsed `aicad.agent_events/2` record. GL-thread only — the

@@ -58,7 +58,6 @@
 #include "ui/doc_tabs.h"        // ui::docTabStripHeight — top inset so the column clears the tab band
 #include "ui/model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
 #include "ui/metrics.h"         // ui::metrics::px/U/asmHeaderIconGap
-#include "ui/activity_panel.h"  // C22b: ActivityPanel still fed for the CHUDWARE_SHOT=activity scenario
 #include "ui/console_panel.h"   // drawConsoleBody (shared console helper)
 #include "ui/file_dialog.h"     // openFileDialog — composer paperclip attachments (M23)
 #include "ui/icons.h"           // getIcon / IconUV — composer settings glyph

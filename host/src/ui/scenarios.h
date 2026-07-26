@@ -25,7 +25,6 @@ namespace ui {
 
 class PropertyManager;
 class EvaluateDialogs;
-class ActivityPanel;
 
 class ScenarioRunner {
 public:
@@ -45,7 +44,7 @@ public:
     // Ctor + dtor are BOTH out-of-line: rsRenderer is a unique_ptr to an incomplete type
     // (render::SplatRenderer), so the compiler-generated cleanup (which the inline ctor's
     // exception path also needs) must be emitted where that type is complete (scenarios.cpp).
-    explicit ScenarioRunner(ActivityPanel& activityPanel);
+    ScenarioRunner();
     ~ScenarioRunner();
 
     // Advance the active scenario's step machine (no-op when no CHUDWARE_SHOT scenario mode
@@ -58,8 +57,6 @@ public:
     FrameAction endFrame(AppState& st, int dw, int dh, const char* screenshotPath);
 
 private:
-    ActivityPanel& activityPanel;
-
     // ---------- C17 M1 integration scenario (CHUDWARE_SHOT=m1) ----------
     int m1Step = 0;            // which scenario step we are on
     int m1Settle = 0;          // frames waited since the step's ops ran (let mesh repaint)
@@ -143,12 +140,6 @@ private:
     std::string rsSavePath, rsCapture;
     bool rsDirReady = false, rsLoaded = false;
     std::unique_ptr<render::SplatRenderer> rsRenderer;
-
-    // ---------- C22b activity scenario (CHUDWARE_SHOT=activity) ----------
-    int actStep = 0, actSettle = 0, actWaitFrames = 0;
-    std::string actCapture;
-    std::string actSavePath;
-    bool actDirReady = false;
 
     // ---------- multi-document scenario (CHUDWARE_SHOT=multidoc) ----------
     // Verifies the per-document DocSession refactor: open a feature-edit PM form mid-edit on Part A

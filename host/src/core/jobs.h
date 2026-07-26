@@ -13,7 +13,8 @@ struct JobState;
 // --- C22b: launch agent_run_v2 on a background thread ---
 // Streams orchestrator events (run_started / stage_started / agent_call / agent_output /
 // stage_result / run_finished) through job->events with kind prefixed "orch_" so the
-// main-thread drain can route them to the ActivityPanel separately from legacy events.
+// main-thread drain can route them to the Agent Workflow DAG store + the conversation's
+// inline activity timeline, separately from legacy iteration events.
 // `job` is the run slot BOUND to `convId` (see AppState::runFor/activeRun) — JobState is
 // non-copyable, so it is always passed/held by shared_ptr; the detached worker thread captures
 // it by value so the JobState outlives the run even if AppState::runs rehashes. Refuses (no-op)

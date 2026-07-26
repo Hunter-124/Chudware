@@ -147,9 +147,6 @@ inline void wasmBootDom(const char *msg) {
 #include "ui/evaluate_dialogs.h"
 #include "ui/sim_manager.h"
 // --- end C19 ---
-// --- C22b: Activity panel + prompt editor ---
-#include "ui/activity_panel.h"
-// --- end C22b ---
 // --- C20b: assembly UI ---
 #include "ui/asm_panels.h"
 // --- end C20b ---
@@ -2035,12 +2032,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // each frame.
   ui::CutListPanel cutListPanel;
 
-  // --- C22b: ActivityPanel — owned here, borrowed via st.activityPanel (opaque
-  // void*). ---
-  ui::ActivityPanel activityPanel;
-  st.activityPanel = &activityPanel;
-  // --- end C22b ---
-
   // --- C20b: AsmPanels — owned here, borrowed via st.asmPanels (opaque void*).
   // ---
   ui::AsmPanels asmPanels;
@@ -2944,12 +2935,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.ribbonTab = AppState::RT_Simulation;
     st.leftPaneTab = AppState::LP_Simulation;
   }
-  // C22b: activity shot — new part doc -> agent_run_v2 -> Activity panel ->
-  // Settings Agents tab
-  st.wantActivity = shot && shotMode && std::strcmp(shotMode, "activity") == 0;
-  if (st.wantActivity) {
-    st.showActivityPanel = true;
-  }
   // [workspace-tabs seam] workspaces shot — cycle all 8 workspace tabs, one
   // screenshot each.
   st.wantWorkspace =
@@ -3123,8 +3108,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   if (st.wantAsm) {
     st.showRibbon = true;
     st.ribbonTab = AppState::RT_Features; // Assembly tools live on Features tab
-    st.showActivityPanel =
-        false; // keep the FeatureManager (Mates folder) unobscured
     if (wantMateForm) {
       st.wantAsm = false; // suppress the scripted scenario; just show the form
       asmPanels.handleCommand(
@@ -3484,7 +3467,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // (ui/scenarios.cpp). tick() advances the active scenario before each frame;
   // endFrame() handles the captures and the scenario-driven swap+continue /
   // swap+break at loop bottom.
-  ui::ScenarioRunner scenarios(activityPanel);
+  ui::ScenarioRunner scenarios;
 
   auto desiredThemeForFrame = [&st]() {
     if (const char *envTheme = std::getenv("CHUDWARE_THEME")) {
@@ -3833,20 +3816,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       const bool isViewedDoc =
           !job.docKey.empty() && job.docKey == st.chatDocKey;
       for (auto &e : evs) {
-        // --- C22b: route orchestrator events to the ActivityPanel ---
+        // --- route orchestrator events to the Agent Workflow DAG store ---
         if (e.kind.rfind("orch_", 0) == 0) {
           std::string orchKind = e.kind.substr(5); // strip "orch_"
           try {
             nlohmann::json data = nlohmann::json::parse(e.text);
-            // The panel keeps a SINGLE global live tree and clears it on
-            // run_started, so feeding it from every conversation's run makes
-            // two concurrent chats shred each other's tree. Feed it from the
-            // VIEWED conversation only, and only while the window is actually
-            // open — it is reachable solely via View > Activity and the
-            // CHUDWARE_SHOT=activity scenario, so closed costs nothing.
-            if (st.activityPanel && st.showActivityPanel &&
-                runConvId == st.activeConvId())
-              st.activityPanel->onEvent(orchKind, data);
             // Phase 2 (M9/M10): feed the owning conversation's Agent Workflow
             // DAG store. Keyed by runConvId, so every chat builds its OWN
             // execution trace and two concurrent runs never blank or hijack
@@ -5957,11 +5931,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // bound (st.chatDocKey) and is debounced to ~1 Hz, so double-calling with the panel's own
     // hook is free.
     ui::maybePersistChatHistoryDebounced(st, /*force=*/false);
-    // W3-H: standalone "Agent Activity" window (View > Activity / the pane's
-    // Activity button / the activity shot). No-op unless st.showActivityPanel;
-    // was previously unreachable because only the in-pane tab hosted drawBody.
-    activityPanel.draw(st);
-
     if (!wsFullBody) {
       // ---- 3D/2D viewport (Model, Drawing, Simulate, Manufacture) ----
       // Electronics uses the ECAD editor as the full central body — skip the 3D

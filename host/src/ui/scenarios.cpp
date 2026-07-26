@@ -22,8 +22,6 @@
 #include "../core/app_state.h"
 #include "../renderer.h"  // T-G15 iconpipe: transparent thumbnail render + FBO readback
 #include "../render/splat_renderer.h"  // RE-28: 3DGS splat renderer
-#include "../core/jobs.h"  // launchAgentRunV2 (C22b activity scenario)
-#include "activity_panel.h"
 #include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
 #include "asm_panels.h"
 #include "evaluate_dialogs.h"
@@ -984,73 +982,6 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
 
-    // --- C22b activity scenario (CHUDWARE_SHOT=activity) ---
-    if (st.wantActivity && st.workerStarted && !st.activityShotDone && st.frame >= 5) {
-        if (!actDirReady) {
-            actDirReady = true;
-            const char* repo = std::getenv("CHUDWARE_REPO");
-            std::string base = repo ? std::string(repo) : std::string(".");
-            actSavePath = base + "/scratch/activity_shots";
-            std::error_code ec; std::filesystem::create_directories(actSavePath, ec);  // W1-B (item 12)
-        }
-        const int kSettle = 4;
-        if (actSettle > 0) { --actSettle; }
-        else if (actCapture.empty()) {
-            std::string aerr;
-            switch (actStep) {
-                case 0: {  // New part
-                    if (!st.docMirror.newPart(st.worker, aerr)) {
-                        std::printf("activity: new_part FAILED: %s\n", aerr.c_str());
-                        std::fflush(stdout); st.activityShotDone = true; break;
-                    }
-                    std::printf("activity: new_part doc_id=%s rev=%d\n",
-                                st.docMirror.docId().c_str(), st.docMirror.revision());
-                    std::fflush(stdout);
-                    actSettle = kSettle; ++actStep; break;
-                }
-                case 1: {  // Launch agent_run_v2
-                    std::string req = "a bracket with a filleted top edge";
-                    std::strncpy(st.prompt.data(), req.c_str(), st.prompt.size() - 1);
-                    st.agentV2 = true;
-                    st.agentV2Running = true;
-                    activityPanel.clearLive();
-                    launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, req, st.docMirror.docId());
-                    std::printf("activity: agent_run_v2 launched: %s\n", req.c_str());
-                    std::fflush(stdout);
-                    actWaitFrames = 0; ++actStep; break;
-                }
-                case 2: {  // Wait for run to finish
-                    ++actWaitFrames;
-                    if (!st.convRunning(st.activeConvId()) || actWaitFrames > 1800) {
-                        std::printf("activity: run done (frames=%d)\n", actWaitFrames);
-                        std::fflush(stdout);
-                        actSettle = kSettle * 2; ++actStep;
-                    }
-                    break;
-                }
-                case 3: {  // Screenshot 1: Activity panel with run tree
-                    std::printf("activity: shot1 activity panel\n"); std::fflush(stdout);
-                    actCapture = actSavePath + "/activity_01_run.png";
-                    actSettle = kSettle; ++actStep; break;
-                }
-                case 4: {  // Open Settings > Agents tab
-                    st.openSettings = true;
-                    st.pendingPromptRole = "modeler";
-                    actSettle = kSettle * 2; ++actStep; break;
-                }
-                case 5: {  // Screenshot 2: Settings Agents tab
-                    std::printf("activity: shot2 agents settings tab\n"); std::fflush(stdout);
-                    actCapture = actSavePath + "/activity_02_agents.png";
-                    actSettle = kSettle; ++actStep; break;
-                }
-                default:
-                    st.activityShotDone = true;
-                    std::printf("activity: scenario complete\n"); std::fflush(stdout);
-                    break;
-            }
-        }
-    }
-    // --- end C22b activity scenario ---
 
     // ---------- multi-document scenario (CHUDWARE_SHOT=multidoc) ----------
     runMultidoc(st);
@@ -1232,8 +1163,7 @@ void ScenarioRunner::runIconPipe(AppState& st) {
 }
 
 // Out-of-line ctor + dtor (rsRenderer is a unique_ptr to render::SplatRenderer, complete only here).
-ScenarioRunner::ScenarioRunner(ActivityPanel& activityPanel)
-    : activityPanel(activityPanel) {}
+ScenarioRunner::ScenarioRunner() = default;
 ScenarioRunner::~ScenarioRunner() = default;
 
 // RE-28 3DGS splat scenario (CHUDWARE_SHOT=reveng_splat). Self-contained: loads the canned gaussian
@@ -2057,28 +1987,6 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         return FrameAction::Continue;
     }
 
-    // --- C22b activity shot capture ---
-    // C39: wait for the async post-run doc_rebuild to drain before shot1 captures.
-    if (st.wantActivity) {
-        ++st.frame;
-        if (!actCapture.empty() && !st.rpc.busy()) {
-            // W1-B (item 12): the dir was created up-front via std::filesystem; ensure it again
-            // here (no-op if present) instead of the old fragile std::system("mkdir ...") shell
-            // call, which could mangle quotes on some paths.
-            std::error_code ec; std::filesystem::create_directories(actSavePath, ec);
-            // Mirror the last step to screenshotPath
-            const char* mirror = actCapture.find("activity_02_agents") != std::string::npos
-                               ? screenshotPath : nullptr;
-            writeBackbufferPng(actCapture.c_str(), dw, dh, mirror);
-            std::printf("activity: screenshot -> %s (%dx%d)\n",
-                        actCapture.c_str(), dw, dh);
-            std::fflush(stdout);
-            actCapture.clear();
-        }
-        glfwSwapBuffers(st.win);
-        return st.activityShotDone ? FrameAction::Break : FrameAction::Continue;
-    }
-    // --- end C22b activity shot capture ---
 
     // appearance scenario: single capture (mirrored to the caller's --ui-screenshot target),
     // waiting for any async worker call to drain so the modal + preview are settled.

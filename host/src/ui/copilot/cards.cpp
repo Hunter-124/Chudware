@@ -1215,7 +1215,6 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     st.status = m.liveStatus; st.statusKind = 0;
     st.agentV2Running = true;
     st.agentV2 = true;
-    if (st.activityPanel) st.activityPanel->clearLive();
 
     if (asSwarm || asEngFirm) {
         launchMissionRunChat(st, req, /*needFreshDoc=*/true, payload);

@@ -52,7 +52,6 @@ class SketchMode;
 class Sketch3DMode;   // 3D free-space sketcher (sketch3d features) — app-wide singleton
 class SimManager;
 class AsmPanels;
-class ActivityPanel;
 class EvaluateDialogs;  // Measure / Mass Properties / Section dialogs — owned per-document (DocSession)
 // Wave 2 (GUI rework): the per-document ECAD editor state (mirror + canvas + selection + edit
 // buffers) lives on each Schematic/PCB DocTab. Its full definition stays in ecad_panel.cpp (it
@@ -1635,11 +1634,9 @@ struct AppState {
     bool wantAsm = false;              // CHUDWARE_SHOT=asm scripted assembly flow
     bool asmShotDone = false;          // guard so the asm scenario runs once per shot
 
-    // ---- C22b: Activity panel + prompt editor + orchestrator wiring ----
-    bool showActivityPanel = false;         // View > Activity window (hidden until a run/View toggle opens it)
+    // ---- C22b: prompt editor + orchestrator wiring ----
     bool agentV2 = true;                    // "Use orchestrator (v2)" checkbox in Design panel
     std::string pendingPromptRole;          // when non-empty, Settings > Agents tab opens on this role
-    ui::ActivityPanel* activityPanel = nullptr;  // owned by run_gui (W1-B: typed)
     // Live status line for the v2 orchestrator run, shown in the chat area
     std::string agentV2Status;              // e.g. "PLAN > planner attempt 1..."
     bool agentV2Running = false;            // a v2 (job-based) run is in flight somewhere —
@@ -1704,8 +1701,6 @@ struct AppState {
     // CHUDWARE_SHOT=tabperf: open 2 parts and hammer A<->B tab switches for logTabPerf timings.
     bool wantTabPerf = false;
     bool tabPerfShotDone = false;
-    bool wantActivity = false;  // C22b: CHUDWARE_SHOT=activity scripted orchestrator run + activity panel
-    bool activityShotDone = false; // guard so the activity scenario runs exactly once
     // [workspace-tabs seam] CHUDWARE_SHOT=workspaces: cycle all 8 workspace tabs, one screenshot each.
     bool wantWorkspace = false;     // CHUDWARE_SHOT=workspaces: workspace cycle scenario
     bool workspaceShotDone = false; // guard so the workspaces scenario runs exactly once

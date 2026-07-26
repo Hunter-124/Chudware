@@ -297,8 +297,6 @@ void launchDesignRun(AppState& st, const std::string& request,
     st.status = "Designing...";  st.statusKind = 0;
     st.agentV2Running = true;
     st.agentV2 = true;
-    if (st.activityPanel)
-        st.activityPanel->clearLive();
     launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, request,
                      st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture, payload);
 }
@@ -342,8 +340,6 @@ void launchMissionRunChat(AppState& st, const std::string& request, bool needFre
     st.status = "Working on it...";  st.statusKind = 0;
     st.agentV2Running = true;
     st.agentV2 = true;
-    if (st.activityPanel)
-        st.activityPanel->clearLive();
     // O1: pin the picker's provider/model/effort explicitly in the RPC payload.
     nlohmann::json payload = agentProviderOverride(st.settings);
     if (extra.is_object()) {
@@ -1013,8 +1009,6 @@ void submitTurn(AppState& st, const std::string& text) {
         st.status = "Editing...";  st.statusKind = 0;
         st.agentV2Running = true;
         st.agentV2 = true;
-        if (st.activityPanel)
-            st.activityPanel->clearLive();
         nlohmann::json extra = provOverride;
         for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
             extra[it.key()] = it.value();
@@ -1059,7 +1053,6 @@ void submitTurn(AppState& st, const std::string& text) {
                 st.status = "Editing...";  st.statusKind = 0;
                 st.agentV2Running = true;
                 st.agentV2 = true;
-                if (st.activityPanel) st.activityPanel->clearLive();
                 nlohmann::json extra = provOverride;
                 for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
                     extra[it.key()] = it.value();
@@ -1190,8 +1183,6 @@ void submitTurn(AppState& st, const std::string& text) {
         st.status = "Planning...";  st.statusKind = 0;
         st.agentV2Running = true;
         st.agentV2 = true;
-        if (st.activityPanel)
-            st.activityPanel->clearLive();
         for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
             if (!it->fromUser && it->running) {
                 it->planApprovePending = true;
@@ -1298,8 +1289,6 @@ void submitTurn(AppState& st, const std::string& text) {
             st.status = "Editing...";  st.statusKind = 0;
             st.agentV2Running = true;
             st.agentV2 = true;
-            if (st.activityPanel)
-                st.activityPanel->clearLive();
             nlohmann::json extra = provOverride;
             for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
                 extra[it.key()] = it.value();

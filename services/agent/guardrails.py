@@ -55,6 +55,24 @@ MUTATING_TOOLS: frozenset[str] = frozenset({
     "sketch3d_add", "sketch3d_edit", "convert_face_to_sketch",
 }) | DESTRUCTIVE_TOOLS
 
+# Datum names the KERNEL resolves without a feature existing. Mirrors
+# ``RESERVED_DATUMS`` in core/doc/validate.cpp — kept in lockstep by
+# ``test_reserved_datum_parity`` in services/agent/test_guardrail_datums.py.
+#
+# This set is load-bearing: the WI-15 ref check is a HARD, WAIVER-LESS block, so
+# a reserved name missing from it is not a warning, it is a permanent wall. It
+# was, exactly: ``cad_guide('sketch')`` tells the model the sketch plane MUST be
+# spelled "plane.top"/"plane.front"/"plane.right", the model obeyed, and the
+# guard rejected the batch with "Missing: plane.top" while advising it to "name
+# datum planes front/top/right" — the bare forms, which only resolved by
+# accident through the plain-English heuristic in ``_looks_like_geom_query``.
+# Our own documented spelling was unbuildable.
+RESERVED_DATUMS: frozenset[str] = frozenset({
+    "origin", "point.origin",
+    "plane.front", "plane.top", "plane.right",
+    "axis.x", "axis.y", "axis.z",
+})
+
 # Tools whose args may carry feature/face refs that must resolve (WI-15).
 REF_MUTATING_TOOLS: frozenset[str] = frozenset({
     "add_features", "doc_apply_ops",
@@ -722,7 +740,11 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
     declared: set[str] = set()
 
     def _resolves(ref: str) -> bool:
-        return ref in known_ids or ref in known_names or ref in declared
+        # A reserved datum resolves in the KERNEL without any feature existing,
+        # so it can never be "dangling" — checking it against the feature tree
+        # is a category error, and a waiver-less one.
+        return (ref in known_ids or ref in known_names or ref in declared
+                or ref in RESERVED_DATUMS)
 
     for op in ops:
         if not isinstance(op, dict):
@@ -841,14 +863,16 @@ def _refs_hint(known: tuple[set[str], set[str]] | None) -> str:
     block into a one-shot correction.
     """
     avail = sorted((known[0] | known[1]) if known else set())
+    datums = ", ".join(sorted(RESERVED_DATUMS))
     if not avail:
         return (" The document has no features yet — create every feature you "
                 "reference within this same ops batch (refs to features added "
-                "by EARLIER ops in the batch do resolve), and name datum "
-                "planes front/top/right.")
+                "by EARLIER ops in the batch do resolve). These datums always "
+                f"resolve without a feature: {datums}.")
     shown = ", ".join(avail[:20])
     more = f" (+{len(avail) - 20} more)" if len(avail) > 20 else ""
-    return f" Refs that exist: {shown}{more}."
+    return (f" Refs that exist: {shown}{more}. These datums also always "
+            f"resolve: {datums}.")
 
 
 def check_refs_against_doc(ops: list[dict], doc_id: str | None,

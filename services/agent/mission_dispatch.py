@@ -512,9 +512,12 @@ class MissionDispatch:
                  docs: list | None = None, **_ignored: Any) -> dict:
         """Spawn a sub-agent role with an isolated brief and token budget (§12).
 
-        Requires the mission's live delegation tree; without one this returns a
-        structured refusal (and records the request) — do the work directly or
-        escalate in your handoff.
+        A mission that reaches this call with no delegation tree but WITH a model
+        provider gets one bound on the spot (same tree run_linear_role_turn binds,
+        recorded as ``delegation_tree_autobound``) so an advertised tool is not a
+        guaranteed failure. With neither tree nor provider nothing could execute,
+        so the call returns a structured refusal naming what to do instead — do
+        the work directly and record the remainder with ledger_note.
 
         WS4: spawn-depth policy (max_spawn_depth from capability / config) is
         checked before the tree spawn; deeper spawns require decreasing
@@ -564,6 +567,41 @@ class MissionDispatch:
         exec_brief = brief_raw[: self._BRIEF_EXEC_MAX]
 
         if self.delegation_tree is None:
+            # ADVERTISED BUT IMPOSSIBLE (15 dead calls in the gym ledgers): every
+            # role card on the orchestrator/manager path lists `delegate` and the
+            # prompt tells the model to use it, so an unbound tree made an
+            # advertised tool fail 100% of the time. run_linear_role_turn already
+            # binds a tree for exactly this reason — do the same here, lazily, so
+            # any mission that reaches delegate() with a provider gets a REAL
+            # spawn. The tree self-limits (budget meter, max_subagent_depth), and
+            # the binding is recorded, never silent.
+            if self.provider is not None:
+                try:
+                    from services.agent.delegation import (  # noqa: PLC0415
+                        DelegationTree as _DelegationTree,
+                    )
+                    self.delegation_tree = _DelegationTree(
+                        run_id=str(getattr(self, "run_id", "") or ""),
+                        ledger=self.ledger,
+                        on_event=self.on_event,
+                    )
+                    self._delegation_tree_autobound = True
+                    if self.ledger is not None:
+                        try:
+                            self.ledger.append("agent", "note", {
+                                "event": "delegation_tree_autobound",
+                                "run_id": str(getattr(self, "run_id", "") or ""),
+                                "why": ("delegate called on a mission with no tree; "
+                                        "a provider is bound so the spawn really runs"),
+                            })
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception:  # noqa: BLE001 — degrade to the honest refusal
+                    self.delegation_tree = None
+
+        if self.delegation_tree is None:
+            # No provider ⇒ a spawned node could not execute; saying "spawned"
+            # would be a fabricated success. Refuse, and name the alternative.
             if self.ledger is not None:
                 try:
                     self.ledger.append("agent", "note", {
@@ -573,9 +611,23 @@ class MissionDispatch:
                         "status": "unavailable"})
                 except Exception:  # noqa: BLE001
                     pass
-            return {"ok": False, "status": "unavailable",
-                    "error": ("no delegation tree bound to this mission (org layer "
-                              "off); do the work directly or escalate in your handoff")}
+            return {
+                "ok": False, "status": "unavailable",
+                "error": (
+                    "delegate is not available in this run: no delegation tree and "
+                    "no model provider are bound to it, so no sub-agent can execute. "
+                    "Do NOT retry delegate — do the work yourself with the concrete "
+                    f"tools this turn already has (the {role_resolved!r} work you "
+                    "were about to hand off), and record what is left for another "
+                    "run with ledger_note(kind='handoff', ...)."
+                ),
+                "role_requested": role_raw,
+                "role_resolved": role_resolved,
+                "do_instead": [
+                    "build/inspect directly with the modeling tools in your allowlist",
+                    "ledger_note(kind='handoff', payload={...}) for work you cannot finish",
+                ],
+            }
 
         # WS4 spawn-depth policy: max depth from capability letter / config.
         try:
@@ -623,6 +675,10 @@ class MissionDispatch:
                     "role_resolved": role_resolved,
                     "brief_len": len(brief_raw),
                     "brief_truncated": brief_truncated}
+
+        if isinstance(node, dict) and getattr(self, "_delegation_tree_autobound", False):
+            # Observable, not silent: this mission had no tree until this call.
+            node["delegation_tree_autobound"] = True
 
         # Phase 4 (M11): run the approved sub-agent NOW (synchronous, bounded).
         # HONESTY: without a bound provider nothing executes — the node is returned

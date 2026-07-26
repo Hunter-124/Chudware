@@ -377,12 +377,18 @@ class TestFeatureCreatedFaces:
         assert roster["f2"] == [8, 9]
         assert roster["f1"] == [1, 2, 4, 6]
 
-    def test_no_tessellation_leaves_the_join_alone(self, monkeypatch):
-        """Without real face points there is nothing to judge with, so the owner_map join
-        must survive intact rather than be guessed at."""
+    def test_attribution_does_not_depend_on_tessellation(self, monkeypatch):
+        """STRENGTHENED contract (was "no face points -> leave the owner_map join alone").
+
+        De-smearing now runs the params-based TOOL SCALE test first, and that test needs no
+        geometry at all: an r8 bore's tool cannot have authored an 8381 or 9399 mm2 plane, so
+        both plate faces go back to the plate with the tessellation stubbed out. Only the
+        second, geometric footprint test degrades when doc_face_points is unavailable, and it
+        can only refine what the scale test already decided. The old expectation froze the
+        FALLBACK (keep everything) as if it were the contract."""
         monkeypatch.setattr(ct.cb, "call", _plate_boss_bore(points_by_sid={}))
         ms = ct._feature_owned_matches("doc-1", "Bore")
-        assert [m["sid"] for m in ms] == ["F742d7a", "Fd83900", "F704662"]
+        assert [m["sid"] for m in ms] == ["F704662"]
 
     def test_blind_hole_keeps_its_floor(self, monkeypatch):
         """The floor fits INSIDE the wall footprint, so it is the tool's own face."""

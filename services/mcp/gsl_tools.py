@@ -17,13 +17,17 @@ re-reading the whole B-rep after every edit.
 """
 from __future__ import annotations
 
+import json
 import math
 from collections import defaultdict
-from typing import Optional
+from typing import Annotated, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from mcp_server import core_bridge as cb
+from mcp_server.cad_common import (_NON_BODY_FEATURE_TYPES, _face_attribution,
+                                   _solid_feature_order)
 from mcp_server.cad_tools import _doc, _dumps, _err
 from mcp_server.fit_narration import _format_fit  # single home (T-F8); loop.py shares it
 
@@ -58,9 +62,6 @@ def _axis_order(faces: list) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------- A3: placement narrative
-# A feature type that never owns solid faces (references/sketches) — never gets a placement
-# line or a "consumed" line, since it was never expected to own B-rep faces to begin with.
-_NON_BODY_FEATURE_TYPES = {"sketch", "plane", "axis", "point", "csys"}
 
 _SIDE_AXIS = {"top": "z", "bottom": "z", "right": "x", "left": "x", "front": "y", "back": "y"}
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
@@ -263,90 +264,14 @@ def _feature_group_line(fg: dict) -> str:
 
 # ------------------------------------------------- feature -> face attribution, de-smeared
 # doc_tree's owner_map credits every face a boolean REGENERATED to the feature that ran the
-# boolean, so a small cut ends up owning the large planar face it merely pierced (measured:
-# an r8 through-bore in a 120x80x15 plate owns the plate's whole 9398 mm^2 bottom face; a
-# 25 mm spout fused onto a 165 mm bucket owns the bucket's 309048 mm^2 outer wall). The
-# engine's real tool solid (CompileResult::tool_recs) never leaves C++ — the one RPC over it,
-# eval_feature_overlap, returns pairwise VOLUMES, not per-face membership — so we discriminate
-# geometrically from the tool the feature AUTHORED:
-#
-#     a feature's tool cannot create a face larger than the tool's own cross-section.
-#
-# That is a one-way test: it only ever removes a face the owner demonstrably could NOT have
-# made, never a face it could. A removed face is re-credited to the latest EARLIER feature
-# whose tool could have made it, and left unowned when none could — faces are conserved, never
-# duplicated, and a feature left with nothing is labelled, not back-filled. Feature types with
-# no analytic cross-section (extrude/revolve/loft/sweep/shell/fillet/...) get no scale and so
-# keep every face the kernel gave them.
-_TOOL_SCALE_EPS = 1.02  # slack for tessellation/imprint noise on an exact-size match
-
-
-def _dim_num(v) -> Optional[float]:
-    """A dimension param's number, from {"value":..,"expr":..} or a bare number."""
-    if isinstance(v, dict):
-        v = v.get("value")
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
-
-
-def _feature_tool_scale(ft: dict) -> Optional[dict]:
-    """{"radius": largest curved radius this tool can produce (0.0 = none at all),
-        "plane_area": largest planar face this tool can produce}, from the AUTHORED params.
-    None for a feature type whose tool has no analytic cross-section — such a feature is
-    unconstrained and keeps whatever the kernel attributed to it."""
-    if not isinstance(ft, dict):
-        return None
-    t = (ft.get("type") or "").lower()
-    p = ft.get("params") or {}
-
-    def _radius(*keys) -> Optional[float]:
-        vals = [_dim_num(p.get(k)) for k in keys]
-        vals = [v for v in vals if v is not None]
-        return max(vals) if vals else None
-
-    if t == "box":
-        length, width, height = (_dim_num(p.get(k)) for k in ("length", "width", "height"))
-        if None in (length, width, height):
-            return None
-        # A box tool's boundary is entirely planar: it cannot author a curved face.
-        return {"radius": 0.0,
-                "plane_area": max(length * width, length * height, width * height)}
-    if t in ("cylinder", "sphere"):
-        r = _radius("radius")
-        if r is None:
-            d = _dim_num(p.get("diameter"))
-            r = d / 2.0 if d is not None else None
-    elif t == "cone":
-        r = _radius("radius", "radius1", "radius2", "radius_bottom", "radius_top")
-    elif t == "torus":
-        major, minor = _radius("radius", "major_radius"), _radius("radius2", "minor_radius")
-        r = (major + minor) if (major is not None and minor is not None) else None
-    elif t in ("hole", "bolt_circle"):
-        # The widest authored diameter wins: a counterbore/countersink is wider than the drill.
-        ds = [_dim_num(v) for k, v in p.items() if "diameter" in str(k).lower()]
-        ds = [d for d in ds if d is not None]
-        rs = [_dim_num(v) for k, v in p.items() if str(k).lower().endswith("radius")]
-        rs = [x for x in rs if x is not None] + [d / 2.0 for d in ds]
-        r = max(rs) if rs else None
-    else:
-        return None
-    if r is None or r <= 0.0:
-        return None
-    return {"radius": r, "plane_area": math.pi * r * r}
-
-
-def _tool_scale_accepts(scale: Optional[dict], f: dict) -> bool:
-    """Could this feature's tool have created this face? Necessary condition only."""
-    if not scale:
-        return True
-    if (f.get("surf") or "plane") != "plane":
-        r, rt = f.get("radius"), scale.get("radius")
-        if r is None or rt is None:
-            return True  # no size cue on either side — keep, never guess a face away
-        return r <= rt * _TOOL_SCALE_EPS + 1e-6
-    a, pa = f.get("area_or_len"), scale.get("plane_area")
-    if a is None or pa is None:
-        return True
-    return a <= pa * _TOOL_SCALE_EPS + 1e-6
+# boolean, in both directions: a small cut ends up owning the large planar face it merely
+# pierced, and a small boss ends up owning the large face it merely landed on (measured: an r8
+# through-bore in a 120x80x15 plate owns the plate's whole 9398 mm^2 bottom face; a 25 mm spout
+# fused onto a 165 mm bucket owns the bucket's 309048 mm^2 outer wall). Un-smearing that is
+# cad_common's job — _face_attribution there is the single implementation, shared with the
+# inspect/render targeting join and the callout roster. This module only NARRATES its output:
+# `owned` is the de-smeared partition, `claimed` the raw kernel count that stays visible as
+# `attributed_faces`, and `reattributed` the number of faces that changed hands.
 
 
 def _digest(doc_id: str) -> dict:
@@ -361,7 +286,7 @@ def _digest(doc_id: str) -> dict:
     except Exception:  # noqa: BLE001
         bbox = {}
     feats = ((tree.get("tree") or {}).get("features")) or []
-    owner_map = tree.get("owner_map") or {}  # kept for callers that want the raw map
+    owner_map = tree.get("owner_map") or {}  # the raw feature->topology table; de-smeared below
 
     # Instance/symmetry clustering: faces with the same shape+size are likely pattern copies.
     groups: dict = defaultdict(list)
@@ -385,54 +310,13 @@ def _digest(doc_id: str) -> dict:
     caps = [{"sid": f.get("sid"), "side": f.get("side"), "area": f.get("area_or_len")}
             for f in faces if f.get("surf") == "plane" and f.get("side")]
 
-    # A3 — group owned faces by feature. doc_query's per-face `owner_feature` field is ALWAYS
-    # null (core/doc/picks.cpp resolve_geom_query hardcodes ti.owner = nullopt — verified at
-    # runtime), so ownership must be joined from doc_tree's owner_map instead: it keys each
-    # feature's owned faces as [body_id, topo_id] pairs (1-based TopExp topo index). doc_query
-    # enumerates the SAME body's faces in the SAME order (both walk face topology in first-
-    # encounter order for a single-solid body — verified: owner_map's (body,topo) pairs line up
-    # 1:1 with doc_query's 0-based match order via topo_id == index+1), and doc_query always
-    # queries the LAST body, so we join against the highest body_id owner_map mentions.
-    last_body = 0
-    for om in owner_map.values():
-        for pair in om.get("faces", []) or []:
-            if isinstance(pair, list) and len(pair) == 2:
-                last_body = max(last_body, pair[0])
-    owner_by_topo: dict = {}
-    for fid, om in owner_map.items():
-        for pair in om.get("faces", []) or []:
-            if isinstance(pair, list) and len(pair) == 2 and pair[0] == last_body:
-                owner_by_topo[pair[1]] = fid
-
-    # De-smear (see the attribution note above): a face whose owner's tool could not have
-    # created it goes back to the latest EARLIER feature whose tool could. `order`/`rank` are
-    # the solid-feature tree order; a sketch/datum is never a candidate owner.
-    order = [ft.get("id") for ft in feats
-             if isinstance(ft, dict) and ft.get("id")
-             and ft.get("type") not in _NON_BODY_FEATURE_TYPES]
+    att = _face_attribution(doc_id, feats, owner_map, faces)
+    ord_owner = att["owner"]              # per doc_query face index: the de-smeared owner
+    faces_by_owner = att["owned"]
+    attributed = att["claimed"]           # raw owner_map count, for honest bookkeeping below
+    reattributed = att["reattributed"]
+    order = _solid_feature_order(feats)
     rank = {fid: i for i, fid in enumerate(order)}
-    scales = {ft["id"]: _feature_tool_scale(ft) for ft in feats
-              if isinstance(ft, dict) and ft.get("id") in rank}
-    attributed: dict = defaultdict(int)
-    ord_owner: list = [None] * len(faces)
-    reattributed = 0
-    for i, f in enumerate(faces):
-        claimed = owner_by_topo.get(i + 1)
-        if not claimed:
-            continue
-        attributed[claimed] += 1
-        if claimed not in rank or _tool_scale_accepts(scales.get(claimed), f):
-            ord_owner[i] = claimed
-            continue
-        for j in range(rank[claimed] - 1, -1, -1):
-            if _tool_scale_accepts(scales.get(order[j]), f):
-                ord_owner[i] = order[j]
-                reattributed += 1
-                break
-    faces_by_owner: dict = defaultdict(list)
-    for i, f in enumerate(faces):
-        if ord_owner[i]:
-            faces_by_owner[ord_owner[i]].append(f)
     area_by_owner = {fid: sum(f.get("area_or_len") or 0.0 for f in fl)
                      for fid, fl in faces_by_owner.items()}
 
@@ -1487,21 +1371,28 @@ def _describe_board_text(doc_id: str) -> str:
     return _dumps({"ok": True, "text": "\n".join(lines)})
 
 
-def _describe_project_text(run: dict | None = None) -> str:
+def _describe_project_text(run: dict | None = None, notes: list | None = None) -> str:
     """Narrate a DAG run's status: nodes done/blocked, budgets, open questions.
 
     Feeds WS-A dag_status and the T-F17 mission-control UI. Accepts an optional
     ``run`` dict matching contracts/dag_schema.md; degrades gracefully when no run
     data is available (services/dag/ not yet landed as of T-F8).
 
+    ``run["brief"]`` (a {field: value} map assembled by _describe_project_args from the
+    semantic fields a model wrote instead of a run dict) is narrated back verbatim, so
+    nothing the caller supplied silently disappears. ``notes`` is echoed as `interpreted`.
+
     Data sources: the caller-supplied run dict (no engine RPC — DAG is Python-side).
     """
     if run is None:
-        return _dumps({"ok": True, "text":
-                       "No DAG run data supplied — pass run=<dag_run_dict> from "
-                       "dag_status() once services/dag is available, or from your "
-                       "WS-A dag driver directly. See contracts/dag_schema.md "
-                       "for the expected shape."})
+        out = {"ok": True, "text":
+               "No DAG run data supplied — pass run=<dag_run_dict> from "
+               "dag_status() once services/dag is available, or from your "
+               "WS-A dag driver directly. See contracts/dag_schema.md "
+               "for the expected shape."}
+        if notes:
+            out["interpreted"] = notes
+        return _dumps(out)
 
     run_id = run.get("id") or run.get("run_id") or "?"
     name = run.get("name") or run.get("project") or run_id
@@ -1531,6 +1422,18 @@ def _describe_project_text(run: dict | None = None) -> str:
                          "(source: dag_run.budget)")
         elif spent is not None:
             lines.append(f"  Budget: {spent:,} tokens used  (source: dag_run.budget)")
+
+    # Whatever the caller described in fields instead of a run dict — narrated back, never
+    # dropped and never treated as planning input (this tool narrates, it does not plan).
+    brief = run.get("brief") if isinstance(run.get("brief"), dict) else None
+    if brief:
+        lines.append("\nSupplied project description (narrated back, not planned from):")
+        for k, v in brief.items():
+            if isinstance(v, (list, tuple)):
+                v = ", ".join(str(x) for x in v)
+            elif isinstance(v, dict):
+                v = json.dumps(v, sort_keys=True)
+            lines.append(f"  {k}: {v}")
 
     # Done/review nodes
     if done:
@@ -1573,7 +1476,10 @@ def _describe_project_text(run: dict | None = None) -> str:
 
     lines.append("\n(Source: dag_run dict — numbers narrated from the DAG run record, "
                  "never recomputed)")
-    return _dumps({"ok": True, "text": "\n".join(lines)})
+    out = {"ok": True, "text": "\n".join(lines)}
+    if notes:
+        out["interpreted"] = notes
+    return _dumps(out)
 
 
 def sketch_health_text(d: dict) -> str:
@@ -1656,10 +1562,229 @@ def sketch_health_text(d: dict) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------------- accepted input dialect (describe_*)
+# Recorded in the agent ledgers: describe_part(part=...)/`part_name=`/`attributes=` 6x and
+# describe_project(run_id=)/`project=`/`project_name=`/`mission_request=`/`deliverable=` 11x,
+# every one of them rejected before the function ran and every one a burnt turn. The model is
+# naming the thing in the words of its own request, which is not a mistake worth a round trip —
+# so these two tools OWN those spellings. Every rewrite is echoed in `interpreted`; nothing is
+# guessed silently, and an argument this tool genuinely has no use for is named in the echo
+# rather than dropped. A canonical call (only doc_id= / only run=) produces no echo at all.
+#
+# The var-keyword parameter is what makes this reachable: agent_turn._reconcile_kwargs inspects
+# the target signature and rejects unknown kwargs BEFORE calling, so a fixed signature can
+# never receive `part=`. It MUST be spelled `**kwargs: Annotated[Any, Field(default=None)]` —
+# FastMCP's func_metadata turns a bare `**kwargs` into a REQUIRED pydantic field literally
+# named "kwargs", which breaks every FastMCP call including the canonical one. FastMCP then
+# passes {"kwargs": None}, so each body pops that literal key first.
+_DOC_ALIASES = ("part", "part_name", "part_id", "name", "target", "doc", "docid",
+                "document", "document_id", "model", "model_name")
+_VIEW_ALIASES = ("attributes", "attribute", "parameters", "params", "properties",
+                 "fields", "include", "sections", "section", "detail", "view")
+
+
+def _unwrap_var_kw(kwargs: dict) -> None:
+    """Normalise the var-keyword bag in place, whichever path filled it.
+
+    The built-in agent calls the function directly, so `kwargs` already holds the extra
+    arguments. FastMCP instead validates against a generated pydantic model: it hands the tool
+    {"kwargs": None} for a canonical call, and DROPS any argument the model has no field for.
+    So a FastMCP client reaches the dialect through the one field the schema does carry —
+    kwargs={"part": "bracket"} — and that nested mapping is merged here."""
+    nested = kwargs.pop("kwargs", None)
+    if isinstance(nested, dict):
+        kwargs.update(nested)
+
+
+def _describe_part_args(doc_id: Optional[str], kwargs: dict) -> tuple:
+    """(doc_id, interpreted notes) for describe_part's accepted input dialect.
+
+    Consumes `kwargs` in place. A document alias routes to doc_id — which resolves a doc id OR
+    an open part's NAME (cad_common._doc) — so `part="bracket"` needs no extra lookup."""
+    notes: list = []
+    for key in _DOC_ALIASES:
+        v = kwargs.pop(key, None)
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() and not doc_id:
+            doc_id = v.strip()
+            notes.append(f'read {key}={v.strip()!r} as the document to describe '
+                         '(doc_id takes a doc id OR an open part name)')
+        else:
+            notes.append(f'ignored {key}={v!r}: doc_id={doc_id!r} already names the document')
+    asked = [k for k in _VIEW_ALIASES if kwargs.pop(k, None) is not None]
+    if asked:
+        notes.append(
+            f'{"/".join(asked)} is not a filter describe_part has — it always returns the whole '
+            'outline, and everything is already in the response: digest.bbox_mm, digest.faces/'
+            'edges, digest.feature_groups (one placement record per feature), digest.symmetry, '
+            'digest.instances, digest.bores, digest.planar_caps. Read the one you wanted from '
+            'there instead of asking again.')
+    leftover = sorted(k for k, v in kwargs.items() if v is not None)
+    if leftover:
+        notes.append(
+            f'ignored unrecognised argument(s) {", ".join(leftover)} — describe_part takes only '
+            'doc_id (a doc id or an open part name). Nothing else changes what it returns.')
+    return doc_id, notes
+
+
+def _empty_part_text(doc_id: str) -> str:
+    """The answer for describe_part on a document that has no solid body yet.
+
+    doc_query raises "document has no bodies to query" there, which reads like a broken tool and
+    got retried verbatim 5x in the ledgers. new_part() creates the DOCUMENT; the first
+    add_features() creates the body. Name what was resolved, say it is empty, give the next
+    call."""
+    name, feats = doc_id, []
+    try:
+        tree = (cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("tree") or {}
+        name = tree.get("name") or doc_id
+        feats = [f for f in (tree.get("features") or []) if isinstance(f, dict)]
+    except Exception:  # noqa: BLE001
+        pass
+    lines = [f'Part "{name}" ({doc_id}) is EMPTY: the document exists but holds no solid body '
+             'yet, so there is nothing to describe. This is not a tool failure.']
+    if feats:
+        roster = ", ".join(f'{f.get("id")} [{f.get("type")}]' for f in feats[:8])
+        lines.append(f'  It has {len(feats)} feature(s) ({roster}) but none of them produced a '
+                     'body — a sketch or datum alone makes no solid; extrude/revolve it.')
+    lines.append('  new_part() only creates the document. Add the first solid, then describe:')
+    lines.append(f'    add_features(doc_id="{doc_id}", ops=[{{"op": "add_feature", "feature": '
+                 '{"type": "box", "name": "Base", "params": {"length": 100, "width": 60, '
+                 '"height": 20}}}])')
+    lines.append(f'    describe_part(doc_id="{doc_id}")')
+    return "\n".join(lines)
+
+
+_RUN_ID_ALIASES = ("run_id", "runid", "run", "id")
+_PROJECT_ALIASES = ("project", "project_name", "name", "mission", "mission_name", "title")
+_BRIEF_ALIASES = ("mission_request", "mission_spec", "brief", "description", "request",
+                  "deliverable", "deliverables", "components", "component", "constraints",
+                  "constraint", "goal", "goals", "requirements", "scope", "notes")
+_RUN_FIELD_ALIASES = ("nodes", "budget", "open_questions", "questions", "status")
+
+
+def _runs_dir():
+    """services/dag's persisted-run directory (mirrors executor.default_runs_dir)."""
+    from pathlib import Path  # noqa: PLC0415
+    import os  # noqa: PLC0415
+    import platform  # noqa: PLC0415
+    if platform.system() == "Windows":
+        appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
+        return Path(appdata) / "Chudware" / "runs"
+    xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(xdg) / "Chudware" / "runs"
+
+
+def _load_dag_run(run_id: str) -> Optional[dict]:
+    """The persisted aicad.dag/1 graph for `run_id`, shaped as the run dict this tool narrates.
+
+    services/dag/executor.py writes <runs_dir>/<run_id>.graph.json beside the checkpoint DB.
+    Per-node VERDICTS are not persisted (dag_status documents that limitation), so nodes come
+    back with their graph identity and no status — narrated as pending, which is honest, rather
+    than invented. None when no such run exists on disk."""
+    if not run_id or not str(run_id).strip():
+        return None
+    rid = str(run_id).strip()
+    path = _runs_dir() / f"{rid}.graph.json"
+    try:
+        graph = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — unknown / unreadable run is not an error here
+        return None
+    nodes = [{"id": n.get("id"), "title": n.get("name") or n.get("title") or n.get("id"),
+              "owner": n.get("type"), "status": n.get("status") or "pending"}
+             for n in (graph.get("nodes") or []) if isinstance(n, dict)]
+    return {"id": graph.get("id") or rid, "name": graph.get("name") or rid, "nodes": nodes}
+
+
+def _describe_project_args(run, kwargs: dict) -> tuple:
+    """(run dict | None, interpreted notes) for describe_project's accepted input dialect.
+
+    Consumes `kwargs` in place. Three shapes beyond the canonical run dict:
+      * a run ID (run="<id>", run_id=, id=) — loaded from the persisted DAG run when it exists,
+        and otherwise narrated as the bare id it is, with how to start one;
+      * a project NAME (project=, project_name=, mission=);
+      * a free-form description in semantic fields (mission_request=, deliverables=,
+        constraints=, ...) — collected under run["brief"] and narrated straight back, because
+        this tool narrates a run, it does not plan one."""
+    notes: list = []
+    if isinstance(run, dict):
+        for k in list(kwargs):
+            if kwargs[k] is None:
+                kwargs.pop(k)
+        if kwargs:
+            notes.append(f'narrated the run dict; ignored {", ".join(sorted(kwargs))} '
+                         '(describe_project reads the run dict only)')
+        return run, notes
+
+    run_id = run.strip() if isinstance(run, str) and run.strip() else None
+    if run_id:
+        notes.append(f'read run={run_id!r} as a DAG run id (run also takes the full run dict)')
+    for key in _RUN_ID_ALIASES:
+        v = kwargs.pop(key, None)
+        if isinstance(v, dict) and not run_id:
+            return v, notes + [f'read {key}= as the run dict']
+        if isinstance(v, str) and v.strip() and not run_id:
+            run_id = v.strip()
+            notes.append(f'read {key}={run_id!r} as the DAG run id')
+
+    name = None
+    for key in _PROJECT_ALIASES:
+        v = kwargs.pop(key, None)
+        if isinstance(v, str) and v.strip() and not name:
+            name = v.strip()
+            notes.append(f'read {key}={name!r} as the project name')
+
+    fields: dict = {}
+    for key in _RUN_FIELD_ALIASES:
+        v = kwargs.pop(key, None)
+        if v is not None:
+            fields["open_questions" if key == "questions" else key] = v
+            notes.append(f'took {key}= straight into the run record')
+
+    brief: dict = {}
+    for key in _BRIEF_ALIASES:
+        v = kwargs.pop(key, None)
+        if v is not None:
+            brief[key] = v
+    extra = {k: v for k, v in kwargs.items() if v is not None}
+    if extra:
+        brief.update(extra)
+        notes.append(f'kept unrecognised argument(s) {", ".join(sorted(extra))} as part of the '
+                     'supplied description — describe_project narrates a DAG run, so they are '
+                     'echoed back rather than acted on')
+
+    loaded = _load_dag_run(run_id) if run_id else None
+    if loaded is not None:
+        notes.append(f'loaded DAG run {loaded["id"]!r} from {_runs_dir()} '
+                     f'({len(loaded["nodes"])} node(s)); per-node status is not persisted, so '
+                     'nodes read as pending')
+        out = loaded
+    elif run_id or name or brief or fields:
+        out = {"id": run_id or "(no run id)", "name": name or run_id or "(unnamed project)",
+               "nodes": []}
+        if run_id:
+            notes.append(f'no DAG run {run_id!r} under {_runs_dir()} — narrating the id you '
+                         'gave and nothing more. Start a run with dag_plan(brief=...) then '
+                         'dag_run(graph_json=...), or pass run=dag_status()["run"]')
+        else:
+            notes.append('no run id or run dict was given, so there is no DAG run to read — '
+                         'narrating what you described. dag_plan(brief=...) turns a description '
+                         'like this into a real run')
+    else:
+        return None, notes
+
+    out.update(fields)
+    if brief:
+        out["brief"] = brief
+    return out, notes
+
+
 def register_gsl_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
-    def describe_part(doc_id: Optional[str] = None) -> str:
+    def describe_part(doc_id: Optional[str] = None,
+                      **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Compact, NAMED outline of the part — use INSTEAD of dumping every face on a complex part.
 
         Returns the bounding box, the feature groups WITH a placement narrative (the side of the
@@ -1670,15 +1795,40 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         side, and a stable `sid` for every addressable face/edge. A feature that owns no surviving
         faces (fully consumed by a later boolean) is called out explicitly. Face counts are the
         faces a feature can be shown to have CREATED: the kernel credits every face a boolean
-        regenerated to the feature that ran it, so a face too large for a feature's own tool is
-        re-credited to the earlier feature that authored the surface, and the raw kernel count
-        stays visible as `attributed_faces`.
+        regenerated to the feature that ran it — both the faces a CUT merely pierced and the ones
+        a FUSE merely landed on — so a face outside a feature's own tool is re-credited to the
+        earlier feature that authored the surface, and the raw kernel count stays visible as
+        `attributed_faces`.
         Token cost scales with the number of DISTINCT feature roles, not the raw face count — a
         68-face impeller describes in a few hundred tokens. Drill into one entity with hover(sid).
+
+        doc_id: a doc id ("doc-cpp0000001c") or an open part's NAME ("bracket"). Omit it for the
+        current part. ALSO ACCEPTED for the same thing: part=, part_name=, part_id=, name=,
+        target=, document=, document_id=, model=. attributes=/parameters=/fields=/detail= are
+        accepted and ignored — describe_part has no filtered view, and the whole outline is
+        already the answer. Anything rewritten or ignored is listed in `interpreted` on the
+        response; a plain describe_part(doc_id=...) carries no such key.
+        A document with no solid body yet answers ok with `empty: true` and the add_features call
+        to make one — that is an empty part, not a tool failure.
         """
+        _unwrap_var_kw(kwargs)
         try:
-            d = _digest(_doc(doc_id))
-            return _dumps({"ok": True, "outline": _outline_text(d), "digest": d})
+            doc_id, notes = _describe_part_args(doc_id, kwargs)
+            did = _doc(doc_id)
+            try:
+                d = _digest(did)
+            except Exception as e:  # noqa: BLE001
+                if "no bodies" not in str(e):
+                    raise
+                out = {"ok": True, "empty": True, "doc_id": did,
+                       "outline": _empty_part_text(did)}
+                if notes:
+                    out["interpreted"] = notes
+                return _dumps(out)
+            out = {"ok": True, "outline": _outline_text(d), "digest": d}
+            if notes:
+                out["interpreted"] = notes
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -1947,18 +2097,35 @@ def register_gsl_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def describe_project(run: Optional[dict] = None) -> str:
+    def describe_project(run: Optional[dict] = None,
+                         **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Compact narrative of a DAG project run — nodes done/blocked, budgets, open questions.
         Feeds WS-A dag_status and the T-F17 mission-control UI.
 
         run: a dag_run dict matching contracts/dag_schema.md — pass dag_status()['run'] or your
-        WS-A driver's run record. When omitted, returns a graceful 'no run supplied' message.
+        WS-A driver's run record. When omitted entirely, returns a graceful 'no run supplied'
+        message.
+
+        ALSO ACCEPTED, because a run dict is rarely what a caller has to hand:
+          * a run ID string — run="<id>", run_id="<id>", id="<id>". The persisted DAG run is
+            loaded from disk when it exists (per-node status is not persisted, so its nodes read
+            as pending); an unknown id is narrated as the bare id, with how to start a real run.
+          * a project name — project=, project_name=, mission=, title=.
+          * a free-form description — mission_request=, mission_spec=, brief=, deliverables=,
+            components=, constraints=, requirements=, scope=. These are narrated straight back
+            under "Supplied project description": describe_project reports on a run, it does not
+            plan one — dag_plan(brief=...) is what turns a description into a run.
+          * run-record fields given loose — nodes=, budget=, open_questions=, status=.
+        Every rewrite is listed in `interpreted` on the response; a plain describe_project() or
+        describe_project(run={...}) carries no such key.
 
         Returns node status counts (done/doing/blocked/pending), per-node titles and owners,
         budget usage (tokens spent vs cap), and open questions by task id. Narrates the dag_run
         dict only — never queries the engine. See contracts/dag_schema.md for the run shape.
         """
+        _unwrap_var_kw(kwargs)
         try:
-            return _describe_project_text(run)
+            run, notes = _describe_project_args(run, kwargs)
+            return _describe_project_text(run, notes)
         except Exception as e:  # noqa: BLE001
             return _err(e)

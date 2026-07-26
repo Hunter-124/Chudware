@@ -23,6 +23,14 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server import core_bridge as cb
 from mcp_server.cad_tools import _doc, _dumps, _err
+# fit_report's ad-hoc pair is the SAME engine as fit_calc — one dialect, one maths.
+# _Extra is the var-keyword annotation FastMCP needs (a bare **kwargs becomes a
+# required "kwargs" field there and breaks every call); see research_tools.
+from mcp_server.research_tools import (
+    _Extra,
+    fit_from_kwargs as _fit_from_kwargs,
+    has_fit_inputs as _has_fit_inputs,
+)
 from services.intake import intake as ik
 
 
@@ -114,6 +122,116 @@ _K_LEDGER = "crit_dims"
 _K_FIT = "fit_report"
 _K_INTAKE = "intake"
 _K_PHOTOS = "photos"
+
+
+def _measure_state(doc_id: str, measured, ledger) -> dict:
+    """What the document ACTUALLY holds — the fit_report error has to name it."""
+    photos = _get(doc_id, _K_PHOTOS)
+    return {
+        "doc_id": doc_id,
+        "measured_parts": len(measured.features) if measured is not None else 0,
+        "ledger_rows": len(ledger.rows) if ledger is not None else 0,
+        "critical_rows": (len([r for r in ledger.rows if r.is_critical])
+                          if ledger is not None else 0),
+        "photos_registered": len(photos.get("photos", {})) if isinstance(photos, dict) else 0,
+    }
+
+
+def _nothing_measured(doc_id: str, process: str, measured, ledger) -> dict:
+    """The teaching version of "nothing measured yet": what is missing, which tool
+    fills it, in what order, and a one-liner that works right now."""
+    state = _measure_state(doc_id, measured, ledger)
+    missing = ("no measured part AND no critical-dimension ledger"
+               if measured is None and ledger is None else
+               "no measured part (the ledger exists but has no part behind it)"
+               if measured is None else
+               "no critical-dimension ledger (a measured part exists but was never "
+               "turned into a ledger)")
+    return {
+        "ok": False,
+        "error": "nothing measured yet",
+        "reason": "no_measurements",
+        "state": state,
+        "missing": missing,
+        "hint": (
+            f"fit_report reports the mating pairs recorded on doc {doc_id}, and that "
+            f"document has {state['measured_parts']} measured feature(s) and "
+            f"{state['ledger_rows']} ledger row(s) — {missing}. Populate it first, in "
+            f"this order: "
+            f"1) submit_part_photos(claims=[{{feature, dim, value_mm, scale_source, "
+            f"in_plane}}]) — or measure_from_photo(photo_id, px_a, px_b, feature, dim) "
+            f"once per mating pair — builds measured_parts + crit_dims; "
+            f"2) confirm_dimensions([{{key, value_mm}}]) for every open_demand it "
+            f"returns (typed caliper values); "
+            f"3) fit_report() — now it has pairs to report. "
+            f"For a ONE-OFF pair you do not need any of that: pass the diameters "
+            f"directly."),
+        "example": ('submit_part_photos(claims=[{"feature": "output_shaft", '
+                    '"dim": "dia", "value_mm": 20.0, "scale_source": "caliper_typed", '
+                    '"in_plane": true}])  then  fit_report()'),
+        "ad_hoc_example": ('fit_report(bore_diameter=20.02, shaft_diameter=20.0)  or  '
+                           'fit_report(bore_diameter=20, tolerance="H7/g6")'),
+        "next_actions": [
+            "submit_part_photos(claims=[...]) — record the measured dims",
+            "measure_from_photo(photo_id, px_a, px_b, feature, dim) — measure one dim",
+            "confirm_dimensions([{key, value_mm}]) — close fit-critical demands",
+            "fit_report(bore_diameter=..., shaft_diameter=...) — ad-hoc pair, no doc state",
+        ],
+        "process": process,
+    }
+
+
+def _ad_hoc_fit_report(doc_id: str, process: str, supplied: dict,
+                       doc_has_measurements: bool) -> dict:
+    """One mating pair straight from the arguments, via the fit_calc engine.
+
+    Clearly labelled as an ad-hoc pair: it is NOT derived from the document, is not
+    persisted as the document's fit report, and does not clear the intake gate."""
+    env = _fit_from_kwargs(supplied)
+    notes = list(env.get("interpreted") or [])
+    notes.insert(0, "ad-hoc pair computed from the arguments you passed — this is NOT "
+                    "the document's fit report and does not clear the intake gate; "
+                    "call fit_report() with no diameters after submit_part_photos / "
+                    "confirm_dimensions for that")
+    if doc_has_measurements:
+        notes.append(f"doc {doc_id} DOES have recorded measurements — call fit_report() "
+                     f"with no diameters for the document report")
+    if not env.get("ok"):
+        env = dict(env)
+        env["interpreted"] = notes
+        env["mode"] = "ad_hoc_pair"
+        return env
+    answer = env.get("answer") or {}
+    verdict = "ok" if answer.get("fit_character") else "unmeasured"
+    return {
+        "ok": True,
+        "mode": "ad_hoc_pair",
+        "process": process,
+        "fit_report": {
+            "checks": [{
+                "feature": "ad_hoc_pair",
+                "key": "ad_hoc_pair.dia",
+                "modeled_mm": (answer.get("hole_absolute") or [None])[0],
+                "source_mm": (answer.get("shaft_absolute") or [None])[0],
+                "fit": env.get("inputs", {}).get("fit"),
+                "clearance_mm": answer.get("clearance"),
+                "source": "argument",
+                "confidence": "given",
+                "verdict": verdict,
+            }],
+            "assumptions": ([f"process {process.upper()} assumed",
+                             "sizes taken from the call, not from the document"]
+                            + ([] if verdict == "ok" else
+                               ["only one side was supplied — clearance is not "
+                                "computable; add the mating diameter or a two-part fit "
+                                "class such as 'H7/g6'"])),
+            "process": process,
+            "overall": "pass" if verdict == "ok" else "at_risk",
+            "coupon": {},
+        },
+        "fit": env,
+        "interpreted": notes,
+    }
 
 
 def _get(doc_id: str, key: str):
@@ -587,17 +705,40 @@ def register_intake_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def fit_report(doc_id: Optional[str] = None) -> str:
+    def fit_report(doc_id: Optional[str] = None, **kwargs: _Extra) -> str:
         """The fit report to review before printing: each mating pair's modeled-vs-source dimension,
         the clearance applied for the process, its source/confidence, and an ok/at_risk verdict, plus
-        the assumptions made. Proves first-try fit (or flags what rests on a soft measurement)."""
+        the assumptions made. Proves first-try fit (or flags what rests on a soft measurement).
+
+        DOCUMENT REPORT (no arguments) — reports the pairs recorded on the part. It needs
+        measurements to exist first: `submit_part_photos(claims=[...])` (or
+        `measure_from_photo(...)` per dimension) builds `measured_parts` + the
+        critical-dimension ledger, then `confirm_dimensions([{key, value_mm}])` closes
+        any fit-critical demand, then `fit_report()`. With nothing recorded the tool
+        says exactly which of those is missing and what the document currently holds.
+
+        AD-HOC PAIR (explicit diameters) — no measurement flow needed for a one-off
+        question; the answer is labelled `mode: "ad_hoc_pair"`, NOT a document report:
+            fit_report(bore_diameter=20.02, shaft_diameter=20.0)   # actual fit
+            fit_report(bore_diameter=20, tolerance="H7/g6")        # designed fit
+            fit_report(bore="d20", band="sliding-fit")             # keyword -> H7/g6
+            fit_report(nominal=20, hole="H7", shaft="h7")
+        Sizes accept units and the Ø shorthand ("20mm", "0.75in", "d20"); per-side
+        classes/tolerances (`bore_tolerance="H7"`, `shaft_tolerance=0.01`) are accepted.
+        This is the same engine as `fit_calc` — see its docstring for every accepted
+        spelling — and every rewrite is echoed in `interpreted`.
+        """
         try:
+            kwargs.pop("kwargs", None)
             d = _doc(doc_id)
             proc = _process_id(d)
             measured = _load_measured(d)
             ledger = _load_ledger(d)
+            if _has_fit_inputs(kwargs):
+                return _dumps(_ad_hoc_fit_report(d, proc, kwargs,
+                                                 measured is not None and ledger is not None))
             if measured is None or ledger is None:
-                return _dumps({"ok": False, "error": "nothing measured yet"})
+                return _dumps(_nothing_measured(d, proc, measured, ledger))
             fr = ik.build_fit_report(measured, ledger, process=proc)
             _set(d, _K_FIT, fr.to_dict())
             return _dumps({"ok": True, "fit_report": fr.to_dict()})

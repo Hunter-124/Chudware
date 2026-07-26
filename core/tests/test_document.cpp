@@ -3642,3 +3642,213 @@ TEST_CASE("add_feature: before/after belong beside \"op\", not inside \"feature\
     CHECK(feats[1].value("name", std::string()) == "Middle");  // inserted BEFORE Last
     CHECK(feats[2].value("name", std::string()) == "Last");
 }
+
+// ============================================================================
+// SHAPE NORMALIZATION (validate.cpp::normalize_feature_shape)
+//
+// The validator used to be stricter than the compiler in two places, and a live
+// Opus run lost a whole batch to both at once while following cad_guide('sketch')
+// to the letter:
+//     features[1](f2).params.mode: required for extrude
+//     features[1](f2).refs.profile: must be a non-empty list
+// It had written refs:{"profile":"$0"} — the shape every model writes — and had
+// omitted `mode`, which document.cpp reads with a default on every feature type
+// that "requires" it.
+//
+// The normalization is deliberately SILENT (see the comment at its call site in
+// session.cpp), and that is only defensible while it stays behaviour-neutral.
+// The equivalence assertions below ARE that justification: if one ever fails,
+// the rewrite has become a semantic guess and must start reporting itself.
+// ============================================================================
+
+namespace {
+
+// A square sketch of side `s` on plane.top, as an add_feature op.
+json square_sketch_op(double s) {
+    const double h = s / 2.0;
+    json ents = json::array();
+    const double xs[4] = {h, -h, -h, h};
+    const double ys[4] = {h, h, -h, -h};
+    for (int i = 0; i < 4; ++i)
+        ents.push_back(json{{"type", "line"},
+                            {"p1", json::array({xs[i], ys[i]})},
+                            {"p2", json::array({xs[(i + 1) % 4], ys[(i + 1) % 4]})}});
+    return json{{"op", "add_feature"}, {"feature",
+        json{{"type", "sketch"}, {"name", "Sq"},
+             {"params", {{"entities", ents}, {"constraints", json::array()}}},
+             {"refs", {{"plane", "plane.top"}}}}}};
+}
+
+double doc_volume(const std::string& doc_id) {
+    const json bb = chudware::doc::doc_bbox(doc_id);
+    const json& mn = bb.at("min");
+    const json& mx = bb.at("max");
+    return (mx[0].get<double>() - mn[0].get<double>()) *
+           (mx[1].get<double>() - mn[1].get<double>()) *
+           (mx[2].get<double>() - mn[2].get<double>());
+}
+
+}  // namespace
+
+TEST_CASE("shape: a scalar in a list-form ref slot equals the one-element list") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    // The SAME extrude, profile written scalar vs list. Same solid, or the
+    // wrap changed meaning and must stop being silent.
+    double vols[2] = {0.0, 0.0};
+    for (int variant = 0; variant < 2; ++variant) {
+        const std::string id = doc_new("part", "wrapcmp").at("doc_id").get<std::string>();
+        json ops = json::array({square_sketch_op(20.0)});
+        json refs = json::object();
+        refs["profile"] = (variant == 0) ? json("$0") : json::array({"$0"});
+        ops.push_back(json{{"op", "add_feature"}, {"feature",
+            json{{"type", "extrude"}, {"name", "Body"},
+                 {"params", {{"mode", "new"}, {"depth", dimv(5)}}},
+                 {"refs", refs}}}});
+        json r = doc_apply_ops(id, -1, ops, false);
+        for (const json& st : r.at("rebuild").at("feature_status"))
+            REQUIRE_MESSAGE(st.value("ok", false),
+                            "variant " << variant << " failed: " << status_err(st));
+        vols[variant] = doc_volume(id);
+    }
+    CHECK(vols[0] > 1.0);
+    CHECK(vols[0] == doctest::Approx(vols[1]));
+}
+
+TEST_CASE("shape: `mode` is NOT defaulted here — the echoing layer owns it") {
+    using chudware::doc::doc_new;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const std::string id = doc_new("part", "modeowner").at("doc_id").get<std::string>();
+
+    // An earlier draft of normalize_feature_shape also filled required params the
+    // compiler already defaults. It was removed on purpose: cad_doc_tools.py fills
+    // `mode` too, and a default living in two layers with two different values
+    // ("new" here, "boss" there) is exactly the drift that bites later. Python
+    // owns it because Python can ECHO the choice back to the model as
+    // `interpreted`, and boss-vs-new is a real design decision — silently picking
+    // one is only acceptable when it cannot change the geometry, and this can.
+    //
+    // So the kernel must still REJECT a bare extrude. If this ever starts passing,
+    // someone has re-added a silent semantic default here and the two layers are
+    // fighting again.
+    const std::string msg = apply_err(id, json::array({square_sketch_op(20.0),
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "extrude"}, {"name", "Body"},
+                 {"params", {{"depth", dimv(5)}}},
+                 {"refs", {{"profile", "$0"}}}}}}}));
+    REQUIRE_MESSAGE(!msg.empty(), "the kernel must not silently choose boss vs new");
+    CHECK(msg.find("mode") != std::string::npos);
+    // ...but the SHAPE half still ran: the scalar profile was wrapped, so the only
+    // complaint left is the mode, never "profile must be a non-empty list".
+    CHECK(msg.find("profile") == std::string::npos);
+}
+
+TEST_CASE("shape: the Opus sketch+extrude batch builds a solid") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    const std::string id = doc_new("part", "opusstar").at("doc_id").get<std::string>();
+
+    // The live batch, with the SHAPE defects the model actually made: op-level
+    // `type`/`refs` and no "feature" wrapper, "plane.top" exactly as
+    // cad_guide('sketch') mandates, and a scalar `profile`. All three are this
+    // normalizer's job and all three are asserted here.
+    //
+    // The model ALSO omitted `mode` and wrote params {"distance":4,
+    // "symmetric":true} where the compiler reads {"depth":…,"mid_plane":…}. Those
+    // are param-level dialect, not shape, and are deliberately NOT fixed in the
+    // kernel: per the house split they are rewritten in
+    // services/mcp/cad_doc_tools.py, where every rewrite is echoed back to the
+    // model as `interpreted` — and where the end-to-end verbatim batch is
+    // asserted. Canonical param names below so this case tests exactly one thing.
+    const double pts[8][4] = {{50, 0, 9.9, 9.9},    {9.9, 9.9, 0, 50},
+                              {0, 50, -9.9, 9.9},   {-9.9, 9.9, -50, 0},
+                              {-50, 0, -9.9, -9.9}, {-9.9, -9.9, 0, -50},
+                              {0, -50, 9.9, -9.9},  {9.9, -9.9, 50, 0}};
+    json ops = json::array({json{{"op", "add_feature"}, {"type", "sketch"},
+                                 {"refs", {{"plane", "plane.top"}}}}});
+    for (const auto& p : pts)
+        ops.push_back(json{{"op", "sketch_add_entity"}, {"sketch", "$0"},
+                           {"entity", {{"type", "line"},
+                                       {"p1", json::array({p[0], p[1]})},
+                                       {"p2", json::array({p[2], p[3]})}}}});
+    ops.push_back(json{{"op", "add_feature"}, {"type", "extrude"},
+                       {"refs", {{"profile", "$0"}}},
+                       {"params", {{"mode", "new"}, {"depth", 4}, {"mid_plane", true}}}});
+
+    json r = doc_apply_ops(id, -1, ops, false);
+    for (const json& st : r.at("rebuild").at("feature_status"))
+        CHECK_MESSAGE(st.value("ok", false), "opus batch: " << status_err(st));
+    CHECK(doc_volume(id) > 1.0);
+}
+
+TEST_CASE("shape: normalization does not paper over a genuinely empty list slot") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const std::string id = doc_new("part", "emptyslot").at("doc_id").get<std::string>();
+
+    // "I named the slot and gave it nothing" is a real error, not a shape
+    // mismatch — wrapping must not invent a profile here.
+    const std::string msg = apply_err(id, json::array({square_sketch_op(20.0),
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "extrude"}, {"name", "Body"},
+                 {"params", {{"mode", "new"}, {"depth", dimv(5)}}},
+                 {"refs", {{"profile", json::array()}}}}}}}));
+    REQUIRE_MESSAGE(!msg.empty(), "an empty profile list must still be rejected");
+    CHECK(msg.find("profile") != std::string::npos);
+}
+
+TEST_CASE("shape: an explicit mode is never overwritten by the default") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const std::string id = doc_new("part", "modekeep").at("doc_id").get<std::string>();
+
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "box"}, {"name", "Base"},
+                 {"params", {{"length", dimv(40)}, {"width", dimv(40)}, {"height", dimv(20)}}}}}},
+        square_sketch_op(10.0),
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "extrude"}, {"name", "Slot"},
+                 {"params", {{"mode", "cut"}, {"depth", dimv(30)}}},
+                 {"refs", {{"profile", "$1"}}}}}},
+    });
+    json r = doc_apply_ops(id, -1, ops, false);
+    for (const json& st : r.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(st.value("ok", false), "cut batch: " << status_err(st));
+    // The stored feature must still say "cut" — the fill only ever adds.
+    const json& feats = r.at("tree").at("features");
+    REQUIRE(feats.size() == 3);
+    CHECK(feats[2].at("params").at("mode").get<std::string>() == "cut");
+}
+
+TEST_CASE("shape: a bare QUERY object in a list slot is left alone") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const std::string id = doc_new("part", "shellquery").at("doc_id").get<std::string>();
+
+    // The scalar-to-list wrap must fire for STRINGS only. An earlier revision
+    // wrapped objects too, which sent shell's remove:{"of":"face","side":"top"}
+    // through the list-selector resolver instead of the query resolver: it
+    // answered "no candidates of matching kind", the batch rolled back, and the
+    // document came out empty. A silent rewrite is only allowed while it cannot
+    // change the build, so this pins the boundary.
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "box"}, {"name", "B"},
+                 {"params", {{"length", dimv(40)}, {"width", dimv(40)},
+                             {"height", dimv(40)}}}}}},
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "shell"}, {"name", "Hollow"},
+                 {"params", {{"thickness", dimv(2)}, {"outward", false}}},
+                 {"refs", {{"remove", {{"of", "face"}, {"side", "top"}}}}}}}},
+    });
+    json r = doc_apply_ops(id, -1, ops, false);
+    for (const json& st : r.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(st.value("ok", false), "shell: " << status_err(st));
+    CHECK(doc_volume(id) > 1.0);
+}

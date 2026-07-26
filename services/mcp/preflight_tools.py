@@ -8,19 +8,158 @@ External tool:
 
 Internal seam:
     ``run_auto_preflight(doc_id, tool, ops)`` — called by add_features / mutating
-    tools when ``CHUDWARE_PREFLIGHT=1`` (default on).  Returns the preflight result
-    dict; caller attaches ``advisory_items`` to its own response and, if the
-    verdict is ``fail``, calls ``log_preflight_override`` after applying.
+    tools when ``CHUDWARE_PREFLIGHT`` is on (default).  Returns the preflight
+    result dict; caller attaches ``advisory_items`` to its own response and, if
+    the verdict is ``fail``, calls ``log_preflight_override`` after applying.
+
+    A shadow-clone dry-run costs ~8 engine RPCs (doc_tree, doc_new, replay
+    doc_apply_ops, per-check measures, doc_tree again, doc_close) on the hottest
+    tool in the product.  ``skip_reason`` gates it: batches whose verdict none of
+    the four checks could plausibly change (a lone primitive with no refs, a
+    rename / set_units / set_material / set_appearance / eq_set) skip the clone.
+    Every decision — skip or run — is recorded in ``preflight_decisions()`` and
+    the skip reason rides back on the envelope, so it is never silent.
+
+Env:
+    ``CHUDWARE_PREFLIGHT=0``       — off entirely (verdict "skipped", "disabled").
+    ``CHUDWARE_PREFLIGHT=always``  — force the clone even for trivial batches.
+    ``CHUDWARE_PREFLIGHT_MAX_OPS`` — batch size above which the gate always runs
+                                     the clone (default 3).
 
 Freedom rule: a failed preflight NEVER blocks the caller.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
-from typing import Optional
+from collections import deque
+from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+
+_log = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------ complexity gate
+
+# Metadata-only ops: no geometry, no refs to resolve, nothing for a shadow-clone
+# rebuild to predict.  (Op kinds are the closed vocabulary in
+# core/doc/op_registry.cpp; everything NOT listed here runs the clone.)
+_METADATA_OPS: frozenset[str] = frozenset({
+    "rename", "set_units", "set_material", "set_appearance", "set_folder", "eq_set",
+})
+
+# Primitive solids whose whole definition is a handful of positive numbers.
+_SIMPLE_FEATURE_TYPES: frozenset[str] = frozenset({
+    "box", "cylinder", "sphere", "cone", "torus",
+})
+
+# Dimension params _check_params_sane would flag as non-positive.  A batch that
+# trips this locally still runs the real preflight so the model gets the advisory.
+_DIM_KEYS: frozenset[str] = frozenset({
+    "radius", "length", "width", "height", "depth", "diameter", "thickness",
+    "r1", "r2", "major_r", "minor_r", "size",
+})
+
+# Boolean/subtractive placement — the clone's rebuild_predict earns its keep here.
+_SUBTRACTIVE_MODES: frozenset[str] = frozenset({
+    "cut", "subtract", "intersect", "common", "remove",
+})
+
+_DEFAULT_MAX_OPS = 3
+
+# Last N gate decisions, newest last — observability for a behaviour change that
+# is otherwise invisible from the add_features response.
+_DECISIONS: deque = deque(maxlen=32)
+
+
+def preflight_decisions() -> list[dict]:
+    """The last gate decisions (oldest first): {doc_id, tool, n_ops, ran, reason}."""
+    return list(_DECISIONS)
+
+
+def _gate_max_ops() -> int:
+    try:
+        return max(1, int(os.environ.get("CHUDWARE_PREFLIGHT_MAX_OPS", "")
+                          or _DEFAULT_MAX_OPS))
+    except ValueError:
+        return _DEFAULT_MAX_OPS
+
+
+def _num(raw: Any) -> Optional[float]:
+    """Unwrap the {"value": x, "expr": ...} dimension form; None if not numeric."""
+    v = raw.get("value") if isinstance(raw, dict) else raw
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def skip_reason(ops: Any) -> Optional[str]:
+    """Why the shadow-clone dry-run is pointless for *ops* — or None to run it.
+
+    Runs the clone for anything preflight can actually rule on: a ref to resolve
+    (``refs_resolve``), a cut/boolean/shell/fillet/chamfer/pattern or any sketch,
+    assembly, delete, reorder, rollback, suppress or paste op (``rebuild_predict``
+    / ``downstream_impact``), a non-positive dimension (``params_sane``), or a
+    batch bigger than ``CHUDWARE_PREFLIGHT_MAX_OPS``.
+    """
+    if not isinstance(ops, list):
+        return None                      # unknown shape — let the real thing look
+    if not ops:
+        return "empty op batch"
+    limit = _gate_max_ops()
+    if len(ops) > limit:
+        return None
+    for op in ops:
+        if not isinstance(op, dict):
+            return None
+        kind = str(op.get("op") or "")
+        if kind in _METADATA_OPS:
+            continue
+        if kind != "add_feature":
+            return None                  # sketch_*/asm_*/delete/reorder/rollback/…
+        feat = op.get("feature")
+        if not isinstance(feat, dict):
+            return None
+        if feat.get("refs"):
+            return None                  # something to resolve → refs_resolve earns it
+        if str(feat.get("type") or "") not in _SIMPLE_FEATURE_TYPES:
+            return None                  # cut/shell/fillet/chamfer/pattern/sketch/…
+        params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+        mode = str(feat.get("mode") or params.get("mode") or "").strip().lower()
+        if mode in _SUBTRACTIVE_MODES:
+            return None
+        for key, raw in params.items():
+            if key in _DIM_KEYS:
+                v = _num(raw)
+                if v is not None and v <= 0:
+                    return None          # params_sane has something to say
+    return (f"{len(ops)} cheap op(s): primitive/metadata only, no refs, "
+            f"no boolean, sketch or destructive step")
+
+
+def _record(doc_id: str, tool: str, ops: Any, ran: bool, reason: str) -> None:
+    n = len(ops) if isinstance(ops, list) else -1
+    _DECISIONS.append({"doc_id": doc_id, "tool": tool, "n_ops": n,
+                       "ran": ran, "reason": reason})
+    _log.debug("preflight gate: doc=%s tool=%s n_ops=%s ran=%s (%s)",
+               doc_id, tool, n, ran, reason)
+
+
+def _skipped(doc_id: str, tool: str, reason: str, detail: str) -> dict:
+    return {
+        "schema": "aicad.preflight/1",
+        "id": f"pf_{reason}",
+        "target": {"doc_id": doc_id, "tool": tool, "ops_hash": ""},
+        "verdict": "skipped",
+        "skipped": reason,
+        "skipped_detail": detail,
+        "checks": [],
+        "predicted": {},
+        "downstream": [],
+        "advisory_items": [],
+    }
 
 
 # ------------------------------------------------------------------ public seam
@@ -28,39 +167,31 @@ from mcp.server.fastmcp import FastMCP
 def run_auto_preflight(doc_id: str, tool: str, ops: list) -> dict:
     """Run preflight automatically inside mutating tools.
 
-    Returns an aicad.preflight/1 dict, or ``{"verdict": "skipped", "skipped": "disabled"}``
-    when CHUDWARE_PREFLIGHT=0.  Never raises.
+    Returns an aicad.preflight/1 dict.  Never raises.  ``verdict`` is "skipped"
+    with a ``skipped``/``skipped_detail`` pair when the run was suppressed —
+    ``disabled`` (CHUDWARE_PREFLIGHT=0), ``trivial`` (complexity gate, see
+    :func:`skip_reason`) or ``error``.  ``CHUDWARE_PREFLIGHT=always`` forces the
+    clone past the gate for debugging.
     """
-    enabled = os.environ.get("CHUDWARE_PREFLIGHT", "1").strip().lower()
-    if enabled in ("0", "false", "off", "no"):
-        return {
-            "schema": "aicad.preflight/1",
-            "id": "pf_disabled",
-            "target": {"doc_id": doc_id, "tool": tool, "ops_hash": ""},
-            "verdict": "skipped",
-            "skipped": "disabled",
-            "skipped_detail": "CHUDWARE_PREFLIGHT=0",
-            "checks": [],
-            "predicted": {},
-            "downstream": [],
-            "advisory_items": [],
-        }
+    mode = os.environ.get("CHUDWARE_PREFLIGHT", "1").strip().lower()
+    if mode in ("0", "false", "off", "no"):
+        _record(doc_id, tool, ops, False, "disabled")
+        return _skipped(doc_id, tool, "disabled", "CHUDWARE_PREFLIGHT=0")
+    forced = mode in ("always", "force", "all", "2")
+    if not forced:
+        why = skip_reason(ops)
+        if why:
+            _record(doc_id, tool, ops, False, why)
+            return _skipped(doc_id, tool, "trivial", why)
     try:
         from services.agent.advisor.preflight import run_preflight
-        return run_preflight(doc_id, tool, ops)
+        result = run_preflight(doc_id, tool, ops)
+        _record(doc_id, tool, ops, True,
+                f"forced (CHUDWARE_PREFLIGHT={mode})" if forced else "non-trivial batch")
+        return result
     except Exception as exc:  # noqa: BLE001
-        return {
-            "schema": "aicad.preflight/1",
-            "id": "pf_error",
-            "target": {"doc_id": doc_id, "tool": tool, "ops_hash": ""},
-            "verdict": "skipped",
-            "skipped": "error",
-            "skipped_detail": str(exc),
-            "checks": [],
-            "predicted": {},
-            "downstream": [],
-            "advisory_items": [],
-        }
+        _record(doc_id, tool, ops, False, f"error: {exc}")
+        return _skipped(doc_id, tool, "error", str(exc))
 
 
 def log_preflight_override(doc_id: str, tool: str, pf_result: dict) -> None:

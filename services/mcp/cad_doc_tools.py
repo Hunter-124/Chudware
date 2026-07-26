@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
+from typing import Annotated
 from typing import Any
 from typing import Optional
 from typing import Union
+
+from pydantic import Field  # noqa: TC002 — runtime-read by FastMCP's schema builder
 import json
 import os
 import re
@@ -16,6 +19,7 @@ from .cad_common import (
     _JOB_LOCK,
     _LAST_DELIVER_REV,
     _LAST_VOLUME,
+    _SID_RE,
     _autosave,
     _doc,
     _doc_revision,
@@ -26,6 +30,7 @@ from .cad_common import (
     _resolve_alias,
     _resolve_appearance,
     _sanitize_output_path,
+    _sid_match,
     _solve_sync_or_handoff,
     _start_job,
     _tmp,
@@ -52,13 +57,39 @@ from .cad_guide import (
 # canonical shape BEFORE doc_apply_ops so a natural sketch just works. Conservative:
 # only rewrites a feature that shows the deviant form; canonical ops pass through
 # untouched (byte-identical), and any failure falls back to the original op.
+# The engine's RESERVED DATUMS (core/doc/validate.cpp::RESERVED_DATUMS) are the only bare
+# strings a datum/plane/axis ref may carry besides an f<N> feature id — everything else is
+# rejected as "'XZ' is neither a reserved datum nor a feature id". Models write the plane
+# the way a person names it ("XZ", "front", "Top Plane"), so map every natural spelling onto
+# the reserved token here, before the call.
+_DATUM_TOKENS = frozenset({
+    "origin", "point.origin",
+    "plane.front", "plane.top", "plane.right",
+    "axis.x", "axis.y", "axis.z",
+})
 _PLANE_ALIASES = {
-    "xy": "plane.top", "yx": "plane.top", "top": "plane.top",
+    "xy": "plane.top", "yx": "plane.top", "top": "plane.top", "topplane": "plane.top",
+    "plane.xy": "plane.top", "plane_xy": "plane.top", "top_plane": "plane.top",
     "xz": "plane.front", "zx": "plane.front", "front": "plane.front",
+    "frontplane": "plane.front", "plane.xz": "plane.front", "plane_xz": "plane.front",
+    "front_plane": "plane.front",
     "yz": "plane.right", "zy": "plane.right", "right": "plane.right",
+    "rightplane": "plane.right", "plane.yz": "plane.right", "plane_yz": "plane.right",
+    "right_plane": "plane.right", "side": "plane.right",
 }
+_AXIS_DATUM_ALIASES = {
+    "x": "axis.x", "+x": "axis.x", "-x": "axis.x", "xaxis": "axis.x", "x_axis": "axis.x",
+    "axis_x": "axis.x", "axis.x": "axis.x",
+    "y": "axis.y", "+y": "axis.y", "-y": "axis.y", "yaxis": "axis.y", "y_axis": "axis.y",
+    "axis_y": "axis.y", "axis.y": "axis.y",
+    "z": "axis.z", "+z": "axis.z", "-z": "axis.z", "zaxis": "axis.z", "z_axis": "axis.z",
+    "axis_z": "axis.z", "axis.z": "axis.z",
+}
+_DATUM_WORDS = {**_PLANE_ALIASES, **_AXIS_DATUM_ALIASES}
 _CID_RE = re.compile(r"^c\d+$")
 _EID_RE = re.compile(r"^e\d+$")
+_FID_RE = re.compile(r"^f\d+$")
+_BATCH_REF_RE = re.compile(r"^\$\d+$")
 _DIM_CTYPES = frozenset({"distance", "length", "angle", "radius", "diameter"})
 
 
@@ -69,13 +100,25 @@ def _xy(v: Any) -> Any:
     return v
 
 
-def _norm_plane(v: Any) -> Optional[str]:
+def _norm_datum(v: Any) -> Optional[str]:
+    """A plane/axis word -> the engine's reserved datum token. Non-strings -> None.
+
+    An already-canonical token, an f<N> feature id and a same-batch "$N" placeholder are
+    returned untouched; anything the map does not know is handed back verbatim so the
+    engine (not this function) reports it.
+    """
     if not isinstance(v, str) or not v.strip():
         return None
     s = v.strip()
-    if s.startswith("plane.") or s.startswith("f") or "." in s:
-        return s  # already a datum/handle-ish token — leave it
-    return _PLANE_ALIASES.get(s.lower(), s)
+    if s in _DATUM_TOKENS or _FID_RE.match(s) or _BATCH_REF_RE.match(s):
+        return s
+    return _DATUM_WORDS.get(s.lower().replace(" ", "").replace("-", "_"), s)
+
+
+def _is_canon_datum(v: Any) -> bool:
+    """True when a bare-string ref would satisfy validate_sel_or_datum as-is."""
+    return isinstance(v, str) and (v in _DATUM_TOKENS or bool(_FID_RE.match(v))
+                                   or bool(_BATCH_REF_RE.match(v)))
 
 
 def _norm_dim_value(c: dict) -> dict:
@@ -97,7 +140,18 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
         return True
     if "dimensions" in params or "plane" in params:
         return True
-    if not (feat.get("refs") or {}).get("plane"):
+    plane_ref = (feat.get("refs") or {}).get("plane")
+    if not plane_ref:
+        return True
+    # A plane the model NAMED ("XZ", "Top Plane") is not a reserved datum, so the batch dies
+    # on the dangling-ref guardrail even though every entity is already canonical. That path
+    # never reached the normalizer before: fire on it too.
+    if isinstance(plane_ref, str) and not _is_canon_datum(plane_ref):
+        return True
+    # `params.entities` / `params.constraints` are BOTH required for a sketch; a feature that
+    # omits one is rejected outright ("params.constraints: required for sketch").
+    if not isinstance(params.get("entities"), list) or not isinstance(
+            params.get("constraints"), list):
         return True
     for e in (ents or []):
         if not isinstance(e, dict):
@@ -129,9 +183,10 @@ def _normalize_sketch_feature(feat: dict) -> dict:
             return feat[key]
         return None
 
-    ents_in = _pick("entities")
-    if not isinstance(ents_in, list):
-        return feat  # nothing sketch-shaped to work with
+    # A sketch with no `entities` at all is still a sketch: the engine REQUIRES
+    # params.entities and params.constraints on every one, so an empty profile must be
+    # normalized into the canonical empty lists rather than skipped.
+    ents_in = _pick("entities") or []
     if not _sketch_needs_norm(feat, params):
         return feat  # already canonical — leave byte-identical
 
@@ -200,7 +255,7 @@ def _normalize_sketch_feature(feat: dict) -> dict:
     refs_out = dict(feat.get("refs") or {})
     plane = None
     for src in (refs_out.get("plane"), params.get("plane"), feat.get("plane")):
-        p = _norm_plane(src) if src is not None else None
+        p = _norm_datum(src) if src is not None else None
         if p:
             plane = p
             break
@@ -448,7 +503,7 @@ _DIAMETER_ALIASES = {
               "minor_diameter": "minor_r", "tube_diameter": "minor_r",
               "diameter": "major_r"},
 }
-_SIZE_KEYS = ("size", "dimensions", "dims")
+_SIZE_KEYS = ("size", "dimensions", "dimension", "dims")
 _BOX_DIMS = ("length", "width", "height")
 _MAX_INTERPRETED_NOTES = 8
 
@@ -696,10 +751,10 @@ def _normalize_feature_dims(feat: dict, ftype: str, notes: list) -> dict:
 
 
 def _normalize_feature_ops(ops: Any, notes: Optional[list] = None) -> Any:
-    """Normalize dialect primitive placement/orientation + dimension ops; return a new list.
+    """Normalize dialect primitive placement/orientation + dimension + schema ops.
 
     `notes` (optional) collects a plain-English line per rewrite, echoed to the model as
-    `interpreted` so it learns the canonical spelling.
+    `interpreted` so it learns the canonical spelling. Returns a new list.
     """
     if not isinstance(ops, list):
         return ops
@@ -716,6 +771,10 @@ def _normalize_feature_ops(ops: Any, notes: Optional[list] = None) -> Any:
                 if ftype in _PRIMITIVE_TYPES and _primitive_needs_norm(feat, params):
                     new = _normalize_primitive_feature(feat)
                 new = _normalize_feature_dims(new, ftype, sink)
+                # Last: the requirements the engine enforces and the model forgets
+                # (hole style/end/face, boolean op, extrude/revolve mode + profile ref,
+                # datum words, kind-less selectors, {"value":[…]} around a coordinate).
+                new = _normalize_feature_schema(new, ftype, sink)
                 if new is not feat:
                     op = {**op, "feature": new}
             elif (isinstance(op, dict) and op.get("op") == "edit_feature"
@@ -744,6 +803,1350 @@ def _interpreted_notes(notes: list) -> list:
         extra = len(seen) - _MAX_INTERPRETED_NOTES
         seen = seen[:_MAX_INTERPRETED_NOTES] + [f"(+{extra} more of the same kind)"]
     return seen
+
+
+# ---------------------------------------------------------------------------
+# OP-ELEMENT + FEATURE-TYPE normalizer (model-robustness).
+#
+# The canonical batch element is {"op":"add_feature","feature":{"type":…}}. The single
+# most common live rejection in the recorded corpus is one level flatter than that —
+# ops=[{"type":"box","name":"Plate","params":{…}}], which dies as «op[0]: missing 'op'»
+# — closely followed by the model using a feature TYPE as the op name
+# ({"op":"box",…}) and by a type spelled the way a person says it ("cube", "cylindrical",
+# "cut_cylinder"). All three are unambiguous, so they are rewritten here instead of
+# rejected; each rewrite is echoed ONCE per batch in `interpreted` (the notes are
+# de-duplicated, so a 20-element batch adds one line, not twenty).
+_FEATURE_TYPE_ALIASES = {
+    "cube": "box", "cuboid": "box", "rect_prism": "box", "rectangular_prism": "box",
+    "block": "box", "rectangle": "box", "prism": "box", "plate": "box", "slab": "box",
+    "circle": "cylinder", "disc": "cylinder", "disk": "cylinder", "cylindrical": "cylinder",
+    "rod": "cylinder", "shaft": "cylinder", "tube": "cylinder", "pipe": "cylinder",
+    "round_bar": "cylinder", "boss": "cylinder",
+    "ball": "sphere", "spherical": "sphere",
+    "conical": "cone", "frustum": "cone", "taper": "cone",
+    "toroid": "torus", "ring": "torus", "donut": "torus",
+    "bore": "hole", "drill": "hole", "counterbore": "hole", "countersink": "hole",
+    "cbore": "hole", "csink": "hole", "tapped_hole": "hole", "clearance_hole": "hole",
+    "pocket": "extrude", "profile": "sketch", "sketch2d": "sketch", "sketch_2d": "sketch",
+    "round": "fillet", "blend": "fillet", "bevel": "chamfer", "hollow": "shell",
+    "pattern": "linear_pattern", "array": "linear_pattern",
+    "polar_pattern": "circular_pattern", "revolved_pattern": "circular_pattern",
+    "engrave": "text", "emboss": "text", "extrusion": "extrude", "revolution": "revolve",
+}
+# An alias that also implies a boolean MODE ("a pocket" is an extrude that removes material).
+_TYPE_ALIAS_MODE = {"pocket": "cut"}
+# An alias that also pins the hole STYLE the word names.
+_TYPE_ALIAS_HOLE_STYLE = {
+    "counterbore": "cbore", "cbore": "cbore",
+    "countersink": "csink", "csink": "csink",
+    "tapped_hole": "tap",
+}
+# "<something>_cut" / "cut_<something>" = that shape, subtracted.
+_CUT_TYPE_PREFIXES = ("cut_", "remove_", "subtract_", "negative_")
+_CUT_TYPE_SUFFIXES = ("_cut", "_pocket", "_subtract", "_removal")
+# A boolean OPERATION written where a feature type belongs — never a type, always a mode.
+_BOOLEAN_AS_TYPE = frozenset({
+    "cut", "subtract", "difference", "remove", "union", "add", "join", "fuse", "merge",
+    "intersect", "intersection", "common", "combine",
+})
+# Suffix noise a model adds to a real type ("box3D", "cylinder_solid").
+_TYPE_NOISE_SUFFIXES = ("_3d", "3d", "_solid", "_feature", "_prim", "_primitive", "_shape")
+
+
+def _feature_type_vocab() -> tuple[frozenset, bool]:
+    """(the engine's feature types, is-it-live?).
+
+    Sourced from `doc_list_ops` via op_vocab — the same single source the docstring's OP
+    VOCABULARY block quotes — with op_registry's COMMON_FEATURE_TYPES as the offline
+    fallback. The flag matters: the fallback is a SUBSET, so an unknown type may only be
+    REJECTED here when the list came from the live engine.
+    """
+    types: list = []
+    try:
+        from services.mcp import op_vocab as _ov  # noqa: PLC0415
+        types = [str(t) for t in _ov.feature_types() if t]
+    except Exception:  # noqa: BLE001
+        types = []
+    fallback: list = []
+    try:
+        from services.mcp.op_registry import COMMON_FEATURE_TYPES  # noqa: PLC0415
+        fallback = list(COMMON_FEATURE_TYPES)
+    except Exception:  # noqa: BLE001
+        fallback = []
+    live = bool(types) and set(types) != set(fallback)
+    return frozenset(types or fallback), live
+
+
+def _doc_op_vocab() -> frozenset:
+    """The engine's op names (doc_list_ops, op_registry fallback)."""
+    try:
+        from services.mcp import op_vocab as _ov  # noqa: PLC0415
+        ops = [str(o) for o in _ov.doc_ops() if o]
+        if ops:
+            return frozenset(ops)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from services.mcp.op_registry import DOC_OP_KINDS  # noqa: PLC0415
+        return frozenset(DOC_OP_KINDS)
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def _slug(word: Any) -> str:
+    return str(word or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _canon_feature_type(word: Any, vocab: frozenset) -> Optional[str]:
+    """A word -> an engine feature type, or None. Pure (alias table + suffix noise)."""
+    w = _slug(word)
+    if not w:
+        return None
+    if w in vocab:
+        return w
+    if w in _FEATURE_TYPE_ALIASES:
+        return _FEATURE_TYPE_ALIASES[w]
+    for suf in _TYPE_NOISE_SUFFIXES:
+        if w.endswith(suf) and len(w) > len(suf):
+            base = w[: -len(suf)]
+            if base in vocab:
+                return base
+            if base in _FEATURE_TYPE_ALIASES:
+                return _FEATURE_TYPE_ALIASES[base]
+    if w.endswith("s") and len(w) > 1:  # "boxes" is not a thing, but "holes" is written
+        base = w[:-1]
+        if base in vocab:
+            return base
+        if base in _FEATURE_TYPE_ALIASES:
+            return _FEATURE_TYPE_ALIASES[base]
+    return None
+
+
+def _feature_type_error(raw: Any, vocab: frozenset) -> str:
+    """The unknown-feature-type message: closest matches FIRST, then the real vocabulary."""
+    import difflib  # noqa: PLC0415 — failure path only
+    known = sorted(vocab)
+    near = difflib.get_close_matches(_slug(raw), known, n=4, cutoff=0.4)
+    head = f'add_feature: "{raw}" is not a feature type.'
+    if near:
+        head += " Closest: " + ", ".join(near) + "."
+    return (f"{head} A feature type goes in feature.type, never in op — "
+            f'{{"op":"add_feature","feature":{{"type":"box","name":"Block",'
+            f'"params":{{…}}}}}}. Feature types: ' + ", ".join(known) + ".")
+
+
+def _retype_feature(feat: dict, vocab: frozenset, live: bool, notes: list) -> dict:
+    """Map a natural type word onto an engine feature type. Identity when already canonical."""
+    raw = feat.get("type")
+    if isinstance(raw, str) and raw.strip() in vocab:
+        return feat  # canonical — byte-identical
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            'add_feature: the feature has no "type". Every feature needs one, e.g. '
+            '{"op":"add_feature","feature":{"type":"cylinder","name":"Shaft",'
+            '"params":{"radius":10,"height":40}}}. Feature types: '
+            + ", ".join(sorted(vocab)) + ".")
+
+    word = _slug(raw)
+    if word in _BOOLEAN_AS_TYPE:
+        raise ValueError(
+            f'add_feature: "{raw}" is a boolean OPERATION, not a feature type. Subtract by '
+            f'building the SAME shape with mode:"cut" (e.g. {{"type":"cylinder","params":'
+            f'{{"radius":10,"height":40}},"at":[0,0,0],"mode":"cut"}}), fuse with '
+            f'mode:"boss" (the default), or combine two existing bodies with '
+            f'{{"type":"boolean","params":{{"op":"cut","a":"f1","b":"f2"}}}}.')
+
+    base, cut = word, False
+    for pre in _CUT_TYPE_PREFIXES:
+        if base.startswith(pre) and len(base) > len(pre):
+            base, cut = base[len(pre):], True
+            break
+    else:
+        for suf in _CUT_TYPE_SUFFIXES:
+            if base.endswith(suf) and len(base) > len(suf):
+                base, cut = base[: -len(suf)], True
+                break
+
+    ftype = _canon_feature_type(base, vocab)
+    if ftype is None:
+        if live:
+            raise ValueError(_feature_type_error(raw, vocab))
+        return feat  # offline vocabulary is a subset — let the engine be the authority
+
+    out = dict(feat)
+    out["type"] = ftype
+    params = dict(out["params"]) if isinstance(out.get("params"), dict) else {}
+    extra = ""
+    if cut or _TYPE_ALIAS_MODE.get(word) == "cut":
+        if out.get("mode") is None and params.get("mode") is None:
+            out["mode"] = "cut"
+            extra = ' with mode:"cut"'
+    style = _TYPE_ALIAS_HOLE_STYLE.get(word)
+    if style and ftype == "hole" and params.get("style") is None:
+        params["style"] = style
+        extra += f' (style "{style}")'
+    if params or isinstance(out.get("params"), dict):
+        out["params"] = params
+    if word in ("tube", "pipe"):
+        extra += " — a hollow tube also needs a concentric mode:\"cut\" cylinder for its bore"
+    notes.append(f'{_feat_label(feat, ftype)}: interpreted type "{raw}" as "{ftype}"{extra}')
+    return out
+
+
+def _normalize_feature_types(ops: Any, notes: list) -> Any:
+    """Map every add_feature's `type` onto the engine vocabulary. Runs FIRST, because the
+    sketch/primitive/dimension normalizers downstream all branch on the canonical type —
+    a sketch spelled "profile" used to slip past the sketch normalizer entirely."""
+    if not isinstance(ops, list):
+        return ops
+    vocab, live = _feature_type_vocab()
+    out = []
+    for op in ops:
+        if (isinstance(op, dict) and op.get("op") == "add_feature"
+                and isinstance(op.get("feature"), dict)):
+            new = _retype_feature(op["feature"], vocab, live, notes)
+            op = op if new is op["feature"] else {**op, "feature": new}
+        out.append(op)
+    return out
+
+
+# The op keys that name the feature an op acts on. The canonical spelling is `id`;
+# `feature_id` in particular produced the silent «delete_feature: no feature ''».
+_OP_TARGET_ALIASES = ("feature_id", "featureId", "feature", "target", "target_id", "fid")
+_OP_TARGET_OPS = frozenset({
+    "delete_feature", "set_suppressed", "reorder_feature", "rename", "set_folder",
+    "copy_feature", "edit_feature", "set_rollback",
+})
+
+
+def _normalize_op_elements(ops: list, notes: list) -> list:
+    """Give every batch element a valid `op`. Raises ValueError with a teaching message
+    for an element that names neither an op nor a feature type."""
+    ftypes, _live = _feature_type_vocab()
+    docops = _doc_op_vocab()
+    out: list = []
+    for i, el in enumerate(ops):
+        if not isinstance(el, dict):
+            pair = (' A ["<name>", "<value>"] pair is not an op: the op name and its data '
+                    "live in ONE object, keyed."
+                    if isinstance(el, (list, tuple)) else "")
+            raise ValueError(
+                f"ops[{i}] is {type(el).__name__}, not an object.{pair} Every element is "
+                f'either {{"op":"<op name>", …}} from the op vocabulary or a bare feature '
+                f'{{"type":"box","name":"Block","params":{{"length":40,"width":30,'
+                f'"height":20}}}} (read as add_feature). Got: {el!r}')
+        name = el.get("op")
+        if isinstance(name, str) and name.strip():
+            kind = name.strip()
+            # {"op":"add_feature","type":"sketch","refs":{…}} — the feature keys sit BESIDE
+            # the op instead of inside a "feature" object. Unambiguous, so wrap them.
+            if (kind == "add_feature" and not isinstance(el.get("feature"), dict)
+                    and el.get("type") is not None):
+                order = {k: el[k] for k in _OP_ORDER_KEYS if k in el}
+                inner = {k: v for k, v in el.items()
+                         if k != "op" and k not in _OP_ORDER_KEYS and k != "feature"}
+                out.append({"op": "add_feature", "feature": inner, **order})
+                notes.append('read the feature keys sitting beside op:"add_feature" as its '
+                             '"feature" object — an add_feature op is '
+                             '{"op":"add_feature","feature":{"type":…,"params":{…}}}')
+                continue
+            if kind in docops or kind == "new_part":
+                out.append(_normalize_op_target(el, kind, notes))
+                continue
+            ftype = _canon_feature_type(kind, ftypes)
+            if ftype:
+                rest = {k: v for k, v in el.items() if k != "op"}
+                inner = rest.pop("feature", None)
+                feature = dict(inner) if isinstance(inner, dict) else rest
+                feature.setdefault("type", ftype)
+                out.append({"op": "add_feature", "feature": feature})
+                notes.append(
+                    f'interpreted op:"{kind}" as {{"op":"add_feature","feature":'
+                    f'{{"type":"{ftype}",…}}}} — a feature type is not an op name')
+                continue
+            out.append(el)  # a genuinely unknown op: the engine names it (enrich_unknown_op)
+            continue
+        if isinstance(el.get("feature"), dict):
+            out.append({"op": "add_feature", **el})
+            notes.append('read an element carrying a "feature" but no "op" as op:"add_feature"')
+            continue
+        if el.get("type") is not None:
+            out.append({"op": "add_feature", "feature": el})
+            notes.append(
+                'read bare feature dict(s) in ops as {"op":"add_feature","feature":{…}} — '
+                'every ops element needs an "op"')
+            continue
+        raise ValueError(
+            f'ops[{i}] has no "op". An ops element is either {{"op":"<name>", …}} from the op '
+            f'vocabulary or a bare feature {{"type":"<feature type>","name":…,"params":{{…}}}} '
+            f"(read as add_feature). Got keys: {sorted(el)}.")
+    return out
+
+
+def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
+    """`{"op":"delete_feature","feature_id":"f2"}` -> the canonical `id` key."""
+    if kind not in _OP_TARGET_OPS or op.get("id") is not None:
+        return op
+    for alias in _OP_TARGET_ALIASES:
+        v = op.get(alias)
+        if isinstance(v, str) and v.strip():
+            out = dict(op)
+            out.pop(alias, None)
+            out["id"] = v.strip()
+            notes.append(f'{kind}: interpreted {alias}="{v}" as id="{v}" '
+                         f"— the op addresses its feature with `id`")
+            return out
+    return op
+
+
+# ---------------------------------------------------------------------------
+# VALIDATION-MISS normalizer (model-robustness).
+#
+# These are the schema requirements a model reliably forgets, every one of them
+# recovered from a real rejected batch in the run ledgers:
+#   hole      params.style + params.end are REQUIRED and their vocabulary is
+#             simple|tap|cbore|csink / through_all|blind (core/doc/document.cpp) — the
+#             model writes "counterbore"/"through", or omits them entirely; it also omits
+#             refs.face, which the compiler needs to know WHICH face to drill.
+#   sketch    refs.plane must be a RESERVED DATUM, not "XZ" (handled in the sketch pass).
+#   boolean   params.op must be fuse|cut|common with operands a/b, not
+#             params.operation:"union" + params.targets:[…].
+#   extrude/  params.mode is required, and the profile is a refs.region selector, not a
+#   revolve   params.sketch name / an inline polyline.
+#   any       at/axis/origin take a plain [x,y,z]; only SIZES take {"value":N,"expr":…}.
+# Each rewrite is echoed in `interpreted`; anything genuinely ambiguous raises a teaching
+# ValueError instead of guessing.
+_HOLE_STYLES = frozenset({"simple", "tap", "cbore", "csink"})
+_HOLE_STYLE_WORDS = {
+    "simple": "simple", "plain": "simple", "straight": "simple", "drilled": "simple",
+    "clearance": "simple", "standard": "simple", "normal": "simple", "none": "simple",
+    "cbore": "cbore", "counterbore": "cbore", "c_bore": "cbore", "counter_bore": "cbore",
+    "counterbored": "cbore", "socket": "cbore", "spotface": "cbore",
+    "csink": "csink", "countersink": "csink", "c_sink": "csink", "counter_sink": "csink",
+    "countersunk": "csink", "csk": "csink", "flathead": "csink", "chamfered": "csink",
+    "tap": "tap", "tapped": "tap", "threaded": "tap", "thread": "tap",
+}
+_HOLE_ENDS = frozenset({"through_all", "blind"})
+_HOLE_END_WORDS = {
+    "through_all": "through_all", "through": "through_all", "thru": "through_all",
+    "throughall": "through_all", "through_hole": "through_all", "all": "through_all",
+    "full": "through_all", "fully": "through_all", "open": "through_all",
+    "blind": "blind", "to_depth": "blind", "depth": "blind", "partial": "blind",
+    "closed": "blind", "stopped": "blind",
+}
+_HOLE_STYLE_KEYS = ("style", "hole_style", "hole_type")
+_HOLE_END_KEYS = ("end", "end_condition", "termination", "depth_type", "end_type")
+_HOLE_DIR_KEYS = ("direction", "dir", "normal", "drill_direction")
+_HOLE_AT_KEYS = ("origin", "position", "location", "at", "center", "centre")
+# The face word a drill axis names. The SIGN is deliberately dropped: a bore along Z is
+# entered from the top face in every real part, and the note says so.
+_AXIS_FACE_WORD = ("right", "back", "top")
+
+
+def _vec3(v: Any) -> Optional[list]:
+    if isinstance(v, list) and len(v) == 3 and all(_is_num(x) for x in v):
+        return [float(x) for x in v]
+    return None
+
+
+def _face_word_for_axis(v: Any) -> Optional[str]:
+    vec = _vec3(v)
+    if vec is None:
+        if isinstance(v, str):
+            w = _slug(v).lstrip("+-")
+            return {"x": "right", "y": "back", "z": "top"}.get(w)
+        return None
+    dom = max(range(3), key=lambda i: abs(vec[i]))
+    return _AXIS_FACE_WORD[dom] if abs(vec[dom]) > 0 else None
+
+
+def _normalize_hole_feature(feat: dict, notes: list) -> dict:
+    """style/end defaults + synonyms, and the face the bore is entered through."""
+    out, params, peek, consume = _split_two_levels(feat)
+    label = _feat_label(feat, "hole")
+    changed = False
+
+    style_raw = _MISSING
+    for k in _HOLE_STYLE_KEYS:
+        v = consume(k)
+        if style_raw is _MISSING and v is not _MISSING and v is not None:
+            style_raw = v
+    end_raw = _MISSING
+    for k in _HOLE_END_KEYS:
+        v = consume(k)
+        if end_raw is _MISSING and v is not _MISSING and v is not None:
+            end_raw = v
+
+    # "depth":"through" — an END CONDITION written into the depth slot. The engine reads
+    # `depth` as a number, so leaving it there is a hard parse failure later.
+    depth_v = peek("depth")
+    if isinstance(depth_v, str) and _slug(depth_v) in _HOLE_END_WORDS:
+        if end_raw is _MISSING:
+            end_raw = depth_v
+        consume("depth")
+        changed = True
+        notes.append(f'{label}: read depth="{depth_v}" as the end condition, not a distance '
+                     f'— a hole takes end:"through_all"|"blind" plus a numeric depth when blind')
+
+    style = None
+    if style_raw is not _MISSING:
+        w = _slug(style_raw)
+        if w in _HOLE_STYLE_WORDS:
+            style = _HOLE_STYLE_WORDS[w]
+            if style != str(style_raw).strip():
+                changed = True
+                notes.append(f'{label}: interpreted style "{style_raw}" as "{style}" '
+                             f"— hole styles are simple|tap|cbore|csink")
+        elif w in _HOLE_END_WORDS and end_raw is _MISSING:
+            end_raw = style_raw
+            changed = True
+            notes.append(f'{label}: "{style_raw}" is an END condition, not a style — moved to '
+                         f"end; style defaulted to simple")
+        else:
+            raise ValueError(
+                f'hole "{label}": style "{style_raw}" is not a hole style. Use simple (a plain '
+                f'bore), tap (tapped), cbore (counterbored) or csink (countersunk).')
+    if style is None:
+        if peek("cbore_d") is not _MISSING or peek("cbore_depth") is not _MISSING:
+            style = "cbore"
+        elif peek("csink_d") is not _MISSING or peek("csink_angle") is not _MISSING:
+            style = "csink"
+        elif peek("tap") is not _MISSING or peek("thread") is not _MISSING:
+            style = "tap"
+        else:
+            style = "simple"
+        changed = True
+        notes.append(f'{label}: params.style is required for a hole — defaulted to "{style}" '
+                     f"(simple|tap|cbore|csink)")
+
+    end = None
+    if end_raw is not _MISSING:
+        w = _slug(end_raw)
+        if w in _HOLE_END_WORDS:
+            end = _HOLE_END_WORDS[w]
+            if end != str(end_raw).strip():
+                changed = True
+                notes.append(f'{label}: interpreted end "{end_raw}" as "{end}" — a hole ends '
+                             f'"through_all" or "blind"')
+        else:
+            raise ValueError(
+                f'hole "{label}": end "{end_raw}" is not an end condition. Use '
+                f'end:"through_all" (drill straight through) or end:"blind" with a numeric '
+                f"params.depth.")
+    if end is None:
+        depth_now = peek("depth")
+        end = "blind" if (_is_num(depth_now) or _is_dim_object(depth_now)) else "through_all"
+        changed = True
+        notes.append(f'{label}: params.end is required for a hole — defaulted to "{end}"'
+                     + (" (a depth was given)" if end == "blind" else " (no depth was given)"))
+    if end == "blind" and not (_is_num(peek("depth")) or _is_dim_object(peek("depth"))):
+        raise ValueError(
+            f'hole "{label}": end:"blind" needs a numeric params.depth (mm). Give the depth, '
+            f'or use end:"through_all" to drill through.')
+
+    params["style"] = style
+    params["end"] = end
+
+    # A drill DIRECTION names the entry face: that is a rewrite of what the model wrote, so
+    # it belongs here. Supplying a face nobody named is a different decision — see
+    # _supply_missing_refs, which add_features runs on its own.
+    refs = dict(out.get("refs") or {})
+    side = None
+    for k in _HOLE_DIR_KEYS:
+        v = consume(k)
+        if v is not _MISSING and v is not None and side is None:
+            side = _face_word_for_axis(v)
+            changed = True
+    if side and not refs.get("face") and not refs.get("positions_sketch"):
+        refs["face"] = {"of": "face", "side": side}
+        changed = True
+        notes.append(f'{label}: interpreted the drill direction as the {side} face '
+                     f'(refs.face={{"of":"face","side":"{side}"}}) — a bore is entered '
+                     f"through a named planar face, not along a world vector")
+
+    # A world XYZ where the hole's FACE-LOCAL [u,v] positions belong.
+    if not refs.get("positions") and params.get("positions") is None:
+        for k in _HOLE_AT_KEYS:
+            v = peek(k)
+            vec = _vec3(v)
+            if vec is None:
+                continue
+            consume(k)
+            changed = True
+            u, w2 = vec[0], vec[1]
+            if abs(u) < 1e-9 and abs(w2) < 1e-9:
+                notes.append(f'{label}: dropped {k}={vec} — hole positions are FACE-LOCAL '
+                             f"[u,v] pairs and [0,0] is the face centre (the default)")
+            else:
+                params["positions"] = [[u, w2]]
+                notes.append(f'{label}: interpreted {k}={vec} as positions=[[{u}, {w2}]] '
+                             f"— hole positions are FACE-LOCAL [u,v] pairs on refs.face")
+            break
+
+    if not changed:
+        return feat
+    out["params"] = params
+    out["refs"] = refs
+    return out
+
+
+_BOOLEAN_OP_WORDS = {
+    "fuse": "fuse", "union": "fuse", "add": "fuse", "join": "fuse", "merge": "fuse",
+    "combine": "fuse", "weld": "fuse", "boss": "fuse", "plus": "fuse",
+    "cut": "cut", "subtract": "cut", "difference": "cut", "remove": "cut", "minus": "cut",
+    "common": "common", "intersect": "common", "intersection": "common",
+}
+_BOOLEAN_OP_KEYS = ("op", "operation", "boolean", "mode", "action", "kind")
+_BOOLEAN_OPERAND_KEYS = ("targets", "bodies", "operands", "inputs", "features", "tools")
+
+
+def _operand_name(v: Any) -> Optional[str]:
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    if isinstance(v, dict):
+        for k in ("owner_feature", "feature", "id", "body", "name"):
+            s = v.get(k)
+            if isinstance(s, str) and s.strip():
+                return s.strip()
+    return None
+
+
+def _normalize_boolean_feature(feat: dict, notes: list) -> dict:
+    """params.operation:"union" + targets:[a,b] -> params.op:"fuse" + params.a/b."""
+    out, params, peek, consume = _split_two_levels(feat)
+    label = _feat_label(feat, "boolean")
+    changed = False
+
+    raw_op = _MISSING
+    for k in _BOOLEAN_OP_KEYS:
+        v = peek(k)
+        if v is _MISSING or v is None:
+            continue
+        if k != "op":
+            consume(k)
+            changed = True
+        raw_op = v
+        break
+    if raw_op is not _MISSING:
+        word = _slug(raw_op)
+        canon = _BOOLEAN_OP_WORDS.get(word)
+        if canon is None:
+            raise ValueError(
+                f'boolean "{label}": op "{raw_op}" is not a boolean operation. Use '
+                f'"fuse" (union), "cut" (subtract) or "common" (intersect).')
+        if canon != str(raw_op).strip() or params.get("op") != canon:
+            changed = changed or params.get("op") != canon
+            if params.get("op") != canon:
+                notes.append(f'{label}: interpreted boolean op "{raw_op}" as "{canon}" '
+                             f"— the engine's operations are fuse|cut|common")
+        params["op"] = canon
+
+    if params.get("a") is None or params.get("b") is None:
+        operands: list = []
+        for k in _BOOLEAN_OPERAND_KEYS:
+            v = peek(k)
+            if isinstance(v, list) and len(v) >= 2:
+                operands = [_operand_name(x) for x in v[:2]]
+                consume(k)
+                break
+        if not operands:
+            tv = (out.get("refs") or {}).get("targets")
+            if isinstance(tv, list) and len(tv) >= 2:
+                operands = [_operand_name(x) for x in tv[:2]]
+        if len(operands) == 2 and all(operands):
+            params["a"], params["b"] = operands
+            changed = True
+            notes.append(f'{label}: interpreted the operand list as a="{operands[0]}", '
+                         f'b="{operands[1]}" — a boolean fuses/cuts exactly two bodies')
+        elif params.get("op") is not None:
+            raise ValueError(
+                f'boolean "{label}": needs its two operands — params.a and params.b, each a '
+                f'feature id ("f1") or a same-batch placeholder ("$0"). Build both bodies with '
+                f'"merge":false first so they stay separate solids.')
+    if not changed:
+        return feat
+    out["params"] = params
+    return out
+
+
+_PROFILE_MODE_TYPES = frozenset({"extrude", "revolve", "loft", "sweep"})
+_PROFILE_SOURCE_KEYS = ("profile", "sketch", "section", "profile_sketch", "sketch_id",
+                        "source_sketch", "sections")
+_AXIS_SOURCE_TYPES = frozenset({"revolve", "circular_pattern", "surf_revolve", "helix"})
+
+
+def _normalize_profile_feature(feat: dict, ftype: str, notes: list) -> dict:
+    """`params.sketch:"Profile"` + `params.axis:"Z"` -> the refs the engine requires."""
+    out, params, peek, consume = _split_two_levels(feat)
+    refs = dict(out.get("refs") or {})
+    label = _feat_label(feat, ftype)
+    changed = False
+
+    if not refs.get("profile") and not refs.get("sections"):
+        for k in _PROFILE_SOURCE_KEYS:
+            v = peek(k)
+            if v is _MISSING or v is None:
+                continue
+            if isinstance(v, dict) and (v.get("points") or v.get("entities")):
+                raise ValueError(
+                    f'{ftype} "{label}": params.{k} carries INLINE geometry. A profile is '
+                    f'always a sketch feature: add {{"op":"add_feature","feature":'
+                    f'{{"type":"sketch",…}}}} earlier in the same batch and reference it as '
+                    f'refs.profile=[{{"kind":"region","sketch":"$<its index>","hint_index":0}}].')
+            if isinstance(v, str) and v.strip():
+                consume(k)
+                slot = "sections" if ftype == "loft" else "profile"
+                refs[slot] = [{"kind": "region", "sketch": v.strip(), "hint_index": 0}]
+                changed = True
+                notes.append(
+                    f'{label}: interpreted params.{k}="{v}" as refs.{slot}='
+                    f'[{{"kind":"region","sketch":"{v}","hint_index":0}}] — a profile is a '
+                    f"region selector on a sketch feature, not a param")
+                break
+
+    if ftype in _AXIS_SOURCE_TYPES and not refs.get("axis"):
+        v = peek("axis")
+        datum = _norm_datum(v) if isinstance(v, str) else None
+        if datum in _DATUM_TOKENS:
+            consume("axis")
+            refs["axis"] = datum
+            changed = True
+            notes.append(f'{label}: interpreted params.axis="{v}" as refs.axis="{datum}" '
+                         f"— the axis of revolution is a datum REF, not a param")
+
+    if ftype in _PROFILE_MODE_TYPES and params.get("mode") is None:
+        params["mode"] = "cut" if out.get("mode") == "cut" else "boss"
+        out.pop("mode", None)
+        changed = True
+        notes.append(f'{label}: params.mode is required for a {ftype} — defaulted to '
+                     f'"{params["mode"]}" (boss adds material, cut removes it)')
+
+    if not changed:
+        return feat
+    out["params"] = params
+    out["refs"] = refs
+    return out
+
+
+# A ref slot -> the selector kind its members must carry.
+_REF_SLOT_KIND = {
+    "face": "face", "faces": "face", "target_face": "face", "middle_face": "face",
+    "face_set_a": "face", "face_set_b": "face", "remove": "face", "parting": "face",
+    "neutral": "face",
+    "edges": "edge", "edge": "edge", "edge_a": "edge", "edge_b": "edge",
+    "vertices": "vertex",
+    "targets": "body", "tools": "body", "bodies": "body",
+}
+# Slots whose bare-string value must be a reserved datum / feature id.
+_DATUM_REF_SLOTS = frozenset({"plane", "axis", "dir1", "dir2", "pull", "base", "path"})
+# The keys that make a dict a geometry QUERY rather than a topology selector.
+_QUERY_KEYS = frozenset({"side", "surf", "nearest", "largest", "smallest", "index", "at",
+                         "all", "where", "contains", "min", "max"})
+
+
+def _repair_selector(v: Any, kind: str) -> Any:
+    """Give a kind-less ref member the shape validate_selector / validate_geom_query wants."""
+    if isinstance(v, str) and v.strip() and kind == "body":
+        return {"kind": "body", "owner_feature": v.strip()}
+    if not isinstance(v, dict) or v.get("kind") or v.get("of"):
+        return v
+    if kind in ("face", "edge") and (set(v) & _QUERY_KEYS):
+        return {"of": kind, **v}
+    owner = _operand_name(v)
+    if owner and kind == "body":
+        return {"kind": "body", "owner_feature": owner}
+    return v
+
+
+def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
+    """Datum words + kind-less selectors in `refs`. Identity when everything is canonical."""
+    refs = feat.get("refs")
+    if not isinstance(refs, dict) or not refs:
+        return feat
+    label = _feat_label(feat, ftype)
+    out_refs = dict(refs)
+    changed = False
+    for slot, v in refs.items():
+        if slot in _DATUM_REF_SLOTS and isinstance(v, str):
+            datum = _norm_datum(v)
+            if datum != v:
+                out_refs[slot] = datum
+                changed = True
+                notes.append(f'{label}: interpreted refs.{slot}="{v}" as the reserved datum '
+                             f'"{datum}" — the engine knows plane.top/plane.front/plane.right '
+                             f"and axis.x/axis.y/axis.z")
+            continue
+        kind = _REF_SLOT_KIND.get(slot)
+        if kind is None:
+            continue
+        if isinstance(v, list):
+            new = [_repair_selector(x, kind) for x in v]
+            if new != v:
+                out_refs[slot] = new
+                changed = True
+                notes.append(f'{label}: completed refs.{slot} into {kind} selectors — every '
+                             f'member needs a "kind" (or an "of" geometry query)')
+        else:
+            new = _repair_selector(v, kind)
+            if new is not v and new != v:
+                out_refs[slot] = new
+                changed = True
+                notes.append(f'{label}: read refs.{slot} as a {kind} query — a bare '
+                             f'{{"side":…}} is not a topology selector')
+    if not changed:
+        return feat
+    out = dict(feat)
+    out["refs"] = out_refs
+    return out
+
+
+# Keys whose value is a COORDINATE, never a dimension: a {"value":[x,y,z]} wrapper around
+# one of these is rejected outright ("params.at.value: missing or non-numeric").
+_VECTOR_KEYS = frozenset({
+    "at", "at_offset", "axis", "axis_dir", "dir", "direction", "normal", "translate",
+    "rotate", "origin", "position", "location", "center", "centre", "point", "up",
+})
+
+
+def _unwrap_vector_dims(feat: dict, ftype: str, notes: list) -> dict:
+    """`at:{"value":[0,0,-7.5],"expr":null}` -> `at:[0,0,-7.5]`."""
+    out = dict(feat)
+    params = dict(out["params"]) if isinstance(out.get("params"), dict) else None
+    changed = False
+    for holder in (out, params):
+        if holder is None:
+            continue
+        for k in list(holder):
+            if k not in _VECTOR_KEYS:
+                continue
+            v = holder[k]
+            if (isinstance(v, dict) and isinstance(v.get("value"), list)
+                    and set(v) <= {"value", "expr", "unit"}):
+                holder[k] = v["value"]
+                changed = True
+    if not changed:
+        return feat
+    if params is not None:
+        out["params"] = params
+    notes.append(f'{_feat_label(feat, ftype)}: unwrapped a {{"value":[…]}} around a coordinate '
+                 f"— at/axis/origin take a plain [x,y,z]; only SIZES take "
+                 f'{{"value":N,"expr":…}}')
+    return out
+
+
+# A placement written as a WORD. `at` accepts a [x,y,z] or a geometry query, never a bare
+# adjective — "location":"center" reached the engine as at:"center" and died on
+# "'center' is neither a reserved datum nor a feature id".
+_AT_CENTER_WORDS = frozenset({"center", "centre", "origin", "middle", "centered", "centred",
+                              "0,0,0", "world_origin"})
+_AT_SIDE_WORDS = frozenset({"top", "bottom", "left", "right", "front", "back",
+                            "+x", "-x", "+y", "-y", "+z", "-z"})
+
+
+def _normalize_placement_word(feat: dict, ftype: str, notes: list) -> dict:
+    """`at:"center"` -> [0,0,0]; `at:"top"` -> the top-face geometry query."""
+    out, params, peek, _consume = _split_two_levels(feat)
+    v = peek("at")
+    if not isinstance(v, str) or not v.strip():
+        return feat
+    word = _slug(v)
+    label = _feat_label(feat, ftype)
+    if word in _AT_CENTER_WORDS:
+        new: Any = [0, 0, 0]
+        why = "the world origin (which is also the default)"
+    elif word.replace("_", "") in _AT_SIDE_WORDS or word in _AT_SIDE_WORDS:
+        side = word if word in _AT_SIDE_WORDS else word.replace("_", "")
+        new = {"of": "face", "side": side}
+        why = f'the centroid of the {side} face'
+    else:
+        return feat  # not a word we can honour — let the engine name it
+    if "at" in out:
+        out["at"] = new
+    else:
+        params["at"] = new
+        out["params"] = params
+    notes.append(f'{label}: interpreted at="{v}" as {why} — placement is [x,y,z] or a '
+                 f'geometry query like {{"of":"face","side":"top"}}')
+    return out
+
+
+# The extrude family's param NAMES, verified against the keys document.cpp actually reads
+# on an extrude feature (depth, depth2, draft, draft_outward, end, end2, end_offset, flip,
+# mid_plane, mode, offset, start, start_offset, start_ref, thin, thin_side, thin_thickness,
+# up_to). Anything else the model writes for "how far" or "both ways" is inert: the batch
+# died on a raw `key 'depth' not found` kernel exception with nothing to learn from.
+_EXTRUDE_TYPES = frozenset({"extrude", "surf_extrude"})
+_EXTRUDE_DEPTH_ALIASES = ("distance", "length", "extent", "amount", "height", "thickness")
+_MID_PLANE_ALIASES = ("symmetric", "symmetrical", "both_directions", "both_sides",
+                      "midplane", "centered")
+_EXTRUDE_END_WORDS = {"through": "through_all", "thru": "through_all", "all": "through_all",
+                      "midplane": "mid_plane", "symmetric": "mid_plane"}
+
+
+def _normalize_extrude_params(feat: dict, ftype: str, notes: list) -> dict:
+    """distance/length -> depth, symmetric/both_directions -> mid_plane, through -> the end."""
+    out, params, peek, consume = _split_two_levels(feat)
+    label = _feat_label(feat, ftype)
+    changed = False
+
+    if peek("depth") is _MISSING:
+        for k in _EXTRUDE_DEPTH_ALIASES:
+            v = peek(k)
+            if v is _MISSING or v is None:
+                continue
+            if k == "thickness" and peek("thin") not in (_MISSING, None, False):
+                continue  # a THIN feature's wall thickness (thin_thickness), not the run
+            consume(k)
+            params["depth"] = v
+            changed = True
+            notes.append(f'{label}: interpreted {k}={v!r} as params.depth — an {ftype} is '
+                         f"dimensioned by `depth` along its direction")
+            break
+
+    for k in _MID_PLANE_ALIASES:
+        v = peek(k)
+        if v is _MISSING or v is None:
+            continue
+        consume(k)
+        changed = True
+        if peek("mid_plane") is _MISSING:
+            params["mid_plane"] = bool(v)
+            notes.append(f'{label}: interpreted {k}={v!r} as params.mid_plane — the run is '
+                         f"split evenly either side of the sketch plane")
+
+    end_v = peek("end")
+    if isinstance(end_v, str) and _slug(end_v) in _EXTRUDE_END_WORDS:
+        canon = _EXTRUDE_END_WORDS[_slug(end_v)]
+        params["end"] = canon
+        out.pop("end", None)
+        changed = True
+        notes.append(f'{label}: interpreted end "{end_v}" as "{canon}" — an {ftype} ends '
+                     f'"blind" (depth), "through_all" or "mid_plane"')
+
+    if not changed:
+        return feat
+    out["params"] = params
+    return out
+
+
+# Sketching on a FACE is core CAD and the engine supports it, but a ref slot only takes a
+# reserved datum, an f<N> id, a "$N" placeholder or a selector OBJECT — so the bare stable
+# sid describe_part/query_geometry hands the model back ("Ffa9a6e") is rejected outright.
+# The sid grammar and the kind its leading letter implies are cad_common's (_SID_RE /
+# _sid_match, core/doc/selectors.cpp::stable_sid); wrap it into the selector the slot wants,
+# and VERIFY it against the live document first — a stale sid must name what does exist.
+_SID_KINDS = {"f": "face", "e": "edge", "v": "vertex"}
+_SID_REF_SLOTS = frozenset({
+    "plane", "face", "faces", "target_face", "middle_face", "face_set_a", "face_set_b",
+    "remove", "parting", "neutral", "reference_face", "edges", "edge", "edge_a", "edge_b",
+    "vertices", "surface", "tool", "up_to", "start_ref", "end_ref", "base", "path", "axis",
+})
+
+
+def _bare_sid(v: Any) -> Optional[str]:
+    """The stable sid this ref value IS, or None (a datum / f<N> id / selector is not one)."""
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if s in _DATUM_TOKENS or _BATCH_REF_RE.match(s):
+        return None
+    return s if _SID_RE.fullmatch(s) else None
+
+
+def _walk_sid_refs(ops: Any):
+    """Yield (refs dict, slot, index-or-None, sid) for every bare sid sitting in a ref slot."""
+    for op in ops if isinstance(ops, list) else ():
+        feat = op.get("feature") if isinstance(op, dict) else None
+        refs = feat.get("refs") if isinstance(feat, dict) else None
+        if not isinstance(refs, dict):
+            continue
+        for slot, v in refs.items():
+            if slot not in _SID_REF_SLOTS:
+                continue
+            if isinstance(v, list):
+                for i, x in enumerate(v):
+                    sid = _bare_sid(x)
+                    if sid:
+                        yield refs, slot, i, sid
+            else:
+                sid = _bare_sid(v)
+                if sid:
+                    yield refs, slot, None, sid
+
+
+def _sid_roster(doc_id: str, kind: str, limit: int = 12) -> list:
+    """The document's live sids of one kind, for a teaching error."""
+    try:
+        res = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": kind}}) or {}
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for m in res.get("matches") or []:
+        sid = m.get("sid")
+        if not sid:
+            continue
+        bits = [b for b in (m.get("side"), m.get("surf")) if b]
+        out.append(f"{sid} ({'/'.join(bits)})" if bits else str(sid))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _resolve_sid_refs(ops: Any, doc_id: str, notes: list) -> Any:
+    """Wrap a bare stable sid in a ref slot into the selector the engine accepts.
+
+    Costs one doc_query per sid KIND, and only when a bare sid is actually present — a
+    canonical batch never touches the engine here. A sid the document does not carry is a
+    teaching error naming the live roster, never a blind wrap (sids change on every edit).
+    """
+    found = list(_walk_sid_refs(ops))
+    if not found:
+        return ops
+    resolved: dict = {}
+    for _refs, slot, _i, sid in found:
+        if sid in resolved:
+            continue
+        m = _sid_match(doc_id, sid)
+        if m is None:
+            kind = _SID_KINDS.get(sid[:1].lower(), "face")
+            roster = _sid_roster(doc_id, "face" if kind == "vertex" else kind)
+            extra = (" Vertex sids are not selectable — name the face or edge that carries it."
+                     if kind == "vertex" else "")
+            raise ValueError(
+                f'refs.{slot}: no {kind} with sid "{sid}" in this document (sids change '
+                f"whenever the model changes).{extra} Live {kind} sids: "
+                + (", ".join(roster) if roster else "none — the part has no bodies yet")
+                + ". Call describe_part(doc_id) for the current roster, or use a geometry "
+                  'query like {"of":"face","side":"top"}.')
+        # The LIVE doc_query match IS the canonical selector: validate_selector wants a
+        # centroid on a face/edge/vertex, and the resolver already carries it (plus surf /
+        # axis / owner_feature, which is what makes the pick survive a rebuild).
+        sel = {"kind": m.get("kind") or _SID_KINDS.get(sid[:1].lower(), "face"),
+               "sid": m.get("sid") or sid}
+        for k in ("centroid", "surf", "axis", "owner_feature", "radius"):
+            if m.get(k) is not None:
+                sel[k] = m[k]
+        resolved[sid] = sel
+    out = []
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        refs = feat.get("refs") if isinstance(feat, dict) else None
+        if not isinstance(refs, dict):
+            out.append(op)
+            continue
+        new_refs = dict(refs)
+        touched = False
+        for slot, v in refs.items():
+            if slot not in _SID_REF_SLOTS:
+                continue
+            if isinstance(v, list):
+                lst = [resolved.get(_bare_sid(x) or "", x) for x in v]
+                if lst != v:
+                    new_refs[slot], touched = lst, True
+            else:
+                sid = _bare_sid(v)
+                if sid:
+                    new_refs[slot], touched = resolved[sid], True
+        if not touched:
+            out.append(op)
+            continue
+        out.append({**op, "feature": {**feat, "refs": new_refs}})
+    if resolved:
+        shown = ", ".join(sorted(resolved))
+        notes.append(
+            f"wrapped bare face/edge sid(s) {shown} into selector objects "
+            f'({{"kind":"face","sid":"…"}}) — a ref slot takes a selector, a reserved datum, '
+            f'an f<N> id or a "$N" placeholder, never a bare sid')
+    return out
+
+
+# A cylinder with no height cannot build. When the call also reads as a BORE, the model
+# reached for the wrong feature type: a bore in existing material is a `hole`, which is
+# dimensioned by diameter and drilled through a named face. Say that instead of letting the
+# schema report a missing param — but never convert it silently: cylinder-vs-hole is a real
+# modelling choice (a standalone post IS a cylinder).
+_BORE_INTENT_WORDS = ("bore", "hole", "drill", "counterbore", "countersink", "pocket",
+                      "clearance", "thru", "through")
+
+
+def _check_cylinder_height(feat: dict, ftype: str, notes: list) -> dict:
+    if ftype != "cylinder":
+        return feat
+    _out, _params, peek, _consume = _split_two_levels(feat)
+    if peek("height") is not _MISSING:
+        return feat
+    label = _feat_label(feat, ftype)
+    boreish = (str(peek("mode") or "").strip().lower() == "cut"
+               or any(w in label.lower() for w in _BORE_INTENT_WORDS))
+    msg = (f'cylinder "{label}": params.height is required (a cylinder is radius + height, '
+           f"both in mm).")
+    if boreish:
+        msg += (' This reads like a BORE, and a bore in existing material is a `hole`, not a '
+                'cylinder: {"op":"add_feature","feature":{"type":"hole","name":"' + label +
+                '","params":{"diameter":20.042,"style":"simple","end":"through_all"},'
+                '"refs":{"face":{"of":"face","side":"top"}}}} — a hole takes the DIAMETER '
+                'directly and is drilled through a named face. Use a cylinder with '
+                'mode:"cut" only when you want a free-standing tool solid.')
+    raise ValueError(msg)
+
+
+def _supply_missing_refs(ops: Any, notes: list) -> Any:
+    """Supply a REF the engine cannot infer and the model did not name.
+
+    Deliberately separate from the dialect passes above: those rewrite what the model
+    wrote, this one adds something it never said. Today that is a hole's entry face — a
+    solid has six of them, the compiler refuses to pick ("hole: 'face' selector is
+    required (the planar face to drill into)"), and the top face is what a person means by
+    an undecorated bore. Echoed, so the model can name another face next turn.
+    """
+    if not isinstance(ops, list):
+        return ops
+    out = []
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if not (isinstance(feat, dict) and op.get("op") == "add_feature"
+                and str(feat.get("type") or "").strip().lower() == "hole"):
+            out.append(op)
+            continue
+        refs = feat.get("refs") if isinstance(feat.get("refs"), dict) else {}
+        if refs.get("face") or refs.get("positions_sketch"):
+            out.append(op)
+            continue
+        out.append({**op, "feature": {**feat,
+                                      "refs": {**refs,
+                                               "face": {"of": "face", "side": "top"}}}})
+        notes.append(
+            f'{_feat_label(feat, "hole")}: no refs.face given — drilling the TOP face '
+            f'(refs.face={{"of":"face","side":"top"}}); a bore has to be entered through a '
+            f"named planar face, so name another one to drill elsewhere")
+    return out
+
+
+def _normalize_feature_schema(feat: dict, ftype: str, notes: list) -> dict:
+    """Every "the engine requires this and the model forgot" rewrite for one feature."""
+    out = _unwrap_vector_dims(feat, ftype, notes)
+    out = _normalize_placement_word(out, ftype, notes)
+    out = _normalize_feature_refs(out, ftype, notes)
+    if ftype in _PROFILE_MODE_TYPES or ftype in _AXIS_SOURCE_TYPES:
+        out = _normalize_profile_feature(out, ftype, notes)
+    if ftype in _EXTRUDE_TYPES:
+        out = _normalize_extrude_params(out, ftype, notes)
+    elif ftype == "hole":
+        out = _normalize_hole_feature(out, notes)
+    elif ftype == "boolean":
+        out = _normalize_boolean_feature(out, notes)
+    elif ftype == "cylinder":
+        out = _check_cylinder_height(out, ftype, notes)
+    return out
+
+
+def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
+    """Rewrite a reference to a feature this SAME batch creates, by NAME, into its "$N".
+
+    Models name their features and then reference the name ("targets":["Barrel"]); the engine
+    only knows f<N> ids and same-batch "$<index>" placeholders, so the batch died on the
+    dangling-ref guardrail. Pure: only names created earlier in this very list are rewritten.
+    """
+    if not isinstance(ops, list):
+        return ops
+    index: dict[str, str] = {}
+    for i, op in enumerate(ops):
+        if isinstance(op, dict) and op.get("op") == "add_feature":
+            nm = (op.get("feature") or {}).get("name")
+            if isinstance(nm, str) and nm.strip():
+                index.setdefault(nm.strip(), f"${i}")
+    if not index:
+        return ops
+    hits: list = []
+    # Slots whose STRING value names a feature (everything else is left verbatim).
+    ref_keys = ("feature", "owner_feature", "sketch", "a", "b", "id")
+    param_keys = ("a", "b", "sketch", "profile", "targets", "bodies", "features")
+
+    def _sub(v: Any, table: dict) -> Any:
+        if isinstance(v, str):
+            tgt = table.get(v.strip())
+            if tgt and not _is_canon_datum(v.strip()):
+                hits.append(v.strip())
+                return tgt
+            return v
+        if isinstance(v, list):
+            return [_sub(x, table) for x in v]
+        if isinstance(v, dict):
+            return {k: (_sub(x, table) if k in ref_keys or isinstance(x, (list, dict)) else x)
+                    for k, x in v.items()}
+        return v
+
+    out = []
+    for i, op in enumerate(ops):
+        if not (isinstance(op, dict) and op.get("op") == "add_feature"
+                and isinstance(op.get("feature"), dict)):
+            out.append(op)
+            continue
+        feat = op["feature"]
+        # A feature never references ITSELF, and its own `name` is not a ref.
+        table = {k: v for k, v in index.items() if v != f"${i}"}
+        refs, params = feat.get("refs"), feat.get("params")
+        new_refs = _sub(refs, table) if (table and isinstance(refs, dict)) else refs
+        new_params = params
+        if table and isinstance(params, dict):
+            new_params = {k: (_sub(v, table) if k in param_keys else v)
+                          for k, v in params.items()}
+        if new_refs != refs or new_params != params:
+            nf = dict(feat)
+            if new_refs != refs:
+                nf["refs"] = new_refs
+            if new_params != params:
+                nf["params"] = new_params
+            op = {**op, "feature": nf}
+        out.append(op)
+    if hits:
+        notes.append("resolved same-batch feature name(s) " + ", ".join(sorted(set(hits)))
+                     + ' to their "$<index>" placeholders — a ref names an f<N> id or a '
+                       '"$N" position in THIS batch, never a display name')
+    return out
+
+
+# ---------------------------------------------------------------------------
+# add_features ARGUMENT-SHAPE normalizer (model-robustness).
+#
+# `ops=[{"op":"add_feature","feature":{…}}]` is the documented call and is passed through
+# byte-identical. Everything ELSE a model actually writes is rewritten into it here rather
+# than rejected, because a teaching error still burns a whole turn:
+#   ops={…} / ops="[…]"          one op, or the array as a JSON string
+#   feature= features= op=       the batch under the name the model reached for
+#   operations= actions= ops_json=
+#   type=… name=… diameter=…     ONE feature spread over flat top-level kwargs
+#   name= identifier= part=      the DOCUMENT, when no feature type is in sight
+# add_features takes a var-keyword parameter for exactly this reason: agent_turn's
+# _reconcile_kwargs hands a var-kw tool its arguments UNTOUCHED instead of rejecting the
+# unknown names, so the tool owns its own input dialect. Every rewrite is echoed in
+# `interpreted`; genuinely ambiguous input raises a teaching error that names the accepted
+# forms, and nothing is ever silently dropped.
+_BATCH_ALIASES = ("features", "feature", "operations", "actions", "ops_json", "op")
+_DOC_HANDLE_ALIASES = ("identifier", "part_name", "part", "document_id", "document", "doc",
+                       "part_id", "docid", "target_doc", "name")
+_PARAMS_ALIASES = ("params", "parameters", "param", "properties", "props", "attributes")
+_FEATURE_NAME_ALIASES = ("feature", "identifier", "feature_name", "label", "name")
+_BACKGROUND_ALIASES = ("async", "in_background", "run_in_background", "defer")
+# The feature envelope the engine accepts beside "type" (session.cpp::kPrimitiveKeys plus
+# the structural keys). Anything else on a flat call is a param.
+_FEATURE_ENVELOPE_KEYS = frozenset({
+    "type", "name", "params", "refs", "at", "at_offset", "axis", "axis_dir", "centered",
+    "mode", "merge", "folder", "id", "suppressed", "body", "dir",
+})
+_OP_ORDER_KEYS = ("before", "after")
+# DESIGN INTENT, not geometry. A model routinely annotates its build call with why it chose
+# a number; none of these is a parameter of anything. Failing the whole build over an
+# annotation is the exact turn-burning behaviour this normalizer exists to kill — so they
+# are accepted, ignored, and reported.
+_COMMENTARY_KEYS = frozenset({
+    "purpose", "basis", "rationale", "reason", "why", "intent", "design_intent",
+    "justification", "note", "notes", "comment", "comments", "description", "summary",
+    "explanation", "requirement", "requirements", "acceptance", "acceptance_criteria",
+    "criteria", "context", "assumption", "assumptions", "citation", "confidence",
+    "clearance", "goal", "objective", "source", "reference",
+})
+_ADD_FEATURES_ACCEPTS = (
+    'add_features accepts ops=[{"op":"add_feature","feature":{"type":"box","name":"Block",'
+    '"params":{"length":40,"width":30,"height":20}}}] (the canonical batch), '
+    'doc_id="doc-…" (an open part\'s NAME also resolves) and background=true. The batch may '
+    "also arrive as feature=/features=/op=/operations=/actions=/ops_json=, as one op dict, "
+    "as a JSON string, or as ONE feature spread over top-level kwargs "
+    "(type=…, name=…, params={…}). Call cad_guide() for the op vocabulary."
+)
+
+
+def _jsonify(v: Any) -> Any:
+    """Tuples/sets from a Python literal -> JSON-shaped lists."""
+    if isinstance(v, (list, tuple, set)):
+        return [_jsonify(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _jsonify(x) for k, x in v.items()}
+    return v
+
+
+def _as_batch(value: Any, where: str) -> Optional[list]:
+    """Any container a model reaches for -> a list of ops. None: not a batch at all."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, str):
+        s = value.strip()
+        if s[:1] not in ("[", "{"):
+            return None  # a bare word — a NAME, not a batch
+        try:
+            parsed = json.loads(s)
+        except ValueError as e:
+            # A Python REPR of the same structure ("[{'op': 'add_feature', …}]") is the
+            # other thing models emit when told "send JSON"; it is unambiguous, so read it
+            # rather than burn the turn. Only genuine pseudo-code falls through to the error.
+            import ast  # noqa: PLC0415 — failure path only
+            try:
+                lit = ast.literal_eval(s)
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                lit = None
+            if not isinstance(lit, (list, tuple, dict)):
+                raise ValueError(
+                    f"{where} is a string that parses as neither JSON nor a Python literal "
+                    f"({e}). Send a real JSON array: "
+                    f'ops=[{{"op":"add_feature","feature":{{"type":"box","name":"Block",'
+                    f'"params":{{"length":40,"width":30,"height":20}}}}}}].') from None
+            parsed = _jsonify(lit)
+        return parsed if isinstance(parsed, list) else [parsed]
+    return None
+
+
+def _batch_from_flat_kwargs(kw: dict, notes: list) -> Optional[list]:
+    """ONE feature (or one op) spread over top-level kwargs -> a one-op batch.
+
+    Consumes the keys it uses out of *kw*; returns None when the call names neither an op
+    nor a feature type (the caller then reports the leftovers).
+    """
+    docops = _doc_op_vocab()
+    ftypes, _live = _feature_type_vocab()
+
+    op_key = op_word = None
+    for k in ("op", "operation", "action", "kind"):
+        v = kw.get(k)
+        if isinstance(v, str) and v.strip():
+            op_key, op_word = k, v.strip()
+            break
+    type_word = kw.get("type") if isinstance(kw.get("type"), str) else None
+    type_word = type_word.strip() if type_word and type_word.strip() else None
+    if not op_word and not type_word:
+        return None
+
+    # A doc op spelled flat: {"op":"delete_feature","id":"f2"}.
+    if op_word and op_word in docops and not type_word:
+        kw.pop(op_key, None)
+        rest = {k: kw.pop(k) for k in list(kw)}
+        notes.append(f'interpreted the flat call as ops=[{{"op":"{op_word}", …}}] — '
+                     f"add_features always takes a LIST of ops")
+        return [_normalize_op_target({"op": op_word, **rest}, op_word, notes)]
+
+    ftype = type_word or op_word
+    if op_word and not type_word:
+        kw.pop(op_key, None)
+        # Canonicalize HERE so the echoed note names the type the engine will see; an
+        # unresolvable word is left verbatim for _retype_feature's teaching error.
+        ftype = _canon_feature_type(op_word, ftypes) or op_word
+        notes.append(f'interpreted {op_key}="{op_word}" as feature type "{ftype}" — '
+                     f"a feature type is not an op name")
+    else:
+        kw.pop("type", None)
+
+    feature: dict = {"type": ftype}
+    params: dict = {}
+    for pk in _PARAMS_ALIASES:
+        v = kw.pop(pk, None)
+        if isinstance(v, dict):
+            params.update(v)
+            if pk != "params":
+                notes.append(f"interpreted {pk}= as the feature's params")
+        elif v is not None:
+            kw[pk] = v  # not a mapping — fall through to the leftover report
+
+    order = {k: kw.pop(k) for k in _OP_ORDER_KEYS if k in kw}
+    for k in list(kw):
+        if k in _FEATURE_ENVELOPE_KEYS and k != "type":
+            feature[k] = kw.pop(k)
+    if not feature.get("name"):
+        for k in _FEATURE_NAME_ALIASES:
+            v = kw.get(k)
+            if isinstance(v, str) and v.strip():
+                feature["name"] = v.strip()
+                kw.pop(k)
+                notes.append(f'interpreted {k}="{v}" as the feature name')
+                break
+    folded = sorted(kw)
+    for k in folded:
+        params[k] = kw.pop(k)
+    if params or "params" in feature:
+        feature["params"] = {**params, **(feature.get("params") or {})}
+    if folded:
+        notes.append("read top-level " + ", ".join(folded) + " as the feature's params")
+    notes.append(
+        'interpreted a bare feature spec as one add_feature op; the canonical form is '
+        'ops=[{"op":"add_feature","feature":{…}}]')
+    return [{"op": "add_feature", "feature": feature, **order}]
+
+
+def _normalize_add_features_args(ops: Any, doc_id: Optional[str], extra: dict,
+                                 notes: list) -> tuple:
+    """-> (ops list, doc_id, background_override). Raises ValueError to TEACH, never guesses."""
+    supplied = {k: v for k, v in (extra or {}).items() if v is not None}
+    background = None
+    for k in _BACKGROUND_ALIASES:
+        if k in supplied:
+            background = bool(supplied.pop(k))
+            notes.append(f"interpreted {k}= as background=")
+
+    batches: list = []
+    if ops is not None:
+        primary = _as_batch(ops, "ops")
+        if primary is None:
+            raise ValueError(
+                f"ops must be a list of ops — got {type(ops).__name__} {ops!r}. "
+                + _ADD_FEATURES_ACCEPTS)
+        if not isinstance(ops, list):
+            notes.append(f"read ops={type(ops).__name__} as a one-element op list"
+                         if isinstance(ops, dict) else "parsed the ops JSON string")
+        batches.append(("ops", primary))
+    for key in _BATCH_ALIASES:
+        if key not in supplied:
+            continue
+        batch = _as_batch(supplied[key], key)
+        if batch is None:
+            continue  # a bare word under an alias name — a NAME; resolved further down
+        supplied.pop(key)
+        batches.append((key, batch))
+        notes.append(f"interpreted {key}= as ops= — the batch parameter is called `ops`")
+    if len(batches) > 1:
+        head_label, head = batches[0]
+        clashing = [lbl for lbl, b in batches[1:] if b != head]
+        if clashing:
+            raise ValueError(
+                f"add_features() got DIFFERENT op batches under "
+                f"{', '.join([head_label] + clashing)} and cannot tell which one to build. "
+                f"Send exactly one, under `ops`. " + _ADD_FEATURES_ACCEPTS)
+        notes.append(f"ignored duplicate batch(es) under "
+                     f"{', '.join(lbl for lbl, _ in batches[1:])} (identical to {head_label})")
+
+    commentary = [k for k in sorted(supplied) if _slug(k) in _COMMENTARY_KEYS]
+    for k in commentary:
+        supplied.pop(k)
+    if commentary:
+        notes.append("ignored " + ", ".join(commentary) + " — design intent/commentary, not "
+                     "modeling parameters; record reasoning with ledger_note()")
+
+    final = batches[0][1] if batches else _batch_from_flat_kwargs(supplied, notes)
+
+    for key in _DOC_HANDLE_ALIASES:
+        v = supplied.get(key)
+        if not (isinstance(v, str) and v.strip()):
+            continue
+        supplied.pop(key)
+        if doc_id and str(doc_id).strip() != v.strip():
+            raise ValueError(
+                f'add_features() got doc_id="{doc_id}" AND {key}="{v}", which name different '
+                f"documents. Pass the target part once, as doc_id (its id or its exact name).")
+        if not doc_id:
+            doc_id = v.strip()
+            notes.append(
+                f'interpreted {key}="{v}" as doc_id — add_features targets a DOCUMENT and an '
+                f"open part's name resolves to its doc_id; a FEATURE's name goes in "
+                f"feature.name inside an op")
+        break
+
+    if supplied:
+        raise ValueError(
+            f"add_features() got argument(s) it cannot place: {', '.join(sorted(supplied))}. "
+            + _ADD_FEATURES_ACCEPTS)
+    if final is None:
+        raise ValueError("add_features() was called with no ops. " + _ADD_FEATURES_ACCEPTS)
+    return final, doc_id, background
+
 
 
 def register_cad_doc_tools(mcp: FastMCP) -> None:
@@ -895,7 +2298,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def add_features(ops: list, doc_id: Optional[str] = None, background: bool = False) -> str:
+    def add_features(ops: Optional[list] = None, doc_id: Optional[str] = None,
+                     background: bool = False,
+                     **extra: Annotated[Any, Field(default=None)]) -> str:
         """Apply a list of document ops to build/edit the part (the core modeling tool).
 
         `ops` is a JSON array of ops from the CLOSED vocabulary (see OP VOCABULARY below
@@ -908,6 +2313,27 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         Geometry is addressed in plain words via `refs` (e.g. {"face":{"of":"face",
         "side":"top"}}). Ops in one call may reference an earlier op in the SAME array as
         "$<index>" (0-based); existing tree features by id ("f1").
+
+        ARGUMENT SHAPES — the canonical call is `ops=[…]`; these are accepted too, and every
+        rewrite comes back in `interpreted` (prefer the canonical spelling once you know it):
+          ops={"op":…}           a single op dict — read as a one-element batch
+          ops="[{…}]"            the array as a JSON string (real JSON only: Python repr
+                                 with single quotes/tuples is a teaching error, not a guess)
+          feature= features= op= operations= actions= ops_json=
+                                 the batch under another name. Two DIFFERENT batches in one
+                                 call is an error — send exactly one.
+          ops=[{"type":"box",…}] bare feature dicts with no "op" — read as add_feature
+          {"op":"box",…}         a feature TYPE used as the op name — read as add_feature
+          type=… name=… params={…} diameter=… (no ops at all)
+                                 ONE feature spread over top-level kwargs; unrecognised
+                                 kwargs become that feature's params
+          name= identifier= part= part_name=   with NO type= in the call: the DOCUMENT to
+                                 build into (an open part's name resolves to its doc_id).
+                                 Supplying both a differing doc_id and one of these is an
+                                 error. A feature's name always goes in feature.name.
+          purpose= basis= rationale= note= …   design intent is ACCEPTED and ignored (it is
+                                 not a modeling parameter) — record reasoning with
+                                 ledger_note(), not here.
 
         DIMENSIONS — write a size in whichever of these is most natural; all are accepted:
           40                     a bare number, in DOCUMENT UNITS (millimetres)
@@ -932,6 +2358,32 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         These forms work on any add_feature params and on edit_feature params (the unit
         conversion; the per-type diameter alias needs the feature type, so it is add-only).
         Every rewrite this tool performs comes back as `interpreted`:[…] beside the result.
+
+        SCHEMA DEFAULTS the engine requires and you may omit (all echoed in `interpreted`):
+          hole      params.style defaults to "simple" — the vocabulary is simple|tap|cbore|
+                    csink, and counterbore/c-bore/countersink/csk/tapped are mapped onto it.
+                    params.end defaults to "blind" when a numeric depth is present and
+                    "through_all" otherwise; through/thru are mapped onto "through_all".
+                    refs.face defaults to {"of":"face","side":"top"} (a bore has to be
+                    entered SOMEWHERE) — a direction vector picks the face instead. A world
+                    [x,y,z] under origin/position/at becomes FACE-LOCAL positions=[[u,v]].
+          sketch    entities get sequential e1..eN ids and every constraint/dimension handle
+                    that referenced the old id is rewritten with them; params.constraints
+                    defaults to []; refs.plane accepts XY/XZ/YZ/top/front/right (any case)
+                    and becomes the reserved datum plane.top/plane.front/plane.right.
+          boolean   params.op accepts union/add/join -> "fuse", subtract/difference -> "cut",
+                    intersect -> "common"; targets/bodies/operands become params.a and .b.
+          extrude / revolve / loft / sweep
+                    params.mode defaults to "boss"; params.sketch:"<name>" becomes
+                    refs.profile=[{"kind":"region","sketch":…}]; revolve's params.axis:"Z"
+                    becomes refs.axis:"axis.z".
+          any       feature TYPE synonyms are mapped (cube/cuboid/block -> box, cylindrical/
+                    rod/tube -> cylinder, ball -> sphere, cut_<shape> -> <shape> with
+                    mode:"cut", pocket -> extrude with mode:"cut"); an unknown type is
+                    rejected with the closest real types named. A ref that names a feature
+                    CREATED IN THIS SAME BATCH by its display name resolves to its "$N".
+                    at/axis/origin take a plain [x,y,z] — a {"value":[…]} wrapper around a
+                    coordinate is unwrapped, and at:"center" becomes [0,0,0].
 
         OP VOCABULARY (closed — do NOT invent names):
           ops (field op=…): add_feature, edit_feature, delete_feature, reorder_feature,
@@ -1000,8 +2452,24 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         All open docs are autosaved BEFORE the op, so nothing is lost even on a hard timeout.
         Pass background=True to hand off immediately for an op you already know is heavy.
         """
+        interpreted: list = []
         try:
-            ops = list(ops or [])
+            # FastMCP's schema builder turns a var-keyword parameter into a real (optional,
+            # Annotated) field named after it, so a FastMCP call arrives carrying
+            # {"extra": None}. Drop that artifact — and ONLY that artifact — before reading
+            # anything the model actually wrote. The built-in agent path (_bind_tool ->
+            # tool.fn) never sets it.
+            if extra.get("extra", _MISSING) is None:
+                extra.pop("extra", None)
+            if extra.get("kwargs", _MISSING) is None:
+                extra.pop("kwargs", None)
+            # Accept the argument shapes models actually write (a bare feature spec, an
+            # aliased batch, a JSON string, a lone document name) and rewrite them into the
+            # canonical ops list. Canonical input is returned untouched with no notes.
+            ops, doc_id, bg = _normalize_add_features_args(ops, doc_id, extra, interpreted)
+            if bg is not None:
+                background = bg
+            ops = list(ops)
             # Model-robustness: `new_part` is a top-level TOOL, not a batch op — but models
             # reliably open a build batch with {"op":"new_part","name":…} because that reads as
             # the natural first step. Rejecting the whole batch over it (and over the bare
@@ -1024,17 +2492,29 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             if created and not ops:
                 return _dumps({"ok": True, "doc_id": d, "created_doc": created,
                                "note": "created the part; send its build ops in the next call"})
+            # Give every element an `op` (a bare feature dict is the single most common
+            # rejection in the field) and map every feature TYPE onto the engine vocabulary
+            # FIRST — the sketch/primitive passes below branch on the canonical type, so a
+            # sketch spelled "profile" used to slip past the sketch normalizer entirely.
+            ops = _normalize_op_elements(ops, interpreted)
+            ops = _normalize_feature_types(ops, interpreted)
             # Model-robustness: accept the natural/flat sketch shape LLMs emit
             # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
             # to the engine's canonical schema before validation.
             ops = _normalize_sketch_ops(ops)
             # Same, for the primitive placement/orientation dialect models emit
             # (placement:{origin,direction}, boolean:"union") — rewritten to the
-            # canonical at/axis/mode/merge keys the engine actually accepts — and for the
-            # dimension dialect ("25mm", diameter, box size), whose rewrites are echoed
-            # back as `interpreted` so the model learns the canonical spelling.
-            interpreted: list = []
+            # canonical at/axis/mode/merge keys the engine actually accepts — for the
+            # dimension dialect ("25mm", diameter, box size), and for the schema
+            # requirements models forget (hole style/end/face, boolean op, extrude mode).
             ops = _normalize_feature_ops(ops, interpreted)
+            # Supply the one ref the engine cannot infer (a hole's entry face).
+            ops = _supply_missing_refs(ops, interpreted)
+            # A bare face/edge sid in a ref slot -> the selector object the engine wants,
+            # verified against THIS document (one doc_query, only when a sid is present).
+            ops = _resolve_sid_refs(ops, d, interpreted)
+            # Finally, a ref that names a feature THIS batch creates -> its "$N" placeholder.
+            ops = _resolve_batch_name_refs(ops, interpreted)
             interpreted = _interpreted_notes(interpreted)
 
             def _apply() -> dict:
@@ -1254,6 +2734,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             raw = _solve_sync_or_handoff("add_features", _apply)
             if created and isinstance(raw, dict):
                 raw["created_doc"] = created
+            # _solve_sync_or_handoff CATCHES an engine throw and hands it back as
+            # {"ok":false,"error":…}, so the outer `except` never sees a rejected batch. Echo
+            # the rewrites here too: a validation rejection is exactly when the model needs to
+            # know how its arguments were read before it re-sends the same spelling.
+            if (isinstance(raw, dict) and not raw.get("ok") and interpreted
+                    and "interpreted" not in raw):
+                raw["interpreted"] = interpreted
             # mega-8 F7: enrich thin unknown-op errors with closest + cad_guide
             # (C++ path sometimes returns only "unknown op 'cylinder'").
             try:
@@ -1267,7 +2754,19 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 pass
             return _dumps(raw) if not isinstance(raw, str) else raw
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            # A rejected batch is exactly when the model most needs to see how its arguments
+            # were read: an interpretation it did not expect is the first thing to check
+            # before it re-sends the identical spelling.
+            raw_err = _err(e)
+            notes = _interpreted_notes(interpreted)
+            if not notes:
+                return raw_err
+            try:
+                obj = json.loads(raw_err)
+                obj["interpreted"] = notes
+                return _dumps(obj)
+            except Exception:  # noqa: BLE001
+                return raw_err
 
 
 

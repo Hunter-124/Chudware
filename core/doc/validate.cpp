@@ -1480,6 +1480,28 @@ vector<string> validate_feature(const json& f, const string& where,
                 } else {
                     for (size_t i = 0; i < v.size(); ++i) {
                         const string eloc = loc + "[" + std::to_string(i) + "]";
+                        // A STRING element is legitimate and the compiler already
+                        // consumes it: canonical_profile_to_id in document.cpp
+                        // documents "a bare sketch feature-id string" and collapses
+                        // an all-strings list to its first id. Rejecting it here made
+                        // the validator stricter than the kernel — refs:{"profile":
+                        // "$0"} is what every model writes, and even the wrapped
+                        // ["$0"] died on "selector must be an object". Accept the
+                        // same three string forms SelOrDatum/FeatList do: a reserved
+                        // datum, an fN id, and a same-batch "$<index>" placeholder
+                        // (session.cpp rewrites those to fN before compile).
+                        if (v[i].is_string()) {
+                            static const std::regex BATCH_PLACEHOLDER_RE(R"(^\$\d+$)");
+                            const string s = v[i].get<string>();
+                            if (RESERVED_DATUMS.find(s) == RESERVED_DATUMS.end() &&
+                                !std::regex_match(s, FEATURE_ID_RE) &&
+                                !std::regex_match(s, BATCH_PLACEHOLDER_RE)) {
+                                errs.push_back(eloc + ": '" + s + "' is neither a "
+                                               "reserved datum, a feature id, nor a "
+                                               "same-batch \"$<index>\" reference");
+                            }
+                            continue;
+                        }
                         // A list element may be a geometry QUERY ({"of":"edge",...}) just like
                         // a single-value slot — e.g. "chamfer both ends" =
                         // [{"of":"edge","side":"+z"},{"of":"edge","side":"-z"}]. Validate it as
@@ -2059,6 +2081,76 @@ std::vector<std::string> feature_type_names() {
     for (const auto& kv : FEATURE_TYPES) out.push_back(kv.first);
     std::sort(out.begin(), out.end());
     return out;
+}
+
+// --------------------------------------------------------------------------- shape
+
+// Close the gap between what the VALIDATOR demands and what the kernel actually
+// consumes, for one pure-SHAPE case: a list-form ref slot handed a single value.
+//
+// Every model writes refs:{"profile":"$0"}; the slot is typed SelList so the
+// validator demanded ["$0"]. Wrapping is unambiguous, and driving it off
+// FEATURE_TYPES makes it total — profile, sections, edges, faces, targets,
+// features, guides, surfaces: every list slot that exists now or is added later,
+// with no second table to forget. An empty array is deliberately left alone:
+// "you named the slot and gave it nothing" is a real error, not a shape mismatch.
+//
+// SCOPE, deliberately narrow. An earlier draft also filled required params the
+// compiler already defaults (`mode` on extrude/revolve/sweep/loft). That is
+// removed: services/mcp/cad_doc_tools.py fills `mode` too, and a default living
+// in two layers with two different values ("new" here, "boss" there) is the
+// drift that bites a year later. The Python layer OWNS it, because it is the
+// layer that can echo the choice back to the model as `interpreted` — and an
+// opinionated default (boss, so a sketch extruded onto an existing body fuses
+// instead of silently making a second disjoint solid) is only safe when it is
+// visible. What stays here is the rewrite that needs no echo because it has
+// exactly one possible meaning.
+//
+// Returns a human-readable note per rewrite. Empty result == already canonical.
+std::vector<std::string> normalize_feature_shape(nlohmann::json& feature) {
+    std::vector<std::string> notes;
+    if (!feature.is_object()) return notes;
+    const json& tj = get(feature, "type");
+    if (!tj.is_string()) return notes;
+    const string type = tj.get<string>();
+    auto spec_it = FEATURE_TYPES.find(type);
+    if (spec_it == FEATURE_TYPES.end()) return notes;
+    const FeatureSpec& spec = spec_it->second;
+
+    if (feature.contains("refs") && feature["refs"].is_object()) {
+        json& refs = feature["refs"];
+        for (const RefSlot& slot : spec.refs) {
+            switch (slot.form) {
+                case RefForm::SelList:
+                case RefForm::FeatList:
+                case RefForm::CompList:
+                case RefForm::UvList:
+                case RefForm::EntityIdList:
+                    break;
+                default:
+                    continue;  // single-value slot: nothing to wrap
+            }
+            auto it = refs.find(slot.name);
+            if (it == refs.end() || it->is_null() || it->is_array()) continue;
+            // STRINGS ONLY, and this restriction is load-bearing. A bare id or
+            // datum ("$0", "f1", "plane.top") in a list slot has exactly one
+            // meaning, so wrapping it cannot change the build. A bare OBJECT does
+            // not: a query like remove:{"of":"face","side":"top"} already has its
+            // own downstream resolution, and wrapping it into a one-element list
+            // routed it through the list-selector resolver instead, which
+            // answered "no candidates of matching kind" and silently emptied a
+            // shell. test_cad_tools.py::test_wall_thickness_numeric_on_shell
+            // caught it. That is precisely the class of change a SILENT rewrite
+            // may not make — so it does not make it.
+            if (!it->is_string()) continue;
+            notes.push_back("interpreted refs." + slot.name + " " + it->dump() +
+                            " as [" + it->dump() + "] (" + type + "." + slot.name +
+                            " takes a list)");
+            *it = json::array({*it});
+        }
+    }
+
+    return notes;
 }
 
 // --------------------------------------------------------------------------- public

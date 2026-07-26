@@ -33,6 +33,7 @@ import json
 import logging
 import re
 import traceback
+import uuid
 from typing import Any, Callable
 
 _log_mod = logging.getLogger("ai-cad.agent_turn")
@@ -2819,13 +2820,77 @@ def _known_tool_names() -> frozenset[str]:
     return _KNOWN_TOOLS_CACHE
 
 
+def _ask_user_sync(questions: Any = None, question: Any = None,
+                   scope: str = "run", run_id: str | None = None,
+                   doc_id: str | None = None, revision: int | None = None,
+                   **_ignored: Any) -> dict:
+    """Synchronous ``ask_user`` for a turn that has no mission dispatcher.
+
+    The MCP ``ask_user`` is ``async def`` and takes a FastMCP ``Context`` (it
+    raises a client elicitation), so ``_directly_callable`` correctly refuses to
+    bind it — but the tool is advertised in role cards everywhere, which made it
+    fail on EVERY call outside a mission.  That is the "advertised but
+    impossible" defect class, and it does not need a new capability to fix: the
+    interaction CORE (``services.agent.interaction.ask_user``) is synchronous and
+    already defines the honest no-human path (contract §4) — record each
+    question, answer it with its ``suggested`` default, stamp
+    ``source: "default"``.  ``MissionDispatch.ask_user`` does exactly this with a
+    mission ledger; binding the same core here makes the tool behave identically
+    with and without one.
+
+    It never fabricates a human answer.  ``blocking`` is forced off because this
+    turn has no transport to prompt through — a blocking batch would raise.
+    """
+    from services.agent.interaction import MemoryLedger, ask_user  # noqa: PLC0415
+    from services.agent.mission_dispatch import _normalize_questions  # noqa: PLC0415
+
+    norm = _normalize_questions(questions if questions is not None else question)
+    if not norm:
+        return {"ok": False, "status": "bad_arguments",
+                "error": ("ask_user needs questions=[{id, prompt, suggested, kind?}] "
+                          "(a single dict or a plain string also works). Batch every "
+                          "unknown into ONE call, at most 4, each with a suggested "
+                          "default — see cad_guide('interaction')."),
+                "example": [{"id": "material", "kind": "choice",
+                             "prompt": "What material?", "suggested": "PLA",
+                             "options": ["PLA", "PETG", "aluminium 6061"]}]}
+
+    # Answers persist where there is somewhere to persist them: a doc-scoped
+    # batch lands in the .step+ record and replays on reopen.  With neither a run
+    # nor a doc there is nothing to resume, so an explicit in-memory ledger keeps
+    # the answers off disk; the batch still needs a run id to validate, and a
+    # throwaway one is honest precisely BECAUSE the ledger is in memory — nothing
+    # is written under a run that does not exist.
+    kw: dict[str, Any] = {"blocking": False, "revision": revision}
+    if doc_id and scope != "run":
+        kw.update(scope="doc", doc_id=doc_id)
+    elif run_id:
+        kw.update(scope="run", run_id=run_id)
+    elif doc_id:
+        kw.update(scope="doc", doc_id=doc_id)
+    else:
+        kw.update(scope="run", run_id=f"turn-{uuid.uuid4().hex[:12]}",
+                  ledger=MemoryLedger())
+    try:
+        answers = ask_user(norm, **kw)
+    except Exception as exc:  # noqa: BLE001 — the error is data for the model
+        return {"ok": False, "error": f"ask_user failed: {exc}"}
+    return {"ok": True, "answers": answers,
+            "note": ("no interactive transport in this turn: the questions were "
+                     "RECORDED and each was answered with its suggested default "
+                     "(source: 'default'). Proceed on those defaults and state the "
+                     "assumption in your handoff — do not re-ask.")}
+
+
 def _bind_tool(tool: str) -> Any:
     """Resolve *tool* to a callable, or None.  Resolution order:
 
       1. reviewer_exec._resolve_fn — the battery singleton + curated modules
          (already-imported, cheapest, and the run-scoped behaviour tests pin);
       2. the full MCP server registry (lazy, closes the module-coverage class);
-      3. design_recipe, which is implemented in-process, not as an MCP tool.
+      3. the two in-process tools that are not MCP callables here — ask_user
+         (async + Context over MCP, synchronous through the interaction core)
+         and design_recipe.
     """
     from services.agent.reviewer_exec import _resolve_fn  # noqa: PLC0415
     fn = _resolve_fn(tool)
@@ -2834,6 +2899,8 @@ def _bind_tool(tool: str) -> Any:
     fn = _server_tools().get(tool)
     if fn is not None:
         return fn
+    if tool == "ask_user":
+        return _ask_user_sync
     if tool == "design_recipe":
         try:
             from services.agent.design_recipe import design_recipe  # noqa: PLC0415
@@ -2841,6 +2908,56 @@ def _bind_tool(tool: str) -> Any:
         except Exception:  # noqa: BLE001
             return None
     return None
+
+
+# Names models invent that difflib can never rescue, mapped to what they meant.
+# These are not typos: each one is a real CAPABILITY we expose under a different
+# shape (editing is an op inside the modelling batch, not a tool of its own), so
+# the only useful reply names the shape.  Observed in real gym runs; keyed by the
+# punctuation-folded name so "edit-part", "edit_part" and "cad/edit-part" all hit.
+_CONCEPT_REDIRECTS: dict[str, str] = {
+    "edit_part": ('editing is an OP, not a tool: '
+                  'add_features(ops=[{"op":"edit_feature","id":"f2",'
+                  '"params":{...}}]). get_part() or describe_part() first to see '
+                  'the feature ids.'),
+    "edit_feature": ('editing is an OP, not a tool: '
+                     'add_features(ops=[{"op":"edit_feature","id":"f2",'
+                     '"params":{...}}]).'),
+    "edit_assembly": ('assembly edits are OPS: add_features(ops=[{"op":'
+                      '"asm_edit_component",...}]) / asm_add_mate. '
+                      'describe_assembly() shows what is there.'),
+    "assess_model_state": ('describe_part() for the named outline of the part, '
+                           'then verify_battery(doc_id) for the done-check.'),
+    "check_model_state": ('describe_part() for the named outline of the part, '
+                          'then verify_battery(doc_id) for the done-check.'),
+    "ecad_board": ('ecad_make_board() to create a board, describe_board() to '
+                   'inspect one.'),
+}
+
+
+def _fold_tool_name(tool: str) -> str:
+    """Punctuation-folded tool name: last path segment, underscores, lowercase.
+
+    Models write ``add-features``, ``mcp__chudware__add_features`` and
+    ``cad-board/add_features`` for one tool.  Folding is not fuzzy matching --
+    it strips only namespacing and punctuation, so a hit is exact."""
+    name = str(tool).strip().lower().rsplit("/", 1)[-1]
+    if name.startswith("mcp__"):
+        name = name.rsplit("__", 1)[-1]
+    return re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+
+
+def _canonical_tool_name(tool: str) -> str | None:
+    """The real tool a punctuation-mangled name can only have meant, else None.
+
+    Deliberately conservative: returns a name only when the FOLDED form is
+    itself a bindable tool.  There is exactly one candidate in that case, so
+    dispatching it is deterministic rather than a guess -- and the caller still
+    tells the model it happened."""
+    folded = _fold_tool_name(tool)
+    if not folded or folded == tool:
+        return None
+    return folded if _bind_tool(folded) is not None else None
 
 
 def _unresolved_tool_error(tool: str) -> dict:
@@ -2851,14 +2968,18 @@ def _unresolved_tool_error(tool: str) -> dict:
     server = _server_tools()
     bindable = sorted(n for n, f in server.items() if f is not None)
     # Suggest OTHER names — echoing the failed name back teaches nothing.
+    # Match on the FOLDED name too: difflib scores "edit-part" poorly against
+    # every underscore_name in the pool purely because of the punctuation.
+    folded = _fold_tool_name(tool)
     pool = sorted(n for n in _known_tool_names() if n != tool)
-    close = difflib.get_close_matches(tool, pool, n=6, cutoff=0.6)
+    close = difflib.get_close_matches(folded, pool, n=6, cutoff=0.6)
     if not close:
-        close = difflib.get_close_matches(tool, [b for b in bindable if b != tool],
+        close = difflib.get_close_matches(folded, [b for b in bindable if b != tool],
                                           n=6, cutoff=0.45)
     # Only claim "did you mean" on a near-certain match; a weak difflib hit
     # pointed at an unrelated tool is worse than no suggestion.
-    strong = difflib.get_close_matches(tool, pool, n=1, cutoff=0.8)
+    strong = difflib.get_close_matches(folded, pool, n=1, cutoff=0.8)
+    redirect = _CONCEPT_REDIRECTS.get(folded)
     if tool in server and server[tool] is None:
         return {
             "ok": False,
@@ -2894,6 +3015,18 @@ def _unresolved_tool_error(tool: str) -> dict:
                 f"Continue with the tools that do bind and say so in your handoff."
             ),
             "closest_tools": close,
+        }
+    if redirect is not None:
+        # A known confusion, not a typo: name the shape instead of guessing.
+        return {
+            "ok": False,
+            "status": "unknown_tool",
+            "error": (
+                f"there is no '{tool}' tool — the call was NOT made. That "
+                f"capability exists under a different shape: {redirect}"
+            ),
+            "closest_tools": close,
+            "hint": redirect,
         }
     return {
         "ok": False,
@@ -3199,16 +3332,28 @@ def _dispatch_tool(
         if _inner is not None:
             # Custom turn tool_dispatch has signature (tool, args).
             return _inner(tool, merged or {})
+        name, renamed = tool, []
         fn = _bind_tool(tool)
+        if fn is None:
+            # "add-features" / "mcp__chudware__add_features" can only mean one
+            # tool once namespacing and punctuation are folded away, so resolve
+            # it rather than burning a turn — and SAY so, or the model never
+            # learns the real spelling.
+            canon = _canonical_tool_name(tool)
+            if canon is not None:
+                fn, name = _bind_tool(canon), canon
+                renamed = [f"interpreted tool '{tool}' as '{canon}' — same tool, "
+                           f"different punctuation; use '{canon}'"]
         if fn is None:
             # A dead end teaches nothing: say unknown-vs-unbound and name the
             # closest real tools instead of raising a bare KeyError.
             return _unresolved_tool_error(tool)
-        kwargs, notes, arg_error = _reconcile_kwargs(tool, fn, merged or {},
+        kwargs, notes, arg_error = _reconcile_kwargs(name, fn, merged or {},
                                                      config_keys)
         if arg_error is not None:
             return arg_error
         result = fn(**kwargs)
+        notes = renamed + notes
         return _attach_arg_notes(result, notes) if notes else result
 
     def _call_with_timeout() -> Any:

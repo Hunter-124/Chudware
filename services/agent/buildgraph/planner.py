@@ -40,6 +40,79 @@ def _bgid(prefix: str = "bg") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Entry coercion — a BUILD PLAN arrives hand-written by a model, so a "part" may
+# be a bare string and a "feature" may be a dict ({"type": "hole", "dia": 5}).
+# The rule matchers and the label→id map both need plain strings; feeding a dict
+# into feat_label_to_id raised "unhashable type: 'dict'" and killed the whole
+# call (seen in the gym ledgers).
+# ---------------------------------------------------------------------------
+
+_LABEL_HEAD_KEYS = ("label", "name", "description", "desc", "text", "summary",
+                    "title", "feature", "step", "operation", "op", "type", "kind")
+
+
+def label_of(value: Any, fallback: str = "item") -> str:
+    """Best-effort human label for a plan entry of any shape."""
+    if isinstance(value, str):
+        return value.strip() or fallback
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        head = ""
+        for key in _LABEL_HEAD_KEYS:
+            raw = value.get(key)
+            if isinstance(raw, str) and raw.strip():
+                head = raw.strip()
+                break
+        rest = ", ".join(
+            f"{k}={v}" for k, v in value.items()
+            if isinstance(v, (str, int, float, bool))
+            and str(v).strip() and str(v).strip() != head
+        )
+        if head and rest:
+            return f"{head} ({rest})"[:200]
+        if head:
+            return head[:200]
+        if rest:
+            return rest[:200]
+        return (", ".join(sorted(str(k) for k in value)) or fallback)[:200]
+    if isinstance(value, (list, tuple)):
+        joined = ", ".join(label_of(v, fallback) for v in value)
+        return (joined or fallback)[:200]
+    if value is None:
+        return fallback
+    return str(value)[:200]
+
+
+def _as_part(raw: Any, index: int) -> dict:
+    """Coerce one ``parts[]`` entry into {name, features[str]}."""
+    if isinstance(raw, dict):
+        part = dict(raw)
+    else:
+        part = {"name": label_of(raw, f"part_{index + 1}")}
+    name = part.get("name") or part.get("part") or part.get("label") or part.get("id")
+    part["name"] = label_of(name, f"part_{index + 1}") if name is not None \
+        else f"part_{index + 1}"
+    feats = part.get("features")
+    if feats is None:
+        feats = part.get("steps") or part.get("operations") or part.get("ops") or []
+    if isinstance(feats, (str, dict)):
+        feats = [feats]
+    if not isinstance(feats, (list, tuple)):
+        feats = []
+    labels: list[str] = []
+    for i, feat in enumerate(feats):
+        text = label_of(feat, f"feature_{i + 1}")
+        # Duplicate labels collapse in the label→id map; disambiguate so every
+        # declared feature still gets its own node.
+        if text in labels:
+            text = f"{text} #{labels.count(text) + 1}"
+        labels.append(text)
+    part["features"] = labels
+    return part
+
+
+# ---------------------------------------------------------------------------
 # Input shape detection
 # ---------------------------------------------------------------------------
 
@@ -80,8 +153,12 @@ def _nodes_from_build_plan(
     nodes: list[dict] = []
     part_done_ids: list[str] = []
 
-    for part in plan.get("parts", []):
-        part_name: str = part.get("name", "unknown_part")
+    raw_parts = plan.get("parts", [])
+    if not isinstance(raw_parts, (list, tuple)):
+        raw_parts = [raw_parts]
+    for _pi, raw_part in enumerate(raw_parts):
+        part = _as_part(raw_part, _pi)
+        part_name: str = part["name"]
         part_id = _bgid("bg")
 
         # Part root node
@@ -99,7 +176,7 @@ def _nodes_from_build_plan(
         nodes.append(part_node)
 
         # Feature nodes
-        features: list[str] = part.get("features", [])
+        features: list[str] = part["features"]
         feature_nodes: list[dict] = []
         feat_label_to_id: dict[str, str] = {}
 
@@ -430,6 +507,34 @@ def build_graph(
     """
     advisories: list[dict[str, Any]] = []
 
+    # A model hands this over as a JSON string or a bare list often enough that
+    # the bare ``plan.get`` raised "'str' object has no attribute 'get'" —
+    # 2 dead calls in the gym ledgers. Coerce here so every caller (MCP tool,
+    # DAG path, GUI) is covered, not just the tool wrapper.
+    if isinstance(plan, (bytes, bytearray)):
+        plan = plan.decode("utf-8", "replace")
+    if isinstance(plan, str):
+        import json as _json  # noqa: PLC0415
+        try:
+            plan = _json.loads(plan)
+        except ValueError as exc:
+            advisories.append(_advisory(
+                "unknown_plan_shape",
+                f"Plan was a string that is not valid JSON ({exc}). Pass the plan "
+                "as an object with 'parts' (BUILD PLAN) or schema='aicad.dag/1'.",
+                severity="blocker",
+            ))
+            plan = {}
+    if isinstance(plan, (list, tuple)):
+        plan = {"parts": list(plan)}
+    if not isinstance(plan, dict):
+        advisories.append(_advisory(
+            "unknown_plan_shape",
+            f"Plan must be an object, got {type(plan).__name__}. Expected 'parts' "
+            "(BUILD PLAN) or schema='aicad.dag/1'.",
+            severity="blocker",
+        ))
+        plan = {}
     if _is_build_plan(plan):
         nodes = _nodes_from_build_plan(plan, advisories)
         name = plan.get("name", mission or "build_plan")

@@ -80,6 +80,32 @@ def normalize_dimension(value: float, unit: str, family: str = "length") -> dict
 # Question / batch model (contract §1–§3)                                      #
 # --------------------------------------------------------------------------- #
 
+def _coerce_options(raw: Any) -> list[dict] | None:
+    """Normalize a choice question's options to the canonical ``[{value, label}]``.
+
+    Accepts what models actually write: bare strings, ``{value, label}`` dicts,
+    and single-entry ``{label: value}`` mappings. Returns None for absent input
+    so the caller can fall through to the other spelling; an unusable entry is
+    dropped rather than crashing the batch, and ``_validate`` still rejects a
+    choice question left with no options at all.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    out: list[dict] = []
+    for opt in raw:
+        if isinstance(opt, dict):
+            if "value" in opt:
+                out.append(dict(opt))
+            elif len(opt) == 1:
+                label, value = next(iter(opt.items()))
+                out.append({"value": value, "label": str(label)})
+        elif isinstance(opt, (str, int, float, bool)):
+            out.append({"value": opt, "label": str(opt)})
+    return out
+
+
 @dataclass
 class Question:
     id: str
@@ -135,15 +161,15 @@ class Question:
         prompt = d.get("prompt") or d.get("ask") or ""
         kind = d.get("kind") or d.get("type") or "text"
         # Tolerate model aliases for options / multi / targets.
-        options = d.get("options")
-        if options is None and d.get("choices") is not None:
-            raw_choices = d.get("choices") or []
-            options = []
-            for c in raw_choices:
-                if isinstance(c, dict) and "value" in c:
-                    options.append(c)
-                elif isinstance(c, str):
-                    options.append({"value": c, "label": c})
+        # Options may arrive under either spelling AND as bare strings: the
+        # canonical form is [{value, label?}], but a plain list of strings is
+        # what a model writes nine times out of ten (and what cad_guide's own
+        # example shows). Coercing only `choices` used to make the DOCUMENTED
+        # `options: ["PLA", …]` fail validation with "suggested 'PLA' not in
+        # options" — a rejection of our own advertised shape.
+        options = _coerce_options(d.get("options"))
+        if options is None:
+            options = _coerce_options(d.get("choices"))
         multi = bool(d.get("multi", d.get("multiple", False)))
         targets = d.get("targets")
         if targets is None and d.get("target") is not None:

@@ -302,7 +302,9 @@ def _check_refs_resolve(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
     # applied to it — so a ref to a feature an earlier op in this same batch
     # creates is legitimate. Accumulate declarations as we walk (mirrors
     # guardrails.check_refs_resolve_ids, which hard-blocks on the same rule).
-    from services.agent.guardrails import declared_by_op
+    # RESERVED_DATUMS comes from the same module for the same reason: a kernel
+    # datum ("plane.top", "axis.z") has no feature to find in any tree.
+    from services.agent.guardrails import RESERVED_DATUMS, declared_by_op
 
     declared: set[str] = set()
     for op in ops:
@@ -315,7 +317,7 @@ def _check_refs_resolve(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
                 ref_id = ref_val.get("id") or ref_val.get("feature")
                 if ref_id and not ref_id.startswith("$") and \
                    ref_id not in known_ids and ref_id not in known_names and \
-                   ref_id not in declared:
+                   ref_id not in declared and ref_id not in RESERVED_DATUMS:
                     missing.append(ref_id)
         declared |= declared_by_op(op)
 

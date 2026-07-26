@@ -47,7 +47,9 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Annotated, Any
 
+from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 
 # Ensure repo root is on sys.path so engine_oracle is importable from the MCP server process.
@@ -84,12 +86,323 @@ def _parse_json_dict(raw, what: str) -> tuple[dict | None, str | None]:
         return raw, None
     try:
         obj = json.loads(raw)
-    except Exception:  # noqa: BLE001
-        return None, f"{what} is not valid JSON"
+    except Exception as exc:  # noqa: BLE001
+        return None, (f"{what} is not valid JSON ({exc}). Got: "
+                      f"{str(raw)[:80]!r}")
     if not isinstance(obj, dict):
-        return None, f"{what} must be a JSON object"
+        return None, (f"{what} must be a JSON OBJECT, got {type(obj).__name__} "
+                      f"— e.g. '{{\"bore_mm\": 12}}' (or a real dict)")
     return obj, None
 
+
+# ---------------------------------------------------------------------------
+# Input dialect — these tools own the argument shapes models actually write.
+#
+# services/agent/agent_turn.py::_reconcile_kwargs inspects a tool's signature and
+# REFUSES to call it with a kwarg the signature does not name, so a fixed
+# signature can never learn a new spelling. Every tool below therefore takes a
+# var-keyword parameter (_signature_spec then reports var_kw=True and passes the
+# call through untouched) and normalizes in-body. Two rules, no exceptions:
+#   * every rewrite is ECHOED back as `interpreted` (house convention — see
+#     services/mcp/cad_doc_tools.py::_interpreted_notes) so the model learns the
+#     canonical spelling instead of leaning on the alias forever;
+#   * genuinely ambiguous input is a teaching error naming the accepted forms,
+#     never a silent guess.
+#
+# The var-kw ANNOTATION matters: FastMCP's func_metadata does not special-case
+# VAR_KEYWORD and turns a bare **kwargs into a REQUIRED schema field literally
+# named "kwargs", which breaks every external MCP call including the canonical
+# one. Annotated[Any, Field(default=None)] makes that field optional; FastMCP
+# then hands the body kwargs={"kwargs": None}, which _clean_kwargs drops.
+# ---------------------------------------------------------------------------
+
+_VarKw = Annotated[Any, Field(default=None)]
+
+_MAX_INTERPRETED_NOTES = 12
+
+
+def _interpreted_notes(notes) -> list:
+    """De-duplicate and cap the echo list (a wide call must not bury the result)."""
+    seen: list = []
+    for n in notes or ():
+        if n and n not in seen:
+            seen.append(n)
+    if len(seen) > _MAX_INTERPRETED_NOTES:
+        extra = len(seen) - _MAX_INTERPRETED_NOTES
+        seen = seen[:_MAX_INTERPRETED_NOTES] + [f"(+{extra} more of the same kind)"]
+    return seen
+
+
+def _clean_kwargs(kwargs) -> dict:
+    """Drop FastMCP's synthetic ``kwargs`` field and explicit-unset (None) args."""
+    return {k: v for k, v in (kwargs or {}).items()
+            if k != "kwargs" and v is not None}
+
+
+def _norm_key(name) -> str:
+    return str(name).lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _affix_target(norm: str, free) -> str | None:
+    """The single free parameter whose name is an affix of *norm* (or vice versa).
+
+    Mirrors agent_turn._map_arg_name on purpose: giving a tool **kwargs switches
+    that reconciler OFF for it, so the affix tolerance it used to provide
+    (``search_query`` -> ``query``, ``price`` -> ``price_max``) has to be
+    re-provided here or widening a tool would REMOVE tolerance."""
+    hits = []
+    for p in free:
+        np = _norm_key(p)
+        if min(len(np), len(norm)) < 3:
+            continue  # 1-2 char names collide by accident, never by intent
+        if (norm.startswith(np) or norm.endswith(np)
+                or np.startswith(norm) or np.endswith(norm)):
+            hits.append(p)
+    return hits[0] if len(hits) == 1 else None
+
+
+def _absorb(kwargs, params, aliases: dict, notes: list,
+            used=()) -> tuple[dict, dict]:
+    """Split caller kwargs into ``({real parameter: value}, leftover)``.
+
+    Every rewrite is appended to *notes*. ``used`` names parameters the caller
+    already filled explicitly, so an alias never silently overwrites them."""
+    params = tuple(params)
+    taken = set(used)
+    mapped: dict = {}
+    leftover: dict = {}
+    for name, value in _clean_kwargs(kwargs).items():
+        norm = _norm_key(name)
+        if name in params:
+            target = name
+        elif norm in aliases:
+            target = aliases[norm]
+        else:
+            target = _affix_target(norm, [p for p in params if p not in taken])
+        if target is None or target in taken:
+            leftover[name] = value
+            continue
+        mapped[target] = value
+        taken.add(target)
+        if target != name:
+            notes.append(f"interpreted {name}=... as {target}=...")
+    return mapped, leftover
+
+
+def _unknown_args_error(tool: str, leftover: dict, params, examples: str) -> dict:
+    """Teaching error for kwargs a tool genuinely has no place for."""
+    return {"ok": False,
+            "reason": (f"{tool}() got argument(s) "
+                       + ", ".join(repr(k) for k in sorted(leftover))
+                       + " that it has no place for — the call was NOT made."),
+            "hint": f"{tool} accepts: " + ", ".join(params) + ". " + examples}
+
+
+def _part_id_hint(part_id: str = "") -> str:
+    """Teach the id VOCABULARY — 'check it with part_get' teaches nothing."""
+    return (("" if not part_id else f"{part_id!r} matched no record. ")
+            + "part ids are '<domain>:<catalog_id>' — 'fastener:ISO4762:M8', "
+              "'bearing:ISO 15:6205', 'mech_family:shcs:M5', 'ecad:Device:R', "
+              "'section:AISC:W8x31'. Discover one with part_search(query='...') "
+              "— or describe the part: part_search(part_type='bushing', "
+              "bore_mm=20, fit='sliding') — or part_source(need='...'). "
+              "Never invent an id.")
+
+
+def _place_id_hint(part_id: str = "") -> str:
+    return (_part_id_hint(part_id)
+            + f" If {part_id!r} is a body or a document you already modelled, "
+              "part_place is the WRONG tool: build or edit geometry with "
+              "add_features(doc_id=..., ops=[...]), or insert a saved part file "
+              "into an assembly with asm_add_component(path=...).")
+
+
+_PLACE_PARAMS_HINT = (
+    'params takes a real dict OR a JSON object string. Examples: '
+    'params={"length_mm": 25} · params=\'{"pos": {"x": 10, "y": 20}, "ref": "R1"}\'. '
+    'Flat placement keywords work too and are folded into params for you: '
+    'part_place(part_id="ecad:Device:R", location={"x": 10, "y": 20}).')
+
+_PLACE_DOC_HINT = (
+    'doc is the DOCUMENT ITSELF (a dict, or json.dumps(doc)) — never a doc id. '
+    'Mechanical parts need no doc at all: part_place("fastener:ISO4762:M8") '
+    'creates the document. ECAD/structural/piping/hydraulic placements need the '
+    'open doc: part_place("ecad:Device:R", doc=sch_doc, '
+    'params={"pos": {"x": 10, "y": 20}}).')
+
+# geometry_ref kinds that CREATE their own document (core/parts/place.cpp::route).
+_MECH_KINDS = frozenset({"core_family", "generate_model", "import_file"})
+
+
+# Descriptive-kwarg keys whose NAME adds nothing to a free-text search — the
+# value alone is the head noun (part_type="bushing" -> "bushing").
+_HEAD_NOUN_KEYS = frozenset({
+    "parttype", "type", "kind", "category", "class", "component", "item",
+    "part", "product", "family", "style", "shape", "object",
+})
+# Trailing key tokens that are a UNIT, not a word: bore_mm=20 -> "bore 20mm".
+_UNIT_TOKENS = frozenset({"mm", "cm", "m", "in", "inch", "deg", "kg", "g",
+                          "psi", "bar", "nm", "mpa", "rpm"})
+
+
+def _term_value(value) -> str:
+    """One search-text token (or phrase) for a descriptive kwarg value."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (list, tuple)):
+        return " ".join(t for t in (_term_value(v) for v in value) if t)
+    if isinstance(value, dict):
+        lo, hi = value.get("min"), value.get("max")
+        if lo is not None or hi is not None:
+            return f"{_term_value(lo)}-{_term_value(hi)}".strip("-")
+        return " ".join(f"{k} {_term_value(v)}".strip() for k, v in value.items())
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _descriptive_terms(leftover: dict) -> str:
+    """Fold engineering-attribute kwargs into free-text search terms.
+
+    The model is DESCRIBING the part it needs rather than naming it, and the
+    parts index is FTS5 over titles/designations, so the attributes belong in
+    the query text. They are deliberately NOT turned into ``facets``: a facet
+    query whose key is absent from a record's params REJECTS that record
+    (services/parts/taxonomy.py::match_facets), so guessing facet keys out of
+    free-form kwargs would silently return zero hits."""
+    head: list[str] = []
+    rest: list[str] = []
+    for name, value in leftover.items():
+        words = [w for w in str(name).replace("-", "_").split("_") if w]
+        unit = ""
+        if len(words) > 1 and words[-1].lower() in _UNIT_TOKENS:
+            unit = words[-1].lower()
+            words = words[:-1]
+        if isinstance(value, bool):
+            if value:
+                rest.append(" ".join(words))
+            continue
+        text = _term_value(value)
+        if not text:
+            continue
+        if unit:
+            text = f"{text}{unit}"
+        if _norm_key(name) in _HEAD_NOUN_KEYS:
+            head.append(text)
+        else:
+            rest.append(" ".join(words + [text]))
+    return " ".join(t for t in head + rest if t).strip()
+
+
+_SEARCH_PARAMS = ("query", "domain", "limit", "category_id", "facets",
+                  "price_max", "vendors", "in_stock", "detail")
+
+_SEARCH_ALIASES = {
+    "description": "query", "text": "query", "q": "query", "search": "query",
+    "name": "query", "keywords": "query", "keyword": "query", "need": "query",
+    "terms": "query", "searchtext": "query", "searchstring": "query",
+    "prompt": "query", "title": "query",
+    "category": "category_id", "categoryid": "category_id",
+    "node": "category_id", "nodeid": "category_id", "taxonomy": "category_id",
+    "maxresults": "limit", "max": "limit", "n": "limit", "topk": "limit",
+    "count": "limit", "numresults": "limit",
+    "maxprice": "price_max", "budget": "price_max", "pricelimit": "price_max",
+    "vendor": "vendors", "supplier": "vendors", "suppliers": "vendors",
+    "site": "vendors", "sites": "vendors",
+    "filters": "facets", "facet": "facets",
+    "instock": "in_stock", "available": "in_stock",
+    "detaillevel": "detail", "verbosity": "detail",
+}
+
+_TAXONOMY_ALIASES = {
+    "categoryid": "node_id", "category": "node_id", "id": "node_id",
+    "node": "node_id", "path": "node_id", "taxonomy": "node_id",
+    "levels": "depth", "maxdepth": "depth",
+    "facets": "include_facets", "withfacets": "include_facets",
+}
+
+_SOURCE_ALIASES = {
+    "query": "need", "description": "need", "text": "need", "q": "need",
+    "search": "need", "requirement": "need", "requirements": "need",
+    "want": "need", "prompt": "need", "name": "need", "part": "need",
+    "spec": "constraints", "specs": "constraints", "criteria": "constraints",
+    "budget": "constraints", "notes": "constraints",
+    "maxresults": "limit", "max": "limit", "n": "limit", "count": "limit",
+    "topk": "limit",
+}
+
+_MATCH_ALIASES = {
+    "id": "part_id", "part": "part_id", "record": "part_id",
+    "name": "title", "description": "title", "product": "title",
+    "query": "title", "text": "title",
+    "partnumber": "mpn", "mfrpartnumber": "mpn", "pn": "mpn", "sku": "mpn",
+    "manufacturerpartnumber": "mpn",
+    "manufacturer": "brand", "maker": "brand", "make": "brand",
+    "maxresults": "limit", "n": "limit", "topk": "limit", "count": "limit",
+}
+
+_REVENG_ALIASES = {
+    "id": "part_id", "part": "part_id",
+    "link": "url", "href": "url", "page": "url", "producturl": "url",
+    "sourceurl": "url", "pageurl": "url",
+    "name": "title", "description": "title", "product": "title",
+    "partnumber": "mpn", "pn": "mpn", "sku": "mpn",
+    "manufacturer": "brand", "maker": "brand", "make": "brand",
+}
+
+_HEALTH_ALIASES = {
+    "site": "sites", "vendor": "sites", "vendors": "sites", "keys": "sites",
+    "adapter": "sites", "adapters": "sites", "source": "sites",
+    "sources": "sites",
+}
+
+_CAMTOOL_ALIASES = {
+    "id": "part_id", "part": "part_id", "tool": "part_id", "toolid": "part_id",
+    "toolnumber": "number", "num": "number", "slot": "number",
+    "toolmaterial": "material", "mat": "material",
+}
+
+_PARTGET_ALIASES = {
+    "id": "part_id", "part": "part_id", "partnumber": "part_id",
+    "record": "part_id", "partrecord": "part_id", "identifier": "part_id",
+}
+
+_LOGIN_ALIASES = {
+    "vendor": "site", "source": "site", "adapter": "site", "key": "site",
+    "sitekey": "site", "name": "site", "domain": "site",
+}
+
+_SCRAPE_ALIASES = {
+    "vendor": "site", "source": "site", "adapter": "site", "sitekey": "site",
+    "search": "query", "text": "query", "q": "query", "description": "query",
+    "keywords": "query", "terms": "query", "part": "query", "need": "query",
+}
+
+_IMPORT_ALIASES = {
+    "path": "artifact_path", "file": "artifact_path",
+    "filepath": "artifact_path", "filename": "artifact_path",
+    "source": "artifact_path", "artifact": "artifact_path",
+    "localpath": "artifact_path", "step": "artifact_path",
+}
+
+_PLACE_ALIASES = {
+    "id": "part_id", "part": "part_id", "partnumber": "part_id",
+    "record": "part_id", "partrecord": "part_id", "component": "part_id",
+    "docid": "doc", "document": "doc", "targetdoc": "doc", "sheet": "doc",
+    "schematic": "doc", "board": "doc", "into": "doc",
+    "parameters": "params", "options": "params", "overrides": "params",
+    "placement": "params", "settings": "params", "props": "params",
+    "properties": "params", "config": "params",
+}
+
+# Flat placement keywords -> the canonical key inside ``params``.
+_PLACE_PARAM_KEYS = {
+    "location": "pos", "position": "pos", "at": "pos", "origin": "pos",
+    "coordinates": "pos", "xy": "pos", "xyz": "pos", "point": "pos",
+    "orientation": "rotation", "rotation": "rotation", "angle": "rotation",
+    "rotate": "rotation",
+    "size": "size", "dimensions": "size", "extents": "size",
+}
 
 def taxonomy_browse(node_id: str = "", depth: int = 2,
                     include_facets: bool = True) -> dict:
@@ -148,21 +461,73 @@ def taxonomy_browse(node_id: str = "", depth: int = 2,
         return {"ok": False, "reason": f"parts_taxonomy failed: {exc}", "hint": ""}
 
 
-def search_parts_v2(query: str, domain: str = "", limit: int = 20,
+def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
                     category_id: str = "", facets=None, price_max: float = 0.0,
                     vendors: str = "", in_stock: bool = False,
-                    detail: str = "summary") -> dict:
+                    detail: str = "summary", **kwargs) -> dict:
     """V2 faceted, taxonomy-routed part search. Backward-compatible envelope
     (ok/count/has_live/results) plus facet_summary + applied.
 
     Default ``detail='summary'`` projects each hit to
     ``{part_id,title,domain,vendor,price,designation,score}``; full PartRecords
     stay behind ``part_get`` / ``detail='full'``.
+
+    INPUT DIALECT (every rewrite comes back as ``interpreted``):
+      * ``description`` / ``text`` / ``q`` / ``search`` / ``name`` / ``keywords``
+        are read as ``query``;
+      * ANY other descriptive keyword is folded into the query as search TEXT —
+        ``search_parts_v2(part_type="bushing", fit="sliding", bore_mm=20)``
+        becomes ``query="bushing fit sliding bore 20mm"``. The synthesized query
+        is echoed in ``interpreted`` and in ``hint``.
     """
+    notes: list[str] = []
+    supplied = {"query": query, "domain": domain, "limit": limit,
+                "category_id": category_id, "facets": facets,
+                "price_max": price_max, "vendors": vendors,
+                "in_stock": in_stock, "detail": detail}
+    used = [k for k, v in supplied.items()
+            if k not in ("limit", "detail") and v not in (None, "", 0, 0.0, False)]
+    mapped, leftover = _absorb(kwargs, _SEARCH_PARAMS, _SEARCH_ALIASES, notes, used)
+    supplied.update(mapped)
+    query = "" if supplied["query"] is None else str(supplied["query"]).strip()
+    domain, category_id = supplied["domain"], supplied["category_id"]
+    facets, vendors, detail = supplied["facets"], supplied["vendors"], supplied["detail"]
+    limit, price_max = supplied["limit"], supplied["price_max"]
+    in_stock = supplied["in_stock"]
+
+    if leftover:
+        terms = _descriptive_terms(leftover)
+        keys = ", ".join(sorted(leftover))
+        if terms:
+            query = f"{query} {terms}".strip()
+            notes.append(
+                f"folded descriptive argument(s) {keys} into the search text: "
+                f"query={query!r}. part_search takes ONE free-text query — "
+                f"attributes are matched as TEXT, not as filters. For exact "
+                f"filtering, find the category with parts_taxonomy() and pass "
+                f"category_id=... plus facets={{...}} keyed by ITS facet keys.")
+        else:
+            notes.append(f"ignored empty argument(s) {keys}")
+    if not query and not str(category_id or "").strip() \
+            and not str(domain or "").strip() and not facets:
+        return {"ok": False,
+                "reason": "part_search has nothing to search for — no query, no "
+                          "descriptive arguments, no category_id, no domain.",
+                "hint": "Pass free text: part_search(query='M8 socket head cap "
+                        "screw'). Or DESCRIBE the part and the attributes are "
+                        "folded into the query for you: "
+                        "part_search(part_type='bushing', fit='sliding', "
+                        "bore_mm=20). Browse categories with parts_taxonomy().",
+                "interpreted": _interpreted_notes(notes)}
+
     facets_q, err = _parse_json_dict(facets, "facets")
     if err:
         return {"ok": False, "reason": err,
-                "hint": 'Pass facets as a JSON dict string, e.g. \'{"od_mm": 25.4}\'.'}
+                "hint": 'Pass facets as a JSON dict string \'{"od_mm": 25.4}\' or '
+                        'a real dict {"od_mm": 25.4}. The keys must be the facet '
+                        'keys parts_taxonomy(node_id) lists for your category_id '
+                        '— a key no record carries matches nothing.',
+                "interpreted": _interpreted_notes(notes)}
     try:
         from services.parts import search as _search
     except Exception as exc:  # noqa: BLE001
@@ -286,6 +651,12 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
                         "vendors": wanted_vendors, "in_stock": bool(in_stock),
                         "sites": route_sites},
         }
+        if notes:
+            payload["interpreted"] = _interpreted_notes(notes)
+            # `hint` is never budget-dropped (result_serving._NEVER_DROP), so the
+            # synthesized query reaches the model even on a big result set.
+            payload["hint"] = (f"Searched for query={query!r} — refine that string "
+                               f"and pass it as query=... next time.")
         opts = _rs.ServeOpts(
             detail=detail or "summary",
             budget_tokens=1500 if (detail or "summary").strip().lower() != "full" else None,
@@ -555,10 +926,11 @@ def register_parts_tools(mcp: FastMCP) -> None:
     """
 
     @mcp.tool()
-    def part_search(query: str, domain: str = "", limit: int = 20,
+    def part_search(query: str = "", domain: str = "", limit: int = 20,
                     category_id: str = "", facets: str = "",
                     price_max: float = 0.0, vendors: str = "",
-                    in_stock: bool = False, detail: str = "summary") -> str:
+                    in_stock: bool = False, detail: str = "summary",
+                    **kwargs: _VarKw) -> str:
         """Search the unified standard-parts library (all domains federated), with
         V2 taxonomy routing + faceted filtering.
 
@@ -585,6 +957,18 @@ def register_parts_tools(mcp: FastMCP) -> None:
         in_stock    : drop records with KNOWN zero stock (unknown stock passes)
         detail      : 'summary' (default, compact rows) | 'full' (full PartRecords)
 
+        DESCRIBE-THE-PART DIALECT: you do not have to phrase a query yourself.
+        `description` / `text` / `q` / `search` / `name` / `keywords` are read as
+        `query`, and ANY other keyword is folded into the search text:
+          part_search(part_type="bushing", fit="sliding", shaft_diameter=20,
+                      bolt_circle="PCD34", bolt_count=4)
+            -> query="bushing fit sliding shaft diameter 20 bolt circle PCD34
+                      bolt count 4"
+        A `<name>_mm` / `_in` / `_deg` suffix becomes a unit on the value
+        (bore_mm=20 -> "bore 20mm"). The query that was built is echoed back in
+        `interpreted` and `hint` — read it and refine it. Attributes are matched
+        as TEXT, not as filters; for exact filtering use category_id + facets.
+
         Examples:
           part_search("M8 socket head")
           part_search("tube", category_id="structural_stock.metal_tube",
@@ -595,7 +979,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
         out = search_parts_v2(query, domain=domain, limit=limit,
                               category_id=category_id, facets=facets,
                               price_max=price_max, vendors=vendors,
-                              in_stock=in_stock, detail=detail)
+                              in_stock=in_stock, detail=detail, **kwargs)
         # Token-budget wrap for the MCP string path (dict path stays projected).
         if out.get("ok"):
             opts = _rs.ServeOpts(
@@ -607,7 +991,8 @@ def register_parts_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def parts_taxonomy(node_id: str = "", depth: int = 2,
-                       include_facets: bool = True) -> str:
+                       include_facets: bool = True,
+                       **kwargs: _VarKw) -> str:
         """Browse the parts-library category taxonomy (Parts Library V2).
 
         node_id "" lists the root categories (fasteners, bearings_motion,
@@ -618,12 +1003,30 @@ def register_parts_tools(mcp: FastMCP) -> None:
 
         Workflow: parts_taxonomy() -> pick a category -> parts_taxonomy(node_id)
         for its facets -> part_search(query, category_id, facets).
+
+        Accepts `category_id` / `category` / `node` / `id` as spellings of
+        `node_id` (the rewrite is echoed as `interpreted`).
         """
-        return json.dumps(taxonomy_browse(node_id, depth, include_facets),
-                          ensure_ascii=False)
+        notes: list[str] = []
+        params = ("node_id", "depth", "include_facets")
+        mapped, leftover = _absorb(kwargs, params, _TAXONOMY_ALIASES, notes,
+                                   ["node_id"] if node_id else [])
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "parts_taxonomy", leftover, params,
+                "Example: parts_taxonomy(node_id='bearings_motion.ball_bearings')."
+                " To search by attributes use part_search(part_type=..., "
+                "bore_mm=...) instead."), ensure_ascii=False)
+        out = taxonomy_browse(mapped.get("node_id", node_id),
+                              mapped.get("depth", depth),
+                              mapped.get("include_facets", include_facets))
+        if notes:
+            out["interpreted"] = _interpreted_notes(notes)
+        return json.dumps(out, ensure_ascii=False)
 
     @mcp.tool()
-    def part_source(need: str, constraints: str = "", limit: int = 5) -> str:
+    def part_source(need: str = "", constraints: str = "", limit: int = 5,
+                    **kwargs: _VarKw) -> str:
         """Source candidate parts for a plain-language need — deterministic fan-out
         (no LLM inside): taxonomy match -> facet extraction -> routed search ->
         scored candidates with an artifact_plan each.
@@ -641,12 +1044,41 @@ def register_parts_tools(mcp: FastMCP) -> None:
         site, query)+import_artifact for catalog records, make_standard_part for
         standard hardware families.
         """
-        return json.dumps(part_source_impl(need, constraints, limit),
-                          ensure_ascii=False)
+        notes: list[str] = []
+        params = ("need", "constraints", "limit")
+        mapped, leftover = _absorb(kwargs, params, _SOURCE_ALIASES, notes,
+                                   ["need"] if need else [])
+        need = str(mapped.get("need", need) or "")
+        constraints = mapped.get("constraints", constraints)
+        limit = mapped.get("limit", limit)
+        if leftover:
+            # Attributes describe the NEED — that is exactly what this tool eats.
+            terms = _descriptive_terms(leftover)
+            if terms:
+                need = f"{need} {terms}".strip()
+                notes.append(
+                    f"folded descriptive argument(s) "
+                    f"{', '.join(sorted(leftover))} into the need text: "
+                    f"need={need!r}. part_source takes ONE plain-language need "
+                    f"with the dimensions inline.")
+        if not need.strip():
+            return _err("part_source has nothing to source — `need` is empty.",
+                        "Say what you need in plain language, dimensions inline: "
+                        "part_source(need='4130 chromoly tube OD 25.4 wall 1.25') "
+                        "or part_source(need='flanged bushing', bore_mm=20, "
+                        "fit='sliding') — attributes are folded into the need.")
+        out = part_source_impl(need, constraints, limit)
+        if notes and isinstance(out, dict):
+            # `interpreted` is already taken here by the sourcing engine's own
+            # {category_id, facets, terms} read-back, so the arg rewrites get
+            # their own key rather than clobbering it.
+            out["interpreted_args"] = _interpreted_notes(notes)
+        return json.dumps(out, ensure_ascii=False)
 
     @mcp.tool()
     def match_model(part_id: str = "", title: str = "", mpn: str = "",
-                    brand: str = "", limit: int = 8) -> str:
+                    brand: str = "", limit: int = 8,
+                    **kwargs: _VarKw) -> str:
         """Match a discrete manufactured PRODUCT (has an MPN/brand identity, no 3D
         model, not standard hardware, not raw stock) to a CAD model in a source
         repo — deterministic identity fan-out (no LLM inside). Fired when a
@@ -678,13 +1110,36 @@ def register_parts_tools(mcp: FastMCP) -> None:
         fallback.how == "reverse_engineer" (no confident repo match), call
         reverse_engineer_product(...) to harvest the product's photos + datasheet
         into a seeded RE session. reverse_engineer is OFFERED, never auto-started.
+
+        Accepts `name`/`description`/`product` as `title`, `part_number`/`pn`/
+        `sku` as `mpn`, `manufacturer`/`maker` as `brand`, `id`/`part` as
+        `part_id` — every rewrite echoed as `interpreted`.
         """
-        return json.dumps(match_model_impl(part_id, title, mpn, brand, limit),
-                          ensure_ascii=False)
+        notes: list[str] = []
+        params = ("part_id", "title", "mpn", "brand", "limit")
+        given = [k for k, v in (("part_id", part_id), ("title", title),
+                                ("mpn", mpn), ("brand", brand)) if v]
+        mapped, leftover = _absorb(kwargs, params, _MATCH_ALIASES, notes, given)
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "match_model", leftover, params,
+                "match_model identifies ONE product: match_model(title='...', "
+                "mpn='...', brand='...') or match_model(part_id='...'). To look "
+                "for standard hardware by attributes use part_search instead."),
+                ensure_ascii=False)
+        out = match_model_impl(mapped.get("part_id", part_id),
+                               mapped.get("title", title),
+                               mapped.get("mpn", mpn),
+                               mapped.get("brand", brand),
+                               mapped.get("limit", limit))
+        if notes and isinstance(out, dict):
+            out["interpreted"] = _interpreted_notes(notes)
+        return json.dumps(out, ensure_ascii=False)
 
     @mcp.tool()
     def reverse_engineer_product(part_id: str = "", url: str = "", title: str = "",
-                                 mpn: str = "", brand: str = "") -> str:
+                                 mpn: str = "", brand: str = "",
+                                 **kwargs: _VarKw) -> str:
         """Reverse-engineer hand-off (contracts/sourcing.md §2b): when match_model
         finds NO confident repo match (fallback.how == "reverse_engineer"), harvest
         EVERYTHING scrapable off the product page — all product photos / gallery
@@ -701,12 +1156,29 @@ def register_parts_tools(mcp: FastMCP) -> None:
         (the user adds their own photos) — never a traceback. Reference-only URLs;
         nothing is redistributed.
         """
-        return json.dumps(
-            reverse_engineer_product_impl(part_id, url, title, mpn, brand),
-            ensure_ascii=False)
+        notes: list[str] = []
+        params = ("part_id", "url", "title", "mpn", "brand")
+        given = [k for k, v in (("part_id", part_id), ("url", url),
+                                ("title", title), ("mpn", mpn),
+                                ("brand", brand)) if v]
+        mapped, leftover = _absorb(kwargs, params, _REVENG_ALIASES, notes, given)
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "reverse_engineer_product", leftover, params,
+                "Example: reverse_engineer_product(url='https://.../product/123') "
+                "or reverse_engineer_product(part_id='catalog:mcmaster::91290A115')."),
+                ensure_ascii=False)
+        out = reverse_engineer_product_impl(mapped.get("part_id", part_id),
+                                            mapped.get("url", url),
+                                            mapped.get("title", title),
+                                            mapped.get("mpn", mpn),
+                                            mapped.get("brand", brand))
+        if notes and isinstance(out, dict):
+            out["interpreted"] = _interpreted_notes(notes)
+        return json.dumps(out, ensure_ascii=False)
 
     @mcp.tool()
-    def vendors_health(sites: str = "") -> str:
+    def vendors_health(sites: str = "", **kwargs: _VarKw) -> str:
         """Run a canary health check across the vendor source adapters.
 
         sites: CSV adapter keys to restrict (e.g. "mcmaster,grabcad"); blank = all.
@@ -715,10 +1187,27 @@ def register_parts_tools(mcp: FastMCP) -> None:
         human must run vendor_login(site) first (record a question for the human;
         never fabricate results for a logged-out site).
         """
-        return json.dumps(vendors_health_impl(sites), ensure_ascii=False)
+        notes: list[str] = []
+        mapped, leftover = _absorb(kwargs, ("sites",), _HEALTH_ALIASES, notes,
+                                   ["sites"] if sites else [])
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "vendors_health", leftover, ("sites",),
+                "sites is a CSV of adapter keys: "
+                "vendors_health(sites='mcmaster,grabcad'); blank sweeps all."),
+                ensure_ascii=False)
+        sites = mapped.get("sites", sites)
+        if isinstance(sites, (list, tuple)):
+            sites = ",".join(str(s) for s in sites)
+            notes.append("interpreted sites=[...] as a CSV string")
+        out = vendors_health_impl(sites)
+        if notes and isinstance(out, dict):
+            out["interpreted"] = _interpreted_notes(notes)
+        return json.dumps(out, ensure_ascii=False)
 
     @mcp.tool()
-    def cam_tool_import(part_id: str, number: int = 0, material: str = "") -> str:
+    def cam_tool_import(part_id: str = "", number: int = 0, material: str = "",
+                        **kwargs: _VarKw) -> str:
         """Import a cutting-tool part (end mill / drill / tap from the parts
         library, e.g. category tools.cutting_tools.*) into the current CAM job's
         tool library.
@@ -733,12 +1222,35 @@ def register_parts_tools(mcp: FastMCP) -> None:
         op_params_suggestion?}. NOTE: feeds/speeds live in the CuttingDB, not the
         tool record — use feeds_speeds()/cam_check_feeds_envelope() for cutting
         params. Requires a current CAM job (cam_new_job first).
+
+        Accepts `id`/`part`/`tool` as `part_id` and `tool_number` as `number`.
         """
-        return json.dumps(cam_tool_import_impl(part_id, number, material),
-                          ensure_ascii=False)
+        notes: list[str] = []
+        params = ("part_id", "number", "material")
+        mapped, leftover = _absorb(kwargs, params, _CAMTOOL_ALIASES, notes,
+                                   ["part_id"] if part_id else [])
+        part_id = str(mapped.get("part_id", part_id) or "").strip()
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "cam_tool_import", leftover, params,
+                "cam_tool_import takes a LIBRARY part id: find the cutter first "
+                "with part_search(category_id='tools.cutting_tools.end_mills', "
+                "query='6mm 3 flute carbide'), then "
+                "cam_tool_import(part_id=<that id>)."), ensure_ascii=False)
+        if not part_id:
+            return _err("cam_tool_import needs a part_id — none was given.",
+                        _part_id_hint())
+        out = cam_tool_import_impl(part_id, mapped.get("number", number),
+                                   mapped.get("material", material))
+        if isinstance(out, dict) and not out.get("ok") and \
+                str(out.get("reason", "")).startswith("part_id not found"):
+            out["hint"] = _part_id_hint(part_id)
+        if notes and isinstance(out, dict):
+            out["interpreted"] = _interpreted_notes(notes)
+        return json.dumps(out, ensure_ascii=False)
 
     @mcp.tool()
-    def part_get(part_id: str) -> str:
+    def part_get(part_id: str = "", **kwargs: _VarKw) -> str:
         """Retrieve a single PartRecord by its stable part_id (aicad.parts/1).
 
         part_id is in the form "<domain>:<catalog_id>", e.g.:
@@ -748,20 +1260,39 @@ def register_parts_tools(mcp: FastMCP) -> None:
 
         Returns the PartRecord dict on success, or {"ok": false, "reason": ...} when
         the part_id is unknown.
+
+        Accepts `id` / `part` / `part_number` as spellings of `part_id`.
         """
+        notes: list[str] = []
+        mapped, leftover = _absorb(kwargs, ("part_id",), _PARTGET_ALIASES, notes,
+                                   ["part_id"] if part_id else [])
+        part_id = str(mapped.get("part_id", part_id) or "").strip()
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "part_get", leftover, ("part_id",),
+                "part_get fetches ONE known id. To find a part by its attributes "
+                "use part_search(part_type='bushing', bore_mm=20, fit='sliding')."),
+                ensure_ascii=False)
+        if not part_id:
+            return _err("part_get needs a part_id — none was given.",
+                        _part_id_hint())
         try:
             from services.parts import get as _get
             rec = _get(part_id)
             if rec is None:
                 return _err(f"part_id not found: {part_id!r}",
-                            "Use part_search to discover valid part_ids.")
-            return json.dumps({"ok": True, "part": rec}, ensure_ascii=False)
+                            _part_id_hint(part_id))
+            out = {"ok": True, "part": rec}
+            if notes:
+                out["interpreted"] = _interpreted_notes(notes)
+            return json.dumps(out, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             return _err(f"part_get failed: {exc}",
                         "Check that services/parts is importable.")
 
     @mcp.tool()
-    def part_place(part_id: str, doc: str = "", params: str = "") -> str:
+    def part_place(part_id: str = "", doc="", params="",
+                   **kwargs: _VarKw) -> str:
         """Place a standard part into a document — universal insertion across all domains (T-P3).
 
         Looks up the PartRecord for ``part_id``, reads its geometry_ref.kind, and routes
@@ -772,14 +1303,23 @@ def register_parts_tools(mcp: FastMCP) -> None:
         part_id : stable part id, e.g. "fastener:ISO4762:M8", "ecad:Device:R",
                   "bearing:ISO 15:6205", "section:AISC:W8x31", "fitting:elbow:NPS1",
                   "hydraulic:pump:gear-1cc"
-        doc     : JSON string of the open document that receives the placement, OR "" for
-                  mechanical parts (core_family / generate_model) which create a new doc.
-        params  : optional JSON dict with domain-specific placement overrides:
+        doc     : the document that receives the placement — a real dict OR a JSON
+                  string (json.dumps(doc)). NEVER a doc id: the document ITSELF.
+                  Leave it out for mechanical parts (core_family / generate_model /
+                  import_file), which create their own new document.
+        params  : domain-specific placement overrides — a real dict OR a JSON
+                  object string:
                   - mech:        {"length_mm": 25}
                   - ecad:        {"pos": {"x": 10, "y": 20}, "value": "1k", "ref": "R1"}
                   - structural:  {"kind": "beam", "length_mm": 3000, "material": "steel"}
                   - piping:      {"type": "elbow", "nps": 1.0}
                   - hydraulic:   {"type": "pump", "displacement_cc_rev": 2.5}
+                  You may also pass placement intent as FLAT keywords and they are
+                  folded into params for you (echoed as `interpreted`):
+                  location/position/at/origin -> params["pos"],
+                  orientation/rotation/angle  -> params["rotation"],
+                  size/dimensions             -> params["size"];
+                  any other keyword goes into params under its own name.
 
         Returns a PlacementResult dict:
           {ok, domain, doc_id, entity_id, editable: true, detail: {...}}
@@ -790,43 +1330,108 @@ def register_parts_tools(mcp: FastMCP) -> None:
           2. part_place("fastener:ISO4762:M8") → creates editable mech part doc_id
           3. For ECAD: part_place("ecad:Device:R", doc=json.dumps(sch_doc), params='{"pos":...}')
         """
-        # Parse doc and params from JSON strings (MCP tools only accept scalars).
+        notes: list[str] = []
+        place_params = ("part_id", "doc", "params")
+        given = [k for k, v in (("part_id", part_id), ("doc", doc),
+                                ("params", params)) if v not in (None, "", {})]
+        mapped, leftover = _absorb(kwargs, place_params, _PLACE_ALIASES,
+                                   notes, given)
+        part_id = mapped.get("part_id", part_id)
+        doc = mapped.get("doc", doc)
+        params = mapped.get("params", params)
+
+        # params: a real dict, a JSON object string, or absent — all accepted.
+        params_dict, err = _parse_json_dict(params, "params")
+        if err:
+            return _err(err, _PLACE_PARAMS_HINT)
+        if isinstance(params, dict) and params:
+            notes.append("read params as a dict (a JSON string is also accepted)")
+        params_dict = dict(params_dict or {})
+
+        # Flat placement intent (location=..., size=...) folds into params.
+        for name, value in leftover.items():
+            key = _PLACE_PARAM_KEYS.get(_norm_key(name), name)
+            if key in params_dict:
+                notes.append(f"ignored {name}=...: params[{key!r}] was given "
+                             f"explicitly and wins")
+                continue
+            params_dict[key] = value
+            notes.append(f"folded {name}=... into params[{key!r}]")
+
+        # doc: a real dict, a JSON document string, or a bare doc id.
         doc_dict: dict | None = None
-        params_dict: dict | None = None
-        if doc and doc.strip():
-            try:
-                doc_dict = _json.loads(doc)
-            except Exception:  # noqa: BLE001
-                return _err("doc argument is not valid JSON.",
-                            "Pass the document as a JSON string: json.dumps(my_doc).")
-        if params and params.strip():
-            try:
-                params_dict = _json.loads(params)
-            except Exception:  # noqa: BLE001
-                return _err("params argument is not valid JSON.",
-                            "Pass params as a JSON string: '{\"pos\": {\"x\": 0, \"y\": 0}}'.")
+        doc_id_only = ""
+        if isinstance(doc, dict):
+            doc_dict = doc or None
+            if doc_dict:
+                notes.append("read doc as a document object "
+                             "(a JSON string is also accepted)")
+        elif isinstance(doc, str) and doc.strip():
+            text = doc.strip()
+            if text[:1] in ("{", "["):
+                try:
+                    parsed = json.loads(text)
+                except Exception as exc:  # noqa: BLE001
+                    return _err(f"doc is not valid JSON ({exc}). Got: "
+                                f"{text[:80]!r}", _PLACE_DOC_HINT)
+                if not isinstance(parsed, dict):
+                    return _err(f"doc must be a JSON OBJECT, got "
+                                f"{type(parsed).__name__}.", _PLACE_DOC_HINT)
+                doc_dict = parsed
+            else:
+                doc_id_only = text
+        elif doc not in (None, ""):
+            return _err(f"doc must be a document object or a JSON string, got "
+                        f"{type(doc).__name__}.", _PLACE_DOC_HINT)
 
         # place.py was ported to core/parts (T-RF19): look the record up via the
         # (Python) hub and hand it to the C++ placement dispatcher.
         from services.parts import get as _hub_get
         from . import core_bridge as cb
+        part_id = str(part_id or "").strip()
+        if not part_id:
+            return _err("part_place needs a part_id — none was given.",
+                        _place_id_hint())
         record = _hub_get(part_id)
         if record is None:
-            return _err(f"unknown part_id: {part_id}",
-                        "Check part_id with part_get first.")
+            return _err(f"unknown part_id: {part_id!r} — the parts library has no "
+                        f"record with that id.", _place_id_hint(part_id))
+
+        if doc_id_only:
+            kind = str(((record or {}).get("geometry_ref") or {}).get("kind", ""))
+            if kind in _MECH_KINDS:
+                notes.append(
+                    f"ignored doc={doc_id_only!r}: {part_id!r} is a {kind} part "
+                    f"and part_place CREATES its document — `doc` only applies to "
+                    f"ecad/structural/piping/hydraulic placements, where it must "
+                    f"be the document OBJECT, not its id")
+            else:
+                return _err(
+                    f"doc={doc_id_only!r} looks like a document ID, but part_place "
+                    f"needs the document ITSELF ({part_id!r} places into a "
+                    f"{kind or 'domain'} document).", _PLACE_DOC_HINT)
         try:
             result = cb.call("part_place", {"part_id": part_id, "record": record,
-                                            "doc": doc_dict, "params": params_dict})
+                                            "doc": doc_dict,
+                                            "params": params_dict or None})
+            if notes and isinstance(result, dict):
+                result = dict(result)
+                result["interpreted"] = _interpreted_notes(notes)
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
-            return _err(f"part_place failed: {exc}",
-                        "Check part_id with part_get first.")
+            out = {"ok": False, "reason": f"part_place failed: {exc}",
+                   "hint": _place_id_hint(part_id)}
+            if notes:
+                # The rewrite is now a SUSPECT — say what we read the call as
+                # before the model re-sends the same spelling.
+                out["interpreted"] = _interpreted_notes(notes)
+            return json.dumps(out, ensure_ascii=False)
 
     # ---- Vendor-source tools (T-X2 / T-X7) ----
     # These expose the services/browser acquisition layer to the GUI's vendor sources pane.
 
     @mcp.tool()
-    def vendor_status() -> str:
+    def vendor_status(**kwargs: _VarKw) -> str:
         """Return the login status of all registered vendor source adapters.
 
         Returns a list of source records:
@@ -877,7 +1482,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
             return _err(f"vendor_status failed: {exc}")
 
     @mcp.tool()
-    def vendor_login(site: str) -> str:
+    def vendor_login(site: str = "", **kwargs: _VarKw) -> str:
         """Open a HEADED browser window so the user can log into a vendor site.
 
         Blocks until the user closes the window (up to 5 minutes).  The saved
@@ -895,9 +1500,27 @@ def register_parts_tools(mcp: FastMCP) -> None:
         worker thread for up to 300 seconds while the user completes the login.
         The GUI displays a "Logging in…" spinner for the duration.
         """
+        notes: list[str] = []
+        mapped, leftover = _absorb(kwargs, ("site",), _LOGIN_ALIASES, notes,
+                                   ["site"] if site else [])
+        site = str(mapped.get("site", site) or "").strip().lower()
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "vendor_login", leftover, ("site",),
+                "vendor_login opens ONE vendor's login window: "
+                "vendor_login(site='mcmaster'). vendor_status() lists the keys."),
+                ensure_ascii=False)
+        if not site:
+            return _err("vendor_login needs a site — none was given.",
+                        "site is an adapter key: 'mcmaster', 'grabcad', "
+                        "'traceparts', 'misumi', 'digikey'. vendor_status() "
+                        "lists every registered key and its login state.")
         try:
             from services.browser.session import browser_login as _login
-            result = _login(site.strip().lower())
+            result = _login(site)
+            if notes and isinstance(result, dict):
+                result = dict(result)
+                result["interpreted"] = _interpreted_notes(notes)
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             return _err(f"vendor_login failed: {exc}",
@@ -915,7 +1538,8 @@ def register_parts_tools(mcp: FastMCP) -> None:
         pass  # graceful degradation: queue tools still work, just won't run jobs
 
     @mcp.tool()
-    def scrape_enqueue(site: str, query: str) -> str:
+    def scrape_enqueue(site: str = "", query: str = "",
+                       **kwargs: _VarKw) -> str:
         """Enqueue a vendor search + CAD-model download in the background queue.
 
         The job runs asynchronously: the function returns immediately with a job id.
@@ -932,15 +1556,40 @@ def register_parts_tools(mcp: FastMCP) -> None:
           → done (artifact_path set: local file path to the downloaded CAD file)
           → error (error message set; check vendor login status)
         """
+        notes: list[str] = []
+        given = [k for k, v in (("site", site), ("query", query)) if v]
+        mapped, leftover = _absorb(kwargs, ("site", "query"), _SCRAPE_ALIASES,
+                                   notes, given)
+        site = str(mapped.get("site", site) or "").strip().lower()
+        query = str(mapped.get("query", query) or "").strip()
+        if leftover:
+            terms = _descriptive_terms(leftover)
+            if terms:
+                query = f"{query} {terms}".strip()
+                notes.append(
+                    f"folded descriptive argument(s) "
+                    f"{', '.join(sorted(leftover))} into the search text: "
+                    f"query={query!r}")
+        if not site or not query:
+            missing = " and ".join(n for n, v in (("site", site), ("query", query))
+                                   if not v)
+            return _err(f"scrape_enqueue needs {missing}.",
+                        "site is a vendor adapter key you are logged into "
+                        "(vendor_status() lists them, vendor_login(site) signs "
+                        "in); query is free text. Example: "
+                        "scrape_enqueue(site='mcmaster', query='6205 bearing').")
         try:
             from services.browser.queue import enqueue as _enqueue
-            return json.dumps(_enqueue(site.strip().lower(), query.strip()),
-                              ensure_ascii=False)
+            out = _enqueue(site, query)
+            if notes and isinstance(out, dict):
+                out = dict(out)
+                out["interpreted"] = _interpreted_notes(notes)
+            return json.dumps(out, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             return _err(f"scrape_enqueue failed: {exc}")
 
     @mcp.tool()
-    def scrape_queue_status() -> str:
+    def scrape_queue_status(**kwargs: _VarKw) -> str:
         """Return the current state of all scrape/download queue jobs.
 
         Returns {ok, jobs: [{id, site, query, status, artifact_path, error,
@@ -959,7 +1608,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
             return _err(f"scrape_queue_status failed: {exc}")
 
     @mcp.tool()
-    def import_artifact(artifact_path: str) -> str:
+    def import_artifact(artifact_path: str = "", **kwargs: _VarKw) -> str:
         """Import a locally acquired CAD file (STEP/IGES) into a new editable part doc.
 
         This is the second step after a scrape/download queue job completes with
@@ -978,10 +1627,20 @@ def register_parts_tools(mcp: FastMCP) -> None:
         feature recovery where the geometry supports it.
         """
         import os
-        path = (artifact_path or "").strip()
+        notes: list[str] = []
+        mapped, leftover = _absorb(kwargs, ("artifact_path",), _IMPORT_ALIASES,
+                                   notes, ["artifact_path"] if artifact_path else [])
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "import_artifact", leftover, ("artifact_path",),
+                "import_artifact takes ONE local file path — the artifact_path a "
+                "done scrape_queue_status job reports."), ensure_ascii=False)
+        path = str(mapped.get("artifact_path", artifact_path) or "").strip()
         if not path:
-            return _err("artifact_path is required",
-                        "Pass the artifact_path from scrape_queue_status on a done job.")
+            return _err("import_artifact needs an artifact_path — none was given.",
+                        "Run scrape_enqueue(site, query), poll "
+                        "scrape_queue_status() until the job is 'done', then pass "
+                        "that job's artifact_path here.")
         if not os.path.isfile(path):
             return _err(f"file not found: {path}",
                         "Verify the artifact_path from scrape_queue_status. "

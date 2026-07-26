@@ -40,4 +40,13 @@ std::vector<std::string> validate_document(const nlohmann::json& doc);
 // Owned here so MCP / op_registry / tests never hand-copy the list.
 std::vector<std::string> feature_type_names();
 
+// Rewrite a feature's SHAPE (not its intent) into what validate_document accepts:
+// wrap a single value handed to a list-form ref slot ("profile":"$0" -> ["$0"]).
+// Returns one human-readable note per rewrite, so the caller can echo the
+// correction; an empty result means the feature was already canonical. Driven by
+// the same FEATURE_TYPES table the validator uses, so it cannot drift from the
+// rules it is satisfying. Param DEFAULTS are deliberately not done here — see the
+// scope note on the definition in validate.cpp.
+std::vector<std::string> normalize_feature_shape(nlohmann::json& feature);
+
 }  // namespace chudware::doc

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from mcp.server.fastmcp import Image
+from pydantic import Field
+from typing import Annotated
+from typing import Any
 from typing import Optional
 from typing import Union
 import json
@@ -11,6 +14,7 @@ import os
 from .cad_common import (
     CoreError,
     _EMPHASIS_PALETTE,
+    _QVOCAB_HELP,
     _apply_emphasis_overlay,
     _as_face_query,
     _between_from_batch,
@@ -32,12 +36,387 @@ from .cad_common import (
     cb,
 )
 
+# --------------------------------------------------------------------------- input dialect
+# `_reconcile_kwargs` (services/agent/agent_turn.py) rejects an unknown kwarg BEFORE the tool
+# is ever called — unless the tool declares a var-keyword parameter, which makes it the owner
+# of its own input dialect. The tools below therefore take `**kwargs` and normalise in-body.
+# Every rewrite is echoed back to the model as `interpreted` (the cad_doc_tools house
+# convention); genuinely ambiguous input raises a teaching error instead of a silent guess.
+
+# The structured geometry-query keys. A model that writes the query FLATTENED across top-level
+# kwargs — query_geometry(of="face", side="top") — means exactly the documented dict, so
+# assemble it rather than refusing the call.
+_QUERY_KEYS = ("of", "side", "surf", "surface", "shape", "parallel", "perpendicular",
+               "pick", "near", "count", "index", "body_id")
+_QUERY_KEY_CANON = {"surface": "surf", "shape": "surf"}
+
+# Spellings of the `query` PARAMETER itself (as opposed to a key inside it).
+_QUERY_SPELLINGS = ("target", "q", "face", "edge", "selector", "where")
+
+
+def _take_alias(kwargs: dict, spellings: tuple) -> list:
+    """Every supplied spelling of one parameter, removed from `kwargs` -> [(name, value)]."""
+    return [(k, kwargs.pop(k)) for k in list(kwargs) if k in spellings]
+
+
+def _one_alias(tool: str, canonical: str, kwargs: dict, spellings: tuple,
+               value=None, notes: Optional[list] = None):
+    """Adopt an alias spelling of `canonical` out of `kwargs`, echoing the rewrite in `notes`.
+
+    Two spellings of the same parameter that DISAGREE are a real ambiguity, so they raise a
+    teaching error naming both rather than letting one win silently."""
+    found = [(k, v) for k, v in _take_alias(kwargs, spellings) if v is not None]
+    if not found:
+        return value
+    if value is not None:
+        clash = [(k, v) for k, v in found if v != value]
+        if clash:
+            raise ValueError(
+                f"{tool}() got {canonical}={value!r} and "
+                + " and ".join(f"{k}={v!r}" for k, v in clash)
+                + f" — those are the same parameter spelled two ways and they disagree. "
+                  f"Pass {canonical}= once with the value you mean.")
+        if notes is not None:
+            notes.append(f"{found[0][0]}= is another spelling of {canonical}= "
+                         f"(same value) — kept once")
+        return value
+    if len({repr(v) for _, v in found}) > 1:
+        raise ValueError(
+            f"{tool}() got {len(found)} spellings of {canonical}= with different values ("
+            + ", ".join(f"{k}={v!r}" for k, v in found)
+            + f") — they are one parameter, so pass {canonical}= once.")
+    if notes is not None:
+        notes.append(f"{found[0][0]}={found[0][1]!r} read as {canonical}=")
+    return found[0][1]
+
+
+def _reject_unknown(tool: str, kwargs: dict, accepted: str) -> None:
+    """Leftover kwargs are a real mistake — name them and the parameters that DO exist."""
+    if not kwargs:
+        return
+    raise ValueError(
+        f"{tool}() got unknown argument(s) "
+        + ", ".join(f"{k}={kwargs[k]!r}" for k in sorted(kwargs))
+        + f" — {accepted}")
+
+
+def _interpreted(out: dict, notes: list) -> dict:
+    """Attach the de-duplicated echo list, and ONLY when something was actually rewritten, so a
+    canonical call's response is byte-identical to what it always was."""
+    seen: list = []
+    for n in notes:
+        if n and n not in seen:
+            seen.append(n)
+    if seen:
+        out["interpreted"] = seen
+    return out
+
+
+# ------------------------------------------------------------------- "no bodies" diagnostics
+
+def _open_docs() -> list:
+    """Every open document row (doc_id + name + feature_count), [] when doc_list is unusable."""
+    try:
+        return [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                if isinstance(e, dict) and e.get("doc_id")]
+    except Exception:  # noqa: BLE001 — diagnostics must never mask the original error
+        return []
+
+
+def _feature_rows(doc_id: str) -> Optional[list]:
+    """The document's feature list, or None when the tree could NOT be read.
+
+    None and [] must stay distinct: "this part has no features" and "I could not look" lead to
+    different advice, and guessing between them is exactly the failure mode we are fixing."""
+    try:
+        tree = (cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("tree") or {}
+    except Exception:  # noqa: BLE001
+        return None
+    feats = tree.get("features")
+    return feats if isinstance(feats, list) else None
+
+
+def _add_box_call(doc_id: str) -> str:
+    return (f'add_features(doc_id="{doc_id}", ops=[{{"op":"add_feature","feature":'
+            '{"type":"box","name":"Plate","params":{"length":80,"width":60,"height":10}}}])')
+
+
+def _teach_no_bodies(e: Exception, doc_id: Optional[str], retry: str) -> Exception:
+    """Turn the engine's bare "document has no bodies to <x>" into a fixable instruction.
+
+    core/doc/session.cpp::throw_no_bodies emits TWO different situations under one headline:
+    a document that simply has no solid in it, and a document whose features all FAILED to
+    rebuild (then, and only then, it appends the per-feature errors and sets
+    detail.reason="feature rebuild failed"). The remedies are opposite — add geometry vs.
+    repair the feature that broke — so this names which one it is, quoting the resolved doc_id
+    and part name, and says plainly when the tree could not be read to tell them apart."""
+    if not doc_id or "no bodies" not in str(e).lower():
+        return e
+    msg = str(e)
+    detail = getattr(e, "detail", None)
+    detail = dict(detail) if isinstance(detail, dict) else {"doc_id": doc_id}
+    entry = next((x for x in _open_docs() if x.get("doc_id") == doc_id), {})
+    name = entry.get("name") or ""
+    who = f'{doc_id} "{name}"' if name else doc_id
+    rows = _feature_rows(doc_id)
+    rebuild_failed = (detail.get("reason") == "feature rebuild failed"
+                      or "failed to rebuild" in msg)
+
+    if rebuild_failed:
+        because = msg.split(" — ", 1)[1].strip() if " — " in msg else "see `detail`"
+        text = (f"{who} resolved fine but has no bodies because its feature(s) FAILED TO "
+                f"REBUILD: {because}. Adding more geometry will not help — repair the broken "
+                f'feature: call get_part(doc_id="{doc_id}") to read the tree and each '
+                f"feature's error, then edit_feature (fix the parameter / re-point the "
+                f"reference) or delete it, and retry {retry}.")
+        code = "no_bodies_rebuild_failed"
+    elif rows == []:
+        text = (f"{who} resolved fine but is EMPTY — 0 features, so 0 bodies and nothing to "
+                f"work on. Add geometry first, e.g. {_add_box_call(doc_id)}, then retry "
+                f"{retry}.")
+        code = "no_bodies_empty_document"
+    elif rows:
+        kinds = ", ".join(sorted({str(f.get("type") or "?") for f in rows
+                                  if isinstance(f, dict)})) or "unknown types"
+        text = (f"{who} has {len(rows)} feature(s) ({kinds}) and the engine reports no rebuild "
+                f"failure, yet the document has no SOLID body — those features are "
+                f"construction-only (sketch / plane / axis) and never made material. Turn one "
+                f"into a solid (add_features with an extrude/revolve of the profile, or a "
+                f"primitive: {_add_box_call(doc_id)}), then retry {retry}.")
+        code = "no_bodies_no_solid_feature"
+    else:
+        text = (f"{who} resolved fine but has no bodies, and its feature tree could NOT be read "
+                f"(doc_tree failed), so I cannot tell you whether the part is empty or its "
+                f'features failed to build. Call get_part(doc_id="{doc_id}"): if it lists no '
+                f"features, add geometry ({_add_box_call(doc_id)}); if it lists features, fix "
+                f"the one whose status is not ok. Then retry {retry}.")
+        code = "no_bodies_undiagnosed"
+
+    detail.setdefault("doc_id", doc_id)
+    if name:
+        detail["doc_name"] = name
+    detail["engine_message"] = msg
+    # The transport `code` stays whatever the engine said (the envelope is unchanged); the
+    # WHICH-of-the-two-situations verdict rides along additively so a caller can branch on it.
+    detail["diagnosis"] = code
+    return CoreError(text, getattr(e, "code", "") or "invalid_op", detail)
+
+
+def _extra_kwargs(kwargs: dict) -> dict:
+    """The var-keyword bag, cleaned up before anything reads it.
+
+    FastMCP's func_metadata has no VAR_KEYWORD case: it synthesises a pydantic field literally
+    named "kwargs" and hands it back as {"kwargs": None}, so drop that. A model that wrapped
+    its real arguments in kwargs={...} gets them unwrapped instead of rejected."""
+    nested = kwargs.pop("kwargs", None)
+    if isinstance(nested, dict):
+        for k, v in nested.items():
+            kwargs.setdefault(k, v)
+    return kwargs
+
+
+def _read_query(tool: str, query, kwargs: dict, notes: list) -> tuple:
+    """Normalise every spelling of a geometry query into ONE query dict.
+
+    Accepts the canonical `query=` (dict or phrase), the alias spellings in _QUERY_SPELLINGS,
+    and the query written FLATTENED across top-level kwargs (of=/side=/surf=/pick=/…) — a
+    model writing `of="face", side="top"` means the documented dict, and that intent is not
+    ambiguous. Returns (query_dict, subjects); `subjects` are alias values that are NOT
+    geometry vocabulary (a part or feature name attached to the call), which the caller
+    verifies rather than ignores. Every rewrite lands in `notes`."""
+    flat: dict = {}
+    for key in list(kwargs):
+        if key in _QUERY_KEYS:
+            flat[_QUERY_KEY_CANON.get(key, key)] = kwargs.pop(key)
+
+    spelled = [(k, v) for k, v in _take_alias(kwargs, _QUERY_SPELLINGS) if v is not None]
+    if query is not None:
+        spelled.insert(0, ("query", query))
+
+    readable: list = []   # (spelling, original value, query dict)
+    subjects: list = []   # (spelling, original value, why it is not a query)
+    for name, value in spelled:
+        if isinstance(value, dict):
+            readable.append((name, value, dict(value)))
+            continue
+        try:
+            q = _as_face_query(value)
+        except ValueError as ve:
+            subjects.append((name, value, str(ve)))
+            continue
+        if name in ("face", "edge"):
+            q = dict(q, of=name)  # the spelling itself pins the topology kind
+        readable.append((name, value, q))
+
+    if not readable and not flat:
+        if subjects:
+            name, value, why = subjects[0]
+            raise ValueError(
+                f"{tool}(): {name}={value!r} is the only argument that could be the geometry "
+                f"query, and it is not query vocabulary. {why}")
+        raise ValueError(
+            f'{tool}() needs a geometry query. Pass query={{"of":"face","side":"top"}}, a bare '
+            f'side word (query="top"), or write the keys flat as kwargs '
+            f'({tool}(of="face", side="top")). Keys: {_QVOCAB_HELP}')
+
+    merged: dict = {}
+    origin: dict = {}
+
+    def _merge(label: str, src: dict) -> None:
+        for k, v in src.items():
+            if k in merged and merged[k] != v:
+                raise ValueError(
+                    f"{tool}(): the query key {k!r} arrived twice with different values "
+                    f"({merged[k]!r} from {origin[k]}, {v!r} from {label}) — that is one "
+                    f"query, so pass it once as query={{...}}.")
+            merged[k] = v
+            origin.setdefault(k, label)
+
+    for name, _value, q in readable:
+        _merge(f"{name}=", q)
+    if flat:
+        _merge("the flattened kwargs", flat)
+        notes.append(
+            "the query was written flat across top-level kwargs ("
+            + ", ".join(f"{k}={v!r}" for k, v in flat.items())
+            + ") — assembled into query=" + json.dumps(merged, sort_keys=True))
+    for name, value, q in readable:
+        if name != "query":
+            notes.append(f"{name}={value!r} read as query={json.dumps(q, sort_keys=True)}")
+    return merged, subjects
+
+# --------------------------------------------------------------- datum plane / direction words
+# The engine only accepts the three reserved datum names, so "XY"/"xz"/"z" — the spellings a
+# draftsman and a model both reach for — died on `plane 'xy' is not a reserved planar datum`.
+# The mapping is exact (Z-up: top=XY, front=XZ, right=YZ), so accepting it is a rename, not a
+# guess; it is still echoed.
+_PLANE_WORDS = {
+    "top": "top", "xy": "top", "yx": "top", "plan": "top", "horizontal": "top",
+    "z": "top", "+z": "top", "-z": "top", "normalz": "top",
+    "front": "front", "xz": "front", "zx": "front", "elevation": "front",
+    "y": "front", "+y": "front", "-y": "front", "normaly": "front",
+    "right": "right", "yz": "right", "zy": "right", "side": "right", "profile": "right",
+    "x": "right", "+x": "right", "-x": "right", "normalx": "right",
+}
+
+# Signed direction words -> a unit vector. Unlike a query `side`, a PULL direction's sign is
+# load-bearing (draft along -Z is not draft along +Z), so the sign is preserved.
+_DIR_WORDS = {
+    "x": (1.0, 0.0, 0.0), "+x": (1.0, 0.0, 0.0), "-x": (-1.0, 0.0, 0.0),
+    "y": (0.0, 1.0, 0.0), "+y": (0.0, 1.0, 0.0), "-y": (0.0, -1.0, 0.0),
+    "z": (0.0, 0.0, 1.0), "+z": (0.0, 0.0, 1.0), "-z": (0.0, 0.0, -1.0),
+    "top": (0.0, 0.0, 1.0), "up": (0.0, 0.0, 1.0), "bottom": (0.0, 0.0, -1.0),
+    "down": (0.0, 0.0, -1.0), "right": (1.0, 0.0, 0.0), "left": (-1.0, 0.0, 0.0),
+    "back": (0.0, 1.0, 0.0), "rear": (0.0, 1.0, 0.0), "front": (0.0, -1.0, 0.0),
+    "vertical": (0.0, 0.0, 1.0),
+}
+
+
+def _read_plane(tool: str, plane, notes: list) -> str:
+    """A reserved datum-plane name from any of its spellings ("XY" -> "top")."""
+    if plane is None:
+        return "top"
+    raw = str(plane).strip().lower().replace("plane", "")
+    sign = raw[:1] if raw[:1] in "+-" else ""   # "-x" must not lose its sign to separator strip
+    body = raw[len(sign):]
+    for junk in (" ", "\t", "_", "-"):
+        body = body.replace(junk, "")
+    hit = _PLANE_WORDS.get((sign + body) or "top")
+    if hit is None:
+        raise ValueError(
+            f"{tool}(plane={plane!r}): the engine has exactly three reserved datum planes "
+            f'(Z-up) — "top" (XY, normal +Z), "front" (XZ, normal -Y) and "right" (YZ, normal '
+            f'+X). Pass one of those names; "XY"/"XZ"/"YZ" and a bare axis letter are accepted '
+            f"spellings of them.")
+    if hit != str(plane):
+        notes.append(f"plane={plane!r} read as the reserved datum plane {hit!r}")
+    return hit
+
+
+def _read_direction(tool: str, param: str, value, default: tuple) -> tuple:
+    """A [x,y,z] direction from a vector OR a signed axis/side word, never from a guess.
+
+    The old code silently substituted +Z for anything that was not a 3-list, so
+    draft_analysis(pull_dir=[1,0]) reported a Z-pull result under the caller's X-pull
+    question. A malformed vector now says so instead."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        hit = _DIR_WORDS.get(value.strip().lower())
+        if hit is None:
+            raise ValueError(
+                f"{tool}({param}={value!r}): pass a direction as [x,y,z] (e.g. [0,0,1]) or as a "
+                f"signed axis / side word (+x/-x/+y/-y/+z/-z, top/bottom/left/right/front/back).")
+        return hit
+    if isinstance(value, dict):
+        try:
+            return (float(value["x"]), float(value["y"]), float(value["z"]))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                f"{tool}({param}={value!r}): a dict direction needs numeric x, y and z keys; "
+                f"[x,y,z] or a signed axis word (\"+z\") also work.") from None
+    if isinstance(value, (list, tuple)):
+        if len(value) != 3:
+            raise ValueError(
+                f"{tool}({param}={list(value)!r}): a direction needs exactly 3 components "
+                f"[x,y,z] — got {len(value)}. (This used to be silently replaced by [0,0,1], "
+                f"so the answer described a different pull than the one you asked about.)")
+        try:
+            return (float(value[0]), float(value[1]), float(value[2]))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{tool}({param}={list(value)!r}): every component must be a number.") from None
+    raise ValueError(
+        f"{tool}({param}={value!r}): pass [x,y,z] or a signed axis word (\"+z\", \"bottom\").")
+
+
+def _sketch_features(doc_id: str) -> list:
+    """The document's sketch features (empty when it has none, or when the tree is unreadable)."""
+    return [f for f in (_feature_rows(doc_id) or [])
+            if isinstance(f, dict) and str(f.get("type") or "") == "sketch"]
+
+
+def _sketch_roster(doc_id: str) -> str:
+    """One clause naming every sketch the model may legally pass, or that there are none."""
+    rows = _sketch_features(doc_id)
+    if not rows:
+        return f"{doc_id} has no sketch features yet — author one with add_features first."
+    return ("Its sketch features are: "
+            + ", ".join(f'{f.get("id")} "{f.get("name") or ""}"' for f in rows) + ".")
+
+
+def _teach_unknown_sketch(e: Exception, doc_id: Optional[str]) -> Exception:
+    """"no sketch feature 's1'" names the symptom; the document's actual sketch roster — or the
+    fact that it has none — names the fix."""
+    msg = str(e)
+    if not doc_id or "no sketch feature" not in msg.lower():
+        return e
+    rows = _feature_rows(doc_id)
+    if rows is None:
+        return e
+    sketches = _sketch_features(doc_id)
+    if sketches:
+        text = (f"{msg} in {doc_id}. {_sketch_roster(doc_id)} Pass one of those ids, "
+                f'e.g. check_sketch(sketch="{sketches[0].get("id")}", doc_id="{doc_id}").')
+    else:
+        text = (f"{msg}: {doc_id} has {len(rows)} feature(s) and NOT ONE of them is a sketch, so "
+                f"there is nothing for check_sketch to solve. Author a sketch first — "
+                f'add_features(doc_id="{doc_id}", ops=[{{"op":"add_feature","feature":'
+                '{"type":"sketch","name":"Sk","params":{"plane":"top"},"entities":[…]}}]) — '
+                f'or call get_part(doc_id="{doc_id}") to see what the tree really holds.')
+    return CoreError(text, getattr(e, "code", "") or "invalid_op",
+                     {"doc_id": doc_id, "reason": "unknown sketch",
+                      "sketches": [f.get("id") for f in sketches]})
+
+
 def register_cad_eval_tools(mcp: FastMCP) -> None:
     """CAD query/measure/check MCP tools (T-RF8 split of cad_tools.py): query_geometry, check_sketch, measure*, interference/overlap/symmetry/section/wall/draft checks."""
 
 
     @mcp.tool()
-    def query_geometry(query: Union[str, dict], doc_id: Optional[str] = None) -> str:
+    def query_geometry(query: Optional[Union[str, dict]] = None,
+                       doc_id: Optional[str] = None,
+                       **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Resolve a STRUCTURED face/edge query against the part — explore/confirm geometry.
 
         `query` is a dict of query keys — a whole sentence is NOT a query (see the note below):
@@ -59,6 +438,19 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
           {"of":"edge","surf":"line","parallel":"z"}                     the vertical straight edges
           {"of":"edge","surf":"line","near":[40,0,2],"count":1}          exactly ONE edge, by position
 
+        ACCEPTED SPELLINGS (all normalised to the dict above, and echoed back in `interpreted`
+        so you always see what was actually asked):
+          query={...} / query="top"        the canonical form
+          target= / q= / selector= / where=   the same value under another name
+          face="top" / edge="longest"      the alias also pins `of` to face / edge
+          of="face", side="top", …         the query written FLAT across top-level kwargs —
+                                           assembled into {"of":"face","side":"top"}
+          surface= / shape=                spellings of `surf`
+        A spelling that is NOT query vocabulary (target="bushing_body") is read as the SUBJECT
+        — the part or feature the query is about: an open document's id/name selects that
+        document, a feature name is reported (this tool always searches the whole document),
+        and anything else is reported as unresolved instead of quietly steering the query.
+
         Returns each matching face/edge with its shape (surf), side, centroid, size and stable
         sid, so you can confirm "the top face" resolves before you reference it in a feature or a
         simulation. CONVENIENCE: a short phrase built only from the words above ("top", "outer
@@ -66,9 +458,78 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         with the vocabulary rather than silently mis-resolved. For open-ended exploration call
         describe_part (the named face/edge roster) then hover(sid) — not this tool with a sentence.
         """
+        d = None
         try:
-            q = query if isinstance(query, dict) else _as_face_query(query)
-            res = cb.call("doc_query", {"doc_id": _doc(doc_id), "query": q})
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            q, subjects = _read_query("query_geometry", query, extra, notes)
+            _reject_unknown(
+                "query_geometry", extra,
+                'it takes query=, doc_id=, the query spellings (target/q/face/edge/selector/'
+                'where) or the query keys written flat (of/side/surf/parallel/perpendicular/'
+                'pick/near/count/index/body_id).')
+
+            # A non-vocabulary spelling names the SUBJECT. When it is an open document and no
+            # doc_id was given, that IS the document the model meant — adopt it and say so.
+            docs = _open_docs() if subjects else []
+
+            def _as_doc(value) -> Optional[dict]:
+                text = str(value).strip()
+                return next((x for x in docs
+                             if x.get("doc_id") == text
+                             or (x.get("name") or "").strip().casefold() == text.casefold()),
+                            None)
+
+            adopted = None
+            if doc_id is None:
+                for name, value, _why in subjects:
+                    hit = _as_doc(value)
+                    if hit:
+                        doc_id = hit["doc_id"]
+                        adopted = (name, value)
+                        notes.append(f"{name}={value!r} names the open part "
+                                     f"{hit['doc_id']} \"{hit.get('name') or ''}\" — used as "
+                                     f"doc_id=")
+                        break
+
+            d = _doc(doc_id)
+            unresolved: list = []
+            for name, value, _why in subjects:
+                if adopted == (name, value):
+                    continue
+                hit = _as_doc(value)
+                if hit and hit["doc_id"] == d:
+                    notes.append(f"{name}={value!r} names this document ({d}) — read as the "
+                                 f"subject, not as the query")
+                    continue
+                if hit:
+                    raise ValueError(
+                        f"query_geometry() was pointed at two different documents: doc_id={d} "
+                        f"and {name}={value!r} (part {hit['doc_id']}). Pass one — "
+                        f'doc_id="{hit["doc_id"]}" queries the part you named.')
+                feats = _feature_rows(d) or []
+                feat = next((f for f in feats if isinstance(f, dict)
+                             and str(f.get("name") or "").strip().casefold()
+                             == str(value).strip().casefold()), None)
+                if feat:
+                    notes.append(
+                        f"{name}={value!r} names the feature {feat.get('name')!r} "
+                        f"({feat.get('id')}) — query_geometry always searches the WHOLE "
+                        f"document, so the matches below are document-wide; for just that "
+                        f"feature's faces call inspect_part(target={feat.get('name')!r})")
+                    continue
+                unresolved.append(value)
+                notes.append(
+                    f"{name}={value!r} is neither geometry-query vocabulary nor the name of an "
+                    f"open part or of a feature in {d} — it did NOT restrict this query. The "
+                    f"matches below answer query={json.dumps(q, sort_keys=True)} over the whole "
+                    f"document; call get_part or describe_part to see what is really there.")
+
+            try:
+                res = cb.call("doc_query", {"doc_id": d, "query": q})
+            except CoreError as ce:
+                raise _teach_no_bodies(
+                    ce, d, f"query_geometry(query={json.dumps(q, sort_keys=True)})") from None
             # Every other tool reports `ok`; doc_query returns a bare match list, so a model
             # checking the usual success flag saw None and couldn't tell a hit from a miss.
             # Echo the RESOLVED query too: when a phrase was normalised into keys, the model
@@ -78,14 +539,17 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             if not (out.get("matches") or []):
                 out["note"] = ("no face/edge matched this query — loosen it (drop `side` or "
                                "`surf`) or call describe_part to see the actual roster")
-            return _dumps(out)
+            if unresolved:
+                out["unresolved_subject"] = unresolved
+            return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_no_bodies(e, d, "query_geometry(query=…)"))
 
 
 
     @mcp.tool()
-    def check_sketch(sketch: str, doc_id: Optional[str] = None) -> str:
+    def check_sketch(sketch: Optional[str] = None, doc_id: Optional[str] = None,
+                     **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Check whether a sketch is well-constrained (fully defined) and report what's missing.
 
         Solves the named sketch feature and returns its constraint health so you can author
@@ -93,7 +557,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         parallel, perpendicular, tangent, equal, concentric, symmetric, midpoint, collinear) plus
         DRIVING DIMENSIONS — instead of loose geometry that only looks right.
 
-        sketch: the sketch feature id (e.g. "s1") whose constraints to evaluate.
+        sketch: the sketch feature id (e.g. "s1") whose constraints to evaluate. Also accepted
+          as sketch_id= / sketch_name= / feature= / feature_id= / id= / name= / target= (every
+          rewrite is echoed in `interpreted`); a sketch id that does not exist comes back with
+          the document's actual sketch roster, not just "no sketch feature".
 
         Returns:
           status       "full" (fully defined — the goal), "under" (under-defined), or "over"
@@ -110,8 +577,20 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         parametrically. Before declaring a sketch done: render_sketch_ascii + sketch_health /
         check_sketch with dof 0.
         """
+        d = None
         try:
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            sketch = _one_alias("check_sketch", "sketch", extra,
+                                ("sketch_id", "sketch_name", "sketch_fid", "feature",
+                                 "feature_id", "id", "name", "target"), sketch, notes)
+            _reject_unknown("check_sketch", extra,
+                            'it takes sketch= (the sketch feature id, e.g. "s1") and doc_id=.')
             d = _doc(doc_id)
+            if not sketch:
+                raise ValueError(
+                    "check_sketch() needs sketch= — the sketch FEATURE id to evaluate (e.g. "
+                    f'check_sketch(sketch="s1", doc_id="{d}")). {_sketch_roster(d)}')
             # sketch_health is the read-only source of truth (never touches the interactive
             # active_sketch state). It returns status/dof plus the narrated read; its
             # conflicting/redundant are [{id,type,suggestion}] objects, from which we pull the
@@ -152,17 +631,19 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                    "open_endpoints": (r.get("closure") or {}).get("open_endpoints"),
                    "dof_narration": narration, "schedule": r.get("schedule"),
                    "advisory": r.get("advisory")}
-            return _dumps(out)
+            return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_unknown_sketch(_teach_no_bodies(
+                e, d, f"check_sketch(sketch={sketch!r})"), d))
 
 
 
     @mcp.tool()
-    def measure(targets: list,
+    def measure(targets: Optional[list] = None,
                 doc_id: Optional[str] = None,
                 view: Optional[Union[str, dict]] = "auto",
-                annotate: bool = True) -> list:
+                annotate: bool = True,
+                **kwargs: Annotated[Any, Field(default=None)]) -> list:
         """Color-coded multi-element measurement with an annotated render.
 
         Resolves each plain-English target (or resolved selector dict — same vocabulary as
@@ -176,6 +657,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
           One target → that element's intrinsic measure (length / area / diameter / …).
           Two targets → also the distance (+ angle when applicable) between them.
           Three+ → chain multi-distance across the ordered refs.
+          ACCEPTED SPELLINGS (echoed in the caption's `interpreted`): a bare selector instead
+          of a list (targets="top" → ["top"]); target= / element(s)= / ref(s)= / selector(s)= /
+          query= / faces= / edges= as other names for targets=; and the two-element form
+          written apart, measure(a="top", b="bottom") → targets=["top","bottom"].
         view: "auto" (default — frame along the measured elements' normals) or a named /
           custom camera like render_part / inspect_part.
         annotate: pass face labels / triad through to the underlying render (default True).
@@ -187,11 +672,36 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
         Returns [image, caption].
         """
+        extra = _extra_kwargs(dict(kwargs))
+        notes: list = []
+        targets = _one_alias("measure", "targets", extra,
+                             ("target", "elements", "element", "refs", "ref", "selectors",
+                              "selector", "queries", "query", "faces", "edges"),
+                             targets, notes)
+        a_val = _one_alias("measure", "targets[0]", extra,
+                           ("a", "a_query", "from", "first"), None, notes)
+        b_val = _one_alias("measure", "targets[1]", extra,
+                           ("b", "b_query", "to", "second"), None, notes)
+        if a_val is not None or b_val is not None:
+            if targets is not None:
+                raise ValueError(
+                    "measure() got targets= AND the split a=/b= form — pass one: "
+                    "targets=['top','bottom'].")
+            targets = [v for v in (a_val, b_val) if v is not None]
+        if isinstance(targets, (str, dict)):
+            notes.append(f"targets={targets!r} is a single selector — wrapped as [{targets!r}]")
+            targets = [targets]
+        elif isinstance(targets, tuple):
+            targets = list(targets)
+        _reject_unknown("measure", extra,
+                        "it takes targets= (a list of selectors), doc_id=, view= and annotate=.")
         d = _doc(doc_id)
         if not isinstance(targets, list) or not targets:
             raise ValueError(
                 "measure(targets=[...]) needs a non-empty list of plain-English selectors "
-                "(e.g. ['top', {'of':'edge','parallel':'z','pick':'largest'}]).")
+                "(e.g. ['top', {'of':'edge','parallel':'z','pick':'largest'}]). A single "
+                "selector on its own (targets='top'), or the pair written apart "
+                "(a='top', b='bottom'), is accepted too.")
 
         refs: list = []
         matches: list = []
@@ -208,6 +718,13 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         # Batch measure (all refs at once) — single / pair / multi-distance.
         try:
             batch = cb.call("eval_measure", {"doc_id": d, "refs": refs})
+        except CoreError as e:
+            taught = _teach_no_bodies(e, d, f"measure(targets={targets!r})")
+            if taught is not e:
+                raise taught from None
+            raise ValueError(
+                f"eval_measure failed: {e}. The selectors resolved to {refs!r} — re-check them "
+                f"with query_geometry (each must name ONE face/edge/vertex) and retry.") from e
         except Exception as e:  # noqa: BLE001
             raise ValueError(f"eval_measure failed: {e}") from e
 
@@ -237,10 +754,17 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         # Render + per_face emphasis so each measured element is colour-coded.
         try:
             part_bb = cb.call("doc_bbox", {"doc_id": d})
+        except CoreError as e:
+            taught = _teach_no_bodies(e, d, f"measure(targets={targets!r})")
+            if taught is not e:
+                raise taught from None
+            raise ValueError(f"doc_bbox failed: {e}") from e
         except Exception as e:  # noqa: BLE001
             raise ValueError(f"doc_bbox failed: {e}") from e
         if not part_bb or not part_bb.get("size"):
-            raise ValueError("no part bounding box — build geometry first")
+            raise ValueError(
+                f"{d} has no bounding box, so there is no geometry to frame or measure. Add "
+                f"geometry first — {_add_box_call(d)} — then retry measure(targets={targets!r}).")
 
         target_bb = _target_bbox(d, matches)
         view_dir = _camera_dir_for_target(matches, view)
@@ -254,7 +778,11 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                          {"doc_id": d, "out_path": png_full, "annotate": bool(annotate)})
             if not r2.get("ok") or not os.path.exists(png_full):
                 raise ValueError(
-                    f"measure render failed: {r.get('reason', r.get('error', 'no bodies'))}")
+                    f"measure render failed for {d}: "
+                    f"{r.get('reason', r.get('error', 'no bodies'))}. The readings above could "
+                    f"not be turned into a picture — call render_part(doc_id=\"{d}\") to see "
+                    f"whether the part renders at all, or measure_between for a text-only "
+                    f"reading of the same selectors.")
             view_dir = _vnorm((1.0, 1.0, 0.8))
 
         rect = _crop_rect_for_target(part_bb, target_bb, view_dir,
@@ -281,13 +809,13 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         if between:
             bval = between.get("value")
             bval_s = f"{bval:.6g}" if isinstance(bval, float) else str(bval)
-            extra = ""
+            angle_txt = ""
             if between.get("angle") is not None:
-                extra = f", angle={between['angle']:.4g} deg"
+                angle_txt = f", angle={between['angle']:.4g} deg"
             lines.append(
                 f"  between: {between.get('kind')} = {bval_s}"
                 f"{' ' + (between.get('unit') or '') if between.get('unit') else ''}"
-                f"{extra}")
+                f"{angle_txt}")
         structured = {
             "ok": True,
             "doc_id": d,
@@ -296,6 +824,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             "n_targets": len(refs),
             "palette_mode": "per_face",
         }
+        _interpreted(structured, notes)
         caption = (
             f"MEASURE ({len(refs)} target{'s' if len(refs) != 1 else ''}):\n"
             + "\n".join(lines)
@@ -307,18 +836,39 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def measure_part(doc_id: Optional[str] = None, density_g_cm3: float = 7.85) -> str:
+    def measure_part(doc_id: Optional[str] = None, density_g_cm3: float = 7.85,
+                     **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Mass properties of the current part: volume (mm^3), mass (g), centre of mass, inertia.
 
-        density_g_cm3 sets the material density used for mass (default 7.85 = steel). Also runs a
-        geometry sanity check (closed/valid solid).
+        density_g_cm3 sets the material density used for mass (default 7.85 = steel). Also
+        accepted as density= / density_g_cc= / material_density= / rho= (echoed in
+        `interpreted`). Also runs a geometry sanity check (closed/valid solid).
 
         Multi-body docs: the top-level volume/mass/com/inertia are the COMBINED total of ALL
         bodies, and `mass.bodies[]` lists each body's own properties (with `mass.body_count`).
         Pass body_id via a direct query if you need just one. (Previously this silently reported
         only the last body of an assembly.)
+
+        A document with no solid says WHICH situation it is — empty, or every feature failed to
+        rebuild — and gives the call that fixes it.
         """
+        d = None
         try:
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            density = _one_alias("measure_part", "density_g_cm3", extra,
+                                 ("density", "density_g_cc", "density_gcm3", "material_density",
+                                  "rho"), None, notes)
+            if density is not None:
+                try:
+                    density_g_cm3 = float(density)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"measure_part(density_g_cm3={density!r}): density is a NUMBER in g/cm^3 "
+                        "(steel 7.85, aluminium 2.70, ABS 1.04). To pick a material by name use "
+                        "set_material instead.") from None
+            _reject_unknown("measure_part", extra,
+                            "it takes doc_id= and density_g_cm3= only.")
             d = _doc(doc_id)
             mass = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": density_g_cm3})
             out = {"ok": True, "doc_id": d, "mass": mass}
@@ -326,17 +876,19 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 out["check"] = cb.call("eval_check", {"doc_id": d})
             except CoreError:
                 pass
-            return _dumps(out)
+            return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_no_bodies(e, d, "measure_part()"))
 
 
 
     # ---------------------------------------------------------------- inspection
 
     @mcp.tool()
-    def measure_between(a_query: Union[str, dict], b_query: Optional[Union[str, dict]] = None,
-                        doc_id: Optional[str] = None) -> str:
+    def measure_between(a_query: Optional[Union[str, dict]] = None,
+                        b_query: Optional[Union[str, dict]] = None,
+                        doc_id: Optional[str] = None,
+                        **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Measure a face/edge — or the distance + angle BETWEEN two of them — in plain words.
 
         This is the engineer's measure/probe tool. Address geometry the same way you do
@@ -353,8 +905,45 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         Each query must resolve to exactly ONE face/edge. If it matches several (e.g. "all the
         vertical edges"), narrow it with a predicate ("pick":"largest"/"side":"top"/…) — call
         query_geometry(query) first to see the candidates. Returns a readable `summary` line.
+
+        ACCEPTED SPELLINGS (echoed in `interpreted`): a= / from= / first= / target= for
+        a_query=, b= / to= / second= for b_query=, and the pair given as one list —
+        measure_between(targets=["top","bottom"]) or a_query=["top","bottom"].
         """
+        d = None
         try:
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            a_query = _one_alias("measure_between", "a_query", extra,
+                                 ("a", "from", "first", "target", "query", "selector"),
+                                 a_query, notes)
+            b_query = _one_alias("measure_between", "b_query", extra,
+                                 ("b", "to", "second"), b_query, notes)
+            pair = _one_alias("measure_between", "a_query/b_query", extra,
+                              ("targets", "refs", "selectors", "queries", "elements"),
+                              None, notes)
+            if pair is not None:
+                if a_query is not None or b_query is not None:
+                    raise ValueError(
+                        "measure_between() got the pair BOTH as a list and as a_query/b_query — "
+                        "pass one form.")
+                a_query = pair
+            if isinstance(a_query, (list, tuple)):
+                items = list(a_query)
+                if not 1 <= len(items) <= 2:
+                    raise ValueError(
+                        f"measure_between(): a list of selectors must hold 1 or 2 entries (got "
+                        f"{len(items)}). For three or more use measure(targets=[…]).")
+                notes.append(f"the selector list {items!r} was split into a_query/b_query")
+                a_query = items[0]
+                b_query = items[1] if len(items) == 2 else b_query
+            _reject_unknown("measure_between", extra,
+                            "it takes a_query=, b_query= and doc_id=.")
+            if a_query is None:
+                raise ValueError(
+                    'measure_between() needs at least a_query= — the face/edge to measure (e.g. '
+                    'a_query="top", or a_query={"of":"edge","pick":"longest"}). Add b_query= to '
+                    "get the distance/angle between two of them.")
             d = _doc(doc_id)
             ref_a = _resolve_one_selector(d, a_query)
             refs = [ref_a]
@@ -385,15 +974,17 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                     out["summary"] = f"volume = {res.get('volume'):.6g} mm^3"
                 else:
                     out["summary"] = f"measured ({kind})"
-            return _dumps(out)
+            return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_no_bodies(e, d, f"measure_between(a_query={a_query!r})"))
 
 
 
     @mcp.tool()
-    def check_interference(doc_id: Optional[str] = None, include_coincident: bool = False,
-                           min_clearance_mm: float = 0.0) -> str:
+    def check_interference(doc_id: Optional[str] = None,
+                           include_coincident: Optional[bool] = None,
+                           min_clearance_mm: Optional[float] = None,
+                           **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?
 
         Runs a pairwise interference analysis over every body in the document (for an assembly
@@ -408,25 +999,48 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         <= 1e-6 mm) as `contacts` entries instead of clearances — the "coincident faces" case
         SolidWorks flags separately (two parts touching exactly, not overlapping or gapped).
         min_clearance_mm: tag any clearance pair tighter than this with a "below min clearance"
-        warning (e.g. flag a press-fit gap that's actually too tight to assemble by hand).
+        warning (e.g. flag a press-fit gap that's actually too tight to assemble by hand). Also
+        accepted as min_clearance= / clearance= / clearance_mm= / min_gap_mm=, and
+        include_coincident= as coincident= / include_contacts= (echoed in `interpreted`).
 
         Returns {ok, summary, parts:[{name,bbox,volume}], interferences:[{a,b,volume}],
         clearances:[{a,b,distance}], contacts:[{a,b,distance}]}. ok is True only when NOTHING
         interferes. A single-body part trivially reports no interference (build a multi-body
         part with the `transform` copy feature, or open an assembly, to get meaningful pairs).
         """
+        d = None
         try:
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            coincident = _one_alias(
+                "check_interference", "include_coincident", extra,
+                ("coincident", "include_contacts", "contacts"), include_coincident, notes)
+            clearance = _one_alias(
+                "check_interference", "min_clearance_mm", extra,
+                ("min_clearance", "clearance", "clearance_mm", "min_gap_mm", "min_gap"),
+                min_clearance_mm, notes)
+            try:
+                min_clearance_mm = 0.0 if clearance is None else float(clearance)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"check_interference(min_clearance_mm={clearance!r}): the minimum "
+                    "clearance is a NUMBER of millimetres, e.g. min_clearance_mm=0.2."
+                ) from None
+            include_coincident = bool(coincident)
+            _reject_unknown("check_interference", extra,
+                            "it takes doc_id=, include_coincident= and min_clearance_mm=.")
             d = _doc(doc_id)
             res = cb.call("eval_interference", {"doc_id": d, "include_coincident": include_coincident,
                                                 "min_clearance_mm": min_clearance_mm})
-            return _dumps({"ok": res.get("ok", True), "doc_id": d, **res})
+            return _dumps(_interpreted({"ok": res.get("ok", True), "doc_id": d, **res}, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_no_bodies(e, d, "check_interference()"))
 
 
 
     @mcp.tool()
-    def check_feature_overlap(doc_id: Optional[str] = None, features: Optional[list] = None) -> str:
+    def check_feature_overlap(doc_id: Optional[str] = None, features: Optional[list] = None,
+                              **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Intra-PART feature-vs-feature overlap — do two of THIS part's own features collide?
 
         Tests each feature's own pre-boolean tool solid (the shape it added/removed BEFORE it
@@ -441,7 +1055,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         ids you just added) instead of the whole tree — add_features already runs this
         automatically on each new batch and surfaces it as `overlap_warnings` in its return, so
         you rarely need to call this yourself right after building; call it explicitly to
-        re-check the whole part or a specific subset.
+        re-check the whole part or a specific subset. A single id on its own (features="f2") is
+        accepted and wrapped into a list, as are feature= / feature_ids= / ids= (echoed in
+        `interpreted`).
 
         Returns {ok, summary, pairs:[{a, b, a_name, b_name, kind, volume_mm3}], dead_features}.
           kind "boss_overlap"   — two ADDITIVE features share volume (often intentional — a
@@ -455,44 +1071,71 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         dead_features: feature ids that built successfully but own NO surviving faces (fully
         consumed by a later op) — a feature silently doing nothing right now.
         """
+        d = None
         try:
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            features = _one_alias("check_feature_overlap", "features", extra,
+                                  ("feature", "feature_ids", "feature_id", "ids", "id"),
+                                  features, notes)
+            if isinstance(features, (str, dict)):
+                notes.append(f"features={features!r} is a single feature — wrapped as a list")
+                features = [features]
+            elif isinstance(features, tuple):
+                features = list(features)
+            _reject_unknown("check_feature_overlap", extra,
+                            "it takes doc_id= and features= (a list of feature ids).")
             d = _doc(doc_id)
             params: dict = {"doc_id": d}
             if features is not None:
                 params["features"] = features
             res = cb.call("eval_feature_overlap", params)
-            return _dumps({"ok": res.get("ok", True), "doc_id": d, **res})
+            return _dumps(_interpreted({"ok": res.get("ok", True), "doc_id": d, **res}, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_no_bodies(e, d, "check_feature_overlap()"))
 
 
 
     @mcp.tool()
-    def check_symmetry(plane: str = "top", doc_id: Optional[str] = None) -> str:
+    def check_symmetry(plane: Optional[str] = None, doc_id: Optional[str] = None,
+                       **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Is the part mirror-symmetric about a principal datum plane? Returns the deviation.
 
         plane : "top" (XY, mirror across Z), "front" (XZ, mirror across Y), or "right" (YZ,
-                mirror across X) — the reserved Chudware datum planes (Z-up).
+                mirror across X) — the reserved Chudware datum planes (Z-up). The plane may be
+                spelled as its axis pair ("XY"/"xz"/"YZ"), as a normal axis ("z"/"+x"), or as
+                about= / datum= / mirror_plane= / about_plane=; every rewrite is echoed in
+                `interpreted`, and an unreadable name lists the three legal planes.
         Mirrors the active body across the plane and measures the symmetric-difference volume.
         Returns {symmetric: bool, deviation_mm3}: symmetric is True when the leftover volume is
         within a tiny tolerance (1e-3 of the part volume). Handy to confirm a feature you meant
         to place symmetrically really is, or to pick a sensible mirror plane.
         """
+        d = None
         try:
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            plane = _one_alias("check_symmetry", "plane", extra,
+                               ("about", "about_plane", "datum", "datum_plane", "mirror_plane",
+                                "plane_name", "axis"), plane, notes)
+            _reject_unknown("check_symmetry", extra, "it takes plane= and doc_id=.")
+            plane = _read_plane("check_symmetry", plane, notes)
             d = _doc(doc_id)
             res = cb.call("eval_symmetry", {"doc_id": d, "plane": plane})
             sym = res.get("symmetric")
             dev = res.get("deviation_mm3")
             summary = (f"symmetric about plane '{plane}' (deviation {dev:.4g} mm^3)" if sym
                        else f"NOT symmetric about plane '{plane}' (deviation {dev:.4g} mm^3)")
-            return _dumps({"ok": True, "doc_id": d, "plane": plane, "summary": summary, **res})
+            return _dumps(_interpreted(
+                {"ok": True, "doc_id": d, "plane": plane, "summary": summary, **res}, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_no_bodies(e, d, f'check_symmetry(plane="{plane or "top"}")'))
 
 
 
     @mcp.tool()
-    def inspect_section(plane: str = "top", doc_id: Optional[str] = None) -> str:
+    def inspect_section(plane: Optional[str] = None, doc_id: Optional[str] = None,
+                        **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Cut the part with a datum plane and report the CROSS-SECTION area + section moments.
 
         This is the "section the part to inspect its internals" probe. It slices the active
@@ -501,6 +1144,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
         plane : "top" (XY, normal +Z), "front" (XZ, normal -Y), or "right" (YZ, normal +X) —
                 the reserved Chudware datum planes (Z-up). The cut passes through the origin.
+                Spellable as its axis pair ("XY"/"xz"/"YZ"), as a normal axis ("z"/"+x"), or as
+                section= / at= / datum= / plane_name= — every rewrite is echoed in
+                `interpreted`, and an unreadable name lists the three legal planes instead of
+                dying on "not a reserved planar datum".
 
         Returns {ok, area_mm2, centroid:[x,y,z], Ixx, Iyy, Ixy, summary}:
           * area_mm2 — the cross-section area (mm^2), the headline number. For a solid this is
@@ -511,7 +1158,15 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         Use it to verify a beam's cross-section, check a wall's cut area, or feed a hand
         bending calc. A plane that misses the body (empty cut) returns area 0.
         """
+        d = None
         try:
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            plane = _one_alias("inspect_section", "plane", extra,
+                               ("section", "section_plane", "at", "datum", "datum_plane",
+                                "plane_name", "axis"), plane, notes)
+            _reject_unknown("inspect_section", extra, "it takes plane= and doc_id=.")
+            plane = _read_plane("inspect_section", plane, notes)
             d = _doc(doc_id)
             res = cb.call("eval_section_props", {"doc_id": d, "plane": plane})
             area = res.get("area_mm2", 0.0)
@@ -519,10 +1174,14 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 summary = f"cross-section area at plane '{plane}' = {area:.6g} mm^2"
             else:
                 summary = (f"plane '{plane}' produced no closed cross-section (the cut may miss "
-                           f"the body or only graze an edge) — area = 0")
-            return _dumps({"ok": True, "doc_id": d, "plane": plane, "summary": summary, **res})
+                           f"the body or only graze an edge) — area = 0. The cut always passes "
+                           f"through the ORIGIN, so a part modelled away from it sections empty: "
+                           f"check where the body sits with measure_part (centre of mass) and "
+                           f"try another plane, e.g. inspect_section(plane=\"front\").")
+            return _dumps(_interpreted(
+                {"ok": True, "doc_id": d, "plane": plane, "summary": summary, **res}, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_no_bodies(e, d, f'inspect_section(plane="{plane or "top"}")'))
 
 
 
@@ -544,6 +1203,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         Compare min_thickness_mm against your process minimum (e.g. ~1 mm injection wall,
         ~0.8 mm FDM) to flag thin spots before manufacturing.
         """
+        d = None
         try:
             d = _doc(doc_id)
             res = cb.call("eval_thickness", {"doc_id": d})
@@ -554,16 +1214,21 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                            + (f" (mean {mean:.4g} mm)" if mean is not None else ""))
             else:
                 summary = ("no through-wall thickness could be measured (open/sheet body, or no "
-                           "opposite wall in line of sight)")
+                           "opposite wall in line of sight) — every inward ray left the material "
+                           f"without hitting a far wall. Confirm {d} really holds a closed solid "
+                           "with measure_part (a valid solid reports a volume), and if the part "
+                           "is meant to be hollow, shell it first (add_features with a shell op) "
+                           "so there ARE two walls to measure between.")
             return _dumps({"ok": True, "doc_id": d, "summary": summary, **res})
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_no_bodies(e, d, "wall_thickness()"))
 
 
 
     @mcp.tool()
     def draft_analysis(pull_dir: Optional[list] = None, min_draft_deg: float = 3.0,
-                       doc_id: Optional[str] = None) -> str:
+                       doc_id: Optional[str] = None,
+                       **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Moldability check: which faces lack enough DRAFT to release from the mold?
 
         For a given mold-pull (ejection) direction it measures each face's draft angle — how far
@@ -571,8 +1236,16 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         min_draft_deg would drag on the tool during ejection and need a draft feature added.
 
         pull_dir : the mold-opening / ejection direction as [x,y,z] (defaults to +Z, [0,0,1]).
+                   A signed axis or side word is accepted too — "+z"/"-z"/"x"/"bottom"/"front" —
+                   and the SIGN is kept (pulling -Z is not the same question as +Z). Also
+                   spellable as pull= / direction= / pull_direction= / ejection_dir= / axis=.
+                   A malformed vector (two components, a non-number) is now an error naming the
+                   accepted forms: it used to be replaced by [0,0,1] in silence, so the answer
+                   described a different pull than the one asked about.
         min_draft_deg : the minimum acceptable draft angle in degrees (default 3°, a common
-                        injection-molding minimum).
+                        injection-molding minimum). Also angle_deg= / min_angle= / draft_deg= /
+                        threshold_deg= / min_draft=.
+        Every rewrite is echoed back in `interpreted`.
 
         Returns {ok, min_draft_deg, max_draft_deg, threshold_deg, n_faces_below_threshold,
         faces_below_threshold:[{face_id, min_draft_deg, area_mm2, centroid}], aicm_path,
@@ -580,10 +1253,29 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         mold along that direction). The faces_below_threshold list (centroid + area) tells you
         WHERE to add draft. aicm_path is the colour-map field for the in-app viewer.
         """
+        d = None
         try:
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            pull_dir = _one_alias("draft_analysis", "pull_dir", extra,
+                                  ("pull", "direction", "pull_direction", "ejection_dir",
+                                   "eject_dir", "axis", "dir"), pull_dir, notes)
+            angle = _one_alias("draft_analysis", "min_draft_deg", extra,
+                               ("angle_deg", "min_angle", "min_angle_deg", "draft_deg",
+                                "threshold_deg", "min_draft", "draft_angle"), None, notes)
+            _reject_unknown("draft_analysis", extra,
+                            "it takes pull_dir=, min_draft_deg= and doc_id=.")
+            if angle is not None:
+                try:
+                    min_draft_deg = float(angle)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"draft_analysis(min_draft_deg={angle!r}): the draft minimum is a NUMBER "
+                        "of degrees, e.g. min_draft_deg=3.") from None
+            pull = list(_read_direction("draft_analysis", "pull_dir", pull_dir, (0.0, 0.0, 1.0)))
+            if isinstance(pull_dir, str):
+                notes.append(f"pull_dir={pull_dir!r} read as the direction {pull}")
             d = _doc(doc_id)
-            pull = pull_dir if (isinstance(pull_dir, (list, tuple)) and len(pull_dir) == 3) \
-                else [0.0, 0.0, 1.0]
             res = cb.call("eval_draft",
                           {"doc_id": d, "pull": [float(x) for x in pull],
                            "angle_deg": float(min_draft_deg)})
@@ -594,8 +1286,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                            f"moldable in that direction")
             else:
                 summary = (f"{n_bad} face(s) below the {thr:g}deg draft minimum along pull "
-                           f"{list(pull)} — add draft there before molding")
-            return _dumps({"ok": True, "doc_id": d, "pull_dir": list(pull),
-                           "summary": summary, **res})
+                           f"{list(pull)} — add draft there before molding: add_features with a "
+                           f'{{"type":"draft"}} op on those faces (their centroids are in '
+                           f"faces_below_threshold), then re-run draft_analysis")
+            return _dumps(_interpreted({"ok": True, "doc_id": d, "pull_dir": list(pull),
+                                        "summary": summary, **res}, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _err(_teach_no_bodies(e, d, "draft_analysis()"))

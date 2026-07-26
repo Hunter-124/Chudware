@@ -1092,6 +1092,22 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
             throw OpError("invalid_op", msg);
         }
     }
+    // SHAPE, not intent: wrap a single value handed to a list-form ref slot
+    // ("profile":"$0" -> ["$0"]). The validator typed those slots as lists while
+    // the compiler happily consumes a bare id, so the scalar form every model
+    // writes cost an entire rejected batch for nothing — a live Opus run lost one
+    // to exactly this while following cad_guide('sketch') to the letter. Owned by
+    // validate.cpp so it is driven by the same FEATURE_TYPES table it satisfies.
+    //
+    // Deliberately SILENT, unlike the dialect rewrites in cad_doc_tools.py which
+    // all echo an `interpreted` note. Those can change what gets BUILT, so the
+    // model must see them. This one cannot: a list slot given one value has
+    // exactly one possible meaning. Pinned by "a scalar in a list-form ref slot
+    // equals the one-element list" in core/tests/test_document.cpp — if that
+    // equivalence ever breaks, the rewrite has become a semantic guess and MUST
+    // start reporting itself. Param defaults live in the Python layer for the
+    // same reason; see the scope note on normalize_feature_shape.
+    normalize_feature_shape(env);
     resolve_placeholders_deep(env["params"], id_map);
     resolve_placeholders_deep(env["refs"], id_map);
 

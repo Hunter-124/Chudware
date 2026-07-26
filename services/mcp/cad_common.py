@@ -1883,22 +1883,34 @@ def _resolve_feature_ref(doc_id: str, ref, feats: Optional[list] = None,
 
 
 # ------------------------------------------------- what a feature actually CREATED (vs re-cut)
-# A boolean CUT re-creates every face its tool solid passes through, and OCCT attributes those
-# REGENERATED faces to the CUTTING feature. So doc_tree's owner_map hands an 8 mm through-bore
-# the plate's whole 9399 mm^2 bottom face — a caller that frames or tints "the bore" lights up
-# the entire part. The kernel's real provenance (CompileResult::tool_recs, the pre-boolean tool
-# solid per feature) never leaves C++: doc_query's per-face `owner_feature` is hardcoded null
+# Every boolean RE-CREATES the neighbour faces its tool touches, and OCCT credits those
+# regenerated faces to the feature that ran the boolean. The smear runs in BOTH directions:
+# a CUT is handed the faces it merely pierced (an r8 through-bore owns the plate's whole
+# 9399 mm^2 top and bottom face) and a FUSE is handed the faces it merely landed on (an r18
+# boss owns the plate's 8582 mm^2 top; a 25 mm spout owns a bucket's 309048 mm^2 outer wall).
+# A caller that frames, tints or narrates "the boss" then lights up the entire part.
+#
+# The kernel's real provenance (CompileResult::tool_recs, the pre-boolean tool solid per
+# feature) never leaves C++: doc_query's per-face `owner_feature` is hardcoded null
 # (core/doc/picks.cpp), and eval_feature_overlap only reports pairwise common VOLUME between
-# tool solids, never per-face membership. So the tool footprint is reconstructed here from the
-# feature's OWN surviving faces, which is exact enough to be decisive:
+# tool solids, never per-face membership. So ownership is reconstructed here from the two
+# things Python CAN see, cheapest first:
 #
-#   a subtractive tool is a prism/revolve along an axis. Its LATERAL faces (the hole wall, the
-#   pocket walls) run ALONG that axis and are always genuinely new. Its CAP faces run ACROSS it
-#   and are either the tool's own floor — which fits INSIDE the lateral footprint — or a
-#   pre-existing neighbour the tool merely punched through, which does not.
+#   1. TOOL SCALE, from the AUTHORED params — no RPC. A feature's tool cannot create a face
+#      larger than its own cross-section: an r25 spout did not author an r165 wall, an r18
+#      boss did not author an 8582 mm^2 plane. A feature type with no analytic cross-section
+#      (extrude/revolve/loft/sweep/shell/fillet) has no scale and is left alone.
+#   2. TOOL FOOTPRINT, from the real tessellation. A prism/revolve tool's LATERAL faces run
+#      ALONG its axis and are always genuinely new; its CAP faces run ACROSS it and are either
+#      the tool's own floor/top — which fits INSIDE the lateral footprint — or a neighbour it
+#      merely punched through or landed on, which does not. This decides what (1) cannot: an
+#      r50 bore through a 120x80 plate leaves a 1746 mm^2 top face, SMALLER than the tool's own
+#      7854 mm^2 cross-section, so only the footprint can tell it is not the bore's.
 #
-# Nothing here can invent geometry: it only ever drops faces from the owner_map join, never
-# returns an empty set, and leaves additive features exactly as they were.
+# Neither test can invent geometry: they only ever drop faces from the owner_map join. A face
+# dropped from its claimed owner is re-credited to the latest EARLIER feature whose tool could
+# have authored it, and left unowned when none could — faces are conserved, never duplicated,
+# and a feature left with nothing is reported as owning nothing rather than back-filled.
 
 # Feature types that remove material outright — no `mode` param to read.
 _SUBTRACTIVE_TYPES = frozenset({"hole", "bolt_circle"})
@@ -1947,6 +1959,89 @@ def _feature_is_subtractive(feat, feats: Optional[list] = None, _depth: int = 0)
     return False
 
 
+# A feature type that never owns solid faces (references/sketches) — never a candidate owner.
+_NON_BODY_FEATURE_TYPES = frozenset({"sketch", "plane", "axis", "point", "csys"})
+_TOOL_SCALE_EPS = 1.02  # slack for tessellation/imprint noise on an exact-size match
+
+
+def _solid_feature_order(feats: Optional[list]) -> list:
+    """Feature ids in tree order, skipping sketches/datums — the only features that can own a
+    face, and the order the de-smear walks BACKWARDS when it re-credits one."""
+    return [str(f.get("id")) for f in (feats or [])
+            if isinstance(f, dict) and f.get("id")
+            and f.get("type") not in _NON_BODY_FEATURE_TYPES]
+
+
+def _dim_num(v) -> Optional[float]:
+    """A dimension param's number, from {"value":..,"expr":..} or a bare number."""
+    if isinstance(v, dict):
+        v = v.get("value")
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _feature_tool_scale(ft) -> Optional[dict]:
+    """{"radius": largest curved radius this tool can produce (0.0 = none at all),
+        "plane_area": largest planar face this tool can produce}, from the AUTHORED params.
+    None for a feature type whose tool has no analytic cross-section — such a feature is
+    unconstrained and keeps whatever the kernel attributed to it."""
+    if not isinstance(ft, dict):
+        return None
+    t = (ft.get("type") or "").lower()
+    p = ft.get("params") or {}
+    if not isinstance(p, dict):
+        return None
+
+    def _radius(*keys) -> Optional[float]:
+        vals = [_dim_num(p.get(k)) for k in keys]
+        vals = [v for v in vals if v is not None]
+        return max(vals) if vals else None
+
+    if t == "box":
+        length, width, height = (_dim_num(p.get(k)) for k in ("length", "width", "height"))
+        if None in (length, width, height):
+            return None
+        # A box tool's boundary is entirely planar: it cannot author a curved face.
+        return {"radius": 0.0,
+                "plane_area": max(length * width, length * height, width * height)}
+    if t in ("cylinder", "sphere"):
+        r = _radius("radius")
+        if r is None:
+            d = _dim_num(p.get("diameter"))
+            r = d / 2.0 if d is not None else None
+    elif t == "cone":
+        r = _radius("radius", "radius1", "radius2", "radius_bottom", "radius_top")
+    elif t == "torus":
+        major, minor = _radius("radius", "major_radius"), _radius("radius2", "minor_radius")
+        r = (major + minor) if (major is not None and minor is not None) else None
+    elif t in ("hole", "bolt_circle"):
+        # The widest authored diameter wins: a counterbore/countersink is wider than the drill.
+        ds = [_dim_num(v) for k, v in p.items() if "diameter" in str(k).lower()]
+        ds = [d for d in ds if d is not None]
+        rs = [_dim_num(v) for k, v in p.items() if str(k).lower().endswith("radius")]
+        rs = [x for x in rs if x is not None] + [d / 2.0 for d in ds]
+        r = max(rs) if rs else None
+    else:
+        return None
+    if r is None or r <= 0.0:
+        return None
+    return {"radius": r, "plane_area": math.pi * r * r}
+
+
+def _tool_scale_accepts(scale: Optional[dict], f: dict) -> bool:
+    """Could this feature's tool have created this face? Necessary condition only."""
+    if not scale:
+        return True
+    if (f.get("surf") or "plane") != "plane":
+        r, rt = f.get("radius"), scale.get("radius")
+        if r is None or rt is None:
+            return True  # no size cue on either side — keep, never guess a face away
+        return r <= rt * _TOOL_SCALE_EPS + 1e-6
+    a, pa = f.get("area_or_len"), scale.get("plane_area")
+    if a is None or pa is None:
+        return True
+    return a <= pa * _TOOL_SCALE_EPS + 1e-6
+
+
 def _perp_basis(axis) -> tuple:
     """Two unit vectors spanning the plane perpendicular to `axis`."""
     a = _vnorm(axis)
@@ -1970,21 +2065,58 @@ def _face_world_points(doc_id: str, match: dict) -> list:
             if isinstance(p, (list, tuple)) and len(p) >= 3]
 
 
-def _cut_axis_survivors(matches: list, clouds: list, axis) -> Optional[tuple]:
-    """({kept indices}, dropped_area) reading `axis` as the tool's extrusion/revolution axis,
-    or None when that reading explains nothing (no lateral wall, no cap, or nothing to drop)."""
+_FACE_CLOUD_CACHE: dict = {}      # doc_id -> (revision token, {sid: [(x,y,z), ...]})
+
+
+def _face_cloud_memo(doc_id: str) -> dict:
+    """The {sid: world points} memo for `doc_id`, emptied whenever the model changes.
+
+    doc_face_points costs ~3.5 ms a face (it re-samples the triangulation), and a whole-document
+    attribution asks for several. The engine's tessellation handle carries the revision — the
+    same invalidation trick _doc_mesh uses — so an edit empties this by itself and a describe/
+    inspect/render burst over one unchanged model pays for each face exactly once."""
+    try:
+        rb = cb.call("doc_rebuild", {"doc_id": doc_id}) or {}
+        token = ((rb.get("tess") or {}).get("aicm_path")) or None
+    except Exception:  # noqa: BLE001
+        token = None
+    if token is None:
+        return {}                 # no revision to key on — never serve a stale cloud
+    cached = _FACE_CLOUD_CACHE.get(doc_id)
+    if cached and cached[0] == token:
+        return cached[1]
+    memo: dict = {}
+    _FACE_CLOUD_CACHE.clear()     # one document at a time, like _MESH_CACHE
+    _FACE_CLOUD_CACHE[doc_id] = (token, memo)
+    return memo
+
+
+def _axis_reading(matches: list, axis) -> tuple:
+    """(lateral indices, cap indices) reading `axis` as the tool's extrusion/revolution axis.
+
+    A curved face is never a cap: a cylinder/cone/spline wall cannot be the flat neighbour a
+    prism punched through. Cheap — match records only, so a caller can rule an axis out before
+    paying for tessellation."""
     a = _vnorm(axis)
     lateral: list = []
     caps: list = []
     for i, m in enumerate(matches):
         if str(m.get("surf") or "").strip().lower() != "plane":
-            lateral.append(i)          # a cylinder/cone/spline wall is never a pierced cap
+            lateral.append(i)
             continue
         n = _vnorm(m.get("normal") or m.get("axis") or (0.0, 0.0, 1.0))
         (caps if abs(_vdot(n, a)) > 0.7 else lateral).append(i)
+    return lateral, caps
+
+
+def _cut_axis_survivors(matches: list, clouds: list, axis) -> Optional[tuple]:
+    """({kept indices}, dropped_area) reading `axis` as the tool's extrusion/revolution axis,
+    or None when that reading explains nothing (no lateral wall, no cap, or nothing to drop)."""
+    lateral, caps = _axis_reading(matches, axis)
     if not lateral or not caps:
         return None
 
+    a = _vnorm(axis)
     u, v = _perp_basis(a)
     us = [_vdot(p, u) for i in lateral for p in clouds[i]]
     vs = [_vdot(p, v) for i in lateral for p in clouds[i]]
@@ -2018,32 +2150,41 @@ def _dedupe_axes(axes: list) -> list:
 
 
 def _created_face_matches(doc_id: str, feat, matches: list,
-                          feats: Optional[list] = None) -> list:
-    """The subset of a feature's owner_map FACE matches that the feature actually CREATED.
+                          feats: Optional[list] = None,
+                          cloud_memo: Optional[dict] = None) -> list:
+    """The subset of `matches` that feature `feat` demonstrably CREATED — the ONE de-smear
+    implementation in this codebase. _face_attribution drives it over a whole document, and
+    describe_part, the inspect/render targeting join and the callout roster all go through
+    that, so there is a single place where a face is judged.
 
-    Additive features are returned untouched — a boss ADDS its faces, so owner_map is right.
-    For a subtractive feature (mode cut, type hole/bolt_circle, boolean cut, or a pattern/mirror
-    of one) the tool axis is recovered from the feature's own faces — a curved wall states its
-    axis outright, an all-planar pocket yields candidate axes as the cross products of its wall
-    normals — and the reading that explains the MOST regenerated area wins. Faces across that
-    axis are kept only when they fit inside the lateral walls' footprint, so a blind hole keeps
-    its floor and a through-bore keeps only its wall.
+    Both tests from the section note above, cheapest first:
+      * TOOL SCALE — authored params, no RPC. Fires for a FUSE exactly as for a CUT.
+      * TOOL FOOTPRINT — real tessellation. The tool axis is recovered from the feature's own
+        faces (a curved wall states it outright; an all-planar pocket yields candidate axes as
+        the cross products of its wall normals) and the reading that explains the MOST
+        regenerated area wins, so a blind hole keeps its floor and a through-bore keeps only
+        its wall. Skipped for the FIRST solid feature in `feats`: it authored the body, so
+        there is no earlier geometry it could have regenerated — and every cap it would test
+        costs a doc_face_points round trip.
 
-    Conservative by construction: same dicts, same doc_query order, never empty, and any
-    ambiguity (one face, missing tessellation, no axis that explains anything) returns `matches`
-    unchanged rather than guessing.
+    Returns a subset of the SAME dicts in the SAME order, possibly EMPTY: a feature whose every
+    claimed face belongs to something earlier owns nothing, and saying so is the honest answer.
+    Ambiguity is still never resolved by guessing — no analytic tool scale and no usable
+    tessellation leaves the matches untouched.
     """
-    if len(matches) < 2 or not _feature_is_subtractive(feat, feats):
-        return matches
-    if any((m.get("kind") or "face") != "face" for m in matches):
-        return matches
-
-    clouds = [_face_world_points(doc_id, m) for m in matches]
-    if any(len(c) < 3 for c in clouds):
-        return matches                # no real geometry to judge with — leave the join alone
+    if not matches:
+        return []
+    ft = feat if isinstance(feat, dict) else {}
+    scale = _feature_tool_scale(ft)
+    kept = [m for m in matches if _tool_scale_accepts(scale, m)] if scale else list(matches)
+    if len(kept) < 2 or any((m.get("kind") or "face") != "face" for m in kept):
+        return kept
+    order = _solid_feature_order(feats)
+    if order and order[0] == str(ft.get("id")):
+        return kept
 
     cands = []
-    for m in matches:
+    for m in kept:
         if str(m.get("surf") or "").strip().lower() == "plane":
             continue
         ax = _v3(m.get("axis"))
@@ -2052,52 +2193,162 @@ def _created_face_matches(doc_id: str, feat, matches: list,
     if not cands:
         # All-planar tool (box cut / rectangular pocket or slot): the axis is perpendicular to
         # two non-parallel wall normals.
-        normals = [_vnorm(m.get("normal") or m.get("axis") or (0.0, 0.0, 1.0)) for m in matches]
+        normals = [_vnorm(m.get("normal") or m.get("axis") or (0.0, 0.0, 1.0)) for m in kept]
         for i in range(len(normals)):
             for j in range(i + 1, len(normals)):
                 c = _vcross(normals[i], normals[j])
                 if _vdot(c, c) > 0.04:          # >~11 deg apart
                     cands.append(_vnorm(c))
-
-    best = None
+    axes = []
     for ax in _dedupe_axes(cands):
-        got = _cut_axis_survivors(matches, clouds, ax)
+        lat, caps = _axis_reading(kept, ax)
+        if lat and caps:
+            axes.append(ax)
+    if not axes:
+        return kept        # no reading has both a wall and a cap — nothing tessellation adds
+
+    memo = _face_cloud_memo(doc_id) if cloud_memo is None else cloud_memo
+    clouds = []
+    for m in kept:
+        sid = m.get("sid")
+        if sid is None:
+            clouds.append(_face_world_points(doc_id, m))
+            continue
+        if sid not in memo:
+            memo[sid] = _face_world_points(doc_id, m)
+        clouds.append(memo[sid])
+    if any(len(c) < 3 for c in clouds):
+        return kept        # no real geometry to judge with — leave the join alone
+    best = None
+    for ax in axes:
+        got = _cut_axis_survivors(kept, clouds, ax)
         if got is not None and (best is None or got[1] > best[1]):
             best = got
     if best is None:
-        return matches
-    kept = [m for i, m in enumerate(matches) if i in best[0]]
-    return kept or matches
+        return kept
+    return [m for i, m in enumerate(kept) if i in best[0]]
+
+
+def _face_attribution(doc_id: str, feats: Optional[list] = None,
+                      owner_map: Optional[dict] = None,
+                      faces: Optional[list] = None) -> dict:
+    """Who owns each face of the LAST body, de-smeared — the one feature->face join.
+
+    owner_map keys each feature's topology as [body_id, topo_id] (1-based TopExp index) and
+    doc_query enumerates the same body in the same first-encounter order, so topo_id ==
+    match_index + 1. The join is taken against the highest body_id owner_map mentions: a
+    feature whose only pairs sit on a superseded body was consumed by a later boolean and owns
+    nothing addressable now, and joining its stale topo ids against the live body would frame
+    the WRONG faces.
+
+    Each feature's claimed faces then go through _created_face_matches. A face it did not
+    create is re-credited to the latest EARLIER feature whose tool could have authored it, and
+    left unowned when none could.
+
+    Returns {
+      "faces":   [match, ...] in doc_query order — index i is topo id i+1 on "last_body",
+      "owner":   [feature_id | None, ...] parallel to "faces" — the de-smeared partition,
+      "owned":   {feature_id: [match, ...]} — that partition grouped, INCLUDING faces
+                 re-credited from a later feature. The "who owns this face" view describe_part
+                 narrates.
+      "created": {feature_id: [match, ...]} — only the faces the feature itself claimed AND
+                 kept. The "what did this feature add" view framing/tinting/callouts need: a
+                 plate must not grow a top face just because the bore that pierced it handed
+                 the face back. Empty (or absent) is a real answer.
+      "claimed": {feature_id: int} — the raw owner_map face count on the live body, so a caller
+                 can report honestly how many faces it moved,
+      "reattributed": int — faces moved to a different feature,
+      "last_body": int}
+    """
+    if feats is None or owner_map is None:
+        feats, owner_map = _target_feature_roster(doc_id)
+    owner_map = owner_map or {}
+    if faces is None:
+        try:
+            faces = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
+                     or {}).get("matches") or []
+        except Exception:  # noqa: BLE001
+            faces = []
+
+    last_body = 0
+    for om in owner_map.values():
+        for pair in (om.get("faces") or []):
+            if isinstance(pair, list) and len(pair) == 2:
+                last_body = max(last_body, int(pair[0]))
+    if last_body <= 0:            # a face-less tree (sketches/datums only) still has edges
+        for om in owner_map.values():
+            for pair in (om.get("edges") or []):
+                if isinstance(pair, list) and len(pair) == 2:
+                    last_body = max(last_body, int(pair[0]))
+
+    by_id = {str(f.get("id")): f for f in (feats or [])
+             if isinstance(f, dict) and f.get("id")}
+    order = _solid_feature_order(feats)
+    rank = {fid: i for i, fid in enumerate(order)}
+    scales = {fid: _feature_tool_scale(by_id.get(fid)) for fid in order}
+
+    claimed_idx: dict = {}
+    owner: list = [None] * len(faces)
+    for fid, om in owner_map.items():
+        for pair in (om.get("faces") or []):
+            if not (isinstance(pair, list) and len(pair) == 2 and int(pair[0]) == last_body):
+                continue
+            i = int(pair[1]) - 1
+            if 0 <= i < len(faces):
+                claimed_idx.setdefault(str(fid), []).append(i)
+                owner[i] = str(fid)
+
+    created: dict = {}
+    reattributed = 0
+    cloud_memo = _face_cloud_memo(doc_id)
+    for fid, idxs in claimed_idx.items():
+        idxs.sort()
+        mine = [faces[i] for i in idxs]
+        if fid not in rank:
+            # Not a solid feature in the tree: no authored tool to reason about, no tree
+            # position to walk back from. Leave the kernel's answer alone.
+            created[fid] = mine
+            continue
+        kept = _created_face_matches(doc_id, by_id.get(fid), mine, feats, cloud_memo)
+        keep_ids = {id(m) for m in kept}
+        created[fid] = [m for m in mine if id(m) in keep_ids]
+        for i in idxs:
+            if id(faces[i]) in keep_ids:
+                continue
+            owner[i] = None
+            for j in range(rank[fid] - 1, -1, -1):
+                if _tool_scale_accepts(scales.get(order[j]), faces[i]):
+                    owner[i] = order[j]
+                    reattributed += 1
+                    break
+
+    owned: dict = {}
+    for i, f in enumerate(faces):
+        if owner[i]:
+            owned.setdefault(owner[i], []).append(f)
+    return {"faces": faces, "owner": owner, "owned": owned, "created": created,
+            "claimed": {fid: len(idxs) for fid, idxs in claimed_idx.items()},
+            "reattributed": reattributed, "last_body": last_body}
 
 
 def _owned_matches_for(doc_id: str, fid: str, label: str, owner_map: dict,
                        feats: Optional[list] = None) -> list:
-    """doc_query matches for the geometry a feature owns — its FACES, exactly the set
-    describe_part's feature_groups reports, falling back to owned edges only for a feature that
-    ended up with no surviving face.
+    """doc_query matches for the geometry a feature CREATED — _face_attribution's `created`
+    view — falling back to owned edges only for a feature that ended up with no surviving face.
 
-    owner_map keys each feature's topology as [body_id, topo_id] (1-based); doc_query enumerates
-    the LAST body in first-encounter order, so topo_id == match_index + 1 on that body — the same
-    join describe_part uses (gsl_tools._digest). The last body is taken across the WHOLE
-    owner_map, not just this feature's pairs: a feature whose only pairs sit on a superseded body
-    was consumed by a later boolean and owns nothing addressable now, and joining its stale topo
-    ids against the live body would silently frame the WRONG faces.
+    `created`, not `owned`: this feeds framing, tinting and measurement of ONE feature, so the
+    plate must not grow a top face just because the bore that pierced it handed the face back.
 
     Edges are deliberately excluded while faces exist. A fuse RE-CREATES the neighbour edges it
     splits and the kernel attributes them to the new feature, so a 36 mm boss "owns" the plate's
     102 mm top edges; framing on those blew the target bbox out past the whole part (151x131x102
     on a 138x98x33 model) and the close-up degenerated into a whole-part render.
 
-    Owned faces are finally passed through _created_face_matches, which drops the neighbour
-    faces a CUT merely punched through and re-attributed to itself (see that function). `feats`
-    is the doc_tree roster — needed to read the feature's add/cut role, and to follow a
-    pattern/mirror to its seed; without it every feature is treated as additive.
+    `feats` is the doc_tree roster — needed to read each feature's authored tool and its tree
+    position; without it a feature is judged with no earlier candidate to hand a face back to.
     """
-    last_body = 0
-    for om_any in (owner_map or {}).values():
-        for pair in (om_any.get("faces") or []) + (om_any.get("edges") or []):
-            if isinstance(pair, list) and len(pair) == 2:
-                last_body = max(last_body, int(pair[0]))
+    att = _face_attribution(doc_id, feats, owner_map)
+    last_body = att["last_body"]
     if last_body <= 0:
         raise ValueError(
             f"{label}: the document tree records no owned topology at all (owner_map is empty). "
@@ -2114,26 +2365,21 @@ def _owned_matches_for(doc_id: str, fid: str, label: str, owner_map: dict,
             f"it, so there is nothing to frame. describe_part(doc_id) marks consumed features "
             f"and lists the sids that DO still exist.")
 
-    out: list = []
-    if face_topos:
-        faces = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
-                 .get("matches") or [])
-        for i, m in enumerate(faces):
-            if (i + 1) in face_topos:
-                out.append(m)
-        feat = next((f for f in (feats or [])
-                     if isinstance(f, dict) and str(f.get("id")) == fid), None)
-        out = _created_face_matches(doc_id, feat, out, feats)
+    out = list(att["created"].get(fid) or [])
     if not out and edge_topos:
         edges = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "edge"}})
                  .get("matches") or [])
-        for i, m in enumerate(edges):
-            if (i + 1) in edge_topos:
-                out.append(m)
+        out = [m for i, m in enumerate(edges) if (i + 1) in edge_topos]
     if not out:
+        feat = next((f for f in (feats or [])
+                     if isinstance(f, dict) and str(f.get("id")) == fid), None)
+        verb = "cut" if _feature_is_subtractive(feat, feats) else "fuse"
         raise ValueError(
-            f"{label} is in the tree but none of its owned topology resolved on body "
-            f"{last_body} — the model changed under it. Re-read describe_part(doc_id).")
+            f"{label} created no face of its own: every one of the {len(face_topos)} face(s) "
+            f"the kernel credited to it already existed — a {verb} regenerates the faces its "
+            f"tool touches and OCCT re-attributes them to the {verb} — so there is nothing of "
+            f"its own to frame. describe_part(doc_id) says which feature owns those faces; "
+            f"inspect that feature by name, or one of its sids.")
     return out
 
 
@@ -3292,43 +3538,26 @@ def _doc_topo_maps(doc_id: str) -> dict:
 
 
 def _feature_roster(doc_id: str) -> list:
-    """[{id, name, type, face_topos}] for the LAST body — the doc_tree roster joined to
-    owner_map's feature->topology table (the same join _feature_owned_matches uses), reshaped
-    for the render overlay so a callout can be drawn on the faces a feature actually owns.
+    """[{id, name, type, face_topos}] for the LAST body — _face_attribution's `created` view
+    reshaped for the render overlay, so a callout is drawn on the faces a feature actually
+    made rather than on every face the kernel credited to it.
 
     Owned EDGES are deliberately dropped: a fuse re-creates the neighbour edges it splits and
     the kernel attributes them to the NEW feature, so an edge-derived anchor lands on unrelated
-    geometry. Faces carry the same smear after a CUT, so the owned set is run through
-    _created_face_matches first — a bore is left with its wall, not with the host faces it
-    punched through. The callout still anchors on the SMALLEST visible owned face (the most
-    specific one) for the additive smear that filter deliberately leaves alone."""
+    geometry. A feature left owning no face of its own gets NO callout, rather than a callout
+    parked on somebody else's face. The callout still anchors on the SMALLEST visible owned
+    face — the most specific one."""
     feats, owner_map = _target_feature_roster(doc_id)
-    body = 0
-    for om in owner_map.values():
-        for pair in (om.get("faces") or []) + (om.get("edges") or []):
-            if isinstance(pair, list) and len(pair) == 2:
-                body = max(body, int(pair[0]))
-    try:
-        face_matches = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
-                        or {}).get("matches") or []
-    except Exception:  # noqa: BLE001
-        face_matches = []
+    att = _face_attribution(doc_id, feats, owner_map)
+    sid_topo = {id(m): i + 1 for i, m in enumerate(att["faces"])}
     out = []
     for f in feats:
         if f.get("suppressed"):
             continue
         fid = f.get("id")
-        om = owner_map.get(fid) or {}
-        topos = {int(p[1]) for p in (om.get("faces") or [])
-                 if isinstance(p, list) and len(p) == 2 and int(p[0]) == body}
+        topos = {sid_topo[id(m)] for m in (att["created"].get(fid) or [])}
         if not topos:
             continue
-        joined = [(t, face_matches[t - 1]) for t in sorted(topos)
-                  if 1 <= t <= len(face_matches)]
-        if len(joined) == len(topos):
-            kept = _created_face_matches(doc_id, f, [m for _t, m in joined], feats)
-            keep_ids = {id(m) for m in kept}
-            topos = {t for t, m in joined if id(m) in keep_ids} or topos
         out.append({"id": fid, "name": f.get("name") or f.get("type") or fid,
                     "type": f.get("type"), "face_topos": topos})
     return out

@@ -455,8 +455,6 @@ void drawForgingAnimation(float box) {
     ImGui::Dummy(ImVec2(box, box));
 }
 
-
-
 // A "bubble" = an auto-height child painted over an explicit glassPanel fill, ported from
 // ui/imgui/src/ui/agent_panel.cpp's GlassBubble. The child's true height is only known after
 // EndChild(), so the PARENT draw list is channel-split: content goes to channel 1, and

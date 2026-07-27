@@ -2351,6 +2351,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             syncAxisHid("axis.y");
             syncAxisHid("axis.z");
             for (const auto& id : st.axisDatumIds) syncAxisHid(id);
+            // Self-heal from the renderer's OWN datum set: any axis id that can draw must be
+            // visibility-managed here, even if the DocMirror-listener inject never ran for it
+            // (cached-AICM opens, instant tab binds, pre-auto-axis files). Otherwise it renders
+            // with no FM row and no hiddenFeatures entry.
+            for (const auto& rd : renderer.refDatums())
+                if (rd.kind == Renderer::RefDatum::Kind::Axis) syncAxisHid(rd.id);
 
             std::unordered_set<std::string> effDatums = st.hiddenFeatures;
             if (!st.originUserToggled) {
@@ -2382,6 +2388,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 effAxis("axis.y");
                 effAxis("axis.z");
                 for (const auto& id : st.axisDatumIds) effAxis(id);
+                for (const auto& rd : renderer.refDatums())
+                    if (rd.kind == Renderer::RefDatum::Kind::Axis) effAxis(rd.id);
             }
             renderer.setHiddenDatums(std::move(effDatums));
         } else {

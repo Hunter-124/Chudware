@@ -4640,6 +4640,23 @@ void drawFeatureTreeBody(AppState& st,
                         axes.push_back({ent.id, displayName(ent.id, fb)});
                     }
                 }
+                // Union the renderer's own axis datums: whatever can DRAW must be listable,
+                // even when the DocMirror-listener inject never ran for this load path
+                // (cached-AICM opens, instant tab binds, pre-auto-axis files).
+                if (st.renderer) {
+                    for (const auto& rd : st.renderer->refDatums()) {
+                        if (rd.kind != Renderer::RefDatum::Kind::Axis || rd.id.empty() ||
+                            rd.id == "axis.x" || rd.id == "axis.y" || rd.id == "axis.z")
+                            continue;
+                        bool seen = false;
+                        for (const auto& ar : axes)
+                            if (ar.id == rd.id) { seen = true; break; }
+                        if (!seen) {
+                            const char* fb = rd.name.empty() ? rd.id.c_str() : rd.name.c_str();
+                            axes.push_back({rd.id, displayName(rd.id, fb)});
+                        }
+                    }
+                }
                 // User axis features not yet in axisDatumIds (pre-inject / edge cases).
                 for (const auto& ua : userAxes) {
                     bool seen = false;
@@ -4657,6 +4674,11 @@ void drawFeatureTreeBody(AppState& st,
                 std::unordered_set<std::string> autoCacheIds;
                 for (const auto& ent : st.axisAutoCache)
                     if (!ent.id.empty()) autoCacheIds.insert(ent.id);
+                std::unordered_set<std::string> rendererAxisIds;
+                if (st.renderer)
+                    for (const auto& rd : st.renderer->refDatums())
+                        if (rd.kind == Renderer::RefDatum::Kind::Axis && !rd.id.empty())
+                            rendererAxisIds.insert(rd.id);
                 std::vector<AxisRow> listedAxes;
                 listedAxes.reserve(axes.size());
                 for (const auto& ar : axes) {
@@ -4665,8 +4687,9 @@ void drawFeatureTreeBody(AppState& st,
                     const bool inDatum = st.axisDatumIds.count(ar.id) > 0;
                     const bool isUserAxis = userAxisIds.count(ar.id) > 0;
                     const bool inAutoCache = autoCacheIds.count(ar.id) > 0;
-                    // Defaults always; injected auto/user axes; cache fallback; user features.
-                    if (isDefault || isUserAxis || inDatum || inAutoCache)
+                    const bool inRenderer = rendererAxisIds.count(ar.id) > 0;
+                    // Defaults always; injected auto/user axes; cache/renderer fallback; user features.
+                    if (isDefault || isUserAxis || inDatum || inAutoCache || inRenderer)
                         listedAxes.push_back(ar);
                 }
                 bool anyAxisShown = false;

@@ -38,14 +38,22 @@ from . import sub_auth
 log = logging.getLogger("agent.providers.kimi_sub")
 
 PROVIDER_ID = "kimi-sub"
-# Subscription endpoint only accepts "kimi-for-coding". GUI catalog uses kimi-k3 /
-# kimi-k2.7 (K3 is the CAD-modeling priority model); normalize before the wire call.
-DEFAULT_MODEL = "kimi-for-coding"
+# The Kimi Code endpoint now takes real per-model wire ids: k3 (1M ctx), k3-256k,
+# kimi-for-coding / -highspeed (K2.7). Legacy GUI/catalog ids normalize below.
+DEFAULT_MODEL = "k3"
 _WIRE_ALIASES = {
-    "kimi-k3": "kimi-for-coding",
+    # Current wire ids (identity — explicit so the fallback stays a last resort
+    # rather than silently rewriting a valid pick).
+    "k3": "k3",
+    "k3-256k": "k3-256k",
+    "kimi-for-coding": "kimi-for-coding",
+    "kimi-for-coding-highspeed": "kimi-for-coding-highspeed",
+    # Legacy GUI/catalog ids → current wire ids.
+    "kimi-k3": "k3",
+    "kimi-k3-1m": "k3",
+    "kimi-k3-256k": "k3-256k",
     "kimi-k2.7": "kimi-for-coding",
     "kimi-k2.7-code": "kimi-for-coding",
-    "kimi-for-coding": "kimi-for-coding",
 }
 
 
@@ -59,7 +67,7 @@ DEFAULT_OAUTH_HOST = "https://auth.kimi.com"
 DEFAULT_BASE_URL = "https://api.kimi.com/coding/v1"
 ANTHROPIC_VERSION = "2023-06-01"
 # Version reported in the Kimi CLI headers (omp packages/ai package.json at port time).
-KIMI_CLI_VERSION = "17.0.5"
+KIMI_CLI_VERSION = "17.1.5"
 
 DEVICE_ID_FILENAME = "kimi-device-id"
 DEFAULT_POLL_INTERVAL_S = 5

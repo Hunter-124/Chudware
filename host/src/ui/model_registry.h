@@ -201,11 +201,13 @@ inline const std::vector<ModelInfo>& builtinModels() {
         // (ERROR_BAD_MODEL_NAME), and composer-1/1.5 are sunset — every pick failed.
         {PROV_CURSOR, "composer-2.5", "Cursor Composer 2.5", true, true},
         {PROV_CURSOR, "composer-2", "Cursor Composer 2", true, true},
-        // Kimi Code subscription (wire provider "kimi-sub") — GUI ids kimi-k3 / kimi-k2.7.
-        // K3 is the CAD-modeling priority model (1M ctx); K2.7 is the lighter secondary (262k).
-        // Wire alias: kimi_sub_provider maps both → "kimi-for-coding" on the subscription endpoint.
-        {PROV_KIMISUB, "kimi-k3", "Kimi K3 (1M)", true, true},
-        {PROV_KIMISUB, "kimi-k2.7", "Kimi K2.7 (262K)", true, true},
+        // Kimi Code (wire provider "kimi-code", routed through the OMP bridge) — the ids
+        // here ARE the endpoint's wire ids (no alias layer). K3 is the CAD-modeling
+        // priority model (1M ctx); K3-256k caps the window for cheaper turns; K2.7
+        // Coding is the lighter secondary.
+        {PROV_KIMISUB, "k3", "Kimi K3 (1M)", true, true},
+        {PROV_KIMISUB, "k3-256k", "Kimi K3-256k (256K)", true, true},
+        {PROV_KIMISUB, "kimi-for-coding", "Kimi K2.7 Coding (262K)", true, true},
         // xAI Grok — only grok-4.5 is user-visible (500k context; ~$2/$6 per Mtok). No longer the
         // default (needs an explicit xAI sign-in) — kept for users who ARE signed into xAI.
         {PROV_XAI, "grok-4.5", "Grok 4.5 (500k)", true, true},
@@ -343,11 +345,11 @@ inline int defaultContextWindowForModel(int provider, const std::string& id,
     if (has("gpt-4o") || has("gpt-4-turbo") || has("4o-mini")) return 128000;
     if (has("gpt-3.5")) return 16385;
     if (has("qwen") || has("deepseek")) return 128000;
-    // Moonshot Kimi / Kimi Code — check k2.7 / 256k / for-coding BEFORE bare kimi-k3
-    // (kimi-k3-256k contains "kimi-k3"). K3 = 1M; K2.7 = 262k.
-    if (has("kimi-k3-256k") || has("kimi-k2.7") || has("kimi-k2") || has("kimi-for-coding"))
+    // Moonshot Kimi / Kimi Code — check the 256k / k2.x / for-coding arms BEFORE the
+    // bare-k3 one ("k3-256k" contains "k3"). K3 = 1M; K3-256k / K2.7 = 262k.
+    if (has("k3-256k") || has("kimi-k2.7") || has("kimi-k2") || has("kimi-for-coding"))
         return 262144;
-    if (has("kimi-k3")) return 1048576;
+    if (has("kimi-k3") || has("k3")) return 1048576;
     // Grok 4.5 ships with a 500k context window; older grok-4.x is ~128k.
     if (has("grok-4.5") || has("grok-4-5")) return 500000;
     if (has("grok")) return 131072;

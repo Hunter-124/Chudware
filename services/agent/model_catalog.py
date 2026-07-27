@@ -573,6 +573,10 @@ def reasoning_efforts_for(provider: str, model_id: str, *, reasoning: bool | Non
     # keeps matching the full id exactly as before. `kimi-k2-thinking` is a distinct id
     # that keeps the generic think ladder below, so it is excluded here.
     kimi = m.rsplit("/", 1)[-1]
+    # The Kimi Code subscription endpoint's own wire ids are bare `k3` / `k3-256k`
+    # (plus `kimi-for-coding*`, caught by the startswith arm below).
+    if kimi == "k3" or kimi.startswith("k3-"):
+        return ["low", "high", "max"]
     if kimi.startswith("kimi") and "think" not in kimi:
         # K3's real wire ladder is low|high|max — there is NO medium rung, so the GUI
         # offers exactly the three the endpoint accepts rather than a fourth that would

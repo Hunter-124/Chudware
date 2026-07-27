@@ -1215,7 +1215,7 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
         if "codex-sub" in sub or "codex" in sub:
             _add("codex-sub", "gpt-5")
         if "kimi-sub" in sub or "kimi" in sub:
-            _add("kimi-sub", "kimi-for-coding")
+            _add("kimi-sub", "k3")
 
     # mega-16: drop process-local unavailable providers (spending-limit etc.)
     out[:] = [

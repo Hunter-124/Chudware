@@ -258,10 +258,14 @@ void loadSettings(Settings& s) {
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
         if (s.provider == 6 && model.empty()) model = "grok-4.5";
         if (s.provider == 9 && model.empty()) model = "x-ai/grok-4.5-free";
-        if (s.provider == 8 && model.empty()) model = "kimi-k3";
-        // Stale GUI ids from prior releases → current catalog defaults.
-        if (s.provider == 8 && (model == "kimi-for-coding" || model == "kimi-k2.7-code"))
-            model = "kimi-k3";
+        if (s.provider == 8 && model.empty()) model = "k3";
+        // Stale GUI ids from prior releases → the wire ids the Kimi Code endpoint now
+        // accepts directly (k3 / k3-256k / kimi-for-coding). kimi-k2.7 keeps the user's
+        // lighter-model pick; the rest fold onto the K3 default.
+        if (s.provider == 8 && (model == "kimi-k3" || model == "kimi-for-coding" ||
+                                model == "kimi-k2.7-code"))
+            model = "k3";
+        else if (s.provider == 8 && model == "kimi-k2.7") model = "kimi-for-coding";
         if (s.provider == 6 && model != "grok-4.5" && model.rfind("grok", 0) == 0)
             model = "grok-4.5";
         // Cursor has NO chat-completions transport (its agent API is Connect-RPC/protobuf, not
@@ -706,7 +710,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         // Kimi Code subscription — OAuth credential lives in subscription_auth (like xai-sub).
         // Distinct from Moonshot API key path (provider "moonshot" / keys.moonshot).
         j["provider"] = "kimi-sub";
-        j["model"] = s.model[0] ? s.model : "kimi-k3";
+        j["model"] = s.model[0] ? s.model : "k3";
     } else if (s.provider == 9) {
         // ZenMux — OMP-bridge provider (core/agent/providers.cpp kOmpBridgeProviders). No local
         // api_key: the completion routes through the bun bridge, which resolves the credential

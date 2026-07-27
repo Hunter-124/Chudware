@@ -24,7 +24,7 @@ CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 OAUTH_HOST = "https://auth.kimi.com"
 API_BASE = "https://api.kimi.com/coding/v1"
 PROVIDER_ID = "kimi-sub"
-DEFAULT_MODEL = "kimi-for-coding"
+DEFAULT_MODEL = "k3"
 
 
 # ── fixtures / HTTP mock helpers ─────────────────────────────────────────────

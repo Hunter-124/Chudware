@@ -319,7 +319,10 @@ RPCs `ai_roles_get` / `ai_roles_set` echo the full map including `thinking`.
 
 Provider id: `kimi-sub` (friendly id `kimi`; human label "Moonshot Kimi (Kimi For Coding)").
 Module: `services/agent/providers/kimi_sub_provider.py` (`KimiSubProvider`,
-`PROVIDER_ID = "kimi-sub"`, `DEFAULT_MODEL = "kimi-for-coding"`, `supports_vision = True`).
+`PROVIDER_ID = "kimi-sub"`, `DEFAULT_MODEL = "k3"`, `supports_vision = True`).
+Wire ids are the endpoint's real per-model ids — `k3` (1M ctx), `k3-256k`,
+`kimi-for-coding` / `kimi-for-coding-highspeed` (K2.7); legacy GUI ids
+(`kimi-k3`, `kimi-k2.7`, …) normalize via `_WIRE_ALIASES`.
 
 - **Auth:** OAuth 2.0 device authorization grant against `https://auth.kimi.com`
   (env override `KIMI_CODE_OAUTH_HOST` / `KIMI_OAUTH_HOST`). Client id

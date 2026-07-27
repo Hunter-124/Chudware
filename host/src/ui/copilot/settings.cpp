@@ -301,7 +301,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             std::strncpy(s.model, "composer-2.5", sizeof(s.model) - 1);
             s.vision = true;
         } else if (s.provider == ui::PROV_KIMISUB) {
-            std::strncpy(s.model, "kimi-k3", sizeof(s.model) - 1);
+            std::strncpy(s.model, "k3", sizeof(s.model) - 1);
             s.vision = true;
         } else if (s.provider == ui::PROV_ZENMUX) {
             std::strncpy(s.model, "x-ai/grok-4.5-free", sizeof(s.model) - 1);
@@ -636,12 +636,13 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         ImGui::PopStyleColor();
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (s.provider == ui::PROV_CURSOR || s.provider == ui::PROV_KIMISUB) {
-        // Subscription-only providers: OAuth credential lives in subscription_auth — no API key.
+        // Subscription-only providers: no API key field — the credential is an OAuth grant.
         if (s.provider == ui::PROV_KIMISUB) {
-            dimText("Kimi Code subscription (OAuth via subscription_auth). Sign in under "
-                    "Accounts; no Moonshot API key required for this path.");
+            dimText("Kimi Code (OMP bridge). Sign in under Settings \xe2\x86\x92 Providers; the "
+                    "bridge resolves the credential from its own auth db — no Moonshot API key "
+                    "required for this path.");
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-            ImGui::TextUnformatted("Wire provider: kimi-sub \xc2\xb7 model: kimi-k3 (default)");
+            ImGui::TextUnformatted("Wire provider: kimi-code \xc2\xb7 model: k3 (default)");
             ImGui::PopStyleColor();
         } else {
             dimText("Cursor subscription (OAuth via subscription_auth). Sign in under Accounts; "

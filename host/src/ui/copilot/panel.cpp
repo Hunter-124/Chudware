@@ -448,7 +448,10 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
         bool picked = ImGui::InvisibleButton("##pickconv",
                                             ImVec2(std::max(1.0f, rowW - actionsReserve - padX), rowH));
-        bool rowHov = ImGui::IsItemHovered();
+        // NOTE: do NOT use IsItemHovered() on ##pickconv for row-hover logic — that
+        // button is shrunk to exclude the action zone, so its hover drops the moment
+        // the mouse reaches for the Archive/Delete buttons and they vanish under the
+        // cursor. rowHot (the full-row rect test above) is the one true predicate.
         // Picking stays live during a run (multi-session): switching parks the viewed
         // conversation; its run keeps streaming into it in the background.
         if (picked) {
@@ -460,7 +463,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
             st.showAISettingsOverlay = false;
         }
 
-        float wash = active ? 0.55f : (rowHov ? 0.44f : 0.34f);
+        float wash = active ? 0.55f : (rowHot ? 0.44f : 0.34f);
         ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, (i % 2) == 1, active, wash);
 
         // Scope color-code: once the model has assessed the session (first routing event),
@@ -529,7 +532,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // badge's invisible click target swallowed the row-action clicks).
         std::string badge;
         int badgeTab = -1;
-        const bool showBadge = !(rowHov || active);
+        const bool showBadge = !rowHot;
         if (showBadge && c.docLink.rfind("file:", 0) == 0) {
             const std::string p = c.docLink.substr(5);
             const size_t slash = p.find_last_of("/\\");
@@ -587,7 +590,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
         bool doDel = false;
         bool doArchiveToggle = false;
-        if (rowHov || active) {
+        if (rowHot) {
             const float delX = rowMax.x - delBtnW - rightMargin;
             ImGui::SetCursorScreenPos(ImVec2(delX, rowMin.y + (rowH - delBtnH) * 0.5f));
             IconUV trash = ui::getIcon("delete", 20);

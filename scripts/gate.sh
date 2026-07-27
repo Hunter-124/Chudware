@@ -561,6 +561,31 @@ stage_ui_imgui() {
         echo "  FAIL: $shot not created"
         fail_fatal=1
     fi
+
+    # Slash-autocomplete regression (composer hang on "/"): menu capture +
+    # scripted Enter fill. Two PNGs — the open menu and the filled composer.
+    local slash_shot="${GATE_TMP}/copilot-slash.png"
+    local slash_menu="${GATE_TMP}/copilot_slash_menu.png"
+    local slash_cmd="env CHUDWARE_NO_FILE_DIALOGS=1 CHUDWARE_SHOT=copilot_slash"
+    [ -f "$libchudware" ] && slash_cmd="$slash_cmd CHUDWARE_LIBCHUDWARE=$libchudware"
+    slash_cmd="$slash_cmd \"$bin\" --ui-screenshot \"$slash_shot\""
+    if [ "${CHUDWARE_SHOT_HEADED:-0}" != "1" ] && command -v xvfb-run >/dev/null 2>&1; then
+        slash_cmd="xvfb-run -a $slash_cmd"
+    fi
+    if ! eval "$slash_cmd" > ${GATE_TMP}/copilot_slash.out 2>&1; then
+        record "slash shot          FAIL    CHUDWARE_SHOT=copilot_slash (see ${GATE_TMP}/copilot_slash.out)"
+        echo "  FAIL: copilot_slash shot"; tail -n 15 ${GATE_TMP}/copilot_slash.out | sed 's/^/    /'
+        fail_fatal=1
+        return 0
+    fi
+    if [ -f "$slash_shot" ] && [ -f "$slash_menu" ]; then
+        record "slash shot          PASS    CHUDWARE_SHOT=copilot_slash menu + fill screenshots written"
+        echo "  PASS ($slash_shot)"
+    else
+        record "slash shot          FAIL    copilot_slash PNGs not written (see ${GATE_TMP}/copilot_slash.out)"
+        echo "  FAIL: copilot_slash PNGs missing"
+        fail_fatal=1
+    fi
 }
 
 # ---- Stage 6: model-eval bench smoke (T-H8) ---------------------------------

@@ -2836,6 +2836,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.suppressToasts = true;
   st.wantSettings = shot && shotMode && std::strcmp(shotMode, "settings") == 0;
   st.wantChat = shot && shotMode && std::strcmp(shotMode, "chat") == 0;
+  // copilot_slash: slash-autocomplete regression — the composer holds a bare "/"
+  // so the drop-up menu draws every frame (the detail-truncation loop once hung
+  // the UI thread on exactly this draw), then a scripted Enter accepts the
+  // highlighted suggestion so the final capture shows the filled composer.
+  st.wantCopilotSlash =
+      shot && shotMode && std::strcmp(shotMode, "copilot_slash") == 0;
   st.wantAssembly = shot && shotMode && std::strcmp(shotMode, "assembly") == 0;
   st.wantPlan = shot && shotMode && std::strcmp(shotMode, "plan") == 0;
   st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
@@ -3648,7 +3654,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           anyDirty = true;
           break;
         }
-      if (anyDirty) {
+      // In-flight copilot runs get their own prompt FIRST (Continue in
+      // background / Stop agent & quit); the dirty-doc modal follows when both
+      // apply.
+      if (st.anyRunActive()) {
+        glfwSetWindowShouldClose(win, GLFW_FALSE);
+        st.wantQuitAgentConfirm = true;
+      } else if (anyDirty) {
         glfwSetWindowShouldClose(win, GLFW_FALSE);
         st.wantQuitConfirm = true;
       }
@@ -5560,8 +5572,22 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (shot && st.frame == 1) {
       if (st.wantSettings)
         st.openSettings = true;
-      if (st.wantChat || st.wantAssembly || st.wantPlan)
+      if (st.wantChat || st.wantAssembly || st.wantPlan || st.wantCopilotSlash)
         st.designStarted = true; // show the conversation takeover
+      // Seed AFTER the startup session load (frame 0 clears the composer while
+      // restoring the active conversation / prompt draft).
+      if (st.wantCopilotSlash)
+        std::snprintf(st.prompt.data(), st.prompt.size(), "/");
+    }
+    // copilot_slash: with the menu open (composer holds "/"), inject Enter on
+    // frame 5 (release on 6) so the highlighted suggestion is accepted — the
+    // final capture verifies the fill ("/compact ") landed in the composer.
+    if (shot && st.wantCopilotSlash) {
+      if (st.frame == 5) io.AddKeyEvent(ImGuiKey_Enter, true);
+      if (st.frame == 6) io.AddKeyEvent(ImGuiKey_Enter, false);
+      if (st.frame == 7)
+        std::fprintf(stderr, "[copilot_slash] composer after fill: '%s'\n",
+                     st.prompt.data());
     }
     // Screenshot verification captures after a few frames; keep the settings
     // popup request alive long enough that ImGui opens it even if the first
@@ -5705,7 +5731,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // intentionally forces one clean DockBuilder layout after major window/dock
     // identity changes.
     ImGuiID dockId = ImGui::GetID(
-        "AICADDockV6"); // V6: overlay layout — splitless central node
+        "CHUDWAREDockV6"); // V6: overlay layout — splitless central node
     if ((!st.layoutInit && ImGui::DockBuilderGetNode(dockId) == nullptr) ||
         st.resetLayout) {
       buildDefaultLayout(dockId,
@@ -6156,6 +6182,85 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // the doc-strip "+" / Ctrl+N raise it regardless of which central document
     // — part, drawing, or ECAD — is forward.
     ui::drawNewDocChooser(st);
+
+    // ---------- agent-work confirmation on app exit ----------
+    // Raised from the main-loop close guard (st.wantQuitAgentConfirm) when the
+    // user tries to quit with a copilot run in flight. Runs execute daemon-side,
+    // so "Continue in background" just lets the quit proceed — hostd keeps the
+    // run (its tray icon shows the work) and exits on its own once the work
+    // finishes. "Stop agent & quit" fires agent_cancel (empty run_id = all live
+    // runs) first. Either choice then falls through to the dirty-doc prompt
+    // below if any user-owned docs are unsaved, or straight to the exit.
+    {
+      static bool s_quitAgentModalOpen = false;
+      if (st.wantQuitAgentConfirm) {
+        st.wantQuitAgentConfirm = false;
+        s_quitAgentModalOpen = true;
+      }
+      if (s_quitAgentModalOpen)
+        ImGui::OpenPopup("Agent work in progress##appquitagent");
+      ImGui::SetNextWindowPos(
+          ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f),
+          ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+      bool openAgent = true;
+      if (ImGui::BeginPopupModal("Agent work in progress##appquitagent",
+                                 &openAgent,
+                                 ImGuiWindowFlags_AlwaysAutoResize |
+                                     ImGuiWindowFlags_NoSavedSettings)) {
+        int nActive = 0;
+        for (const auto &[convId, run] : st.runs)
+          if (run && run->running.load())
+            ++nActive;
+        ImGui::Text("%d agent run%s still in progress.", nActive,
+                    nActive == 1 ? " is" : "s are");
+        ImGui::Spacing();
+        ImGui::TextUnformatted(
+            "Continue in background keeps the work running in the\n"
+            "background daemon (tray icon); results land in the document.");
+        ImGui::Spacing();
+        // After the agent choice: dirty user docs still get the save prompt,
+        // otherwise the quit proceeds.
+        auto proceedQuit = [&st, win] {
+          bool anyDirty = false;
+          for (const auto &t : st.docTabs)
+            if (t.dirty && (!t.aiHandoff || t.userAdopted)) {
+              anyDirty = true;
+              break;
+            }
+          if (anyDirty)
+            st.wantQuitConfirm = true;
+          else {
+            st.quitConfirmed = true;
+            glfwSetWindowShouldClose(win, GLFW_TRUE);
+          }
+        };
+        const float bw = 190.0f * scale;
+        if (ImGui::Button("Continue in background", ImVec2(bw, 0))) {
+          st.quitAgentContinues = true;
+          s_quitAgentModalOpen = false;
+          ImGui::CloseCurrentPopup();
+          proceedQuit();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Stop agent & quit", ImVec2(bw, 0))) {
+          nlohmann::json res;
+          std::string err;
+          // Empty run_id cancels ALL live runs (cooperative cancel).
+          st.worker.callAgentCancel("", res, err);
+          s_quitAgentModalOpen = false;
+          ImGui::CloseCurrentPopup();
+          proceedQuit();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(90.0f * scale, 0))) {
+          s_quitAgentModalOpen = false;
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+      }
+      if (!openAgent)
+        s_quitAgentModalOpen = false; // dismissed via the title-bar X = Cancel
+    }
 
     // ---------- unsaved-changes confirmation on app exit ----------
     // Raised from the main-loop close guard (st.wantQuitConfirm) when the user
@@ -6696,6 +6801,26 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       shotFrame =
           (st.daemonH2CaptureFrame > 0) ? st.daemonH2CaptureFrame : 99999;
     }
+    // copilot_slash: capture the open slash menu at frame 4 (before the scripted
+    // Enter) as a mid PNG; the final capture at frame 8 shows the accepted fill.
+    if (st.wantCopilotSlash) {
+      if (st.frame == 4) {
+        const char *slash = std::strrchr(screenshotPath, '/');
+        std::string midPath = slash ? std::string(screenshotPath, slash + 1) +
+                                          "copilot_slash_menu.png"
+                                    : std::string("copilot_slash_menu.png");
+        std::vector<unsigned char> px(dw * dh * 4);
+        glReadBuffer(GL_BACK);
+        glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        std::vector<unsigned char> flip(dw * dh * 4);
+        for (int y = 0; y < dh; ++y)
+          std::memcpy(&flip[(dh - 1 - y) * dw * 4], &px[y * dw * 4], dw * 4);
+        stbi_write_png(midPath.c_str(), dw, dh, 4, flip.data(), dw * 4);
+        std::printf("[copilot_slash] menu screenshot -> %s\n", midPath.c_str());
+        std::fflush(stdout);
+      }
+      shotFrame = 8;
+    }
     if (shot && ++st.frame >= shotFrame) {
       std::vector<unsigned char> px(dw * dh * 4);
       glReadBuffer(GL_BACK);
@@ -6716,7 +6841,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   }
 
   // Clean-exit signal (daemon mode): closing the app normally is a DELIBERATE
-  // exit.
+  // exit. In-flight agent runs are NOT cancelled here — they execute
+  // daemon-side and survive by design; the quit modal already gave the user
+  // the explicit "Stop agent & quit" choice (agent_cancel) when a run was
+  // live, and hostd exits on its own once the work finishes.
   //  * USER-owned docs (own tabs + adopted AI mirrors): doc_discard — drop the
   //  parts we're
   //    leaving unsaved so, once abandoned, the daemon doesn't retire them and

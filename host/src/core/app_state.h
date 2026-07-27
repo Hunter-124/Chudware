@@ -1700,6 +1700,7 @@ struct AppState {
 
     // ---- screenshot-mode flags (set from CHUDWARE_SHOT in run_gui) ----
     bool wantSettings = false, wantChat = false, wantAssembly = false, wantPlan = false;
+    bool wantCopilotSlash = false;  // CHUDWARE_SHOT=copilot_slash: slash-menu regression (menu + fill)
     bool wantPick   = false;  // C15: load box.aicm, simulate a center pick, print + screenshot
     bool wantRibbon = false;  // C14: ribbon screenshot mode
     bool pickPrinted = false;  // guard so the "pick:" stdout line prints exactly once
@@ -1842,6 +1843,12 @@ struct AppState {
     // Quit-without-saving so the next close request falls straight through to the real exit.
     bool wantQuitConfirm = false;     // raise the "unsaved changes on exit" modal next frame
     bool quitConfirmed   = false;     // user approved the quit (after saving or discarding)
+    // Agent-work quit guard: raised by the same close intercept when a copilot run is in flight.
+    // The modal offers "Continue in background" (the run is daemon-side and survives the GUI) or
+    // "Stop agent & quit" (agent_cancel). This prompt comes FIRST; the dirty-doc prompt above
+    // follows if any user-owned docs are also unsaved.
+    bool wantQuitAgentConfirm = false; // raise the "agent work in progress" modal next frame
+    bool quitAgentContinues   = false; // user chose Continue-in-background (diagnostic only)
     // Orphan recovery (daemon mode): set at bootstrap when the daemon reports retired docs from a
     // previous session awaiting explicit recovery (recovery_list). >0 raises the "Recover unsaved
     // parts?" modal next frame; the modal consumes it. "Later" just dismisses — the daemon keeps

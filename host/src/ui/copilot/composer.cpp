@@ -50,12 +50,20 @@ struct ChatInputCb {
 // to the menu instead of moving the caret. Clarify cards (cards.cpp) leave this false.
 bool g_slashMenuActive = false;
 int  g_slashNavDelta = 0;
+// Set when the slash menu fills the composer; the next InputText callback parks
+// the caret at the end of the inserted text (a fresh widget state starts at 0).
+int  g_slashCaretToEnd = 0;
 }  // namespace
 
 
 namespace {
 int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
     auto* cb = static_cast<ChatInputCb*>(data->UserData);
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways && g_slashCaretToEnd) {
+        g_slashCaretToEnd = 0;
+        data->CursorPos = data->BufTextLen;
+        return 0;
+    }
     if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory && cb->interceptHistory) {
         // Steal Up/Down from the multiline caret so the slash menu can navigate.
         if (data->EventKey == ImGuiKey_UpArrow) {
@@ -104,7 +112,8 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     cb.wrapW = wrapW;
     cb.interceptHistory = g_slashMenuActive;
     cb.navDelta = &g_slashNavDelta;
-    ImGuiInputTextFlags flags = ImGuiInputTextFlags_CallbackEdit;
+    ImGuiInputTextFlags flags = ImGuiInputTextFlags_CallbackEdit |
+                                ImGuiInputTextFlags_CallbackAlways;
     if (g_slashMenuActive) {
         // Enter accepts a slash pick (handled by the menu) — don't insert a newline into the token.
         flags |= ImGuiInputTextFlags_CallbackHistory | ImGuiInputTextFlags_CtrlEnterForNewLine;
@@ -541,6 +550,11 @@ struct SlashMenuState {
     int  selected = 0;
     std::string filter;                 // typed text AFTER the leading '/'
     std::vector<SlashItem> matches;
+    // Esc latch: once dismissed, stay closed while the query text is unchanged
+    // (drawSlashAutocomplete recomputes `open` from the buffer every frame, so a
+    // bare `open = false` reopens on the very next frame).
+    bool        dismissed = false;
+    std::string dismissedFilter;
 };
 static SlashMenuState s_slash;
 
@@ -748,8 +762,18 @@ static bool slashMenuRow(const char* iconName, const char* label, const char* de
     if (detail && detail[0]) {
         std::string d = detail;
         const float maxDetailW = (mx.x - textX) - 10.0f * sc;
-        while (d.size() > 4 && ImGui::CalcTextSize(d.c_str()).x > maxDetailW)
-            d = d.substr(0, d.size() - 2) + "\xe2\x80\xa6";
+        // Trim-to-fit. The previous loop appended the ellipsis EVERY pass
+        // (`substr(size-2) + "…"` → net +1 byte/iteration), so a detail wider
+        // than the row never converged — an infinite loop that froze the UI
+        // thread the first frame the menu drew (the "type / and the app
+        // crashes" hang). Shrink the raw text first, append the ellipsis once.
+        if (maxDetailW > 1.0f && ImGui::CalcTextSize(d.c_str()).x > maxDetailW) {
+            const std::string ell = "\xe2\x80\xa6";
+            while (d.size() > 4 &&
+                   ImGui::CalcTextSize((d + ell).c_str()).x > maxDetailW)
+                d.resize(d.size() - 2);
+            d += ell;
+        }
         dl->AddText(ImVec2(textX, midY + fh * 0.15f),
                     ui::Palette::toU32(pal.textDim), d.c_str());
     }
@@ -767,8 +791,21 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
     if (!want) {
         s_slash.open = false;
         s_slash.matches.clear();
+        s_slash.dismissed = false;
+        s_slash.dismissedFilter.clear();
         g_slashMenuActive = false;
         return false;
+    }
+
+    if (s_slash.dismissed) {
+        if (filter == s_slash.dismissedFilter) {
+            // Esc dismissed this exact query — stay closed until the text changes.
+            s_slash.open = false;
+            s_slash.matches.clear();
+            g_slashMenuActive = false;
+            return false;
+        }
+        s_slash.dismissed = false;  // query changed — re-arm the menu
     }
 
     pollComposerSkills(st, /*force=*/false);
@@ -878,9 +915,10 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar(3);
 
-    // Enter accepts the highlighted row (do not submit the turn).
+    // Enter or Tab accepts the highlighted row (do not submit the turn).
     if (!accepted && !s_slash.matches.empty() &&
-        ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !ImGui::GetIO().KeyShift) {
+        ((ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !ImGui::GetIO().KeyShift) ||
+         ImGui::IsKeyPressed(ImGuiKey_Tab, false))) {
         accepted = true;
         acceptText = s_slash.matches[(size_t)s_slash.selected].insert;
         ateEnter = true;
@@ -888,6 +926,7 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
 
     if (accepted && !acceptText.empty()) {
         applySlashInsert(st.prompt, acceptText);
+        g_slashCaretToEnd = 1;  // park the caret after the inserted command
         s_slash.open = false;
         s_slash.matches.clear();
         g_slashMenuActive = false;
@@ -1015,6 +1054,17 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
         params["keep_recent_tokens"] = keepRecent;
         params["supersede_reads"] = supersedeReads;
         params["drop_useless"] = dropUseless;
+        // Snap rendering is provider-shaped: tell the worker which provider/model
+        // this session runs on (agentProviderOverride pins both), and anchor the
+        // re-snap chain to the conversation so later rounds append and a provider
+        // switch re-renders from the stored OG source instead of losing history.
+        {
+            nlohmann::json pov = agentProviderOverride(st.settings);
+            for (auto& el : pov.items()) params[el.key()] = el.value();
+            if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size() &&
+                !st.conversations[st.activeConv].id.empty())
+                params["session_id"] = st.conversations[st.activeConv].id;
+        }
         st.rpc.call("session_compact", params, [&st, strategy](const core::RpcResult& r) {
             if (!r.ok) {
                 st.toast(ui::ToastLevel::Error,
@@ -1025,7 +1075,12 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
                 st.toast(ui::ToastLevel::Error, "session_compact: bad result");
                 return;
             }
-            if (r.result.contains("kept_messages") && r.result["kept_messages"].is_array())
+            // Prefer the rebuilt conversation (archive message + kept tail) so the
+            // compacted history is reinjected instead of silently dropped; fall
+            // back to the bare kept tail for older workers.
+            if (r.result.contains("messages") && r.result["messages"].is_array())
+                applyWireMessagesToChat(st, r.result["messages"]);
+            else if (r.result.contains("kept_messages") && r.result["kept_messages"].is_array())
                 applyWireMessagesToChat(st, r.result["kept_messages"]);
             std::string notice;
             if (r.result.contains("short_summary") && r.result["short_summary"].is_string())
@@ -3169,6 +3224,11 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     // Esc: close slash autocomplete first, then staged edit restore, else disarm context pick.
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         if (s_slash.open) {
+            // Latch the dismissal on the current query — drawSlashAutocomplete
+            // recomputes `open` from the buffer each frame and would reopen
+            // instantly (editing the query re-arms it there).
+            s_slash.dismissed = true;
+            s_slash.dismissedFilter = s_slash.filter;
             s_slash.open = false;
             s_slash.matches.clear();
             g_slashMenuActive = false;

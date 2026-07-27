@@ -910,6 +910,51 @@ def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
         pass
 
 
+def _project_save_stem(name: Optional[str], doc_id: str) -> str:
+    """Sanitize a doc name into a filesystem-safe stem, mirroring the host's rule:
+    spaces -> '_', keep alnum/'_'/'-', drop everything else. Falls back to the
+    doc_id when the name yields an empty stem."""
+    stem = re.sub(r"\s+", "_", name or "")
+    stem = "".join(c for c in stem if c.isalnum() or c in "_-")
+    return stem or doc_id
+
+
+def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional[str]:
+    """Save the doc as a DELIVERABLE native .step+ in the user's project folder
+    (<CHUDWARE_PROJECT_SAVE_DIR>/<safe_stem>.step+) and return the written path.
+
+    Unlike _autosave (crash recovery, session-prefixed, hidden appdata dir) this is the
+    user's own file: it is NOT session-prefixed, so it stays stable and openable across
+    runs and overwrites itself as the part is revised. Returns None when the env var is
+    unset (the default — nothing changes for existing callers/tests). Best-effort; a
+    failed deliverable save must NEVER fail the tool call, so this never raises."""
+    if not doc_id:
+        return None
+    try:
+        root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR")
+        if not root:
+            return None
+        d = Path(root)
+        d.mkdir(parents=True, exist_ok=True)
+        if not d.is_dir():
+            return None
+        # Resolve the doc's real name from the engine when the caller didn't pass one.
+        if not name:
+            try:
+                for e in (cb.call("doc_list", {}) or {}).get("docs", []):
+                    if isinstance(e, dict) and e.get("doc_id") == doc_id:
+                        name = e.get("name") or ""
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+        path = d / f"{_project_save_stem(name, doc_id)}.step+"
+        r = cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
+        written = r.get("path", str(path)) if isinstance(r, dict) else str(path)
+        return written if os.path.exists(written) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # doc_id -> engine revision at the doc's last autosave. Each autosave serializes the
 # full doc to disk; skipping unchanged docs turns the idle 60s sweep into a no-op.
 _AUTOSAVE_LAST_REV: dict = {}

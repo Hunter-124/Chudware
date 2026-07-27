@@ -1010,3 +1010,174 @@ def test_live_mudbucket_polyline_revolve_boolean_batch_builds():
     assert "expanded the polyline into 4 line entities" in text
     assert "unwrapped the one-element list in refs.axis" in text
     assert 'target="body"' in text and 'tool="drain_boss"' in text
+
+
+# --------------------------------------------------- loft sections / revolve zero-volume
+# The live "bucket" run (kimi-k3, 2026-07-27) died on «refs.sections: required for loft»
+# after writing the profiles under a different key, and on «revolve produced a
+# zero-volume solid» with no hint of WHERE the profile sat. The loft aliases normalize;
+# the revolve error now names the exact offset — geometry is NEVER auto-repaired.
+
+def _loft_feat(refs=None, **params):
+    f = {"type": "loft", "name": "Bucket",
+         "params": {"mode": "boss", **params}}
+    if refs is not None:
+        f["refs"] = refs
+    return f
+
+
+def _sections_of(feat, notes=None):
+    """Run one loft through the schema pipeline -> its refs.sections value."""
+    sink = notes if notes is not None else []
+    out = M._normalize_feature_schema(feat, "loft", sink)
+    return (out.get("refs") or {}).get("sections")
+
+
+def test_loft_refs_profiles_alias_becomes_sections():
+    notes: list = []
+    secs = _sections_of(_loft_feat(refs={"profiles": [
+        {"kind": "region", "sketch": "base"}, {"kind": "region", "sketch": "rim"}]}), notes)
+    assert secs == [{"kind": "region", "sketch": "base"},
+                    {"kind": "region", "sketch": "rim"}]
+    assert any("refs.profiles" in n and "refs.sections" in n for n in notes)
+
+
+def test_loft_refs_sketches_alias_becomes_sections():
+    secs = _sections_of(_loft_feat(refs={"sketches": [{"kind": "region", "sketch": "s1"}]}))
+    assert secs == [{"kind": "region", "sketch": "s1"}]
+
+
+def test_loft_sections_nested_one_level_too_deep_are_unwrapped():
+    secs = _sections_of(_loft_feat(refs={"sections": {"sections": [
+        {"kind": "region", "sketch": "a"}, {"kind": "region", "sketch": "b"}]}}))
+    assert [s["sketch"] for s in secs] == ["a", "b"]
+
+
+def test_loft_a_single_bare_selector_becomes_a_one_element_list():
+    secs = _sections_of(_loft_feat(refs={"sections": {"kind": "region", "sketch": "only"}}))
+    assert secs == [{"kind": "region", "sketch": "only"}]
+
+
+def test_loft_a_bare_sketch_name_string_becomes_a_region_selector():
+    secs = _sections_of(_loft_feat(refs={"sections": "base"}))
+    assert secs == [{"kind": "region", "sketch": "base", "hint_index": 0}]
+
+
+def test_loft_string_members_become_region_selectors():
+    secs = _sections_of(_loft_feat(refs={"profiles": ["base", "rim"]}))
+    assert secs == [{"kind": "region", "sketch": "base", "hint_index": 0},
+                    {"kind": "region", "sketch": "rim", "hint_index": 0}]
+
+
+@pytest.mark.parametrize("key", ["profiles", "sketches"])
+def test_loft_params_level_plural_keys_become_sections(key):
+    notes: list = []
+    secs = _sections_of(_loft_feat(**{key: ["base", "rim"]}), notes)
+    assert [s["sketch"] for s in secs] == ["base", "rim"]
+    assert any(f"params.{key}" in n for n in notes)
+
+
+def test_loft_params_sections_list_becomes_sections():
+    secs = _sections_of(_loft_feat(sections=[{"kind": "region", "sketch": "a"},
+                                             {"kind": "region", "sketch": "b"}]))
+    assert [s["sketch"] for s in secs] == ["a", "b"]
+
+
+def test_a_canonical_loft_is_left_byte_identical():
+    feat = _loft_feat(refs={"sections": [{"kind": "region", "sketch": "a", "hint_index": 0},
+                                         {"kind": "region", "sketch": "b", "hint_index": 0}]})
+    notes: list = []
+    assert M._normalize_feature_schema(feat, "loft", notes) == feat
+    assert notes == []
+
+
+@pytest.mark.parametrize("bad", [{"sections": []},                    # empty: no intent
+                                 {"sections": {"width": 4}},          # neither wrapper nor selector
+                                 {"sections": [["a", "b"]]},          # non-selector member
+                                 {"sections": {"sections": "deep", "extra": 1}}])
+def test_an_ambiguous_sections_shape_keeps_the_engine_error(bad):
+    feat = _loft_feat(refs=bad)
+    notes: list = []
+    out = M._normalize_feature_schema(feat, "loft", notes)
+    assert (out.get("refs") or {}).get("sections") == bad["sections"]
+    assert not any("refs.sections" in n for n in notes)
+
+
+def test_the_loft_alias_error_now_matches_the_schema_the_engine_validates():
+    # The engine requires refs.sections as a SelList (validate.cpp FEATURE_TYPES["loft"]) —
+    # every accepted alias above lands in exactly that slot as a list of selector objects.
+    for refs in ({"profiles": [{"kind": "region", "sketch": "a"}]},
+                 {"sketches": [{"kind": "region", "sketch": "a"}]},
+                 {"sections": {"sections": [{"kind": "region", "sketch": "a"}]}},
+                 {"sections": {"kind": "region", "sketch": "a"}}):
+        secs = _sections_of(_loft_feat(refs=refs))
+        assert isinstance(secs, list) and all(isinstance(s, dict) for s in secs)
+
+
+# --------------------------------------------------------------------- revolve zero-volume
+
+_ZERO_VOL = ("revolve produced a zero-volume solid — the profile must sit to ONE side of "
+             "the axis (not cross or touch it) and the angle must be > 0 (got 360 deg)")
+
+
+def _revolve_batch(x0, x1):
+    """A front-plane profile sketch + the revolve of it, as a post-normalization batch."""
+    return [{"op": "add_feature", "feature": {
+                "type": "sketch", "name": "profile", "refs": {"plane": "plane.front"},
+                "params": {"plane": "plane.front", "constraints": [], "entities": [
+                    {"type": "line", "p1": [x0, 0], "p2": [x1, 0]},
+                    {"type": "line", "p1": [x1, 0], "p2": [x1, 100]},
+                    {"type": "line", "p1": [x1, 100], "p2": [x0, 100]},
+                    {"type": "line", "p1": [x0, 100], "p2": [x0, 0]}]}}},
+            {"op": "add_feature", "feature": {
+                "type": "revolve", "name": "bucket",
+                "refs": {"profile": [{"kind": "region", "sketch": "profile",
+                                      "hint_index": 0}],
+                         "axis": "axis.z"},
+                "params": {"mode": "boss", "angle": 360}}}]
+
+
+def _enriched(x0, x1):
+    fs = [{"id": "f1", "ok": True, "error": None},
+          {"id": "f2", "ok": False, "error": _ZERO_VOL}]
+    M._enrich_zero_volume_errors(fs, _revolve_batch(x0, x1), {"$0": "f1", "$1": "f2"})
+    assert fs[0]["error"] is None                      # untouched: only failures enriched
+    return fs[1]["error"]
+
+
+def test_a_straddling_profile_error_names_the_offset_that_clears_the_axis():
+    msg = _enriched(-10, 40)
+    assert _ZERO_VOL in msg                            # the engine's words are kept
+    assert "x in [-10, 40] mm" in msg                  # the profile's extent on the plane
+    assert "axis.z" in msg
+    assert "minimum x is > 0" in msg                   # the concrete, actionable fix
+    assert "add 11 mm" in msg and "[1, 51]" in msg     # a worked example of that fix
+
+
+def test_a_profile_touching_the_axis_is_told_to_move_off_it():
+    msg = _enriched(0, 40)
+    assert "minimum x is > 0" in msg and "add 1 mm" in msg
+
+
+def test_a_profile_already_clear_of_the_axis_is_pointed_at_the_angle():
+    msg = _enriched(10, 40)
+    assert "already clears the axis" in msg and "angle" in msg
+    assert "offset" not in msg
+
+
+def test_an_unknown_profile_keeps_a_generic_but_actionable_fix():
+    fs = [{"id": "f2", "ok": False, "error": _ZERO_VOL}]
+    ops = [{"op": "add_feature", "feature": {
+        "type": "revolve", "name": "cup",
+        "refs": {"profile": [{"kind": "region", "sketch": "f9", "hint_index": 0}],
+                 "axis": "axis.y"},
+        "params": {"mode": "boss", "angle": 360}}}]
+    M._enrich_zero_volume_errors(fs, ops, {"$0": "f2"})
+    assert "strictly to ONE side of the axis" in fs[0]["error"]
+
+
+def test_other_failures_are_never_reworded():
+    fs = [{"id": "f1", "ok": False, "error": "loft produced a zero-volume solid — …"},
+          {"id": "f2", "ok": False, "error": "extrude produced a zero-volume solid — …"}]
+    M._enrich_zero_volume_errors(fs, [], {})
+    assert fs[0]["error"].endswith("— …") and fs[1]["error"].endswith("— …")

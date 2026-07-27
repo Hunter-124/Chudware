@@ -27,6 +27,7 @@ from .cad_common import (
     _err,
     _face_hist,
     _publish_current,
+    _project_save,
     _resolve_alias,
     _resolve_appearance,
     _sanitize_output_path,
@@ -1473,6 +1474,46 @@ def _normalize_boolean_feature(feat: dict, notes: list) -> dict:
 _PROFILE_MODE_TYPES = frozenset({"extrude", "revolve", "loft", "sweep"})
 _PROFILE_SOURCE_KEYS = ("profile", "sketch", "section", "profile_sketch", "sketch_id",
                         "source_sketch", "sections")
+# A loft's profiles live ONLY in refs.sections (validate.cpp: SelList, required). The
+# plural spellings a model reaches for — profiles / sketches — name that same slot, so
+# they are unambiguous aliases; a genuinely unknown slot keeps the engine's error.
+_LOFT_SECTION_ALIASES = ("profiles", "sketches")
+# Dict keys that wrap the real list one level too deep ({"sections":[…]}).
+_LOFT_SECTION_WRAP_KEYS = ("sections",) + _LOFT_SECTION_ALIASES
+
+
+def _loft_section_list(v: Any) -> Optional[list]:
+    """A loft sections value in any unambiguous dialect -> the canonical selector LIST.
+
+    A bare string is one sketch name; a selector dict is ONE section (the value should
+    have been a list); a dict whose only key is sections/profiles/sketches is the list
+    nested one level too deep. None when the shape says nothing certain — an empty list,
+    a dict that is neither wrapper nor selector, a non-string/selector member — so the
+    engine's error names it instead of this inventing sections.
+    """
+    if isinstance(v, str):
+        name = v.strip()
+        return [{"kind": "region", "sketch": name, "hint_index": 0}] if name else None
+    if isinstance(v, dict):
+        wrap = [k for k in _LOFT_SECTION_WRAP_KEYS if isinstance(v.get(k), list)]
+        if len(wrap) == 1 and set(v) == {wrap[0]}:
+            return _loft_section_list(v[wrap[0]])
+        if v.get("kind") or v.get("of") or isinstance(v.get("sketch"), str):
+            return [v]
+        return None
+    if isinstance(v, list):
+        if not v:
+            return None
+        out: list = []
+        for el in v:
+            if isinstance(el, str) and el.strip():
+                out.append({"kind": "region", "sketch": el.strip(), "hint_index": 0})
+            elif isinstance(el, dict):
+                out.append(el)
+            else:
+                return None
+        return out
+    return None
 _AXIS_SOURCE_TYPES = frozenset({"revolve", "circular_pattern", "surf_revolve", "helix"})
 
 
@@ -1507,7 +1548,9 @@ def _normalize_profile_feature(feat: dict, ftype: str, notes: list) -> dict:
     changed = False
 
     if not refs.get("profile") and not refs.get("sections"):
-        for k in _PROFILE_SOURCE_KEYS:
+        keys = _PROFILE_SOURCE_KEYS + (
+            ("profiles", "sketches") if ftype == "loft" else ())
+        for k in keys:
             v = peek(k)
             if v is _MISSING or v is None:
                 continue
@@ -1524,6 +1567,19 @@ def _normalize_profile_feature(feat: dict, ftype: str, notes: list) -> dict:
                     f'refs.profile=[{{"kind":"region","sketch":"$<index of that sketch op>",'
                     f'"hint_index":0}}] and no params.{k}. Sketch coordinates are 2D on that '
                     f'plane — "{plane}" is one that CONTAINS the axis, which a revolve needs.')
+            if ftype == "loft" and isinstance(v, (list, dict)):
+                canon = _loft_section_list(v)
+                if canon is None:
+                    continue  # ambiguous shape — the engine names it better than a guess
+                consume(k)
+                refs["sections"] = canon
+                changed = True
+                notes.append(
+                    f'{label}: interpreted params.{k} as refs.sections ({len(canon)} '
+                    f"region selector(s)) — a loft's profiles are a LIST of "
+                    f'{{"kind":"region","sketch":…}} selectors under refs.sections, '
+                    f"not a params.{k} value")
+                break
             if isinstance(v, str) and v.strip():
                 consume(k)
                 slot = "sections" if ftype == "loft" else "profile"
@@ -1683,6 +1739,24 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
                 changed = True
                 notes.append(f'{label}: read refs.{slot} as a {kind} query — a bare '
                              f'{{"side":…}} is not a topology selector')
+    if ftype == "loft":
+        # refs.sections is the ONLY profile slot a loft has — so refs.profiles /
+        # refs.sketches can only mean it, a {"sections":[…]} wrapper is the list nested
+        # one level too deep, and ONE bare selector/string is the list that should have
+        # been. Remap/unwrap; anything ambiguous keeps the engine's error.
+        src = "sections" if "sections" in out_refs else next(
+            (a for a in _LOFT_SECTION_ALIASES if a in out_refs), None)
+        if src is not None:
+            canon = _loft_section_list(out_refs[src])
+            if canon is not None and (src != "sections" or canon != out_refs[src]):
+                if src != "sections":
+                    out_refs.pop(src)
+                out_refs["sections"] = canon
+                changed = True
+                notes.append(
+                    f"{label}: read refs.{src} as refs.sections ({len(canon)} region "
+                    f"selector(s)) — a loft's profiles are a LIST of "
+                    f'{{"kind":"region","sketch":…}} selectors under refs.sections')
     if not changed:
         return feat
     out = dict(feat)
@@ -2097,6 +2171,116 @@ def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# The sketch-space coordinate that measures a profile's distance from each revolve
+# axis, per sketch plane (plane bases: top u=+X v=+Y, front u=+X v=+Z, right u=+Y
+# v=+Z — core/geom/plane.h). 0 = the u ("x") coordinate, 1 = the v ("y") one. A
+# plane that does not CONTAIN the axis has no single radial coordinate -> absent.
+_RADIAL_COORD = {("plane.top", "axis.x"): 1, ("plane.top", "axis.y"): 0,
+                 ("plane.front", "axis.x"): 1, ("plane.front", "axis.z"): 0,
+                 ("plane.right", "axis.y"): 1, ("plane.right", "axis.z"): 0}
+
+
+def _datum_token(v: Any) -> Optional[str]:
+    """A ref-slot datum value (bare word or {"kind":"datum","feature":…}) -> token."""
+    if isinstance(v, dict):
+        v = v.get("feature")
+    tok = _norm_datum(v)
+    return tok if tok in _DATUM_TOKENS else None
+
+
+def _sketch_radial_extent(sketch_feat: dict, plane: str, axis: str):
+    """(min, max) of the profile's radial coordinate, or None when not cheaply known.
+
+    Only reads points already written in THIS batch's sketch entities (line/arc
+    p1/p2, circle/arc centre +/- radius) — never invents or repairs geometry.
+    """
+    idx = _RADIAL_COORD.get((plane, axis))
+    if idx is None:
+        return None
+    ents = ((sketch_feat.get("params") or {}).get("entities")
+            if isinstance(sketch_feat.get("params"), dict) else None)
+    if not isinstance(ents, list):
+        return None
+    vals: list = []
+    for e in ents:
+        if not isinstance(e, dict):
+            continue
+        for pk in ("p1", "p2", "center"):
+            p = e.get(pk)
+            if (isinstance(p, list) and len(p) >= 2
+                    and all(isinstance(c, (int, float)) and not isinstance(c, bool)
+                            for c in p[:2])):
+                vals.append(float(p[idx]))
+                r = e.get("radius") if pk == "center" else None
+                if isinstance(r, (int, float)) and not isinstance(r, bool) and r > 0:
+                    vals.extend((float(p[idx]) - r, float(p[idx]) + r))
+    return (min(vals), max(vals)) if vals else None
+
+
+def _enrich_zero_volume_errors(fs: list, ops: list, idmap: dict) -> None:
+    """Make a revolve zero-volume failure ACTIONABLE, in place on feature_status.
+
+    The engine guard ("revolve produced a zero-volume solid") says WHAT is wrong but
+    not WHERE the profile sits, and the model resent the identical batch (live k3
+    run, 2026-07-27). This is a modelling mistake, never a dialect — no geometry is
+    repaired; when the profile sketch is in the SAME batch its radial extent is
+    cheap, so the message names the exact offset that clears the axis.
+    """
+    idx_of = {fid: int(k[1:]) for k, fid in idmap.items()
+              if isinstance(k, str) and k.startswith("$")
+              and k[1:].isdigit() and isinstance(fid, str)}
+    for s in fs:
+        err = str(s.get("error") or "")
+        if s.get("ok") or "zero-volume" not in err or "revolve" not in err:
+            continue
+        i = idx_of.get(s.get("id"))
+        feat = ops[i].get("feature") if i is not None and i < len(ops) else None
+        if not isinstance(feat, dict) or feat.get("type") != "revolve":
+            continue
+        refs = feat.get("refs") if isinstance(feat.get("refs"), dict) else {}
+        axis = _datum_token(refs.get("axis")) or "axis.y"
+        prof = refs.get("profile")
+        sel = prof[0] if isinstance(prof, list) and prof else prof
+        sk_name = (sel.get("sketch") if isinstance(sel, dict)
+                   else sel if isinstance(sel, str) else None)
+        sketch = None
+        if isinstance(sk_name, str) and sk_name.startswith("$") and sk_name[1:].isdigit():
+            j = int(sk_name[1:])
+            f = ops[j].get("feature") if j < len(ops) else None
+            sketch = f if isinstance(f, dict) and f.get("type") == "sketch" else None
+        elif sk_name is not None:
+            sketch = next((o["feature"] for o in ops
+                           if isinstance(o, dict)
+                           and isinstance(o.get("feature"), dict)
+                           and o["feature"].get("type") == "sketch"
+                           and o["feature"].get("name") == sk_name), None)
+        extent = None
+        plane = "plane.top"
+        if sketch is not None:
+            srefs = sketch.get("refs") if isinstance(sketch.get("refs"), dict) else {}
+            plane = (_datum_token(srefs.get("plane"))
+                     or _datum_token((sketch.get("params") or {}).get("plane"))
+                     or "plane.top")
+            extent = _sketch_radial_extent(sketch, plane, axis)
+        if extent is None:
+            s["error"] = err + (" | fix: move the profile so it sits strictly to ONE "
+                                "side of the axis — no point on or across it")
+            continue
+        lo, hi = extent
+        coord = "xy"[_RADIAL_COORD[(plane, axis)]]
+        if lo > 0:
+            s["error"] = err + (f" | the profile already clears the axis "
+                                f"({coord} in [{lo:g}, {hi:g}] mm on {plane}) — the "
+                                f"cause is the angle; use an angle well above 0")
+        else:
+            shift = 1.0 - lo
+            s["error"] = err + (
+                f" | fix: on {plane} the profile spans {coord} in [{lo:g}, {hi:g}] mm "
+                f"and the axis ({axis}) lies along the sketch {coord}=0 line — offset "
+                f"the profile so its minimum {coord} is > 0 (e.g. add {shift:g} mm to "
+                f"every point's {coord}, giving [{lo + shift:g}, {hi + shift:g}])")
+
+
 # add_features ARGUMENT-SHAPE normalizer (model-robustness).
 #
 # `ops=[{"op":"add_feature","feature":{…}}]` is the documented call and is passed through
@@ -2480,8 +2664,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # add_features reports a real volume delta ("0.0 -> X (+X)") instead of degrading
             # to the volume-only "volume now X" branch of _write_diff.
             _LAST_VOLUME[did] = 0.0
-            return _dumps({"ok": True, "doc_id": did, "name": name,
-                           "revision": r.get("revision", 0)})
+            out = {"ok": True, "doc_id": did, "name": name,
+                   "revision": r.get("revision", 0)}
+            # Land the (still empty) part in the user's project folder immediately so it
+            # exists as a real, openable file; add_features refreshes it as geometry grows.
+            saved = _project_save(did, name)
+            if saved:
+                out["saved_path"] = saved
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -2743,6 +2933,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
                 r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
                 fs = (r.get("rebuild") or {}).get("feature_status", [])
+                try:
+                    _enrich_zero_volume_errors(fs, ops, r.get("id_map") or {})
+                except Exception:  # noqa: BLE001 — enrichment must never mask a failure
+                    pass
                 feats = [{"id": s.get("id"), "ok": s.get("ok"),
                           "error": s.get("error"), "warning": s.get("warning")} for s in fs]
                 bodies = (r.get("tess") or {}).get("bodies", [])
@@ -2867,6 +3061,12 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     if pub:
                         out["shown_in_app"] = True
                     _autosave(d)  # persist so a server restart can recover this doc
+                # Refresh the deliverable .step+ in the user's project folder so the file on
+                # disk tracks the latest revision (no-op unless the workspace is configured).
+                if ok:
+                    saved = _project_save(d)
+                    if saved:
+                        out["saved_path"] = saved
                 # T-W12: attach preflight advisory items and log override event.
                 if _pf_result:
                     adv_items = _pf_result.get("advisory_items") or []

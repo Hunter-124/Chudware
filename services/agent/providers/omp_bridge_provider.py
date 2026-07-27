@@ -27,7 +27,9 @@ a module-level import raises.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 from typing import Any
 
 from .base import Provider
@@ -115,6 +117,30 @@ _KIMI_RESAMPLE_NUDGE = (
 )
 
 
+_THINK_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def _directive_from_thinking(thinking: str) -> str:
+    """A fenced tool/finish block the model left in its REASONING channel.
+
+    k3 often emits the JSON directive while thinking and returns empty text.
+    Salvaging it turns a wasted, fully-billed resample into a free hit; the
+    block is only accepted when it parses AND looks like a real directive, so
+    a stray brace in prose never becomes a phantom tool call.
+    """
+    for match in _THINK_FENCE_RE.finditer(thinking or ""):
+        blob = match.group(1)
+        try:
+            obj = json.loads(blob)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict) and (
+            obj.get("tool") or obj.get("done") or obj.get("status")
+        ):
+            return f"```json\n{blob}\n```"
+    return ""
+
+
 class OmpBridgeProvider(Provider):
     """A cloud model served through the OMP bun sidecar."""
 
@@ -177,7 +203,11 @@ class OmpBridgeProvider(Provider):
             # (measured 3 consecutive empties on one history), so each retry APPENDS a
             # cache-busting nudge that also restates the dialect. The nudge rides only
             # the wire copy — the harness history stays verbatim.
-            attempts = 4 if self.wire_provider == "kimi-code" else 1
+            # Cost control: every resample is a FULLY BILLED completion that
+            # re-sends the whole prompt. Before spending one, check whether the
+            # model already wrote the directive into its reasoning channel (k3
+            # frequently does) — that costs nothing and is the common case.
+            attempts = 2 if self.wire_provider == "kimi-code" else 1
             result: dict[str, Any] = {}
             wire_messages = params["messages"]
             for attempt in range(attempts):
@@ -190,6 +220,10 @@ class OmpBridgeProvider(Provider):
                     break  # surfaced below with its status — resampling won't help
                 if str(result.get("text") or ""):
                     break  # usable reply
+                salvaged = _directive_from_thinking(str(result.get("thinking") or ""))
+                if salvaged:
+                    result["text"] = salvaged
+                    break  # free: the block was in the reasoning channel
             # attempts exhausted with empty text: result holds the last sample and the
             # no-completion raise below still applies when thinking is empty too.
         except bridge.BridgeUnavailable as exc:

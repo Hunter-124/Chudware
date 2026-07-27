@@ -2138,6 +2138,7 @@ def run_linear_role_turn(
     capability: Any | None = None,
     max_tool_calls: int | None = None,
     tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
+    options: dict | None = None,
 ) -> dict[str, Any]:
     """Run ONE bounded ``agent_turn.run_turn`` against *role*'s card.
 
@@ -2221,6 +2222,7 @@ def run_linear_role_turn(
         on_event=on_event,
         run_id=run_id,
         capability=capability,
+        options=options,
     )
     # OMP Auto-Learn capture-at-stop (agent.autolearn_*). Main-chat / linear
     # entry only — never raises into the turn path.

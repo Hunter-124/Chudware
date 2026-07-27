@@ -315,6 +315,14 @@ def _session_compact(params: dict, _emit: Callable) -> dict:
         prior = p.get("prior_archive")
         if prior is not None and not isinstance(prior, dict):
             prior = None
+        provider = None
+        if p.get("provider") or p.get("model"):
+            provider = {
+                "provider": p.get("provider"),
+                "model": p.get("model"),
+            }
+            if isinstance(p.get("vision"), bool):
+                provider["vision"] = p["vision"]
         result = _cmds().compact_session(
             messages,
             strategy,
@@ -322,6 +330,8 @@ def _session_compact(params: dict, _emit: Callable) -> dict:
             supersede_reads=bool(supersede),
             drop_useless=bool(drop_useless),
             prior_archive=prior,
+            provider=provider,
+            session_id=str(p.get("session_id") or "") or None,
         )
         out = {
             "ok": True,
@@ -329,6 +339,8 @@ def _session_compact(params: dict, _emit: Callable) -> dict:
             "summary": result.get("summary") or "",
             "short_summary": result.get("short_summary") or "",
         }
+        if result.get("messages") is not None:
+            out["messages"] = result["messages"]
         if result.get("archive") is not None:
             out["archive"] = result["archive"]
         if "cut_index" in result:
@@ -1390,8 +1402,8 @@ OFFICE_METHODS: dict[str, Callable] = {
 
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     """``agent_admin_turn {request, run_id?, role?, provider?, model?, api_key?,
-    base_url?, reasoning_effort?} -> {ok, turn:{success, stop_reason, result, role,
-    allowed_tools}} | {ok:false, reason}``.
+    base_url?, reasoning_effort?, workspace_dir?} -> {ok, turn:{success, stop_reason,
+    result, role, allowed_tools}} | {ok:false, reason}``.
 
     Streams turn events through ``_emit`` — worker_main.py's serve loop tags each
     one with this request's id and pushes it as a ``{"event":...}`` line
@@ -1421,6 +1433,35 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         return value.strip() if isinstance(value, str) else ""
 
     provider_name = _param_str("provider")
+
+    # Workspace plumbing (T: project-folder awareness). run.cpp's general lane now
+    # passes ``workspace_dir`` (the user's project folder, resolved via
+    # agent_workspace_dir(options)). Two effects, both strictly opt-in:
+    #   1. fs_* tools jail on CHUDWARE_FS_ROOT — unset, they resolved against the
+    #      worker's CWD, i.e. the CAD source repo checkout, so the agent had no
+    #      project-folder awareness at all.
+    #   2. chdir to it so shell/fs defaults land in the user's project, not the repo.
+    # The worker is a fresh fork per turn (run.cpp call_admin_worker_turn), so no
+    # restore is needed — but every step is guarded so a bad path only logs/no-ops
+    # and NEVER fails the turn. Absent/invalid param == behaviour exactly as before.
+    project_root = ""
+    try:
+        raw_ws = (params or {}).get("workspace_dir")
+        if isinstance(raw_ws, str) and raw_ws.strip():
+            import os as _os  # noqa: PLC0415
+            from pathlib import Path as _Path  # noqa: PLC0415
+            cand = _Path(_os.path.abspath(_os.path.expanduser(raw_ws.strip())))
+            if cand.is_dir():
+                project_root = str(cand)
+                for env_key in (
+                    "CHUDWARE_FS_ROOT",
+                    "CHUDWARE_PROJECT_DIR",
+                    "CHUDWARE_PROJECT_SAVE_DIR",
+                ):
+                    _os.environ[env_key] = project_root
+                _os.chdir(project_root)
+    except Exception:  # noqa: BLE001 — a bad workspace path must never break a turn
+        project_root = ""
 
     try:
         from services.agent import config as agent_config  # noqa: PLC0415
@@ -1465,6 +1506,10 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         turn = run_linear_role_turn(
             request, role, provider,
             on_event=_on_event, run_id=run_id,
+            # Project memory / skills resolve against the user's project (agent_turn
+            # reads options project_dir/project_path/workspace_dir for its
+            # project-memory lookup).
+            options={"project_dir": project_root} if project_root else None,
         )
         return {"ok": True, "turn": turn}
     except Exception as exc:  # noqa: BLE001 — never raise across the worker seam
@@ -1498,9 +1543,20 @@ def _ai_prompt_preview(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _ai_tool_catalog(params: dict, _emit: Callable) -> dict:
+    """Settings → AI → Tools: full live tool catalog (families, descriptions,
+    curated guidance) so the panel is no longer a hardcoded stale table."""
+    try:
+        from services.agent.prompt_preview import tool_catalog  # noqa: PLC0415
+        return tool_catalog()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 PREVIEW_METHODS: dict[str, Callable] = {
     "ai_tool_preview": _ai_tool_preview,
     "ai_prompt_preview": _ai_prompt_preview,
+    "ai_tool_catalog": _ai_tool_catalog,
 }
 
 

@@ -132,3 +132,81 @@ def test_agent_admin_turn_honors_explicit_role(monkeypatch):
     assert out["ok"] is True
     assert captured["role"] == "project_organizer"
     assert out["turn"]["role"] == "project_organizer"
+
+
+# ──── workspace_dir plumbing (project-folder awareness) ────
+# run.cpp's general lane resolves the user's project folder via
+# agent_workspace_dir(options) and passes it as ``workspace_dir``. The worker is a
+# fresh fork per turn, so _agent_admin_turn sets CHUDWARE_FS_ROOT /
+# CHUDWARE_PROJECT_DIR / CHUDWARE_PROJECT_SAVE_DIR and chdirs into it — fs_* tools
+# jail on CHUDWARE_FS_ROOT and previously resolved against the CAD source repo
+# checkout (the worker's CWD). Absent/invalid param == behaviour exactly as before.
+
+_WS_ENV_KEYS = ("CHUDWARE_FS_ROOT", "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR")
+
+
+def _clear_ws_env(monkeypatch):
+    for key in _WS_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_agent_admin_turn_workspace_dir_sets_env_and_chdir(monkeypatch, tmp_path):
+    """A valid workspace_dir sets the three env vars to the resolved absolute path
+    and moves the worker's CWD into the user's project folder."""
+    import os
+    import sys
+
+    assert sys.platform != "win32" or True  # path assertions use realpath both sides
+    _clear_ws_env(monkeypatch)
+    start_cwd = os.getcwd()
+    provider = _OneToolProvider(["All done; the project is tidy."])
+    monkeypatch.setattr(agent_config, "get_provider", lambda *a, **k: provider)
+    try:
+        out = worker_rpc._agent_admin_turn(
+            {"request": "tidy my project folder",
+             "workspace_dir": str(tmp_path)},
+            lambda data: None,
+        )
+        assert out["ok"] is True
+        root = os.path.realpath(str(tmp_path))
+        for key in _WS_ENV_KEYS:
+            assert os.path.realpath(os.environ[key]) == root
+        assert os.path.realpath(os.getcwd()) == root
+    finally:
+        os.chdir(start_cwd)
+
+
+def test_agent_admin_turn_workspace_dir_absent_mutates_nothing(monkeypatch):
+    """No workspace_dir param: no env writes, no chdir — exactly today's behaviour."""
+    import os
+
+    _clear_ws_env(monkeypatch)
+    start_cwd = os.getcwd()
+    provider = _OneToolProvider(["Done."])
+    monkeypatch.setattr(agent_config, "get_provider", lambda *a, **k: provider)
+    out = worker_rpc._agent_admin_turn(
+        {"request": "summarize the project"}, lambda data: None)
+    assert out["ok"] is True
+    for key in _WS_ENV_KEYS:
+        assert key not in os.environ
+    assert os.getcwd() == start_cwd
+
+
+def test_agent_admin_turn_workspace_dir_nonexistent_is_ignored(monkeypatch, tmp_path):
+    """A non-existent workspace_dir never fails the turn: it is ignored (no env
+    writes, no chdir) and the turn still completes."""
+    import os
+
+    _clear_ws_env(monkeypatch)
+    start_cwd = os.getcwd()
+    provider = _OneToolProvider(["Done anyway."])
+    monkeypatch.setattr(agent_config, "get_provider", lambda *a, **k: provider)
+    out = worker_rpc._agent_admin_turn(
+        {"request": "list my files",
+         "workspace_dir": str(tmp_path / "does-not-exist")},
+        lambda data: None,
+    )
+    assert out["ok"] is True
+    for key in _WS_ENV_KEYS:
+        assert key not in os.environ
+    assert os.getcwd() == start_cwd

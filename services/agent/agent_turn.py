@@ -396,6 +396,66 @@ def _force_first_tool(
     return calls, tool_calls_made, True
 
 
+#: Where models actually put the human-readable finish text. The canonical
+#: role-card envelope uses `summary`, but the `{"done": true, "handoff": {...}}`
+#: dialect kimi k3 writes puts the whole answer in `response` — reading only
+#: `summary` made a real chat reply look content-free and the unearned-finish
+#: gate rejected it (live 2026-07-27: "say hi in five words" -> no_code).
+_HANDOFF_TEXT_KEYS = (
+    "summary", "response", "text", "message", "answer", "reply",
+    "result", "verdict", "reasoning_summary",
+)
+
+
+def _handoff_text(handoff: Any) -> str:
+    """Human-readable text carried by a finish envelope, any known dialect."""
+    if not isinstance(handoff, dict):
+        return str(handoff or "").strip()
+    seen: list[str] = []
+
+    def _harvest(obj: Any) -> None:
+        if not isinstance(obj, dict):
+            return
+        for key in _HANDOFF_TEXT_KEYS:
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                seen.append(value.strip())
+
+    _harvest(handoff)
+    _harvest(handoff.get("outputs"))
+    return " ".join(seen).strip()
+
+
+
+
+#: Openers that promise an action rather than deliver one. Tested against the
+#: FINAL clause only: "I'll explain: <answer>" delivers (colon payload), while
+#: "...truncated - let me get the tail end." is a promise and must not finish.
+_NEXT_STEP_OPENER_RE = re.compile(
+    r"^(?:let me|let'?s|i'?ll|i will|i'?m going to|i am going to|now i|"
+    r"next,?\s+i|give me a (?:sec|second|moment)|one moment|hold on|"
+    r"checking|i need to|i should|i'?m about to)\b",
+    re.IGNORECASE,
+)
+#: Clause boundaries INCLUDING dashes/semicolons — the live miss was an em-dash
+#: ("The listing got truncated - let me get the tail end of the directory.").
+_CLAUSE_SPLIT_RE = re.compile(r"[.!?\n;]|\s[-\u2013\u2014]\s")
+
+
+def _announces_next_step(text: str) -> bool:
+    """True when *text* ends by promising an action instead of delivering one."""
+    tail = (text or "").strip()
+    if not tail:
+        return False
+    clauses = [c.strip() for c in _CLAUSE_SPLIT_RE.split(tail[-400:]) if c.strip()]
+    if not clauses:
+        return False
+    last = clauses[-1]
+    if ":" in last:
+        return False  # a colon introduces delivered content, not a promise
+    return bool(_NEXT_STEP_OPENER_RE.match(last))
+
+
 # Fabricated-success detector: a finish (bare prose, junk JSON, or a formal
 # done envelope) that CLAIMS completed work while the turn ran zero voluntary
 # tool calls. Live (2026-07-27, kimi k3-256k general lane): "make me a
@@ -1085,6 +1145,29 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     except Exception:  # noqa: BLE001 — memory never breaks a turn
         pass
 
+    # Project-folder awareness: list the user's existing CAD files so the
+    # model opens them instead of re-creating duplicates (2026-07-27).
+    # Injected once per turn, only when a root is known and the block is
+    # non-empty. Best-effort: never breaks a turn.
+    try:
+        from services.agent.project_context import project_context_block  # noqa: PLC0415
+        import os as _os  # noqa: PLC0415
+        _pc_root = _os.environ.get("CHUDWARE_PROJECT_DIR") or None
+        if not _pc_root and isinstance(options, dict):
+            _pc_root = (options.get("project_dir") or options.get("project_path")
+                        or options.get("workspace_dir"))
+        if not _pc_root:
+            try:
+                from services.agent.config import workspace_dir as _ws_dir  # noqa: PLC0415
+                _pc_root = _ws_dir()
+            except Exception:  # noqa: BLE001
+                _pc_root = None
+        _pc_blk = project_context_block(_pc_root)
+        if _pc_blk:
+            system = system.rstrip() + "\n\n" + _pc_blk
+    except Exception:  # noqa: BLE001
+        pass
+
     # OMP Auto-Learn standing guidance (Settings → AI → Harness). Best-effort.
     try:
         from services.agent.autolearn import standing_guidance  # noqa: PLC0415
@@ -1172,6 +1255,9 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     # finish that claims completed work with zero voluntary tool calls; the
     # second such finish ends the turn honestly (no_code) instead of looping.
     _novol_nudge = [0]
+    # At most one "you described the step instead of taking it" nudge, so a
+    # chatty model is pushed once and never loops.
+    _continue_nudge = [0]
     # T-W21 §20 / mega-25: trigger-injection bookkeeping scoped to THIS
     # run_turn() call — messages/context is always fresh per call (no cross-
     # call conversation continuity), so cooldown only needs to hold across
@@ -1511,6 +1597,25 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                         continue
                     last_reason = _NOCODE
                     break
+                # A reply that announces its NEXT action is mid-thought, not a
+                # finish. Live 2026-07-27 (HERC project): after two fs_list
+                # calls the model said "The listing got truncated - let me get
+                # the tail end of the directory" and the harness returned that
+                # as the completed answer. Push it to actually do the step.
+                if (
+                    _announces_next_step(reply)
+                    and tool_calls_made < budget
+                    and _continue_nudge[0] < 1
+                ):
+                    _continue_nudge[0] += 1
+                    messages.append({"role": "user", "content": _parts(
+                        "[UNFINISHED] You described the next step instead of "
+                        "taking it, and the turn is not over. Do it now with a "
+                        "real tool call. Only finish when the user's request is "
+                        "actually answered - then state the ANSWER, not a plan."
+                    )})
+                    last_reason = _RETRY
+                    continue
                 bare_handoff = {
                     "status": "done",
                     "summary": (reply or "")[:600],
@@ -1627,13 +1732,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             if handoff_status in ("", "done"):
                 # Fabricated-success gate: a done envelope claiming completed
                 # work while every call so far was harness-forced is not done.
-                _ho_out = (handoff or {}).get("outputs")
-                _ho_text = " ".join(str(x) for x in (
-                    (handoff or {}).get("summary") or "",
-                    (_ho_out or {}).get("text") if isinstance(_ho_out, dict) else "",
-                    (_ho_out or {}).get("reasoning_summary")
-                    if isinstance(_ho_out, dict) else "",
-                ) if x).strip()
+                _ho_text = _handoff_text(handoff)
                 _unearned = _unearned_finish_block(
                     calls, _ho_text[:4000], empty_is_unearned=True)
                 if _unearned is not None:
@@ -3722,13 +3821,31 @@ def _parts(text: str) -> list[dict]:
     return [{"type": "text", "text": str(text)}]
 
 
-def _as_text(result: Any) -> str:
+_TOOL_RESULT_CHARS = 8000
+
+
+def _as_text(result: Any, limit: int = _TOOL_RESULT_CHARS) -> str:
+    """Tool result as prompt text, truncated VISIBLY rather than silently.
+
+    The old 2000-char silent cut made a 31-file fs_list unreadable: the model
+    received half a JSON object with nothing saying anything was missing, so it
+    re-issued the same listing and burned completions on it (live 2026-07-27,
+    HERC project folder). A truncation the model can SEE is one it can work
+    around; an invisible one costs tokens and still fails.
+    """
     if isinstance(result, str):
-        return result[:2000]
-    try:
-        return json.dumps(result, default=str)[:2000]
-    except Exception:  # noqa: BLE001
-        return str(result)[:2000]
+        text = result
+    else:
+        try:
+            text = json.dumps(result, default=str)
+        except Exception:  # noqa: BLE001
+            text = str(result)
+    if len(text) <= limit:
+        return text
+    return (text[:limit] +
+            f"\n... [TRUNCATED: {len(text) - limit} of {len(text)} chars withheld. "
+            f"Narrow the call (a subdirectory, a filter, or offset/limit) - "
+            f"repeating it unchanged returns the same truncated text.]")
 
 
 

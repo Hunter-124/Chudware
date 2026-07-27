@@ -586,7 +586,8 @@ std::string admin_worker_repo_root() {
 // the caller's contract is to treat every false return identically: fall back
 // to the blocked response.
 bool call_admin_worker_turn(const std::string& request, const std::string& run_id,
-                            const json& provider_cfg, RunEvents& events, json& turn_out,
+                            const json& provider_cfg, const std::string& workspace_dir,
+                            RunEvents& events, json& turn_out,
                             std::string& err) {
     const std::string python = admin_worker_python_bin();
     if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
@@ -655,6 +656,10 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     // omitted rather than sent as "" so the worker's "caller supplied nothing" branch
     // stays distinguishable from "caller supplied a blank".
     json params{{"request", request}, {"run_id", run_id}, {"role", "general_agent"}};
+    // The user's project/workspace dir (agent_workspace_dir(options)): the python
+    // worker jails fs_* on CHUDWARE_FS_ROOT and chdirs here so file work lands in
+    // the user's folder instead of the CAD source repo checkout.
+    if (!workspace_dir.empty()) params["workspace_dir"] = workspace_dir;
     if (provider_cfg.is_object()) {
         auto put = [&](const char* cfg_key, const char* param_key) {
             const auto it = provider_cfg.find(cfg_key);
@@ -777,7 +782,8 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     return ok_final;
 }
 #else   // _WIN32
-bool call_admin_worker_turn(const std::string&, const std::string&, const json&, RunEvents&,
+bool call_admin_worker_turn(const std::string&, const std::string&, const json&,
+                            const std::string&, RunEvents&,
                             json&, std::string& err) {
     err = "admin worker bridge unavailable on this platform";
     return false;
@@ -992,7 +998,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // response carrying that reason — never a crash, never a silent hang.
         json turn;
         std::string worker_err;
-        if (!call_admin_worker_turn(request, run_id, provider_cfg, events, turn, worker_err)) {
+        const std::string ws_dir = agent_workspace_dir(options);
+        if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, events, turn,
+                                    worker_err)) {
             if (worker_err == "cancelled" || run_ctl.cancelled()) {
                 events.emit("run_finished", json{{"status", "cancelled"},
                                                  {"stop_reason", "cancelled"}});
@@ -1024,15 +1032,26 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         const json turn_result = turn.value("result", json::object());
         std::string summary;
         if (turn_result.is_object()) {
+            // Models write the finish text under several keys: the canonical
+            // role envelope uses `summary`, kimi k3's {"done":true,"handoff":{…}}
+            // dialect uses `response`. Read every known one, top level and
+            // under `outputs`, or the chat bubble comes up blank.
+            static const char* kTextKeys[] = {"summary", "response", "text",
+                                              "message", "answer", "reply",
+                                              "verdict"};
             const json handoff = turn_result.value("handoff", json::object());
-            if (handoff.is_object()) {
-                summary = handoff.value("summary", std::string());
-                if (summary.empty()) {
-                    const json outputs = handoff.value("outputs", json::object());
-                    if (outputs.is_object()) summary = outputs.value("text", std::string());
+            auto harvest = [&](const json& obj) {
+                if (!obj.is_object()) return;
+                for (const char* key : kTextKeys) {
+                    if (!summary.empty()) return;
+                    const auto it = obj.find(key);
+                    if (it != obj.end() && it->is_string() && !it->get<std::string>().empty())
+                        summary = it->get<std::string>();
                 }
-            }
-            if (summary.empty()) summary = turn_result.value("text", std::string());
+            };
+            harvest(handoff);
+            if (handoff.is_object()) harvest(handoff.value("outputs", json::object()));
+            harvest(turn_result);
         }
         return json{{"run_id", run_id},
                     {"status", status},

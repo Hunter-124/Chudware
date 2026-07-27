@@ -14,15 +14,15 @@ How to model one solid part in Chudware. Prefer standard editable features over 
 
 ## Sequence
 
-1. **Orient** — `cad_guide()` if the op vocabulary is not already in context. Call `list_parts()` / `describe_part(doc_id)` when a doc may already exist.
-2. **Open or create** — `new_part(name)` for a fresh body; keep the returned `doc_id` and pass it on every later call when more than one part is open.
+1. **Orient** — `cad_guide()` if the op vocabulary is not already in context. Call `list_parts()` / `describe_part` when a doc may already exist (prefer the part name in narration; pass opaque `doc_id` when multi-doc or ambiguous).
+2. **Open or create** — `new_part(name)` for a fresh body; when more than one part is open, pass the opaque `doc_id` on later tool calls; prefer the part **name** in user-facing text.
 3. **Interface first** — if this part mates to another, model the **mating interface dims first** (bore, boss, hole pattern, flange face). Read dims from the existing mating part via `measure_part` / `query_geometry` — never parallel-guess both sides.
 4. **Build features** — `add_features([...ops...])` with human features: sketch+extrude/revolve/loft/sweep, fillet/chamfer/shell, holes, patterns, mirror. Address faces in plain words ("the top face", "the largest cylindrical face").
 5. **Verify each mutation** — after every `add_features`:
-   - `describe_part(doc_id)` or `measure_part(doc_id)` on the affected geometry
-   - `check_feature_overlap(doc_id)` after boolean-heavy work
+   - `describe_part` or `measure_part` on the affected geometry
+   - `check_feature_overlap` after boolean-heavy work
 6. **Standard parts** — fasteners, bearings, inserts: `part_search(query)` then `part_place(part_id)`. Never approximate a catalog part.
-7. **Done gate** — `verify_battery(doc_id)` must show no FAILs before you report done. See `skill://edit-part` resources and `cad_guide('verify')`.
+7. **Done gate** — `verify_battery` must show no FAILs before you report done (pass `doc_id` when multi-doc). See `skill://edit-part` resources and `cad_guide('verify')`.
 
 ## Rules
 

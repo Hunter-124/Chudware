@@ -734,10 +734,16 @@ void chatArtifactActions(AppState& st, const std::string& path) {
 // with the human-readable target as a dim wrapped line. Args preview + failure text + image
 // artifacts expand on click. feedTurnActivity packs the capped error_preview after
 // "\n\x1eERR\x1e\n" and artifact image paths after "\n\x1eART\x1e\n".
-void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
+// Mid-loop CAD tool failures use statusWarn (amber), matching drawAgentStep build issues — the
+// error is fed back for repair, not a catastrophic turn failure. `failCount` > 1 collapses
+// consecutive identical tool+target fails into one row (drawAgentTimeline computes the run).
+static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& fonts,
+                                int failCount) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool fail = a.status == "fail";
+    // Amber chrome for repairable mid-loop fails (glyph via "retry" status → statusWarn).
+    const ImVec4 failTone = semanticOnGlass(pal.statusWarn, chatSurf());
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -745,7 +751,7 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
     ImGui::BeginChild("##toolrow", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     const ui::AdaptiveSurface& surf = chatSurf();
-    drawStatusGlyph(a.status, ImGui::GetTextLineHeight());
+    drawStatusGlyph(fail ? "retry" : a.status, ImGui::GetTextLineHeight());
     ImGui::SameLine(0, 6 * sc);
     ui::IconUV iv = ui::getIcon("wrench", 20);
     if (iv.valid) {
@@ -757,8 +763,7 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
     ImGui::PushFont(fonts.medium);
     {
         std::string doingTitle = "Doing \xc2\xb7 " + a.title;
-        ImGui::TextColored(fail ? semanticOnGlass(pal.statusErr, surf) : surf.textPrimary,
-                           "%s", doingTitle.c_str());
+        ImGui::TextColored(fail ? failTone : surf.textPrimary, "%s", doingTitle.c_str());
     }
     ImGui::PopFont();
 
@@ -801,25 +806,35 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
     }
-    if (fail || a.durationMs > 0) {
+    if (fail || a.durationMs > 0 || failCount > 1) {
         ImGui::SameLine(0, 8 * sc);
-        char meta[64];
-        if (fail && a.durationMs > 0)
+        char meta[80];
+        if (fail && failCount > 1 && a.durationMs > 0)
+            std::snprintf(meta, sizeof(meta), "failed \xc3\x97%d \xc2\xb7 %.1fs",
+                          failCount, a.durationMs / 1000.0);
+        else if (fail && failCount > 1)
+            std::snprintf(meta, sizeof(meta), "failed \xc3\x97%d", failCount);
+        else if (fail && a.durationMs > 0)
             std::snprintf(meta, sizeof(meta), "failed \xc2\xb7 %.1fs", a.durationMs / 1000.0);
         else if (fail)
             std::snprintf(meta, sizeof(meta), "failed");
         else
             std::snprintf(meta, sizeof(meta), "%.1fs", a.durationMs / 1000.0);
-        ImGui::PushStyleColor(ImGuiCol_Text, fail ? semanticOnGlass(pal.statusErr, surf)
-                                                  : surf.textSecondary);
+        ImGui::PushStyleColor(ImGuiCol_Text, fail ? failTone : surf.textSecondary);
         ImGui::TextUnformatted(meta);
         ImGui::PopStyleColor();
     }
     if (!a.reason.empty()) dimText(a.reason.c_str());   // the human target — "what it acts on"
+    // Keep a one-line cause visible even when collapsed (same calm tone as drawAgentStep).
+    if (fail && !errBody.empty() && !a.expanded) {
+        ImGui::PushStyleColor(ImGuiCol_Text, failTone);
+        ImGui::TextWrapped("%s", errSummary(errBody).c_str());
+        ImGui::PopStyleColor();
+    }
     if (a.expanded && hasDrawer) {
-        // Why it failed, first: red summary line + the full text in a red-outlined code box.
+        // Why it failed, first: amber summary + full text in a warn-outlined code box.
         if (fail && !errBody.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.statusErr, surf));
+            ImGui::PushStyleColor(ImGuiCol_Text, failTone);
             ImGui::TextWrapped("%s", errSummary(errBody).c_str());
             ImGui::PopStyleColor();
             const ImVec2 errMin = ImGui::GetCursorScreenPos();
@@ -828,7 +843,7 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
             const ImVec2 errMax(errMin.x + errW,
                                 ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y);
             ImGui::GetWindowDrawList()->AddRect(errMin, errMax,
-                                                ui::Palette::toU32(pal.statusErr),
+                                                ui::Palette::toU32(pal.statusWarn),
                                                 4.0f * sc, 0, ui::metrics::stroke(1.0f));
         }
         if (!argsBody.empty())
@@ -886,13 +901,17 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
     ImRect rowRect = endGlassBubble(gb);
     if (fail)
         ImGui::GetWindowDrawList()->AddRect(rowRect.Min, rowRect.Max,
-                                            ui::Palette::toU32(pal.statusErr),
+                                            ui::Palette::toU32(pal.statusWarn),
                                             ui::metrics::rounding(8.0f), 0, ui::metrics::stroke(1.5f));
     {
         const std::string toolCopy = chatActivityCopyText(a);
         chatCopyContext(rowRect, "##tool_copy", toolCopy);
 
     }
+}
+
+void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
+    drawToolCallRowImpl(st, a, fonts, /*failCount=*/1);
 }
 
 
@@ -923,7 +942,24 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         } else if (a.rowKind == 2) {
             drawThoughtBox(a, fonts, showThinking, turnRunning);
         } else if (a.rowKind == 3) {
-            drawToolCallRow(st, a, fonts);
+            // Collapse consecutive identical tool+target failures into one row with a count
+            // (stops five identical amber cards stacking during a repair loop). Show the
+            // last item in the run so the visible error_preview is the most recent.
+            int failCount = 1;
+            size_t drawIdx = i;
+            if (a.status == "fail") {
+                size_t j = i + 1;
+                while (j < m.activity.size()) {
+                    const ActivityItem& n = m.activity[j];
+                    if (n.rowKind != 3 || n.status != "fail") break;
+                    if (n.title != a.title || n.reason != a.reason) break;
+                    ++failCount;
+                    ++j;
+                }
+                drawIdx = j - 1;
+                i = j - 1;  // loop ++i advances past the coalesced run
+            }
+            drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount);
         } else if (a.rowKind == 10) {
             drawClassificationCard(a, fonts, turnRunning);
         } else if (a.rowKind == 19) {

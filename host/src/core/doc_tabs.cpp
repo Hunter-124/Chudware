@@ -89,22 +89,36 @@ static std::string docTitle(const nlohmann::json& tree, bool isAssembly) {
     return isAssembly ? "Assembly1" : "Part1";
 }
 
-// See app_state.h: filename-first label for a tab. Strip directory + one trailing extension so an
-// opened "C:\parts\bracket.step+" reads as "bracket"; fall back to the tree-derived title otherwise.
+// See app_state.h: label for a tab. Prefer a human part name (handoffName / tree title) over path
+// stem so AI-created parts never read as "doc-cpp…". Filename-first remains only for generic
+// placeholders on path-backed tabs (opened "C:\parts\bracket.step+" with title still "Part1").
 std::string AppState::DocTab::displayTitle() const {
+    auto opaqueId = [](const std::string& s) {
+        return s.rfind("doc-cpp", 0) == 0 || s.rfind("doc_cpp", 0) == 0;
+    };
+    // handoffName (MCP docs.json) beats title; skip opaque engine ids either way.
+    const std::string human = !handoffName.empty() && !opaqueId(handoffName) ? handoffName
+                            : (!title.empty() && !opaqueId(title) ? title : std::string());
+
     // Live MCP-handoff mirror: never show its on-disk name ("live", from live.step+). Label it as
-    // the AI's part using the tree-derived title so the user reads "AI: bracket", not "live".
+    // the AI's part so the user reads "AI: bracket", not "live" / "doc-cpp…".
     // Once the user has ADOPTED it (edited it), it's their doc — drop the "AI:" prefix.
     if (aiHandoff && !userAdopted)
-        return "AI: " + (title.empty() ? std::string("part") : title);
+        return "AI: " + (human.empty() ? std::string("part") : human);
+
+    if (!human.empty()) {
+        const bool generic = (human == "Part1" || human == "Assembly1" ||
+                              human == "Untitled" || human == "AI part" || human == "part");
+        if (!generic) return human;
+    }
     if (!path.empty()) {
         std::size_t slash = path.find_last_of("/\\");
         std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
         std::size_t dot = base.find_last_of('.');
         if (dot != std::string::npos && dot > 0) base = base.substr(0, dot);
-        if (!base.empty()) return base;
+        if (!base.empty() && !opaqueId(base)) return base;
     }
-    return title.empty() ? std::string("Untitled") : title;
+    return human.empty() ? std::string("Untitled") : human;
 }
 
 int AppState::tabIndexForActiveDoc() const {

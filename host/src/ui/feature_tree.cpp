@@ -1608,6 +1608,8 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
             if (!canOpen) ImGui::BeginDisabled();
             if (ImGui::MenuItem("Open Part"))
                 openComponentPart(st, importSrcPath);
+            if (haveOsFileManager() && ImGui::MenuItem("Open Part Location"))
+                revealInFileManager(importSrcPath);
             if (!canOpen) ImGui::EndDisabled();
             if (ImGui::MenuItem("Rename")) {
                 s_renamingId = fid;
@@ -2609,6 +2611,8 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
             if (unavailable) ImGui::BeginDisabled();
             if (ImGui::MenuItem("Open Part"))
                 openComponentPart(st, component.sourceAbsPath);
+            if (haveOsFileManager() && ImGui::MenuItem("Open Part Location"))
+                revealInFileManager(component.sourceAbsPath);
             if (unavailable) ImGui::EndDisabled();
             ImGui::EndPopup();
         }
@@ -2838,6 +2842,8 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             if (unavailable) ImGui::BeginDisabled();
             if (ImGui::MenuItem("Open Part"))
                 openComponentPart(st, absPath);
+            if (haveOsFileManager() && ImGui::MenuItem("Open Part Location"))
+                revealInFileManager(absPath);
             if (unavailable) ImGui::EndDisabled();
             ImGui::Separator();
             if (ImGui::MenuItem("Add to AI context")) {
@@ -2906,6 +2912,8 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             if (!canOpen) ImGui::BeginDisabled();
             if (ImGui::MenuItem("Open Part"))
                 openComponentPart(st, group.absPath);
+            if (haveOsFileManager() && ImGui::MenuItem("Open Part Location"))
+                revealInFileManager(group.absPath);
             if (!canOpen) ImGui::EndDisabled();
             ImGui::EndPopup();
         }
@@ -5476,6 +5484,8 @@ void drawFeatureTreeBody(AppState& st,
                                 if (!canOpen) ImGui::BeginDisabled();
                                 if (ImGui::MenuItem("Open Part"))
                                     openComponentPart(st, g.absPath);
+                                if (haveOsFileManager() && ImGui::MenuItem("Open Part Location"))
+                                    revealInFileManager(g.absPath);
                                 if (!canOpen) ImGui::EndDisabled();
                                 ImGui::EndPopup();
                             }
@@ -5819,10 +5829,11 @@ void pollAiCadHandoff(AppState& st) {
                     if (!hd.step.empty()) published.push_back(hd);
                 }
             } else {
-                // Legacy shape {rev, step, doc_id} — a single mirror keyed by "".
+                // Legacy shape {rev, step, doc_id[, name]} — a single mirror keyed by "".
                 HandoffDoc hd;
                 hd.docId = std::string();  // stable legacy key
                 hd.step  = j.value("step", std::string());
+                hd.name  = j.value("name", std::string());
                 hd.rev   = j.value("rev", (long long)-1);
                 if (!hd.step.empty()) { haveControl = true; published.push_back(hd); }
             }
@@ -5894,6 +5905,8 @@ void pollAiCadHandoff(AppState& st) {
                 st.docTabs[newIdx].aiHandoff = true;
                 st.docTabs[newIdx].handoffDocId = docId;
                 st.docTabs[newIdx].handoffName = hd.name;
+                // Prefer advertised part name over path stem / opaque docId on the tab strip.
+                if (!hd.name.empty()) st.docTabs[newIdx].title = hd.name;
                 openFails.erase(docId);
                 // DEDUPE (fixes the doubled-view bug): close any OTHER mirror tab that shows the
                 // same part — either the same doc_id (a racing/stale open) OR the same non-empty
@@ -5984,6 +5997,7 @@ void pollAiCadHandoff(AppState& st) {
             st.docTabs[st.activeTab].aiHandoff = true;
             st.docTabs[st.activeTab].handoffDocId = docId;
             st.docTabs[st.activeTab].handoffName = hd.name;
+            if (!hd.name.empty()) st.docTabs[st.activeTab].title = hd.name;
             st.docTabs[st.activeTab].aiPulse = false;   // user is viewing this refresh — no glow
             st.yaw = cy; st.pitch = cp; st.zoom = cz;
             st.pan[0] = px; st.pan[1] = py; st.pan[2] = pz;

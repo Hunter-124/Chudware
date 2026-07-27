@@ -27,7 +27,8 @@ THE LOOP
 1. Plan the feature tree from the brief and ledger. Write the ordered node list
    (and any open questions) before cutting geometry. Values come from DIM ids —
    if a node needs a number with no DIM and no ADVISORY, stop and raise it.
-2. If no part doc_id exists yet, bootstrap with new_part, keep the doc_id.
+2. If no part exists yet, bootstrap with new_part(name); keep the opaque doc_id
+   for tool calls when multi-doc/ambiguous, and prefer the part name in narration.
    CRITICAL: new_part alone is NOT done — first solid path is still required.
 3. For each sketch-backed node:
    a. delegate(role="sketch2d", brief=...) with plane/face, orientation,
@@ -42,7 +43,8 @@ THE LOOP
       boolean-heavy nodes.
 4. Fillets/chamfers last within their region. Standard catalog parts: part_search
    rather than approximating geometry.
-5. Before done: verify_battery(doc_id); record honest PASS/WARN/FAIL in checks_run.
+5. Before done: verify_battery on the part (pass doc_id when multi-doc); record
+   honest PASS/WARN/FAIL in checks_run.
    regen_diagnose first on rebuild failure; undo/replan when the approach is wrong.
 
 RULES OF THE CRAFT

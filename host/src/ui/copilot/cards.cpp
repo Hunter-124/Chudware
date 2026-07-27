@@ -562,6 +562,20 @@ std::string planProgressLine(const PlanState& plan,
 void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& activity,
                      const ui::Fonts& fonts) {
     if (!plan.present) return;
+    // Real plan = at least one non-subagent item (step/task/part/objective/node)
+    // OR an explicit fromEvent plan with a non-empty summary. Spawn-only runs that
+    // only carry kind=subagent rows must not draw a Plan/checklist card — the
+    // Delegating card is the spawn surface.
+    bool hasRealItem = false;
+    for (const auto& it : plan.items) {
+        if (it.kind == "step" || it.kind == "task" || it.kind == "part" ||
+            it.kind == "objective" || it.kind == "node") {
+            hasRealItem = true;
+            break;
+        }
+    }
+    const bool meaningfulSummary = plan.fromEvent && !plan.summary.empty();
+    if (!hasRealItem && !meaningfulSummary) return;
     // Nothing to show if we have no items and no summary/title-only noise.
     if (plan.items.empty() && plan.summary.empty() && plan.title.empty()) return;
 
@@ -733,8 +747,11 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
             planDrawTodosTree(plan, activity, fonts);
     }
 
-    // Always try subagents subsection (omits itself when empty).
-    planDrawSubagents(plan, activity, fonts);
+    // Subagents subsection only when the Plan has real work items. Spawn-only
+    // (subagents alone) never reaches here; when Delegating already lists them
+    // and they'd be the only Plan body, omit to avoid duplicating that card.
+    if (hasRealItem)
+        planDrawSubagents(plan, activity, fonts);
 
     ImGui::PopStyleColor();
     ImGui::EndChild();

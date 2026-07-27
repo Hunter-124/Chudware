@@ -784,6 +784,43 @@ TEST_CASE("clarify: geometry_select kind emits empty suggested + targets") {
     CHECK(result["questions"][0]["kind"] == "geometry_select");
 }
 
+// --------------------------------------------------------------------------- tool_call target (humanize)
+TEST_CASE("emit_agent_tool_call demotes opaque doc_id; prefers name and ops") {
+    std::vector<json> seen;
+    RunEvents ev("target-humanize", [&](const json& e) { seen.push_back(e); });
+
+    // new_part-style: name beats doc_id on the same object.
+    seen.clear();
+    emit_agent_tool_call(ev, "new_part", /*target=*/"",
+                         json{{"name", "mud_bucket"}, {"doc_id", "doc-cpp00000002"}},
+                         true, 1);
+    REQUIRE(!seen.empty());
+    CHECK(seen.back()["target"] == "mud_bucket");
+
+    // MCP add_features envelope: ops feature summary beats opaque doc_id.
+    seen.clear();
+    emit_agent_tool_call(
+        ev, "add_features", /*target=*/"",
+        json{{"doc_id", "doc-cpp00000009"},
+             {"ops",
+              json::array({json{{"op", "add_feature"},
+                                {"feature",
+                                 {{"type", "extrude"},
+                                  {"name", "BucketWall"},
+                                  {"params", {{"depth", 40}}}}}}})}},
+        true, 1);
+    REQUIRE(!seen.empty());
+    CHECK(seen.back()["target"].get<std::string>().find("BucketWall") != std::string::npos);
+    CHECK(seen.back()["target"].get<std::string>().find("doc-cpp") == std::string::npos);
+
+    // Bare opaque doc_id alone must not become the human target.
+    seen.clear();
+    emit_agent_tool_call(ev, "add_features", /*target=*/"",
+                         json{{"doc_id", "doc-cpp00000001"}}, true, 1);
+    REQUIRE(!seen.empty());
+    CHECK(seen.back()["target"].get<std::string>().find("doc-cpp") == std::string::npos);
+}
+
 // --------------------------------------------------------------------------- plan_state
 TEST_CASE("plan_item_title caps at 10 words") {
     CHECK(plan_item_title("one two three") == "one two three");

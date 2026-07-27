@@ -1159,12 +1159,24 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         }
         m.planState.present = true;
     } else if (kind == "agent.spawn") {
-        // Subagent row for the Plan section Subagents list.
-        PlanState& ps = ensureDerivedPlan();
+        // Subagent dispatch. Never invent Plan chrome (present/title/checklist) for
+        // spawn-only runs — that produced an empty Plan card with only Subagents.
+        // Attach a kind=subagent row only when a real plan already exists; the
+        // Delegating card below is always the spawn-only surface.
+        auto planHasRealContent = [&]() -> bool {
+            if (!m.planState.present) return false;
+            for (const auto& pi : m.planState.items) {
+                if (pi.kind == "step" || pi.kind == "task" || pi.kind == "part" ||
+                    pi.kind == "objective" || pi.kind == "node")
+                    return true;
+            }
+            return m.planState.fromEvent && !m.planState.summary.empty();
+        };
+
         PlanItem it;
         it.id = jstr(data, "subagent_id");
         if (it.id.empty()) it.id = jstr(data, "id");
-        if (it.id.empty()) it.id = "spawn:" + std::to_string(ps.items.size());
+        if (it.id.empty()) it.id = "spawn:" + std::to_string(m.planState.items.size());
         // Ensure spawn: namespace when bare.
         if (it.id.find(':') == std::string::npos) it.id = "spawn:" + it.id;
         it.title = jstr(data, "name");
@@ -1176,8 +1188,13 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         if (it.desc.empty()) it.desc = jstr(data, "assignment");
         it.kind = "subagent";
         it.status = "running";
-        upsertDerivedItem(std::move(it));
-        ps.present = true;
+        // Capture before move — upsertDerivedItem(std::move(it)) empties it.title.
+        const std::string roleTitle = it.title;
+        std::string brief = jstr(data, "brief");
+        if (brief.empty()) brief = jstr(data, "task");
+        if (brief.empty()) brief = jstr(data, "assignment");
+        if (planHasRealContent())
+            upsertDerivedItem(std::move(it));
 
         // Delegation card (rowKind 19): transparency view of subagent dispatches,
         // styled after the Routing card. One card per turn, upserted as spawns land;
@@ -1201,10 +1218,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             if (!meta.contains("delegates") || !meta["delegates"].is_array())
                 meta["delegates"] = nlohmann::json::array();
             nlohmann::json entry;
-            entry["role"] = it.title;
-            std::string brief = jstr(data, "brief");
-            if (brief.empty()) brief = jstr(data, "task");
-            if (brief.empty()) brief = jstr(data, "assignment");
+            entry["role"] = roleTitle;
             entry["brief"] = brief;
             entry["spawn_kind"] = jstr(data, "spawn_kind");
             meta["delegates"].push_back(std::move(entry));

@@ -120,20 +120,31 @@ std::string summarize_feature_op(const json& op) {
 }
 
 std::string derive_ops_target(const json& args) {
-    auto one = [](const json& op) -> std::string {
+    auto is_opaque_doc_id = [](const std::string& s) -> bool {
+        return s.rfind("doc-cpp", 0) == 0 || s.rfind("doc_cpp", 0) == 0;
+    };
+    auto one = [&](const json& op) -> std::string {
         if (!op.is_object()) return "";
         // Feature ops first: the geometry name + dims beat any plumbing field.
         {
             std::string fs = summarize_feature_op(op);
             if (!fs.empty()) return fs;
         }
-        for (const char* k : {"target", "face", "faces", "edge", "edges", "feature",
-                              "sketch", "part", "part_name", "name", "body", "component",
-                              "plane", "doc_id", "path", "id"}) {
-            if (!op.contains(k)) continue;
+        // Human keys before opaque handles (doc_id/path/id) — Doing rows show
+        // part names, not engine ids. Opaque ids are skipped (display-only;
+        // live doc_list resolve lives on the Python producer path).
+        static const char* kHuman[] = {
+            "target", "face", "faces", "edge", "edges", "feature",
+            "sketch", "part", "part_name", "name", "body", "component", "plane"};
+        static const char* kOpaque[] = {"doc_id", "path", "id"};
+        auto take = [&](const char* k) -> std::string {
+            if (!op.contains(k)) return "";
             const auto& v = op[k];
-            if (v.is_string() && !v.get_ref<const std::string&>().empty())
-                return cap_text(v.get<std::string>(), 120);
+            if (v.is_string()) {
+                const std::string& s = v.get_ref<const std::string&>();
+                if (s.empty() || is_opaque_doc_id(s)) return "";
+                return cap_text(s, 120);
+            }
             if (v.is_number_integer()) return std::to_string(v.get<long long>());
             if (v.is_number_unsigned()) return std::to_string(v.get<unsigned long long>());
             if (v.is_number_float()) return std::to_string(v.get<double>());
@@ -142,15 +153,32 @@ std::string derive_ops_target(const json& args) {
                 int n = 0;
                 for (const auto& el : v) {
                     if (n >= 4) break;
+                    std::string piece;
+                    if (el.is_string()) {
+                        piece = el.get<std::string>();
+                        if (piece.empty() || is_opaque_doc_id(piece)) continue;
+                    } else if (el.is_number_integer()) {
+                        piece = std::to_string(el.get<long long>());
+                    } else if (el.is_number()) {
+                        piece = el.dump();
+                    } else {
+                        continue;
+                    }
                     if (!joined.empty()) joined += ", ";
-                    if (el.is_string()) joined += el.get<std::string>();
-                    else if (el.is_number_integer()) joined += std::to_string(el.get<long long>());
-                    else if (el.is_number()) joined += el.dump();
-                    else continue;
+                    joined += piece;
                     ++n;
                 }
                 if (!joined.empty()) return cap_text(joined, 120);
             }
+            return "";
+        };
+        for (const char* k : kHuman) {
+            std::string t = take(k);
+            if (!t.empty()) return t;
+        }
+        for (const char* k : kOpaque) {
+            std::string t = take(k);  // skips opaque engine ids
+            if (!t.empty()) return t;
         }
         // type/op as last-resort label fragment — with dims when the op carries them
         // ("extrude (22mm)", "cut (\u00d83.4mm)") so the action is readable at a glance.
@@ -192,7 +220,49 @@ std::string derive_ops_target(const json& args) {
         if (s.empty()) s = std::to_string(args.size()) + " ops";
         return cap_text(s, 120);
     }
-    if (args.is_object()) return one(args);
+    if (args.is_object()) {
+        // Prefer top-level human keys / feature summary (same order as Python).
+        {
+            std::string fs = summarize_feature_op(args);
+            if (!fs.empty()) return fs;
+        }
+        for (const char* k : {"target", "face", "faces", "edge", "edges", "feature",
+                              "sketch", "part", "part_name", "name", "body",
+                              "component", "plane"}) {
+            if (!args.contains(k) || !args[k].is_string()) continue;
+            const std::string& s = args[k].get_ref<const std::string&>();
+            if (s.empty() || is_opaque_doc_id(s)) continue;
+            return cap_text(s, 120);
+        }
+        // MCP-style {doc_id, ops}: prefer feature-bearing ops over a bare opaque
+        // handle. Bare op/type verbs alone still fall through to one(args).
+        if (args.contains("ops") && args["ops"].is_array() && !args["ops"].empty()) {
+            const json& ops = args["ops"];
+            bool any_feature = false;
+            for (const auto& op : ops) {
+                if (op.is_object() && !summarize_feature_op(op).empty()) {
+                    any_feature = true;
+                    break;
+                }
+                if (op.is_object()) {
+                    for (const char* k : {"part_name", "name", "part"}) {
+                        if (op.contains(k) && op[k].is_string() &&
+                            !op[k].get_ref<const std::string&>().empty() &&
+                            !is_opaque_doc_id(op[k].get<std::string>())) {
+                            any_feature = true;
+                            break;
+                        }
+                    }
+                }
+                if (any_feature) break;
+            }
+            if (any_feature) {
+                std::string from_ops = derive_ops_target(ops);
+                if (!from_ops.empty()) return from_ops;
+            }
+        }
+        return one(args);  // demoted handles / type·op last resort
+    }
     return "";
 }
 

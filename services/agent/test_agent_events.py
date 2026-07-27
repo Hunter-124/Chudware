@@ -66,6 +66,57 @@ def test_target_prefers_face_over_generic():
     assert p["target"] == "top face of Part1"
 
 
+def test_new_part_target_is_part_name_not_doc_id():
+    # new_part(name=…) — Doing row must show the human name.
+    _, p = ae.tool_call_event(
+        "n", "new_part", {"name": "mud_bucket"},
+        {"ok": True, "doc_id": "doc-cpp00000002", "name": "mud_bucket"},
+        ok=True, latency_ms=1.0)
+    assert p["target"] == "mud_bucket"
+    assert "doc-cpp" not in p["target"]
+
+
+def test_add_features_opaque_doc_id_resolved_via_doc_list(monkeypatch):
+    # add_features(doc_id=doc-cpp…) with no name in args — resolve via doc_list.
+    monkeypatch.setattr(
+        ae, "_resolve_doc_name",
+        lambda doc_id: "mud_bucket" if doc_id == "doc-cpp00000002" else "")
+    _, p = ae.tool_call_event(
+        "n", "add_features",
+        {"doc_id": "doc-cpp00000002", "ops": [{"op": "add_feature"}]},
+        {"ok": True}, ok=True, latency_ms=1.0)
+    assert p["target"] == "mud_bucket"
+
+
+def test_add_features_prefers_ops_feature_summary_over_opaque_id(monkeypatch):
+    # When ops carry a feature name, that wins over an unresolvable doc_id.
+    monkeypatch.setattr(ae, "_resolve_doc_name", lambda _doc_id: "")
+    _, p = ae.tool_call_event(
+        "n", "add_features",
+        {"doc_id": "doc-cpp00000009",
+         "ops": [{"op": "add_feature",
+                  "feature": {"type": "extrude", "name": "BucketWall",
+                              "params": {"depth": 40}}}]},
+        {"ok": True}, ok=True, latency_ms=1.0)
+    assert p["target"] == "BucketWall (extrude)"
+    assert "doc-cpp" not in p["target"]
+
+
+def test_opaque_doc_id_alone_yields_empty_without_resolver(monkeypatch):
+    # Never surface doc-cpp… as the human target when resolve fails.
+    monkeypatch.setattr(ae, "_resolve_doc_name", lambda _doc_id: "")
+    assert ae.derive_target({"doc_id": "doc-cpp00000001"}) == ""
+
+
+def test_tool_call_prefers_result_name_over_opaque_args_target(monkeypatch):
+    monkeypatch.setattr(ae, "_resolve_doc_name", lambda _doc_id: "")
+    _, p = ae.tool_call_event(
+        "n", "add_features", {"doc_id": "doc-cpp00000003"},
+        {"ok": True, "name": "mud_bucket", "doc_id": "doc-cpp00000003"},
+        ok=True, latency_ms=1.0)
+    assert p["target"] == "mud_bucket"
+
+
 def test_thought_block_and_delta_kinds():
     k, p = ae.thought_event("n", "considering the load path", model="opus",
                             parent_id="turn", actor="cad")

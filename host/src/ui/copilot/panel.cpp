@@ -44,6 +44,20 @@ static bool s_cpCollapsed = false;
 // draw-list text is not clipped by its card, so every user-supplied string gets measured).
 static std::string artiEllipsize(const std::string& s, float maxW);
 
+// True when the plan has real checklist content — at least one non-subagent item
+// (step/task/part/objective/node) or an explicit fromEvent plan with a non-empty summary.
+// Spawn-only shells (present + title "Plan" + subagent rows) are not real; same gate as
+// cards.cpp drawPlanSection (W1-B). Local copy — do not share across TUs in this wave.
+static bool planIsReal(const PlanState& ps) {
+    if (!ps.present) return false;
+    for (const auto& it : ps.items) {
+        if (it.kind == "step" || it.kind == "task" || it.kind == "part" ||
+            it.kind == "objective" || it.kind == "node")
+            return true;
+    }
+    return ps.fromEvent && !ps.summary.empty();
+}
+
 // Aggregate task/plan progress (done/total) from the active conversation's most recent
 // assistant turn. DETERMINISTIC: statuses come from engine stage/mission events, not the
 // model claiming completion (no cheating). Excludes subagent/objective rows.
@@ -51,7 +65,7 @@ static void copilotTaskProgress(AppState& st, int& done, int& total) {
     done = 0;
     total = 0;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
-        if (it->fromUser || !it->planState.present || it->planState.items.empty()) continue;
+        if (it->fromUser || !planIsReal(it->planState)) continue;
         for (const auto& pi : it->planState.items) {
             if (pi.kind == "subagent" || pi.kind == "objective") continue;
             ++total;
@@ -598,7 +612,7 @@ static void drawTaskListPanel(AppState& st, bool busy) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const PlanState* ps = nullptr;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-        if (!it->fromUser && it->planState.present && !it->planState.items.empty()) {
+        if (!it->fromUser && planIsReal(it->planState)) {
             ps = &it->planState; break;
         }
     int done = 0, total = 0;
@@ -606,7 +620,8 @@ static void drawTaskListPanel(AppState& st, bool busy) {
     char progress[48];
     std::snprintf(progress, sizeof(progress), "%d of %d complete", done, total);
     ui::cpMenuHeader(st.fonts,
-                     ps && !ps->title.empty() ? ps->title.c_str() : "Task list", progress);
+                     ps && !ps->title.empty() ? ps->title.c_str() : "Task list",
+                     ps ? progress : "");
     if (ps && !ps->summary.empty()) {
         ui::cpMenuHint(ps->summary.c_str());
         ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
@@ -791,7 +806,7 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
     artiSectionHeader(surf, "Plan", 0);
     const PlanState* ps = nullptr;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-        if (!it->fromUser && it->planState.present) { ps = &it->planState; break; }
+        if (!it->fromUser && planIsReal(it->planState)) { ps = &it->planState; break; }
     if (ps) {
         int d = 0, t = 0; copilotTaskProgress(st, d, t);
         char line[320];

@@ -46,39 +46,193 @@ def _digest(obj: Any) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 
 
-# Arg keys, in priority order, that tend to name "what a tool acts on" in plain words.
-_TARGET_KEYS = (
+# Human-facing arg keys first. Opaque handles (doc_id / path / id) are demoted —
+# Doing rows should show part names (mud_bucket), not engine ids (doc-cpp…).
+_HUMAN_TARGET_KEYS = (
     "target", "face", "faces", "edge", "edges", "feature", "sketch", "part",
-    "part_name", "name", "body", "component", "plane", "doc_id", "path", "id",
+    "part_name", "name", "body", "component", "plane",
 )
+_OPAQUE_TARGET_KEYS = ("doc_id", "path", "id")
+
+
+def _is_opaque_doc_id(val: Any) -> bool:
+    """True for engine-minted doc handles (doc-cpp00000002 / doc_cpp…)."""
+    if not isinstance(val, str):
+        return False
+    s = val.strip()
+    return s.startswith("doc-cpp") or s.startswith("doc_cpp")
+
+
+def _resolve_doc_name(doc_id: str) -> str:
+    """Best-effort live part name for an opaque doc_id via doc_list. Never raises."""
+    if not doc_id or not _is_opaque_doc_id(doc_id):
+        return ""
+    try:
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
+        for e in (cb.call("doc_list", {}) or {}).get("docs", []) or []:
+            if not isinstance(e, dict) or e.get("doc_id") != doc_id:
+                continue
+            name = e.get("name")
+            if isinstance(name, str) and name.strip() and not _is_opaque_doc_id(name):
+                return name.strip()
+            break
+    except Exception:  # noqa: BLE001 — display resolve must never break emission
+        pass
+    return ""
+
+
+def _feature_summary(op: dict, *, limit: int = 120) -> str:
+    """One-line summary of a feature-bearing op (mirrors C++ summarize_feature_op)."""
+    feat = op.get("feature")
+    if not isinstance(feat, dict):
+        return ""
+    name = feat.get("name") if isinstance(feat.get("name"), str) else ""
+    sub = ""
+    params = feat.get("params")
+    if isinstance(params, dict):
+        family = params.get("family")
+        if isinstance(family, str) and family.strip():
+            sub = family.strip()
+    if not sub:
+        ftype = feat.get("type")
+        if isinstance(ftype, str) and ftype.strip():
+            sub = ftype.strip()
+    if name and sub:
+        return f"{name} ({sub})"[:limit]
+    return (name or sub)[:limit]
+
+
+def _ops_summary(ops: list, *, limit: int = 120, features_only: bool = False) -> str:
+    """Human summary from an ops list (MCP add_features / doc_apply_ops shape).
+
+    When *features_only* is True, only feature.name / part_name style labels
+    count — bare op/type verbs are skipped so an opaque doc_id can still
+    resolve to a live part name.
+    """
+    parts: list[str] = []
+    show = len(ops) if len(ops) <= 3 else 2
+    for op in ops[:show]:
+        if not isinstance(op, dict):
+            continue
+        t = _feature_summary(op, limit=limit)
+        if not t:
+            keys = ("part_name", "name", "part") if features_only else (
+                "part_name", "name", "part", "op", "type")
+            for k in keys:
+                v = op.get(k)
+                if isinstance(v, str) and v.strip() and not _is_opaque_doc_id(v):
+                    t = v.strip()
+                    break
+        if t:
+            parts.append(t)
+    if not parts:
+        return ""
+    s = " → ".join(parts)
+    if len(ops) > show:
+        s += f" → +{len(ops) - show} more"
+    return s[:limit]
+
+
+def _scalar_target(val: Any, *, resolve_docs: bool = True, limit: int = 120) -> str:
+    """Format one arg value as a display target; resolve/skip opaque doc ids."""
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return str(val)[:limit]
+    if isinstance(val, str) and val.strip():
+        s = val.strip()
+        if _is_opaque_doc_id(s):
+            if resolve_docs:
+                resolved = _resolve_doc_name(s)
+                if resolved:
+                    return resolved[:limit]
+            return ""  # never surface opaque ids as the human target
+        return s[:limit]
+    if isinstance(val, (list, tuple)) and val:
+        bits: list[str] = []
+        for v in val[:4]:
+            piece = _scalar_target(v, resolve_docs=resolve_docs, limit=limit)
+            if piece:
+                bits.append(piece)
+        return ", ".join(bits)[:limit] if bits else ""
+    if isinstance(val, dict):
+        return _feature_summary(val, limit=limit)
+    return ""
 
 
 def derive_target(args: dict | None, *, limit: int = 120) -> str:
     """Best-effort human-readable "what it acts on" string for a tool call (§3.2).
 
-    Shallow by design (contract-honest): pulls the first legible value from a small
-    set of known arg keys; falls back to a compact join of scalar args. Returns ""
-    when nothing legible is present. NOT a universal arg→English mapper.
+    Prefers part_name/name/feature summaries over opaque doc_id. When only a
+    doc-cpp* id is available, best-effort resolves it to the live part name via
+    doc_list (never raises). Returns "" when nothing legible is present.
     """
     if not args or not isinstance(args, dict):
         return ""
-    for key in _TARGET_KEYS:
-        if key in args:
-            val = args[key]
-            if isinstance(val, (str, int, float)) and str(val).strip():
-                return str(val).strip()[:limit]
-            if isinstance(val, (list, tuple)) and val:
-                joined = ", ".join(str(v) for v in val[:4])
-                if joined.strip():
-                    return joined[:limit]
-    # Fallback: compact join of scalar args (skip long/blob values).
+    for key in _HUMAN_TARGET_KEYS:
+        if key not in args:
+            continue
+        got = _scalar_target(args[key], resolve_docs=False, limit=limit)
+        if got:
+            return got
+    # MCP-style {doc_id, ops}: feature names beat a bare opaque handle.
+    ops = args.get("ops")
+    if isinstance(ops, list) and ops:
+        from_ops = _ops_summary(ops, limit=limit, features_only=True)
+        if from_ops:
+            return from_ops
+    # Demoted handles: resolve opaque doc_id → live name; skip if unresolvable.
+    for key in _OPAQUE_TARGET_KEYS:
+        if key not in args:
+            continue
+        got = _scalar_target(args[key], resolve_docs=True, limit=limit)
+        if got:
+            return got
+    # Last resort from ops: bare op/type verbs (still better than nothing).
+    if isinstance(ops, list) and ops:
+        from_ops = _ops_summary(ops, limit=limit, features_only=False)
+        if from_ops:
+            return from_ops
+    # Fallback: compact join of scalar args (skip long/blob + opaque ids).
     parts: list[str] = []
     for k, v in args.items():
+        if k == "ops":
+            continue
         if isinstance(v, (str, int, float, bool)) and len(str(v)) <= 40:
+            if isinstance(v, str) and _is_opaque_doc_id(v):
+                resolved = _resolve_doc_name(v.strip())
+                if resolved:
+                    parts.append(f"{k}={resolved}")
+                continue
             parts.append(f"{k}={v}")
         if len(parts) >= 3:
             break
     return (", ".join(parts))[:limit]
+
+
+def _name_from_result(result: Any) -> str:
+    """Human part name from a tool result dict (or JSON string), if present."""
+    payload = result
+    if isinstance(payload, str):
+        s = payload.strip()
+        if not s:
+            return ""
+        try:
+            payload = json.loads(s)
+        except Exception:  # noqa: BLE001
+            return ""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("name", "part_name"):
+        v = payload.get(key)
+        if isinstance(v, str) and v.strip() and not _is_opaque_doc_id(v):
+            return v.strip()
+    # Nested common envelopes (ok/result wrappers).
+    inner = payload.get("result")
+    if isinstance(inner, dict):
+        for key in ("name", "part_name"):
+            v = inner.get(key)
+            if isinstance(v, str) and v.strip() and not _is_opaque_doc_id(v):
+                return v.strip()
+    return ""
 
 
 def _cap(text: Any, n: int) -> str:
@@ -191,9 +345,15 @@ def tool_call_event(
 ) -> tuple[str, dict]:
     payload = _linkage(node_id, span_id=span_id or new_span_id(),
                        parent_id=parent_id, actor=actor)
+    # Prefer result.name when present (new_part / add_features envelopes) over an
+    # opaque or empty args-derived target — display only; args keep the real doc_id.
+    target = derive_target(args)
+    from_result = _name_from_result(result)
+    if from_result and (not target or _is_opaque_doc_id(target)):
+        target = from_result[:120]
     payload.update({
         "tool_name": tool_name,
-        "target": derive_target(args),
+        "target": target,
         "args_digest": _digest(args or {}),
         "result_digest": _digest(result),
         "ok": bool(ok),

@@ -618,7 +618,15 @@ def test_a2_live_shape_junk_json_zero_tool_force_and_confirm():
     assert res.success is True, (res.stop_reason, res.result)
     assert res.stop_reason == "confirmed"
     calls = (res.result or {}).get("calls") or []
-    assert any(c.get("forced") and c.get("tool") == "ledger_get" for c in calls), calls
+    # Forced opener: ledger_get on plain floors; the category menu when the
+    # mode gate exposed the meta pair (2026-07-27 on-ramp change) — either way
+    # the zero-tool turn gets exactly one forced tool result, which is the a2
+    # contract this test defends.
+    assert any(
+        c.get("forced")
+        and c.get("tool") in ("ledger_get", "list_tool_categories")
+        for c in calls
+    ), calls
 
 
 def test_a2_live_shape_force_then_junk_json_bare_completes():

@@ -3,7 +3,7 @@ name: edit-assembly
 description: Build assemblies with interface-first mating — model the mating part first, mate with plain-word faces, then interference + interface_check before done.
 inject: auto
 triggers:
-  keywords: [assembly, mate, mates, component, subassembly, fit together, bolt pattern]
+  keywords: [assembly, mate, mates, component, subassembly, fit together, put together, assemble, bolt pattern]
   tools: [new_assembly, asm_add_component, asm_mate, solve_mates, check_interference, interface_check]
   phases: [assembly, feature]
 ---

@@ -776,3 +776,237 @@ def test_live_bore_shaped_cylinder_error_names_the_hole_feature(live):
     assert r["ok"] is False
     assert '"type":"hole"' in r["error"]
     assert r["interpreted"]          # how the flat kwargs were read is still echoed
+
+
+# --------------------------------------------------- polyline / boolean / selector shapes
+# The live "mudbucket" run (kimi-k3, 2026-07-27) fumbled add_features twice on shapes that
+# say exactly one thing: a polyline profile, a flat boolean with target/tool/kind, and a
+# single selector wrapped in a list. Each is normalized; each ambiguous cousin still errors.
+
+_MUDBUCKET_POLYLINE = {"type": "polyline", "closed": True,
+                       "points": [[0, 0], [256, 0], [306, 800], [0, 800]]}
+
+
+def _sketch_ops(feature, notes=None):
+    """Run one add_feature through the op-element + sketch passes -> the feature dict."""
+    sink = notes if isinstance(notes, list) else []
+    ops = M._normalize_op_elements([feature], sink)
+    return M._normalize_sketch_ops(ops, sink)[0]["feature"]
+
+
+def test_a_flat_polyline_sketch_op_expands_into_the_line_entities_it_names():
+    notes: list = []
+    feat = _sketch_ops({"op": "sketch", "name": "shell_profile", "plane": "XZ",
+                        "entities": [_MUDBUCKET_POLYLINE]}, notes)
+    assert feat == {
+        "type": "sketch", "name": "shell_profile",
+        "refs": {"plane": "plane.front"},
+        "params": {"constraints": [], "entities": [
+            {"id": "e1", "type": "line", "construction": False,
+             "p1": [0, 0], "p2": [256, 0]},
+            {"id": "e2", "type": "line", "construction": False,
+             "p1": [256, 0], "p2": [306, 800]},
+            {"id": "e3", "type": "line", "construction": False,
+             "p1": [306, 800], "p2": [0, 800]},
+            {"id": "e4", "type": "line", "construction": False,
+             "p1": [0, 800], "p2": [0, 0]},        # closed:true -> back to the first point
+        ]}}
+    assert any("expanded the polyline into 4 line entities" in n for n in notes)
+
+
+def test_a_repeated_closing_point_is_not_a_second_closing_segment():
+    feat = _sketch_ops({"op": "add_feature", "feature": {
+        "type": "sketch", "name": "S", "params": {"plane": "XY"},
+        "entities": [{"type": "polyline", "closed": True,
+                      "points": [[0, 0], [10, 0], [10, 20], [0, 0]]}]}})
+    ents = feat["params"]["entities"]
+    assert [e["id"] for e in ents] == ["e1", "e2", "e3"]
+    assert ents[-1]["p1"] == [10, 20] and ents[-1]["p2"] == [0, 0]
+
+
+def test_an_open_polyline_is_left_open():
+    feat = _sketch_ops({"op": "sketch", "name": "S", "entities": [
+        {"type": "polyline", "closed": False, "points": [[0, 0], [5, 0], [5, 5]]}]})
+    ents = feat["params"]["entities"]
+    assert len(ents) == 2 and ents[-1]["p2"] == [5, 5]
+
+
+def test_a_polyline_keeps_numbering_beside_the_entities_around_it():
+    feat = _sketch_ops({"op": "sketch", "name": "S", "entities": [
+        {"type": "circle", "center": [0, 0], "radius": 3},
+        {"type": "polyline", "closed": False, "points": [[0, 0], [1, 0], [2, 0]]},
+        {"type": "line", "start": [2, 0], "end": [2, 9]}]})
+    ents = feat["params"]["entities"]
+    assert [e["id"] for e in ents] == ["e1", "e2", "e3", "e4"]
+    assert [e["type"] for e in ents] == ["circle", "line", "line", "line"]
+
+
+def test_a_construction_polyline_expands_into_construction_lines():
+    feat = _sketch_ops({"op": "sketch", "name": "S", "entities": [
+        {"type": "polyline", "construction": True, "points": [[0, 0], [1, 1]]}]})
+    assert feat["params"]["entities"][0]["construction"] is True
+
+
+def test_a_one_point_polyline_is_left_for_the_engine_to_reject():
+    # Nothing unambiguous to expand -> the type stays "polyline" and validate.cpp still
+    # answers "not a sketch entity type" instead of this inventing a profile.
+    feat = _sketch_ops({"op": "sketch", "name": "S", "entities": [
+        {"type": "polyline", "closed": True, "points": [[0, 0]]}]})
+    assert feat["params"]["entities"][0]["type"] == "polyline"
+
+
+def test_a_polyline_whose_points_are_not_xy_pairs_is_left_alone():
+    feat = _sketch_ops({"op": "sketch", "name": "S", "entities": [
+        {"type": "polyline", "points": [[0, 0], "midpoint", [4, 4]]}]})
+    assert feat["params"]["entities"][0]["type"] == "polyline"
+
+
+def test_entities_at_the_feature_level_are_re_homed_under_params():
+    # The wrapper-op dialect: params holds the plane, entities sit beside it. Canonical is
+    # params.entities (validate.cpp FEATURE_TYPES["sketch"] requires it there).
+    feat = _sketch_ops({"op": "add_feature", "feature": {
+        "type": "sketch", "name": "S", "params": {"plane": "XZ"},
+        "entities": [{"type": "line", "start": [0, 0], "end": [1, 0]}]}})
+    assert "entities" not in feat and "plane" not in feat["params"]
+    assert feat["params"]["entities"][0] == {"id": "e1", "type": "line",
+                                             "construction": False,
+                                             "p1": [0, 0], "p2": [1, 0]}
+    assert feat["refs"]["plane"] == "plane.front"
+
+
+def test_a_boolean_target_tool_pair_becomes_params_a_and_b():
+    notes: list = []
+    out = M._normalize_boolean_feature(
+        {"type": "boolean", "name": "drain_union", "target": "body",
+         "tool": "drain_boss", "kind": "union"}, notes)
+    assert out == {"type": "boolean", "name": "drain_union",
+                   "params": {"op": "fuse", "a": "body", "b": "drain_boss"}}
+    text = " ".join(notes)
+    assert 'target="body"' in text and 'tool="drain_boss"' in text
+
+
+@pytest.mark.parametrize("word,want", [("union", "fuse"), ("fuse", "fuse"),
+                                       ("cut", "cut"), ("subtract", "cut"),
+                                       ("difference", "cut"),
+                                       ("intersect", "common"), ("common", "common")])
+def test_boolean_kind_words_map_onto_the_engine_operations(word, want):
+    out = M._normalize_boolean_feature(
+        {"type": "boolean", "name": "B", "kind": word, "target": "A", "tool": "T"}, [])
+    assert out["params"] == {"op": want, "a": "A", "b": "T"}
+
+
+def test_a_single_element_operand_list_is_read_as_that_operand():
+    out = M._normalize_boolean_feature(
+        {"type": "boolean", "name": "B", "params": {"op": "cut"},
+         "targets": ["plate"], "tools": ["pocket"]}, [])
+    assert out["params"] == {"op": "cut", "a": "plate", "b": "pocket"}
+
+
+def test_a_boolean_with_only_a_target_still_teaches_the_two_operands():
+    with pytest.raises(ValueError) as ei:
+        M._normalize_boolean_feature(
+            {"type": "boolean", "name": "B", "kind": "union", "target": "body"}, [])
+    assert "needs its two operands" in str(ei.value)
+
+
+def test_an_unknown_boolean_kind_is_still_a_teaching_error():
+    with pytest.raises(ValueError) as ei:
+        M._normalize_boolean_feature(
+            {"type": "boolean", "name": "B", "kind": "imprint",
+             "target": "body", "tool": "t"}, [])
+    assert "is not a boolean operation" in str(ei.value)
+
+
+def test_a_one_element_selector_list_in_a_single_slot_is_unwrapped():
+    notes: list = []
+    out = M._normalize_feature_refs(
+        {"type": "revolve", "name": "body",
+         "refs": {"profile": [{"kind": "region", "sketch": "P"}],
+                  "axis": [{"kind": "datum", "id": "Z"}]}}, "revolve", notes)
+    assert out["refs"] == {"profile": [{"kind": "region", "sketch": "P"}],  # a LIST slot
+                           "axis": {"kind": "datum", "feature": "axis.z"}}
+    text = " ".join(notes)
+    assert "unwrapped the one-element list in refs.axis" in text
+
+
+def test_a_multi_element_list_in_a_single_slot_keeps_the_engine_error():
+    feat = {"type": "revolve", "name": "body", "refs": {
+        "axis": [{"kind": "datum", "feature": "axis.z"},
+                 {"kind": "datum", "feature": "axis.x"}]}}
+    # Two selectors in a one-selector slot is a real disagreement, not a spelling:
+    # left untouched so validate.cpp still says "selector must be an object".
+    assert M._normalize_feature_refs(feat, "revolve", []) is feat
+
+
+def test_a_datum_selector_gets_its_datum_under_feature():
+    out = M._normalize_feature_refs(
+        {"type": "circular_pattern", "name": "P",
+         "refs": {"axis": {"kind": "datum", "name": "Y axis"}}}, "circular_pattern", [])
+    assert out["refs"]["axis"] == {"kind": "datum", "feature": "axis.y"}
+
+
+def test_a_datum_selector_naming_no_known_datum_is_left_alone():
+    feat = {"type": "revolve", "name": "R",
+            "refs": {"axis": {"kind": "datum", "id": "spindle"}}}
+    assert M._normalize_feature_refs(feat, "revolve", []) is feat
+
+
+def test_a_canonical_datum_selector_round_trips():
+    feat = {"type": "revolve", "name": "R",
+            "refs": {"axis": {"kind": "datum", "feature": "axis.z"}}}
+    assert M._normalize_feature_refs(feat, "revolve", []) is feat
+
+
+def test_the_live_mudbucket_batch_normalizes_end_to_end():
+    """Both rejected calls from run-13918288087065, through the unit pipeline."""
+    notes: list = []
+    ops = [{"op": "sketch", "name": "shell_profile", "plane": "XZ",
+            "entities": [_MUDBUCKET_POLYLINE]},
+           {"op": "add_feature", "feature": {
+               "type": "revolve", "name": "body",
+               "refs": {"profile": [{"kind": "region", "sketch": "shell_profile"}],
+                        "axis": [{"kind": "datum", "id": "Z"}]},
+               "params": {"mode": "boss", "angle": 360}}},
+           {"op": "boolean", "name": "drain_union", "tool": "drain_boss",
+            "target": "body", "kind": "union"}]
+    ops = M._normalize_op_elements(ops, notes)
+    ops = M._normalize_feature_types(ops, notes)
+    ops = M._normalize_sketch_ops(ops, notes)
+    ops = M._normalize_feature_ops(ops, notes)
+    sketch, revolve, boolean = (o["feature"] for o in ops)
+    assert len(sketch["params"]["entities"]) == 4
+    assert all(e["type"] == "line" for e in sketch["params"]["entities"])
+    assert sketch["refs"]["plane"] == "plane.front"
+    assert revolve["refs"]["axis"] == {"kind": "datum", "feature": "axis.z"}
+    assert boolean["params"] == {"op": "fuse", "a": "body", "b": "drain_boss"}
+
+
+@enginetest
+def test_live_mudbucket_polyline_revolve_boolean_batch_builds():
+    """The VERBATIM shapes of both rejected calls in run-13918288087065 (kimi-k3, "make me
+    a mudbucket for oil drilling and rigging"), merged into the batch they were reaching
+    for: a flat polyline sketch op, a revolve whose axis is a one-element datum-selector
+    list, and a flat boolean spelled target/tool/kind. It must BUILD, not just normalize."""
+    from services.agent.agent_turn import _bind_tool
+    new_part, add_features = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(new_part(name="mudbucket_dialect"))["doc_id"]
+    r = json.loads(add_features(doc_id=doc, ops=[
+        {"op": "sketch", "name": "shell_profile", "plane": "XZ", "entities": [
+            {"type": "polyline", "closed": True,
+             "points": [[0, 0], [256, 0], [306, 800], [0, 800]]}]},
+        {"op": "add_feature", "feature": {
+            "type": "revolve", "name": "body",
+            "refs": {"profile": [{"kind": "region", "sketch": "shell_profile"}],
+                     "axis": [{"kind": "datum", "id": "Z"}]},
+            "params": {"mode": "boss", "angle": 360}}},
+        {"op": "add_feature", "feature": {
+            "type": "cylinder", "name": "drain_boss", "merge": False,
+            "params": {"radius": 40, "height": 120, "at": [0, 0, 0], "axis": [1, 0, 0]}}},
+        {"op": "boolean", "name": "drain_union", "tool": "drain_boss",
+         "target": "body", "kind": "union"}]))
+    assert r["ok"], r
+    assert r["changes"]["volume_delta_mm3"] > 0
+    text = " ".join(r["interpreted"])
+    assert "expanded the polyline into 4 line entities" in text
+    assert "unwrapped the one-element list in refs.axis" in text
+    assert 'target="body"' in text and 'tool="drain_boss"' in text

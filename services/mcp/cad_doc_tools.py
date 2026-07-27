@@ -133,6 +133,52 @@ def _norm_dim_value(c: dict) -> dict:
     return c
 
 
+# A POLYLINE is how a model draws a revolve/extrude profile in one breath
+# ({"type":"polyline","closed":true,"points":[[x,y],…]}) and the engine has no such
+# entity type, so the whole batch died on «params.entities[0].type: not a sketch entity
+# type» (live run 2026-07-27, "mudbucket"). Unlike `rectangle`/`polygon` — which
+# session.cpp already expands from a size — a polyline carries its own coordinates, so
+# turning it into the N `line` entities it names needs no geometry guessing at all.
+_POLYLINE_TYPES = frozenset({"polyline", "poly_line", "polyline_closed"})
+
+
+def _polyline_points(ent: dict) -> list:
+    """The polyline's [x,y] points, consecutive duplicates dropped. [] = not expandable."""
+    raw = ent.get("points")
+    if not isinstance(raw, list):
+        return []
+    pts: list = []
+    for p in raw:
+        q = _xy(p)
+        if not (isinstance(q, list) and len(q) == 2 and _is_num(q[0]) and _is_num(q[1])):
+            return []
+        if not pts or pts[-1] != q:
+            pts.append(q)
+    return pts
+
+
+def _expand_polyline(ent: dict, start_id: int) -> list:
+    """A polyline entity -> the `line` entities it means, ids e<start_id+1…>.
+
+    `closed` adds the segment back to the first point (a repeated closing point is the
+    same segment, so it is dropped first). [] when the shape is not unambiguously a
+    polyline — a non-[x,y] point, or fewer than two distinct points — so the engine's
+    own error still teaches instead of this inventing a profile.
+    """
+    pts = _polyline_points(ent)
+    closed = bool(ent.get("closed", ent.get("close", False)))
+    if closed and len(pts) > 1 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+    if len(pts) < 2:
+        return []
+    constr = bool(ent.get("construction", False))
+    segs = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+    if closed and len(pts) > 2:
+        segs.append((pts[-1], pts[0]))
+    return [{"id": f"e{start_id + i + 1}", "type": "line", "construction": constr,
+             "p1": list(a), "p2": list(b)} for i, (a, b) in enumerate(segs)]
+
+
 def _sketch_needs_norm(feat: dict, params: dict) -> bool:
     ents = params.get("entities") if isinstance(params.get("entities"), list) else feat.get("entities")
     cons = params.get("constraints") if isinstance(params.get("constraints"), list) else feat.get("constraints")
@@ -156,6 +202,8 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
     for e in (ents or []):
         if not isinstance(e, dict):
             continue
+        if _slug(e.get("type")) in _POLYLINE_TYPES:
+            return True
         if not (isinstance(e.get("id"), str) and _EID_RE.match(e["id"])):
             return True
         if not isinstance(e.get("construction"), bool):
@@ -172,9 +220,10 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
     return False
 
 
-def _normalize_sketch_feature(feat: dict) -> dict:
+def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     """Rewrite a natural/flat sketch add_feature into the engine's canonical shape."""
     params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+    sink = notes if isinstance(notes, list) else []
 
     def _pick(key: str) -> Any:
         if isinstance(params.get(key), list):
@@ -194,12 +243,28 @@ def _normalize_sketch_feature(feat: dict) -> dict:
     dims_in = _pick("dimensions") or []
 
     id_map: dict[str, str] = {}
-    norm_ents = []
-    for idx, e in enumerate(ents_in, start=1):
+    norm_ents: list = []
+    eid = 0
+    for e in ents_in:
         if not isinstance(e, dict):
             norm_ents.append(e)
             continue
-        new_id = f"e{idx}"
+        if _slug(e.get("type")) in _POLYLINE_TYPES:
+            seg = _expand_polyline(e, eid)
+            if seg:
+                if isinstance(e.get("id"), str) and e["id"]:
+                    id_map[e["id"]] = seg[0]["id"]
+                eid += len(seg)
+                norm_ents.extend(seg)
+                sink.append(
+                    f'{_feat_label(feat, "sketch")}: expanded the polyline into '
+                    f"{len(seg)} line entities — a sketch entity is one segment "
+                    f"(line/arc/circle/spline), so a profile is a list of them")
+                continue
+            # < 2 distinct points, or a point that is not [x,y]: nothing unambiguous to
+            # expand. Fall through and let the engine name what is wrong with it.
+        eid += 1
+        new_id = f"e{eid}"
         if isinstance(e.get("id"), str) and e["id"]:
             id_map[e["id"]] = new_id
         ne = dict(e)
@@ -284,7 +349,7 @@ def _normalize_sketch_feature(feat: dict) -> dict:
     return new_feat
 
 
-def _normalize_sketch_ops(ops: Any) -> Any:
+def _normalize_sketch_ops(ops: Any, notes: Optional[list] = None) -> Any:
     """Normalize any sketch add_feature ops in-place-safe; return a new list."""
     if not isinstance(ops, list):
         return ops
@@ -294,7 +359,7 @@ def _normalize_sketch_ops(ops: Any) -> Any:
             if (isinstance(op, dict) and op.get("op") == "add_feature"
                     and isinstance(op.get("feature"), dict)
                     and op["feature"].get("type") == "sketch"):
-                op = {**op, "feature": _normalize_sketch_feature(op["feature"])}
+                op = {**op, "feature": _normalize_sketch_feature(op["feature"], notes)}
         except Exception:  # noqa: BLE001 — never let normalization break a valid call
             pass
         out.append(op)
@@ -1308,6 +1373,13 @@ _BOOLEAN_OP_WORDS = {
 }
 _BOOLEAN_OP_KEYS = ("op", "operation", "boolean", "mode", "action", "kind")
 _BOOLEAN_OPERAND_KEYS = ("targets", "bodies", "operands", "inputs", "features", "tools")
+# The SINGULAR operand pair. `{"op":"boolean","target":"body","tool":"boss","kind":"union"}`
+# is the flat op a model writes for a boolean (live run 2026-07-27) and it died on «needs
+# its two operands» because only the plural LIST spellings above were read. target = the
+# body that is kept (params.a), tool = the body applied to it (params.b) — the roles are
+# named, so there is nothing to guess.
+_BOOLEAN_TARGET_KEYS = ("target", "targets", "base", "target_body", "base_body")
+_BOOLEAN_TOOL_KEYS = ("tool", "tools", "tool_body", "cutter")
 
 
 def _operand_name(v: Any) -> Optional[str]:
@@ -1319,6 +1391,13 @@ def _operand_name(v: Any) -> Optional[str]:
             if isinstance(s, str) and s.strip():
                 return s.strip()
     return None
+
+
+def _one_operand(v: Any) -> Optional[str]:
+    """One operand name from a body reference, or a one-element list holding one."""
+    if isinstance(v, list):
+        return _one_operand(v[0]) if len(v) == 1 else None
+    return _operand_name(v)
 
 
 def _normalize_boolean_feature(feat: dict, notes: list) -> dict:
@@ -1363,10 +1442,22 @@ def _normalize_boolean_feature(feat: dict, notes: list) -> dict:
             tv = (out.get("refs") or {}).get("targets")
             if isinstance(tv, list) and len(tv) >= 2:
                 operands = [_operand_name(x) for x in tv[:2]]
+        pair_note = None
+        if not operands:
+            tgt = next((k for k in _BOOLEAN_TARGET_KEYS
+                        if _one_operand(peek(k)) is not None), None)
+            tol = next((k for k in _BOOLEAN_TOOL_KEYS
+                        if _one_operand(peek(k)) is not None), None)
+            if tgt and tol:
+                operands = [_one_operand(consume(tgt)), _one_operand(consume(tol))]
+                pair_note = (f'{label}: read {tgt}="{operands[0]}" as params.a (the body '
+                             f'kept) and {tol}="{operands[1]}" as params.b (the body '
+                             f"applied to it) — a boolean's operands are params.a/params.b")
         if len(operands) == 2 and all(operands):
             params["a"], params["b"] = operands
             changed = True
-            notes.append(f'{label}: interpreted the operand list as a="{operands[0]}", '
+            notes.append(pair_note or
+                         f'{label}: interpreted the operand list as a="{operands[0]}", '
                          f'b="{operands[1]}" — a boolean fuses/cuts exactly two bodies')
         elif params.get("op") is not None:
             raise ValueError(
@@ -1488,6 +1579,17 @@ _REF_SLOT_KIND = {
 }
 # Slots whose bare-string value must be a reserved datum / feature id.
 _DATUM_REF_SLOTS = frozenset({"plane", "axis", "dir1", "dir2", "pull", "base", "path"})
+# Ref slots the engine types Sel / SelOrDatum (validate.cpp::FEATURE_TYPES) — ONE selector
+# object or datum string, never a list. A model that wraps the single selector in a list
+# ("axis":[{"kind":"datum",…}]) died on «selector must be an object»; a ONE-element list
+# says exactly one thing, so unwrap it. A multi-element list keeps the error — that is a
+# real disagreement about the slot, not a spelling.
+_SINGLE_REF_SLOTS = frozenset({
+    "plane", "axis", "base", "second", "a", "b", "target", "origin", "x_dir", "y_dir",
+    "offset", "at", "up_to", "up_to2", "start_ref", "end_ref", "end2_ref", "path",
+    "centerline", "target_face", "middle_face", "reference_face", "neutral", "pull",
+    "face", "positions_sketch", "dir1", "dir2", "edge", "sketch",
+})
 # The keys that make a dict a geometry QUERY rather than a topology selector.
 _QUERY_KEYS = frozenset({"side", "surf", "nearest", "largest", "smallest", "index", "at",
                          "all", "where", "contains", "min", "max"})
@@ -1507,6 +1609,28 @@ def _repair_selector(v: Any, kind: str) -> Any:
     return v
 
 
+def _repair_datum_selector(v: Any) -> Optional[dict]:
+    """`{"kind":"datum","id":"Z"}` -> `{"kind":"datum","feature":"axis.z"}`.
+
+    A datum selector names its datum under `feature` and validate_selector accepts nothing
+    else; models reach for id/name/ref. None when there is nothing unambiguous to fix —
+    already canonical, not a datum selector, or a word that is no datum the engine knows.
+    """
+    if not isinstance(v, dict) or _slug(v.get("kind")) != "datum":
+        return None
+    if _is_canon_datum(v.get("feature")):
+        return None
+    for k in ("feature", "datum", "id", "name", "ref"):
+        token = _norm_datum(v.get(k))
+        if token and _is_canon_datum(token):
+            out = dict(v)
+            if k != "feature":
+                out.pop(k, None)
+            out["feature"] = token
+            return out
+    return None
+
+
 def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
     """Datum words + kind-less selectors in `refs`. Identity when everything is canonical."""
     refs = feat.get("refs")
@@ -1516,14 +1640,31 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
     out_refs = dict(refs)
     changed = False
     for slot, v in refs.items():
-        if slot in _DATUM_REF_SLOTS and isinstance(v, str):
-            datum = _norm_datum(v)
-            if datum != v:
-                out_refs[slot] = datum
+        if (slot in _SINGLE_REF_SLOTS and isinstance(v, list) and len(v) == 1
+                and isinstance(v[0], (dict, str))):
+            v = v[0]
+            out_refs[slot] = v
+            changed = True
+            notes.append(f"{label}: unwrapped the one-element list in refs.{slot} — that "
+                         f"slot takes ONE selector; only a multi-selector slot "
+                         f"(refs.profile, refs.edges, refs.faces) is a list")
+        if slot in _DATUM_REF_SLOTS:
+            if isinstance(v, str):
+                datum = _norm_datum(v)
+                if datum != v:
+                    out_refs[slot] = datum
+                    changed = True
+                    notes.append(f'{label}: interpreted refs.{slot}="{v}" as the reserved '
+                                 f'datum "{datum}" — the engine knows plane.top/plane.front/'
+                                 f"plane.right and axis.x/axis.y/axis.z")
+                continue
+            fixed = _repair_datum_selector(v)
+            if fixed is not None:
+                out_refs[slot] = fixed
                 changed = True
-                notes.append(f'{label}: interpreted refs.{slot}="{v}" as the reserved datum '
-                             f'"{datum}" — the engine knows plane.top/plane.front/plane.right '
-                             f"and axis.x/axis.y/axis.z")
+                notes.append(f"{label}: completed the datum selector in refs.{slot} into "
+                             f'{{"kind":"datum","feature":"{fixed["feature"]}"}} — a datum '
+                             f"selector names its datum under `feature`")
             continue
         kind = _REF_SLOT_KIND.get(slot)
         if kind is None:
@@ -2561,7 +2702,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # Model-robustness: accept the natural/flat sketch shape LLMs emit
             # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
             # to the engine's canonical schema before validation.
-            ops = _normalize_sketch_ops(ops)
+            ops = _normalize_sketch_ops(ops, interpreted)
             # Same, for the primitive placement/orientation dialect models emit
             # (placement:{origin,direction}, boolean:"union") — rewritten to the
             # canonical at/axis/mode/merge keys the engine actually accepts — for the

@@ -293,3 +293,89 @@ def test_session_system_block_includes_catalog_and_activation(skill_roots):
     assert "[SKILLS]" in block
     assert "PART BODY" in block
     assert "edit-part" in block
+
+
+# ------------------------------------------------- real builtin keyword phrasings
+
+
+@pytest.fixture()
+def real_builtins(monkeypatch):
+    """Drop root overrides so the shipped builtin SKILL.md files are the catalog."""
+    for k in ("CHUDWARE_SKILLS_PROJECT_DIR", "CHUDWARE_SKILLS_USER_DIR",
+              "CHUDWARE_SKILLS_BUILTIN_DIR"):
+        monkeypatch.delenv(k, raising=False)
+    sk.clear_cache()
+    sk.reset_session()
+    yield
+    sk.clear_cache()
+    sk.reset_session()
+
+
+def _fires(text: str, session_id: str) -> set[str]:
+    sk.reset_session(session_id)
+    return {s.name for s in sk.match_keyword_triggers(text, session_id=session_id)}
+
+
+@pytest.mark.parametrize("text", [
+    "make me a mudbucket for oil drilling and rigging",
+    "build me a bracket",
+    "build a bracket",
+    "create a housing for the pump",
+    "create me a spacer",
+    "model me a flange",
+    "design me a gearbox case",
+    "3d print a knob",
+    "machine a fixture plate",
+])
+def test_builtin_edit_part_fires_on_natural_build_phrasing(real_builtins, text):
+    """The build-phrasing family must reach edit-part; it teaches new_part → add_features → verify."""
+    assert "edit-part" in _fires(text, "kwphrase")
+
+
+@pytest.mark.parametrize("text,expected_absent", [
+    # File housekeeping: "parts" plural must not trip the bare `part` keyword.
+    ("organize my files and archive old parts", "edit-part"),
+    # Bare verbs are deliberately not keywords.
+    ("build the firmware and make it louder", "edit-part"),
+    ("create the release notes", "edit-part"),
+])
+def test_builtin_build_phrasing_does_not_overfire(real_builtins, text, expected_absent):
+    assert expected_absent not in _fires(text, "kwguard")
+
+
+def test_builtin_fea_phrasing_routes_to_simulate_only(real_builtins):
+    hits = _fires("run fea on this bracket", "kwfea")
+    assert "simulate" in hits
+    assert "edit-part" not in hits
+
+
+def test_bare_part_keyword_does_not_match_plural_parts(real_builtins):
+    """`\\bpart\\b` is literal: 'parts' is a different token and must not activate edit-part."""
+    assert "edit-part" in _fires("check the part thickness", "kwsing")
+    assert "edit-part" not in _fires("archive old parts", "kwplur")
+
+
+def test_builtin_assembly_and_sketch_build_phrasings(real_builtins):
+    assert "edit-assembly" in _fires("put together the gearbox", "kwasm")
+    assert "edit-assembly" in _fires("assemble the bracket and plate", "kwasm2")
+    assert "edit-sketch" in _fires("draw a profile on the top plane", "kwskt")
+    assert "edit-sketch" in _fires("draw me a hex outline", "kwskt2")
+
+
+@pytest.mark.parametrize("text", ["add a fillet to the top edge", "add a hole through the boss",
+                                  "add a chamfer on that edge"])
+def test_builtin_edit_feature_already_catches_add_phrasings(real_builtins, text):
+    """The bare fillet/hole/chamfer nouns already cover 'add a <feature>' — no keyword needed."""
+    assert "edit-feature" in _fires(text, "kwfeat")
+
+
+def test_builtin_build_phrasing_injects_once_per_session(real_builtins):
+    sk.reset_session("kwonce")
+    first = sk.activate_for_prompt("make me a mudbucket for oil drilling", session_id="kwonce")
+    assert any("# Edit Part" in b for b in first)
+    again = sk.activate_for_prompt("build me a bracket too", session_id="kwonce")
+    assert not any("# Edit Part" in b for b in again)
+    # A different session still gets it.
+    sk.reset_session("kwonce2")
+    other = sk.activate_for_prompt("build me a bracket", session_id="kwonce2")
+    assert any("# Edit Part" in b for b in other)

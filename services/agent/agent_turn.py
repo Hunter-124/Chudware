@@ -276,18 +276,25 @@ def _force_first_tool(
     if tool_calls_made >= budget or not callable(dispatch):
         return calls, tool_calls_made, False
     allow_set = set(allow or [])
-    # Prefer ledger_get as universal floor; then domain openers.
-    candidates = (
-        "ledger_get", "ledger_note", "dag_plan", "buildgraph_status",
-        "ecad_status", "fw_status", "describe_project", "workspace_status",
-    )
-    tool = next((t for t in candidates if t in allow_set), None)
-    if tool is None and allow_set:
-        # submit_bug_report is a Settings floor union, not real work — force-firing
-        # it on a zero-tool turn would fabricate a tool result (and file nothing),
-        # flipping the no_code invariant. Never pick it as the forced opener.
-        pick = sorted(t for t in allow_set if t != "submit_bug_report")
-        tool = pick[0] if pick else None
+    # Prefer the category menu when the turn can self-serve more packs: on the
+    # general lane (enable_tools + list_tool_categories on the floor) a blind
+    # forced read taught the model nothing — handing it the pack menu is the
+    # on-ramp the role card itself prescribes (2026-07-27 zero-step run).
+    if {"enable_tools", "list_tool_categories"} <= allow_set:
+        tool = "list_tool_categories"
+    else:
+        # Prefer ledger_get as universal floor; then domain openers.
+        candidates = (
+            "ledger_get", "ledger_note", "dag_plan", "buildgraph_status",
+            "ecad_status", "fw_status", "describe_project", "workspace_status",
+        )
+        tool = next((t for t in candidates if t in allow_set), None)
+        if tool is None and allow_set:
+            # submit_bug_report is a Settings floor union, not real work — force-firing
+            # it on a zero-tool turn would fabricate a tool result (and file nothing),
+            # flipping the no_code invariant. Never pick it as the forced opener.
+            pick = sorted(t for t in allow_set if t != "submit_bug_report")
+            tool = pick[0] if pick else None
     if not tool:
         return calls, tool_calls_made, False
     args: dict = {}
@@ -309,10 +316,17 @@ def _force_first_tool(
         })
     except Exception:  # noqa: BLE001
         pass
+    _force_extra = ""
+    if "enable_tools" in allow_set:
+        _force_extra = (
+            " If the request asks you to build or edit geometry: call "
+            "enable_tools(categories=[\"modeling\", \"sketch\"]) next, then "
+            "new_part(name), then add_features(ops)."
+        )
     messages.append({"role": "user", "content": _parts(
         f"[FORCE] Model emitted no tool call. Harness is executing {tool} "
         f"now so the turn has a tool result — continue with more tools or "
-        f"a done handoff."
+        f"a done handoff.{_force_extra}"
     )})
     tool_calls_made += 1
     try:
@@ -346,6 +360,85 @@ def _force_first_tool(
         f"Tool result ({tool}):\n{_as_text(result)}"
     )})
     return calls, tool_calls_made, True
+
+
+# Fabricated-success detector: a finish (bare prose, junk JSON, or a formal
+# done envelope) that CLAIMS completed work while the turn ran zero voluntary
+# tool calls. Live (2026-07-27, kimi k3-256k general lane): "make me a
+# mudbucket" -> model replied "Done - I built this as parametric features; see
+# the FeatureManager tree and the viewport" with tool_calls=0; the forced
+# first-tool floor made tool_calls_made=1 and the bare-handoff path accepted
+# the fabrication as a clean done. The gate keys on the MODEL'S OWN CLAIMS so
+# legit zero-tool chat/Q&A finishes are untouched.
+_WORK_CLAIM_RE = re.compile(
+    r"(?:\bi(?:'ve| have)?\s+(?:just\s+|also\s+|now\s+){0,2}(?:built|created|"
+    r"made|modelled?|added|moved|saved|exported|generated|placed|registered|"
+    r"checkpointed|organised?|cleaned(?:\s+up)?|deleted|renamed|updated|"
+    r"modified|extruded|revolved|sketched|filleted|chamfered|shelled|mated|"
+    r"wired|routed|simulated|wrote|written|edited|changed|removed|fixed|"
+    r"imported|drew|drawn|set up)"
+    r"|\b(?:built|created|made|added|saved|exported|generated|placed|"
+    r"registered|checkpointed|moved|deleted|renamed|updated|modified|"
+    r"extruded|revolved)\s+(?:it|that|this|them|the|a|an|\d)"
+    r"|\bfeature\s*manager\b|\bfeaturemanager\b|\bin the viewport\b"
+    r"|\bin the (?:feature\s*)?tree\b|\bsee the (?:viewport|tree|model|part)\b"
+    r"|\b(?:is|are)\s+now (?:in|built|ready|done|created|saved)\b)",
+    re.IGNORECASE,
+)
+
+
+def _claims_completed_work(text: str) -> bool:
+    """Conservative: does *text* assert work was performed / artifacts exist?"""
+    if not text:
+        return False
+    return bool(_WORK_CLAIM_RE.search(text))
+
+
+_UNEARNED_FINISH_NUDGE = (
+    "[NO WORK PERFORMED] This turn has not done any real work yet - browsing "
+    "tool categories or enabling packs is not work, and nothing was built or "
+    "changed. If the user asked you to build or change something, DO IT NOW "
+    "with real tool calls - for a part build: enable_tools(categories="
+    "[\"modeling\", \"sketch\"]), then new_part(name), then add_features(ops). "
+    "For file/PLM work use the fs_* / plm_* tools already in your loadout. If "
+    "you cannot do the work, say so plainly and explain why - never describe "
+    "artifacts you did not create, and never finish silently."
+)
+
+#: Meta tools let the model reach for capability; they are never a deliverable.
+_META_TOOLS_NOT_WORK = frozenset({"enable_tools", "list_tool_categories"})
+
+
+def _did_real_work(calls: list) -> bool:
+    """True when the model voluntarily called a non-meta tool this turn."""
+    return any(
+        not c.get("forced") and c.get("tool") not in _META_TOOLS_NOT_WORK
+        for c in calls
+    )
+
+
+def _unearned_finish_block(
+    calls: list,
+    text: str,
+    *,
+    empty_is_unearned: bool = False,
+) -> str | None:
+    """Return the corrective nudge when a finish did not earn its status.
+
+    Fires when the turn did no real work (every call harness-forced or a meta
+    pack/category call) AND either the finish CLAIMS completed work, or -
+    on the formal-handoff path only (*empty_is_unearned*) - the finish is
+    content-free. Live 2026-07-27: kimi k3 called list_tool_categories once
+    and then emitted `status: done` with an empty summary, building nothing.
+    Voluntary real tool work (even failed) and honest prose pass untouched.
+    """
+    if _did_real_work(calls):
+        return None
+    if _claims_completed_work(text):
+        return _UNEARNED_FINISH_NUDGE
+    if empty_is_unearned and not (text or "").strip():
+        return _UNEARNED_FINISH_NUDGE
+    return None
 
 
 def _drop_oldest_tool_results(messages: list[dict], *, keep_recent: int = 6) -> int:
@@ -1013,6 +1106,10 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         pass
     # mega-24 a2: at most one forced first-tool on zero-tool no_code.
     _force_once = [False]
+    # 2026-07-27 fabricated-success gate: at most one corrective nudge for a
+    # finish that claims completed work with zero voluntary tool calls; the
+    # second such finish ends the turn honestly (no_code) instead of looping.
+    _novol_nudge = [0]
     # T-W21 §20 / mega-25: trigger-injection bookkeeping scoped to THIS
     # run_turn() call — messages/context is always fresh per call (no cross-
     # call conversation continuity), so cooldown only needs to hold across
@@ -1332,6 +1429,18 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                             _ecad_bootstrap_nudge = 0
                             continue
                     continue
+                # Fabricated-success gate: a finish that claims work - or says
+                # nothing at all - while the turn did no real work is not done.
+                _unearned = _unearned_finish_block(
+                    calls, reply or "", empty_is_unearned=True)
+                if _unearned is not None:
+                    if _novol_nudge[0] < 1:
+                        _novol_nudge[0] += 1
+                        messages.append({"role": "user", "content": _parts(_unearned)})
+                        last_reason = _RETRY
+                        continue
+                    last_reason = _NOCODE
+                    break
                 bare_handoff = {
                     "status": "done",
                     "summary": (reply or "")[:600],
@@ -1444,6 +1553,26 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                             continue
                     else:
                         continue
+            if handoff_status in ("", "done"):
+                # Fabricated-success gate: a done envelope claiming completed
+                # work while every call so far was harness-forced is not done.
+                _ho_out = (handoff or {}).get("outputs")
+                _ho_text = " ".join(str(x) for x in (
+                    (handoff or {}).get("summary") or "",
+                    (_ho_out or {}).get("text") if isinstance(_ho_out, dict) else "",
+                    (_ho_out or {}).get("reasoning_summary")
+                    if isinstance(_ho_out, dict) else "",
+                ) if x).strip()
+                _unearned = _unearned_finish_block(
+                    calls, _ho_text[:4000], empty_is_unearned=True)
+                if _unearned is not None:
+                    if _novol_nudge[0] < 1:
+                        _novol_nudge[0] += 1
+                        messages.append({"role": "user", "content": _parts(_unearned)})
+                        last_reason = _RETRY
+                        continue
+                    last_reason = _NOCODE
+                    break
             block = _done_guardrail_block(handoff, ledger, actor, calls)
             if block is not None:
                 messages.append({"role": "user", "content": _parts(block)})
@@ -1473,6 +1602,17 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     )})
                     last_reason = _RETRY
                     continue
+                # Same fabricated-success gate as the prose finish above.
+                _unearned = _unearned_finish_block(
+                    calls, reply or "", empty_is_unearned=True)
+                if _unearned is not None:
+                    if _novol_nudge[0] < 1:
+                        _novol_nudge[0] += 1
+                        messages.append({"role": "user", "content": _parts(_unearned)})
+                        last_reason = _RETRY
+                        continue
+                    last_reason = _NOCODE
+                    break
                 bare_handoff = {
                     "status": "done",
                     "summary": (reply or "")[:600],
@@ -1524,6 +1664,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         # the allow deny-check so meta-tools always run when present on the floor.
         if tool in ("enable_tools", "list_tool_categories"):
             tool_calls_made += 1
+            import time as _time  # noqa: PLC0415 — local, matches dispatch site
+            _meta_t0 = _time.monotonic()
             meta_result: dict
             try:
                 from services.agent.tool_categories import (  # noqa: PLC0415
@@ -1615,6 +1757,21 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 "tool": tool, "args": args, "ok": call_rec["ok"],
                 "result": _truncate(meta_result),
             })
+            # M20 parity: meta calls are real steps — stream them like any
+            # other tool call so the GUI timeline / events.jsonl stop showing
+            # "0/0" on turns that enabled packs (2026-07-27 invisible-enable).
+            if _turn_span is not None:
+                try:
+                    from services.agent import agent_events as _ae  # noqa: PLC0415
+                    _kind, _payload = _ae.tool_call_event(
+                        _ev_node, tool, args, meta_result,
+                        ok=call_rec["ok"],
+                        latency_ms=(_time.monotonic() - _meta_t0) * 1000.0,
+                        parent_id=_turn_span, actor=actor)
+                    _ae.emit_event(
+                        _kind, _payload, live=on_event, journal=_ev_journal)
+                except Exception:  # noqa: BLE001 — event emission never blocks
+                    pass
             messages.append({"role": "user", "content": _parts(
                 f"Result of {tool}:\n{_as_text(meta_result)}"
             )})
@@ -1624,8 +1781,40 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             note = {"tool": tool, "error": f"tool {tool!r} not in allowed list"}
             calls.append(note)
             _log(ledger, actor, {"event": "tool_denied", **note})
-            messages.append({"role": "user", "content": _parts(
-                f"Tool {tool!r} is not permitted. Choose an allowed tool.")})
+            # Name the pack that owns the tool when we can — "not permitted"
+            # alone leaves the model guessing dialects for a tool it cannot
+            # see (2026-07-27: k3 wrote add_features blind twice).
+            _deny_msg = (
+                f"Tool {tool!r} is not permitted. Choose an allowed tool.")
+            try:
+                from services.agent.tool_categories import (  # noqa: PLC0415
+                    CATEGORY_PACKS,
+                    resolve_categories,
+                )
+                _packs = [
+                    name for name in sorted(CATEGORY_PACKS)
+                    if tool in resolve_categories([name])
+                ]
+                if _packs:
+                    _deny_msg = (
+                        f"Tool {tool!r} is not enabled in this turn. It is in "
+                        f"the {_packs!r} pack(s) - call enable_tools("
+                        f"categories=[{_packs[0]!r}]) to pull it in with its "
+                        f"schema, then retry.")
+            except Exception:  # noqa: BLE001 — pack lookup is best-effort
+                pass
+            messages.append({"role": "user", "content": _parts(_deny_msg)})
+            # Skill auto-invocation on reach: a denied tool with a skill
+            # trigger still injects its SKILL.md body so the model learns the
+            # right workflow at the moment of need (once per session).
+            try:
+                from services.agent import skills as _skills_den  # noqa: PLC0415
+                for _sk_body in _skills_den.activate_for_prompt(
+                        "", session_id=_sid, tools_about_to_run=[tool],
+                        role=actor):
+                    messages.append({"role": "user", "content": _parts(_sk_body)})
+            except Exception:  # noqa: BLE001 — skill nudge never breaks turn
+                pass
             continue
 
         # mega-13/14: HARD block thrash tools that skip the ECAD product chain.
@@ -1887,6 +2076,19 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     args["doc_id"] = sch_id
             except Exception:  # noqa: BLE001
                 pass
+        # Skill auto-invocation on tool reach: the first time each session the
+        # model calls a tool with a matching skill trigger, inject that SKILL.md
+        # body so domain guidance (e.g. edit-part's verify discipline) lands at
+        # the moment of need — OMP-style automatic invocation (T: match_tool_
+        # triggers was previously wired in tests only, never in the live loop).
+        try:
+            from services.agent import skills as _skills_run  # noqa: PLC0415
+            for _sk_body in _skills_run.activate_for_prompt(
+                    "", session_id=_sid, tools_about_to_run=[tool],
+                    role=actor):
+                messages.append({"role": "user", "content": _parts(_sk_body)})
+        except Exception:  # noqa: BLE001 — skill nudge never breaks the turn
+            pass
         if _blocked is not None:
             result = {"ok": False, "error": _blocked}
             ok = False

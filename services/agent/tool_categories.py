@@ -273,9 +273,18 @@ def resolve_categories(
     Unknown category names are ignored. ``family:X`` tokens inside packs expand
     against the live tool_registry catalog when available. Cap defaults to
     :data:`CATEGORY_EXPAND_CAP`.
+
+    Explicit pack entries are CURATED and never trimmed: the cap applies only
+    to ``family:X`` expansion results. Live defect (2026-07-27): the modeling
+    pack leads with ``family:cad`` (112 tools), so the old alphabetical 40-cap
+    trim silently dropped ``new_part``/``new_assembly``/``save_part``/
+    ``set_material``/``preflight_ops`` — models enabled ``modeling`` and then
+    could not call ``new_part``, going straight to ``add_features`` on whatever
+    doc happened to be active.
     """
     limit = CATEGORY_EXPAND_CAP if cap is None else max(0, int(cap))
-    out: set[str] = set()
+    explicit: set[str] = set()
+    expanded: set[str] = set()
     for raw in names or []:
         key = str(raw or "").strip().lower()
         if not key:
@@ -284,10 +293,14 @@ def resolve_categories(
         if not pack:
             continue
         for token in pack:
-            out |= _expand_token(token)
-            if len(out) >= limit:
-                # Deterministic trim when over cap.
-                return set(sorted(out)[:limit])
-    if len(out) > limit:
-        return set(sorted(out)[:limit])
-    return out
+            t = (token or "").strip()
+            if t.startswith("family:"):
+                expanded |= _expand_token(t)
+            else:
+                explicit |= _expand_token(t)
+    # Explicit entries are curated and take PRIORITY; family expansion fills
+    # whatever room is left. The cap stays a HARD ceiling either way.
+    kept_explicit = sorted(explicit)[:limit]
+    room = max(0, limit - len(kept_explicit))
+    kept_family = sorted(expanded.difference(kept_explicit))[:room]
+    return set(kept_explicit) | set(kept_family)

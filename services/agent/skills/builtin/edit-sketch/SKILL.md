@@ -3,7 +3,7 @@ name: edit-sketch
 description: 2D sketch workflow — close profiles, constrain to DOF 0, smart-dimension mating features first, then check_sketch before extrude/revolve. Uses ASCII readback for non-vision parity.
 inject: auto
 triggers:
-  keywords: [sketch, profile, constrain, dimension, dof, rectangle, circle sketch, ascii]
+  keywords: [sketch, profile, constrain, dimension, dof, rectangle, circle sketch, ascii, draw a, draw me a]
   tools: [check_sketch, sketch_health, sketch_auto_constrain, render_sketch_ascii, apply_ascii_edits]
   phases: [sketch]
 ---

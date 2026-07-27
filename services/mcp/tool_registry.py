@@ -63,6 +63,10 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
 # Explicit overrides for names the classifier would mislabel. name -> risk.
 _RISK_OVERRIDES: dict[str, str] = {
     # nothing metered/spend today; add here when a paid-compute tool lands.
+    # submit_bug_report writes one LOCAL markdown file (Documents/Chudware/
+    # Bug-Reports/) — the `submit_` prefix would auto-classify EXTERNAL
+    # (network egress), which offline/local-only policies would refuse.
+    "submit_bug_report": RISK_WRITE,
 }
 
 

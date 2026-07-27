@@ -407,13 +407,54 @@ class RoleCard:
         explicitly list e.g. research_web_search or fs_write would have it offered
         by the mode layer yet REFUSED at dispatch — a silent floor/enforcement
         mismatch, not an intentional restriction.
+
+        Settings → AI → Tools ``agent.role_tools``: family tokens for the mapped
+        harness role are unioned in so the UI assignment actually reaches the
+        dispatch gate. When ``agent.direct_agent_full_tools`` is on and this is
+        the main-chat ``general_agent`` / ``default`` harness role, policy is
+        opened (``allow=None``) so the agent can use the full catalog.
         """
         from services.agent.copilot_mode_tools import (  # noqa: PLC0415
             AGENT_DEFAULT_TOOLS,
             SHARED_DEFAULT_TOOLS,
         )
+        from services.agent.config import (  # noqa: PLC0415
+            direct_agent_full_tools,
+            get_role_tools,
+            harness_role_for_yaml,
+        )
 
-        tokens = list(dict.fromkeys([*self.allow_tokens, *SHARED_DEFAULT_TOOLS, *AGENT_DEFAULT_TOOLS]))
+        harness = harness_role_for_yaml(self.id)
+        role_fams = get_role_tools(harness)
+        fam_tokens = [f"family:{f}" for f in role_fams if f]
+
+        # Main chat: open the gate so the agent can rip with every registered tool
+        # (per-tool enabled flags + legacy family kill-switches still apply).
+        if direct_agent_full_tools() and harness == "default":
+            registry.set_policy(allow=None)
+            tokens = list(dict.fromkeys([
+                *self.allow_tokens, *fam_tokens,
+                *SHARED_DEFAULT_TOOLS, *AGENT_DEFAULT_TOOLS,
+            ]))
+            try:
+                from services.agent.config import bugreport_floor  # noqa: PLC0415
+                tokens = list(dict.fromkeys([*tokens, *bugreport_floor()]))
+            except Exception:  # noqa: BLE001
+                pass
+            return tokens
+
+        tokens = list(dict.fromkeys([
+            *self.allow_tokens, *fam_tokens,
+            *SHARED_DEFAULT_TOOLS, *AGENT_DEFAULT_TOOLS,
+        ]))
+        # Settings → AI → Tools "Send bug reports": the registry policy is the
+        # ONE dispatch gate, so the floor must be unioned here too or an
+        # advertised submit_bug_report would be refused at dispatch.
+        try:
+            from services.agent.config import bugreport_floor  # noqa: PLC0415
+            tokens = list(dict.fromkeys([*tokens, *bugreport_floor()]))
+        except Exception:  # noqa: BLE001 — floor union is best-effort
+            pass
         registry.set_policy(allow=tokens)
         return tokens
 

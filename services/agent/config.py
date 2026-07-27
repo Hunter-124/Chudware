@@ -401,7 +401,9 @@ def advisor_enabled(cfg: dict | None = None) -> bool:
 # --------------------------------------------------------------------------- preference enums
 # Shared with host Settings: off | option | encourage | require
 VALID_PREFERENCES = frozenset({"off", "option", "encourage", "require"})
-DEFAULT_PLAN_PREFERENCE = "encourage"
+# Default Off: main chat should tool-call directly instead of forcing a
+# plan/intake breakdown (Settings → AI → Harness "Plan preference").
+DEFAULT_PLAN_PREFERENCE = "off"
 DEFAULT_SUBAGENT_PREFERENCE = "option"
 DEFAULT_ADVISOR_PREFERENCE = "encourage"
 DEFAULT_PROACTIVE_ADVISOR = False
@@ -433,7 +435,7 @@ def _parse_preference(raw, default: str) -> str:
 
 
 def get_plan_preference(cfg: dict | None = None) -> str:
-    """Return plan preference string (default encourage). Honors legacy plan_mode bool."""
+    """Return plan preference string (default off). Honors legacy plan_mode bool."""
     c = cfg if cfg is not None else load_config()
     if not isinstance(c, dict):
         return DEFAULT_PLAN_PREFERENCE
@@ -442,7 +444,7 @@ def get_plan_preference(cfg: dict | None = None) -> str:
     agent = c.get(AGENT_CONFIG_KEY) if isinstance(c.get(AGENT_CONFIG_KEY), dict) else {}
     if isinstance(agent, dict) and "plan_preference" in agent:
         return _parse_preference(agent.get("plan_preference"), DEFAULT_PLAN_PREFERENCE)
-    # Legacy bool
+    # Legacy bool — only honor when plan_preference was never set.
     if "plan_mode" in c:
         return "encourage" if bool(c.get("plan_mode")) else "off"
     return DEFAULT_PLAN_PREFERENCE
@@ -539,14 +541,194 @@ DEFAULT_TOOL_FAMILIES = (
     "sim", "workspace",
 )
 
+# ---------------------------------------------------------------------------
+# Per-role default tool families (Settings → AI → Tools)
+# agent.role_tools: { "default": ["cad", "files", ...], "task": [...], ... }
+# Keys match Settings → AI → Roles harness roles (advisor/task/planning/…).
+# Missing key → DEFAULT_ROLE_TOOLS[role]. Empty list = no family defaults
+# (SHARED/AGENT floors in apply_tool_policy still apply).
+# ---------------------------------------------------------------------------
+HARNESS_ROLE_KEYS = (
+    "advisor", "task", "planning", "vision", "default", "plm", "redaction",
+    "sketch2d", "model3d", "memory", "cam", "sim", "ecad", "drawing", "reveng",
+)
+
+# Sensible default loadouts — lean specialists, broad "default" (main chat).
+DEFAULT_ROLE_TOOLS: dict[str, tuple[str, ...]] = {
+    "advisor": ("advisor", "research", "ledger", "gsl"),
+    "task": ("cad", "sim", "cam", "parts", "gsl", "files", "shell", "office"),
+    "planning": ("mission", "advisor", "ledger", "research", "gsl", "workspace"),
+    "vision": ("gsl", "cad"),
+    "default": (
+        "cad", "files", "shell", "office", "plm", "research", "parts", "gsl",
+        "advisor", "workspace", "ledger", "sim", "cam", "ecad", "reveng",
+        "mission",
+    ),
+    "plm": ("plm", "files", "office", "ledger"),
+    "redaction": (),
+    "sketch2d": ("cad", "gsl", "ecad"),
+    "model3d": ("cad", "sim", "parts", "gsl"),
+    "memory": ("ledger", "plm", "files"),
+    "cam": ("cam", "cad", "parts"),
+    "sim": ("sim", "cad", "gsl"),
+    "ecad": ("ecad", "parts", "research", "em"),
+    "drawing": ("cad", "office", "gsl"),
+    "reveng": ("reveng", "research", "cad", "parts"),
+}
+
+# YAML role card id → harness role for role_tools lookup.
+YAML_ROLE_TO_HARNESS: dict[str, str] = {
+    "general_agent": "default",
+    "advisor": "advisor",
+    "orchestrator": "planning",
+    "department_manager": "planning",
+    "overseer": "planning",
+    "project_organizer": "planning",
+    "intake_analyst": "planning",
+    "clarifier": "planning",
+    "spec_writer": "planning",
+    "design_thinker": "planning",
+    "layout_engineer": "model3d",
+    "feature_architect": "model3d",
+    "feature_modeler": "task",
+    "geometry_designer": "model3d",
+    "sketcher": "sketch2d",
+    "sketch2d": "sketch2d",
+    "model3d": "model3d",
+    "assembly_fit_engineer": "task",
+    "linkage_planner": "task",
+    "cam_programmer": "cam",
+    "sim_engineer": "sim",
+    "ecad_engineer": "ecad",
+    "firmware_engineer": "ecad",
+    "drawing_detailer": "drawing",
+    "re_modeler": "reveng",
+    "re_datasheet_reader": "reveng",
+    "re_geometry_verifier": "reveng",
+    "sourcing_specialist": "task",
+    "reviewer": "advisor",
+    "fixer": "task",
+    "memory": "memory",
+}
+
+# Main-chat agent uses a full tool surface (no 14-tool cap / no lean packs) when
+# agent.direct_agent_full_tools is true (default). Settings → AI → Harness.
+DEFAULT_DIRECT_AGENT_FULL_TOOLS = True
+# Agent-mode auto-route to mission_start / agent_mission_v1 on build+analyze
+# phrasing. Default off — main chat stays on the direct general_agent turn.
+DEFAULT_AUTO_MISSION_ROUTING = False
+
+
+def get_role_tools(role: str, cfg: dict | None = None) -> list[str]:
+    """Return the default tool-family list for a harness *role*.
+
+    Precedence: ``agent.role_tools.<role>`` (list) > :data:`DEFAULT_ROLE_TOOLS`.
+    Unknown roles fall back to ``default``. Families not in
+    :data:`DEFAULT_TOOL_FAMILIES` are kept (forward-compatible) but blank/non-
+    string entries are dropped.
+    """
+    role_s = (role or "default").strip().lower() or "default"
+    defaults = list(DEFAULT_ROLE_TOOLS.get(role_s, DEFAULT_ROLE_TOOLS["default"]))
+    try:
+        c = cfg if isinstance(cfg, dict) else load_config()
+    except Exception:  # noqa: BLE001
+        c = cfg if isinstance(cfg, dict) else {}
+    agent = c.get("agent") if isinstance(c, dict) and isinstance(c.get("agent"), dict) else {}
+    raw_root = agent.get("role_tools") if isinstance(agent, dict) else None
+    if not isinstance(raw_root, dict):
+        return defaults
+    # Only the explicit role key overrides that role's defaults. Do NOT fall through
+    # to config's "default" list for other roles — that would clobber specialist
+    # loadouts when the user only customized the main-chat Default role.
+    if role_s not in raw_root:
+        return defaults
+    entry = raw_root.get(role_s)
+    if entry is None:
+        return defaults
+    if not isinstance(entry, (list, tuple)):
+        return defaults
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in entry:
+        if not isinstance(item, str):
+            continue
+        fam = item.strip().lower()
+        if not fam or fam in seen:
+            continue
+        seen.add(fam)
+        out.append(fam)
+    return out
+
+
+def get_all_role_tools(cfg: dict | None = None) -> dict[str, list[str]]:
+    """Full harness-role → families map (defaults filled for every known role)."""
+    return {k: get_role_tools(k, cfg) for k in HARNESS_ROLE_KEYS}
+
+
+def harness_role_for_yaml(role_id: str) -> str:
+    """Map a YAML role-card id to a harness role key for :func:`get_role_tools`."""
+    rid = (role_id or "").strip().lower()
+    if not rid:
+        return "default"
+    if rid in HARNESS_ROLE_KEYS:
+        return rid
+    return YAML_ROLE_TO_HARNESS.get(rid, "default")
+
+
+def direct_agent_full_tools(cfg: dict | None = None) -> bool:
+    """When True, main-chat ``general_agent`` / ``default`` get an uncapped tool surface."""
+    try:
+        env = os.environ.get("CHUDWARE_DIRECT_AGENT_FULL_TOOLS")
+        if env is not None and str(env).strip() != "":
+            return str(env).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        agent = _agent_block(cfg)
+        if "direct_agent_full_tools" in agent:
+            return bool(agent.get("direct_agent_full_tools"))
+    except Exception:  # noqa: BLE001
+        pass
+    return DEFAULT_DIRECT_AGENT_FULL_TOOLS
+
+
+def auto_mission_routing(cfg: dict | None = None) -> bool:
+    """When True, Agent mode may auto-route build+analyze phrasing to a mission."""
+    try:
+        env = os.environ.get("CHUDWARE_AUTO_MISSION_ROUTING")
+        if env is not None and str(env).strip() != "":
+            return str(env).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        agent = _agent_block(cfg)
+        if "auto_mission_routing" in agent:
+            return bool(agent.get("auto_mission_routing"))
+    except Exception:  # noqa: BLE001
+        pass
+    return DEFAULT_AUTO_MISSION_ROUTING
+
 
 # ---------------------------------------------------------------------------
 # Per-tool options (Settings → AI → Tools)
 # agent.tool_options: { "run_fea_static": {"timeout_s": 180, "prompt_note": "..."}, ... }
 # Missing key / missing field = stock behavior.
+#
+# Keys (extend in place — do not invent a parallel config tree):
+#   enabled              bool — kill-switch for this tool name
+#   timeout_s            int  — per-call wall timeout (0/absent → global default)
+#   max_calls_per_turn   int  — per-turn call cap (0/absent → global default)
+#   param_defaults       dict — kwargs merged under the model's call (model wins)
+#   prompt_note          str  — AI usage guidance appended as "Note: …" in the
+#                               tools-slot schema (tool_schemas.render_tools_block)
+#   description_override str  — replaces the MCP docstring in the tools-slot
+#                               (included tool context); empty = use live docstring
+#   schema_trim          bool|null — per-tool override of the tier's
+#                               tool_schema_trim dial (None = inherit tier)
 # ---------------------------------------------------------------------------
 TOOL_OPTION_KEYS = (
     "enabled", "timeout_s", "max_calls_per_turn", "param_defaults", "prompt_note",
+    "description_override", "schema_trim",
 )
 
 _TOOL_OPTION_DEFAULTS: dict = {
@@ -555,6 +737,8 @@ _TOOL_OPTION_DEFAULTS: dict = {
     "max_calls_per_turn": None,
     "param_defaults": {},
     "prompt_note": "",
+    "description_override": "",
+    "schema_trim": None,
 }
 
 
@@ -566,6 +750,8 @@ def get_tool_options(cfg: dict | None, name: str) -> dict:
         "max_calls_per_turn": None,
         "param_defaults": {},
         "prompt_note": "",
+        "description_override": "",
+        "schema_trim": None,
     }
     if not name:
         return out
@@ -600,6 +786,14 @@ def get_tool_options(cfg: dict | None, name: str) -> dict:
         out["param_defaults"] = dict(entry.get("param_defaults") or {})
     if "prompt_note" in entry and entry.get("prompt_note") is not None:
         out["prompt_note"] = str(entry.get("prompt_note") or "")
+    if "description_override" in entry and entry.get("description_override") is not None:
+        out["description_override"] = str(entry.get("description_override") or "")
+    if "schema_trim" in entry:
+        v = entry.get("schema_trim")
+        if v is None or v == "":
+            out["schema_trim"] = None
+        else:
+            out["schema_trim"] = bool(v)
     return out
 
 
@@ -717,15 +911,33 @@ def supervision_interval_calls(cfg: dict | None = None) -> int:
 
 
 def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
-    """Return family→enabled map. Defaults all known families to True."""
+    """Return family→enabled map.
+
+    When ``agent.role_tools`` is present, a family is enabled if ANY harness
+    role lists it (union). Legacy ``agent.tool_families`` still wins as an
+    explicit False kill-switch for a family. Missing everything → all on.
+    """
     c = cfg if isinstance(cfg, dict) else load_config()
     agent = c.get("agent") if isinstance(c.get("agent"), dict) else {}
     raw = agent.get("tool_families") if isinstance(agent.get("tool_families"), dict) else {}
+    role_tools_raw = agent.get("role_tools") if isinstance(agent.get("role_tools"), dict) else None
+
+    # Union of role assignments when role_tools is configured.
+    role_union: set[str] | None = None
+    if isinstance(role_tools_raw, dict) and role_tools_raw:
+        role_union = set()
+        for role_key in HARNESS_ROLE_KEYS:
+            for fam in get_role_tools(role_key, c):
+                role_union.add(fam)
+
     out: dict[str, bool] = {}
     for fam in DEFAULT_TOOL_FAMILIES:
-        v = raw.get(fam, True)
-        out[fam] = bool(v) if not isinstance(v, bool) else v
-    # preserve any extra keys user added
+        if fam in raw and isinstance(raw[fam], bool):
+            out[fam] = raw[fam]
+        elif role_union is not None:
+            out[fam] = fam in role_union
+        else:
+            out[fam] = True
     for k, v in raw.items():
         if k not in out:
             out[str(k)] = bool(v)
@@ -771,6 +983,9 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
 #   agent.compaction_backend  "builtin" | "omp"      (default "builtin")
 #   agent.cache_warming       bool                   (default False)
 #   agent.memory_learn        bool                   (default True)
+#   agent.memory_model        "online" | "local"     (default "online"; mnemopi LLM)
+#   agent.autolearn_enabled / autolearn_auto_continue / autolearn_min_tool_calls
+#     — OMP Auto-Learn sidecar (Settings → AI → Harness → Memory & Learning)
 # Precedence is ENV > config.json > default: CHUDWARE_MEMORY_BACKEND /
 # CHUDWARE_COMPACTION_BACKEND still win when set (per-process override; the GUI
 # comboboxes write config.json only).
@@ -779,11 +994,20 @@ MEMORY_BACKEND_KEY = "memory_backend"
 COMPACTION_BACKEND_KEY = "compaction_backend"
 CACHE_WARMING_KEY = "cache_warming"
 MEMORY_LEARN_KEY = "memory_learn"
+MEMORY_MODEL_KEY = "memory_model"
+AUTOLEARN_ENABLED_KEY = "autolearn_enabled"
+AUTOLEARN_AUTO_CONTINUE_KEY = "autolearn_auto_continue"
+AUTOLEARN_MIN_TOOL_CALLS_KEY = "autolearn_min_tool_calls"
 
 DEFAULT_MEMORY_BACKEND: str = "sqlite"
 DEFAULT_COMPACTION_BACKEND: str = "builtin"
 DEFAULT_CACHE_WARMING: bool = False
 DEFAULT_MEMORY_LEARN: bool = True
+DEFAULT_MEMORY_MODEL: str = "online"
+DEFAULT_AUTOLEARN_ENABLED: bool = False
+DEFAULT_AUTOLEARN_AUTO_CONTINUE: bool = False
+DEFAULT_AUTOLEARN_MIN_TOOL_CALLS: int = 5
+VALID_MEMORY_MODELS = frozenset({"online", "local"})
 
 _MEMORY_BACKEND_MNEMOPI = frozenset({"mnemopi", "omp", "bridge"})
 _COMPACTION_BACKEND_OMP = frozenset({"omp", "bridge", "mnemopi"})
@@ -847,6 +1071,42 @@ def memory_learn_enabled(cfg: dict | None = None) -> bool:
     """
     agent = _agent_block(cfg)
     return bool(agent.get(MEMORY_LEARN_KEY, DEFAULT_MEMORY_LEARN))
+
+
+def memory_model(cfg: dict | None = None) -> str:
+    """Return ``agent.memory_model`` (``online`` | ``local``, default online).
+
+    OMP ``providers.memoryModel`` port — which tiny/LLM path mnemopi uses for
+    fact extraction when the bridge enables LLM (today the bridge runs
+    embeddings/llm off and degrades to FTS; the knob is still persisted so the
+    UI matches OMP and future bridge options honor it).
+    """
+    agent = _agent_block(cfg)
+    raw = agent.get(MEMORY_MODEL_KEY, DEFAULT_MEMORY_MODEL)
+    s = str(raw or DEFAULT_MEMORY_MODEL).strip().lower()
+    return s if s in VALID_MEMORY_MODELS else DEFAULT_MEMORY_MODEL
+
+
+def autolearn_enabled(cfg: dict | None = None) -> bool:
+    """Return ``agent.autolearn_enabled`` (OMP Auto-Learn master flag, default off)."""
+    agent = _agent_block(cfg)
+    return bool(agent.get(AUTOLEARN_ENABLED_KEY, DEFAULT_AUTOLEARN_ENABLED))
+
+
+def autolearn_auto_continue(cfg: dict | None = None) -> bool:
+    """Return ``agent.autolearn_auto_continue`` (capture-at-stop, default off)."""
+    agent = _agent_block(cfg)
+    return bool(agent.get(AUTOLEARN_AUTO_CONTINUE_KEY, DEFAULT_AUTOLEARN_AUTO_CONTINUE))
+
+
+def autolearn_min_tool_calls(cfg: dict | None = None) -> int:
+    """Return ``agent.autolearn_min_tool_calls`` (default 5, clamped ≥ 1)."""
+    agent = _agent_block(cfg)
+    try:
+        n = int(agent.get(AUTOLEARN_MIN_TOOL_CALLS_KEY, DEFAULT_AUTOLEARN_MIN_TOOL_CALLS))
+    except (TypeError, ValueError):
+        n = DEFAULT_AUTOLEARN_MIN_TOOL_CALLS
+    return max(1, n)
 
 
 # --------------------------------------------------------------------------- compaction / session cmds
@@ -945,6 +1205,29 @@ def handoff_save_to_disk(cfg: dict | None = None) -> bool:
     """Return ``agent.handoff_save_to_disk`` (bool, default False)."""
     agent = _agent_block(cfg)
     return bool(agent.get(HANDOFF_SAVE_TO_DISK_KEY, DEFAULT_HANDOFF_SAVE_TO_DISK))
+
+
+BUG_REPORTS_KEY = "bug_reports"
+DEFAULT_BUG_REPORTS = True
+
+
+def bug_reports_enabled(cfg: dict | None = None) -> bool:
+    """Return ``agent.bug_reports`` (bool, default True).
+
+    Settings → AI → Tools "Send bug reports": the agent gets the
+    ``submit_bug_report`` tool and may file a local markdown report
+    (Documents/Chudware/Bug-Reports/) when it hits tool errors that look
+    like our bug. Reports never leave the machine.
+    """
+    agent = _agent_block(cfg)
+    raw = agent.get(BUG_REPORTS_KEY, DEFAULT_BUG_REPORTS)
+    return bool(raw) if isinstance(raw, bool) else DEFAULT_BUG_REPORTS
+
+
+def bugreport_floor(cfg: dict | None = None) -> frozenset:
+    """Tool names unioned onto every advertised/allowed list when bug reports
+    are on (empty frozenset when off) — the Settings toggle is the gate."""
+    return frozenset({"submit_bug_report"}) if bug_reports_enabled(cfg) else frozenset()
 
 
 
@@ -1183,6 +1466,49 @@ _PROVIDER_BASE_URL_CFG_KEY = {
     "openrouter": "openrouter",
 }
 
+# Provider ids served by the OMP bun sidecar (vendor/omp/bridge/src/bridge.ts) instead of a
+# native Python SDK adapter. Kept verbatim in sync with the C++ source of truth,
+# core/agent/providers.cpp:1131-1146 (omp_bridge_provider_ids()) — re-sync by copying that
+# set over whenever the vendored OMP catalog is re-pulled and provider coverage shifts.
+#
+# It deliberately EXCLUDES every id CAD serves natively (openai, gemini, xai/xai-sub,
+# moonshot, cursor-sub, llamacpp, vllm, mock), so routing a bridge id can never shadow a
+# loopback endpoint or an already-working native adapter.
+OMP_BRIDGE_PROVIDER_IDS = frozenset({
+    "aimlapi", "alibaba-coding-plan", "amazon-bedrock", "anthropic", "anthropic-sub",
+    "azure", "baseten", "cerebras",
+    "cloudflare-ai-gateway", "coreweave", "deepseek", "devin", "firepass", "fireworks",
+    "github-copilot", "gitlab-duo", "gitlab-duo-agent", "google-antigravity",
+    "google-gemini-cli", "google-vertex", "groq", "huggingface", "kilo", "kimi-code",
+    "minimax", "minimax-cn", "minimax-code", "minimax-code-cn", "mistral", "nanogpt",
+    "novita", "nvidia", "ollama-cloud", "openai-codex", "opencode", "opencode-go",
+    "opencode-zen", "openrouter", "qianfan", "qwen-portal", "sakana", "synthetic",
+    "together", "umans", "venice", "vercel-ai-gateway", "wafer-serverless", "xiaomi",
+    "xiaomi-token-plan-ams", "xiaomi-token-plan-cn", "xiaomi-token-plan-sgp", "zai",
+    "zenmux", "zhipu-coding-plan",
+})
+
+
+# Persisted provider ids that were renamed to a bridge id. _resolve_provider normalizes the
+# name through this table, but a config written before the rename still files the nested
+# section and the keys map under the OLD id — so per-provider lookups try both, newest first.
+# core/agent/config.cpp performs the same kimi-sub -> kimi-code rename on its side.
+_PROVIDER_ID_ALIASES = {"kimi-sub": "kimi-code"}
+
+
+def _provider_cfg_names(name: str) -> tuple[str, ...]:
+    """Config ids *name*'s settings may be filed under: the current id, then pre-rename aliases."""
+    return (name, *(old for old, new in _PROVIDER_ID_ALIASES.items() if new == name))
+
+
+def _provider_cfg_section(cfg: dict, name: str) -> dict:
+    """Nested per-provider config block for *name* as a plain copy (empty dict when unset)."""
+    for key in _provider_cfg_names(name):
+        section = cfg.get(key)
+        if isinstance(section, dict):
+            return dict(section)
+    return {}
+
 
 def _resolve_via_routing(role: str | None, cfg: dict) -> tuple[str, str | None, str | None] | None:
     """Resolve *role* against routing.yaml (contract §14). Returns
@@ -1233,6 +1559,9 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             cfg[sub_key].setdefault("base_url", routed_base_url)
 
     name = (name or os.environ.get("CHUDWARE_PROVIDER") or cfg.get("provider") or "").lower()
+    # Pre-rename persisted ids (kimi-sub -> kimi-code) normalize before every lookup below,
+    # exactly as core/agent/config.cpp's resolve_provider does on its side.
+    name = _PROVIDER_ID_ALIASES.get(name, name)
     offline = offline_enabled(cfg) or compliance_mode(cfg) == "local_only"
 
     # Offline mode: refuse cloud providers OUTRIGHT before constructing them (no client, no key
@@ -1282,13 +1611,20 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the vLLM serving "
                 f"endpoint {base_url!r} is not loopback, so it is refused before construction.")
     if offline and name in ("anthropic-sub", "codex-sub", "cursor-sub", "xai-sub",
-                            "kimi-sub", "claude-cli", "codex-cli"):
+                            "claude-cli", "codex-cli"):
         # Subscription-auth providers (§4.4) and CLI-subscription drivers always talk to
         # a vendor cloud endpoint (the CLI is just a local front-end).
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the subscription "
             f"provider {name!r} uses a vendor cloud endpoint and is refused. Use a local "
             f"(loopback) model server instead.")
+    if offline and name in OMP_BRIDGE_PROVIDER_IDS:
+        # The OMP sidecar is a local process, but every id it serves is a vendor cloud
+        # endpoint it calls on our behalf — refuse by name, before any child is spawned.
+        raise OfflineModeError(
+            f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the cloud provider "
+            f"{name!r} is routed through the OMP sidecar to a vendor API endpoint and is "
+            f"refused. Use a local (loopback) model server instead.")
 
     if not name:
         # Nothing configured: default to a local LM Studio (OpenAI-compatible) endpoint
@@ -1330,6 +1666,42 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             from .providers.mock_provider import RoleScriptedProvider
             return RoleScriptedProvider(by_role)
         return MockProvider(replies or [""])
+
+    if name in OMP_BRIDGE_PROVIDER_IDS:
+        # Cloud providers served by the OMP bun sidecar instead of a raw vendor SDK: the
+        # sidecar owns CAD's shared credential store, so an OAuth-only subscription (Claude
+        # Pro/Max, Kimi For Coding, …) completes here with no api_key at all, and no pip
+        # package has to be installed for the provider to work. Deliberately ahead of the
+        # native cloud branches below so a bridge id wins over a same-named SDK adapter.
+        from .providers.omp_bridge_provider import OmpBridgeProvider
+
+        aliases = _provider_cfg_names(name)
+        pc = _provider_cfg_section(cfg, name)
+        keys_map = cfg.get("keys") if isinstance(cfg.get("keys"), dict) else {}
+        # cfg["api_key"] is the flat single-provider slot the native branches read; it belongs
+        # to whoever cfg["provider"] names, and handing another provider's key to the sidecar
+        # would suppress its AuthStorage (OAuth) lookup entirely. Vendor env vars are left to
+        # the sidecar, which consults them itself.
+        flat_provider = str(cfg.get("provider") or "").lower()
+        flat_key = cfg.get("api_key") if flat_provider in ("", *aliases) else None
+        key = (
+            pc.get("api_key")
+            or flat_key
+            or next((keys_map[k] for k in aliases if keys_map.get(k)), None)
+        )
+        model = cfg.get("model") or pc.get("model") or ""
+        caps = _catalog_caps(name, model, cfg)
+        vision = pc["vision"] if "vision" in pc else caps.get("vision", True)
+        prov = OmpBridgeProvider(
+            provider=name,
+            model=model,
+            api_key=key,
+            base_url=pc.get("base_url"),
+            reasoning_effort=cfg.get("reasoning_effort"),
+            supports_vision=bool(vision),
+            timeout=pc.get("timeout"),
+        )
+        return _attach_catalog_meta(prov, caps)
 
     if name == "anthropic":
         from .providers.anthropic_provider import AnthropicProvider, DEFAULT_MODEL
@@ -1478,12 +1850,6 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         from .providers.xai_sub_provider import XAISubProvider, DEFAULT_MODEL
 
         return XAISubProvider(model=cfg.get("model", DEFAULT_MODEL))
-
-    if name == "kimi-sub":
-        # Subscription auth (§4.4): Kimi For Coding device-code OAuth.
-        from .providers.kimi_sub_provider import KimiSubProvider, DEFAULT_MODEL
-
-        return KimiSubProvider(model=cfg.get("model", DEFAULT_MODEL))
 
     if name == "claude-cli":
         # Headless Claude Code CLI — subscription-backed, never offline-safe.

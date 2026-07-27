@@ -552,6 +552,13 @@ def design_recipe(query: str = "", max_results: int = 3) -> dict:
     """
     return _design_recipe_fn(query=query, max_results=max_results)
 
+# Bug reports (Settings → AI → Tools "Send bug reports"): submit_bug_report lets the
+# agent file a local markdown report (Documents/Chudware/Bug-Reports/) when it hits a
+# tool error that looks like our bug. Self-gates on agent.bug_reports at call time;
+# failure context is auto-captured by agent_turn via services.agent.bugreport_context.
+from mcp_server.bugreport_tools import register_bugreport_tools
+register_bugreport_tools(_reg.view(mcp, "workspace"))
+
 # Interface alignment checker (T-BL49): interface_check inspects mating component pairs for
 # hole-pattern registration, bore coaxiality, contact-plane flushness, and fastener pass-through
 # — the layout errors that pass check_interference (no clash) but are still wrong.  Reuses

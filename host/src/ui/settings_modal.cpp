@@ -1773,7 +1773,47 @@ static const char* kRoleLabels[] = {
     "Advisor", "Task", "Planning", "Vision", "Default", "PLM", "Redaction",
     "Sketch 2D", "Model 3D", "Memory", "CAM", "Simulation", "ECAD", "Drawing",
     "Reverse eng"};
+// Unique accent per role (RGBA 0–1) — used in Roles + Tools assignment chrome.
+static const ImVec4 kRoleColors[] = {
+    {0.45f, 0.72f, 0.95f, 1.0f},  // advisor — sky
+    {0.95f, 0.62f, 0.35f, 1.0f},  // task — amber
+    {0.62f, 0.55f, 0.95f, 1.0f},  // planning — violet
+    {0.35f, 0.85f, 0.75f, 1.0f},  // vision — teal
+    {0.55f, 0.78f, 0.45f, 1.0f},  // default — green
+    {0.40f, 0.65f, 0.85f, 1.0f},  // plm — steel
+    {0.90f, 0.40f, 0.40f, 1.0f},  // redaction — red
+    {0.85f, 0.70f, 0.35f, 1.0f},  // sketch2d — gold
+    {0.35f, 0.70f, 0.90f, 1.0f},  // model3d — cyan
+    {0.70f, 0.60f, 0.45f, 1.0f},  // memory — taupe
+    {0.90f, 0.50f, 0.55f, 1.0f},  // cam — coral
+    {0.55f, 0.85f, 0.55f, 1.0f},  // sim — mint
+    {0.75f, 0.55f, 0.90f, 1.0f},  // ecad — orchid
+    {0.50f, 0.55f, 0.70f, 1.0f},  // drawing — slate
+    {0.85f, 0.55f, 0.30f, 1.0f},  // reveng — orange
+};
+static const char* kRoleIcons[] = {
+    "A", "T", "P", "V", "D", "L", "R",
+    "S", "3", "M", "C", "F", "E", "W", "X"};
 static constexpr int kRoleCount = 15;
+
+// Colored letter badge for a harness role (Roles table + Tools assignment).
+static void drawRoleBadge(int roleIdx, float sc) {
+    if (roleIdx < 0 || roleIdx >= kRoleCount) roleIdx = 4;
+    const ImVec4& col = kRoleColors[roleIdx];
+    const float sz = 18.0f * sc;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 fill = ImGui::ColorConvertFloat4ToU32(col);
+    const ImU32 border = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(col.x * 0.55f, col.y * 0.55f, col.z * 0.55f, 1.0f));
+    dl->AddCircleFilled(ImVec2(p.x + sz * 0.5f, p.y + sz * 0.5f), sz * 0.48f, fill, 16);
+    dl->AddCircle(ImVec2(p.x + sz * 0.5f, p.y + sz * 0.5f), sz * 0.48f, border, 16, 1.2f * sc);
+    const char* glyph = kRoleIcons[roleIdx];
+    const ImVec2 ts = ImGui::CalcTextSize(glyph);
+    dl->AddText(ImVec2(p.x + (sz - ts.x) * 0.5f, p.y + (sz - ts.y) * 0.5f),
+                IM_COL32(255, 255, 255, 240), glyph);
+    ImGui::Dummy(ImVec2(sz + 4.0f * sc, sz));
+}
 
 static std::string benchTierForSource(const Settings& s, int source) {
     if (source == 1) return "xai:grok-4-5";
@@ -2477,6 +2517,8 @@ static void drawModelRolesSection(AppState& st, float sc) {
 
             ImGui::TableNextColumn();
             ImGui::AlignTextToFramePadding();
+            drawRoleBadge(i, sc);
+            ImGui::SameLine(0.0f, 6.0f * sc);
             ImGui::TextUnformatted(kRoleLabels[i]);
             // Purpose tooltip on every role (vision has the full vision-review description).
             if (std::strcmp(key, "advisor") == 0) {
@@ -2505,6 +2547,16 @@ static void drawModelRolesSection(AppState& st, float sc) {
             } else if (std::strcmp(key, "memory") == 0) {
                 helpMarker("Project memory distiller — writes durable decisions/notes to "
                            ".plm/memory.db. Does not design geometry.");
+            } else if (std::strcmp(key, "cam") == 0) {
+                helpMarker("CAM / toolpath specialist — stock, setups, operations, post.");
+            } else if (std::strcmp(key, "sim") == 0) {
+                helpMarker("Simulation specialist — FEA, CFD, motion.");
+            } else if (std::strcmp(key, "ecad") == 0) {
+                helpMarker("Electronics specialist — schematics, PCB, ERC/DRC.");
+            } else if (std::strcmp(key, "drawing") == 0) {
+                helpMarker("2D drawing / detailing specialist.");
+            } else if (std::strcmp(key, "reveng") == 0) {
+                helpMarker("Reverse-engineering specialist — scans, photos, reconstruction.");
             }
             if (isRedaction) {
                 ImGui::SameLine(0.0f, 6.0f * sc);
@@ -3009,8 +3061,9 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
         prefCombo("Plan preference", "##h_plan_pref", &settings.planPreference,
-                  "Off = never plan first. Option = model may plan. "
-                  "Encourage = plan by default (recommended). "
+                  "Off = never plan first (default — agent tools directly). "
+                  "Option = model may plan. "
+                  "Encourage = plan by default. "
                   "Require = always draft a plan before building.");
         ImGui::TableNextColumn();
         prefCombo("Subagent preference", "##h_sub_pref", &settings.subagentPreference,
@@ -3060,6 +3113,21 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                    "company (director + departments). Default off — Agent will "
                    "not auto-invoke company; use Swarm / Eng. Firm modes or "
                    "turn this on when ready.");
+
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Auto-route missions", &settings.autoMissionRouting))
+            changed = true;
+        helpMarker("When on, Agent mode may auto-launch a mission (intake → "
+                   "breakdown → specialists) for build+analyze phrasing. "
+                   "Default off — the main chat stays on one direct agent "
+                   "turn with tools.");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Full tool loadout (main chat)", &settings.directAgentFullTools))
+            changed = true;
+        helpMarker("When on, the main-chat agent gets the full MCP catalog "
+                   "(still respecting per-tool Options and role family "
+                   "assignments). When off, it starts lean and pulls packs "
+                   "via enable_tools. Saved as agent.direct_agent_full_tools.");
 
         ImGui::TableNextColumn();
         if (ImGui::Checkbox("Vision (send screenshots)", &settings.vision)) changed = true;
@@ -3348,12 +3416,16 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
 
     static bool s_loaded = false;
     static int s_memBackend = 0;      // 0 sqlite | 1 mnemopi  (agent.memory_backend)
-    static int s_compBackend = 0;     // 0 builtin | 1 omp     (agent.compaction_backend)
-    static int s_compStrategy = 0;    // 0 off | 1 snapcompact | 2 shake | 3 summary
-                                      // (agent.compaction_strategy)
+    // Unified compaction control (was two combos: backend + strategy). Maps to
+    // agent.compaction_strategy + agent.compaction_backend together.
+    // 0 Off | 1 Snapcompact (builtin) | 2 Snapcompact (OMP) | 3 Shake | 4 Summary
+    static int s_compMode = 0;
     static bool s_supersedeReads = true;  // agent.compaction.supersede_reads
     static bool s_dropUseless = true;     // agent.compaction.drop_useless
     static bool s_learn = true;       // agent.memory_learn
+    static bool s_autolearn = false;  // agent.autolearn_enabled
+    static bool s_autoContinue = false; // agent.autolearn_auto_continue
+    static int s_memModel = 0;        // 0 online | 1 local  (agent.memory_model)
     static int s_verbosity = 2;       // ui::aiUiVerbosity (0 quiet | 1 normal | 2 full)
     static bool s_follow = true;      // ui::aiFollowActiveSession
     static bool s_previews = true;    // ui::aiActiveWorkPreviews
@@ -3361,15 +3433,28 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     if (!s_loaded) {
         s_loaded = true;
         s_memBackend = (loadAgentConfigString("memory_backend", "sqlite") == "mnemopi") ? 1 : 0;
-        s_compBackend = (loadAgentConfigString("compaction_backend", "builtin") == "omp") ? 1 : 0;
         {
             const std::string cs = loadAgentConfigString("compaction_strategy", "off");
-            s_compStrategy = cs == "snapcompact" ? 1 : cs == "shake" ? 2
-                           : cs == "summary" ? 3 : 0;
+            const bool omp = (loadAgentConfigString("compaction_backend", "builtin") == "omp");
+            if (cs == "off" || cs.empty())
+                s_compMode = 0;
+            else if (omp && (cs == "snapcompact" || cs == "omp"))
+                s_compMode = 2;
+            else if (cs == "snapcompact")
+                s_compMode = 1;
+            else if (cs == "shake")
+                s_compMode = 3;
+            else if (cs == "summary")
+                s_compMode = 4;
+            else
+                s_compMode = omp ? 2 : 0;
         }
         s_supersedeReads = loadAgentConfigNestedBool("compaction", "supersede_reads", true);
         s_dropUseless = loadAgentConfigNestedBool("compaction", "drop_useless", true);
         s_learn = loadAgentConfigBool("memory_learn", true);
+        s_autolearn = loadAgentConfigBool("autolearn_enabled", false);
+        s_autoContinue = loadAgentConfigBool("autolearn_auto_continue", false);
+        s_memModel = (loadAgentConfigString("memory_model", "online") == "local") ? 1 : 0;
         s_verbosity = ui::aiUiVerbosity();
         s_follow = ui::aiFollowActiveSession();
         s_previews = ui::aiActiveWorkPreviews();
@@ -3377,9 +3462,29 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     }
 
     static const char* kMemBackends[] = {"SQLite", "Mnemopi"};
-    static const char* kCompBackends[] = {"Builtin", "OMP snapcompact"};
-    static const char* kCompStrategies[] = {"Off", "Snapcompact", "Shake", "Summary"};
+    static const char* kCompModes[] = {
+        "Off",
+        "Snapcompact (builtin)",
+        "Snapcompact (OMP)",
+        "Shake",
+        "Summary",
+    };
+    static const char* kMemModels[] = {"Online", "Local"};
     static const char* kVerbosity[] = {"Quiet", "Normal", "Full"};
+
+    auto saveCompMode = [&](int mode) {
+        const char* strategy = "off";
+        const char* backend = "builtin";
+        switch (mode) {
+        case 1: strategy = "snapcompact"; backend = "builtin"; break;
+        case 2: strategy = "snapcompact"; backend = "omp"; break;
+        case 3: strategy = "shake"; backend = "builtin"; break;
+        case 4: strategy = "summary"; backend = "builtin"; break;
+        default: strategy = "off"; backend = "builtin"; break;
+        }
+        saveAgentConfigValue("compaction_strategy", strategy);
+        saveAgentConfigValue("compaction_backend", backend);
+    };
 
     if (ImGui::BeginTable("##memory_learning", 2,
                           ImGuiTableFlags_SizingStretchSame |
@@ -3399,30 +3504,15 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         ImGui::TableNextColumn();
         {
             ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Compaction backend");
+            ImGui::TextUnformatted("Compaction");
             ImGui::SameLine();
-            helpMarker("How long transcripts are compacted. Builtin = pure-Python "
-                       "snapcompact archive (default). OMP snapcompact = OMP bridge "
-                       "compact engine. Saved to config.json agent.compaction_backend.");
+            helpMarker("How long transcripts are compacted. Off = truncate only. "
+                       "Snapcompact = snapshot-style archive (builtin Python or OMP "
+                       "bridge). Shake = drop low-value turns. Summary = model-written "
+                       "recap. Writes agent.compaction_strategy + agent.compaction_backend.");
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::Combo("##comp_backend", &s_compBackend, kCompBackends, 2))
-                saveAgentConfigValue("compaction_backend", s_compBackend == 1 ? "omp" : "builtin");
-        }
-        ImGui::TableNextColumn();
-        {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Compaction strategy");
-            ImGui::SameLine();
-            helpMarker("How a compaction pass rewrites an overflowing transcript. "
-                       "Off = truncate only (default). Snapcompact = snapshot-style "
-                       "archive. Shake = drop low-value turns. Summary = model-written "
-                       "recap. Saved to config.json agent.compaction_strategy.");
-            ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::Combo("##comp_strategy", &s_compStrategy, kCompStrategies, 4))
-                saveAgentConfigValue("compaction_strategy",
-                                     s_compStrategy == 1 ? "snapcompact"
-                                     : s_compStrategy == 2 ? "shake"
-                                     : s_compStrategy == 3 ? "summary" : "off");
+            if (ImGui::Combo("##comp_mode", &s_compMode, kCompModes, 5))
+                saveCompMode(s_compMode);
         }
 
         ImGui::TableNextColumn();
@@ -3458,6 +3548,49 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         helpMarker("Compaction drops turns that contributed nothing (failed no-op "
                    "tool calls, empty replies) instead of archiving them "
                    "(agent.compaction.drop_useless, default on).");
+        ImGui::EndTable();
+    }
+
+    // ---- OMP Auto-Learn (experimental) — matches OMP Memory tab knobs ----
+    settingsSectionHeader("Auto-Learn (experimental)");
+    dimText("OMP sidecar: after substantive turns, capture lessons into project "
+            "memory. Standing guidance is prompt-cache neutral; auto-run capture "
+            "uses an extra private write when enabled.");
+    if (ImGui::BeginTable("##autolearn", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Auto-Learn (experimental)", &s_autolearn))
+            saveAgentConfigValue("autolearn_enabled", s_autolearn);
+        helpMarker("After the agent stops, nudge it to capture lessons to memory "
+                   "(agent.autolearn_enabled). Standing guidance is injected into "
+                   "the system prompt when on. Default off.");
+        ImGui::TableNextColumn();
+        if (!s_autolearn) ImGui::BeginDisabled();
+        if (ImGui::Checkbox("Auto-run capture at stop", &s_autoContinue))
+            saveAgentConfigValue("autolearn_auto_continue", s_autoContinue);
+        helpMarker("When on, auto-write one project-memory note after a turn with "
+                   "enough tool calls (agent.autolearn_auto_continue). Uses a little "
+                   "extra work. When off, only standing Auto-Learn guidance remains.");
+        if (!s_autolearn) ImGui::EndDisabled();
+
+        ImGui::TableNextColumn();
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Memory model");
+            ImGui::SameLine();
+            helpMarker("Mnemopi LLM path for fact extraction when the OMP bridge "
+                       "enables it: Online (default) or Local on-device. Persisted as "
+                       "agent.memory_model. Bridge currently runs keyword/FTS-degraded "
+                       "when LLM/embeddings are off.");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (s_memBackend != 1) ImGui::BeginDisabled();
+            if (ImGui::Combo("##mem_model", &s_memModel, kMemModels, 2))
+                saveAgentConfigValue("memory_model", s_memModel == 1 ? "local" : "online");
+            if (s_memBackend != 1) ImGui::EndDisabled();
+        }
+        ImGui::TableNextColumn();
+        ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
         ImGui::EndTable();
     }
 
@@ -4466,7 +4599,13 @@ const SettingsEntry kSettingsEntries[] = {
     { "Session knobs",            "AI",           2 },
     { "Harness",                  "AI",           2 },
     { "Tools",                    "AI",           2 },
+    { "Dev Preview",              "AI",           2 },
+    { "Prompt assembly",          "AI",           2 },
+    { "Auto-Learn",               "AI",           2 },
+    { "Compaction",               "AI",           2 },
     { "Tool families",            "AI",           2 },
+    { "Bug reports",              "AI",           2 },
+    { "Send bug reports",         "AI",           2 },
     { "Sketch 2D",                "AI",           2 },
     { "Model 3D",                 "AI",           2 },
     { "Reasoning effort",         "AI",           2 },
@@ -5095,7 +5234,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                         dimText("Same knobs as Copilot -> Quick settings, plus modal-only "
                                 "options (role adoption, company auto-route, Eng. Firm budget).");
                         ImGui::Dummy(ImVec2(0, 4.0f * sc));
-                        drawHarnessSessionKnobs(st, sc);
+                        if (drawHarnessSessionKnobs(st, sc))
+                            saveSettings(st.settings);
                         settingsGlassSectionEnd();
 
                         settingsGlassSectionBegin("##ai_memory", "Memory & Learning");
@@ -5474,28 +5614,65 @@ void drawSettingsModal(AppState& st, bool busy) {
                         }
                         settingsGlassSectionEnd();
 
-                        settingsGlassSectionBegin("##ai_tools_families", "Tool families");
-                        dimText("Toggle whole MCP tool families the agent may call. Per-tool "
-                                "rows live in the tree below. Saved under config.json "
-                                "agent.tool_families / agent.tool_options.");
-                        static std::map<std::string, bool> s_toolFam;
-                        static double s_toolFamLast = -1e9;
-                        static bool s_toolFamDirty = false;
+                        settingsGlassSectionBegin("##ai_tools_roles", "Default tools by role");
+                        dimText("Pick a role, then assign which MCP tool families it gets by "
+                                "default. Replaces global on/off family toggles. Saved under "
+                                "config.json agent.role_tools. Per-tool Options below still apply.");
+
+                        // ---- role_tools state (mirrors services/agent/config.py DEFAULT_ROLE_TOOLS)
+                        static std::map<std::string, std::set<std::string>> s_roleTools;
+                        static int s_roleToolsSel = 4;  // "default"
+                        static bool s_roleToolsDirty = false;
                         static bool s_toolOptDirty = false;
+                        static double s_roleToolsLast = -1e9;
                         static std::map<std::string, bool> s_toolEnabled;
                         static std::map<std::string, int> s_toolTimeout;
                         static std::map<std::string, int> s_toolMaxCalls;
                         static std::map<std::string, std::string> s_toolDefaults;
                         static std::map<std::string, std::string> s_toolNote;
+                        // Included tool context (description_override) + per-tool schema_trim
+                        // ( -1 inherit tier, 0 full paragraph, 1 first-sentence trim ).
+                        static std::map<std::string, std::string> s_toolDescOverride;
+                        static std::map<std::string, int> s_toolSchemaTrim;
                         static std::string s_toolOptErr;
+
                         static const char* kToolFamilies[] = {
                             "cad", "ecad", "cam", "em", "reveng", "plm", "parts",
                             "advisor", "ledger", "intake", "recon", "gsl",
-                            "workspace", "research", "sim", "mission"
+                            "workspace", "research", "sim", "mission",
+                            "office", "files", "shell"
                         };
                         static constexpr int kToolFamilyCount =
                             (int)(sizeof(kToolFamilies) / sizeof(kToolFamilies[0]));
-                        // Static per-family tool lists (mirrors services/mcp test inventory).
+
+                        // Sensible defaults — keep in sync with services/agent/config.py
+                        // DEFAULT_ROLE_TOOLS.
+                        auto seedDefaultRoleTools = [&]() {
+                            s_roleTools.clear();
+                            auto put = [&](const char* role, std::initializer_list<const char*> fams) {
+                                std::set<std::string> s;
+                                for (const char* f : fams) s.insert(f);
+                                s_roleTools[role] = std::move(s);
+                            };
+                            put("advisor", {"advisor", "research", "ledger", "gsl"});
+                            put("task", {"cad", "sim", "cam", "parts", "gsl", "files", "shell", "office"});
+                            put("planning", {"mission", "advisor", "ledger", "research", "gsl", "workspace"});
+                            put("vision", {"gsl", "cad"});
+                            put("default", {"cad", "files", "shell", "office", "plm", "research",
+                                            "parts", "gsl", "advisor", "workspace", "ledger",
+                                            "sim", "cam", "ecad", "reveng", "mission"});
+                            put("plm", {"plm", "files", "office", "ledger"});
+                            put("redaction", {});
+                            put("sketch2d", {"cad", "gsl", "ecad"});
+                            put("model3d", {"cad", "sim", "parts", "gsl"});
+                            put("memory", {"ledger", "plm", "files"});
+                            put("cam", {"cam", "cad", "parts"});
+                            put("sim", {"sim", "cad", "gsl"});
+                            put("ecad", {"ecad", "parts", "research", "em"});
+                            put("drawing", {"cad", "office", "gsl"});
+                            put("reveng", {"reveng", "research", "cad", "parts"});
+                        };
+
                         struct FamTools { const char* fam; const char* const* tools; int n; };
                         static const char* kCadTools[] = {
                             "cad_guide","new_part","add_features","render_part","close_part",
@@ -5514,13 +5691,14 @@ void drawSettingsModal(AppState& st, bool busy) {
                             "ecad_new_schematic","ecad_new_pcb","ecad_place_symbol","ecad_wire",
                             "ecad_autoroute","ecad_run_erc","ecad_run_drc","board_from_schematic"
                         };
+                        static const char* kEmTools[] = {
+                            "em_status","em_eigenmode","em_driven","em_timedomain"
+                        };
                         static const char* kPartsTools[] = {
                             "part_search","part_get","part_place","part_source",
                             "bom_price","bom_rollup","request_quote"
                         };
                         static const char* kRevengTools[] = {
-                            "reverse_engineer","compare_parts","convert_face_to_sketch",
-                            "project_into_sketch",
                             "list_reveng_sessions","get_reveng_session","get_reveng_coverage",
                             "get_reveng_deviation","describe_reveng_result","reveng_status",
                             "list_reveng_dims",
@@ -5550,11 +5728,41 @@ void drawSettingsModal(AppState& st, bool busy) {
                         static const char* kAdvisorTools[] = {
                             "advise","stage_set","advisory_dispute"
                         };
+                        static const char* kOfficeTools[] = {
+                            "office_extract","office_read_pptx","office_edit_pptx",
+                            "office_read_xlsx","office_edit_xlsx","office_read_csv",
+                            "office_edit_csv","office_read_pdf","office_edit_pdf",
+                            "office_read_docx","office_edit_docx","office_read_doc",
+                            "office_edit_doc"
+                        };
+                        static const char* kFilesTools[] = {
+                            "fs_read","fs_write","fs_edit","fs_glob","fs_grep","fs_list"
+                        };
+                        static const char* kShellTools[] = {
+                            "run_shell"
+                        };
+                        static const char* kLedgerTools[] = {
+                            "ledger_get","ledger_note"
+                        };
+                        static const char* kIntakeTools[] = {
+                            "req_create","req_update","req_status","confirm_dimensions"
+                        };
+                        static const char* kReconTools[] = {
+                            "reverse_engineer","compare_parts","convert_face_to_sketch",
+                            "project_into_sketch","resolve_process","dfm_check",
+                            "start_capture_session","stop_capture_session",
+                            "request_part_photos","submit_part_photos","measure_from_photo"
+                        };
+                        static const char* kWorkspaceTools[] = {
+                            "workspace_status","workspace_doc_events","enable_tools",
+                            "list_tool_categories","ask_user","delegate"
+                        };
                         static const FamTools kFamToolMap[] = {
                             {"cad", kCadTools, (int)(sizeof(kCadTools)/sizeof(kCadTools[0]))},
                             {"sim", kSimTools, (int)(sizeof(kSimTools)/sizeof(kSimTools[0]))},
                             {"cam", kCamTools, (int)(sizeof(kCamTools)/sizeof(kCamTools[0]))},
                             {"ecad", kEcadTools, (int)(sizeof(kEcadTools)/sizeof(kEcadTools[0]))},
+                            {"em", kEmTools, (int)(sizeof(kEmTools)/sizeof(kEmTools[0]))},
                             {"parts", kPartsTools, (int)(sizeof(kPartsTools)/sizeof(kPartsTools[0]))},
                             {"reveng", kRevengTools, (int)(sizeof(kRevengTools)/sizeof(kRevengTools[0]))},
                             {"plm", kPlmTools, (int)(sizeof(kPlmTools)/sizeof(kPlmTools[0]))},
@@ -5562,24 +5770,238 @@ void drawSettingsModal(AppState& st, bool busy) {
                             {"mission", kMissionTools, (int)(sizeof(kMissionTools)/sizeof(kMissionTools[0]))},
                             {"gsl", kGslTools, (int)(sizeof(kGslTools)/sizeof(kGslTools[0]))},
                             {"advisor", kAdvisorTools, (int)(sizeof(kAdvisorTools)/sizeof(kAdvisorTools[0]))},
+                            {"office", kOfficeTools, (int)(sizeof(kOfficeTools)/sizeof(kOfficeTools[0]))},
+                            {"files", kFilesTools, (int)(sizeof(kFilesTools)/sizeof(kFilesTools[0]))},
+                            {"shell", kShellTools, (int)(sizeof(kShellTools)/sizeof(kShellTools[0]))},
+                            {"ledger", kLedgerTools, (int)(sizeof(kLedgerTools)/sizeof(kLedgerTools[0]))},
+                            {"intake", kIntakeTools, (int)(sizeof(kIntakeTools)/sizeof(kIntakeTools[0]))},
+                            {"recon", kReconTools, (int)(sizeof(kReconTools)/sizeof(kReconTools[0]))},
+                            {"workspace", kWorkspaceTools, (int)(sizeof(kWorkspaceTools)/sizeof(kWorkspaceTools[0]))},
                         };
                         static constexpr int kFamToolMapN =
                             (int)(sizeof(kFamToolMap)/sizeof(kFamToolMap[0]));
+
+                        // Short hover help for each tool row — first sentence of the MCP
+                        // tool docstring (services/mcp/*_tools.py + related). Keep in sync
+                        // via scratch/gen_tool_descs.py when tools are added.
+                        static const struct { const char* name; const char* desc; } kToolDescs[] = {
+                            {"add_dimension", "Add a dimension to a view."},
+                            {"add_drawing_view", "Add ONE projected view to a drawing."},
+                            {"add_features", "Apply a list of document ops to build/edit the part (the core modeling tool)."},
+                            {"add_gdt", "Add an ASME Y14.5 feature control frame."},
+                            {"advise", "Run the stage's read-only check battery over *doc_id* and return advisories."},
+                            {"advisory_dispute", "Contest an advisory (contract §9.3)."},
+                            {"ask_user", "Ask the human a typed batch of questions and return machine-readable answers."},
+                            {"board_from_schematic", "ONE-CALL schematic -> preliminary PCB: sync footprints, place (connectivity-aware), autoroute, then (by default) optimize traces (arc cor..."},
+                            {"bom_price", "Roll up the BOM for `doc_path` AND resolve bought-line prices via the provider chain."},
+                            {"bom_rollup", "Roll an assembly (+ any linked ECAD board) up into a unified made/bought BOM."},
+                            {"buildgraph_plan", "Compile a BUILD PLAN or mission into an aicad.buildgraph/1 prerequisite graph."},
+                            {"cad_guide", "Return the engine's modeling/simulation knowledge so you can drive it well."},
+                            {"cam_add_operation", "Add a machining operation to a setup."},
+                            {"cam_add_setup", "Add a machining setup (a stock + WCS + machine/platform)."},
+                            {"cam_add_tool", "Add (or replace by number) a tool in the library."},
+                            {"cam_generate", "Generate toolpaths for the job (or one setup / one op)."},
+                            {"cam_new_job", "Create a new CAM machining job and make it current."},
+                            {"cam_post", "Post-process to controller G-code."},
+                            {"cam_set_stock", "Set/replace a setup's stock."},
+                            {"cam_simulate", "Material-removal simulation: removed/remaining volume, machined fraction, gouge, rapid-through-stock, and holder/shank collision checks,..."},
+                            {"check_interference", "Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?"},
+                            {"close_part", "Close a part document and free it."},
+                            {"compare_parts", "Boolean-compare two documents' solids: how much volume they share and where they differ."},
+                            {"confirm_dimensions", "Close fit-critical demands with TYPED caliper values (the dims we refuse to guess)."},
+                            {"convert_face_to_sketch", "Trace a planar face boundary into a new editable sketch (Convert Entities)."},
+                            {"dag_plan", "Decompose a mission description into an aicad.dag/1 graph JSON."},
+                            {"dag_run", "Start or resume a DAG run from an aicad.dag/1 graph document."},
+                            {"dag_status", "Return the current state of a DAG run."},
+                            {"delegate", "Spawn a sub-agent role with an isolated brief and token budget."},
+                            {"describe_part", "Compact, NAMED outline of the part — use INSTEAD of dumping every face on a complex part."},
+                            {"describe_reveng_result", "Describe the reverse-engineering result for *session_id*."},
+                            {"describe_sketch", "Compose a sketch's PLANE, ENTITY roster, CONSTRAINT roster, closed REGIONS and DOF verdict into text — the non-vision equivalent of looki..."},
+                            {"design_recipe", "Map a natural-language intent to an ordered tool recipe (or list the catalog)."},
+                            {"dfm_check", "Design-for-manufacturing punch list against the part ProcessProfile."},
+                            {"ecad_autoroute", "Auto-route the active board's ratsnest with a basic 2-layer grid (Lee/A*) router."},
+                            {"ecad_new_pcb", "Start a NEW PCB (board) document and make it the active one."},
+                            {"ecad_new_schematic", "Start a NEW schematic document and make it the active one."},
+                            {"ecad_place_symbol", "Place a symbol on the active schematic and return its assigned REF plus its full PIN LIST (name/number/type/world-xy) and the count of pi..."},
+                            {"ecad_run_drc", "Run the Design Rule Check on the active board and return a summary with the worst offenders (clearance, track width, via size, annular ri..."},
+                            {"ecad_run_erc", "Run the Electrical Rules Check on the active schematic and return the violations as readable lines plus a one-line verdict ('N errors, M..."},
+                            {"ecad_wire", "Auto-route an orthogonal wire from one pin to another (emits sch_connect) and return the RESULTING net plus the updated list of what is s..."},
+                            {"em_driven", "Driven S-parameter sweep of a uniform guide section (analytic-uniform default)."},
+                            {"em_eigenmode", "Waveguide eigenmode cutoffs (builtin-fdfd by default)."},
+                            {"em_status", "EM solver matrix — which backends are installed and the default per analysis."},
+                            {"em_timedomain", "Time-domain pulse through a uniform guide (analytic dispersive IFFT default)."},
+                            {"enable_tools", "Pull additional tool category packs into this turn."},
+                            {"export_drawing", "Export a 2D DRAWING document to a vector file so you can deliver it."},
+                            {"export_reveng_bundle", "Export the full RE session directory as a zip bundle to *dest*."},
+                            {"fit_calc", "ISO 286 fit maths, in DESIGN mode (what should the sizes be?) or MEASURED mode (what fit do these two real sizes actually give?) — code d..."},
+                            {"fs_edit", "Replace text in an existing file."},
+                            {"fs_glob", "Find paths matching a glob under the project root."},
+                            {"fs_grep", "Regex-search file contents under a path (optional glob filter)."},
+                            {"fs_list", "List a directory's entries (name, dir flag, size)."},
+                            {"fs_read", "Read a text file, directory, or document with CONTEXT-SAFE, line-numbered output."},
+                            {"fs_write", "Create or OVERWRITE a text file with *content*."},
+                            {"get_reveng_coverage", "Return measured capture coverage against the 11-shot orbit plan."},
+                            {"get_reveng_deviation", "Compute mesh-vs-mesh (or mesh-vs-B-Rep tessellation) deviation (RE-16)."},
+                            {"get_reveng_session", "Return the full ``aicad.reveng_session/1`` manifest for *session_id*."},
+                            {"import_scan_mesh", "Import an externally-produced scan mesh (.ply / .obj) into *session_id*."},
+                            {"ledger_get", "Return the design ledger for *run_id*, rendered within *budget_tokens*."},
+                            {"ledger_note", "Append a structured event to the design ledger for *run_id*."},
+                            {"list_reveng_dims", "Return the dimension ledger the Review stage confirms against."},
+                            {"list_reveng_sessions", "List all reverse engineering sessions in the session store."},
+                            {"list_tool_categories", "List available tool category packs (name + one line)."},
+                            {"make_drawing", "Create a 2D engineering drawing of the current part in ONE shot, then refine it."},
+                            {"measure_from_photo", "Measure one in-plane dimension between two pixel points vs a ChArUco fiducial."},
+                            {"measure_part", "Mass properties of the current part: volume (mm^3), mass (g), centre of mass, inertia."},
+                            {"mission_start", "Plan a mission: validate the deliverable manifest and compile the role-assigned mission DAG (does NOT execute — call dag_run to run it)."},
+                            {"mission_status", "Render a mission's phase state from the ledger (pure read)."},
+                            {"new_part", "Create a new, empty editable part document and make it current."},
+                            {"office_edit_csv", "Full-file rewrite (csv has no partial-edit primitive)."},
+                            {"office_edit_doc", "Lossy round-trip: soffice .doc→.docx, apply ``office_edit_docx``-style *ops*, soffice .docx→.doc back over *out_path* (default: the origi..."},
+                            {"office_edit_docx", "``ops``: ``[{paragraph_index, text}]`` or ``[{op:\"append_paragraph\", text}]``."},
+                            {"office_edit_pdf", "pypdf PAGE-LEVEL ops only — ``{\"op\":\"rotate\",\"page\":0,\"degrees\":90}``, ``{\"op\":\"delete\",\"page\":2}``, ``{\"op\":\"merge\",\"with_path\":\"other.p..."},
+                            {"office_edit_pptx", "``ops``: ``[{slide, shape_index, text}]`` — in-place text-frame replacements (content only; no layout/theme/animation edits)."},
+                            {"office_edit_xlsx", "``cells``: ``{\"B2\": 214.8, \"C3\": \"=SUM(B2:B5)\"}`` — preserves other formulas (opened with ``data_only=False``)."},
+                            {"office_extract", "Read-only text/structure extraction, dispatched by file extension."},
+                            {"office_read_csv", "Returns ``{ok, header, rows}`` (``rows`` capped to *limit* when > 0)."},
+                            {"office_read_doc", "Legacy .doc: ``soffice --headless --convert-to docx`` to a tmp dir, then read the result the same way ``office_read_docx`` does."},
+                            {"office_read_docx", "Returns ``{ok, paragraphs, tables}``."},
+                            {"office_read_pdf", "pypdfium2 text extraction."},
+                            {"office_read_pptx", "Structured slide read."},
+                            {"office_read_xlsx", "Returns ``{ok, sheets:[{name, rows}]}``, or a single sheet if *sheet* is given."},
+                            {"part_get", "Retrieve a single PartRecord by its stable part_id (aicad.parts/1)."},
+                            {"part_place", "Place a standard part into a document — universal insertion across all domains (T-P3)."},
+                            {"part_search", "Search the unified standard-parts library (all domains federated), with V2 taxonomy routing + faceted filtering."},
+                            {"part_source", "Source candidate parts for a plain-language need — deterministic fan-out (no LLM inside): taxonomy match -> facet extraction -> routed se..."},
+                            {"plm_checkpoint", "Save a named checkpoint the user can return to."},
+                            {"plm_history", "Return the timeline (newest first), optionally filtered to one item."},
+                            {"plm_init", "Create a project vault at *path* (a folder), registering existing documents."},
+                            {"plm_open", "Open a project folder, auto-creating history if absent (zero-config)."},
+                            {"plm_release", "Release an item: checks first (unsaved changes, out-of-date component references, never-released components), then stamps the next revisi..."},
+                            {"plm_rollback", "Roll an AI-authored document back to an earlier checkpoint."},
+                            {"plm_status", "Return project state for the Hub/badges: items (with revision + lifecycle), which have unsaved changes, and the current mode."},
+                            {"plm_where_used", "Answer \"where is this used?\": the assemblies, drawings and CAM jobs that consume an item (directly, or the whole chain with ``transitive``)."},
+                            {"project_into_sketch", "Project edges/faces into an existing sketch (SolidWorks Convert Entities)."},
+                            {"recommend_fit", "Map a functional description to recommended ISO 286 fit classes with rationale."},
+                            {"render_part", "Render the current part to an ANNOTATED image and return it so you can SEE the result."},
+                            {"render_sketch", "Render the part containing a 2D sketch as a multi-view image."},
+                            {"replan_request", "Route an ``aicad.replan/1`` request per §17 and report the approvers."},
+                            {"req_create", "Create a new ``aicad.req/1`` requirements document."},
+                            {"req_status", "Record a status transition on a requirement (e.g."},
+                            {"req_update", "Add or update content in a requirements document."},
+                            {"request_part_photos", "Ask the user for photos of a real part so it can be measured."},
+                            {"request_quote", "Request an on-demand manufacturing quote for a doc from an approved supplier API."},
+                            {"research_eng_calc", "Evaluate a named deterministic engineering formula in SI (code does the maths)."},
+                            {"research_fetch_page", "Fetch a page and return clean readability->markdown `content` with provenance."},
+                            {"research_material_lookup", "Look up material properties (yield/ultimate/modulus/density/...) with provenance."},
+                            {"research_web_search", "Search the web for up-to-date facts instead of recalling from memory."},
+                            {"resolve_process", "Decide the manufacturing process from the request (FDM default)."},
+                            {"reveng_add_images", "Add still images to *session_id* for photogrammetry / multi-view reconstruction."},
+                            {"reveng_add_video", "Extract blur-culled stills from a video orbit and add them to *session_id*."},
+                            {"reveng_attach_result", "Attach a parts-hub ``part_ref`` to the completed RE result for *session_id*."},
+                            {"reveng_build_parametric", "Build an editable parametric model from the reconstructed mesh."},
+                            {"reveng_fit_primitives", "Segment the mesh and RANSAC-fit primitive shapes (cylinder, box, cone, etc.)."},
+                            {"reveng_ingest_datasheet", "Ingest a PDF datasheet into *session_id* via docling (RE-04)."},
+                            {"reveng_make_part_from_library", "One-call flow: seed → research → build → attach for a library part with no 3D model."},
+                            {"reveng_print_scale_mat", "Generate a printable ArUco scale-mat PDF for the RE pipeline."},
+                            {"reveng_reconstruct", "Launch sparse + dense reconstruction for *session_id* — returns immediately."},
+                            {"reveng_research_source", "Pull web / datasheet data into a session for the no-photo research lane."},
+                            {"reveng_set_scale", "Solve and record scale calibration for *session_id* (contracts/reveng.md §8.2)."},
+                            {"reveng_single_photo", "Run single-photo mesh reconstruction (TripoSR or TRELLIS tier)."},
+                            {"reveng_start_session", "Create a new reverse engineering session."},
+                            {"reveng_status", "Return the RE workspace readiness probe (contracts/reveng.md §8.1)."},
+                            {"reverse_engineer", "Rebuild an imported solid (STEP/IGES/BREP/STL/...) as an EDITABLE parametric feature tree, verified against the source by boolean compari..."},
+                            {"run_cfd_accurate", "HIGH-FIDELITY external-aero CFD via OpenFOAM (steady RANS, k-omega SST + prism layers)."},
+                            {"run_cfd_flow", "Wind-tunnel CFD over the current part/assembly (LBM)."},
+                            {"run_fea_modal", "Modal FEA — the natural frequencies (Hz) of the held part."},
+                            {"run_fea_static", "Linear-static stress FEA on the current part."},
+                            {"run_fea_thermal", "Thermal (heat-conduction) FEA — steady-state via CalculiX, TRANSIENT via the C++ core solver on the real part mesh."},
+                            {"run_shell", "Run a shell command and capture combined stdout+stderr (byte-capped)."},
+                            {"simulate_motion", "Kinematic motion study: DRIVE one mate over a range, re-solve the mechanism each step, return the trajectory (every body's pose per step)..."},
+                            {"sketch_health", "The single narrated read of a sketch's constraint state — solve it and get back WHY it is under/over-defined plus an ordered plan to reac..."},
+                            {"solve_mates", "Solve the mate constraints of an ASSEMBLY document (positions its components)."},
+                            {"stage_set", "Override the inferred process stage (contract §1: ``stage_set``)."},
+                            {"start_capture_session", "Start a local photo-capture server (QR upload) for photogrammetry."},
+                            {"stop_capture_session", "Stop photo capture and optionally run photogrammetry reconstruction."},
+                            {"submit_part_photos", "Register user photo files and/or measurements read from them."},
+                            {"workspace_doc_events", "Return per-doc event stream entries starting at *since_seq*."},
+                            {"workspace_status", "Return the full workspace snapshot for *run_id*."},
+                        };
+                        static constexpr int kToolDescsN =
+                            (int)(sizeof(kToolDescs) / sizeof(kToolDescs[0]));
+                        auto toolTooltip = [&](const char* tn) -> const char* {
+                            if (!tn || !tn[0]) return "MCP tool.";
+                            // kToolDescs is sorted by name — linear scan is fine at this size.
+                            for (int i = 0; i < kToolDescsN; ++i) {
+                                if (!std::strcmp(tn, kToolDescs[i].name))
+                                    return kToolDescs[i].desc;
+                            }
+                            // Family-aware fallbacks — never the useless generic alone.
+                            if (std::strncmp(tn, "reveng_", 7) == 0 ||
+                                std::strncmp(tn, "get_reveng_", 11) == 0 ||
+                                std::strncmp(tn, "list_reveng_", 12) == 0)
+                                return "Reverse-engineering session / reconstruct tool.";
+                            if (std::strncmp(tn, "plm_", 4) == 0)
+                                return "Product lifecycle management tool.";
+                            if (std::strncmp(tn, "office_", 7) == 0)
+                                return "Office document read/edit tool.";
+                            if (std::strncmp(tn, "cam_", 4) == 0)
+                                return "CAM / machining tool.";
+                            if (std::strncmp(tn, "ecad_", 5) == 0)
+                                return "Electronics CAD tool.";
+                            if (std::strncmp(tn, "fs_", 3) == 0)
+                                return "Project filesystem tool.";
+                            if (std::strncmp(tn, "research_", 9) == 0)
+                                return "Research / lookup tool.";
+                            if (std::strncmp(tn, "em_", 3) == 0)
+                                return "Electromagnetics simulation tool.";
+                            if (std::strncmp(tn, "dag_", 4) == 0 ||
+                                std::strncmp(tn, "mission_", 8) == 0)
+                                return "Mission / DAG orchestration tool.";
+                            return "Agent tool — see Options for AI usage parameters.";
+                        };
+
+                        auto famHelp = [](const char* fam) -> const char* {
+                            if (!std::strcmp(fam, "cad")) return "Parametric modeling, drawings, measure, mates.";
+                            if (!std::strcmp(fam, "sim")) return "FEA, CFD, and motion simulation.";
+                            if (!std::strcmp(fam, "cam")) return "CAM jobs, stock, toolpaths, post.";
+                            if (!std::strcmp(fam, "ecad")) return "Schematic + PCB tools.";
+                            if (!std::strcmp(fam, "em")) return "Electromagnetics simulation.";
+                            if (!std::strcmp(fam, "parts")) return "Catalog parts, BOM, quotes.";
+                            if (!std::strcmp(fam, "reveng")) return "Reverse engineering from scans/photos.";
+                            if (!std::strcmp(fam, "plm")) return "Project history, checkpoints, releases.";
+                            if (!std::strcmp(fam, "research")) return "Web search, materials, eng calc.";
+                            if (!std::strcmp(fam, "mission")) return "DAG / mission orchestration.";
+                            if (!std::strcmp(fam, "gsl")) return "Geometry narrative describers + sketch health.";
+                            if (!std::strcmp(fam, "advisor")) return "Steering advisor tools.";
+                            if (!std::strcmp(fam, "office")) return "Read/edit Office + PDF (office_oxide extract).";
+                            if (!std::strcmp(fam, "files")) return "Project filesystem read/write/glob/grep.";
+                            if (!std::strcmp(fam, "shell")) return "Shell commands inside the project jail.";
+                            if (!std::strcmp(fam, "ledger")) return "Mission ledger read/write.";
+                            if (!std::strcmp(fam, "intake")) return "Requirements / intake confirmations.";
+                            if (!std::strcmp(fam, "recon")) return "Mesh reconstruction helpers.";
+                            if (!std::strcmp(fam, "workspace")) return "Workspace status, enable_tools, delegate.";
+                            return "Tool family.";
+                        };
+
                         const double nowTf = ImGui::GetTime();
-                        if (s_toolFam.empty() || (nowTf - s_toolFamLast) > 2.0) {
-                            s_toolFamLast = nowTf;
+                        if (s_roleTools.empty() || (nowTf - s_roleToolsLast) > 2.0) {
+                            s_roleToolsLast = nowTf;
+                            seedDefaultRoleTools();
                             try {
                                 std::ifstream in(configPath());
                                 nlohmann::json j = nlohmann::json::object();
                                 if (in) { in >> j; }
                                 auto ag = j.value("agent", nlohmann::json::object());
-                                auto tf = ag.value("tool_families", nlohmann::json::object());
-                                for (int i = 0; i < kToolFamilyCount; ++i) {
-                                    const char* k = kToolFamilies[i];
-                                    bool on = true;
-                                    if (tf.is_object() && tf.contains(k) && tf[k].is_boolean())
-                                        on = tf[k].get<bool>();
-                                    s_toolFam[k] = on;
+                                auto rt = ag.value("role_tools", nlohmann::json::object());
+                                if (rt.is_object()) {
+                                    for (auto it = rt.begin(); it != rt.end(); ++it) {
+                                        if (!it.value().is_array()) continue;
+                                        std::set<std::string> fams;
+                                        for (const auto& v : it.value()) {
+                                            if (v.is_string()) fams.insert(v.get<std::string>());
+                                        }
+                                        s_roleTools[it.key()] = std::move(fams);
+                                    }
                                 }
                                 auto to = ag.value("tool_options", nlohmann::json::object());
                                 if (to.is_object()) {
@@ -5593,44 +6015,114 @@ void drawSettingsModal(AppState& st, bool busy) {
                                             s_toolEnabled[tn] = true;
                                         if (e.contains("timeout_s") && e["timeout_s"].is_number_integer())
                                             s_toolTimeout[tn] = e["timeout_s"].get<int>();
-                                        if (e.contains("max_calls_per_turn") && e["max_calls_per_turn"].is_number_integer())
+                                        if (e.contains("max_calls_per_turn") &&
+                                            e["max_calls_per_turn"].is_number_integer())
                                             s_toolMaxCalls[tn] = e["max_calls_per_turn"].get<int>();
                                         if (e.contains("param_defaults"))
                                             s_toolDefaults[tn] = e["param_defaults"].dump(2);
                                         if (e.contains("prompt_note") && e["prompt_note"].is_string())
                                             s_toolNote[tn] = e["prompt_note"].get<std::string>();
+                                        if (e.contains("description_override") &&
+                                            e["description_override"].is_string())
+                                            s_toolDescOverride[tn] =
+                                                e["description_override"].get<std::string>();
+                                        if (e.contains("schema_trim")) {
+                                            if (e["schema_trim"].is_null())
+                                                s_toolSchemaTrim[tn] = -1;
+                                            else if (e["schema_trim"].is_boolean())
+                                                s_toolSchemaTrim[tn] =
+                                                    e["schema_trim"].get<bool>() ? 1 : 0;
+                                        }
                                     }
                                 }
                             } catch (...) {
-                                for (int i = 0; i < kToolFamilyCount; ++i)
-                                    s_toolFam[kToolFamilies[i]] = true;
+                                seedDefaultRoleTools();
                             }
                         }
-                        if (ImGui::BeginTable("##tool_fams", 3,
-                                              ImGuiTableFlags_SizingStretchSame)) {
-                            for (int i = 0; i < kToolFamilyCount; ++i) {
-                                const char* k = kToolFamilies[i];
-                                ImGui::TableNextColumn();
-                                bool v = s_toolFam.count(k) ? s_toolFam[k] : true;
-                                if (ImGui::Checkbox(k, &v)) {
-                                    s_toolFam[k] = v;
-                                    s_toolFamDirty = true;
-                                }
+
+                        // Role badge picker row
+                        if (s_roleToolsSel < 0 || s_roleToolsSel >= kRoleCount) s_roleToolsSel = 4;
+                        ImGui::BeginGroup();
+                        for (int i = 0; i < kRoleCount; ++i) {
+                            ImGui::PushID(i + 9100);
+                            const bool sel = (i == s_roleToolsSel);
+                            if (sel) {
+                                ImGui::PushStyleColor(ImGuiCol_Button,
+                                    ImVec4(kRoleColors[i].x, kRoleColors[i].y,
+                                           kRoleColors[i].z, 0.35f));
+                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                    ImVec4(kRoleColors[i].x, kRoleColors[i].y,
+                                           kRoleColors[i].z, 0.50f));
+                                ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                    ImVec4(kRoleColors[i].x, kRoleColors[i].y,
+                                           kRoleColors[i].z, 0.65f));
                             }
-                            ImGui::EndTable();
+                            drawRoleBadge(i, sc);
+                            ImGui::SameLine(0.0f, 2.0f * sc);
+                            char btn[64];
+                            std::snprintf(btn, sizeof(btn), "%s##rolepick%d", kRoleLabels[i], i);
+                            if (ImGui::SmallButton(btn)) s_roleToolsSel = i;
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Edit default tool families for %s",
+                                                  kRoleLabels[i]);
+                            if (sel) ImGui::PopStyleColor(3);
+                            if ((i + 1) % 5 != 0)
+                                ImGui::SameLine(0.0f, 8.0f * sc);
+                            ImGui::PopID();
+                        }
+                        ImGui::EndGroup();
+
+                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                        {
+                            const char* rk = kRoleKeys[s_roleToolsSel];
+                            ImGui::AlignTextToFramePadding();
+                            drawRoleBadge(s_roleToolsSel, sc);
+                            ImGui::SameLine(0.0f, 6.0f * sc);
+                            ImGui::Text("Families for %s", kRoleLabels[s_roleToolsSel]);
+                            helpMarker("Checked families become this role's default tool "
+                                       "surface (unioned onto the role card allowlist). "
+                                       "Main-chat Default also respects "
+                                       "\"Full tool loadout\" in Harness.");
+
+                            std::set<std::string>& assigned = s_roleTools[rk];
+                            if (ImGui::BeginTable("##role_fam_assign", 3,
+                                                  ImGuiTableFlags_SizingStretchSame |
+                                                  ImGuiTableFlags_NoPadOuterX)) {
+                                for (int fi = 0; fi < kToolFamilyCount; ++fi) {
+                                    const char* fam = kToolFamilies[fi];
+                                    ImGui::TableNextColumn();
+                                    bool on = assigned.count(fam) > 0;
+                                    ImGui::PushID(fam);
+                                    if (ImGui::Checkbox(fam, &on)) {
+                                        if (on) assigned.insert(fam);
+                                        else assigned.erase(fam);
+                                        s_roleToolsDirty = true;
+                                    }
+                                    if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s", famHelp(fam));
+                                    ImGui::PopID();
+                                }
+                                ImGui::EndTable();
+                            }
                         }
 
                         ImGui::Dummy(ImVec2(0, 8.0f * sc));
-                        dimText("Per-tool rows: the checkbox enables a tool (dimmed = off); "
-                                "Options overrides timeout, call cap, param defaults, and "
-                                "prompt note.");
+                        dimText("Per-tool rows: checkbox enables a tool globally (dimmed = off); "
+                                "Options overrides limits, included tool context, and AI usage "
+                                "guidance. Hover a name for what it does.");
                         static char s_toolFilterBuf[64] = "";
                         ImGui::SetNextItemWidth(-1);
                         ImGui::InputTextWithHint("##tool_filter", "Filter tools...",
                                                  s_toolFilterBuf, sizeof(s_toolFilterBuf));
                         const std::string toolNeedle = toLowerAscii(s_toolFilterBuf);
+
+                        // Only expand families assigned to the selected role (plus always
+                        // show all when filtering so users can find disabled tools).
+                        const std::set<std::string>& selFams =
+                            s_roleTools[kRoleKeys[s_roleToolsSel]];
                         for (int fi = 0; fi < kFamToolMapN; ++fi) {
                             const FamTools& ft = kFamToolMap[fi];
+                            const bool famAssigned = selFams.count(ft.fam) > 0;
                             if (!toolNeedle.empty()) {
                                 int famMatches = 0;
                                 for (int ti = 0; ti < ft.n; ++ti)
@@ -5639,8 +6131,16 @@ void drawSettingsModal(AppState& st, bool busy) {
                                         ++famMatches;
                                 if (famMatches == 0) continue;
                                 ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+                            } else if (!famAssigned) {
+                                // Still list unassigned families collapsed so users can
+                                // enable individual tools / browse Options.
                             }
-                            if (!ImGui::TreeNode(ft.fam)) continue;
+                            char famLabel[96];
+                            std::snprintf(famLabel, sizeof(famLabel), "%s%s",
+                                          ft.fam, famAssigned ? "" : "  (not assigned)");
+                            if (!ImGui::TreeNode(famLabel)) continue;
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", famHelp(ft.fam));
                             for (int ti = 0; ti < ft.n; ++ti) {
                                 const char* tn = ft.tools[ti];
                                 if (!toolNeedle.empty() &&
@@ -5653,24 +6153,29 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     s_toolOptDirty = true;
                                 }
                                 if (ImGui::IsItemHovered())
-                                    ImGui::SetTooltip("Enable/disable this tool.");
+                                    ImGui::SetTooltip("Enable/disable this tool globally.");
                                 ImGui::SameLine();
                                 if (!en)
                                     ImGui::PushStyleColor(
                                         ImGuiCol_Text,
                                         ui::Palette::toU32(ui::palette.textDim));
                                 ImGui::TextUnformatted(tn);
+                                if (ImGui::IsItemHovered())
+                                    ImGui::SetTooltip("%s", toolTooltip(tn));
                                 if (!en) ImGui::PopStyleColor();
                                 ImGui::SameLine();
                                 if (ImGui::SmallButton("Options"))
                                     ImGui::OpenPopup("tool_opts");
                                 if (ImGui::BeginPopup("tool_opts")) {
                                     ImGui::TextUnformatted(tn);
+                                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 360.0f * sc);
+                                    ImGui::TextDisabled("%s", toolTooltip(tn));
+                                    ImGui::PopTextWrapPos();
                                     ImGui::Separator();
                                     ImGui::TextDisabled("0 = use global default");
-                                    const float labelW = 150.0f * sc;  // left label column
-                                    const float fieldW = 90.0f * sc;   // compact int field
-                                    const float boxW = 320.0f * sc;    // bounds the popup width (was -1 -> ballooned to ~1000px)
+                                    const float labelW = 150.0f * sc;
+                                    const float fieldW = 90.0f * sc;
+                                    const float boxW = 360.0f * sc;
                                     auto popupFieldRow = [&](const char* label) {
                                         ImGui::AlignTextToFramePadding();
                                         ImGui::TextUnformatted(label);
@@ -5703,27 +6208,205 @@ void drawSettingsModal(AppState& st, bool busy) {
                                         else
                                             ImGui::TextDisabled("(global: unlimited)");
                                     }
-                                    static char defBuf[2048];
-                                    static char noteBuf[1024];
-                                    std::snprintf(defBuf, sizeof(defBuf), "%s",
-                                        s_toolDefaults.count(tn) ? s_toolDefaults[tn].c_str() : "{}");
-                                    std::snprintf(noteBuf, sizeof(noteBuf), "%s",
-                                        s_toolNote.count(tn) ? s_toolNote[tn].c_str() : "");
-                                    ImGui::Dummy(ImVec2(0, 2.0f * sc));
-                                    ImGui::TextUnformatted("param_defaults JSON");
-                                    if (ImGui::InputTextMultiline("##param_defaults",
-                                            defBuf, sizeof(defBuf),
-                                            ImVec2(boxW, 60 * sc))) {
-                                        s_toolDefaults[tn] = defBuf;
+
+                                    // AI usage parameters / included tool context
+                                    // (agent.tool_options.<name> — same shape as Python
+                                    // get_tool_options).
+                                    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+                                    ImGui::TextUnformatted("AI usage parameters");
+                                    ImGui::Separator();
+
+                                    int trimMode = s_toolSchemaTrim.count(tn)
+                                                       ? s_toolSchemaTrim[tn] : -1;
+                                    if (trimMode < -1 || trimMode > 1) trimMode = -1;
+                                    ImGui::AlignTextToFramePadding();
+                                    ImGui::TextUnformatted("schema_trim");
+                                    if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip(
+                                            "How much of the tool description is included in "
+                                            "the AI tools prompt. Inherit = tier default.");
+                                    ImGui::SameLine(labelW);
+                                    ImGui::SetNextItemWidth(boxW - labelW + fieldW);
+                                    const char* trimLabels[] = {
+                                        "Inherit tier", "Full paragraph", "First sentence"
+                                    };
+                                    // Map stored -1/0/1 -> combo 0/1/2
+                                    int trimSel = (trimMode < 0) ? 0 : (trimMode == 0 ? 1 : 2);
+                                    if (ImGui::Combo("##schema_trim", &trimSel, trimLabels, 3)) {
+                                        s_toolSchemaTrim[tn] =
+                                            (trimSel == 0) ? -1 : (trimSel == 1 ? 0 : 1);
                                         s_toolOptDirty = true;
                                     }
-                                    ImGui::TextUnformatted("prompt_note");
+
+                                    static char descBuf[2048];
+                                    static char defBuf[2048];
+                                    static char noteBuf[1024];
+                                    std::snprintf(descBuf, sizeof(descBuf), "%s",
+                                        s_toolDescOverride.count(tn)
+                                            ? s_toolDescOverride[tn].c_str() : "");
+                                    std::snprintf(defBuf, sizeof(defBuf), "%s",
+                                        s_toolDefaults.count(tn)
+                                            ? s_toolDefaults[tn].c_str() : "{}");
+                                    std::snprintf(noteBuf, sizeof(noteBuf), "%s",
+                                        s_toolNote.count(tn) ? s_toolNote[tn].c_str() : "");
+
+                                    // Live docstring (what the model gets when override empty).
+                                    const char* liveDesc = toolTooltip(tn);
+                                    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+                                    ImGui::TextUnformatted("Included tool context");
+                                    if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip(
+                                            "description_override — replaces the MCP docstring "
+                                            "in the AI tools prompt. Leave empty to use the "
+                                            "live tool description shown below.");
+                                    if (descBuf[0] == '\0' && liveDesc && liveDesc[0]) {
+                                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                            ui::Palette::toU32(ui::palette.textDim));
+                                        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
+                                        ImGui::TextWrapped("Live (no override): %s", liveDesc);
+                                        ImGui::PopTextWrapPos();
+                                        ImGui::PopStyleColor();
+                                    }
+                                    if (ImGui::InputTextMultiline("##description_override",
+                                            descBuf, sizeof(descBuf),
+                                            ImVec2(boxW, 56 * sc))) {
+                                        s_toolDescOverride[tn] = descBuf;
+                                        s_toolOptDirty = true;
+                                    }
+
+                                    ImGui::TextUnformatted("AI usage guidance");
+                                    if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip(
+                                            "prompt_note — appended as \"Note: ...\" under this "
+                                            "tool in the AI tools prompt.");
+                                    if (noteBuf[0] == '\0') {
+                                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                            ui::Palette::toU32(ui::palette.textDim));
+                                        ImGui::TextUnformatted(
+                                            "(empty — no Note: line in the tools prompt)");
+                                        ImGui::PopStyleColor();
+                                    }
                                     if (ImGui::InputTextMultiline("##prompt_note",
                                             noteBuf, sizeof(noteBuf),
                                             ImVec2(boxW, 40 * sc))) {
                                         s_toolNote[tn] = noteBuf;
                                         s_toolOptDirty = true;
                                     }
+
+                                    ImGui::TextUnformatted("Default arguments (JSON)");
+                                    if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip(
+                                            "param_defaults — kwargs merged under the model's "
+                                            "call (model-supplied values win).");
+                                    if (ImGui::InputTextMultiline("##param_defaults",
+                                            defBuf, sizeof(defBuf),
+                                            ImVec2(boxW, 60 * sc))) {
+                                        s_toolDefaults[tn] = defBuf;
+                                        s_toolOptDirty = true;
+                                    }
+
+                                    // ---- Model receives: real assembled tools-slot entry ----
+                                    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                                    ImGui::TextUnformatted("Model receives (preview)");
+                                    ImGui::SameLine();
+                                    helpMarker("Exact tools-slot block assembled the same way "
+                                               "as tool_schemas.render_tools_block (signature + "
+                                               "description + optional Note). Refresh pulls from "
+                                               "the worker; offline falls back to the live "
+                                               "docstring + your overrides.");
+                                    static std::string s_previewTool;
+                                    static std::string s_previewText;
+                                    static std::string s_previewErr;
+                                    static double s_previewAt = -1e9;
+                                    const bool canPrev = st.workerStarted && !busy;
+                                    auto buildLocalPreview = [&]() {
+                                        std::string sig = std::string("- ") + tn + "(…)";
+                                        std::string body;
+                                        if (s_toolDescOverride.count(tn) &&
+                                            !s_toolDescOverride[tn].empty())
+                                            body = s_toolDescOverride[tn];
+                                        else if (liveDesc)
+                                            body = liveDesc;
+                                        std::string entry = sig;
+                                        if (!body.empty())
+                                            entry += "\n    " + body;
+                                        if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
+                                            entry += "\n    Note: " + s_toolNote[tn];
+                                        s_previewText =
+                                            "[TOOLS] Call tools with EXACTLY these kwargs:\n" +
+                                            entry;
+                                        s_previewErr.clear();
+                                    };
+                                    auto fetchPreview = [&](bool force) {
+                                        const double now = ImGui::GetTime();
+                                        if (!force && s_previewTool == tn &&
+                                            (now - s_previewAt) < 1.5)
+                                            return;
+                                        s_previewTool = tn;
+                                        s_previewAt = now;
+                                        if (!canPrev) {
+                                            buildLocalPreview();
+                                            s_previewErr = "Worker offline — local approximation";
+                                            return;
+                                        }
+                                        nlohmann::json p;
+                                        p["tool"] = tn;
+                                        // Pass explicit trim when not inheriting.
+                                        if (s_toolSchemaTrim.count(tn) &&
+                                            s_toolSchemaTrim[tn] >= 0)
+                                            p["trim"] = (s_toolSchemaTrim[tn] != 0);
+                                        nlohmann::json r;
+                                        std::string err;
+                                        if (!st.worker.call("ai_tool_preview", p, r, err, 8000) ||
+                                            !r.value("ok", false)) {
+                                            buildLocalPreview();
+                                            s_previewErr = err.empty()
+                                                ? r.value("error", "preview failed")
+                                                : err;
+                                            return;
+                                        }
+                                        s_previewText = r.value("text", "");
+                                        if (s_previewText.empty())
+                                            s_previewText = r.value("entry", "");
+                                        s_previewErr.clear();
+                                    };
+                                    // Refresh when popup opens / tool changes. Edits rebuild
+                                    // a local approximation until Refresh is clicked.
+                                    if (s_previewTool != tn) {
+                                        fetchPreview(/*force=*/true);
+                                    } else if (s_toolOptDirty && s_previewErr.find("offline") ==
+                                               std::string::npos &&
+                                               s_previewErr.find("Worker") == std::string::npos) {
+                                        // Keep showing last worker text; user can Refresh.
+                                    }
+                                    ImGui::SameLine();
+                                    if (!canPrev) ImGui::BeginDisabled();
+                                    if (ImGui::SmallButton("Refresh##tool_preview"))
+                                        fetchPreview(/*force=*/true);
+                                    if (!canPrev) ImGui::EndDisabled();
+                                    // Always refresh local approx when worker unavailable.
+                                    if (!canPrev && (s_previewTool != tn || s_toolOptDirty))
+                                        buildLocalPreview();
+                                    if (!s_previewErr.empty()) {
+                                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                            ui::Palette::toU32(ui::palette.statusWarn));
+                                        ImGui::TextWrapped("%s", s_previewErr.c_str());
+                                        ImGui::PopStyleColor();
+                                    }
+                                    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                                        ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
+                                               ui::palette.panelBg[2], 1));
+                                    ImGui::BeginChild("##tool_recv_preview",
+                                                      ImVec2(boxW, 110 * sc), true);
+                                    ImGui::PushFont(st.fonts.mono);
+                                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW - 12 * sc);
+                                    ImGui::TextUnformatted(
+                                        s_previewText.empty() ? "(empty)" : s_previewText.c_str());
+                                    ImGui::PopTextWrapPos();
+                                    ImGui::PopFont();
+                                    ImGui::EndChild();
+                                    ImGui::PopStyleColor();
+
                                     ImGui::EndPopup();
                                 }
                                 ImGui::PopID();
@@ -5731,25 +6414,39 @@ void drawSettingsModal(AppState& st, bool busy) {
                             ImGui::TreePop();
                         }
 
-                        if (s_toolFamDirty || s_toolOptDirty) {
+                        if (s_roleToolsDirty || s_toolOptDirty) {
                             ImGui::Dummy(ImVec2(0, 6.0f * sc));
                             if (!s_toolOptErr.empty()) {
                                 ImGui::TextColored(ImVec4(1,0.4f,0.3f,1), "%s",
                                                    s_toolOptErr.c_str());
                             }
-                            if (ImGui::Button("Save tool families & options",
+                            if (ImGui::Button("Save role tools & options",
                                               ImVec2(240.0f * sc, 0))) {
+                                nlohmann::json rt = nlohmann::json::object();
+                                for (const auto& kv : s_roleTools) {
+                                    nlohmann::json arr = nlohmann::json::array();
+                                    for (const auto& fam : kv.second) arr.push_back(fam);
+                                    rt[kv.first] = std::move(arr);
+                                }
+
+                                // Derive tool_families as the union of all role assignments
+                                // so legacy kill-switches / MCP external clients stay coherent.
                                 nlohmann::json tf = nlohmann::json::object();
-                                for (const auto& kv : s_toolFam) tf[kv.first] = kv.second;
+                                std::set<std::string> unionFams;
+                                for (const auto& kv : s_roleTools)
+                                    for (const auto& fam : kv.second) unionFams.insert(fam);
+                                for (int i = 0; i < kToolFamilyCount; ++i)
+                                    tf[kToolFamilies[i]] = unionFams.count(kToolFamilies[i]) > 0;
 
                                 nlohmann::json to = nlohmann::json::object();
-                                // Collect all tool names we know about
                                 std::set<std::string> names;
                                 for (const auto& kv : s_toolEnabled) names.insert(kv.first);
                                 for (const auto& kv : s_toolTimeout) names.insert(kv.first);
                                 for (const auto& kv : s_toolMaxCalls) names.insert(kv.first);
                                 for (const auto& kv : s_toolDefaults) names.insert(kv.first);
                                 for (const auto& kv : s_toolNote) names.insert(kv.first);
+                                for (const auto& kv : s_toolDescOverride) names.insert(kv.first);
+                                for (const auto& kv : s_toolSchemaTrim) names.insert(kv.first);
                                 s_toolOptErr.clear();
                                 for (const auto& tn : names) {
                                     nlohmann::json e = nlohmann::json::object();
@@ -5771,32 +6468,59 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     }
                                     if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
                                         e["prompt_note"] = s_toolNote[tn];
+                                    if (s_toolDescOverride.count(tn) &&
+                                        !s_toolDescOverride[tn].empty())
+                                        e["description_override"] = s_toolDescOverride[tn];
+                                    if (s_toolSchemaTrim.count(tn) &&
+                                        s_toolSchemaTrim[tn] >= 0)
+                                        e["schema_trim"] = (s_toolSchemaTrim[tn] != 0);
                                     if (!e.empty()) to[tn] = e;
                                 }
                                 if (s_toolOptErr.empty()) {
                                     updateConfigJson([&](nlohmann::json& j) {
                                         if (!j.contains("agent") || !j["agent"].is_object())
                                             j["agent"] = nlohmann::json::object();
+                                        j["agent"]["role_tools"] = rt;
                                         j["agent"]["tool_families"] = tf;
                                         j["agent"]["tool_options"] = to;
                                     });
-                                    s_toolFamDirty = false;
+                                    s_roleToolsDirty = false;
                                     s_toolOptDirty = false;
-                                    s_toolFamLast = -1e9;
+                                    s_roleToolsLast = -1e9;
                                 }
                             }
                             ImGui::SameLine();
-                            if (ImGui::Button("Reset all on", ImVec2(120.0f * sc, 0))) {
-                                for (int i = 0; i < kToolFamilyCount; ++i)
-                                    s_toolFam[kToolFamilies[i]] = true;
+                            if (ImGui::Button("Reset role defaults", ImVec2(160.0f * sc, 0))) {
+                                seedDefaultRoleTools();
+                                s_roleToolsDirty = true;
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Reset tool options", ImVec2(150.0f * sc, 0))) {
                                 s_toolEnabled.clear();
                                 s_toolTimeout.clear();
                                 s_toolMaxCalls.clear();
                                 s_toolDefaults.clear();
                                 s_toolNote.clear();
-                                s_toolFamDirty = true;
+                                s_toolDescOverride.clear();
+                                s_toolSchemaTrim.clear();
                                 s_toolOptDirty = true;
                             }
+                        }
+                        settingsGlassSectionEnd();
+
+                        ImGui::Dummy(ImVec2(0, 10.0f * sc));
+                        settingsGlassSectionBegin("##ai_bugreports", "Bug reports");
+                        dimText("Give the agent a submit_bug_report tool so it can file a "
+                                "report when it hits tool errors or broken behavior. Reports "
+                                "are markdown files in Documents/Chudware/Bug-Reports/ \xe2\x80\x94 "
+                                "nothing leaves this machine.");
+                        {
+                            static bool s_bugReports = loadAgentConfigBool("bug_reports", true);
+                            if (ImGui::Checkbox("Send bug reports", &s_bugReports))
+                                saveAgentConfigValue("bug_reports", s_bugReports);
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Saved immediately to config.json "
+                                                  "agent.bug_reports.");
                         }
                         settingsGlassSectionEnd();
 
@@ -5818,6 +6542,130 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 dimText("Running\xe2\x80\xa6");
                             }
                         }
+                        settingsGlassSectionEnd();
+                        ImGui::EndTabItem();
+                    }
+
+                    // ---- Dev Preview: assembled general_agent system prompt ----
+                    if (ImGui::BeginTabItem("Dev Preview", nullptr, subFlags(7))) {
+                        if (aiSubTabJustEntered(7)) ImGui::SetScrollY(0.0f);
+                        settingsGlassSectionBegin("##ai_dev_preview", "Prompt assembly preview");
+                        dimText("Shows the system prompt a typical main-chat / general_agent "
+                                "turn would send (role card + capability SOFT block + harness "
+                                "base + catalog + sample ledger/stage + tools slot + Auto-Learn "
+                                "guidance when enabled). The coloured sample is where the user "
+                                "request goes — not sent to a model.");
+
+                        static std::string s_devSys;
+                        static std::string s_devUser;
+                        static std::string s_devErr;
+                        static std::string s_devMeta;
+                        static bool s_devLoaded = false;
+                        static bool s_devFetching = false;
+                        static bool s_includeTools = true;
+
+                        const bool canDev = st.workerStarted && !busy;
+                        auto fetchDevPreview = [&]() {
+                            s_devFetching = true;
+                            s_devErr.clear();
+                            if (!canDev) {
+                                s_devSys.clear();
+                                s_devUser.clear();
+                                s_devMeta.clear();
+                                s_devErr = "Worker not ready — start the runtime to load the "
+                                           "assembled prompt.";
+                                s_devLoaded = true;
+                                s_devFetching = false;
+                                return;
+                            }
+                            nlohmann::json p;
+                            p["include_tools"] = s_includeTools;
+                            nlohmann::json r;
+                            std::string err;
+                            if (!st.worker.call("ai_prompt_preview", p, r, err, 30000) ||
+                                !r.value("ok", false)) {
+                                s_devSys.clear();
+                                s_devUser.clear();
+                                s_devMeta.clear();
+                                s_devErr = err.empty()
+                                    ? r.value("error", std::string("ai_prompt_preview failed"))
+                                    : err;
+                                s_devLoaded = true;
+                                s_devFetching = false;
+                                return;
+                            }
+                            s_devSys = r.value("system", "");
+                            s_devUser = r.value("user_placeholder", "");
+                            auto meta = r.value("meta", nlohmann::json::object());
+                            char buf[256];
+                            std::snprintf(buf, sizeof(buf),
+                                "role=%s  tools≈%d  chars=%d  tokens≈%d  autolearn=%s",
+                                meta.value("role", "general_agent").c_str(),
+                                meta.value("allowed_tool_count", 0),
+                                meta.value("system_chars", 0),
+                                meta.value("system_tokens_est", 0),
+                                meta.value("autolearn", false) ? "on" : "off");
+                            s_devMeta = buf;
+                            s_devErr.clear();
+                            s_devLoaded = true;
+                            s_devFetching = false;
+                        };
+
+                        if (!s_devLoaded && canDev && !s_devFetching)
+                            fetchDevPreview();
+
+                        if (ImGui::Checkbox("Include tools slot", &s_includeTools)) {
+                            s_devLoaded = false;
+                        }
+                        ImGui::SameLine();
+                        if (!canDev || s_devFetching) ImGui::BeginDisabled();
+                        if (ImGui::Button("Refresh##dev_preview", ImVec2(100.0f * sc, 0)))
+                            fetchDevPreview();
+                        if (!canDev || s_devFetching) ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                            ImGui::SetTooltip(canDev
+                                ? "Re-assemble from live role cards + tool_schemas"
+                                : "Start the worker to load the prompt preview");
+                        if (!s_devMeta.empty()) {
+                            ImGui::SameLine();
+                            dimText(s_devMeta.c_str());
+                        }
+                        if (!s_devErr.empty()) {
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ui::Palette::toU32(ui::palette.statusWarn));
+                            ImGui::TextWrapped("%s", s_devErr.c_str());
+                            ImGui::PopStyleColor();
+                        }
+
+                        // Coloured rendering: system (dim/normal) then user placeholder (accent).
+                        const float prevH = ImMax(280.0f * sc,
+                            ImGui::GetContentRegionAvail().y - 8.0f * sc);
+                        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                            ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
+                                   ui::palette.panelBg[2], 1));
+                        ImGui::BeginChild("##dev_prompt_body", ImVec2(-1, prevH), true);
+                        ImGui::PushFont(st.fonts.mono);
+                        const float wrapX = ImGui::GetCursorPosX() +
+                            ImGui::GetContentRegionAvail().x - 4.0f * sc;
+                        ImGui::PushTextWrapPos(wrapX);
+                        if (!s_devSys.empty()) {
+                            ImGui::TextUnformatted("--- system ---");
+                            ImGui::TextUnformatted(s_devSys.c_str());
+                        } else if (s_devErr.empty() && !s_devLoaded) {
+                            dimText("Loading…");
+                        }
+                        if (!s_devUser.empty()) {
+                            ImGui::Dummy(ImVec2(0, 10.0f * sc));
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ui::Palette::toU32(ui::palette.accent));
+                            ImGui::TextUnformatted("--- user (sample placeholder) ---");
+                            ImGui::TextWrapped("%s", s_devUser.c_str());
+                            ImGui::PopStyleColor();
+                        }
+                        ImGui::PopTextWrapPos();
+                        ImGui::PopFont();
+                        ImGui::EndChild();
+                        ImGui::PopStyleColor();
                         settingsGlassSectionEnd();
                         ImGui::EndTabItem();
                     }

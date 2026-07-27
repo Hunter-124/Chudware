@@ -785,6 +785,12 @@ class MissionDispatch:
                     allowed = sorted(set(allowed) | SUBAGENT_DEFAULT_TOOLS)
                 except Exception:  # noqa: BLE001 — floor union is best-effort
                     pass
+                # Settings → AI → Tools "Send bug reports": nodes may file too.
+                try:
+                    from services.agent.config import bugreport_floor  # noqa: PLC0415
+                    allowed = sorted(set(allowed) | bugreport_floor())
+                except Exception:  # noqa: BLE001 — floor union is best-effort
+                    pass
             # Always expose coordination board tools to sub-agents so they can
             # claim/release resources and post progress without clobbering peers.
             _COORD_TOOLS = (
@@ -1146,6 +1152,13 @@ class MissionDispatch:
                             SUBAGENT_DEFAULT_TOOLS,
                         )
                         allowed = sorted(set(allowed) | SUBAGENT_DEFAULT_TOOLS)
+                    except Exception:  # noqa: BLE001 — floor union is best-effort
+                        pass
+                    # Settings → AI → Tools "Send bug reports": keep the tool
+                    # through mode narrowing (a report never mutates the doc).
+                    try:
+                        from services.agent.config import bugreport_floor  # noqa: PLC0415
+                        allowed = sorted(set(allowed) | bugreport_floor())
                     except Exception:  # noqa: BLE001 — floor union is best-effort
                         pass
                     # Re-render tools_text against the narrowed set (+ category menu).
@@ -2129,6 +2142,11 @@ def run_linear_role_turn(
 
     card = load_role(role)
     allowed = sorted(set(card.concrete_tools) | SUBAGENT_DEFAULT_TOOLS)
+    try:
+        from services.agent.config import bugreport_floor  # noqa: PLC0415
+        allowed = sorted(set(allowed) | bugreport_floor())
+    except Exception:  # noqa: BLE001 — floor union is best-effort
+        pass
 
     # Meta-tool coverage (live admin path passes no dispatcher): ask_user &
     # the other coordination tools resolve only via MissionDispatch.resolve,
@@ -2188,6 +2206,21 @@ def run_linear_role_turn(
         run_id=run_id,
         capability=capability,
     )
+    # OMP Auto-Learn capture-at-stop (agent.autolearn_*). Main-chat / linear
+    # entry only — never raises into the turn path.
+    try:
+        from services.agent.autolearn import maybe_capture_after_turn  # noqa: PLC0415
+        _calls = 0
+        _res = result.result if isinstance(getattr(result, "result", None), dict) else {}
+        if isinstance(_res, dict):
+            _calls = int(_res.get("tool_calls") or 0)
+            if not _calls and isinstance(_res.get("calls"), list):
+                _calls = len(_res["calls"])
+        maybe_capture_after_turn(
+            request=request, result=result, tool_calls=_calls,
+        )
+    except Exception:  # noqa: BLE001
+        pass
     # Handoff synthesis — the same rescue _run_subagent applies at its join.
     # This is the UNIVERSAL top-level entry (every online run lands here via
     # worker_rpc.agent_admin_turn), yet it returned run_turn's raw result: on a

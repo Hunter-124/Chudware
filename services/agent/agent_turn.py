@@ -283,7 +283,11 @@ def _force_first_tool(
     )
     tool = next((t for t in candidates if t in allow_set), None)
     if tool is None and allow_set:
-        tool = sorted(allow_set)[0]
+        # submit_bug_report is a Settings floor union, not real work — force-firing
+        # it on a zero-tool turn would fabricate a tool result (and file nothing),
+        # flipping the no_code invariant. Never pick it as the forced opener.
+        pick = sorted(t for t in allow_set if t != "submit_bug_report")
+        tool = pick[0] if pick else None
     if not tool:
         return calls, tool_calls_made, False
     args: dict = {}
@@ -781,6 +785,18 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             allowed_tools = sorted(allow)
     except Exception:  # noqa: BLE001 — mode gate never breaks a turn
         pass
+    # Settings → AI → Tools "Send bug reports" (agent.bug_reports, default on):
+    # every turn may file a local bug report. Unioned AFTER the mode gate — a
+    # report writes one markdown file, it never mutates the document.
+    try:
+        from services.agent.config import bugreport_floor  # noqa: PLC0415
+        _br_floor = set(bugreport_floor())
+        if _br_floor:
+            allow |= _br_floor
+            if allowed_tools is not None:
+                allowed_tools = sorted(set(allowed_tools) | _br_floor)
+    except Exception:  # noqa: BLE001 — the floor never breaks a turn
+        pass
     actor = actor or name
     # mega-25: once-per-session key for the static catalog gate below (role
     # catalog is main-turn-only; skills catalog applies to every call). Fresh
@@ -912,6 +928,15 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                         except Exception:  # noqa: BLE001
                             pass
     except Exception:  # noqa: BLE001 — memory never breaks a turn
+        pass
+
+    # OMP Auto-Learn standing guidance (Settings → AI → Harness). Best-effort.
+    try:
+        from services.agent.autolearn import standing_guidance  # noqa: PLC0415
+        _al = standing_guidance()
+        if _al:
+            system = system.rstrip() + "\n\n" + _al
+    except Exception:  # noqa: BLE001
         pass
 
     if tools_text:
@@ -1914,6 +1939,14 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             _log(ledger, actor, {"event": "tool_call", **{
                 k: call_rec[k] for k in ("tool", "args", "ok")
             }, "result": _truncate(result)})
+        # Bug-report context: capture the failed call so submit_bug_report can
+        # embed it (Settings → AI → Tools). Best-effort, in-memory only.
+        if not ok:
+            try:
+                from services.agent import bugreport_context as _brc  # noqa: PLC0415
+                _brc.record_failure(tool, args, result, run_id=run_id, actor=actor)
+            except Exception:  # noqa: BLE001
+                pass
         # mega-17 Z2: denial→reinject once when wire fails on missing ref.
         # Re-derive from live ledger (place + add_power refs) and retry.
         if (

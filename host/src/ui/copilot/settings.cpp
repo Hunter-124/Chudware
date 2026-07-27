@@ -430,33 +430,56 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         // Cloud OpenAI-compatible: needs BOTH an endpoint (set by the preset, editable) and a key.
         // OpenRouter is first-class — key status names the active service. Moonshot uses its own
         // keys.moonshot buffer (via providerKeyBuf) so generic cloud_compat keys are preserved.
+        // Bridge-catalog services (Bedrock / Azure / Antigravity / AIMLAPI) ride this slot too,
+        // but their credential lives in the bridge's own auth db and saveSettings deliberately
+        // drops anything typed here for them — show the sign-in path, not a dead field.
         const char* svc = ui::cloudServiceKey(s.baseUrl);
         const bool isOR = (std::strcmp(svc, "openrouter") == 0);
         const bool isMS = (std::strcmp(svc, "moonshot") == 0);
-        ImGui::TextUnformatted(isOR ? "OpenRouter endpoint"
-                                    : (isMS ? "Moonshot endpoint" : "Endpoint (base URL)"));
+        const bool bridgeAuth = !ui::cloudServiceUsesLocalKey(svc);
+        ImGui::TextUnformatted(bridgeAuth
+            ? "Service endpoint (identifies the bridge provider)"
+            : (isOR ? "OpenRouter endpoint"
+                    : (isMS ? "Moonshot endpoint" : "Endpoint (base URL)")));
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##cloudbase", s.baseUrl, sizeof(s.baseUrl))) changed = true;
-        ImGui::TextUnformatted(isOR ? "OpenRouter API key"
-                                    : (isMS ? "Moonshot (Kimi) API key" : "API key"));
-        char* key = providerKeyBuf(s, s.provider);
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
-        if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
-        bool haveKey = key[0] != '\0';
-        ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? ui::Palette::toU32(ui::palette.statusOk)
-                                                     : ui::Palette::toU32(ui::palette.statusWarn));
-        if (isOR)
-            ImGui::TextUnformatted(haveKey ? "OpenRouter key set — models available (blocked in Offline mode)"
-                                           : "no OpenRouter key — add one at openrouter.ai/keys");
-        else if (isMS)
-            ImGui::TextUnformatted(haveKey
-                ? "Moonshot key set — Kimi available (blocked in Offline mode)"
-                : "no Moonshot key — add one at platform.moonshot.ai");
-        else
-            ImGui::TextUnformatted(haveKey ? "key set — cloud API available (blocked in Offline mode)"
-                                           : "no API key — add your OpenRouter / DashScope / DeepSeek key");
-        ImGui::PopStyleColor();
+        if (bridgeAuth) {
+            dimText("Signed in through the OMP bridge — no API key field here. The bridge "
+                    "resolves both the endpoint and the credential from its own auth db "
+                    "(Settings \xe2\x86\x92 Providers).");
+            if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision))
+                changed = true;
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
+            ImGui::TextUnformatted(
+                std::string(ui::categoryLabel(svc)).append(
+                    " \xe2\x80\x94 signed in via the bridge (blocked in Offline mode)").c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::TextUnformatted(isOR ? "OpenRouter API key"
+                                        : (isMS ? "Moonshot (Kimi) API key" : "API key"));
+            char* key = providerKeyBuf(s, s.provider);
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password))
+                changed = true;
+            if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision))
+                changed = true;
+            bool haveKey = key[0] != '\0';
+            ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? ui::Palette::toU32(ui::palette.statusOk)
+                                                         : ui::Palette::toU32(ui::palette.statusWarn));
+            if (isOR)
+                ImGui::TextUnformatted(haveKey
+                    ? "OpenRouter key set — models available (blocked in Offline mode)"
+                    : "no OpenRouter key — add one at openrouter.ai/keys");
+            else if (isMS)
+                ImGui::TextUnformatted(haveKey
+                    ? "Moonshot key set — Kimi available (blocked in Offline mode)"
+                    : "no Moonshot key — add one at platform.moonshot.ai");
+            else
+                ImGui::TextUnformatted(haveKey
+                    ? "key set — cloud API available (blocked in Offline mode)"
+                    : "no API key — add your OpenRouter / DashScope / DeepSeek key");
+            ImGui::PopStyleColor();
+        }
         // Always surface the Moonshot key slot even when another cloud service is active, so
         // credit can be parked without switching the default provider.
         if (!isMS) {
@@ -1845,6 +1868,16 @@ void drawModelDropdown(AppState& st, bool busy) {
         if (p == "deepseek") return {ui::PROV_CLOUDCOMPAT, "https://api.deepseek.com/v1"};
         if (p == "alibaba" || p == "alibaba-coding-plan")
             return {ui::PROV_CLOUDCOMPAT, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"};
+        // Bridge-only catalog providers: no native C++ transport and no dedicated ProviderIndex,
+        // so they ride the SHARED cloud slot. The URL here is a DISCRIMINATOR, not an endpoint —
+        // ui::cloudServiceKey() maps it back to the bridge id that agentProviderOverride pins,
+        // and the bun bridge supplies the real endpoint + credential from its own AuthStorage
+        // (saveSettings omits the cloud slot's api_key for these; see cloudServiceUsesLocalKey).
+        if (p == "amazon-bedrock")
+            return {ui::PROV_CLOUDCOMPAT, "https://bedrock-runtime.amazonaws.com"};
+        if (p == "azure") return {ui::PROV_CLOUDCOMPAT, "https://api.openai.azure.com"};
+        if (p == "google-antigravity") return {ui::PROV_CLOUDCOMPAT, "https://antigravity.google"};
+        if (p == "aimlapi") return {ui::PROV_CLOUDCOMPAT, "https://api.aimlapi.com/v1"};
         return {-1, ""};  // cursor + any unrouted provider: no working composer transport -> excluded
     };
 

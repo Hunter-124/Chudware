@@ -684,7 +684,8 @@ BuiltRequest openai_build_request(const std::string& model, const std::string& s
 // Verified against live provider docs (2026-07):
 //   OpenAI gpt-5*/o1/o3/o4    reasoning_effort: low|medium|high   (non-reasoning gpt-4*: omit)
 //   xAI grok-4.5/4.3/-fast/3-mini reasoning_effort: low|medium|high (original grok-4: omit)
-//   Moonshot kimi-k3          reasoning_effort: "max" ONLY         (kimi-k2.x: omit -> thinking)
+//   Moonshot kimi-k3          reasoning_effort: low|high|max  (NO medium rung, so a
+//                             medium selection maps to high; kimi-k2.x: omit -> thinking)
 //   DeepSeek reasoner/v4      reasoning_effort: high|max           -> "high" (deepseek-chat: omit)
 //   Alibaba Qwen (DashScope)  enable_thinking:true (top-level bool; no low/med/high level)
 //   OpenRouter                reasoning:{effort: low|medium|high}
@@ -705,6 +706,18 @@ json openai_reasoning_patch(const std::string& provider, const std::string& mode
         if (lvl == "minimal") return "low";
         return "high";  // xhigh / max / any other on-value -> high
     };
+    // kimi-k3 accepts low|high|max and has NO medium rung, so a "medium" selection maps
+    // to high (the nearest real rung above low) and the above-high spellings map to the
+    // model's genuine "max". Nothing is clamped: the ladder the GUI offers for this model
+    // is exactly what the endpoint accepts.
+    auto kimi_k3 = [&]() -> std::string {
+        if (lvl == "low" || lvl == "minimal") return "low";
+        if (lvl == "max" || lvl == "maximum" || lvl == "xhigh" || lvl == "x-high" ||
+            lvl == "extra_high" || lvl == "extra-high" || lvl == "ultra" ||
+            lvl == "highest")
+            return "max";
+        return "high";  // medium / high / any other on-value
+    };
     // Local endpoints have no reasoning_effort knob.
     if (has(b, "localhost") || has(b, "127.0.0.1") || has(b, "::1") || has(b, "0.0.0.0"))
         return json::object();
@@ -714,7 +727,7 @@ json openai_reasoning_patch(const std::string& provider, const std::string& mode
     if (has(b, "openrouter"))  // OpenRouter unified reasoning object (ignored per non-reasoning model)
         return json{{"reasoning", json{{"effort", lmh()}}}};
     if (p == "moonshot" || has(b, "moonshot.ai")) {
-        if (has(m, "kimi-k3")) return json{{"reasoning_effort", "max"}};  // K3: only "max"
+        if (has(m, "kimi-k3")) return json{{"reasoning_effort", kimi_k3()}};
         return json::object();  // kimi-k2.x uses the `thinking` field, not reasoning_effort
     }
     if (p == "xai" || p == "xai-sub" || has(b, "x.ai")) {
@@ -736,7 +749,7 @@ json openai_reasoning_patch(const std::string& provider, const std::string& mode
     }
     // --- No endpoint match: fall back to MODEL-NAME heuristics (bare provider name / empty base). ---
     if (m.rfind("kimi", 0) == 0) {
-        if (has(m, "kimi-k3")) return json{{"reasoning_effort", "max"}};
+        if (has(m, "kimi-k3")) return json{{"reasoning_effort", kimi_k3()}};
         return json::object();
     }
     if (m.rfind("grok", 0) == 0) {
@@ -1065,8 +1078,11 @@ std::string humanize_provider_error(const std::string& raw) {
         return "The model provider returned an error. See details below.";
 
     // Resolution / config
+    // "no api key" is the bun bridge's own phrasing (omp MissingApiKeyError -> "No API key for
+    // provider: <id>") for a provider whose credential lives in neither CAD's config nor the
+    // bridge's AuthStorage.
     if (has("not signed in") || has("not configured") || has("missing api_key") ||
-        has("missing access_token"))
+        has("no api key") || has("missing access_token"))
         return "Provider not signed in. Open Settings → AI → Accounts.";
     if (has("unknown provider") || has("offline mode"))
         return s;  // already human
@@ -1769,14 +1785,44 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         if (!api_key.empty()) params["apiKey"] = api_key;
         if (!base_url.empty()) params["baseUrl"] = base_url;
         if (!effort.empty()) params["reasoningEffort"] = effort;
+        // Stream ONLY when this run actually has a live sink to feed: the SAME one the native
+        // openai branch feeds (SseAccum::feed -> the run's g_provider_delta_emitter), so the GUI
+        // cannot tell a bridge delta from a native one. With no emitter installed there is
+        // nothing to show, and asking for `stream` would just make the sidecar write
+        // notification lines for the reader thread to parse and drop.
+        //
+        // Both the emitter and the cancel flag are thread_locals of THIS thread while the sink
+        // runs on the bridge client's reader thread, so bind them here instead of re-reading
+        // them over there. call() guarantees the sink is dead before it returns, which is what
+        // makes the reference capture and the raw flag pointer safe.
+        auto& delta_emit = g_provider_delta_emitter;
+        const std::atomic<bool>* cancel = g_provider_cancel;
+        OmpBridgeClient::OnEvent on_delta;
+        if (delta_emit) {
+            // bridge.ts then writes one {"id",event:"delta",data:{text|thinking}} line per
+            // fragment ahead of its unchanged final response line.
+            params["stream"] = true;
+            on_delta = [&delta_emit, cancel](const json& data, const std::string& event) {
+                if (event != "delta" || !delta_emit) return;
+                // Stop feeding the GUI the instant Stop is pressed; the client's own wait loop
+                // notices the same flag and abandons the call within its next 50 ms tick.
+                if (cancel && cancel->load(std::memory_order_acquire)) return;
+                for (const char* k : {"text", "thinking"}) {
+                    const auto it = data.find(k);
+                    if (it == data.end() || !it->is_string()) continue;
+                    const std::string c = it->get<std::string>();
+                    if (!c.empty()) delta_emit(c, k);
+                }
+            };
+        }
 
         json result;
         std::string bridge_err;
-        // 300 s: handleComplete() in bridge.ts awaits the FULL (non-streamed-to-us)
-        // completion before responding, so this has to tolerate a slow reasoning-model turn,
-        // not just RPC round-trip latency.
+        // 300 s: bridge.ts streams fragments as they arrive but writes its response line only
+        // once the completion has FULLY resolved, so this still has to tolerate a slow
+        // reasoning-model turn, not just RPC round-trip latency.
         const bool ok = OmpBridgeClient::instance().call("complete", params, result, bridge_err,
-                                                          /*timeoutMs=*/300000);
+                                                          /*timeoutMs=*/300000, on_delta);
         res.model = model;
         res.endpoint = "omp-bridge:" + provider;
         if (!ok) {

@@ -27,7 +27,9 @@ enum ProviderIndex {
                           // so the offline (ITAR) guard REFUSES it while local stays allowed.
     PROV_XAI = 6,         // xAI Grok — API key (console.x.ai) and/or SuperGrok OAuth (xai-sub)
     PROV_CURSOR = 7,      // Cursor (Composer + proxied Anthropic/OpenAI models)
-    PROV_KIMISUB = 8,     // Kimi Code subscription — OAuth via subscription_auth (wire "kimi-sub")
+    PROV_KIMISUB = 8,     // Kimi Code — OMP-bridge provider (wire "kimi-code"); the credential
+                          // lives in the bridge's auth db (Settings → Providers sign-in). The
+                          // Python "kimi-sub" subscription provider is a separate id/namespace.
     PROV_ZENMUX = 9,      // ZenMux — OMP-bridge provider (core/agent/providers.cpp
                           // kOmpBridgeProviders); credentials live in the bridge's own auth db
                           // (Settings → Providers sign-in), not a local config.json key. Default
@@ -106,11 +108,21 @@ inline bool baseUrlIsLoopback(const std::string& base_url) {
 }
 
 // Map a cloud base URL to its service category key (OpenRouter / Alibaba / DeepSeek / generic).
+// Bridge-catalog services with no native OpenAI-compatible transport (Bedrock / Azure /
+// Antigravity / AIMLAPI) ride this same slot, so their URL is purely a service DISCRIMINATOR:
+// the completion goes through the bun bridge, which supplies the real endpoint AND the
+// credential from its own AuthStorage. Those keys are spelled as the OMP bridge provider id
+// (core/agent/providers.cpp omp_bridge_provider_ids) so the picker badge, the logo lookup
+// (provider_logos.cpp) and cloudServiceWireName() below all agree on one spelling.
 inline const char* cloudServiceKey(const std::string& base_url) {
     if (base_url.find("openrouter.ai") != std::string::npos) return "openrouter";
     if (base_url.find("aliyuncs.com") != std::string::npos) return "alibaba";
     if (base_url.find("deepseek.com") != std::string::npos) return "deepseek";
     if (base_url.find("moonshot.ai") != std::string::npos) return "moonshot";
+    if (base_url.find("amazonaws.com") != std::string::npos) return "amazon-bedrock";
+    if (base_url.find("azure.com") != std::string::npos) return "azure";
+    if (base_url.find("antigravity.google") != std::string::npos) return "google-antigravity";
+    if (base_url.find("aimlapi.com") != std::string::npos) return "aimlapi";
     return "cloud";
 }
 
@@ -151,6 +163,10 @@ inline const char* categoryLabel(const std::string& key) {
     if (key == "alibaba") return "Alibaba Cloud (Qwen)";
     if (key == "deepseek") return "DeepSeek";
     if (key == "moonshot") return "Moonshot (Kimi)";
+    if (key == "amazon-bedrock") return "Amazon Bedrock";
+    if (key == "azure") return "Azure OpenAI";
+    if (key == "google-antigravity") return "Google Antigravity";
+    if (key == "aimlapi") return "AI/ML API";
     if (key == "xai") return "xAI (Grok)";
     if (key == "cursor") return "Cursor";
     if (key == "kimi-code") return "Kimi Code (subscription)";

@@ -431,6 +431,22 @@ the app data vendor cache for local AI workflows.
 `min_clearance_mm?: number = 0` (clearance entries below the threshold carry
 `warning: "below min clearance"`). Return shape otherwise unchanged.
 
+### Copilot voice input / OMP ASR sidecar (append-only, 2026-07-27)
+
+Proxied by `libchudware` → bun OMP bridge (`vendor/omp/bridge/src/stt`). Reuses OMP's
+`pi-natives` `AudioCapture` + Whisper (`@huggingface/transformers`) approach. When the
+ASR runtime or mic native addon is missing, `available` is false and the GUI disables
+the mic with a tooltip hint — never crashes.
+
+| method | params → result |
+|---|---|
+| `agent_stt_status` | `{}` → `{ok, available, reason?, state: "idle"\|"listening"\|"processing"\|"error", model?, modelLabel?, modelSizeHint?, modelCached?, partial?, committed?, error?, level?}` |
+| `agent_stt_start` | `{model?: "fast"\|"balanced"\|"turbo", language?}` → same shape as status (`state:"listening"` on success). First use may download the Whisper ONNX weights (~60 MB for `fast`). |
+| `agent_stt_stop` | `{}` → status fields + `{text}` final transcript (committed segments joined). |
+| `agent_stt_cancel` | `{}` → status with `state:"idle"`; discards partial/committed audio without inserting text. |
+
+Env: `CHUDWARE_STT_MODEL` overrides the default model key (`fast`).
+
 ## 3. Sim worker (`engine/sim/worker.py`, separate process, spawned on demand)
 
 Same wire protocol. One job in flight; `job_id` correlates events.

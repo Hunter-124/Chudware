@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <nlohmann/json.hpp>
 
@@ -15,6 +16,14 @@
 namespace ui {
 namespace {
 
+// One bridge provider's cached windows. Keyed by bridge provider id because the composer and the
+// Settings Providers tab can be looking at different providers, and neither may blank the other.
+struct BridgeUsage {
+    std::vector<UsageWindow> windows;
+    double lastPoll = -1e9;
+    bool   inFlight = false;
+};
+
 struct UsageState {
     std::vector<UsageAccount> rows;
     std::map<std::string, UsageLoginProgress> login;
@@ -23,6 +32,8 @@ struct UsageState {
     bool   accountsInFlight = false;
     bool   usageInFlight    = false;
     bool   rpcMissing       = false;   // unknown_method → stop polling, degrade quietly
+    std::map<std::string, BridgeUsage> bridge;   // omp sidecar windows, by bridge provider id
+    bool   bridgeRpcMissing = false;   // agent_provider_state absent → stop asking the sidecar
     std::string lastError;
 };
 UsageState g;
@@ -48,6 +59,16 @@ nlohmann::json jobj(const nlohmann::json& obj, const char* key) {
     auto it = obj.find(key);
     return (it != obj.end() && it->is_object()) ? *it : nlohmann::json::object();
 }
+// A reset timestamp is ISO-8601 from the Python worker and a NUMBER of milliseconds since the
+// epoch from the omp bridge. Keep the wire value verbatim either way — the ms form is stored as
+// its decimal digits, and usageResetCountdown() tells the two apart.
+std::string jstamp(const nlohmann::json& obj, const char* key) {
+    auto it = obj.find(key);
+    if (it == obj.end()) return {};
+    if (it->is_string()) return it->get<std::string>();
+    if (it->is_number()) return std::to_string((long long)it->get<double>());
+    return {};
+}
 
 void parseUsageWindows(const nlohmann::json& src, UsageAccount& row) {
     row.usage.clear();
@@ -66,7 +87,7 @@ void parseUsageWindows(const nlohmann::json& src, UsageAccount& row) {
             w.usedFraction = (float)std::clamp(uf->get<double>(), 0.0, 1.0);
             w.hasFraction  = true;
         }
-        w.resetsAt = jstr(u, "resets_at");
+        w.resetsAt = jstamp(u, "resets_at");
         w.status   = jstr(u, "status");
         if (w.status.empty()) w.status = "unknown";
         row.usage.push_back(std::move(w));
@@ -113,6 +134,35 @@ void mergeUsageRows(const nlohmann::json& rows) {
     }
 }
 
+// `agent_provider_state`'s `usage.windows[]` → the same UsageWindow rows the subscription path
+// produces, so ONE renderer serves both sources. The bridge differs only in spelling: camelCase
+// keys, a "<provider>:<window>" id, and a numeric resetsAt.
+void parseBridgeWindows(const nlohmann::json& wins, std::vector<UsageWindow>& out) {
+    out.clear();
+    for (const auto& w : wins) {
+        if (!w.is_object()) continue;
+        UsageWindow uw;
+        // The shared model's `window` is the bare machine id ("5h"), which is what the compact
+        // ring caption derives from; the bridge prefixes it with the provider ("anthropic:5h").
+        uw.window = jstr(w, "id");
+        const std::size_t colon = uw.window.rfind(':');
+        if (colon != std::string::npos) uw.window.erase(0, colon + 1);
+        if (uw.window.empty()) uw.window = jstr(w, "windowLabel");
+        uw.label = jstr(w, "label");
+        if (uw.label.empty()) uw.label = jstr(w, "windowLabel");
+        if (uw.label.empty()) uw.label = uw.window.empty() ? "Usage" : uw.window;
+        auto uf = w.find("usedFraction");
+        if (uf != w.end() && uf->is_number()) {
+            uw.usedFraction = (float)std::clamp(uf->get<double>(), 0.0, 1.0);
+            uw.hasFraction  = true;
+        }
+        uw.resetsAt = jstamp(w, "resetsAt");
+        uw.status   = jstr(w, "status");
+        if (uw.status.empty()) uw.status = "unknown";
+        out.push_back(std::move(uw));
+    }
+}
+
 }  // namespace
 
 // ---- polling -----------------------------------------------------------------------------------
@@ -141,6 +191,39 @@ void providerUsagePollUsage(AppState& st, bool force) {
         if (!jbool(r.result, "ok", true)) return;   // soft failure (429 / outage): keep prior
         if (const auto* rows = jarr(r.result, "rows")) mergeUsageRows(*rows);
     });
+}
+
+void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool force) {
+    if (g.bridgeRpcMissing || !bridgeProviderId || !*bridgeProviderId) return;
+    const std::string id = bridgeProviderId;
+    BridgeUsage& slot = g.bridge[id];
+    const double now = ImGui::GetTime();
+    if (!force && (now - slot.lastPoll) < kUsageTtlSec) return;
+    if (slot.inFlight) return;
+    slot.lastPoll = now;
+    slot.inFlight = true;
+    st.rpc.call("agent_provider_state", nlohmann::json{{"provider", id}},
+                [id](const core::RpcResult& r) {
+        BridgeUsage& s = g.bridge[id];   // std::map: the slot taken above is still this one
+        s.inFlight = false;
+        if (!r.ok) {
+            // Same latch as subscription_usage: an absent method stops the polling for good,
+            // a transport blip just keeps the windows we already have.
+            const std::string& err = r.err;
+            if (err.find("unknown_method") != std::string::npos ||
+                err.find("unknown method") != std::string::npos ||
+                err.find("not found") != std::string::npos) {
+                g.bridgeRpcMissing = true;
+            }
+            return;
+        }
+        if (!r.result.is_object()) return;
+        if (!jbool(r.result, "ok", true)) return;   // signed out / upstream 429: keep prior
+        const nlohmann::json usage = jobj(r.result, "usage");
+        const auto* wins = jarr(usage, "windows");
+        if (!wins) return;   // no usage block, or notes only — keep the last good windows
+        parseBridgeWindows(*wins, s.windows);
+    }, 15000);   // auth_state fetches the usage report upstream (8s bridge-side cap)
 }
 
 void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
@@ -224,6 +307,7 @@ void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
 void providerUsageInvalidate() {
     g.lastAccountsPoll = -1e9;
     g.lastUsagePoll    = -1e9;
+    for (auto& kv : g.bridge) kv.second.lastPoll = -1e9;
 }
 
 // ---- reading -----------------------------------------------------------------------------------
@@ -256,6 +340,22 @@ const std::vector<UsageWindow>* activeAccountUsage(const std::string& subProvide
     return fallback;
 }
 
+const char* bridgeProviderForCad(int cadProvider) {
+    switch (cadProvider) {
+        case PROV_ANTHROPIC: return "anthropic";
+        case PROV_ZENMUX:    return "zenmux";
+        case PROV_KIMISUB:   return "kimi-code";
+        default: return nullptr;   // not bridge-routed: the subscription path serves it
+    }
+}
+
+const std::vector<UsageWindow>* bridgeProviderUsage(const std::string& bridgeProviderId) {
+    if (bridgeProviderId.empty()) return nullptr;
+    auto it = g.bridge.find(bridgeProviderId);
+    if (it == g.bridge.end() || it->second.windows.empty()) return nullptr;
+    return &it->second.windows;
+}
+
 // ---- shared presentation -------------------------------------------------------------------
 
 const float* usageStatusColor(const std::string& status, float frac) {
@@ -268,24 +368,33 @@ const float* usageStatusColor(const std::string& status, float frac) {
     return ui::palette.statusOk;
 }
 
-std::string usageResetCountdown(const std::string& iso) {
-    if (iso.empty()) return {};
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
-    if (std::sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 6) return {};
-    std::tm tm{};
-    tm.tm_year = y - 1900;
-    tm.tm_mon  = mo - 1;
-    tm.tm_mday = d;
-    tm.tm_hour = h;
-    tm.tm_min  = mi;
-    tm.tm_sec  = s;
+std::string usageResetCountdown(const std::string& stamp) {
+    if (stamp.empty()) return {};
+    long long delta = 0;
+    if (stamp.find_first_not_of("0123456789") == std::string::npos) {
+        // omp bridge form: milliseconds since the epoch, sent as a JSON number.
+        const long long ms = std::strtoll(stamp.c_str(), nullptr, 10);
+        if (ms <= 0) return {};
+        delta = ms / 1000 - (long long)std::time(nullptr);
+    } else {
+        int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+        if (std::sscanf(stamp.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 6)
+            return {};
+        std::tm tm{};
+        tm.tm_year = y - 1900;
+        tm.tm_mon  = mo - 1;
+        tm.tm_mday = d;
+        tm.tm_hour = h;
+        tm.tm_min  = mi;
+        tm.tm_sec  = s;
 #if defined(_WIN32)
-    const time_t target = _mkgmtime(&tm);
+        const time_t target = _mkgmtime(&tm);
 #else
-    const time_t target = timegm(&tm);
+        const time_t target = timegm(&tm);
 #endif
-    if (target == (time_t)-1) return {};
-    long long delta = (long long)(target - std::time(nullptr));
+        if (target == (time_t)-1) return {};
+        delta = (long long)(target - std::time(nullptr));
+    }
     if (delta <= 0) return "resets soon";
     const long long days = delta / 86400;
     delta %= 86400;

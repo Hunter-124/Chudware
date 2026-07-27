@@ -14,17 +14,26 @@
  *   -> {"id": <number>, "method": <string>, "params": <object>}
  *   <- {"id": <number>, "ok": true,  "result": <object>}
  *   <- {"id": <number>, "ok": false, "error": {"message": <string>, "status"?: <number>}}
+ *   <- {"id": <number>, "event": <string>, "data": <object>}   (notification; no "ok" member)
+ *
+ * Notification frames are opt-in per request and always precede that id's response line, which
+ * is unchanged. Today the only one is `complete` streaming: pass `stream: true` and each
+ * text/thinking fragment arrives as {"id": <same id>, "event": "delta", "data": {"text"|
+ * "thinking": <chunk>}} — INCREMENTAL fragments, while the final result still carries the FULL
+ * accumulated text. Without `stream: true` the stdout byte stream is exactly what it was before.
  *
  * Methods: ping | listProviders | listModels{provider} | complete{provider,model,apiKey?,
- * baseUrl?,system?,messages,maxTokens?} | models_list{provider?} | cost_summary{events?} |
+ * baseUrl?,system?,messages,maxTokens?,stream?} | models_list{provider?} | cost_summary{events?} |
  * auth_list_providers | auth_state{provider?} | auth_validate_key{provider,apiKey} |
  * auth_set_key{provider,apiKey} | auth_remove_key{provider,account?} |
  * auth_logout{provider,account?} | auth_begin_oauth{provider} | auth_oauth_poll{handle} |
  * auth_oauth_manual{handle,code} | auth_oauth_cancel{handle} | memory_remember{root,content,
  * kind?,source?,importance?} | memory_recall{root,query,limit?,tokenBudget?,kind?} |
- * memory_stats{root} | compact{messages,keepRecentTokens?,priorArchive?,mode?}. Auth/model/
+ * memory_stats{root} | compact{messages,keepRecentTokens?,priorArchive?,mode?} |
+ * stt_status | stt_start{model?,language?} | stt_stop | stt_cancel. Auth/model/
  * cost methods are implemented in the sibling json.ts/models.ts/auth-context.ts/oauth-flow.ts
- * modules; memory_* and compact live in memory.ts/compact.ts. All are wired in through dispatch()
+ * modules; memory_* and compact live in memory.ts/compact.ts; stt_* reuses OMP's pi-natives
+ * AudioCapture + Whisper ASR approach under ./stt/. All are wired in through dispatch()
  * below; see those files for the OMP surface each one reuses.
  *
  * NOTE: `stream().result()` resolves (does not throw) on provider HTTP errors — the error is
@@ -54,10 +63,23 @@ import { asObject, str, type Json } from "./json";
 import { handleMemoryRecall, handleMemoryRemember, handleMemoryStats } from "./memory";
 import { handleCostSummary, handleModelsList, modelInfo, resolveModel, type ProviderId } from "./models";
 import { handleAuthBeginOAuth, handleAuthOAuthCancel, handleAuthOAuthManual, handleAuthOAuthPoll } from "./oauth-flow";
+import { handleSttCancel, handleSttStart, handleSttStatus, handleSttStop } from "./stt";
 
 function log(...args: unknown[]): void {
 	process.stderr.write(args.map(String).join(" ") + "\n");
 }
+
+/** The ONLY stdout writer: one newline-delimited JSON frame (a response or a notification). */
+function writeFrame(frame: Json): void {
+	process.stdout.write(JSON.stringify(frame) + "\n");
+}
+
+/**
+ * Per-request notification sink handed to dispatch(). Writes {"id","event","data"} lines on the
+ * request's own id, ahead of its response line. Handlers only reach for it when the caller opted
+ * in (e.g. `complete` with `stream: true`); everything else leaves stdout byte-identical.
+ */
+type Notify = (event: string, data: Json) => void;
 
 interface CadPart {
 	type: "text" | "image";
@@ -176,7 +198,7 @@ const EFFORT_BY_NAME: Readonly<Record<string, Effort>> = {
 	max: Effort.Max,
 };
 
-async function handleComplete(params: Json): Promise<Json> {
+async function handleComplete(params: Json, notify: Notify): Promise<Json> {
 	const provider = str(params.provider);
 	const modelId = str(params.model);
 	if (!provider || !modelId) throw new Error("complete requires provider and model");
@@ -199,7 +221,21 @@ async function handleComplete(params: Json): Promise<Json> {
 	if (reasoning !== undefined) options.reasoning = reasoning;
 	else if (effort === "off" || effort === "none" || effort === "") options.disableReasoning = true;
 
-	const result = await streamSimple(model, context, options).result();
+	const events = streamSimple(model, context, options);
+	// Opt-in live delivery. streamSimple returns an AssistantMessageEventStream — an
+	// AsyncIterable of AssistantMessageEvent (packages/ai/src/utils/event-stream.ts:106) — and
+	// result() settles independently off the terminal done/error event (event-stream.ts:170-174),
+	// so draining the iterator and awaiting result() are complementary, not exclusive.
+	// text_delta/thinking_delta carry INCREMENTAL fragments; *_end carries the accumulated text
+	// and is deliberately skipped so the caller never sees a chunk twice. Non-streaming callers
+	// don't iterate at all — the events just queue, exactly as they always have.
+	if (params.stream === true) {
+		for await (const event of events) {
+			if (event.type === "text_delta") notify("delta", { text: event.delta });
+			else if (event.type === "thinking_delta") notify("delta", { thinking: event.delta });
+		}
+	}
+	const result = await events.result();
 	return collapse(result);
 }
 
@@ -257,7 +293,7 @@ async function handleProviderLogo(params: Json): Promise<Json> {
 	return { ok: false, domain, message: "no icon found" };
 }
 
-async function dispatch(method: string, params: Json): Promise<Json> {
+async function dispatch(method: string, params: Json, notify: Notify): Promise<Json> {
 	switch (method) {
 		case "ping":
 			return { pong: true, bun: globalThis.Bun?.version ?? "unknown" };
@@ -270,7 +306,7 @@ async function dispatch(method: string, params: Json): Promise<Json> {
 			return { models: getBundledModels(provider as ProviderId).map(modelInfo) };
 		}
 		case "complete":
-			return handleComplete(params);
+			return handleComplete(params, notify);
 		case "warm_cache":
 			return handleWarmCache(params);
 		case "cache_policy":
@@ -309,6 +345,14 @@ async function dispatch(method: string, params: Json): Promise<Json> {
 			return handleMemoryStats(params);
 		case "compact":
 			return handleCompact(params);
+		case "stt_status":
+			return handleSttStatus(params);
+		case "stt_start":
+			return handleSttStart(params);
+		case "stt_stop":
+			return handleSttStop(params);
+		case "stt_cancel":
+			return handleSttCancel(params);
 		default:
 			throw new Error(`unknown method: ${method}`);
 	}
@@ -343,8 +387,9 @@ async function main(): Promise<void> {
 		try {
 			const req = asObject(JSON.parse(trimmed));
 			id = req.id ?? null;
-			const result = await dispatch(str(req.method), asObject(req.params));
-			process.stdout.write(JSON.stringify({ id, ok: true, result }) + "\n");
+			const notify: Notify = (event, data) => writeFrame({ id, event, data });
+			const result = await dispatch(str(req.method), asObject(req.params), notify);
+			writeFrame({ id, ok: true, result });
 		} catch (err: unknown) {
 			// `in` + typeof narrowing (no inline cast): read message/status only when present.
 			let message = String(err);
@@ -354,7 +399,7 @@ async function main(): Promise<void> {
 				if ("status" in err && typeof err.status === "number") error.status = err.status;
 			}
 			error.message = message;
-			process.stdout.write(JSON.stringify({ id, ok: false, error }) + "\n");
+			writeFrame({ id, ok: false, error });
 		}
 	}
 }

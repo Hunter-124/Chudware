@@ -301,28 +301,24 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     ImGui::Dummy(ImVec2(0, ui::metrics::px(4.0f)));
 }
 
-// The "running" pill drawn just after a session row's title. Shared by the current-doc
-// Sessions rows and the "Other sessions" (background, other-document) rows so both read
-// identically. `x` is the left edge of the pill in screen space.
-static void drawSessionRunningBadge(ImDrawList* dl, const ui::AdaptiveSurface& surf,
-                                    float x, float titleY, float titleH, float sc) {
-    const char* badge = "running";
-    const ImVec2 bsz = ImGui::CalcTextSize(badge);
-    const float by0 = titleY + (titleH - bsz.y) * 0.5f - 1.0f * sc;
-    const float bx1 = x + bsz.x + 8.0f * sc;
-    const float by1 = by0 + bsz.y + 2.0f * sc;
-    ImVec4 acc = semanticOnGlass(ui::palette.accent, surf);
-    acc.w = 0.22f;
-    dl->AddRectFilled(ImVec2(x, by0), ImVec2(bx1, by1),
-                      ImGui::ColorConvertFloat4ToU32(acc), ui::metrics::cpMenuChipRound());
+// In-flight marker for a session row: the brand tesseract spinner at the row's left edge,
+// animated by the same per-frame repaint that streams the run itself. Returns the extra
+// x-indent title/subtitle text must use to clear the icon. Shared by the current-doc
+// Sessions rows and the "Other sessions" rows so both read identically.
+static float drawSessionRunningIcon(ImDrawList* dl, const ui::AdaptiveSurface& surf,
+                                    const ImVec2& rowMin, float rowH, float padX, float sc) {
+    const float sz = std::max(ui::kTesseractSpinnerMinPx, rowH - 14.0f * sc);
+    const ImVec2 center(rowMin.x + padX + sz * 0.5f, rowMin.y + rowH * 0.5f);
     ImVec4 accInk = semanticOnGlass(ui::palette.accent, surf);
     accInk.w = 1.0f;
-    dl->AddText(ImVec2(x + 4.0f * sc, by0 + 1.0f * sc),
-                ImGui::ColorConvertFloat4ToU32(accInk), badge);
+    ui::drawTesseractSpinner(dl, center, sz, ImGui::GetTime(),
+                             ImGui::ColorConvertFloat4ToU32(accInk));
+    return sz + 6.0f * sc;  // icon box + gap before the text
 }
 
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
 void drawSessionsPanel(AppState& st, bool busy) {
+    (void)busy;  // runs are per-conversation; this panel never locks on the viewed run
     const float sc = ui::uiScale;
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -339,7 +335,9 @@ void drawSessionsPanel(AppState& st, bool busy) {
     // primaryButton rather than the theme's default slab (which rendered as a flat dark block
     // that read as a disabled panel over the light glass). Return to chat via the header Chat
     // button (Sessions stays labeled "Sessions" — no "< Chat" rename that reflows the header).
-    if (busy) ImGui::BeginDisabled();
+    // New-session stays enabled while a run is active: runs are per-conversation (st.runs)
+    // and park/restore keeps them streaming in the background, so starting or switching
+    // sessions mid-run is safe — this is the multi-session workflow.
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
     if (primaryButton("+ New session", ImVec2(-1, 0))) {
         newConversation(st);
@@ -348,7 +346,6 @@ void drawSessionsPanel(AppState& st, bool busy) {
         st.showSessionsPicker = false;  // land in the new chat, not stuck on the list
     }
     ImGui::PopStyleVar();
-    if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
@@ -393,8 +390,11 @@ void drawSessionsPanel(AppState& st, bool busy) {
         ++shownIdx;
         std::string title = c.title.empty() ? ("Chat " + std::to_string(shownIdx)) : c.title;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
-        // Truthful per-session state: this conversation's own run, not a global flag.
-        const bool running = st.convRunning(c.id);
+        // Truthful per-session state: this conversation's own run, not a global flag. The
+        // trailing-message scan catches one-shot RPC turns (agent_ask_v2 …) that never get
+        // a JobState in st.runs.
+        const bool running = st.convRunning(c.id) ||
+            (!msgs.empty() && !msgs.back().fromUser && msgs.back().running);
         bool active = (i == st.activeConv);
 
         char sub[96];
@@ -418,7 +418,9 @@ void drawSessionsPanel(AppState& st, bool busy) {
         bool picked = ImGui::InvisibleButton("##pickconv",
                                             ImVec2(std::max(1.0f, rowW - actionsW - padX), rowH));
         bool rowHov = ImGui::IsItemHovered();
-        if (picked && !busy) {
+        // Picking stays live during a run (multi-session): switching parks the viewed
+        // conversation; its run keeps streaming into it in the background.
+        if (picked) {
             // Always land in chat for the chosen session — including re-clicking
             // the already-active one (switchConversation early-returns on same idx).
             if (i != st.activeConv)
@@ -472,17 +474,17 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // the card, under the scrollbar and off the column edge. Clip both to the room they
         // actually have (title also yields the action-button zone) with a real ellipsis.
         const float titleY = rowMin.y + padY;
-        const float textMaxW = std::max(ui::metrics::px(24.0f), rowW - padX * 2.0f - actionsW);
+        // In-flight sessions get the animated tesseract icon at the row's left edge; text
+        // indents past it only for those rows.
+        const float runIndent = running ? drawSessionRunningIcon(dl, surf, rowMin, rowH, padX, sc)
+                                        : 0.0f;
+        const float textMaxW = std::max(ui::metrics::px(24.0f),
+                                        rowW - padX * 2.0f - actionsW - runIndent);
         const std::string titleShown = artiEllipsize(title, textMaxW);
         ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
-        dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, titleShown.c_str());
-        if (running)
-            drawSessionRunningBadge(dl, surf,
-                                    rowMin.x + padX +
-                                        ImGui::CalcTextSize(titleShown.c_str()).x + 8.0f * sc,
-                                    titleY, titleH, sc);
+        dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, titleShown.c_str());
 
-        dl->AddText(ImVec2(rowMin.x + padX, titleY + titleH + 2.0f * sc),
+        dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY + titleH + 2.0f * sc),
                     ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
                     artiEllipsize(sub, std::max(ui::metrics::px(24.0f),
                                                 rowW - padX * 2.0f)).c_str());
@@ -500,7 +502,9 @@ void drawSessionsPanel(AppState& st, bool busy) {
                 ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(img, img), trash.uv0, trash.uv1)
                 : ImGui::SmallButton("x");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this session");
-            doDel = del && !busy;
+            // Destructive row actions are blocked only for the row whose own run is live —
+            // an unrelated background run never locks them.
+            doDel = del && !running;
 
             const float archX = delX - archBtnW - actionGap;
             ImGui::SetCursorScreenPos(ImVec2(archX, rowMin.y + (rowH - btnH) * 0.5f));
@@ -510,7 +514,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
                     ? "Restore to the active sessions list"
                     : "Archive: hides from the default list but keeps the full transcript "
                       "(unlike Delete). Toggle \"Show archived\" above to find it again.");
-            doArchiveToggle = archClick && !busy;
+            doArchiveToggle = archClick && !running;
         }
 
         ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
@@ -533,6 +537,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         int nConvs = 0;
     };
     std::vector<OtherSess> others;
+    std::vector<std::string> staleEmptyKeys;
     {
         nlohmann::json root = nlohmann::json::object();
         try {
@@ -572,12 +577,25 @@ void drawSessionsPanel(AppState& st, bool busy) {
                     if (!o.snippet.empty()) break;
                 }
                 if (o.snippet.size() > 60) o.snippet = o.snippet.substr(0, 57) + "...";
-                // Skip totally empty orphan buckets.
-                if (o.nConvs == 0 && o.snippet.empty()) continue;
+                // Fresh sessions are never kept: a bucket whose conversations are ALL empty
+                // (no messages at all) is junk left by older builds — drop it from the list
+                // and queue it for removal from disk below.
+                bool anyContent = !o.snippet.empty();
+                for (const auto& jc : convs) {
+                    if (anyContent) break;
+                    if (!jc.value("msgs", nlohmann::json::array()).empty()) anyContent = true;
+                }
+                if (!anyContent) {
+                    if (o.nConvs > 0) staleEmptyKeys.push_back(k);
+                    continue;
+                }
                 others.push_back(std::move(o));
             }
         }
     }
+    // One-shot cleanup of the all-empty buckets found above (fire-and-forget; the write is
+    // atomic and never touches the active doc key).
+    if (!staleEmptyKeys.empty()) eraseChatHistoryKeys(staleEmptyKeys);
     if (!others.empty()) {
         // Group chrome from the SHARED cpMenuSection (section gap + dim label + hairline) rather
         // than a hand-rolled header, so this group is literally the same widget as the Artifacts
@@ -661,7 +679,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
             bool picked = ImGui::InvisibleButton("##pickother",
                                                 ImVec2(std::max(1.0f, rowW - trashSz - padX), rowH));
             bool rowHov = ImGui::IsItemHovered();
-            if (picked && !busy) {
+            if (picked) {
                 // Read-only browse: load that key's sessions into view and pin so
                 // syncChatToDoc doesn't immediately bounce back to the live doc key.
                 if (!st.chatDocKey.empty()) persistChatHistory(st);
@@ -674,22 +692,19 @@ void drawSessionsPanel(AppState& st, bool busy) {
             float wash = rowHov ? 0.42f : 0.22f;
             ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, (oi % 2) == 1, false, wash);
             const float titleY = rowMin.y + padY;
-            // Same clip rule as the active-doc rows: draw-list text does not respect the card.
-            const float oTextMaxW =
-                std::max(ui::metrics::px(24.0f), rowW - padX * 2.0f - trashSz);
-            const std::string oLabelShown = artiEllipsize(o.label, oTextMaxW);
-            ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
-            dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, oLabelShown.c_str());
             // Disk JSON can't say "running now" — cross-reference the resident conversation
             // set, which keeps background runs from other document keys alive in-process.
             bool otherRunning = false;
             for (const Conversation& rc : st.conversations)
                 if (rc.docKey == o.key && st.convRunning(rc.id)) { otherRunning = true; break; }
-            if (otherRunning)
-                drawSessionRunningBadge(dl, surf,
-                                        rowMin.x + padX +
-                                            ImGui::CalcTextSize(oLabelShown.c_str()).x + 8.0f * sc,
-                                        titleY, titleH, sc);
+            const float runIndent = otherRunning
+                ? drawSessionRunningIcon(dl, surf, rowMin, rowH, padX, sc) : 0.0f;
+            // Same clip rule as the active-doc rows: draw-list text does not respect the card.
+            const float oTextMaxW =
+                std::max(ui::metrics::px(24.0f), rowW - padX * 2.0f - trashSz - runIndent);
+            const std::string oLabelShown = artiEllipsize(o.label, oTextMaxW);
+            ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+            dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, oLabelShown.c_str());
             char sub[160];
             if (!o.snippet.empty())
                 std::snprintf(sub, sizeof(sub), "%s", o.snippet.c_str());
@@ -697,10 +712,10 @@ void drawSessionsPanel(AppState& st, bool busy) {
                 std::snprintf(sub, sizeof(sub), "1 session");
             else
                 std::snprintf(sub, sizeof(sub), "%d sessions", o.nConvs);
-            dl->AddText(ImVec2(rowMin.x + padX, titleY + titleH + 2.0f * sc),
+            dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY + titleH + 2.0f * sc),
                         ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
                         artiEllipsize(sub, std::max(ui::metrics::px(24.0f),
-                                                    rowW - padX * 2.0f)).c_str());
+                                                    rowW - padX * 2.0f - runIndent)).c_str());
 
             // Per-row delete — same trash affordance as active-doc conversations.
             bool doDel = false;

@@ -1834,6 +1834,24 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             // persistence, no network.
             return emit(omp_bridge_proxy("cost_summary", params), out_json, 0);
         }
+        // OMP ASR sidecar (vendor/omp/bridge/src/stt) — pi-natives AudioCapture + Whisper.
+        // Copilot composer drives these via st.rpc; missing deps return available:false.
+        if (m == "agent_stt_status") {
+            return emit(omp_bridge_proxy("stt_status", params.is_object() ? params : json::object()),
+                        out_json, 0);
+        }
+        if (m == "agent_stt_start") {
+            return emit(omp_bridge_proxy("stt_start", params.is_object() ? params : json::object()),
+                        out_json, 0);
+        }
+        if (m == "agent_stt_stop") {
+            return emit(omp_bridge_proxy("stt_stop", params.is_object() ? params : json::object()),
+                        out_json, 0);
+        }
+        if (m == "agent_stt_cancel") {
+            return emit(omp_bridge_proxy("stt_cancel", params.is_object() ? params : json::object()),
+                        out_json, 0);
+        }
         if (m == "agent_cap_raw") {
             std::string text = params.value("text", std::string());
             return emit(json{{"capped", chudware::agent::cap_raw(text)}}, out_json, 0);

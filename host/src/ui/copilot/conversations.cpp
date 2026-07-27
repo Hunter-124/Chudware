@@ -357,6 +357,9 @@ static nlohmann::json planStateToJson(const PlanState& ps) {
     return j;
 }
 
+// Defined near the lifecycle functions below.
+static bool conversationIsFresh(const AppState& st, int idx);
+
 // Persist EVERY resident conversation, grouped by its OWN docKey — never just the currently
 // viewed one. A background conversation on a different document keeps mutating independently
 // of what's on screen (that's the whole point of the fix), so its progress must be just as
@@ -420,7 +423,10 @@ void persistChatHistory(AppState& st) {
     int localActive = 0;
     for (int gi = 0; gi < (int)groupIdxs.size(); ++gi) {
         const int i = groupIdxs[gi];
-        if (i == st.activeConv) localActive = gi;
+        // Fresh sessions (no messages, no queue, no run) are never written — same rule as
+        // empty parts never autosaving.
+        if (conversationIsFresh(st, i)) continue;
+        if (i == st.activeConv) localActive = (int)convs.size();
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
         nlohmann::json jm = nlohmann::json::array();
         for (const auto& m : msgs) {
@@ -548,6 +554,8 @@ void persistChatHistory(AppState& st) {
         convs.push_back(std::move(convObj));
     }
     // Load-modify-write: only replace THIS doc key; every other key on disk stays intact.
+    // A group that filtered down to nothing (all sessions fresh) drops the key entirely.
+    if (convs.empty()) { root.erase(key); continue; }
     root[key] = {{"active", localActive}, {"conversations", convs}};
     }  // end for (key : orderedKeys)
     // Rekey migration cleanup: drop the pre-autosave doc:<id> key once the entry lives at file:.
@@ -813,6 +821,9 @@ static void applyChatEntry(AppState& st, const std::string& key, const nlohmann:
             for (const auto& q : jc["queued_prompts"])
                 if (q.is_string()) c.queuedPrompts.push_back(q.get<std::string>());
         }
+        // Fresh sessions are never kept (same rule as persist) — drop legacy empty entries
+        // left on disk by older builds instead of resurrecting them.
+        if (c.msgs.empty() && c.queuedPrompts.empty()) continue;
         st.conversations.push_back(std::move(c));
     }
     if ((int)st.conversations.size() == base) {
@@ -1089,6 +1100,34 @@ static void clearComposerState(AppState& st) {
     st.contextPickActive = false;
 }
 
+// A session with nothing in it: no messages, no queued prompts, no live run. Mirrors the
+// "never autosave an empty part" rule (featureTreeSaveDocToPath) — fresh sessions are
+// disposable and must never accumulate in the list or on disk.
+static bool conversationIsFresh(const AppState& st, int idx) {
+    if (idx < 0 || idx >= (int)st.conversations.size()) return false;
+    const Conversation& c = st.conversations[idx];
+    const bool active = (idx == st.activeConv);
+    const std::vector<ChatMsg>& msgs = active ? st.chat : c.msgs;
+    const auto& queued = active ? st.queuedPrompts : c.queuedPrompts;
+    // The composer's unsent draft is content too — a session the user is typing into is
+    // not fresh.
+    if (active && st.prompt[0] != 0) return false;
+    return msgs.empty() && queued.empty() && !st.convRunning(c.id);
+}
+
+// Drop the ACTIVE conversation when it is still fresh (see above), fixing up activeConv.
+// Returns true when it erased — callers then skip parking (there was nothing to park).
+static bool discardActiveConversationIfFresh(AppState& st) {
+    if (!conversationIsFresh(st, st.activeConv)) return false;
+    freeChatTextures(st.chat);
+    st.chat.clear();
+    st.lastContextTokens = 0;
+    st.queuedPrompts.clear();
+    st.conversations.erase(st.conversations.begin() + st.activeConv);
+    st.activeConv = -1;  // callers set the new active index right after
+    return true;
+}
+
 void parkActiveConversation(AppState& st) {
     if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
     // Keep in-progress prompt + chips for this session on disk before parking.
@@ -1132,7 +1171,10 @@ bool activeConversationRunning(AppState& st) {
 
 void newConversation(AppState& st) {
     ensureConversations(st);
-    parkActiveConversation(st);  // force-saves old draft
+    // A fresh outgoing session is replaced, not parked — "+ New session" from an untouched
+    // chat must not accumulate "Chat 1, Chat 2, …" empties in the list or on disk.
+    if (!discardActiveConversationIfFresh(st))
+        parkActiveConversation(st);  // force-saves old draft
     Conversation c;
     c.id = newConvId(st);
     c.title = "Chat " + std::to_string((int)st.conversations.size() + 1);
@@ -1142,12 +1184,18 @@ void newConversation(AppState& st) {
     st.showSessionsPicker = false;
     clearComposerState(st);
     clearPromptDraft(st);  // new empty session has no draft
-    persistChatHistory(st);
+    // No persist: a fresh session carries no state worth writing. It reaches disk with the
+    // first real message via the dirty-flag path (maybePersistChatHistoryDebounced).
 }
 
 void switchConversation(AppState& st, int idx) {
     if (idx == st.activeConv || idx < 0 || idx >= (int)st.conversations.size()) return;
-    parkActiveConversation(st);  // force-saves draft + parks chat (incl. running msgs)
+    // Same fresh-session rule as newConversation: never park an empty session.
+    const int oldActive = st.activeConv;
+    if (!discardActiveConversationIfFresh(st))
+        parkActiveConversation(st);  // force-saves draft + parks chat (incl. running msgs)
+    else if (idx > oldActive)
+        --idx;  // erase shifted the target down
     st.activeConv = idx;
     st.chatDocKey = st.conversations[idx].docKey;  // keep the invariant: chatDocKey == viewed
                                                    // conversation's docKey, even if a future

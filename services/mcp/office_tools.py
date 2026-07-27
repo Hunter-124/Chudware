@@ -4,8 +4,11 @@ Reuses the already-pinned deliverables-pack libraries (python-pptx, openpyxl, py
 pypdfium2 — see requirements.txt "deliverables pack" block) against arbitrary EXISTING files,
 not just fresh templates, plus pypdf (BSD-3, new dep) for PDF page-level edits pypdfium2 can't
 do, and the LibreOffice-headless subprocess bridge already wired for
-``services/deliverables/engines.py::office_to_pdf`` for legacy .doc round-trips. No new
-in-process parser is written for any format.
+``services/deliverables/engines.py::office_to_pdf`` for legacy .doc round-trips.
+
+Read path prefers ``office_oxide`` (https://github.com/yfedoseev/office_oxide — MIT/Apache-2.0,
+pip ``office-oxide``) for fast native text extraction when installed; falls back to the Python
+libs above. No new in-process parser is written for any format.
 
 Envelope: ``{ok:true, …}`` | ``{ok:false, reason, hint}`` — never a traceback (mirrors
 plm_tools.py's ``_err``/``_ok``). Every tool lazily imports its backing library per call so the
@@ -289,21 +292,81 @@ def _extract_doc(path: str) -> dict:
 
 # --------------------------------------------------------------------------- frozen shared extraction
 
+_OXIDE_KINDS = frozenset({"docx", "doc", "pptx", "ppt", "xlsx", "xls", "xlsm"})
+
+
+def _extract_via_office_oxide(path: str, kind: str) -> dict | None:
+    """Prefer office_oxide (https://github.com/yfedoseev/office_oxide) for text extract.
+
+    Returns a contract-shaped dict on success, or None to fall through to the
+    python-docx/openpyxl/python-pptx path (missing wheel, unsupported kind, or
+    extract failure). Spreadsheet ``sheets`` structured payload is left to the
+    openpyxl path — oxide only supplies flattened ``text`` / markdown here.
+    """
+    if kind not in _OXIDE_KINDS:
+        return None
+    try:
+        from office_oxide import Document, extract_text, to_markdown  # noqa: PLC0415
+    except ImportError:
+        return None
+    try:
+        text = ""
+        # Prefer markdown when available (tables read better for the agent).
+        try:
+            text = to_markdown(path) or ""
+        except Exception:  # noqa: BLE001
+            text = ""
+        if not text.strip():
+            try:
+                text = extract_text(path) or ""
+            except Exception:  # noqa: BLE001
+                text = ""
+        if not text.strip():
+            with Document.open(path) as doc:
+                text = (doc.to_markdown() if hasattr(doc, "to_markdown") else "") or ""
+                if not text.strip():
+                    text = (doc.plain_text() if hasattr(doc, "plain_text") else "") or ""
+        if not text.strip():
+            return None
+        # Map legacy ppt/xls kinds onto the contract vocabulary the host expects.
+        out_kind = kind
+        if kind == "ppt":
+            out_kind = "pptx"
+        elif kind == "xls":
+            out_kind = "xlsx"
+        return {"ok": True, "kind": out_kind, "text": text, "engine": "office_oxide"}
+    except Exception:  # noqa: BLE001 — never raise out of extract_office
+        return None
+
+
 def extract_office(path: str) -> dict:
     """Read-only text/structure extraction, dispatched by file extension. FROZEN contract
     (contracts/office.md): both the ``office_extract`` MCP tool and the ``office_extract``
     worker RPC (services/agent/worker_rpc.py) call this exact function, so the read logic
     lives exactly once.
 
-    Returns ``{ok, kind, text, sheets?}`` — ``kind`` in {pptx,xlsx,xlsm,csv,pdf,doc,docx};
-    ``sheets`` present only for xlsx/xlsm (``[{name, rows:[[...]]}]``). Never raises — every
-    failure is an ``{ok:false, reason, hint}`` dict.
+    Prefers ``office_oxide`` (native) for Office formats when installed; falls back to
+    python-pptx / openpyxl / python-docx / LibreOffice. Returns
+    ``{ok, kind, text, sheets?}`` — ``kind`` in {pptx,xlsx,xlsm,csv,pdf,doc,docx};
+    ``sheets`` present only for xlsx/xlsm (``[{name, rows:[[...]]}]``). Never raises —
+    every failure is an ``{ok:false, reason, hint}`` dict.
     """
     kind = _kind_for(path)
+    oxide = _extract_via_office_oxide(path, kind)
+    # Spreadsheets still need the structured sheets payload for the host docs panel —
+    # oxide text is a fine preview, but keep openpyxl for xlsx/xlsm when available.
+    if oxide is not None and kind not in ("xlsx", "xlsm"):
+        return oxide
     if kind == "pptx":
         return _extract_pptx(path)
     if kind in ("xlsx", "xlsm"):
-        return _extract_xlsx(path, keep_vba=(kind == "xlsm"))
+        result = _extract_xlsx(path, keep_vba=(kind == "xlsm"))
+        # Attach oxide text as a richer `text` when openpyxl succeeded but text is thin.
+        if result.get("ok") and oxide is not None and oxide.get("text"):
+            result = dict(result)
+            result["text"] = oxide["text"]
+            result["engine"] = "office_oxide+openpyxl"
+        return result
     if kind == "csv":
         return _extract_csv(path)
     if kind == "pdf":

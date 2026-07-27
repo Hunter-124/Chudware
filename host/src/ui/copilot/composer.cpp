@@ -1,8 +1,9 @@
 // Copilot composer (T-RF6 split of legacy_chat.cpp): the auto-growing wrapping chat input,
 // file attachments + context refs, design/mission run launch, the session slash commands
-// (/compact /shake /handoff /btw /prewalk), the submitTurn send path, and the composer chrome
-// (runtime banner, Agent/Plan/Swarm/Edit/Ask prelude + context/provider-limit gauge rings,
-// graduated segmented toolbar, in-box send/stop).
+// (/compact /shake /handoff /btw /prewalk /skills /help), slash-menu autocomplete (commands +
+// skills), the submitTurn send path, and the composer chrome (runtime banner, Agent/Plan/
+// Swarm/Edit/Ask prelude + context/provider-limit gauge rings, graduated segmented toolbar,
+// in-box send/stop).
 
 #include "copilot_internal.h"
 #include "ui/provider_usage.h"   // THE subscription-usage poller behind the prelude's limit rings
@@ -40,14 +41,33 @@ bool rewrapInPlace(char* buf, int len, float wrapW) {
     return changed;
 }
 namespace {
-struct ChatInputCb { float wrapW = 0.0f; };
+struct ChatInputCb {
+    float wrapW = 0.0f;
+    bool  interceptHistory = false;  // slash menu open — eat Up/Down for menu nav
+    int*  navDelta = nullptr;        // -1 Up / +1 Down when interceptHistory
+};
+// Set by drawComposer when the slash autocomplete is open so drawChatInput routes Up/Down
+// to the menu instead of moving the caret. Clarify cards (cards.cpp) leave this false.
+bool g_slashMenuActive = false;
+int  g_slashNavDelta = 0;
 }  // namespace
 
 
 namespace {
 int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
+    auto* cb = static_cast<ChatInputCb*>(data->UserData);
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory && cb->interceptHistory) {
+        // Steal Up/Down from the multiline caret so the slash menu can navigate.
+        if (data->EventKey == ImGuiKey_UpArrow) {
+            if (cb->navDelta) *cb->navDelta -= 1;
+            return 1;
+        }
+        if (data->EventKey == ImGuiKey_DownArrow) {
+            if (cb->navDelta) *cb->navDelta += 1;
+            return 1;
+        }
+    }
     if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
-        auto* cb = static_cast<ChatInputCb*>(data->UserData);
         if (rewrapInPlace(data->Buf, data->BufTextLen, cb->wrapW))
             data->BufDirty = true;   // same length, so BufTextLen/CursorPos are unchanged
     }
@@ -79,11 +99,19 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     if (rows > maxLines) rows = maxLines;
     const float h = lineH * (float)rows + style.FramePadding.y * 2.0f;
 
+    g_slashNavDelta = 0;
     ChatInputCb cb;
     cb.wrapW = wrapW;
+    cb.interceptHistory = g_slashMenuActive;
+    cb.navDelta = &g_slashNavDelta;
+    ImGuiInputTextFlags flags = ImGuiInputTextFlags_CallbackEdit;
+    if (g_slashMenuActive) {
+        // Enter accepts a slash pick (handled by the menu) — don't insert a newline into the token.
+        flags |= ImGuiInputTextFlags_CallbackHistory | ImGuiInputTextFlags_CtrlEnterForNewLine;
+    }
     ImGui::InputTextMultiline(id, buf.data(), buf.size(),
         ImVec2(rightReserve > 0.0f ? -rightReserve : -1.0f, h),
-        ImGuiInputTextFlags_CallbackEdit, chatInputEditCallback, &cb);
+        flags, chatInputEditCallback, &cb);
     s_activeLast[wid] = ImGui::IsItemActive();
     // Enter sends, Shift+Enter does not. Detect the KEY (not a trailing '\n') so a newline the
     // rewrap just inserted can never be mistaken for a submit.
@@ -107,19 +135,25 @@ namespace ui {
 
 // ---- O1: model picker → RPC payload threading --------------------------------------------------
 // Canonical provider NAME for the core's resolve_provider(name, cfg, env) from the GUI enum.
-// PROV_LOCAL / PROV_CLOUDCOMPAT resolve as "openai" descriptors — the base_url (persisted to
-// config.json by saveSettings immediately before every send) discriminates local vs cloud.
+// PROV_LOCAL resolves as an "openai" descriptor — the base_url (persisted to config.json by
+// saveSettings immediately before every send) discriminates local vs cloud. PROV_CLOUDCOMPAT is
+// a SHARED slot serving many services; this returns only its generic fallback, and
+// agentProviderOverride refines it to the real service via ui::cloudServiceKey(base_url).
 static const char* providerWireName(int provider) {
     switch (provider) {
         case ui::PROV_ANTHROPIC:   return "anthropic";
         case ui::PROV_LOCAL:       return "openai";  // base_url discriminates (loopback)
         case ui::PROV_OPENAI:
-        case ui::PROV_CLOUDCOMPAT: return "openai";  // moonshot override happens in agentProviderOverride
+        case ui::PROV_CLOUDCOMPAT: return "openai";  // cloud slot refined in agentProviderOverride
         case ui::PROV_LLAMACPP:    return "llamacpp";
         case ui::PROV_GEMINI:      return "gemini";
         case ui::PROV_XAI:         return "xai";  // saveSettings rewrites to xai-sub when no key
         case ui::PROV_CURSOR:      return "cursor";
-        case ui::PROV_KIMISUB:     return "kimi-sub";
+        // Kimi Code — OMP-bridge provider id. The old "kimi-sub" spelling is a PYTHON
+        // subscription-provider id (services/agent/providers/kimi_sub_provider.py): the C++
+        // resolve_provider has no branch for it and it is absent from kOmpBridgeProviders, so
+        // every send from this slot died on "Unknown provider: 'kimi-sub'".
+        case ui::PROV_KIMISUB:     return "kimi-code";
         // ZenMux — OMP-bridge provider id, routed through the bun bridge (core/agent/providers.cpp
         // is_omp_bridge_provider) using its own auth db, not a config.json key. Default provider.
         case ui::PROV_ZENMUX:      return "zenmux";
@@ -153,15 +187,15 @@ static int composerEffortLadder(const Settings& s, const char** outLabels,
 nlohmann::json agentProviderOverride(const Settings& s) {
     nlohmann::json j = nlohmann::json::object();
     const char* name = providerWireName(s.provider);
-    // Kimi presets ride PROV_CLOUDCOMPAT with a moonshot.ai base_url. Pin the real
-    // provider name so resolve_provider lands on the moonshot descriptor (kimi-k3
-    // alias normalize, 1M context window, reasoning_effort=max) instead of the
-    // generic openai one. saveSettings already writes provider=moonshot +
-    // api_key=moonshotKey to config.json in this case, so the key resolves.
     std::string wire = name ? name : "";
-    if (s.provider == ui::PROV_CLOUDCOMPAT &&
-        std::string(s.baseUrl).find("moonshot.ai") != std::string::npos)
-        wire = "moonshot";
+    // The cloud-compat slot is shared by every base_url-keyed service (OpenRouter / DashScope /
+    // DeepSeek / Moonshot, plus the bridge-catalog ids that have no native transport at all).
+    // Pin the REAL provider name so resolve_provider lands on that service's descriptor — its
+    // OMP bridge id, or the first-class native "moonshot" branch for Kimi presets (kimi-k3 alias
+    // normalize, 1M context window, reasoning_effort=max) — instead of the generic openai one.
+    // saveSettings writes the same classified name + the matching credential to config.json.
+    if (s.provider == ui::PROV_CLOUDCOMPAT)
+        wire = ui::cloudServiceWireName(ui::cloudServiceKey(s.baseUrl));
     if (!wire.empty()) j["provider"] = wire;
     // llamacpp's Settings::model holds the gguf FILE PATH (the wire model stays "local-gguf");
     // don't clobber the descriptor's model with a filesystem path.
@@ -473,6 +507,395 @@ static void ovSetAgentBool(const char* key, bool v) {
     });
 }
 
+// ============================ slash autocomplete (commands + skills) ============================
+// Editor-style drop-up menu when the composer holds a single slash token (`^/[^\s]*$`).
+// Session cmds are local; skills come from the skills_list RPC (same catalog as Settings).
+
+enum class SlashKind { Session, Skill, Meta };
+
+struct SlashItem {
+    SlashKind   kind = SlashKind::Session;
+    std::string insert;   // text written into the composer on accept
+    std::string label;    // primary row text (usually same as insert, trimmed)
+    std::string detail;   // muted description
+    const char* icon = "ai_panel";
+};
+
+struct ComposerSkillRow {
+    std::string name;
+    std::string description;
+    std::string source;
+};
+
+struct ComposerSkillsCache {
+    std::vector<ComposerSkillRow> skills;
+    bool   loaded = false;
+    bool   inFlight = false;
+    bool   rpcMissing = false;
+    double lastList = 0.0;
+};
+static ComposerSkillsCache s_composerSkills;
+
+struct SlashMenuState {
+    bool open = false;
+    int  selected = 0;
+    std::string filter;                 // typed text AFTER the leading '/'
+    std::vector<SlashItem> matches;
+};
+static SlashMenuState s_slash;
+
+static std::string slashLower(std::string s) {
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+
+static bool slashSkillsAbsent(const core::RpcResult& r) {
+    if (!r.ok) {
+        const std::string& e = r.err;
+        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
+            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
+            return true;
+        return false;
+    }
+    if (r.result.is_object()) {
+        const std::string c = r.result.value("code", std::string());
+        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
+            return true;
+        if (!r.result.value("ok", true)) {
+            const std::string reason = r.result.value("reason", std::string());
+            if (reason == "unknown_method" || reason == "method_not_found")
+                return true;
+        }
+    }
+    return false;
+}
+
+static void pollComposerSkills(AppState& st, bool force) {
+    if (s_composerSkills.rpcMissing) return;
+    if (!st.workerStarted && !force) return;
+    const double now = ImGui::GetTime();
+    if (!force && s_composerSkills.loaded && (now - s_composerSkills.lastList) < 8.0) return;
+    if (s_composerSkills.inFlight) return;
+    s_composerSkills.lastList = now;
+    s_composerSkills.inFlight = true;
+    st.rpc.call("skills_list", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_composerSkills.inFlight = false;
+        if (slashSkillsAbsent(r)) {
+            s_composerSkills.rpcMissing = true;
+            s_composerSkills.loaded = true;
+            s_composerSkills.skills.clear();
+            return;
+        }
+        if (!r.ok || !r.result.is_object()) {
+            s_composerSkills.loaded = true;
+            return;
+        }
+        s_composerSkills.skills.clear();
+        auto arr = r.result.value("skills", nlohmann::json::array());
+        if (arr.is_array()) {
+            for (const auto& e : arr) {
+                if (!e.is_object()) continue;
+                ComposerSkillRow row;
+                row.name = e.value("name", std::string());
+                row.description = e.value("description", std::string());
+                row.source = e.value("source", std::string("builtin"));
+                if (!row.name.empty()) s_composerSkills.skills.push_back(std::move(row));
+            }
+        }
+        std::sort(s_composerSkills.skills.begin(), s_composerSkills.skills.end(),
+                  [](const ComposerSkillRow& a, const ComposerSkillRow& b) {
+                      return a.name < b.name;
+                  });
+        s_composerSkills.loaded = true;
+    }, 15000);
+}
+
+static bool tryHandleSkillsListCommand(AppState& st) {
+    pollComposerSkills(st, /*force=*/true);
+    if (s_composerSkills.skills.empty()) {
+        pushSessionNotice(st,
+            s_composerSkills.inFlight
+                ? "Loading skills\xe2\x80\xa6 try /skills again in a moment."
+                : (s_composerSkills.rpcMissing
+                       ? "Skills RPC not available (worker missing skills_list)."
+                       : "No skills discovered. Type / for the command menu."));
+        return true;
+    }
+    std::string body = "Skills (" + std::to_string(s_composerSkills.skills.size()) +
+                       ") \xe2\x80\x94 activate with /skill:<name> or pick from / autocomplete:\n";
+    for (const auto& sk : s_composerSkills.skills) {
+        body += "  /skill:";
+        body += sk.name;
+        if (!sk.description.empty()) {
+            body += "  \xe2\x80\x94  ";
+            body += sk.description.size() > 90 ? sk.description.substr(0, 87) + "\xe2\x80\xa6"
+                                               : sk.description;
+        }
+        body += "\n";
+    }
+    pushSessionNotice(st, body);
+    return true;
+}
+
+static const SlashItem kSessionSlashItems[] = {
+    {SlashKind::Session, "/compact ", "/compact",
+     "Compact conversation [snapcompact|shake|summary]", "ai_panel"},
+    {SlashKind::Session, "/shake ", "/shake",
+     "Shake loose tokens [elide|images]", "ai_panel"},
+    {SlashKind::Session, "/handoff ", "/handoff",
+     "New session seeded with a handoff document", "ai_panel"},
+    {SlashKind::Session, "/btw ", "/btw",
+     "Side question (does not enter the transcript)", "ask"},
+    {SlashKind::Session, "/prewalk", "/prewalk",
+     "Arm agent prewalk for the next turn", "plan_board"},
+    {SlashKind::Meta, "/skills", "/skills",
+     "List available skills", "team"},
+    {SlashKind::Meta, "/help", "/help",
+     "Show slash-command help", "ask"},
+};
+
+// True when the composer is still typing a single slash token (menu should stay open).
+static bool parseSlashQuery(const char* buf, std::string& outFilter) {
+    outFilter.clear();
+    if (!buf || buf[0] != '/') return false;
+    for (const char* p = buf + 1; *p; ++p) {
+        if (*p == ' ' || *p == '\t' || *p == '\n') return false;
+    }
+    outFilter.assign(buf + 1);
+    return true;
+}
+
+static bool slashMatches(const SlashItem& it, const std::string& filterLower) {
+    if (filterLower.empty()) return true;
+    auto has = [&](const std::string& hay) {
+        return slashLower(hay).find(filterLower) != std::string::npos;
+    };
+    if (has(it.label)) return true;
+    if (has(it.insert)) return true;
+    if (has(it.detail)) return true;
+    // `/skill:edit-part` also matches bare skill name / `skill:edit`.
+    if (it.kind == SlashKind::Skill) {
+        const size_t colon = it.label.rfind(':');
+        if (colon != std::string::npos && has(it.label.substr(colon + 1))) return true;
+    }
+    return false;
+}
+
+static void rebuildSlashMatches(const std::string& filter) {
+    const std::string fl = slashLower(filter);
+    s_slash.matches.clear();
+    for (const auto& it : kSessionSlashItems) {
+        if (slashMatches(it, fl)) s_slash.matches.push_back(it);
+    }
+    for (const auto& sk : s_composerSkills.skills) {
+        SlashItem it;
+        it.kind = SlashKind::Skill;
+        it.insert = "/skill:" + sk.name + " ";
+        it.label = "/skill:" + sk.name;
+        it.detail = sk.description.empty()
+                        ? (sk.source.empty() ? "skill" : sk.source)
+                        : sk.description;
+        it.icon = "plan_board";
+        if (slashMatches(it, fl) || slashLower(sk.name).find(fl) != std::string::npos)
+            s_slash.matches.push_back(std::move(it));
+    }
+    if (s_slash.selected < 0) s_slash.selected = 0;
+    if (s_slash.selected >= (int)s_slash.matches.size())
+        s_slash.selected = s_slash.matches.empty() ? 0 : (int)s_slash.matches.size() - 1;
+}
+
+static void applySlashInsert(std::vector<char>& buf, const std::string& text) {
+    if (buf.size() < text.size() + 1)
+        buf.resize(text.size() + 1, 0);
+    std::memcpy(buf.data(), text.c_str(), text.size() + 1);
+}
+
+static bool slashMenuRow(const char* iconName, const char* label, const char* detail,
+                         bool selected, int uid) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const float rowH = ImGui::GetFrameHeight() + 6.0f * sc;
+    const float fh = ImGui::GetFontSize();
+    ImGui::PushID(uid);
+    const bool clicked = ImGui::Selectable("##slashrow", selected,
+                                           ImGuiSelectableFlags_AllowItemOverlap |
+                                               ImGuiSelectableFlags_DontClosePopups,
+                                           ImVec2(-1, rowH));
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    const float rnd = 4.0f;
+    const float washA = selected ? 0.42f : (hov ? 0.36f : 0.28f);
+    ui::glassRowBackground(dl, mn, mx, rnd, /*stripe=*/false, /*selected=*/false,
+                           /*washAlpha=*/washA);
+    if (selected || hov) {
+        ui::coloredRowWash(dl, mn, mx, rnd, pal.accent,
+                           selected ? 0.34f : 0.18f, /*selected=*/selected);
+    }
+    const float midY = (mn.y + mx.y) * 0.5f;
+    const float pad = 8.0f * sc;
+    const float isz = fh * 1.02f;
+    const ImU32 ink = ui::Palette::toU32(selected ? pal.text : pal.textDim);
+    float textX = mn.x + pad;
+    IconUV ic = ui::getIcon(iconName, 20);
+    if (ic.valid) {
+        const ImVec2 i0(mn.x + pad, midY - isz * 0.5f);
+        dl->AddImage(ic.texId, i0, ImVec2(i0.x + isz, i0.y + isz), ic.uv0, ic.uv1, ink);
+        textX = i0.x + isz + 7.0f * sc;
+    }
+    dl->AddText(ImVec2(textX, midY - fh * 0.55f), ui::Palette::toU32(pal.text), label);
+    if (detail && detail[0]) {
+        std::string d = detail;
+        const float maxDetailW = (mx.x - textX) - 10.0f * sc;
+        while (d.size() > 4 && ImGui::CalcTextSize(d.c_str()).x > maxDetailW)
+            d = d.substr(0, d.size() - 2) + "\xe2\x80\xa6";
+        dl->AddText(ImVec2(textX, midY + fh * 0.15f),
+                    ui::Palette::toU32(pal.textDim), d.c_str());
+    }
+    ImGui::PopID();
+    return clicked;
+}
+
+// Draw the drop-up slash menu above the composer input. Returns true when an item was
+// accepted (caller must bump the InputText generation so the insert is visible).
+static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const ImVec2& inputMax,
+                                  bool& ateEnter) {
+    ateEnter = false;
+    std::string filter;
+    const bool want = parseSlashQuery(st.prompt.data(), filter);
+    if (!want) {
+        s_slash.open = false;
+        s_slash.matches.clear();
+        g_slashMenuActive = false;
+        return false;
+    }
+
+    pollComposerSkills(st, /*force=*/false);
+    if (!s_slash.open || filter != s_slash.filter) {
+        s_slash.filter = filter;
+        s_slash.selected = 0;
+        rebuildSlashMatches(filter);
+    } else {
+        rebuildSlashMatches(filter);  // skills may arrive mid-typing
+    }
+    s_slash.open = !s_slash.matches.empty() || filter.empty();
+    if (s_slash.matches.empty()) {
+        // Keep the menu shell open on bare `/` while skills load; otherwise hide.
+        if (!filter.empty() || (!s_composerSkills.inFlight && s_composerSkills.loaded)) {
+            s_slash.open = false;
+            g_slashMenuActive = false;
+            return false;
+        }
+    }
+    g_slashMenuActive = true;
+
+    // Apply Up/Down captured by the InputText history callback.
+    bool scrolledByKey = false;
+    if (g_slashNavDelta != 0 && !s_slash.matches.empty()) {
+        const int n = (int)s_slash.matches.size();
+        s_slash.selected = (s_slash.selected + g_slashNavDelta) % n;
+        if (s_slash.selected < 0) s_slash.selected += n;
+        g_slashNavDelta = 0;
+        scrolledByKey = true;
+    }
+
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const auto& pal = ui::palette;
+    const float popW = ImMax(inputMax.x - inputMin.x, 280.0f * sc);
+    const float rowH = ImGui::GetFrameHeight() + 6.0f * sc;
+    const float headerH = ImGui::GetTextLineHeight() + 10.0f * sc;
+    const int visible = (int)std::min<size_t>(8, std::max<size_t>(1, s_slash.matches.size()));
+    const float listH = rowH * (float)visible + 6.0f * sc;
+    const float popH = headerH + listH + 8.0f * sc;
+    const float gap = 4.0f * sc;
+
+    ImGui::SetNextWindowPos(ImVec2(inputMin.x, inputMin.y - gap), ImGuiCond_Always,
+                            ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowSize(ImVec2(popW, popH), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * sc, 6.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::metrics::rounding(8.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+
+    bool accepted = false;
+    std::string acceptText;
+    ImGuiWindowFlags wflags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoScrollbar;
+    if (ImGui::Begin("##slashautocomplete", nullptr, wflags)) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->ChannelsSplit(2);
+        dl->ChannelsSetCurrent(1);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(s_slash.matches.empty() ? "Loading commands\xe2\x80\xa6"
+                                                       : "Commands & skills");
+        ImGui::PopStyleColor();
+
+        ImGui::BeginChild("##slashlist", ImVec2(-1, listH), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoBackground);
+        for (int i = 0; i < (int)s_slash.matches.size(); ++i) {
+            const auto& it = s_slash.matches[(size_t)i];
+            const bool sel = (i == s_slash.selected);
+            if (slashMenuRow(it.icon, it.label.c_str(), it.detail.c_str(), sel, i)) {
+                accepted = true;
+                acceptText = it.insert;
+                s_slash.selected = i;
+            }
+            if (sel && scrolledByKey) ImGui::SetScrollHereY(0.35f);
+            if (ImGui::IsItemHovered()) s_slash.selected = i;
+        }
+        if (s_slash.matches.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextUnformatted("No matches");
+            ImGui::PopStyleColor();
+        }
+        ImGui::EndChild();
+
+        // Glass backdrop behind content (same family as drawing-panel popups).
+        {
+            ImVec2 p0 = ImGui::GetWindowPos();
+            ImVec2 p1(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
+            dl->ChannelsSetCurrent(0);
+            ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Regular,
+                           ImGui::GetStyle().WindowRounding / sc, surf);
+            // Subtle border so the menu reads against busy chat backdrops.
+            dl->AddRect(p0, p1,
+                        ImGui::ColorConvertFloat4ToU32(
+                            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.35f)),
+                        ImGui::GetStyle().WindowRounding, 0, ui::metrics::stroke(1.0f));
+            dl->ChannelsMerge();
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(3);
+
+    // Enter accepts the highlighted row (do not submit the turn).
+    if (!accepted && !s_slash.matches.empty() &&
+        ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !ImGui::GetIO().KeyShift) {
+        accepted = true;
+        acceptText = s_slash.matches[(size_t)s_slash.selected].insert;
+        ateEnter = true;
+    }
+
+    if (accepted && !acceptText.empty()) {
+        applySlashInsert(st.prompt, acceptText);
+        s_slash.open = false;
+        s_slash.matches.clear();
+        g_slashMenuActive = false;
+        return true;
+    }
+    return false;
+}
+
 // Returns true if `text` was a slash command (handled; do not run a normal turn).
 static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     if (text.empty() || text[0] != '/') return false;
@@ -727,8 +1150,12 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     if (cmd == "/help") {
         st.toast(ui::ToastLevel::Info,
                  "/compact [snapcompact|shake|summary]  /shake [elide|images]  "
-                 "/handoff [focus]  /btw <q>  /prewalk");
+                 "/handoff [focus]  /btw <q>  /prewalk  /skills  "
+                 "(type / for autocomplete)");
         return true;
+    }
+    if (cmd == "/skills") {
+        return tryHandleSkillsListCommand(st);
     }
     return false;  // unknown slash — send as normal text
 }
@@ -790,7 +1217,8 @@ void submitTurn(AppState& st, const std::string& text) {
     if (text.empty()) return;
     // A fresh turn always clears a lingering stop latch (e.g. worker never drained after cancel).
     st.activeRun()->stopRequested = false;
-    // Slash commands: /compact /shake /handoff /btw /prewalk — pure host+RPC, no agent turn.
+    // Slash commands: /compact /shake /handoff /btw /prewalk /skills /help — pure host+RPC,
+    // no agent turn. Skills themselves (/skill:<name>) ride a normal turn and activate in-agent.
     if (tryHandleSlashCommand(st, text)) return;
     // Persist the active provider/model to config.json BEFORE launching any run. The C++ core
     // resolves the provider from config.json (not in-memory st.settings), so this guarantees the
@@ -928,8 +1356,11 @@ void submitTurn(AppState& st, const std::string& text) {
          lo.rfind("which ", 0) == 0 || lo.find(" which ") != std::string::npos ||
          has("is it") || has("should i") || has("can you tell") || has("explain "));
 
-    // MISSION intent: Agent mode only.
+    // MISSION intent: Agent mode only, and only when Settings → AI → Harness
+    // "Auto-route missions" is on. Default off — main chat stays on the direct
+    // general_agent tool loop (no intake/breakdown).
     auto looksLikeMission = [&]() -> bool {
+        if (!st.settings.autoMissionRouting) return false;
         if (!agentMode || st.convRunning(st.activeConvId())) return false;
         bool buildVerb = has("make ") || has("model ") || has("build ") || has("design ") ||
                          has("create ") || has("generate ") || has("give me");
@@ -1499,21 +1930,33 @@ static float measureContextMeter(AppState& st, float roomForMeter) {
 }
 
 // Provider rate-limit gauges for the prelude row: one ring per usage window the ACTIVE
-// subscription account reports ("5H (o) 7D (o)"), sitting immediately left of the context ring.
+// account reports ("5H (o) 7D (o)"), sitting immediately left of the context ring.
 // Every layer is opt-out by ABSENCE, which is what keeps inapplicable elements hidden: key-based
-// and local providers have no subscription id, an account may report no windows at all, and a
+// and local providers have no usage source at all, an account may report no windows, and a
 // window without a fraction is status-only — each of those draws NOTHING rather than a
 // misleading empty ring. `draw == false` measures only (emits no ImGui items) so the caller can
 // right-align the usage cluster and the context gauge as one block.
 //
+// Two upstream stores can answer, and the omp bridge is asked FIRST: a Claude Max / ZenMux /
+// Kimi Code session signs in through the sidecar's own credential store, so the bridge is the
+// only source that knows about it — and it is the one Settings → Providers already agrees with.
+// The Python subscription poller serves everything else (xAI, Cursor) and remains the fallback
+// for a bridge provider that has not answered yet.
+//
 // `budget` is the width the rings may consume. Indicators are dropped from the END until the
 // set fits, rather than all-or-nothing: a 340dp column only clears ~90dp next to the context
 // gauge, so an all-or-nothing rule would hide Claude's 5H+7D pair on the DEFAULT layout. Both
-// passes are handed the same budget, so measure and draw always pick the same set.
+// passes are handed the same budget, so measure and draw always pick the same set. RPC results
+// only land in AsyncRpc::drain() at the top of a frame, so the source cannot change between the
+// two passes and the composer row never jumps.
 static float usageRingCluster(AppState& st, float budget, bool draw) {
-    const char* sub = ui::subscriptionProviderForCad(st.settings.provider);
-    if (!sub) return 0.0f;
-    const std::vector<ui::UsageWindow>* wins = ui::activeAccountUsage(sub);
+    const std::vector<ui::UsageWindow>* wins = nullptr;
+    if (const char* bridgeId = ui::bridgeProviderForCad(st.settings.provider))
+        wins = ui::bridgeProviderUsage(bridgeId);
+    if (!wins) {
+        if (const char* sub = ui::subscriptionProviderForCad(st.settings.provider))
+            wins = ui::activeAccountUsage(sub);
+    }
     if (!wins || wins->empty()) return 0.0f;
 
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -1624,6 +2067,11 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     // being MANAGED here, the rings just need the active account's windows to stay roughly fresh.
     ui::providerUsagePollAccounts(st, 60.0, false);
     ui::providerUsagePollUsage(st, false);
+    // Bridge-owned providers (Claude Max / ZenMux / Kimi Code) keep their windows in the omp
+    // sidecar's credential store, which the two subscription RPCs above cannot see. Only the
+    // ACTIVE provider is polled, on the same 5-min TTL — one RPC per provider per five minutes.
+    if (const char* bridgeUsageId = ui::bridgeProviderForCad(st.settings.provider))
+        ui::providerUsagePollBridge(st, bridgeUsageId, false);
     // The model chip's human name ("Claude Opus 5") comes from the OMP catalog. Until now the
     // catalog was only fetched by the Settings/Providers UI and the model dropdown, so a user who
     // never opened either saw the raw id in the chip — the exact thing the chip stopped showing.
@@ -1796,9 +2244,243 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     // Tight gap to the prompt — prelude sits closer to the input box.
 }
 
-// Toolbar row below the prompt: [model | thinking | paperclip | context-cube | New]
+// ---- voice input (OMP ASR sidecar via agent_stt_*) --------------------------------------------
+enum class VoiceUiState { Idle, Listening, Processing, Error, Unavailable };
+
+struct VoiceInputUi {
+    VoiceUiState state = VoiceUiState::Unavailable;
+    bool probed = false;
+    bool rpcBusy = false;
+    bool pollQueued = false;
+    std::string reason;       // unavailable / error tip
+    std::string modelLabel;
+    std::string sizeHint;
+    bool modelCached = false;
+    std::string partial;
+    std::string committed;
+    float level = 0.0f;
+    float animT = 0.0f;
+    std::string basePrompt;   // composer text at start of this listen session
+    double lastPollSec = 0.0;
+};
+
+static VoiceInputUi& voiceUi() {
+    static VoiceInputUi v;
+    return v;
+}
+
+static void voiceApplyPrompt(AppState& st, const std::string& base, const std::string& committed,
+                             const std::string& partial) {
+    std::string out = base;
+    auto append = [&](const std::string& piece) {
+        if (piece.empty()) return;
+        if (!out.empty() && out.back() != ' ' && out.back() != '\n') out.push_back(' ');
+        out += piece;
+    };
+    append(committed);
+    append(partial);
+    if (st.prompt.size() < out.size() + 1) st.prompt.resize(out.size() + 256, 0);
+    std::memcpy(st.prompt.data(), out.c_str(), out.size() + 1);
+}
+
+static void voiceApplyStatus(AppState& st, const nlohmann::json& r) {
+    VoiceInputUi& v = voiceUi();
+    const bool available = r.value("available", false);
+    const std::string bridgeState = r.value("state", std::string("idle"));
+    v.modelLabel = r.value("modelLabel", std::string());
+    v.sizeHint = r.value("modelSizeHint", std::string());
+    v.modelCached = r.value("modelCached", false);
+    v.partial = r.value("partial", std::string());
+    v.committed = r.value("committed", std::string());
+    v.level = r.value("level", 0.0f);
+    if (r.contains("error") && r["error"].is_string())
+        v.reason = r["error"].get<std::string>();
+    else if (r.contains("reason") && r["reason"].is_string())
+        v.reason = r["reason"].get<std::string>();
+
+    if (!available) {
+        v.state = VoiceUiState::Unavailable;
+        return;
+    }
+    if (bridgeState == "listening") {
+        v.state = VoiceUiState::Listening;
+        voiceApplyPrompt(st, v.basePrompt, v.committed, v.partial);
+    } else if (bridgeState == "processing") {
+        v.state = VoiceUiState::Processing;
+    } else if (bridgeState == "error") {
+        v.state = VoiceUiState::Error;
+    } else {
+        v.state = VoiceUiState::Idle;
+    }
+}
+
+static void voiceProbe(AppState& st) {
+    VoiceInputUi& v = voiceUi();
+    if (v.probed || v.rpcBusy) return;
+#ifdef __EMSCRIPTEN__
+    v.probed = true;
+    v.state = VoiceUiState::Unavailable;
+    v.reason = "Voice input is not available in the web build.";
+    return;
+#else
+    v.rpcBusy = true;
+    st.rpc.call("agent_stt_status", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+                    VoiceInputUi& vv = voiceUi();
+                    vv.rpcBusy = false;
+                    vv.probed = true;
+                    if (!r.ok || !r.result.is_object()) {
+                        vv.state = VoiceUiState::Unavailable;
+                        vv.reason = r.err.empty()
+                                        ? "Speech-to-text unavailable (OMP bridge)."
+                                        : r.err;
+                        return;
+                    }
+                    // AppState not captured — status-only; prompt rewrite needs st in poll.
+                    const auto& res = r.result;
+                    vv.modelLabel = res.value("modelLabel", std::string());
+                    vv.sizeHint = res.value("modelSizeHint", std::string());
+                    vv.modelCached = res.value("modelCached", false);
+                    if (!res.value("available", false)) {
+                        vv.state = VoiceUiState::Unavailable;
+                        vv.reason = res.value("reason",
+                                              std::string("Speech-to-text unavailable."));
+                    } else {
+                        vv.state = VoiceUiState::Idle;
+                        vv.reason.clear();
+                    }
+                },
+                15000);
+#endif
+}
+
+static void voicePoll(AppState& st) {
+    VoiceInputUi& v = voiceUi();
+    if (v.state != VoiceUiState::Listening && v.state != VoiceUiState::Processing) return;
+    if (v.rpcBusy || v.pollQueued) return;
+    const double now = ImGui::GetTime();
+    if (now - v.lastPollSec < 0.20) return;
+    v.lastPollSec = now;
+    v.pollQueued = true;
+    st.rpc.call("agent_stt_status", nlohmann::json::object(),
+                [&st](const core::RpcResult& r) {
+                    VoiceInputUi& vv = voiceUi();
+                    vv.pollQueued = false;
+                    if (!r.ok || !r.result.is_object()) return;
+                    voiceApplyStatus(st, r.result);
+                },
+                10000);
+}
+
+static void voiceStart(AppState& st) {
+    VoiceInputUi& v = voiceUi();
+    if (v.rpcBusy || v.state == VoiceUiState::Unavailable) return;
+    v.basePrompt = st.prompt.data();
+    v.partial.clear();
+    v.committed.clear();
+    v.reason.clear();
+    v.rpcBusy = true;
+    v.state = VoiceUiState::Processing;  // warming / opening mic
+    st.rpc.call("agent_stt_start", nlohmann::json::object(),
+                [&st](const core::RpcResult& r) {
+                    VoiceInputUi& vv = voiceUi();
+                    vv.rpcBusy = false;
+                    if (!r.ok || !r.result.is_object()) {
+                        vv.state = VoiceUiState::Error;
+                        vv.reason = r.err.empty() ? "Failed to start voice input." : r.err;
+                        st.toast(ui::ToastLevel::Warn, vv.reason.c_str());
+                        return;
+                    }
+                    voiceApplyStatus(st, r.result);
+                    if (vv.state == VoiceUiState::Error ||
+                        vv.state == VoiceUiState::Unavailable) {
+                        st.toast(ui::ToastLevel::Warn,
+                                 vv.reason.empty() ? "Voice input unavailable." : vv.reason.c_str());
+                    }
+                },
+                300000);  // first-use model download can take a while
+}
+
+static void voiceStop(AppState& st) {
+    VoiceInputUi& v = voiceUi();
+    if (v.rpcBusy) return;
+    v.rpcBusy = true;
+    v.state = VoiceUiState::Processing;
+    st.rpc.call("agent_stt_stop", nlohmann::json::object(),
+                [&st](const core::RpcResult& r) {
+                    VoiceInputUi& vv = voiceUi();
+                    vv.rpcBusy = false;
+                    if (!r.ok || !r.result.is_object()) {
+                        vv.state = VoiceUiState::Error;
+                        vv.reason = r.err.empty() ? "Transcription failed." : r.err;
+                        st.toast(ui::ToastLevel::Warn, vv.reason.c_str());
+                        return;
+                    }
+                    const std::string text = r.result.value("text", std::string());
+                    voiceApplyPrompt(st, vv.basePrompt, text, "");
+                    vv.partial.clear();
+                    vv.committed = text;
+                    vv.state = VoiceUiState::Idle;
+                    if (text.empty())
+                        st.toast(ui::ToastLevel::Info, "No speech detected.");
+                },
+                120000);
+}
+
+static void voiceCancel(AppState& st) {
+    VoiceInputUi& v = voiceUi();
+    if (v.rpcBusy && v.state != VoiceUiState::Listening) return;
+    v.rpcBusy = true;
+    st.rpc.call("agent_stt_cancel", nlohmann::json::object(),
+                [&st](const core::RpcResult& r) {
+                    VoiceInputUi& vv = voiceUi();
+                    vv.rpcBusy = false;
+                    (void)r;
+                    voiceApplyPrompt(st, vv.basePrompt, "", "");
+                    vv.partial.clear();
+                    vv.committed.clear();
+                    vv.state = VoiceUiState::Idle;
+                },
+                15000);
+}
+
+static void drawMicGlyph(ImDrawList* dl, ImVec2 c, float isz, ImU32 ink, float pulse,
+                         float level, bool listening) {
+    const float th = ui::metrics::stroke(1.4f);
+    constexpr float kPi = 3.14159265f;
+    // Capsule mic body
+    const float bw = isz * 0.22f;
+    const float bh = isz * 0.38f;
+    dl->AddRect(ImVec2(c.x - bw, c.y - bh), ImVec2(c.x + bw, c.y + bh * 0.15f), ink,
+                bw, 0, th);
+    // Stem + base
+    dl->AddLine(ImVec2(c.x, c.y + bh * 0.15f), ImVec2(c.x, c.y + bh * 0.55f), ink, th);
+    dl->AddLine(ImVec2(c.x - bw * 0.9f, c.y + bh * 0.55f),
+                ImVec2(c.x + bw * 0.9f, c.y + bh * 0.55f), ink, th);
+    // Arc yoke
+    dl->PathClear();
+    dl->PathArcTo(ImVec2(c.x, c.y + bh * 0.05f), bw * 1.55f, 0.15f * kPi, 0.85f * kPi);
+    dl->PathStroke(ink, 0, th);
+    if (listening) {
+        // Soft pulse ring + 3-bar waveform driven by level (not noisy).
+        const float ring = isz * (0.62f + 0.10f * pulse);
+        dl->AddCircle(c, ring, IM_COL32((ink >> IM_COL32_R_SHIFT) & 0xFF,
+                                       (ink >> IM_COL32_G_SHIFT) & 0xFF,
+                                       (ink >> IM_COL32_B_SHIFT) & 0xFF,
+                                       (int)(55 + 50 * pulse)),
+                      0, ui::metrics::stroke(1.2f));
+        const float barBase = isz * 0.12f;
+        for (int i = 0; i < 3; ++i) {
+            const float x = c.x + (i - 1) * isz * 0.18f;
+            const float h = barBase * (0.55f + level * (0.9f + 0.35f * (float)(i == 1)));
+            dl->AddLine(ImVec2(x, c.y - h), ImVec2(x, c.y + h), ink, th);
+        }
+    }
+}
+
+// Toolbar row below the prompt: [model | thinking | paperclip | mic | context-cube | New]
 // Graduated widths with overlapping rounded corners (connected segmented look).
-// Model picker is the largest share; paperclip/cube are icon-only minimums.
+// Model picker is the largest share; paperclip/mic/cube are icon-only minimums.
 // The send/stop control lives inside the input box (drawComposerSendStop).
 static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) {
     const auto& pal = ui::palette;
@@ -1856,15 +2538,15 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
     const char* effBtn = effIdx >= 0 ? effLabels[effIdx] : "Default";
 
-    // Graduated segment widths (left→right: model, thinking, paperclip, cube, New).
+    // Graduated segment widths (left→right: model, thinking, paperclip, mic, cube, New).
     // Icon chips stay near-square; New < thinking < model share the remaining row.
-    const int nSeg = 5;
+    const int nSeg = 6;
     const float segH = ImGui::GetFrameHeight();
     const float iconSz = segH;
     const float join = -overlap;  // positive join thickness per boundary
     const float totalW = availW + join * (float)(nSeg - 1);
     const float iconW = segH;     // minimal — just an icon
-    const float restW = std::max(0.0f, totalW - iconW * 2.0f);
+    const float restW = std::max(0.0f, totalW - iconW * 3.0f);
     // Relative shares of the non-icon remainder, solved against the DEFAULT 340dp column
     // (metrics::dockRightTarget): availW 326 -> restW 287dp at 17.5px body text. "New" needs
     // 48dp and the widest effort label ("Medium") 76dp before either clips inside its button, so
@@ -1878,7 +2560,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     const float thinkW = restW * (kThink / kSum);
     const float modelW = restW * (kModel / kSum);
 
-    // ---- 1/5 model: provider brand mark + the model's REAL display name (no provider text) ----
+    // ---- 1/6 model: provider brand mark + the model's REAL display name (no provider text) ----
     const std::string modelLogo = composerProviderLogoId(s);
     const float logoSide    = ImGui::GetFontSize() * 1.05f;
     const float logoGap     = ui::metrics::px(6);
@@ -1917,7 +2599,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         ImGui::SetTooltip("%s \xc2\xb7 %s\nModel — click to search and switch.",
                           composerProviderName(s.provider), s.model[0] ? s.model : "default");
 
-    // ---- 2/5 thinking effort (level only; bigger than New) ----
+    // ---- 2/6 thinking effort (level only; bigger than New) ----
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     if (ImGui::Button(effBtn, ImVec2(thinkW, segH))) ImGui::OpenPopup("##cmpeffort");
@@ -1934,7 +2616,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         ImGui::EndPopup();
     }
 
-    // ---- 3/5 paperclip (icon-only, smallest) ----
+    // ---- 3/6 paperclip (icon-only, smallest) ----
     ImGui::SameLine();
     {
         if (ImGui::Button("##attach", ImVec2(iconW, segH))) {
@@ -1986,7 +2668,102 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 4/5 context-cube (icon-only, smallest) ----
+    // ---- 4/6 mic (OMP ASR voice input) ----
+    ImGui::SameLine();
+    {
+        voiceProbe(st);
+        voicePoll(st);
+        VoiceInputUi& v = voiceUi();
+        v.animT += ImGui::GetIO().DeltaTime;
+        const bool listening = v.state == VoiceUiState::Listening;
+        const bool processing = v.state == VoiceUiState::Processing;
+        const bool unavailable = v.state == VoiceUiState::Unavailable;
+        const bool errored = v.state == VoiceUiState::Error;
+        const bool disabled = unavailable || busy;
+        if (listening) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.28f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.40f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.50f));
+        } else if (errored) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.22f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.34f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.44f));
+        }
+        if (disabled) ImGui::BeginDisabled();
+        const bool micClick = ImGui::Button("##voice_mic", ImVec2(iconW, segH));
+        if (disabled) ImGui::EndDisabled();
+        if (listening || errored) ImGui::PopStyleColor(3);
+        if (micClick) {
+            if (listening) voiceStop(st);
+            else if (processing || v.rpcBusy) voiceCancel(st);
+            else if (!unavailable) voiceStart(st);
+        }
+        // Right-click / Esc-while-hover cancels an active listen.
+        if (listening && ImGui::IsItemHovered() &&
+            (ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+             ImGui::IsKeyPressed(ImGuiKey_Escape))) {
+            voiceCancel(st);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (unavailable) {
+                ImGui::SetTooltip("%s", v.reason.empty()
+                    ? "Voice input unavailable — ASR runtime or microphone capture missing."
+                    : v.reason.c_str());
+            } else if (listening) {
+                ImGui::SetTooltip("Listening — click to stop & insert text (Esc/right-click cancels).");
+            } else if (processing) {
+                ImGui::SetTooltip("Processing speech… click to cancel.");
+            } else if (errored) {
+                ImGui::SetTooltip("%s\nClick to retry.",
+                                  v.reason.empty() ? "Voice input error." : v.reason.c_str());
+            } else {
+                const char* cacheHint = v.modelCached ? "model ready" : "first use downloads model";
+                ImGui::SetTooltip("Dictate into the composer (%s%s%s — %s).\nClick to start; click again to stop.",
+                                  v.modelLabel.empty() ? "Whisper" : v.modelLabel.c_str(),
+                                  v.sizeHint.empty() ? "" : ", ",
+                                  v.sizeHint.c_str(),
+                                  cacheHint);
+            }
+        }
+        {
+            ImDrawList* mdl = ImGui::GetWindowDrawList();
+            const ImVec2 mmn = ImGui::GetItemRectMin(), mmx = ImGui::GetItemRectMax();
+            const ImVec2 mc((mmn.x + mmx.x) * 0.5f, (mmn.y + mmx.y) * 0.5f);
+            const float isz = iconSz * 0.55f;
+            ImVec4 inkV = surf.textPrimary;
+            if (unavailable) inkV = surf.textTertiary;
+            else if (errored) inkV = ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1.0f);
+            else if (listening) inkV = ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f);
+            const ImU32 ink = ImGui::ColorConvertFloat4ToU32(inkV);
+            IconUV mic = ui::getIcon("mic", 20);
+            const float pulse = listening
+                ? 0.5f + 0.5f * std::sin(v.animT * 4.0f)
+                : (processing ? 0.5f + 0.5f * std::sin(v.animT * 6.0f) : 0.0f);
+            if (mic.valid && !listening) {
+                mdl->AddImage(mic.texId,
+                              ImVec2(mc.x - isz * 0.5f, mc.y - isz * 0.5f),
+                              ImVec2(mc.x + isz * 0.5f, mc.y + isz * 0.5f),
+                              mic.uv0, mic.uv1, ink);
+            } else {
+                drawMicGlyph(mdl, mc, isz, ink, pulse, v.level, listening || processing);
+            }
+            if (listening) {
+                mdl->AddRect(mmn, mmx,
+                             ImGui::ColorConvertFloat4ToU32(
+                                 ImVec4(pal.accent[0], pal.accent[1], pal.accent[2],
+                                        0.55f + 0.30f * pulse)),
+                             ui::metrics::rounding(4.0f), 0, ui::metrics::stroke(1.4f));
+            }
+        }
+    }
+
+    // ---- 5/6 context-cube (icon-only, smallest) ----
     ImGui::SameLine();
     {
         const bool armed = st.contextPickActive;
@@ -2047,7 +2824,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 5/5 New session (slightly bigger than icon chips) ----
+    // ---- 6/6 New session (slightly bigger than icon chips) ----
     ImGui::SameLine();
     {
         if (busy) ImGui::BeginDisabled();
@@ -2389,9 +3166,13 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         if (cm >= 0 && cm <= 4) st.aiInteraction = cm;
     }
 
-    // Esc: staged edit restore, else disarm context pick (Wave4).
+    // Esc: close slash autocomplete first, then staged edit restore, else disarm context pick.
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        if (s_edit.active) {
+        if (s_slash.open) {
+            s_slash.open = false;
+            s_slash.matches.clear();
+            g_slashMenuActive = false;
+        } else if (s_edit.active) {
             cancelEditStage(st);
         } else if (st.contextPickActive) {
             st.contextPickActive = false;
@@ -2577,18 +3358,42 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         ImGui::SetKeyboardFocusHere();
         s_refocusComposer = false;
     }
+    // Prime slash-menu skill catalog once the worker is up (cheap TTL'd RPC).
+    if (st.workerStarted) pollComposerSkills(st, /*force=*/false);
+
+    // Slash query opens before the InputText so Up/Down history callbacks fire this frame.
+    {
+        std::string q;
+        g_slashMenuActive = parseSlashQuery(st.prompt.data(), q);
+    }
+
     char inputId[32];
     std::snprintf(inputId, sizeof(inputId), "##aiprompt%d", s_composerGen);
     bool submitInput = drawChatInput(inputId, st.prompt, placeholder,
                                      ui::metrics::copilotInputMaxLines(),
                                      sendSz + sendInset * 2.0f);
+    const ImVec2 inputMin = ImGui::GetItemRectMin();
+    const ImVec2 inputMax = ImGui::GetItemRectMax();
     // Crash-safe draft: debounce-write whatever is in the box.
     savePromptDraft(st, /*force=*/false);
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(6);
     // Send/stop rides INSIDE the input box, anchored bottom-right of the composer glass.
-    drawComposerSendStop(st, ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+    drawComposerSendStop(st, inputMin, inputMax,
                          composerMin.x + composerW, canRun, canStart, active, submit, stopReq);
+
+    // Slash autocomplete drop-up (commands + skills). Accept steals Enter from submit.
+    bool slashAteEnter = false;
+    if (drawSlashAutocomplete(st, inputMin, inputMax, slashAteEnter)) {
+        ++s_composerGen;          // active InputText ignores external buffer writes
+        s_refocusComposer = true;
+        submitInput = false;
+        submit = false;
+    } else if (slashAteEnter || (s_slash.open && submitInput)) {
+        // Menu open with matches: Enter must not send the half-typed `/foo` token.
+        submitInput = false;
+        submit = false;
+    }
 
     // No usage/provider id strip above the toolbar — model lives in the toolbar chip.
     drawComposerToolbar(st, busy, true);

@@ -8,8 +8,12 @@
 //   -> {"id": <int>, "method": <string>, "params": <object>}
 //   <- {"id": <int>, "ok": true,  "result": <object>}
 //   <- {"id": <int>, "ok": false, "error": {"message": <string>, "status"?: <number>}}
-// stdout carries ONLY response lines; the child's own stderr logging is left connected to this
-// process's stderr (nothing redirected/discarded).
+//   <- {"id": <int>, "event": <string>, "data": <object>}   (notification; no "ok" member)
+// Notification frames are opt-in per request (today: `complete` with params.stream=true, which
+// emits {"event":"delta","data":{"text"|"thinking":<chunk>}} per fragment) and always precede
+// that id's response line. They are handed to the call's OnEvent sink and NEVER complete or
+// retire the request. stdout carries ONLY those frames; the child's own stderr logging is left
+// connected to this process's stderr (nothing redirected/discarded).
 //
 // Concurrency: the stdio channel is multiplexed, not serialized. A background reader thread
 // owns all reads off the child's stdout and dispatches each response to its id-matched caller;
@@ -27,6 +31,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -48,10 +53,18 @@ class OmpBridgeClient {
 public:
     static OmpBridgeClient& instance();
 
+    // Optional per-call sink for the bridge's notification frames (see the protocol block
+    // above): onEvent(data, event) fires once per {"id","event","data"} line arriving on this
+    // call's id, before its response. Invoked on the background reader thread, but serialized
+    // against the call's own teardown — the sink is guaranteed never to fire before call()
+    // registers it nor after call() returns, so a lambda capturing the caller's stack (the
+    // run's thread_local delta emitter, say) is safe to pass.
+    using OnEvent = std::function<void(const nlohmann::json& data, const std::string& event)>;
+
     // Send {method, params} to the bun bridge; block until the matching response (default
-    // 120 s, matching worker_bridge's default — a non-streaming `complete` round-trip through
-    // a reasoning model can legitimately take a while; providers.cpp passes an explicit larger
-    // timeout for that call).
+    // 120 s, matching worker_bridge's default — a `complete` round-trip through a reasoning
+    // model can legitimately take a while even when its deltas stream in via onEvent;
+    // providers.cpp passes an explicit larger timeout for that call).
     //
     // Safe to call concurrently from multiple threads: each call gets its own id-correlated
     // response and blocks only on ITS OWN result, never on another in-flight call's.
@@ -60,7 +73,7 @@ public:
     // on transport failure or ok:false; err is always set on false, and result carries the
     // bridge's structured {message,status?} error object when it supplied one.
     bool call(const std::string& method, const nlohmann::json& params, nlohmann::json& result,
-              std::string& err, int timeoutMs = 120000);
+              std::string& err, int timeoutMs = 120000, OnEvent onEvent = nullptr);
 
     // Best-effort shutdown of the child (idempotent). Called from ~OmpBridgeClient. Joins the
     // background reader thread before returning — no thread outlives the child's fds.
@@ -89,6 +102,14 @@ private:
         bool ok = false;
         nlohmann::json result;
         std::string err;
+        // Notification sink for this id. Written once at registration, before the request line
+        // goes out; read-only afterwards. The reader thread invokes it under `mtx` (never under
+        // pendingMtx_) — see dispatchResponse().
+        OnEvent onEvent;
+        // Flipped by the waiting caller under `mtx` the instant it stops waiting, whether that
+        // is normal completion, timeout, or cancel. The reader thread refuses to invoke
+        // `onEvent` once this is set, which is what lets the sink capture the caller's stack.
+        bool detached = false;
     };
 
     // Resolve bunExe_/bridgeScript_ once (env overrides, else repo-root discovery). Caller
@@ -113,7 +134,7 @@ private:
     // subprocess exited) — call() only respawns-and-retries in that case; a plain timeout,
     // cancellation, or an ok:false method-level RPC error is final.
     bool callOnce(const std::string& method, const nlohmann::json& params, nlohmann::json& result,
-                  std::string& err, int timeoutMs, bool& childDead);
+                  std::string& err, int timeoutMs, const OnEvent& onEvent, bool& childDead);
     // Background reader thread body for one generation: pumps response lines off `fd` until
     // EOF/error, dispatching each to its id-matched Pending, then reaps this generation (if it
     // wasn't already reaped by a concurrent caller) and fails whatever is left outstanding so

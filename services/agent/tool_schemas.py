@@ -152,17 +152,29 @@ def render_tools_block(
                 entry = f"- {tool}(…)  # schema unavailable"
         else:
             schema = describe_callable(tool, fn)
-            desc = _description_line(schema["description"], trim=trim)
+            # Per-tool agent.tool_options may override the included tool context
+            # (description) and the tier's schema_trim dial.
+            use_trim = trim
+            note = ""
+            try:
+                from services.agent.config import get_tool_options  # noqa: PLC0415
+                opts = get_tool_options(None, tool) or {}
+                override = (opts.get("description_override") or "").strip()
+                if override:
+                    schema = dict(schema)
+                    schema["description"] = override
+                st = opts.get("schema_trim")
+                if st is not None:
+                    use_trim = bool(st)
+                note = (opts.get("prompt_note") or "").strip()
+            except Exception:  # noqa: BLE001
+                pass
+            desc = _description_line(schema["description"], trim=use_trim)
             entry = f"- {schema['signature']}"
             if desc:
                 entry += f"\n    {desc}"
-            try:
-                from services.agent.config import get_tool_options  # noqa: PLC0415
-                note = (get_tool_options(None, tool).get("prompt_note") or "").strip()
-                if note:
-                    entry += f"\n    Note: {note}"
-            except Exception:  # noqa: BLE001
-                pass
+            if note:
+                entry += f"\n    Note: {note}"
         cost = _count_tokens(entry)
         if used + cost > budget:
             omitted.append(tool)

@@ -15,6 +15,8 @@ class TestGetToolOptions(unittest.TestCase):
         self.assertIsNone(opts["max_calls_per_turn"])
         self.assertEqual(opts["param_defaults"], {})
         self.assertEqual(opts["prompt_note"], "")
+        self.assertEqual(opts["description_override"], "")
+        self.assertIsNone(opts["schema_trim"])
 
     def test_unknown_keys_ignored(self):
         from services.agent.config import get_tool_options
@@ -35,6 +37,8 @@ class TestGetToolOptions(unittest.TestCase):
                         "prompt_note": "Keep it short.",
                         "timeout_s": 30,
                         "max_calls_per_turn": 3,
+                        "description_override": "Custom search blurb.",
+                        "schema_trim": False,
                     }
                 }
             }
@@ -44,6 +48,8 @@ class TestGetToolOptions(unittest.TestCase):
         self.assertEqual(opts["prompt_note"], "Keep it short.")
         self.assertEqual(opts["timeout_s"], 30)
         self.assertEqual(opts["max_calls_per_turn"], 3)
+        self.assertEqual(opts["description_override"], "Custom search blurb.")
+        self.assertIs(opts["schema_trim"], False)
 
 
 class TestDenyReasonEnabled(unittest.TestCase):
@@ -165,6 +171,34 @@ class TestPromptNote(unittest.TestCase):
                 include_category_menu=False,
             )
         self.assertIn("Note: Sanity-check fixtures first.", text)
+
+    def test_description_override_in_tools_block(self):
+        from services.agent import tool_schemas as ts
+
+        def dummy(x: int = 1) -> dict:
+            """Original docstring that should be replaced."""
+            return {"ok": True, "x": x}
+
+        cfg_opts = {
+            "enabled": True,
+            "timeout_s": None,
+            "max_calls_per_turn": None,
+            "param_defaults": {},
+            "prompt_note": "",
+            "description_override": "Custom included tool context.",
+            "schema_trim": True,
+        }
+        with mock.patch(
+            "services.agent.config.get_tool_options", return_value=cfg_opts
+        ):
+            text, _meta = ts.render_tools_block(
+                ["dummy"],
+                resolver=lambda n: dummy if n == "dummy" else None,
+                budget_tokens=2000,
+                include_category_menu=False,
+            )
+        self.assertIn("Custom included tool context.", text)
+        self.assertNotIn("Original docstring", text)
 
 
 class TestDesignRecipe(unittest.TestCase):

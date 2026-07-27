@@ -1389,8 +1389,9 @@ OFFICE_METHODS: dict[str, Callable] = {
 
 
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
-    """``agent_admin_turn {request, run_id?, role?} -> {ok, turn:{success,
-    stop_reason, result, role, allowed_tools}} | {ok:false, reason}``.
+    """``agent_admin_turn {request, run_id?, role?, provider?, model?, api_key?,
+    base_url?, reasoning_effort?} -> {ok, turn:{success, stop_reason, result, role,
+    allowed_tools}} | {ok:false, reason}``.
 
     Streams turn events through ``_emit`` — worker_main.py's serve loop tags each
     one with this request's id and pushes it as a ``{"event":...}`` line
@@ -1399,6 +1400,13 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     provider_call / stage_* events any other run emits. Never raises: a
     worker-unreachable/offline caller MUST get a clean ``ok:false`` to fall back
     on, not a crash.
+
+    C4 — the provider descriptor: the GUI/C++ side has ALREADY resolved which
+    provider this turn should use (the one the user picked in the composer). When
+    ``provider`` is supplied we honour it by overlaying the descriptor onto
+    ``load_config()`` and resolving by name, instead of re-deriving the provider
+    from config.json's flat ``provider`` field and silently running something else.
+    With no ``provider`` the legacy ``get_provider(role=role)`` path is unchanged.
     """
     request = (params or {}).get("request", "")
     if not isinstance(request, str) or not request.strip():
@@ -1408,6 +1416,12 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     if not isinstance(role, str) or not role.strip():
         role = "general_agent"
 
+    def _param_str(key: str) -> str:
+        value = (params or {}).get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    provider_name = _param_str("provider")
+
     try:
         from services.agent import config as agent_config  # noqa: PLC0415
         from services.agent.mission_dispatch import run_linear_role_turn  # noqa: PLC0415
@@ -1415,7 +1429,28 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
 
     try:
-        provider = agent_config.get_provider(role=role)
+        if provider_name:
+            # Shallow overlay — load_config() hands back a process-cached dict, so
+            # never mutate it in place. base_url lands on BOTH the flat key and the
+            # per-provider sub-dict, because that is where every native branch in
+            # config.py._resolve_provider actually reads it from (cfg[name].base_url).
+            provider_name = provider_name.lower()
+            cfg = dict(agent_config.load_config())
+            cfg["provider"] = provider_name
+            for key in ("model", "api_key", "reasoning_effort"):
+                value = _param_str(key)
+                if value:
+                    cfg[key] = value
+            base_url = _param_str("base_url")
+            if base_url:
+                cfg["base_url"] = base_url
+                sub = cfg.get(provider_name)
+                sub = dict(sub) if isinstance(sub, dict) else {}
+                sub["base_url"] = base_url
+                cfg[provider_name] = sub
+            provider = agent_config.get_provider(name=provider_name, cfg=cfg, role=role)
+        else:
+            provider = agent_config.get_provider(role=role)
     except agent_config.OfflineModeError as exc:
         return {"ok": False, "reason": f"offline: {exc}"}
     except Exception as exc:  # noqa: BLE001
@@ -1441,6 +1476,34 @@ ADMIN_METHODS: dict[str, Callable] = {
 }
 
 
+def _ai_tool_preview(params: dict, _emit: Callable) -> dict:
+    """Settings → AI → Tools Options: assembled tools-slot entry for one tool."""
+    try:
+        from services.agent.prompt_preview import preview_tool_entry  # noqa: PLC0415
+        name = str((params or {}).get("tool") or (params or {}).get("name") or "")
+        trim = (params or {}).get("trim")
+        trim_b = None if trim is None else bool(trim)
+        return preview_tool_entry(name, trim=trim_b)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _ai_prompt_preview(params: dict, _emit: Callable) -> dict:
+    """Settings → AI → Dev Preview: assembled general_agent system prompt."""
+    try:
+        from services.agent.prompt_preview import preview_main_chat_system  # noqa: PLC0415
+        include_tools = bool((params or {}).get("include_tools", True))
+        return preview_main_chat_system(include_tools=include_tools)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+PREVIEW_METHODS: dict[str, Callable] = {
+    "ai_tool_preview": _ai_tool_preview,
+    "ai_prompt_preview": _ai_prompt_preview,
+}
+
+
 # Merged registration table (engine_oracle/worker.py does ``_METHODS.update``).
 WORKER_METHODS: dict[str, Callable] = {}
 WORKER_METHODS.update(SUBSCRIPTION_METHODS)
@@ -1451,3 +1514,4 @@ WORKER_METHODS.update(ROLE_MODELS_METHODS)
 WORKER_METHODS.update(BENCH_METHODS)
 WORKER_METHODS.update(OFFICE_METHODS)
 WORKER_METHODS.update(ADMIN_METHODS)
+WORKER_METHODS.update(PREVIEW_METHODS)

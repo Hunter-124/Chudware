@@ -245,6 +245,11 @@ class OmpBridgeClient:
                 continue  # non-JSON noise should not happen (stdout is response-only)
             if not isinstance(msg, dict) or msg.get("id") != req_id:
                 continue
+            if "event" in msg and "ok" not in msg:
+                # Streaming notification ({"id":N,"event":"delta","data":{…}}) — the bridge
+                # only emits these for callers that asked for `stream: true`, which no Python
+                # caller does yet. Skip rather than mistake it for a malformed reply.
+                continue
 
             if msg.get("ok"):
                 result = msg.get("result")

@@ -31,7 +31,8 @@ void OmpBridgeClient::shutdownIfCreated() {
 }
 
 bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& /*params*/,
-                           nlohmann::json& /*result*/, std::string& err, int /*timeoutMs*/) {
+                           nlohmann::json& /*result*/, std::string& err, int /*timeoutMs*/,
+                           OnEvent /*onEvent*/) {
     err = "omp bridge unavailable on Windows";
     return false;
 }
@@ -412,13 +413,36 @@ void OmpBridgeClient::dispatchResponse(const std::string& line) {
         return;
     }
 
+    // A notification frame carries "event" and no "ok": it belongs to a call that is still
+    // running (more may follow, and its real response line is still coming), so unlike a
+    // response it must NOT retire the Pending.
+    const auto ev = j.find("event");
+    const bool isEvent = !j.contains("ok") && ev != j.end() && ev->is_string();
+
     std::shared_ptr<Pending> p;
     {
         std::lock_guard<std::mutex> lk(pendingMtx_);
         auto it = pending_.find(rid);
         if (it == pending_.end()) return;  // unknown/expired id (timed out/cancelled) — drop
         p = it->second;
-        pending_.erase(it);
+        if (!isEvent) pending_.erase(it);
+    }
+
+    if (isEvent) {
+        // pendingMtx_ is already released; the sink runs under the Pending's OWN mutex instead.
+        // That is deliberate: the waiting caller flips `detached` under that same mutex the
+        // moment it stops waiting, so this check-then-invoke can never straddle a call() return
+        // and hand a fragment to a sink whose stack frame is gone. The caller holds the mutex
+        // only between its 50 ms cv ticks, so a delta never waits long for it.
+        std::lock_guard<std::mutex> plk(p->mtx);
+        if (p->done || p->detached || !p->onEvent) return;
+        try {
+            p->onEvent(j.value("data", json::object()), ev->get<std::string>());
+        } catch (...) {
+            // A throwing sink must never take down the reader thread — it owns every OTHER
+            // in-flight call's response too.
+        }
+        return;
     }
 
     std::lock_guard<std::mutex> plk(p->mtx);
@@ -463,7 +487,8 @@ void OmpBridgeClient::failAllPending(const std::string& reason) {
 }
 
 bool OmpBridgeClient::callOnce(const std::string& method, const json& params, json& result,
-                               std::string& err, int timeoutMs, bool& childDead) {
+                               std::string& err, int timeoutMs, const OnEvent& onEvent,
+                               bool& childDead) {
     childDead = false;
     if (!ensureRunning(err)) {
         childDead = true;
@@ -472,6 +497,9 @@ bool OmpBridgeClient::callOnce(const std::string& method, const json& params, js
 
     const int64_t id = nextId_.fetch_add(1, std::memory_order_relaxed);
     auto pending = std::make_shared<Pending>();
+    // Published before the map insert below, so the reader thread never observes a registered
+    // Pending with a half-written sink.
+    pending->onEvent = onEvent;
     {
         std::lock_guard<std::mutex> lk(pendingMtx_);
         pending_[id] = pending;
@@ -490,6 +518,13 @@ bool OmpBridgeClient::callOnce(const std::string& method, const json& params, js
         if (!running_ || !writeLine(line)) {
             if (running_) reap();  // dead child: fails every outstanding Pending, including ours
             deregister();          // no-op if reap()'s failAllPending already removed us
+            {
+                // Uniform invariant: callOnce never returns while its Pending can still reach
+                // the caller's sink (deregister() alone would leave a reader thread that had
+                // already grabbed the shared_ptr free to invoke it).
+                std::lock_guard<std::mutex> plk(pending->mtx);
+                pending->detached = true;
+            }
             err = "write failed";
             childDead = true;
             return false;
@@ -509,6 +544,7 @@ bool OmpBridgeClient::callOnce(const std::string& method, const json& params, js
         // dropped by dispatchResponse's "unknown id" path once we deregister below.
         const std::atomic<bool>* cf = provider_cancel_flag();
         if (cf && cf->load(std::memory_order_acquire)) {
+            pending->detached = true;
             plk.unlock();
             deregister();
             err = "cancelled";
@@ -516,6 +552,7 @@ bool OmpBridgeClient::callOnce(const std::string& method, const json& params, js
         }
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
+            pending->detached = true;
             plk.unlock();
             deregister();
             err = "timeout waiting for response";
@@ -525,6 +562,9 @@ bool OmpBridgeClient::callOnce(const std::string& method, const json& params, js
         const auto tick = std::min<std::chrono::milliseconds>(std::chrono::milliseconds(50), remaining);
         pending->cv.wait_for(plk, tick);
     }
+    // Still holding the Pending's mutex: from here on the reader thread must not touch our
+    // sink, whose captures are about to go out of scope with this frame.
+    pending->detached = true;
 
     const bool ok = pending->ok;
     err = pending->err;
@@ -538,22 +578,35 @@ bool OmpBridgeClient::callOnce(const std::string& method, const json& params, js
 }
 
 bool OmpBridgeClient::call(const std::string& method, const json& params, json& result,
-                           std::string& err, int timeoutMs) {
+                           std::string& err, int timeoutMs, OnEvent onEvent) {
     result = json::object();
     err.clear();
     if (timeoutMs <= 0) timeoutMs = 120000;
 
+    // Wrap the caller's sink so the retry below can tell whether anything already reached it.
+    // Mirrors the native streaming branch's `streamed_now` gate (providers.cpp): once a
+    // fragment has been handed to the GUI, replaying the turn would duplicate it on screen, so
+    // a dead-child respawn stops being a safe retry.
+    std::atomic<bool> streamed{false};
+    OnEvent sink;
+    if (onEvent) {
+        sink = [&streamed, &onEvent](const json& data, const std::string& event) {
+            streamed.store(true, std::memory_order_relaxed);
+            onEvent(data, event);
+        };
+    }
+
     // Child died (write fail/subprocess exit) -> reap + respawn once (inside the next
-    // callOnce's ensureRunning), then fail. Timeouts, cancellation, and method-level errors do
-    // NOT respawn — they're final for this call.
+    // callOnce's ensureRunning), then fail. Timeouts, cancellation, method-level errors, and
+    // anything that already streamed do NOT respawn — they're final for this call.
     for (int attempt = 0; attempt < 2; ++attempt) {
         std::string attemptErr;
         bool childDead = false;
-        if (callOnce(method, params, result, attemptErr, timeoutMs, childDead)) return true;
+        if (callOnce(method, params, result, attemptErr, timeoutMs, sink, childDead)) return true;
 
         // Method-level errors (ok:false with a structured {message,status} object) are final.
         const bool methodError = result.is_object() && result.contains("message");
-        if (methodError || !childDead) {
+        if (methodError || !childDead || streamed.load(std::memory_order_relaxed)) {
             err = std::move(attemptErr);
             return false;
         }

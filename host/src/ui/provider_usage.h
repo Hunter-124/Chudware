@@ -8,11 +8,16 @@
 // Copilot composer now shows the same windows as small rings next to the context gauge, and a
 // second independent poller would double the RPC traffic and drift out of sync. So the model,
 // the parsing and the polls live here; every consumer reads the same rows.
-//
 // Everything degrades silently: providers without a subscription (API-key, local endpoints)
 // map to no subscription id, accounts without a `usage` array report `hasUsage == false`, and
 // a worker that doesn't implement `subscription_usage` latches rpcMissing so the polls stop.
 // Consumers MUST hide their indicator when there is nothing to show — never render 0%.
+//
+// There are TWO upstream stores, not one. The `subscription_*` RPCs above read the Python
+// worker's account table; the omp bridge sidecar keeps its OWN credential store, and a Claude
+// Max / ZenMux / Kimi Code OAuth session signed in through Settings → Providers exists only
+// there. Those windows arrive via `agent_provider_state` and land in the SAME UsageWindow model
+// (see providerUsagePollBridge), so a consumer picks a source and draws identical rings.
 // -------------------------------------------------------------------------------------------------
 #include <map>
 #include <string>
@@ -30,7 +35,7 @@ struct UsageWindow {
     std::string label;         // display label; falls back to `window`
     float       usedFraction = 0.0f;   // 0..1, only meaningful when hasFraction
     bool        hasFraction = false;   // null upstream = status-only; never render it as 0%
-    std::string resetsAt;      // ISO-8601, may be empty
+    std::string resetsAt;      // ISO-8601 or ms-epoch decimal; usageResetCountdown() reads both
     std::string status;        // ok | warn | blocked | needs_login | unknown
 };
 
@@ -64,7 +69,12 @@ void providerUsagePollAccounts(AppState& st, double ttlSec, bool force);
 // Usage windows. TTL is fixed at 5 min per contracts/providers.md §4.5; `force` bypasses it.
 // No-op once the worker has reported the method as unknown.
 void providerUsagePollUsage(AppState& st, bool force);
-// Drop both TTLs so the next poll call refetches immediately (after sign-in / switch / logout).
+// Rate-limit windows the omp bridge reports for ONE bridge provider id ("anthropic", "zenmux",
+// "kimi-code"). Source RPC is `agent_provider_state`, the same call Settings → Providers makes;
+// results are cached per provider id. Same 5-min TTL, in-flight guard and unknown-method latch
+// as the polls above; a soft failure keeps the last good windows rather than blanking the rings.
+void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool force);
+// Drop every TTL so the next poll call refetches immediately (after sign-in / switch / logout).
 void providerUsageInvalidate();
 
 // ---- reading -----------------------------------------------------------------------------------
@@ -83,12 +93,23 @@ const char* subscriptionProviderForCad(int cadProvider);
 // connected account that reports usage). nullptr when nothing applicable is signed in.
 const std::vector<UsageWindow>* activeAccountUsage(const std::string& subProviderId);
 
+// The omp bridge provider id backing a CAD ProviderIndex, or nullptr when that provider is not
+// bridge-routed and so has no sidecar-side windows. Callers then fall back to
+// subscriptionProviderForCad() + activeAccountUsage().
+const char* bridgeProviderForCad(int cadProvider);
+
+// Bridge-reported windows for a bridge provider id. nullptr until a poll succeeds AND reports at
+// least one window — never a pointer to an empty vector, so nullptr always means "show nothing".
+const std::vector<UsageWindow>* bridgeProviderUsage(const std::string& bridgeProviderId);
+
 // ---- shared presentation -------------------------------------------------------------------
 // Palette role for a window's status; unknown/empty derives from the fraction using the same
 // thresholds as the composer's context meter, so bars and rings agree on when amber turns red.
 const float* usageStatusColor(const std::string& status, float frac);
-// "resets in 2h 14m" from an ISO-8601 timestamp; empty when unparseable.
-std::string  usageResetCountdown(const std::string& iso);
+// "resets in 2h 14m" from a reset stamp; empty when absent or unparseable. Accepts BOTH wire
+// forms in use: ISO-8601 (Python `subscription_usage`) and a decimal count of milliseconds since
+// the epoch (omp bridge `agent_provider_state`, which sends resetsAt as a NUMBER).
+std::string  usageResetCountdown(const std::string& stamp);
 // Very short window caption for a compact ring ("5H", "7D") derived from window/label.
 std::string  usageWindowShortLabel(const UsageWindow& w);
 

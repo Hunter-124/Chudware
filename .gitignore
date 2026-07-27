@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .venv-mcp/
 .pip-cache/
+.deps/
 
 # secrets
 .env

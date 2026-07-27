@@ -586,7 +586,8 @@ std::string admin_worker_repo_root() {
 // the caller's contract is to treat every false return identically: fall back
 // to the blocked response.
 bool call_admin_worker_turn(const std::string& request, const std::string& run_id,
-                            RunEvents& events, json& turn_out, std::string& err) {
+                            const json& provider_cfg, RunEvents& events, json& turn_out,
+                            std::string& err) {
     const std::string python = admin_worker_python_bin();
     if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
         err = "python runtime not found at " + python;
@@ -647,9 +648,27 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         ::waitpid(pid, nullptr, 0);
     };
 
-    const json req = {{"id", 1}, {"method", "agent_admin_turn"},
-                      {"params", json{{"request", request}, {"run_id", run_id},
-                                      {"role", "general_agent"}}}};
+    // C4: the provider the user picked in the composer is ALREADY resolved into
+    // provider_cfg by the time we get here. Thread the whole descriptor through so
+    // _agent_admin_turn runs THAT provider instead of re-resolving config.json's flat
+    // `provider` field (which silently ignored the GUI's choice). Empty fields are
+    // omitted rather than sent as "" so the worker's "caller supplied nothing" branch
+    // stays distinguishable from "caller supplied a blank".
+    json params{{"request", request}, {"run_id", run_id}, {"role", "general_agent"}};
+    if (provider_cfg.is_object()) {
+        auto put = [&](const char* cfg_key, const char* param_key) {
+            const auto it = provider_cfg.find(cfg_key);
+            if (it == provider_cfg.end() || !it->is_string()) return;
+            std::string v = it->get<std::string>();
+            if (!v.empty()) params[param_key] = std::move(v);
+        };
+        put("name", "provider");
+        put("model", "model");
+        put("api_key", "api_key");
+        put("base_url", "base_url");
+        put("reasoning_effort", "reasoning_effort");
+    }
+    const json req = {{"id", 1}, {"method", "agent_admin_turn"}, {"params", std::move(params)}};
     const std::string line = req.dump() + "\n";
     bool wrote = true;
     {
@@ -758,8 +777,8 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     return ok_final;
 }
 #else   // _WIN32
-bool call_admin_worker_turn(const std::string&, const std::string&, RunEvents&, json&,
-                            std::string& err) {
+bool call_admin_worker_turn(const std::string&, const std::string&, const json&, RunEvents&,
+                            json&, std::string& err) {
     err = "admin worker bridge unavailable on this platform";
     return false;
 }
@@ -928,41 +947,52 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         if (why.empty())
             why = looks_general ? "general work (agent will finish it or escalate)"
                                 : "possible build (agent will decide whether to escalate)";
-        const std::string human =
-            "I handed this to the general agent, but couldn't reach it (offline or the "
-            "worker is unavailable), so nothing was changed. Try again once a provider "
-            "is configured, or use the PLM tab / file explorer directly.";
         events.emit("task_route", json{{"domain", "general"},
                                        {"reason", why},
                                        {"tool_classes", json::array()},
                                        {"context_sheets", json::array()}});
 
-        auto blocked_response = [&]() -> json {
+        // `worker_err` is the concrete reason the general-agent turn failed — a provider
+        // auth failure, a spawn error, a timeout, the worker's own offline refusal. It
+        // used to be buried in a run_note the user never sees while the chat card claimed
+        // the worker was unreachable, which was wrong for every case except the offline
+        // pre-flight below (the ONE path that never calls the worker, and therefore the
+        // one where an empty reason is the honest answer).
+        auto blocked_response = [&](const std::string& worker_err) -> json {
+            const std::string detail = worker_err.empty() ? why : worker_err;
+            const std::string human =
+                worker_err.empty()
+                    ? std::string("I handed this to the general agent, but couldn't reach it "
+                                  "(offline mode is on), so nothing was changed. Turn offline "
+                                  "mode off, or use the PLM tab / file explorer directly.")
+                    : "I handed this to the general agent, but the turn didn't complete, so "
+                      "nothing was changed. Reason: " +
+                          worker_err;
             events.emit("run_finished", json{{"status", "blocked"},
                                              {"stop_reason", "non_modeling_request"},
-                                             {"error_detail", why}});
+                                             {"error_detail", detail}});
             return json{{"run_id", run_id},
                         {"status", "blocked"},
                         {"stop_reason", "non_modeling_request"},
-                        {"error_detail", why},
+                        {"error_detail", detail},
                         {"error_human", human},
                         {"doc_id", doc_id}};
         };
 
         // Offline runs never attempt the worker bridge — same refusal as before.
-        if (offline) return blocked_response();
+        if (offline) return blocked_response(std::string());
 
         // Execute instead of refuse: hand the request to a bounded general_agent
         // role turn (fs/plm/shell + on-demand modeling/sketch/sim/... tool packs
         // via enable_tools) over the python worker's agent_admin_turn RPC
-        // (services/agent/worker_rpc.py). Any
-        // failure to reach/complete it (worker unavailable, spawn failure,
-        // timeout, the worker's OWN offline check, ...) falls back to the
-        // EXACT same blocked response as before — never a crash, never a
-        // silent hang.
+        // (services/agent/worker_rpc.py), threading the caller's resolved provider
+        // descriptor through so the worker runs the provider the user picked. Any
+        // failure to reach/complete it (worker unavailable, spawn failure, timeout,
+        // provider auth, the worker's OWN offline check, ...) falls back to the blocked
+        // response carrying that reason — never a crash, never a silent hang.
         json turn;
         std::string worker_err;
-        if (!call_admin_worker_turn(request, run_id, events, turn, worker_err)) {
+        if (!call_admin_worker_turn(request, run_id, provider_cfg, events, turn, worker_err)) {
             if (worker_err == "cancelled" || run_ctl.cancelled()) {
                 events.emit("run_finished", json{{"status", "cancelled"},
                                                  {"stop_reason", "cancelled"}});
@@ -973,7 +1003,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             }
             events.emit("run_note", json{{"note", "general-work worker turn unavailable"},
                                          {"reason", worker_err}});
-            return blocked_response();
+            return blocked_response(worker_err);
         }
 
         const bool turn_ok = turn.value("success", false);

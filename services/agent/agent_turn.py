@@ -439,6 +439,18 @@ _NEXT_STEP_OPENER_RE = re.compile(
     r"checking|i need to|i should|i'?m about to)\b",
     re.IGNORECASE,
 )
+#: Bare present-participle promises with the subject dropped — "Fixing all of
+#: it now.", "Now fixing the slide numbers." Opus 5 stopped a live job dead
+#: with exactly this shape after nine calls of real analysis, and the
+#: I'll/let-me pattern above never saw it.
+_GERUND_PROMISE_RE = re.compile(
+    r"^(?:now\s+|first,?\s+|then\s+)?"
+    r"(?:fixing|updating|building|creating|writing|editing|adding|making|"
+    r"generating|rendering|applying|implementing|regenerating|rebuilding|"
+    r"patching|correcting|renumbering|rewriting|revising|preparing|"
+    r"finishing|completing|delivering|working on|starting)\b",
+    re.IGNORECASE,
+)
 #: Clause boundaries INCLUDING dashes/semicolons — the live miss was an em-dash
 #: ("The listing got truncated - let me get the tail end of the directory.").
 _CLAUSE_SPLIT_RE = re.compile(r"[.!?\n;]|\s[-\u2013\u2014]\s")
@@ -455,7 +467,19 @@ def _announces_next_step(text: str) -> bool:
     last = clauses[-1]
     if ":" in last:
         return False  # a colon introduces delivered content, not a promise
-    return bool(_NEXT_STEP_OPENER_RE.match(last))
+    if _NEXT_STEP_OPENER_RE.match(last):
+        return True
+    # A gerund opener is only a PROMISE when the clause states an intention
+    # rather than reporting one: "Fixing all of it now." / "Updating the deck."
+    # A report reuses the same opener but keeps going and carries a finite verb
+    # ("Fixing the slide numbers required renumbering three slides."), so demand
+    # an explicit now/next marker or a short clause. Mis-firing costs one extra
+    # nudge; missing one strands the user's job half-done, so lean to detecting.
+    if _GERUND_PROMISE_RE.match(last):
+        words = last.split()
+        return bool(re.search(r"\b(?:now|next|right away|asap)\b", last, re.IGNORECASE)
+                    or len(words) <= 5)
+    return False
 
 
 # Fabricated-success detector: a finish (bare prose, junk JSON, or a formal
@@ -523,7 +547,14 @@ _WORK_VERBS = (
     r"build|make|create|model|design|draw|sketch|extrude|revolve|loft|"
     r"fillet|chamfer|assemble|generate|add|edit|modify|change|fix|delete|"
     r"remove|save|export|import|open|rename|move|run|simulate|mesh|"
-    r"organi[sz]e|clean\s*up|check\s*in|commit|refactor"
+    r"organi[sz]e|clean\s*up|check\s*in|commit|refactor|"
+    # Authoring/delivery verbs — the live miss was "try to deliver the script
+    # ASAP", a document task with no CAD verb in it at all.
+    # "finish"/"complete" are deliberately NOT here: they read as instructions
+    # to the harness ("finish up") as often as to the user's artifact, and they
+    # fire on bare control-flow requests that legitimately do no tool work.
+    r"deliver|write|update|render|produce|prepare|apply|"
+    r"rewrite|revise|renumber|fill\s*in|put\s+together|orchestrate"
 )
 #: The verb only counts in IMPERATIVE position: at the start of the request or
 #: a clause, or after a request auxiliary. Half these words are also everyday
@@ -533,7 +564,10 @@ _WORK_VERBS = (
 _WORK_INTENT_RE = re.compile(
     r"(?:^|[.;:!?]\s*|\b(?:please|then|and|now|also|can you|could you|"
     r"would you|will you|you should|i want you to|i need you to|go ahead and|"
-    r"help me)\s+)"
+    # "try to deliver the script ASAP" is an instruction, not a question — the
+    # hedging auxiliary was hiding the imperative from this gate.
+    r"help me|try(?:ing)? to|attempt to|make sure (?:you|to)|"
+    r"see if you can|go and|start(?:ing)? to)\s+)"
     rf"(?:{_WORK_VERBS})\b",
     re.IGNORECASE,
 )
@@ -1918,6 +1952,31 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         continue
                     last_reason = _NOCODE
                     break
+                # Promise-as-completion after REAL work (2026-07-27). The
+                # unearned gate above only fires when nothing was done, so a
+                # model that investigated for nine calls, said "Fixing all of
+                # it now." and emitted a done envelope sailed straight through
+                # and the user watched it stop mid-job. A done handoff whose
+                # text announces the next action is a promise, not a result:
+                # push once to actually perform it in THIS turn. Bounded by the
+                # same single-nudge budget as the prose path, so a model that
+                # keeps promising still terminates instead of looping.
+                if (
+                    _announces_next_step(_ho_text)
+                    and tool_calls_made < budget
+                    and _continue_nudge[0] < 1
+                    and _request_wants_work(request)
+                    and callable(dispatch)
+                ):
+                    _continue_nudge[0] += 1
+                    messages.append({"role": "user", "content": _parts(
+                        "[UNFINISHED] You announced the next step instead of "
+                        "performing it. Carry it out NOW, in this reply, with "
+                        "the tool calls it needs, then report what actually "
+                        "changed. Do not finish with another promise."
+                    )})
+                    last_reason = _RETRY
+                    continue
             block = _done_guardrail_block(handoff, ledger, actor, calls)
             if block is not None:
                 messages.append({"role": "user", "content": _parts(block)})

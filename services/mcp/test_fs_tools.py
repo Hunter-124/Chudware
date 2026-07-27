@@ -9,8 +9,27 @@ from __future__ import annotations
 import os
 import tempfile
 
+import pytest
+
 import services.mcp.tool_registry as reg
 from services.mcp.fs_tools import register_fs_tools, register_shell_tools
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_jail(monkeypatch):
+    """fs_tools reads its jail policy from the environment, so these tests MUST pin
+    it rather than inherit it.
+
+    Without this, any earlier test that exercised the real
+    worker_rpc._agent_admin_turn (which sets CHUDWARE_FS_ROOT via os.environ, not
+    monkeypatch) left a jail root behind and the write-safety cases failed only
+    when run after it — a pollution that hid until fs and agent tests first shared
+    a session.
+    """
+    for key in ("CHUDWARE_FS_ROOT", "CHUDWARE_FS_ALLOW_OUTSIDE_ROOT",
+                "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    yield
 
 
 class _FakeMCP:

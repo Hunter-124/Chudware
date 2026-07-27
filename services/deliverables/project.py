@@ -1,17 +1,26 @@
 """Project directory + path conventions for deliverables.
 
-The artifact record (contract §3) stores ``path`` and ``spec_ref`` **relative to the project
-dir** so the record is portable with the project. Everything a ``make_*`` writes lives under
-``<project>/artifacts/``; previews live under ``<project>/artifacts/.previews/``; the artifact
-registry is ``<project>/artifacts/registry.json``.
+Two roots, deliberately separate (2026-07-27):
 
-The project dir is ``$CHUDWARE_PROJECT_DIR`` when set (tests and the host point it at the active
-project), else ``paths.ROOT / "project"`` — the single-project fallback under the app's
-``%APPDATA%/Chudware`` root. Resolving it lazily (not at import) lets a test set the env var
-per-case.
+* ``project_dir()`` — the USER's project folder ($CHUDWARE_PROJECT_DIR). This is
+  their Documents tree. Only things the user asked for and would recognise as
+  their own work belong here: the parts the agent creates or edits.
+* ``artifacts_dir()`` — a HIDDEN per-project store under the app's data root.
+  Everything a ``make_*`` generates — rendered pages, previews, the artifact
+  registry, extraction by-products — lands here instead.
+
+They used to be the same directory, so ``<project>/artifacts/`` accumulated every
+intermediate the model produced right beside the user's files. Nothing is dropped:
+the artifact registry still records all of it and reads back through
+``resolve_project_path``; it is simply out of sight. ``CHUDWARE_ARTIFACTS_DIR``
+overrides the hidden location outright (tests, and anyone who genuinely wants the
+tree inside the project).
+
+Resolving both lazily (not at import) lets a test set the env vars per-case.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -34,8 +43,22 @@ def project_dir() -> Path:
     return root
 
 
+def _project_slug() -> str:
+    """Stable, collision-free folder name for the active project.
+
+    Basename keeps the directory browsable by a human; the path digest keeps two
+    same-named projects apart.
+    """
+    root = project_dir()
+    digest = hashlib.sha1(str(root.resolve()).encode("utf-8", "replace")).hexdigest()[:10]
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in root.name) or "project"
+    return f"{safe}-{digest}"
+
+
 def artifacts_dir() -> Path:
-    d = project_dir() / _ARTIFACTS
+    """Hidden per-project artifact store — NOT inside the user's project folder."""
+    env = os.environ.get("CHUDWARE_ARTIFACTS_DIR")
+    d = Path(env) if env else (_APP_ROOT / "projects" / _project_slug() / _ARTIFACTS)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -51,18 +74,29 @@ def registry_path() -> Path:
 
 
 def to_project_rel(p: Path) -> str:
-    """Path relative to the project dir, forward-slashed (the record's portable form)."""
-    root = project_dir().resolve()
+    """Portable form of *p* for an artifact record.
+
+    Relative to whichever root contains it — the hidden artifact store or the
+    user's project — else absolute. ``resolve_project_path`` inverts this.
+    """
     ap = Path(p).resolve()
-    try:
-        return ap.relative_to(root).as_posix()
-    except ValueError:
-        return ap.as_posix()
+    for base in (artifacts_dir().resolve(), project_dir().resolve()):
+        try:
+            return ap.relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return ap.as_posix()
+
 
 
 def resolve_project_path(path: str) -> Path:
-    """Resolve a caller-supplied path: absolute stays absolute; relative is under the project."""
+    """Inverse of :func:`to_project_rel`: absolute stays absolute; a relative path
+    is looked for in the hidden artifact store first (that is where records point),
+    then under the user's project."""
     p = Path(path)
     if p.is_absolute():
         return p
+    candidate = (artifacts_dir() / p).resolve()
+    if candidate.exists():
+        return candidate
     return (project_dir() / p).resolve()

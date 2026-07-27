@@ -47,13 +47,21 @@ from deliverables import joins as J, project  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _project(tmp_path, monkeypatch):
-    """Point the project dir at a fresh tmp dir for each test (project.py reads the env live)."""
+    """Point BOTH roots at a fresh tmp dir per test (project.py reads the env live).
+
+    Artifacts live in a hidden per-project store by default; pinning
+    CHUDWARE_ARTIFACTS_DIR keeps the suite hermetic instead of writing into the
+    real app data root.
+    """
     monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
     yield
 
 
 def _abs(rec):
-    return project.project_dir() / rec["path"]
+    # resolve_project_path is the documented inverse of the to_project_rel that
+    # produced rec["path"] — exercising it here also covers the round trip.
+    return project.resolve_project_path(rec["path"])
 
 
 def _make_view_image() -> str:

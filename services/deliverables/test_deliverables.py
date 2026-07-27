@@ -40,8 +40,13 @@ from deliverables import engines, project  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _project(tmp_path, monkeypatch):
-    """Point the project dir at a fresh tmp dir for each test (project.py reads the env live)."""
+    """Point BOTH roots at a fresh tmp dir per test (project.py reads the env live).
+
+    Artifacts default to a hidden per-project store; pinning CHUDWARE_ARTIFACTS_DIR
+    keeps the suite hermetic instead of writing into the real app data root.
+    """
     monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
     yield
 
 
@@ -115,7 +120,9 @@ def _workbook_spec():
 
 
 def _abs(rec):
-    return project.project_dir() / rec["path"]
+    # resolve_project_path is the documented inverse of the to_project_rel that
+    # produced rec["path"] — exercising it here also covers the round trip.
+    return project.resolve_project_path(rec["path"])
 
 
 # ---------------------------------------------------------- (a) 4B-shaped spec, every format
@@ -135,7 +142,7 @@ def test_make_report_docx_full_roundtrip():
     assert len(rec["source_refs"]) == 3
     assert {r["key"] for r in rec["source_refs"]} == {"max_von_mises_mpa", "min_fos", "mass_g"}
     # spec persisted verbatim for reproducibility.
-    spec_abs = project.project_dir() / rec["spec_ref"]
+    spec_abs = project.resolve_project_path(rec["spec_ref"])
     assert spec_abs.exists()
     # the docx really contains the resolved numbers.
     from docx import Document

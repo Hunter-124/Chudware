@@ -61,6 +61,73 @@ DOC OWNERSHIP & SAVE DISCIPLINE
   net, NOT a delivery mechanism, and never surfaced to the user as a warning. If the user
   edits your doc they ADOPT it (it becomes theirs); you keep co-editing the same live doc.
 
+PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
+  A primitive is built CENTRED ON THE ORIGIN and then placed. These are the placement keys,
+  and they live at FEATURE level — beside "type"/"name"/"params", NOT inside params:
+    at         [x,y,z] absolute, OR a geometry query to sit on existing geometry:
+               {"of":"face","side":"top"} centres the primitive on that face.
+    at_offset  [dx,dy,dz] world-axis nudge applied ON TOP of `at` (boss raised 10 mm above
+               the face it sits on: at_offset:[0,0,10]).
+    axis       [x,y,z] or "+x"/"-x"/"+y"/"-y"/"+z"/"-z" — orients the primitive's local +Z.
+               Default [0,0,1] (straight up) = the historical behaviour. This is how you get
+               a SIDEWAYS cylinder/cone/box without falling back to sketch+extrude.
+    centered   false = the natural base/corner sits at `at` (box corner, cylinder/cone base
+               centre) instead of the centroid. Default true.
+    mode       "boss" fuse into the running body (default) | "cut" subtract it.
+    merge      false = start a NEW body instead of fusing into the current one.
+  Transform order: build centred -> rotate local +Z onto `axis` about the origin -> apply the
+  `centered:false` base offset ALONG THE ROTATED AXIS -> translate by `at` -> add `at_offset`.
+
+  WRONG  {"type":"cylinder","name":"DrainSpout","params":{...},
+          "placement":{"origin":[200,0,40],"direction":[1,0,0]}, "boolean":"union"}
+  RIGHT  {"type":"cylinder","name":"DrainSpout","params":{...},
+          "at":[200,0,40], "axis":[1,0,0], "centered":false, "mode":"boss"}
+  A handful of dialect spellings (placement.origin/position/location/point, placement.
+  direction/axis/normal/dir, feature-level position/location/origin/direction/dir/normal/
+  orientation, boolean/operation "union"|"cut"|"new") are rewritten into the canonical keys
+  above for you — but write the canonical keys. ANY OTHER unrecognised feature-level key is a
+  HARD ERROR that names the offending key and lists the accepted ones. It is never silently
+  dropped, so a placement typo now fails loudly instead of quietly building the primitive at
+  the origin, buried inside the part ("boss added no material").
+
+  ── WORKED EXAMPLE: bucket body + SIDEWAYS drain spout ────────────────────────────────
+
+    new_part('mud_saver_bucket')
+    add_features([
+      {"op":"add_feature","feature":{"type":"cylinder","name":"Body",
+         "params":{"radius":{"value":165,"expr":null},"height":{"value":300,"expr":null}}}},
+      {"op":"add_feature","feature":{"type":"cylinder","name":"DrainSpout",
+         "params":{"radius":{"value":25,"expr":null},"height":{"value":60,"expr":null}},
+         "at":[150,0,-100], "axis":[1,0,0], "centered":false, "mode":"boss"}}])
+    render_part()                 # see the spout stick out the side
+
+  The spout's `at` must START INSIDE the wall (x=150 < the body's r=165) so the boss actually
+  intersects the body — a boss that adds no material is REJECTED, not silently ignored.
+
+GEOMETRY QUERY GRAMMAR (query_geometry, refs.*, at:{...}, FEA fixtures/loads, asm_mate)
+  A query is a STRUCTURED OBJECT (or a bare side word like "top"/"+z"), never a sentence:
+    of             "face" | "edge".  OPTIONAL — defaults to "face".
+    side           top | bottom | left | right | front | back, or "+z"/"-x"/... — which way
+                   it faces. With pick "largest"/"smallest": the largest face facing that way.
+    surf           faces "flat" | "round" (any curved), or cylindrical/conical/spherical/
+                   toroidal; edges "straight" | "round" (or exact line/circle).
+    parallel       "z" | "x" | "y" | [x,y,z] — the direction the geometry runs along.
+    perpendicular  same value forms — keep only geometry perpendicular to that direction.
+                   NOTE a face's direction is its NORMAL, an edge's is the way it RUNS. So a
+                   VERTICAL WALL FACE is perpendicular:"z" (its normal is horizontal) while a
+                   VERTICAL EDGE is parallel:"z". "Vertical"/"horizontal" are not query words.
+    pick           largest | smallest | longest | shortest | inner | outer — narrow a
+                   multi-match to the one you mean (also "near":[x,y,z]+"count", "index":[i]).
+  Examples:
+    {"of":"face","side":"top"}                                the top face
+    {"of":"face","surf":"round","pick":"outer"}               the outer cylindrical wall
+    {"of":"edge","surf":"line","parallel":"z"}                the vertical straight edges
+    {"of":"face","surf":"flat","perpendicular":"z"}           the upright flat wall faces
+  A FREE-TEXT SENTENCE IS NOT A QUERY. "the outer cylindrical wall face at bottom near
+  x=200,y=0" is not parseable geometry — EXPLORE first with describe_part() /
+  query_geometry({"of":"face"}) / hover(sid) to see what the part actually has, then SELECT
+  with a structured query built from the keys above.
+
 ================================================================================
 DOC OPS CHEATSHEET. You emit a JSON array of document ops. Units mm / degrees.
 Dimension params are objects: {"value": <num>, "expr": null}. A later op refers to a feature

@@ -29,6 +29,8 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
+#else
+#include <unistd.h>  // ::getpid() — the config-write tmp name below uses it on all non-Windows
 #endif
 
 #include "app_state.h"

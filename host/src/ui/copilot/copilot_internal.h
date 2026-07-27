@@ -19,7 +19,8 @@
 //   settings.cpp           AI settings sections (provider/model/auth, generation, privacy,
 //                          manage-models), searchable model dropdown, provider usability
 //   composer.cpp           wrapping chat input, attachments/context refs, run launch, slash
-//                          commands, submitTurn send path, composer prelude/toolbar/send-stop
+//                          commands + slash-menu autocomplete (session cmds + skills),
+//                          submitTurn send path, composer prelude/toolbar/send-stop
 //   panel.cpp              the docked Copilot pane host (header, sessions/tasks/artifacts
 //                          panels, drawAIPanel) + the ai_workspace reuse hooks
 #pragma once
@@ -181,6 +182,7 @@ void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts);
 void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
                             bool turnRunning = false);
+void drawDelegationCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawSwarmWaveCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawFirmAwardCard(const ActivityItem& a, const ui::Fonts& fonts);

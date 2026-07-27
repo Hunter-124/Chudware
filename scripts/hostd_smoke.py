@@ -143,6 +143,12 @@ def main() -> int:
     r = c.call("doc_new", {"name": "hostd-smoke"})
     check("engine passthrough", "result" in r and "doc_id" in r["result"], str(r)[:80])
     pid = c.call("daemon_status")["result"]["pid"]
+    # Close the doc before disconnecting, like any well-behaved client: an abandoned doc
+    # stays inside its GC grace (90s base) and idleExpired() deliberately holds the daemon
+    # up for all of it (b497a21c) — the clean-exit autosave purge must not discard a doc a
+    # later GUI could still adopt. Testing idle-exit therefore requires a closed doc.
+    rc = c.call("doc_close", {"doc_id": r["result"]["doc_id"]})
+    check("doc close", "result" in rc, str(rc)[:80])
     c.close()
     check("idle exit", wait_gone(pid, 15.0), f"pid={pid} linger=2s")
 

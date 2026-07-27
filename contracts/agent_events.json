@@ -33,6 +33,7 @@
     {"kind": "agent.spawn", "required_fields": ["node_id", "subagent_id", "role", "spawn_kind", "brief", "budget_tokens"], "optional": false, "emitter_note": "python"},
     {"kind": "agent.advisor", "required_fields": ["node_id", "advisor_kind", "verdict_summary"], "optional": false, "emitter_note": "python"},
     {"kind": "agent.classification", "required_fields": ["task_class", "scaffold_level", "tier", "reason", "request_snippet"], "optional": false, "emitter_note": "python (2026-07-17 additive)"},
+    {"kind": "agent.role", "required_fields": ["node_id", "role", "goal", "from_role", "reason"], "optional": false, "emitter_note": "python (2026-07-27 additive; real adopt_role changes only)"},
     {"kind": "agent.model_assignment", "required_fields": ["depth", "task_class", "picked_model"], "optional": false, "emitter_note": "python (spawn model-assignment audit, watch-list additive)"},
 
     {"kind": "mission.brief.proposed", "required_fields": ["batch_id", "brief_ref"], "optional": true, "emitter_note": "design-brief flow (telemetry.md §5.4)"},

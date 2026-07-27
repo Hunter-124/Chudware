@@ -602,13 +602,17 @@ void finalizeThoughtBox(ActivityItem& a) {
     if (!a.userToggled) a.expanded = true;
 }
 
-// Find or create the single rowKind-10 routing card (always kept at front).
+// Find or create the single rowKind-10 routing card (pinned to front once revealed).
+// The card starts PENDING ("class:pending" — hidden by drawAgentTimeline): the
+// first-turn classification telemetry is advisory-only now that every request enters
+// via the universal general_agent role, so the card stays hidden until a REAL role
+// change (agent.role) reveals it.
 static ActivityItem* findOrCreateRoutingCard(ChatMsg& m) {
     for (auto& a : m.activity)
         if (a.rowKind == 10) return &a;
     ActivityItem ni;
     ni.rowKind = 10;
-    ni.stage   = "class:0";
+    ni.stage   = "class:pending";
     ni.title   = "task";
     ni.status  = "done";
     ni.detail  = "{}";
@@ -1174,6 +1178,43 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         it.status = "running";
         upsertDerivedItem(std::move(it));
         ps.present = true;
+
+        // Delegation card (rowKind 19): transparency view of subagent dispatches,
+        // styled after the Routing card. One card per turn, upserted as spawns land;
+        // entries packed into detail JSON {"delegates":[{role,brief,spawn_kind}]}.
+        ActivityItem* dc = nullptr;
+        for (auto& a : m.activity)
+            if (a.rowKind == 19) { dc = &a; break; }
+        if (!dc) {
+            ActivityItem ni;
+            ni.rowKind = 19;
+            ni.stage   = "deleg:0";
+            ni.title   = "0 subagents";
+            ni.status  = "running";
+            ni.detail  = "{\"delegates\":[]}";
+            m.activity.push_back(std::move(ni));
+            dc = &m.activity.back();
+        }
+        try {
+            nlohmann::json meta = nlohmann::json::parse(dc->detail, nullptr, false);
+            if (meta.is_discarded() || !meta.is_object()) meta = nlohmann::json::object();
+            if (!meta.contains("delegates") || !meta["delegates"].is_array())
+                meta["delegates"] = nlohmann::json::array();
+            nlohmann::json entry;
+            entry["role"] = it.title;
+            std::string brief = jstr(data, "brief");
+            if (brief.empty()) brief = jstr(data, "task");
+            if (brief.empty()) brief = jstr(data, "assignment");
+            entry["brief"] = brief;
+            entry["spawn_kind"] = jstr(data, "spawn_kind");
+            meta["delegates"].push_back(std::move(entry));
+            dc->detail = meta.dump();
+            char tb[40];
+            std::snprintf(tb, sizeof(tb), "%d subagent%s",
+                          (int)meta["delegates"].size(),
+                          meta["delegates"].size() == 1 ? "" : "s");
+            dc->title = tb;
+        } catch (...) {}
     }
 
 
@@ -1767,10 +1808,13 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         if (!existingCard) m.activity.push_back(std::move(scratch));
     } else if (kind == "agent.classification" || kind == "complexity" || kind == "task_route") {
         // Routing card UPSERT (F3): appears on the FIRST of these events and enriches as the
-        // rest land. Shared rowKind 10 at the front of the timeline.
+        // rest land. Shared rowKind 10. The card stays PENDING (hidden) here — this telemetry
+        // is advisory since every request enters via the universal general_agent role; only a
+        // real role change (agent.role below) reveals it and pins it to the front.
         ActivityItem* card = findOrCreateRoutingCard(m);
-        // Keep card at front if something else was inserted first.
-        if (!m.activity.empty() && m.activity.front().rowKind != 10) {
+        // Keep card at front if something else was inserted first (revealed cards only).
+        if (card->stage != "class:pending" &&
+            !m.activity.empty() && m.activity.front().rowKind != 10) {
             ActivityItem tmp = *card;
             // erase the found card (may have shifted)
             for (auto it = m.activity.begin(); it != m.activity.end(); ++it) {
@@ -1818,6 +1862,36 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             else if (m.liveStatus.empty())
                 m.liveStatus = "Routing\xe2\x80\xa6";
         }
+    } else if (kind == "agent.role") {
+        // REAL role change (adopt_role): reveal the hidden routing card with the new
+        // role and pin it to the front of the timeline.
+        ActivityItem* card = findOrCreateRoutingCard(m);
+        card->stage = "class:0";
+        std::string role = jstr(data, "role");
+        if (!role.empty()) card->title = role;
+        std::string reason = jstr(data, "reason");
+        if (reason.empty()) reason = jstr(data, "goal");
+        if (!reason.empty()) card->reason = reason;
+        std::string fromRole = jstr(data, "from_role");
+        if (!fromRole.empty()) {
+            try {
+                nlohmann::json meta = nlohmann::json::parse(card->detail, nullptr, false);
+                if (meta.is_discarded() || !meta.is_object()) meta = nlohmann::json::object();
+                meta["from_role"] = fromRole;
+                card->detail = meta.dump();
+            } catch (...) {}
+        }
+        card->status = "done";
+        if (!m.activity.empty() && m.activity.front().rowKind != 10) {
+            ActivityItem tmp = *card;
+            for (auto it = m.activity.begin(); it != m.activity.end(); ++it) {
+                if (it->rowKind == 10) { m.activity.erase(it); break; }
+            }
+            m.activity.insert(m.activity.begin(), std::move(tmp));
+            card = &m.activity.front();
+        }
+        if (m.running && !card->title.empty())
+            m.liveStatus = "Routing \xc2\xb7 " + card->title;
     } else if (kind == "provider_call") {
         // In-depth provider HTTP call log (InAppDiag / core agent). One row per attempt.
         // rowKind 9; fields packed into existing ActivityItem slots so we never touch
@@ -2273,7 +2347,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
     // Resume-safe: mark history dirty on activity/text/plan changes; force on terminal events.
     if (m.running || kind == "run_finished" || kind == "mission_finished" ||
         kind == "agent.thought" || kind == "agent.thought.delta" || kind == "assistant_delta" ||
-        kind == "agent.tool_call" || kind == "agent.classification" || kind == "plan_state" ||
+        kind == "agent.tool_call" || kind == "agent.classification" || kind == "agent.role" ||
+        kind == "agent.spawn" || kind == "plan_state" ||
         kind == "plan" || kind == "complexity" || kind == "task_route") {
         markChatHistoryDirty();
         if (kind == "run_finished" || kind == "mission_finished")

@@ -394,6 +394,34 @@ def classification_event(
     return "agent.classification", payload
 
 
+def role_event(
+    node_id: str, *,
+    role: str,
+    goal: str = "",
+    from_role: str = "",
+    reason: str = "",
+    span_id: str | None = None,
+    parent_id: str | None = None,
+    actor: str | None = None,
+) -> tuple[str, dict]:
+    """Emit a real role change (2026-07-27 additive).
+
+    Fired only when the agent actually ADOPTS a different role via
+    ``adopt_role`` — never for the default first-turn ``general_agent``
+    entry. The GUI reveals its Routing card on this event; the per-request
+    ``agent.classification`` telemetry alone keeps the card hidden.
+    """
+    payload = _linkage(node_id, span_id=span_id or new_span_id(),
+                       parent_id=parent_id, actor=actor)
+    payload.update({
+        "role": (role or "").strip(),
+        "goal": _cap(goal, 280),
+        "from_role": (from_role or "").strip(),
+        "reason": _cap(reason, 280),
+    })
+    return "agent.role", payload
+
+
 def thought_event(
     node_id: str, text: str, *, model: str | None = None,
     span_id: str | None = None, parent_id: str | None = None,

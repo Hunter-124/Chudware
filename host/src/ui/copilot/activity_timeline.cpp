@@ -913,7 +913,10 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         ActivityItem& a = m.activity[i];
         // Hidden meta row carrying stop_reason / error_detail — never drawn as a card.
         // Provider-call rows (rowKind 9) aggregate into the collapsible Provider log.
+        // Pending routing rows (rowKind 10, "class:pending") stay hidden until a real
+        // role change (agent.role) reveals them — first-turn default routing shows no card.
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
+        if (a.rowKind == 10 && a.stage == "class:pending") continue;
         ImGui::PushID((int)i);
         if (a.rowKind == 1) {
             drawContextChip(a, fonts);
@@ -923,6 +926,8 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
             drawToolCallRow(st, a, fonts);
         } else if (a.rowKind == 10) {
             drawClassificationCard(a, fonts, turnRunning);
+        } else if (a.rowKind == 19) {
+            drawDelegationCard(a, fonts);
         } else if (a.rowKind == 4) {
             drawCorpOrgCard(a, fonts);
         } else if (a.rowKind == 5) {

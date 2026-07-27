@@ -71,3 +71,27 @@ def test_yaml_beats_shipped_md_for_advisor():
     y = yaml.safe_load((repo / "services/agent/roles/advisor.yaml").read_text())
     card = load_role("advisor")
     assert card.system_prompt.strip() == y["system_prompt"].strip()
+
+
+def test_adopt_role_emits_agent_role_event():
+    """MissionDispatch.adopt_role emits agent.role only on a REAL role change —
+    never for the default general_agent entry (2026-07-27 Routing-card rule)."""
+    from services.agent.mission_dispatch import MissionDispatch
+
+    events: list[tuple[str, dict]] = []
+    d = MissionDispatch(run_id="t-role", on_event=lambda k, p: events.append((k, p)))
+
+    r = d.adopt_role("general_agent")  # same as the default entry — no event
+    assert r["ok"] is True
+    assert [k for k, _ in events] == []
+
+    r = d.adopt_role("model3d")  # real change — one agent.role event
+    assert r["ok"] is True
+    role_events = [p for k, p in events if k == "agent.role"]
+    assert len(role_events) == 1
+    assert role_events[0]["role"] == "model3d"
+    assert role_events[0]["from_role"] == "general_agent"
+
+    # Adopting the same role again does not re-emit.
+    d.adopt_role("model3d")
+    assert len([p for k, p in events if k == "agent.role"]) == 1

@@ -500,7 +500,23 @@ class MissionDispatch:
         except Exception:
             pass
         apply = getattr(self, "_apply_role_adoption", None)
-        return _adopt(role, is_root=is_root, depth=depth, cfg=cfg, apply=apply)
+        result = _adopt(role, is_root=is_root, depth=depth, cfg=cfg, apply=apply)
+        # Transparency (2026-07-27): emit agent.role only on a REAL role change —
+        # the default first-turn general_agent entry shows no Routing card.
+        try:
+            new_role = str(result.get("role") or "")
+            prev_role = getattr(self, "_current_role", None) or "general_agent"
+            if result.get("ok") and new_role and new_role != prev_role and self.on_event is not None:
+                from services.agent import agent_events as _ae  # noqa: PLC0415
+                _k, _p = _ae.role_event(
+                    f"run:{self.run_id}", role=new_role,
+                    goal=str(result.get("goal") or ""), from_role=prev_role)
+                _ae.emit_event(_k, _p, live=self.on_event, journal=None)
+            if result.get("ok") and new_role:
+                self._current_role = new_role
+        except Exception:  # noqa: BLE001 — telemetry must never break adoption
+            pass
+        return result
 
     def request_role_change(self, role: str = "", reason: str = "", from_role: str = "", **kwargs):
         from services.agent.role_adoption import request_role_change as _req

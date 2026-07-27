@@ -1639,6 +1639,73 @@ void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
     }
 }
 
+// Delegation card — transparency view of subagent dispatches (rowKind 19).
+// title="N subagents"; detail JSON {"delegates":[{role,brief,spawn_kind}]} upserted by
+// feedTurnActivity as agent.spawn events land. Same glass style as the Routing card.
+void drawDelegationCard(const ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+    ImGui::BeginChild("##delegcard", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("team", 20);
+    if (!iv.valid) iv = ui::getIcon("milestone_flag", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight() * 0.95f;
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, semanticOnGlass(pal.accent, surf));
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "Delegating");
+    ImGui::PopFont();
+    ImGui::SameLine(0, 6 * sc);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::TextUnformatted(a.title.empty() ? "subagents" : a.title.c_str());
+    ImGui::PopStyleColor();
+
+    if (!a.detail.empty()) {
+        try {
+            auto j = nlohmann::json::parse(a.detail);
+            if (j.is_object() && j.contains("delegates") && j["delegates"].is_array()) {
+                for (const auto& d : j["delegates"]) {
+                    if (!d.is_object()) continue;
+                    std::string role, brief, skind;
+                    if (d.contains("role") && d["role"].is_string())
+                        role = d["role"].get<std::string>();
+                    if (d.contains("brief") && d["brief"].is_string())
+                        brief = d["brief"].get<std::string>();
+                    if (d.contains("spawn_kind") && d["spawn_kind"].is_string())
+                        skind = d["spawn_kind"].get<std::string>();
+                    if (role.empty() && brief.empty()) continue;
+                    std::string line = "\xE2\x80\xA2  " + (role.empty() ? "subagent" : role);
+                    if (!skind.empty()) line += " (" + skind + ")";
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                    ImGui::TextUnformatted(line.c_str());
+                    ImGui::PopStyleColor();
+                    if (!brief.empty()) {
+                        ImGui::Indent(12 * sc);
+                        dimText(brief.c_str());
+                        ImGui::Unindent(12 * sc);
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##delegcard WindowPadding
+    ImRect cardRect = endGlassBubble(gb);
+    {
+        const std::string copyTxt = chatActivityCopyText(a);
+        chatCopyContext(cardRect, "##deleg_copy", copyTxt);
+    }
+}
+
 // ============================ Exec-mode timeline cards (swarm / eng_firm / advisor) ============
 
 // ============================ Exec-mode timeline cards (swarm / eng_firm / advisor) ============

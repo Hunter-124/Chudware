@@ -4297,3 +4297,20 @@ revolve.md`, new `services/mcp/test_current_part.py`.
 
 ### Agent bug reports (2026-07-27)
 Settings → AI → Tools gains a "Send bug reports" toggle (config `agent.bug_reports`, default ON; `config.bug_reports_enabled()` / `bugreport_floor()`). When on, the agent gets a `submit_bug_report` MCP tool (`services/mcp/bugreport_tools.py`, family `workspace`, risk overridden to WRITE — the `submit_` prefix auto-classified EXTERNAL) advertised on every turn (union sites: `run_linear_role_turn`, two DAG floors in `mission_dispatch.py`, `run_turn` post-mode-gate, `roles.apply_tool_policy`). Failed tool calls are captured at the `agent_turn` choke point into a per-process ring (`services/agent/bugreport_context.py` — single import identity to dodge the mcp_server/services.mcp dual-module trap) and auto-embedded in the markdown report written to `~/Documents/Chudware/Bug-Reports/` (override `CHUDWARE_BUG_REPORTS_DIR`). Gotcha: the floor tool had to be excluded from `_force_first_tool` candidates or zero-tool turns force-fired it and flipped the no_code invariant. GUI section lives between Tool families and Maintenance in `settings_modal.cpp`; tests in `services/mcp/test_bugreport_tools.py`.
+
+### Routing card only on real role changes + Delegation card (2026-07-27)
+The copilot Routing card (rowKind 10) no longer appears on every first turn: the
+`agent.classification`/`complexity`/`task_route` telemetry is advisory now that every
+request enters via the universal `general_agent` role, so `findOrCreateRoutingCard`
+creates the card PENDING (`stage "class:pending"`, skipped in `drawAgentTimeline`) and
+only a REAL role change reveals it — new additive `agent.role` event
+(`agent_events.role_event`, emitted from `MissionDispatch.adopt_role` only when the
+adopted role differs from the current one; contract appended in
+`contracts/agent_events.md` + `.json`). Subagent dispatches (`agent.spawn`) now also
+upsert a rowKind-19 "Delegating" card (`drawDelegationCard`, delegates packed into
+detail JSON) alongside the unchanged Plan-section subagent rows. Files:
+`services/agent/agent_events.py`, `services/agent/mission_dispatch.py`,
+`services/agent/test_role_adoption.py`, `host/src/ui/copilot/feed.cpp`,
+`host/src/ui/copilot/cards.cpp`, `host/src/ui/copilot/activity_timeline.cpp`,
+`host/src/ui/copilot/copilot_internal.h`. Gotcha: restored chat history from older
+sessions still carries `class:0` routing cards and renders as before.

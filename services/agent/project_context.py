@@ -23,6 +23,60 @@ _SKIP_DIRS = {".plm", ".chudware"}
 _MAX_CHARS = 1500
 _MAX_DEPTH = 2
 
+# Directories that mark a folder as a Chudware/PLM project root. A folder the user
+# opened as a PLM project once carries these forever, so NESTED marker dirs are
+# normal: /Documents/489-final and /Documents/489-final/CAD & Design Geometry both
+# hold a .plm. Picking the NEAREST one is what jailed a live run inside the CAD
+# subfolder and refused a run_shell in the sibling CDR/ folder
+# ("outside_workspace_root"). The user's project is the OUTERMOST marked folder, so
+# resolve_project_root climbs to the topmost one instead of stopping at the first.
+_PROJECT_MARKERS = (".plm", ".aicadvault", ".chudware")
+
+# Never treat these as a project root even if something dropped a marker there —
+# jailing an agent to $HOME or ~/Documents is the same as no jail at all.
+_ROOT_STOP_NAMES = {"Documents", "Desktop", "Downloads", "Music", "Pictures", "Videos"}
+
+
+def _is_project_dir(d: Path) -> bool:
+    return any((d / m).is_dir() for m in _PROJECT_MARKERS)
+
+
+def resolve_project_root(start: str | Path) -> Path:
+    """The user's project root for *start* — the OUTERMOST ancestor carrying a project
+    marker, else *start* itself.
+
+    Climbs from *start* to (but never past) $HOME, remembering the highest marked
+    folder seen. Returns an absolute path; never raises. Callers pass the host's
+    save_dir, which is the open DOCUMENT's folder — often a subfolder of the real
+    project — so this is what turns "the folder this part happens to sit in" into
+    "the project the user is working on".
+    """
+    try:
+        cur = Path(os.path.abspath(os.path.expanduser(str(start))))
+    except Exception:  # noqa: BLE001
+        return Path(str(start))
+    if not cur.is_dir():
+        cur = cur.parent
+    try:
+        home = Path.home().resolve()
+    except Exception:  # noqa: BLE001
+        home = None
+    best = cur
+    node = cur
+    # Bounded climb: filesystem depth is finite, but guard anyway.
+    for _ in range(64):
+        if home is not None and (node == home or node.name in _ROOT_STOP_NAMES):
+            break
+        if node.parent == node:  # filesystem root
+            break
+        try:
+            if _is_project_dir(node):
+                best = node  # keep climbing — an outer marker outranks this one
+        except OSError:
+            pass
+        node = node.parent
+    return best
+
 
 def _age(mtime: float, now: float) -> str:
     secs = max(0.0, now - mtime)

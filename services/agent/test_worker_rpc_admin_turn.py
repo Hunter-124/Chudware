@@ -210,3 +210,67 @@ def test_agent_admin_turn_workspace_dir_nonexistent_is_ignored(monkeypatch, tmp_
     for key in _WS_ENV_KEYS:
         assert key not in os.environ
     assert os.getcwd() == start_cwd
+
+def test_workspace_dir_in_a_subfolder_jails_on_the_whole_project(monkeypatch, tmp_path):
+    """The host passes the open DOCUMENT's folder as workspace_dir. The jail root must
+    be the PROJECT, not that subfolder — otherwise a run_shell in a sibling folder is
+    refused with outside_workspace_root (the live CDR failure).
+
+    Deliverable saves still target the folder the host actually named, so a new part
+    lands beside the document it came from.
+    """
+    import os
+
+    _clear_ws_env(monkeypatch)
+    start_cwd = os.getcwd()
+    project = tmp_path / "489-final"
+    (project / ".plm").mkdir(parents=True)
+    geometry = project / "CAD & Design Geometry"   # spaces + '&' on purpose
+    (geometry / ".plm").mkdir(parents=True)        # nested marker: the trap
+    (project / "CDR").mkdir()
+
+    provider = _OneToolProvider(["Listed it."])
+    monkeypatch.setattr(agent_config, "get_provider", lambda *a, **k: provider)
+    try:
+        out = worker_rpc._agent_admin_turn(
+            {"request": "list the CDR folder", "workspace_dir": str(geometry)},
+            lambda data: None,
+        )
+        assert out["ok"] is True
+        root = os.path.realpath(str(project))
+        assert os.path.realpath(os.environ["CHUDWARE_FS_ROOT"]) == root
+        assert os.path.realpath(os.environ["CHUDWARE_PROJECT_DIR"]) == root
+        # …but saves stay where the host asked.
+        assert os.path.realpath(os.environ["CHUDWARE_PROJECT_SAVE_DIR"]) == \
+            os.path.realpath(str(geometry))
+        assert os.path.realpath(os.getcwd()) == root
+
+        # The behaviour that actually failed live: a sibling folder is now writable.
+        from services.mcp import fs_tools
+        assert fs_tools._root_block(str(project / "CDR")) is None
+    finally:
+        os.chdir(start_cwd)
+
+
+def test_unmarked_workspace_dir_is_used_as_is(monkeypatch, tmp_path):
+    """No project marker anywhere: the passed folder is the root, unchanged. Climbing
+    must never widen the jail to $HOME just because no marker was found."""
+    import os
+
+    _clear_ws_env(monkeypatch)
+    start_cwd = os.getcwd()
+    plain = tmp_path / "loose" / "parts"
+    plain.mkdir(parents=True)
+    provider = _OneToolProvider(["Done."])
+    monkeypatch.setattr(agent_config, "get_provider", lambda *a, **k: provider)
+    try:
+        out = worker_rpc._agent_admin_turn(
+            {"request": "list my files", "workspace_dir": str(plain)},
+            lambda data: None,
+        )
+        assert out["ok"] is True
+        target = os.path.realpath(str(plain))
+        for key in _WS_ENV_KEYS:
+            assert os.path.realpath(os.environ[key]) == target
+    finally:
+        os.chdir(start_cwd)

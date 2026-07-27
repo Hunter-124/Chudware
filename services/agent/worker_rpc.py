@@ -1434,16 +1434,22 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
 
     provider_name = _param_str("provider")
 
-    # Workspace plumbing (T: project-folder awareness). run.cpp's general lane now
-    # passes ``workspace_dir`` (the user's project folder, resolved via
-    # agent_workspace_dir(options)). Two effects, both strictly opt-in:
-    #   1. fs_* tools jail on CHUDWARE_FS_ROOT — unset, they resolved against the
-    #      worker's CWD, i.e. the CAD source repo checkout, so the agent had no
-    #      project-folder awareness at all.
-    #   2. chdir to it so shell/fs defaults land in the user's project, not the repo.
-    # The worker is a fresh fork per turn (run.cpp call_admin_worker_turn), so no
-    # restore is needed — but every step is guarded so a bad path only logs/no-ops
-    # and NEVER fails the turn. Absent/invalid param == behaviour exactly as before.
+    # Workspace plumbing (T: project-folder awareness). run.cpp's general lane passes
+    # ``workspace_dir`` = agent_workspace_dir(options), which prefers options.save_dir —
+    # the open DOCUMENT's folder. That is right for saving a part next to its siblings
+    # but WRONG as a jail root: with a document open under
+    # <project>/CAD & Design Geometry/, a live run was refused a run_shell in the
+    # sibling <project>/CDR/ folder ("outside_workspace_root"). So the two concepts are
+    # now resolved separately:
+    #   * CHUDWARE_FS_ROOT / CHUDWARE_PROJECT_DIR — the PROJECT root (outermost folder
+    #     carrying .plm/.aicadvault/.chudware), so the agent can work across the whole
+    #     project the user opened, and project_context lists all of it, not one subtree.
+    #   * CHUDWARE_PROJECT_SAVE_DIR — the folder the host actually asked us to save in,
+    #     left exactly as passed so deliverables still land beside the open document.
+    # chdir targets the project root so shell/fs defaults start there. The worker is a
+    # fresh fork per turn (run.cpp call_admin_worker_turn), so no restore is needed —
+    # but every step is guarded so a bad path only no-ops and NEVER fails the turn.
+    # Absent/invalid param == behaviour exactly as before.
     project_root = ""
     try:
         raw_ws = (params or {}).get("workspace_dir")
@@ -1452,13 +1458,14 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             from pathlib import Path as _Path  # noqa: PLC0415
             cand = _Path(_os.path.abspath(_os.path.expanduser(raw_ws.strip())))
             if cand.is_dir():
-                project_root = str(cand)
-                for env_key in (
-                    "CHUDWARE_FS_ROOT",
-                    "CHUDWARE_PROJECT_DIR",
-                    "CHUDWARE_PROJECT_SAVE_DIR",
-                ):
-                    _os.environ[env_key] = project_root
+                save_dir = str(cand)
+                from services.agent.project_context import (  # noqa: PLC0415
+                    resolve_project_root,
+                )
+                project_root = str(resolve_project_root(cand))
+                _os.environ["CHUDWARE_FS_ROOT"] = project_root
+                _os.environ["CHUDWARE_PROJECT_DIR"] = project_root
+                _os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = save_dir
                 _os.chdir(project_root)
     except Exception:  # noqa: BLE001 — a bad workspace path must never break a turn
         project_root = ""

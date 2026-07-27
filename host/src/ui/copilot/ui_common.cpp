@@ -590,7 +590,29 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     if ((overItem || overRect) && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
         ImGui::OpenPopup(popupId);
 
-    if (!ImGui::BeginPopup(popupId)) return;
+    // Theme the menu like the app's other popups (interwebz combo): opaque popupBg, glass
+    // border, and an accent hover/active highlight. MenuItem hover reads ImGuiCol_HeaderHovered
+    // and the stock theme's highlight is near-invisible over the chat glass — push the accent
+    // ramp so "Copy text" / "Copy all" get a proper, visible highlight.
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,
+        ImVec4(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
+    ImGui::PushStyleColor(ImGuiCol_Header,
+        ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2], pal.accentSoft[3]));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
+        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.30f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,
+        ImVec4(pal.accentMid[0], pal.accentMid[1], pal.accentMid[2], pal.accentMid[3]));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 6.0f * sc);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
+    if (!ImGui::BeginPopup(popupId)) {
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(5);
+        return;
+    }
     const std::string& all = copyAll.empty() ? copyText : copyAll;
     if (!selText.empty()) {
         if (ImGui::MenuItem("Copy"))
@@ -602,6 +624,8 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     if (ImGui::MenuItem("Copy all", nullptr, false, !all.empty()))
         chatCopyToClipboard(all);
     ImGui::EndPopup();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(5);
 }
 
 

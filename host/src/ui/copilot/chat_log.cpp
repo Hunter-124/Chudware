@@ -85,7 +85,10 @@ static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec
     }
     if (!age.empty()) {
         const float ageW = ImGui::CalcTextSize(age.c_str()).x;
-        const float rx = ImGui::GetWindowContentRegionMax().x - ageW;
+        // Right inset clears the hover "copy" glyph that owns the bubble's top-right corner
+        // (14px glyph + 4px pad, chatHoverCopyGlyph) plus a small breathing gap.
+        const float rightInset = (14.0f + 4.0f + 6.0f) * ui::uiScale;
+        const float rx = ImGui::GetWindowContentRegionMax().x - ageW - rightInset;
         ImGui::SameLine();
         ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), rx));
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);

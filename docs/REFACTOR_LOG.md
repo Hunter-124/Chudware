@@ -4356,3 +4356,13 @@ Gotchas: prompt drafts stay doc-keyed in appdata (separate concern); the WASM sh
 merge was rebuilt for the transcript-file layout but is compile-verified only; legacy
 import happens exactly once (guarded by a static in syncChatToDoc) — deleting
 Sessions/index.json re-imports from appdata.
+
+Follow-up: the sessions-picker badge now clips the subtitle to the badge's real left edge
+(no more overlap with "N messages" in narrow columns), and the transcript store dedups
+session ids on BOTH load (a damaged index.json listing an id twice loaded the session
+multiple times, which then re-persisted the dups — self-perpetuating) and persist
+(defensive writtenIds set); dropping a dup marks the store dirty so the clean order is
+rewritten on the next debounced persist. Files: `host/src/ui/copilot/panel.cpp`,
+`host/src/ui/copilot/conversations.cpp`. Gotcha: the app is single-instance — headless
+verification runs silently hand off to an existing window, so kill all instances before
+screenshot/persist checks or you're testing a stale binary.

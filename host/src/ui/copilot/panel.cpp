@@ -491,53 +491,66 @@ void drawSessionsPanel(AppState& st, bool busy) {
         ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
         dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, titleShown.c_str());
 
-        dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY + titleH + 2.0f * sc),
-                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
-                    artiEllipsize(sub, std::max(ui::metrics::px(24.0f),
-                                                rowW - padX * 2.0f)).c_str());
-
         // Document badge: sessions are document-independent but optionally carry a docLink
         // reference. Show the linked document's name on the sub line; clicking it jumps to
         // that document's tab when the tab is open. file: links always render (basename);
         // doc: links only resolve while the tab is open, otherwise the badge is hidden.
-        if (!c.docLink.empty()) {
-            std::string badge;
-            int badgeTab = -1;
-            if (c.docLink.rfind("file:", 0) == 0) {
-                const std::string p = c.docLink.substr(5);
-                const size_t slash = p.find_last_of("/\\");
-                badge = slash == std::string::npos ? p : p.substr(slash + 1);
-                for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
-                    if (st.docTabs[ti].path == p) { badgeTab = ti; break; }
-            } else if (c.docLink.rfind("doc:", 0) == 0) {
-                const std::string id = c.docLink.substr(4);
-                for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
-                    if (st.docTabs[ti].docId == id) { badgeTab = ti; badge = st.docTabs[ti].title; break; }
-            }
-            if (!badge.empty()) {
-                const ImVec2 bsz = ImGui::CalcTextSize(badge.c_str());
-                const float bx1 = rowMax.x - actionsW - padX;
-                const float bx0 = std::max(rowMin.x + padX + runIndent, bx1 - bsz.x - 8.0f * sc);
-                const float by0 = rowMin.y + padY + titleH + 2.0f * sc
-                                  + (subH - bsz.y) * 0.5f - 1.0f * sc;
-                const float by1 = by0 + bsz.y + 2.0f * sc;
-                ImVec4 badgeBg(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.10f);
-                if (badgeTab < 0) badgeBg.w = 0.05f;
-                dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
-                                  ImGui::ColorConvertFloat4ToU32(badgeBg),
-                                  ui::metrics::cpMenuChipRound());
-                ImVec4 badgeInk = badgeTab >= 0 ? surf.textSecondary : surf.textTertiary;
-                badgeInk.w = 1.0f;
-                dl->AddText(ImVec2(bx0 + 4.0f * sc, by0 + 1.0f * sc),
-                            ImGui::ColorConvertFloat4ToU32(badgeInk), badge.c_str());
-                ImGui::SetCursorScreenPos(ImVec2(bx0, by0));
-                ImGui::InvisibleButton("##docbadge", ImVec2(bx1 - bx0, by1 - by0));
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", badgeTab >= 0
-                        ? "Jump to this document's tab" : "Document not open");
-                if (ImGui::IsItemClicked() && badgeTab >= 0)
-                    st.switchToTab(badgeTab);
-            }
+        // Resolved BEFORE the subtitle so the sub's clip yields room for the badge.
+        std::string badge;
+        int badgeTab = -1;
+        if (c.docLink.rfind("file:", 0) == 0) {
+            const std::string p = c.docLink.substr(5);
+            const size_t slash = p.find_last_of("/\\");
+            badge = slash == std::string::npos ? p : p.substr(slash + 1);
+            for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
+                if (st.docTabs[ti].path == p) { badgeTab = ti; break; }
+        } else if (c.docLink.rfind("doc:", 0) == 0) {
+            const std::string id = c.docLink.substr(4);
+            for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
+                if (st.docTabs[ti].docId == id) { badgeTab = ti; badge = st.docTabs[ti].title; break; }
+        }
+        float badgeW = 0.0f;
+        float badgeX0 = 0.0f, badgeX1 = 0.0f;
+        if (!badge.empty()) {
+            // Never let a long filename eat the whole sub line — cap at half the row.
+            badge = artiEllipsize(badge, std::max(ui::metrics::px(24.0f), rowW * 0.5f - padX));
+            badgeW = ImGui::CalcTextSize(badge.c_str()).x + 8.0f * sc;
+            // Right-aligned at the row's true right edge — same exposure rule as the subtitle
+            // itself (the hover/active action buttons draw over the sub line's tail too).
+            badgeX1 = rowMax.x - padX;
+            badgeX0 = std::max(rowMin.x + padX + runIndent, badgeX1 - badgeW);
+        }
+        // Clip the subtitle to the room it ACTUALLY has: up to the badge's left edge when a
+        // badge is drawn (not the row edge — the badge sits left of the action zone).
+        const float subRight = badgeW > 0.0f ? badgeX0 - 6.0f * sc : rowMax.x - padX;
+        const float subMaxW = std::max(ui::metrics::px(24.0f),
+                                       subRight - (rowMin.x + padX + runIndent));
+        dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY + titleH + 2.0f * sc),
+                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
+                    artiEllipsize(sub, subMaxW).c_str());
+
+        if (!badge.empty()) {
+            const ImVec2 bsz = ImGui::CalcTextSize(badge.c_str());
+            const float bx0 = badgeX0, bx1 = badgeX1;
+            const float by0 = rowMin.y + padY + titleH + 2.0f * sc
+                              + (subH - bsz.y) * 0.5f - 1.0f * sc;
+            const float by1 = by0 + bsz.y + 2.0f * sc;
+            ImVec4 badgeBg(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.10f);
+            if (badgeTab < 0) badgeBg.w = 0.05f;
+            dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
+                              ImGui::ColorConvertFloat4ToU32(badgeBg),
+                              ui::metrics::cpMenuChipRound());
+            ImVec4 badgeInk = badgeTab >= 0 ? surf.textSecondary : surf.textTertiary;
+            badgeInk.w = 1.0f;
+            dl->AddText(ImVec2(bx0 + 4.0f * sc, by0 + 1.0f * sc),
+                        ImGui::ColorConvertFloat4ToU32(badgeInk), badge.c_str());
+            ImGui::SetCursorScreenPos(ImVec2(bx0, by0));
+            ImGui::InvisibleButton("##docbadge", ImVec2(bx1 - bx0, by1 - by0));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", badgeTab >= 0
+                    ? "Jump to this document's tab" : "Document not open");
+            if (ImGui::IsItemClicked() && badgeTab >= 0)
+                st.switchToTab(badgeTab);
         }
 
         bool doDel = false;

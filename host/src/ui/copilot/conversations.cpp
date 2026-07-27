@@ -398,11 +398,13 @@ void persistChatHistory(AppState& st) {
     fs::create_directories(chatSessionsDir(), dirEc);
     nlohmann::json sessions = nlohmann::json::array();  // WASM shared push only
     nlohmann::json order = nlohmann::json::array();
+    std::set<std::string> writtenIds;  // defensive: never write an id twice in one snapshot
     std::string activeId;
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
         // Fresh sessions (no messages, no queue, no run) are never written — same rule as
         // empty parts never autosaving.
         if (conversationIsFresh(st, i)) continue;
+        if (!writtenIds.insert(st.conversations[i].id).second) continue;
         if (i == st.activeConv) activeId = st.conversations[i].id;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
         nlohmann::json jm = nlohmann::json::array();
@@ -804,8 +806,11 @@ void loadChatHistory(AppState& st) {
         }
         if (index.is_object() && index.contains("order") && index["order"].is_array()) {
             activeId = index.value("active", std::string());
+            std::set<std::string> seen;  // a damaged index may list an id twice — load it once
+            bool droppedDup = false;
             for (const auto& jid : index["order"]) {
                 if (!jid.is_string()) continue;
+                if (!seen.insert(jid.get<std::string>()).second) { droppedDup = true; continue; }
                 nlohmann::json js;
                 {
                     std::ifstream sf(chatSessionFilePath(jid.get<std::string>()));
@@ -814,6 +819,7 @@ void loadChatHistory(AppState& st) {
                 if (js.is_object())
                     parseChatSessionJson(st, js, js.value("doc", std::string()));
             }
+            if (droppedDup) markChatHistoryDirty();  // rewrite a clean order on next persist
         }
     }
     if (st.conversations.empty()) {

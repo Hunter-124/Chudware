@@ -81,8 +81,12 @@ static const char* docIconName(const AppState::DocTab& t) {
 // A single tab, placed explicitly at screen position (x, y0). Returns the tab WIDTH so the caller
 // can advance to the next tab. Records a deferred switch/close into the file statics. Layout:
 // [ title (dirty *) × ]. The whole pill switches; the × hot-zone (submitted on top) closes.
+// clipL/clipR bound the visible tab lane (the outer PushClipRect); fadeW is the edge-dissolve
+// width. A tab clipped by a lane edge fades its right-edge separator out over that zone so the
+// separator never reads as a bright vertical fleck where the title is truncated.
 static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
-                        const ui::AdaptiveSurface& surf) {
+                        const ui::AdaptiveSurface& surf,
+                        float clipL, float clipR, float fadeW) {
     const auto& pal = ui::palette;
     AppState::DocTab& t = st.docTabs[idx];
     const bool active = (idx == st.activeTab);
@@ -176,9 +180,23 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
                     kTabR,
                     0,
                     std::max(1.0f, 1.5f * s));
-    } else  // thin separator on the right edge of inactive tabs (inset from pill corners)
-        dl->AddLine(ImVec2(p1.x - 0.5f, p0.y + kTabR), ImVec2(p1.x - 0.5f, p1.y - kTabR),
-                    ui::Palette::toU32(pal.border), 1.0f);
+    } else {  // thin separator on the right edge of inactive tabs (inset from pill corners)
+        // Fade the separator out inside the lane-edge dissolve zone: a tab clipped by the strip
+        // edge (or one whose right edge sits within the fade) otherwise paints a bright vertical
+        // line right where the title is truncated.
+        float sepA = 1.0f;
+        if (fadeW > 0.5f) {
+            if (p0.x < clipL - 0.5f)
+                sepA = std::min(sepA, ImClamp((p1.x - clipL) / fadeW, 0.0f, 1.0f));
+            if (p1.x > clipR + 0.5f)
+                sepA = std::min(sepA, ImClamp((clipR - p1.x + fadeW) / fadeW, 0.0f, 1.0f));
+        }
+        if (sepA > 0.01f) {
+            float sc[4] = {pal.border[0], pal.border[1], pal.border[2], pal.border[3] * sepA};
+            dl->AddLine(ImVec2(p1.x - 0.5f, p0.y + kTabR), ImVec2(p1.x - 0.5f, p1.y - kTabR),
+                        ui::Palette::toU32(sc), 1.0f);
+        }
+    }
 
     // Title text + kind icon — max-contrast glass surface tones (theme-independent vibrancy ramp).
     // Clip to the pill AABB so close-button / label never paint past the tab edge under overflow.
@@ -259,11 +277,15 @@ static float measureOverflowChipW(int count, float s) {
 // Clean alpha fade at a truncated tab edge — neutral surface tone ramping to transparent, NOT a
 // saturated accent gradient block. `fromRight` true: opaque at the right edge, transparent leftward.
 //
-// AddRectFilledMultiColor is SQUARE-cornered. Drawn full-height at the band edge it produced the
-// bright vertical strip / square-corner fleck (same class of bug as coloredRowWash / ribbon_vGrad
-// — MultiColor poking past the rounded glass outline, plus a near-opaque light-tint wall at the
-// solid edge). Keep the MultiColor strictly inside the band's rounded outline and use a soft
-// two-stop dissolve so the title reads as dissolving, not as a bright bar.
+// AddRectFilledMultiColor is SQUARE-cornered. Drawn full-height ON the band's outer rounded
+// outline it produced the bright vertical strip / square-corner fleck (same class of bug as
+// coloredRowWash / ribbon_vGrad — MultiColor poking past the rounded glass outline, plus a
+// near-opaque light-tint wall at the solid edge). So: pass cornerR = the band's corner radius
+// when the fade edge coincides with that rounded outline (inset kept), and cornerR = 0 when the
+// fade edge is INTERIOR to the band (a "+N" chip owns that side) — there the fade deliberately
+// runs the full pill height so the truncated tab's border/separator/shadow dissolve along with
+// the title instead of leaving a sliced pill edge with a text-only fade. Either way the ramp is
+// a soft two-stop dissolve, not a bright bar.
 static void drawTabEdgeFade(ImDrawList* dl, float edgeX, float y0, float y1, float fadeW,
                             bool fromRight, const ui::AdaptiveSurface& surf, float cornerR) {
     if (fadeW < 1.0f) return;
@@ -312,9 +334,10 @@ static void drawTabEdgeFade(ImDrawList* dl, float edgeX, float y0, float y1, flo
 static bool drawOverflowChip(ImDrawList* dl, float x, float y0, float barH, float chipW,
                              int count, const ui::AdaptiveSurface& surf, float s,
                              const char* id, const std::vector<std::string>& hiddenTitles) {
-    const float padY = 2.0f * s;
-    const ImVec2 p0(x, y0 + padY);
-    const ImVec2 p1(x + chipW, y0 + barH - padY);
+    // Full tab-pill height (no vertical inset) so the chip's glass outline lines up with the tab
+    // pills beside it — a shorter chip made the whole control read as vertically off.
+    const ImVec2 p0(x, y0);
+    const ImVec2 p1(x + chipW, y0 + barH);
     const ImRect chipRect(p0, p1);
     const float kChipRdp = 4.0f;
 
@@ -342,8 +365,11 @@ static bool drawOverflowChip(ImDrawList* dl, float x, float y0, float barH, floa
     char lbl[16];
     std::snprintf(lbl, sizeof(lbl), "+%d", count < 0 ? 0 : count);
     const ImVec2 ts = ImGui::CalcTextSize(lbl);
+    // Horizontally centered (measureOverflowChipW pads both sides equally); vertically use the
+    // SAME baseline formula drawOneTab uses for tab titles so "+N" sits on the exact visual line
+    // of the filenames beside it rather than being centered against an inset chip rect.
     const float tx = p0.x + (chipW - ts.x) * 0.5f;
-    const float ty = p0.y + (p1.y - p0.y - ts.y) * 0.5f;
+    const float ty = y0 + (barH - ImGui::GetFontSize()) * 0.5f;
     dl->AddText(ImVec2(tx, ty), ImGui::ColorConvertFloat4ToU32(surf.textPrimary), lbl);
 
     if (hovered) {
@@ -673,24 +699,29 @@ float drawDocTabs(AppState& st, float availW) {
     }
 
     // Draw the tabs clipped to the reserved tab region (chips live outside this clip).
-    // A partially-scrolled boundary tab stays drawn; the edge fade below softens its title.
+    // A partially-scrolled boundary tab stays drawn; the edge fade below dissolves it (title AND
+    // pill edge treatment), so the truncation never reads as a hard slice through border/shadow.
+    const float fadeW = 28.0f * s;
     dl->PushClipRect(ImVec2(tabsL, bandT), ImVec2(tabsR, bandB), true);
     for (int i = 0; i < nTabs; ++i) {
         const float x = tabsL + tabOff[i] - s_scrollX;
         const float xr = x + tabWs[i];
         if (xr <= tabsL + 0.5f) continue;
         if (x  >= tabsR - 0.5f) continue;
-        drawOneTab(st, i, x, y0, barH, surf);
+        drawOneTab(st, i, x, y0, barH, surf, tabsL, tabsR, fadeW);
     }
     // Clean alpha fade on truncated edges (drawn inside the tab clip so it only covers tab content).
-    // MultiColor stays inset past the band's 8dp corner radius — same square-corner guard as
-    // coloredRowWash / ribbon_vGradRounded.
-    const float fadeW = 28.0f * s;
+    // When a "+N" chip owns that side the fade edge is INTERIOR to the band, so it runs the full
+    // pill height and dissolves the sliced border/separator/shadow with the title. When the fade
+    // edge coincides with the band's own rounded corner (no chip), keep the MultiColor inset past
+    // the 8dp corner radius — the square-corner guard shared with coloredRowWash/ribbon_vGrad.
     const float bandRdp = 8.0f * s;
     if (overflow && s_scrollX > 0.5f)
-        drawTabEdgeFade(dl, tabsL, y0, y0 + barH, fadeW, /*fromRight=*/false, surf, bandRdp);
+        drawTabEdgeFade(dl, tabsL, y0, y0 + barH, fadeW, /*fromRight=*/false, surf,
+                        leftChipW > 0.5f ? 0.0f : bandRdp);
     if (overflow && s_scrollX < maxScroll - 0.5f)
-        drawTabEdgeFade(dl, tabsR, y0, y0 + barH, fadeW, /*fromRight=*/true, surf, bandRdp);
+        drawTabEdgeFade(dl, tabsR, y0, y0 + barH, fadeW, /*fromRight=*/true, surf,
+                        rightChipW > 0.5f ? 0.0f : bandRdp);
     dl->PopClipRect();
 
     // Reserved-slot overflow chips — never over a tab title.

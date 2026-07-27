@@ -37,6 +37,9 @@ namespace ui {
 // Deferred actions, applied after the strip finishes drawing (see header note).
 static int  s_switchTo   = -1;   // tab index to activate, or -1
 static int  s_closeIdx   = -1;   // tab index to close, or -1
+// Edge-tab reveal: hovering a lane-clipped tab past the short dwell asks the NEXT frame's layout to
+// scroll it fully into view, so the hover highlight never stays dissolved at a lane edge.
+static int  s_hoverReveal = -1;
 // Wave 2: the "+" New-Document chooser. The clicked menu item records which kind of doc to create;
 // the actual create+addTab runs after the strip is drawn (deferred, like switch/close), so it never
 // mutates docTabs mid-iteration. -1 = nothing requested this frame.
@@ -140,6 +143,12 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     bool switchClicked = ImGui::InvisibleButton("##tab", ImVec2(tabW, tabH));
     bool hovered = ImGui::IsItemHovered();
     bool middleClose = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
+
+    // Hovering a lane-clipped edge tab: past the short dwell, scroll it fully into view next frame
+    // so its hover highlight isn't left half-dissolved at the clip edge.
+    if (hovered && (p0.x < clipL - 0.5f || p1.x > clipR + 0.5f) &&
+        ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+        s_hoverReveal = idx;
 
     // Right-click context menu (attaches to the ##tab item above). "Close Others" is the headline
     // request; Close / Close All round it out. Actions are deferred via the same statics the ×/middle
@@ -730,13 +739,30 @@ float drawDocTabs(AppState& st, float availW) {
         rightChipW = nextRight;
     }
 
-    // Wheel over the strip scrolls it horizontally (horizontal wheel, or a plain wheel as a fallback
+// Wheel over the strip scrolls it horizontally (horizontal wheel, or a plain wheel as a fallback
     // so a trackpad / mouse without an H-wheel still works).
     if (overflow && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
         float wheel = ImGui::GetIO().MouseWheelH;
         if (wheel == 0.0f) wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f)
             s_scrollX = std::min(std::max(s_scrollX - wheel * 60.0f * s, 0.0f), maxScroll);
+    }
+
+    // Clicking (or dwell-hovering) a partially-hidden tab scrolls it fully into view THIS frame (or
+    // the next for hover), so the active/hover border it is about to get is never left dissolved at
+    // a lane edge (and the user can always reach the first/last file by clicking its visible sliver).
+    {
+        const int reveal = s_switchTo >= 0 ? s_switchTo : s_hoverReveal;
+        s_hoverReveal = -1;
+        if (overflow && reveal >= 0 && reveal < nTabs) {
+            const float tL = tabOff[(size_t)reveal];
+            const float tR = tL + tabWs[(size_t)reveal];
+            if (tL < s_scrollX + 0.5f)
+                s_scrollX = tL;
+            else if (tR > s_scrollX + tabsW - 0.5f)
+                s_scrollX = tR - tabsW;
+            s_scrollX = std::min(std::max(s_scrollX, 0.0f), maxScroll);
+        }
     }
 
     // Draw the tabs clipped to the reserved tab region (chips live outside this clip).
@@ -968,5 +994,9 @@ void createNewDoc(AppState& st, int kindOrd) {
 // Wave 2: request the New-Document chooser popup open on the next strip draw (e.g. a Ctrl+N hook in
 // app.cpp). Safe to call anytime; the flag is consumed inside drawDocTabs.
 void openNewDocChooser() { s_openChooser = true; }
+
+// Screenshot/debug hook (CHUDWARE_SHOT=doctabs): pre-set the lane scroll; the next layout pass
+// clamps it into [0, maxScroll].
+void debugSetDocTabScroll(float scrollX) { s_scrollX = scrollX; }
 
 }  // namespace ui

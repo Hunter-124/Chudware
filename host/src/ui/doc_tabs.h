@@ -32,6 +32,10 @@ float drawDocTabs(AppState& state, float availW);
 // Ctrl+N key hook (the "+" button opens it directly). No-op if the strip isn't drawn (no document).
 void openNewDocChooser();
 
+// Screenshot/debug hook: pre-set the tab lane's horizontal scroll (px; clamped at the next layout
+// pass). Used by CHUDWARE_SHOT=doctabs to photograph scroll-extreme states headless.
+void debugSetDocTabScroll(float scrollX);
+
 // Create a document directly from menus/toolbars without drawing the old document strip.
 // kind: 0=Part, 1=Assembly, 2=Drawing, 3=Schematic, 4=PCB.
 void createNewDoc(AppState& state, int kind);

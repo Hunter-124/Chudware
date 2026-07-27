@@ -42,6 +42,16 @@ export const isKimiK26ModelId = memo((modelId: string): boolean => {
 });
 
 /**
+ * Kimi K3 in any namespace form (`kimi-k3`, `kimi-k3.1`, `kimi-k3-turbo`,
+ * `moonshotai/kimi-k3`). K3 always reasons and drives thinking via OpenAI-style
+ * `reasoning_effort: "max"`, not the K2.x binary `thinking: { type }` block —
+ * see the moonshot discovery mapper and `buildOpenAICompat`.
+ */
+export const isKimiK3ModelId = memo((modelId: string): boolean => {
+	return /(^|\/)kimi-k3(?:\.\d+)?(?:[-.:_]|$)/i.test(modelId);
+});
+
+/**
  * Claude ids in any namespace form: bare (`claude-*`), path-namespaced
  * (`anthropic/claude.x`), or dot-prefixed (`us.anthropic.claude-…`,
  * `global.anthropic.claude-…`, `au.anthropic.claude-…` — Bedrock cross-region
@@ -249,6 +259,19 @@ export const modelFamilyToken = memo((modelId: string): string => {
 	if (isGemmaModelId(modelId)) return "gemma";
 	if (parseGlmModel(bareModelId(modelId))) return "glm";
 	return "";
+});
+
+/**
+ * True for Claude generations that support extended thinking: Sonnet/Opus 3.7+,
+ * every 4.x/5+ Opus/Sonnet, and the Fable/Mythos generation. Pre-thinking
+ * models (Claude 3.5 and older) are excluded so no thinking effort dial is
+ * fabricated for a model that rejects thinking parameters. Classifier-based, so
+ * dotted and dashed version forms both match; ids the classifier does not parse
+ * (e.g. Haiku, bare dated ids) return false.
+ */
+export const anthropicModelSupportsThinking = memo((modelId: string): boolean => {
+	const parsed = parseAnthropicModel(bareModelId(modelId));
+	return parsed !== null && semverGte(parsed.version, "3.7");
 });
 
 /**

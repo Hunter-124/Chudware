@@ -41,11 +41,12 @@ function nearestBundled(providerId: ProviderId, modelId: string): Model<Api> | u
 export function resolveModel(provider: string, modelId: string, baseUrl?: string): Model<Api> {
 	// `as ProviderId`: provider is a runtime string; the registry keys on a branded union.
 	const providerId = provider as ProviderId;
-	// getBundledModel is typed non-optional but returns undefined on a registry miss.
-	let model = getBundledModel(providerId, modelId) as Model<Api> | undefined;
+	// CAD-side extras (catalog-extra.ts) win over a bundled row of the same id — they carry
+	// our overrides (e.g. kimi-code K3 real cost where the subscription catalog says $0).
+	let model = extraModels(provider).find((m) => m.id === modelId);
 	if (!model) {
-		// CAD-side additions (kimi-k3 etc.) missing from the pinned vendor catalog.
-		model = extraModels(provider).find((m) => m.id === modelId);
+		// getBundledModel is typed non-optional but returns undefined on a registry miss.
+		model = getBundledModel(providerId, modelId) as Model<Api> | undefined;
 	}
 	if (!model) {
 		// Unknown id under a known provider: clone its closest bundled sibling as a template and

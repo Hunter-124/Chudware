@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -126,6 +127,7 @@ def _copytree_pruned(src: Path, dst: Path) -> None:
 def _generate_root_package_json(source_root: Path) -> dict:
     """Minimal bun workspace root: only the vendored packages + our preserved bridge/."""
     upstream = json.loads((source_root / "package.json").read_text(encoding="utf-8"))
+    catalog = upstream.get("workspaces", {}).get("catalog", {})
     root = {
         "name": "cad-omp-vendor",
         "private": True,
@@ -135,7 +137,7 @@ def _generate_root_package_json(source_root: Path) -> dict:
         "workspaces": {
             "packages": ["packages/*", "bridge"],
             # Reuse upstream's dependency catalog verbatim (our packages pin via `catalog:`).
-            "catalog": upstream.get("workspaces", {}).get("catalog", {}),
+            "catalog": catalog,
         },
     }
     # Keep only patch entries whose patch file we actually carry (avoids bun errors on
@@ -148,6 +150,58 @@ def _generate_root_package_json(source_root: Path) -> dict:
     if kept:
         root["patchedDependencies"] = kept
     return root
+
+
+OMP_SCOPE = "@oh-my-pi/"
+
+# pi-natives' per-platform prebuilt binaries ride along as optionalDependencies of the
+# npm package (not the workspace catalog), so they must be exempted by name as well.
+PI_NATIVES_PLATFORM_PKGS = [
+    f"{OMP_SCOPE}pi-natives-{os}-{arch}"
+    for os in ("linux", "darwin", "win32")
+    for arch in ("x64", "arm64")
+]
+
+
+def _patch_bunfig(path: Path, catalog: dict) -> None:
+    """Exempt our `@oh-my-pi/*` catalog pins from upstream's `minimumReleaseAge` gate.
+
+    The gate is a supply-chain cooldown for floating ranges; our OMP deps are exactly
+    pinned (`exact = true` + catalog pin to the vendored release), so the cooldown only
+    blocks re-vendoring any upstream release younger than 3 days — precisely when a
+    re-vendor happens (fresh upstream fixes). Rewrites the copied bunfig in place.
+    """
+    if not path.exists():
+        return
+    omp_pkgs = sorted(k for k in catalog if k.startswith(OMP_SCOPE))
+    if not omp_pkgs:
+        return
+    text = path.read_text(encoding="utf-8")
+    m = re.search(r"^minimumReleaseAgeExcludes = \[(.*?)\]", text, flags=re.M)
+    existing: list[str] = []
+    if m:
+        existing = re.findall(r'"([^"]+)"', m.group(1))
+    merged = sorted(set(existing) | set(omp_pkgs) | set(PI_NATIVES_PLATFORM_PKGS))
+    line = "minimumReleaseAgeExcludes = [" + ", ".join(f'"{p}"' for p in merged) + "]"
+    if m:
+        text = text[: m.start()] + line + text[m.end() :]
+    elif re.search(r"^\[install\]", text, flags=re.M):
+        text = re.sub(r"^\[install\]\n", "[install]\n" + line + "\n", text, count=1, flags=re.M)
+    else:
+        text += "\n[install]\n" + line + "\n"
+    path.write_text(text, encoding="utf-8")
+
+
+def _excluded_from_lock(rel: str) -> bool:
+    """Paths the content-hash lock must not pin: our preserved bridge/, install output
+    (node_modules at any depth, the bun.lock `bun install` regenerates), and the lock itself."""
+    return (
+        rel.startswith("bridge/")
+        or rel.startswith("node_modules/")
+        or "/node_modules/" in rel
+        or rel == "bun.lock"
+        or rel == "OMP_VENDOR.lock"
+    )
 
 
 def vendor(from_arg: str, sha: str | None, packages: list[str], run_install: bool) -> None:
@@ -178,8 +232,13 @@ def vendor(from_arg: str, sha: str | None, packages: list[str], run_install: boo
             if (source_root / d).is_dir():
                 shutil.copytree(source_root / d, VENDOR_DIR / d)
 
+        root_pkg = _generate_root_package_json(source_root)
+        _patch_bunfig(
+            VENDOR_DIR / "bunfig.toml",
+            root_pkg.get("workspaces", {}).get("catalog", {}),
+        )
         (VENDOR_DIR / "package.json").write_text(
-            json.dumps(_generate_root_package_json(source_root), indent=2) + "\n",
+            json.dumps(root_pkg, indent=2) + "\n",
             encoding="utf-8",
         )
 
@@ -190,7 +249,7 @@ def vendor(from_arg: str, sha: str | None, packages: list[str], run_install: boo
         manifest: dict[str, str] = {}
         for p in _iter_files(VENDOR_DIR):
             rel = p.relative_to(VENDOR_DIR).as_posix()
-            if rel.startswith("bridge/") or "/node_modules/" in rel or rel == "OMP_VENDOR.lock":
+            if _excluded_from_lock(rel):
                 continue
             manifest[rel] = _sha256_file(p)
         lock = {
@@ -229,10 +288,10 @@ def verify() -> int:
             drift.append(f"missing: {rel}")
         elif _sha256_file(p) != want:
             drift.append(f"changed: {rel}")
-    # New tracked files (excluding bridge/ + node_modules) that are not in the lock.
+    # New tracked files (excluding bridge/ + install output) that are not in the lock.
     for p in _iter_files(VENDOR_DIR):
         rel = p.relative_to(VENDOR_DIR).as_posix()
-        if rel.startswith("bridge/") or "/node_modules/" in rel or rel == "OMP_VENDOR.lock":
+        if _excluded_from_lock(rel):
             continue
         if rel not in lock["files"]:
             drift.append(f"untracked: {rel}")

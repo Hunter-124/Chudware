@@ -1,16 +1,13 @@
 /**
  * CAD-side catalog supplement (PRESERVED across re-vendor, unlike vendor/omp/packages/catalog).
  *
- * The bundled OMP catalog (`@oh-my-pi/pi-catalog` models.json) is pinned to a vendor snapshot
- * that predates Kimi K3, and it still lists Moonshot's sunset `moonshot-v1-*` / `kimi-k2.5`
- * families. Rather than edit vendored data (which a re-vendor would clobber), we layer our own
- * additions + a deprecation denylist here, in our owned bridge package, and merge them in
- * `models.ts` for both `models_list` (the Providers-tab catalog) and `resolveModel` (completion).
+ * Layers our own rows over the bundled OMP catalog (`@oh-my-pi/pi-catalog` models.json) without
+ * editing vendored data (a re-vendor would clobber it). Merged in `models.ts` for both
+ * `models_list` (the Providers-tab catalog) and `resolveModel` (completion + cost_summary);
+ * a same-id extra OVERRIDES the bundled row.
  *
- * Each EXTRA entry is CLONED from a sibling bundled model so the full `Model<Api>` shape stays
- * valid without hand-authoring every field; we only retarget id/name/context/cost. `requestModelId`
- * is set explicitly where the display id differs from the wire id (kimi-code subscriptions only
- * accept `kimi-for-coding`).
+ * Each entry is CLONED from the bundled model of the same id so the full `Model<Api>` shape
+ * stays valid without hand-authoring every field.
  */
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog";
 import type { Api, Model } from "@oh-my-pi/pi-catalog";
@@ -19,10 +16,8 @@ type ProviderId = Parameters<typeof getBundledModel>[0];
 
 /** Kimi K3 flat pricing on the official Moonshot API ($/Mtok): $3 in, $15 out, $0.30 cached. */
 const K3_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 };
-const FREE_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-const K3_CONTEXT = 1_048_576;
 
-/** Clone a bundled sibling and retarget it, or fall back to the provider's first model. */
+/** Clone a bundled model and retarget it, or fall back to the provider's first model. */
 function clone(
 	provider: string,
 	siblingId: string,
@@ -36,41 +31,22 @@ function clone(
 	return { ...base, ...over };
 }
 
-/** Models missing from the pinned vendor catalog, keyed by provider id. Empty entries dropped. */
+/** Same-id overrides + models missing from the bundled catalog, keyed by provider id. */
 export function extraModels(provider: string): Model<Api>[] {
 	const out: Model<Api>[] = [];
 	const push = (m: Model<Api> | undefined) => {
 		if (m) out.push(m);
 	};
-	if (provider === "moonshot") {
-		push(clone("moonshot", "kimi-k2.7-code", {
-			id: "kimi-k3", requestModelId: "kimi-k3", name: "Kimi K3",
-			contextWindow: K3_CONTEXT, maxTokens: 262_144, cost: K3_COST,
-		}));
-	} else if (provider === "kimi-code") {
-		// Subscription endpoint only accepts `kimi-for-coding` on the wire.
-		//
-		// cost MUST be set explicitly. Every bundled `kimi-code` model carries
-		// {input:0, output:0, cacheRead:0} because it is a subscription plan, so a clone
-		// that only retargets id/name/context INHERITS those zeros — and the GUI then
+	if (provider === "kimi-code") {
+		// cost MUST be overridden explicitly. Bundled `kimi-code` rows carry
+		// {input:0, output:0, cacheRead:0} because it is a subscription plan, so the GUI
 		// renders the row as "free"/$0 (host/src/ui/copilot/settings.cpp treats
 		// costIn==0 && costOut==0 as free) and the Metrics view prices every K3 turn at
-		// $0. This is the same underlying Moonshot model as the `moonshot` entry above,
-		// so it gets the same real per-Mtok economics; that keeps all three K3 rows
-		// (moonshot / kimi-code / zenmux) agreeing instead of one silently reading $0.
-		push(clone("kimi-code", "kimi-for-coding", {
-			id: "kimi-k3", requestModelId: "kimi-for-coding", name: "Kimi K3",
-			contextWindow: K3_CONTEXT, cost: K3_COST,
-		}));
-	} else if (provider === "zenmux") {
-		push(clone("zenmux", "moonshotai/kimi-k2.7-code", {
-			id: "moonshotai/kimi-k3", requestModelId: "moonshotai/kimi-k3", name: "Kimi K3",
-			contextWindow: K3_CONTEXT, cost: K3_COST,
-		}));
-		push(clone("zenmux", "moonshotai/kimi-k2.7-code-free", {
-			id: "moonshotai/kimi-k3-free", requestModelId: "moonshotai/kimi-k3-free",
-			name: "Kimi K3 (Free)", contextWindow: K3_CONTEXT, cost: FREE_COST,
-		}));
+		// $0. This is the same Kimi K3 the metered `moonshot` provider sells, so both
+		// context variants (1M and 256k) get real per-Mtok economics; that keeps the K3
+		// rows (moonshot / kimi-code / zenmux) agreeing instead of one silently reading $0.
+		push(clone("kimi-code", "k3", { cost: K3_COST }));
+		push(clone("kimi-code", "k3-256k", { cost: K3_COST }));
 	}
 	return out;
 }

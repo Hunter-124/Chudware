@@ -135,7 +135,11 @@ def test_run_turn_consumes_pre_queued_steer():
     reg.register_session("dg_s1", role="worker", status="running")
     reg.queue_steer("dg_s1", "prefer a revolve over a loft")
     prov = RecordingProvider([_DONE])
-    res = run_turn("model the shaft", prov, name="worker", subagent_id="dg_s1")
+    # A BUILD brief that finishes with zero real tool calls is an unearned
+    # finish (the harness nudges, then fails it — browsing packs is not work).
+    # This test covers steer DELIVERY, so use a brief that needs no tools.
+    res = run_turn("summarize the shaft design decisions", prov, name="worker",
+                   subagent_id="dg_s1")
     assert res.success
     # the steer landed as a user message BEFORE the first completion
     assert "[Human steering] prefer a revolve over a loft" in \
@@ -187,12 +191,14 @@ def test_delegate_registers_streams_spawn_and_executes():
         events.append(dict(data))
 
     tree = DelegationTree(run_id="r_test", on_event=on_event)
-    # mega-13 refuses a zero-tool done on product roles (add_features+new_part
-    # on the sketcher allowlist) — script one harmless meta call first.
+    # mega-13 refuses a zero-tool done on product roles; the unearned-finish
+    # gate goes further — a META call (list_tool_categories) is NOT work, so a
+    # BUILD brief still needs a real tool. This test covers spawn/stream/
+    # registry wiring, so the brief is an analysis one that needs no tools.
     prov = MockProvider([_LIST_CATS, _DONE])
     md = MissionDispatch(run_id="r_test", delegation_tree=tree, provider=prov,
                          on_event=on_event)
-    out = md.delegate(role="sketcher", brief="sketch the base plate",
+    out = md.delegate(role="sketcher", brief="review the base plate layout",
                       budget_tokens=2000)
     assert out.get("executed") is True and out.get("ok") is True
     # mega-8 multi-domain gate augments outputs with a residual typed_refusal —

@@ -511,23 +511,63 @@ def _did_real_work(calls: list) -> bool:
     )
 
 
+#: Verbs that make a request WORK rather than conversation. A turn that ends
+#: without a single real tool call has not served one of these, whatever the
+#: reply says — live 2026-07-27: "make me a mudbucket" -> "I'll build it
+#: inline. Enabling modeling tools first." and the turn ENDED, 0/0 steps.
+#: Phrase-matching the REPLY cannot cover every way a model announces intent;
+#: keying on the REQUEST is exhaustive for the class that matters.
+_WORK_VERBS = (
+    r"build|make|create|model|design|draw|sketch|extrude|revolve|loft|"
+    r"fillet|chamfer|assemble|generate|add|edit|modify|change|fix|delete|"
+    r"remove|save|export|import|open|rename|move|run|simulate|mesh|"
+    r"organi[sz]e|clean\s*up|check\s*in|commit|refactor"
+)
+#: The verb only counts in IMPERATIVE position: at the start of the request or
+#: a clause, or after a request auxiliary. Half these words are also everyday
+#: nouns — "summarize the shaft DESIGN decisions" and "what does the MODEL
+#: weigh?" are questions, and blocking their prose answers would be the very
+#: harness-makes-it-impossible failure this gate is meant to prevent.
+_WORK_INTENT_RE = re.compile(
+    r"(?:^|[.;:!?]\s*|\b(?:please|then|and|now|also|can you|could you|"
+    r"would you|will you|you should|i want you to|i need you to|go ahead and|"
+    r"help me)\s+)"
+    rf"(?:{_WORK_VERBS})\b",
+    re.IGNORECASE,
+)
+
+
+def _request_wants_work(request: str) -> bool:
+    """True when the user asked for something to be DONE, not just answered."""
+    return bool(_WORK_INTENT_RE.search((request or "").strip()))
+
+
 def _unearned_finish_block(
     calls: list,
     text: str,
     *,
     empty_is_unearned: bool = False,
+    request: str = "",
+    can_act: bool = True,
 ) -> str | None:
     """Return the corrective nudge when a finish did not earn its status.
 
     Fires when the turn did no real work (every call harness-forced or a meta
-    pack/category call) AND either the finish CLAIMS completed work, or -
-    on the formal-handoff path only (*empty_is_unearned*) - the finish is
-    content-free. Live 2026-07-27: kimi k3 called list_tool_categories once
-    and then emitted `status: done` with an empty summary, building nothing.
-    Voluntary real tool work (even failed) and honest prose pass untouched.
+    pack/category call) AND any of: the user ASKED for work, the finish CLAIMS
+    completed work, or - on the formal-handoff path (*empty_is_unearned*) - the
+    finish is content-free. Voluntary real tool work (even failed) always passes,
+    as does honest prose answering a question that asked for no work.
+
+    *can_act* is False when the turn has NO dispatcher, i.e. no tool could have
+    run whatever the model wanted. Demanding work there would make the turn
+    unsatisfiable by construction, so the work-intent rule is skipped; the
+    claim/empty rules still apply because a model must not invent results it
+    had no means to produce.
     """
     if _did_real_work(calls):
         return None
+    if can_act and _request_wants_work(request):
+        return _UNEARNED_FINISH_NUDGE
     if _claims_completed_work(text):
         return _UNEARNED_FINISH_NUDGE
     if empty_is_unearned and not (text or "").strip():
@@ -1588,7 +1628,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 # Fabricated-success gate: a finish that claims work - or says
                 # nothing at all - while the turn did no real work is not done.
                 _unearned = _unearned_finish_block(
-                    calls, reply or "", empty_is_unearned=True)
+                    calls, reply or "", empty_is_unearned=True, request=request,
+                    can_act=callable(dispatch))
                 if _unearned is not None:
                     if _novol_nudge[0] < 1:
                         _novol_nudge[0] += 1
@@ -1734,7 +1775,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 # work while every call so far was harness-forced is not done.
                 _ho_text = _handoff_text(handoff)
                 _unearned = _unearned_finish_block(
-                    calls, _ho_text[:4000], empty_is_unearned=True)
+                    calls, _ho_text[:4000], empty_is_unearned=True,
+                    request=request, can_act=callable(dispatch))
                 if _unearned is not None:
                     if _novol_nudge[0] < 1:
                         _novol_nudge[0] += 1
@@ -1774,7 +1816,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     continue
                 # Same fabricated-success gate as the prose finish above.
                 _unearned = _unearned_finish_block(
-                    calls, reply or "", empty_is_unearned=True)
+                    calls, reply or "", empty_is_unearned=True, request=request,
+                    can_act=callable(dispatch))
                 if _unearned is not None:
                     if _novol_nudge[0] < 1:
                         _novol_nudge[0] += 1

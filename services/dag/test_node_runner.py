@@ -610,10 +610,23 @@ class TestRoleCardWiring:
 # ---------------------------------------------------------------------------
 
 class _TurnScriptedProvider:
-    """Finish immediately with a done directive (agent_turn protocol)."""
+    """Do one real tool call, then finish (agent_turn protocol).
+
+    A BUILD brief that finishes with zero real tool calls is an unearned finish
+    and the harness refuses it (browsing packs does not count either). These
+    tests are about provider/tier resolution, so the scripted turn performs one
+    harmless ledger write to earn its handoff.
+    """
     name = "scripted"
 
+    def __init__(self):
+        self._turns = 0
+
     def complete(self, system, messages, max_tokens=None):
+        self._turns += 1
+        if self._turns == 1:
+            return ('```json\n{"tool": "ledger_note", "args": {"kind": "note", '
+                    '"payload": {"text": "scripted"}}}\n```')
         return '```json\n{"done": true, "handoff": {"summary": "done"}}\n```'
 
 

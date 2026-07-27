@@ -365,9 +365,18 @@ def test_context_refs_surfaced_in_user_message():
 
     class _CaptureProvider:
         name = "capture"
+        turns = 0
 
         def complete(self, system, messages, max_tokens=8000):
-            seen["messages"] = messages
+            if seen["messages"] is None:
+                seen["messages"] = messages
+            self.__class__.turns += 1
+            # An EDIT request that finishes with zero tool calls is an unearned
+            # finish (the harness refuses it), so do the work then hand off —
+            # this test is about context_refs reaching the user turn, not about
+            # the finish gate.
+            if self.__class__.turns == 1:
+                return '```json\n{"tool": "measure_part", "args": {}}\n```'
             return '```json\n{"done": true, "handoff": {"summary": "ok"}}\n```'
 
     refs = [

@@ -68,9 +68,12 @@ def test_lists_cad_files_newest_first_with_size_and_age(tmp_path):
     blk = project_context_block(tmp_path)
     assert blk, "expected a non-empty block"
     assert str(tmp_path) in blk
-    assert "ALREADY EXIST" in blk
+    assert "already exist" in blk.lower()
     assert "import_part" in blk
-    assert "Do NOT create a second part" in blk
+    # Both branches must be present: a bare prohibition deadlocked k3 live
+    # (it deliberated "import or build?" instead of acting).
+    assert "create the new part" in blk
+    assert "act" in blk.lower()
     assert "new_part.step+" in blk and "old_part.step+" in blk
     assert blk.index("new_part.step+") < blk.index("old_part.step+"), blk
     assert "4 KB" in blk and "2 KB" in blk

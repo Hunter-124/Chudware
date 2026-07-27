@@ -80,13 +80,20 @@ def project_context_block(root: str | Path | None, *, max_files: int = 40) -> st
         for rel, size, mtime in rows:
             parent, _, name = rel.rpartition("/")
             by_dir.setdefault(parent, []).append((name, size, mtime))
+        # Wording matters more than the list. A bare prohibition ("do NOT create
+        # a second part") deadlocked kimi k3 live on 2026-07-27: a matching file
+        # existed, so it spent completions deliberating "import or build?" and
+        # never acted. State BOTH branches and demand a decision in the same
+        # reply — the model needs an action for whichever branch it picks.
         head = [
             "[PROJECT FILES]",
             f"Project folder (absolute): {rp}",
-            "These files ALREADY EXIST on disk. Before creating anything new,",
-            "open/inspect an existing part with import_part(path=...) or read the",
-            "folder with fs_list/fs_read. Do NOT create a second part for something",
-            "already here. New parts are saved into this folder automatically.",
+            "The files below already exist on disk. Decide from this list and act",
+            "in the SAME reply - never stop to deliberate or ask which to do:",
+            "- request clearly refers to one of these -> import_part(path=...) and",
+            "  work on THAT file; do not model it again from scratch.",
+            "- request does not match any of them -> create the new part as usual.",
+            "  That is expected; it is saved into this folder automatically.",
         ]
         body: list[str] = []
         for parent, entries in by_dir.items():

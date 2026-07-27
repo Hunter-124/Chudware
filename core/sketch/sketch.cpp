@@ -58,10 +58,21 @@ std::vector<int> concat(const std::vector<int>& a, const std::vector<int>& b,
     return concat(concat(a, b), c);
 }
 
-// Pick a subset of an index vector by local positions.
+// Pick a subset of an index vector by local positions. Bounds-checked: an entity
+// whose allocation failed registers ZERO solver vars (solve loop fallback), and the
+// hardcoded layouts below ({0,1} on a line, {2,3} on an arc, p9 on a short spline, …)
+// used to turn that into an out-of-bounds read that SIGSEGV'd hostd mid-agent-run.
+// Throwing mirrors the unresolved-handle path: the caller skips the constraint.
 std::vector<int> pick(const std::vector<int>& v, std::initializer_list<int> pos) {
     std::vector<int> r;
-    for (int p : pos) r.push_back(v[p]);
+    r.reserve(pos.size());
+    for (int p : pos) {
+        if (p < 0 || static_cast<std::size_t>(p) >= v.size())
+            throw std::out_of_range("pick: var index " + std::to_string(p) +
+                                    " out of range (" + std::to_string(v.size()) +
+                                    " solver vars)");
+        r.push_back(v[p]);
+    }
     return r;
 }
 
@@ -744,6 +755,13 @@ Handle resolve_handle(const std::string& handle, const EntMap& entities,
     const json& ent = entities.at(eid);
     const std::string t = ent.at("type");
     const std::vector<int>& vidx = var_map.at(eid);
+    // Zero solver vars means the entity's allocation FAILED upstream (the solve loop
+    // registers an empty vector to stay forward-tolerant). Every branch below indexes
+    // this vector; an empty one is UB (and used to SIGSEGV hostd). Throw so the
+    // caller skips the constraint, same as an unresolved handle.
+    if (vidx.empty())
+        throw std::runtime_error("handle '" + handle + "': entity '" + eid + "' (" + t +
+                                 ") has no solver vars — its geometry failed to register");
 
     if (t == "point") return ident_point(vidx);
     if (t == "line") {

@@ -448,3 +448,28 @@ TEST_CASE("spline fix pins every through-point; coincident on a node") {
     CHECK(double(sol.entities["p"]["p"][0]) == doctest::Approx(10.0));
     CHECK(double(sol.entities["p"]["p"][1]) == doctest::Approx(5.0));
 }
+
+TEST_CASE("malformed entity + constraint on it: skipped, no crash (hostd SIGSEGV regression)") {
+    // An entity whose allocation throws registers ZERO solver vars (the forward-tolerant
+    // fallback in the solve loop). A constraint referencing it used to index that empty
+    // vector unchecked in pick() -> out-of-bounds read -> SIGSEGV killing hostd mid
+    // agent-run ("provider_error — daemon connection closed", 2026-07-27). Now handle
+    // resolution throws and the constraint is skipped; the healthy entities still solve.
+    json s;
+    s["entities"] = json::array({
+        line("e1", 0, 0, 80, 0),
+        json{{"id", "bad"}, {"type", "line"}, {"construction", false},
+             {"p1", json::array({"oops", 0})}, {"p2", json::array({10, 0})}},
+    });
+    s["constraints"] = json::array({
+        rel("c1", "coincident", {"e1.p1", "bad.p1"}),
+        rel("c2", "coincident", {"bad.p2", "e1.p2"}),
+        rel("c3", "fix", {"e1.p1"}),
+        dim("c4", "distance", {"e1.p1", "e1.p2"}, 80.0),
+    });
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+    // e1: 4 vars - fix(p1) - distance = 1 rotational DOF; "bad" contributes none.
+    CHECK(sol.dof == 1);
+    CHECK(double(sol.entities["e1"]["p2"][0]) == doctest::Approx(80.0));
+}

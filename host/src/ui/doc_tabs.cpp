@@ -161,27 +161,19 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     ui::GlassLevel level = active ? ui::GlassLevel::Regular : ui::GlassLevel::UltraThin;
     if (hovered && !active) level = ui::GlassLevel::Thin;
 
-    // AI-activity glow: an animated, pulsating halo around a tab a subagent is editing in the
-    // background (never the active tab — viewing it clears the pulse). Drawn UNDER the glass pill so
-    // the pill floats on top of the glow. Rings share kTabR so they stay concentric with the fill.
+    // AI-activity glow: a warm fill tint + breathing accent outline ON the pill rect of a tab a
+    // subagent is editing in the background (never the active tab — viewing it clears the pulse).
+    // Everything stays strictly ON/INSIDE the pill geometry — the old expanding halo rings painted
+    // up to ~7px OUTSIDE the pill, so the overflow lane clip sliced them into bright vertical line
+    // fragments in the gaps between tabs and at the strip edges (the recurring "glowing line"
+    // artifact). Nothing here may paint outside (p0, p1).
+    const float pulsePhase = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 3.2f);  // ~2 Hz breath
     if (t.aiPulse && !active) {
-        const float tsec = (float)ImGui::GetTime();
-        const float phase = 0.5f + 0.5f * std::sin(tsec * 3.2f);   // 0..1 breath, ~2 Hz
         const float ar = pal.accent[0], ag = pal.accent[1], ab = pal.accent[2];
-        // edgeA: a clipped pulsing tab dissolves its glow with the rest of the pill — the rings
-        // extend past the pill, so sliced at the lane edge they were the brightest fleck of all.
-        for (int k = 3; k >= 1; --k) {                             // outer→inner rings
-            const float grow = (float)k * 2.2f * s;
-            const float a = (0.10f + 0.16f * phase) * (float)k / 3.0f * edgeA;
-            const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(ar, ag, ab, a));
-            dl->AddRect(ImVec2(p0.x - grow, p0.y - grow),
-                        ImVec2(p1.x + grow, p1.y + grow),
-                        col, kTabR + grow, 0, 2.0f * s);
-        }
         // Warm fill tint — same rounded rect the glass pill will occupy (no square fill under curves).
         dl->AddRectFilled(p0, p1,
                           ImGui::ColorConvertFloat4ToU32(
-                              ImVec4(ar, ag, ab, (0.06f + 0.10f * phase) * edgeA)),
+                              ImVec4(ar, ag, ab, (0.06f + 0.10f * pulsePhase) * edgeA)),
                           kTabR);
     }
 
@@ -192,6 +184,15 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     if (active || hovered || t.aiPulse)
         ui::glassPanel(dl, tabRect, level, kTabRdp /*dp — glassPanel scales by uiScale*/, surf,
                        edgeA /*clipped pill dissolves its fill/border with the title*/);
+    if (t.aiPulse && !active) {
+        // Breathing outline ON TOP of the pill, exact pill geometry. edgeA dissolves it with the
+        // clipped pill at a lane edge.
+        dl->AddRect(p0, p1,
+                    ImGui::ColorConvertFloat4ToU32(
+                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2],
+                               (0.25f + 0.45f * pulsePhase) * edgeA)),
+                    kTabR, 0, std::max(1.0f, 1.5f * s));
+    }
     if (active) {
         // Accent outline on the EXACT same rounded rect as the glass fill (no inset / no radius
         // mismatch). Stroke sits on the pill edge so corner AA of fill + outline share one geometry.
@@ -203,7 +204,8 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
                     kTabR,
                     0,
                     std::max(1.0f, 1.5f * s));
-    } else {  // thin separator on the right edge of inactive tabs (inset from pill corners)
+    } else if (!t.aiPulse) {  // thin separator on the right edge of inactive tabs (inset from pill
+        // corners) — pulsing tabs already carry their own pill outline, a separator would double it.
         // Fade the separator out inside the lane-edge dissolve zone: a tab clipped by the strip
         // edge (or one whose right edge sits within the fade) otherwise paints a bright vertical
         // line right where the title is truncated.

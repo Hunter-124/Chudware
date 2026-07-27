@@ -2883,6 +2883,27 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.showRibbon = true;
     st.showFeatureTree = true;
   }
+  // CHUDWARE_SHOT=doctabs: seed a long strip of fake AI-handoff tabs (most pulsing,
+  // like a live agent swarm) so headless captures reproduce the doc-tab overflow +
+  // glow state that only shows up mid-mission. Pure visual repro — no worker docs.
+  if (shot && shotMode && std::strcmp(shotMode, "doctabs") == 0) {
+    static const char *kNames[] = {
+        "guide_shaped_batch", "sk",      "sk2",       "Bar",       "Obstacle",
+        "SwingArm",           "dialect_dia", "pf_live_test", "cheatsheet_L22",
+        "cheatsheet_L29",     "cheatsheet_L40", "link_dim_test", "ask_plm",
+        "bracket_mount",      "gear_pair", "housing_v2", "cam_plate",
+        "sensor_node",        "latch_arm", "rail_guide", "knob_dial",
+        "flange_adapter",     "heat_sink", "pulley_40t"};
+    for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); ++i) {
+      AppState::DocTab t;
+      t.kind = AppState::DocTab::TabKind::Part;
+      t.aiHandoff = true;
+      t.handoffName = kNames[i];
+      t.aiPulse = (i % 3 != 2) && !std::getenv("CHUDWARE_SHOT_NOPULSE"); // most tabs pulsing — the live-swarm look
+      st.docTabs.push_back(std::move(t));
+    }
+    st.activeTab = 7;
+  }
   st.wantEcad = shot && shotMode &&
                 std::strcmp(shotMode, "ecad") == 0; // Wave N: ECAD GUI shot
   if (st.wantEcad) {

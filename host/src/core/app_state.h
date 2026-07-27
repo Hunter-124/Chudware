@@ -449,6 +449,13 @@ struct JobState {
     // instead of the generic design summary; createdDocPath still carries any assembly tab to open.
     bool isMission = false;
     std::string missionVerdict;       // the report/verdict prose to show as the assistant reply
+    // General-agent lane (core/agent/run.cpp pre-flight): the turn ran tools over
+    // files/PLM/packs and never entered the geometry pipeline, so ITS handoff is the
+    // only truthful reply. Non-empty => the drain prints this instead of the built-
+    // geometry boilerplate, which otherwise claimed parametric features for a run
+    // that created none (2026-07-27 zero-step mudbucket).
+    bool generalLane = false;
+    std::string agentSummary;
     // status=="partial": some tasks built, at least one failed. NOT an error — geometry is kept.
     // Drain shows a warning-accent "Partially complete" card; doc stays open.
     bool missionPartial = false;
@@ -875,6 +882,11 @@ struct AppState {
         // in the background is visible without stealing focus or the viewport. Cleared the moment the
         // user switches to the tab (switchToTab) or the poller refreshes it while it IS active.
         bool        aiPulse = false;
+        // Steady-clock time of the last agent edit event on this doc. The pulse above means
+        // "actively being edited" ONLY: a per-frame tick clears it once the doc has seen no edit
+        // event for kAgentEditPulseTimeoutS, so a finished/idle agent stops glowing on its own.
+        // Timestamp-based (not a countdown timer) so nothing stacks or drifts across sleeps.
+        std::chrono::steady_clock::time_point lastAgentEditAt{};
         // A pushed foreign revision invalidated this tab's immutable mesh cache. The background
         // parser clears it after prewarming the matching revision; switchToTab never binds while set.
         bool        meshCacheInvalidated = false;

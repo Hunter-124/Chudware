@@ -231,15 +231,22 @@ def test_blank_envelope_after_real_work_still_completes():
 
 
 def test_force_first_prefers_category_menu_on_enable_lane():
-    """General lane: the forced opener is the pack menu, not a blind read."""
+    """General lane: the forced opener is the pack menu, executed IN the loop.
+
+    Live 2026-07-27 (agent_admin_turn): dispatching the meta tool sent it to
+    the registry, where it is deliberately unbound, so the model's on-ramp
+    came back `known_but_unbound / harness_bug` and the turn died in prose.
+    The floor must produce the real catalog without touching dispatch.
+    """
     from services.agent import agent_turn as at
 
     seen = []
 
     def dispatch(tool, args):
         seen.append(tool)
-        return {"ok": True, "categories": []}
+        return {"ok": False, "status": "known_but_unbound", "harness_bug": True}
 
+    emitted = []
     calls, n, forced = at._force_first_tool(
         allow={"enable_tools", "list_tool_categories", "describe_project",
                "ledger_get"},
@@ -250,10 +257,17 @@ def test_force_first_prefers_category_menu_on_enable_lane():
         calls=[],
         tool_calls_made=0,
         budget=8,
+        emit_call=lambda t, a, r, ok: emitted.append((t, ok)),
     )
     assert forced is True
-    assert seen == ["list_tool_categories"], seen
-    assert calls[0].get("forced") is True
+    assert seen == [], "meta opener must never reach the tool registry"
+    rec = calls[0]
+    assert rec["tool"] == "list_tool_categories"
+    assert rec["forced"] is True
+    assert rec["ok"] is True, rec
+    names = {c["name"] for c in rec["result"]["categories"]}
+    assert "modeling" in names, sorted(names)
+    assert emitted == [("list_tool_categories", True)], emitted
 
 
 def test_force_first_legacy_floor_without_enable_tools():

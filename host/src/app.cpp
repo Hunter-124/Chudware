@@ -2900,6 +2900,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       t.aiHandoff = true;
       t.handoffName = kNames[i];
       t.aiPulse = (i % 3 != 2) && !std::getenv("CHUDWARE_SHOT_NOPULSE"); // most tabs pulsing — the live-swarm look
+      if (t.aiPulse) t.lastAgentEditAt = std::chrono::steady_clock::now(); // stamp so the 5s pulse-timeout tick doesn't clear the seed
       st.docTabs.push_back(std::move(t));
     }
     st.activeTab = 7;
@@ -4531,7 +4532,18 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           // above.
           if (job.converged) {
             setStatus("Done", 0);
-            if (openedNewDoc)
+            if (job.generalLane) {
+              // The general agent never enters the geometry pipeline, so the
+              // built-parametric-features boilerplate below would be a claim
+              // nobody made: print the turn's own handoff instead, and say
+              // plainly when it produced no account of itself.
+              assistant = job.agentSummary.empty()
+                              ? std::string(
+                                    "The agent finished without reporting what it "
+                                    "did, and no geometry was built. Nothing was "
+                                    "changed - try rephrasing the request.")
+                              : job.agentSummary;
+            } else if (openedNewDoc)
               assistant =
                   "Done - I built each part as its own editable document and "
                   "assembled them with positioned components. The assembly is "

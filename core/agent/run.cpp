@@ -1016,11 +1016,31 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         events.emit("run_finished", json{{"status", status},
                                          {"stop_reason", stop_reason},
                                          {"role", role}});
+        // The general lane runs NO geometry pipeline: whatever happened, the
+        // turn's own handoff is the only honest account of it. Hand it up so
+        // the host can print it instead of the built-geometry boilerplate
+        // (2026-07-27: a turn that created nothing still rendered "Done - I
+        // built this as parametric features; see the FeatureManager tree").
+        const json turn_result = turn.value("result", json::object());
+        std::string summary;
+        if (turn_result.is_object()) {
+            const json handoff = turn_result.value("handoff", json::object());
+            if (handoff.is_object()) {
+                summary = handoff.value("summary", std::string());
+                if (summary.empty()) {
+                    const json outputs = handoff.value("outputs", json::object());
+                    if (outputs.is_object()) summary = outputs.value("text", std::string());
+                }
+            }
+            if (summary.empty()) summary = turn_result.value("text", std::string());
+        }
         return json{{"run_id", run_id},
                     {"status", status},
                     {"stop_reason", stop_reason},
-                    {"result", turn.value("result", json::object())},
+                    {"result", turn_result},
                     {"role", role},
+                    {"lane", "general"},
+                    {"summary", summary},
                     {"doc_id", doc_id}};
     }
 

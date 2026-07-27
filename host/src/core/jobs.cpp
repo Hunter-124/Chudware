@@ -49,6 +49,7 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
         job->converged = true; job->stopReason.clear(); job->errorDetail.clear();
         job->errorHuman.clear();
         job->isMission = false; job->missionVerdict.clear();
+        job->generalLane = false; job->agentSummary.clear();
         job->missionPartial = false;
         job->missionTasksCompleted = 0;
         job->missionTasksFailed = 0;
@@ -243,6 +244,13 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
                 } else {
                     job->converged = (status == "done");
                     if (!sr.empty()) job->stopReason = sr;
+                    // General lane (no geometry pipeline): keep the turn's own
+                    // handoff prose — the drain must not substitute a built-
+                    // geometry claim for a run that touched no geometry.
+                    if (result.value("lane", std::string()) == "general") {
+                        job->generalLane = true;
+                        job->agentSummary = result.value("summary", std::string());
+                    }
                     std::string ed = result.value("error_detail", std::string());
                     if (ed.empty()) ed = result.value("error", std::string());
                     // error_human is the actionable one-liner, NOT a stand-in for the raw
@@ -329,6 +337,7 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
         job->errorHuman.clear();
         job->createdDocPath.clear();
         job->isMission = true; job->missionVerdict.clear();
+        job->generalLane = false; job->agentSummary.clear();
         job->missionPartial = false;
         job->missionTasksCompleted = 0;
         job->missionTasksFailed = 0;

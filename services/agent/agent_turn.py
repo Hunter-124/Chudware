@@ -255,6 +255,27 @@ def _attach_typed_refusal_if_needed(handoff: dict, calls: list) -> dict:
     return handoff
 
 
+def _tool_category_catalog_result() -> dict:
+    """The `list_tool_categories` payload — shared by the loop and the floor.
+
+    The meta tools are executed BY the turn loop, not bound in the tool
+    registry, so dispatching them like a normal tool returns
+    `known_but_unbound / harness_bug` (live 2026-07-27: the forced opener on
+    the general lane came back as a harness gap, which is all the model ever
+    saw before answering in prose).
+    """
+    try:
+        from services.agent.tool_categories import category_catalog  # noqa: PLC0415
+        return {
+            "ok": True,
+            "categories": [
+                {"name": n, "description": d} for n, d in category_catalog()
+            ],
+        }
+    except Exception as exc:  # noqa: BLE001 — meta tool never crashes a turn
+        return {"ok": False, "error": str(exc)}
+
+
 def _force_first_tool(
     *,
     allow: set[str] | None,
@@ -265,6 +286,7 @@ def _force_first_tool(
     calls: list,
     tool_calls_made: int,
     budget: int,
+    emit_call: Callable | None = None,
 ) -> tuple[list, int, bool]:
     """mega-24 a2/c: zero-tool no_code floor — force ledger_get (or first allow).
 
@@ -329,20 +351,27 @@ def _force_first_tool(
         f"a done handoff.{_force_extra}"
     )})
     tool_calls_made += 1
-    try:
-        result = dispatch(tool, args)
-        ok = True
-        payload = result
-        if isinstance(result, str):
-            try:
-                payload = json.loads(result)
-            except Exception:  # noqa: BLE001
-                payload = None
-        if isinstance(payload, dict) and "ok" in payload:
-            ok = bool(payload.get("ok"))
-    except Exception as exc:  # noqa: BLE001
-        result = {"ok": False, "error": str(exc)}
-        ok = False
+    if tool == "list_tool_categories":
+        # Loop-executed meta tool: dispatching it would hit the registry and
+        # come back known_but_unbound, handing the model a harness-gap error
+        # as the on-ramp it was supposed to learn its capabilities from.
+        result = _tool_category_catalog_result()
+        ok = bool(result.get("ok"))
+    else:
+        try:
+            result = dispatch(tool, args)
+            ok = True
+            payload = result
+            if isinstance(result, str):
+                try:
+                    payload = json.loads(result)
+                except Exception:  # noqa: BLE001
+                    payload = None
+            if isinstance(payload, dict) and "ok" in payload:
+                ok = bool(payload.get("ok"))
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+            ok = False
     rec = {
         "tool": tool, "args": args, "ok": ok, "result": result,
         "forced": True, "force_reason": "no_code_zero_tools",
@@ -356,6 +385,11 @@ def _force_first_tool(
         })
     except Exception:  # noqa: BLE001
         pass
+    if emit_call is not None:
+        try:
+            emit_call(tool, args, result, ok)
+        except Exception:  # noqa: BLE001 — event emission never blocks a turn
+            pass
     messages.append({"role": "user", "content": _parts(
         f"Tool result ({tool}):\n{_as_text(result)}"
     )})
@@ -552,13 +586,27 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
         "not logged in",
         "previously revoked",
     )
+    # A 400 whose body says the REQUEST was malformed is a harness bug, not a
+    # credential problem. Live 2026-07-27: an empty assistant message made
+    # Moonshot answer 400 invalid_request_error, the turn reported
+    # provider_auth, and the GUI sent the user to re-check API keys that were
+    # fine. Keep it non-retryable (the same request will fail identically).
+    malformed_markers = (
+        "invalid_request_error",
+        "must not be empty",
+        "invalid request:",
+    )
     if status_i in (400, 401, 403) or any(m in text for m in auth_markers):
         # 400 alone is ambiguous (bad request vs auth). Treat as non-retryable
         # when auth-ish markers present OR status is 401/403; bare 400 with
         # invalid-argument/key wording also non-retryable.
         if status_i in (401, 403):
             return _PROVIDER_AUTH, False
-        if status_i == 400 or any(m in text for m in auth_markers):
+        if any(m in text for m in auth_markers):
+            return _PROVIDER_AUTH, False
+        if any(m in text for m in malformed_markers):
+            return "provider_error", False
+        if status_i == 400:
             return _PROVIDER_AUTH, False
     if status_i == 429 or "rate limit" in text or "too many requests" in text:
         return _FAILED, True
@@ -967,6 +1015,20 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     if on_event is not None or _ev_journal is not None:
         from services.agent import agent_events as _ae  # noqa: PLC0415
         _turn_span = _ae.new_span_id()
+
+    def _emit_forced_call(_tool: str, _args, _result, _ok: bool) -> None:
+        """Stream a harness-forced tool call like any other step.
+
+        Without this the floor's call is invisible: the GUI timeline showed
+        0/0 on turns whose only step was the forced opener (2026-07-27).
+        """
+        if _turn_span is None:
+            return
+        from services.agent import agent_events as _ae  # noqa: PLC0415
+        _kind, _payload = _ae.tool_call_event(
+            _ev_node, _tool, _args, _result, ok=_ok,
+            parent_id=_turn_span, actor=actor)
+        _ae.emit_event(_kind, _payload, live=on_event, journal=_ev_journal)
 
     system = (system_prompt or "") + "\n\n" + _SYSTEM_BASE
 
@@ -1382,7 +1444,15 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                                    "usage": (_tu.get_turn_usage()
                                              if _tu else None)})
 
-        messages.append({"role": "assistant", "content": _parts(reply)})
+        # An empty assistant turn is not just useless context — Moonshot/kimi
+        # (and other OpenAI-compatible endpoints) REJECT the next request with
+        # HTTP 400 "the message at position N with role 'assistant' must not be
+        # empty", killing the run two calls in. k3 returns empty `content` when
+        # its output was reasoning-only, so this fires on ordinary turns.
+        # Omitting it instead would break strict alternating-role providers.
+        messages.append({"role": "assistant",
+                         "content": _parts(reply if (reply or "").strip()
+                                           else "(no visible output)")})
         _trig_prev_text = reply
         _trig_prev_calls_idx = len(calls)
         # Phase 4: sub-agent transcripts capture every model reply so the GUI viewer
@@ -1480,6 +1550,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     calls=calls,
                     tool_calls_made=tool_calls_made,
                     budget=budget,
+                    emit_call=_emit_forced_call,
                 )
                 if forced:
                     last_reason = _RETRY
@@ -1653,6 +1724,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     calls=calls,
                     tool_calls_made=tool_calls_made,
                     budget=budget,
+                    emit_call=_emit_forced_call,
                 )
                 if forced:
                     last_reason = _RETRY
@@ -1669,17 +1741,10 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             meta_result: dict
             try:
                 from services.agent.tool_categories import (  # noqa: PLC0415
-                    category_catalog,
                     resolve_categories,
                 )
                 if tool == "list_tool_categories":
-                    meta_result = {
-                        "ok": True,
-                        "categories": [
-                            {"name": n, "description": d}
-                            for n, d in category_catalog()
-                        ],
-                    }
+                    meta_result = _tool_category_catalog_result()
                 else:
                     # enable_tools
                     raw_cats = (args or {}).get("categories") if isinstance(args, dict) else None

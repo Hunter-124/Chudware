@@ -393,15 +393,17 @@ void drawSessionsPanel(AppState& st, bool busy) {
     const float rowH  = padY * 2.0f + titleH + 2.0f * sc + subH;
     const float trashSz = ImGui::GetFrameHeight();
     bool anyRowShown = false;
-    int shownIdx = 0;              // per-document row number for the untitled-chat fallback
-    for (int i = 0; i < (int)st.conversations.size(); ++i) {
+    // Newest sessions first: newConversation() appends, so the tail of st.conversations is the
+    // most recent session — walk the vector back-to-front so it lands at the TOP of the list.
+    for (int i = (int)st.conversations.size() - 1; i >= 0; --i) {
         Conversation& c = st.conversations[i];
         // Sessions are document-independent: list ALL of them regardless of the document
         // on screen. Each row can carry a doc badge linking back to its document.
         if (c.archived != s_showArchived) continue;
         anyRowShown = true;
-        ++shownIdx;
-        std::string title = c.title.empty() ? ("Chat " + std::to_string(shownIdx)) : c.title;
+        // Fallback number is the conversation's own slot, not the display row — with the
+        // newest-first order a row position changes every session, a slot number does not.
+        std::string title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
         // Truthful per-session state: this conversation's own run, not a global flag. The
         // trailing-message scan catches one-shot RPC turns (agent_ask_v2 …) that never get
@@ -436,8 +438,16 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const float  rowW   = ImGui::GetContentRegionAvail().x;
         const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
 
+        // The action-button zone (Archive/Delete) only EXISTS on hover/active rows, so only
+        // those rows reserve its width — reserving it on idle rows squeezed every title to a
+        // stub for buttons that were not even drawn. Hovering re-clips the title, which reads
+        // as the buttons taking their place. Hover is tested against the row rect directly:
+        // the reserve is needed BEFORE this frame's InvisibleButton reports its hover state.
+        const bool rowHot = active || ImGui::IsMouseHoveringRect(rowMin, rowMax);
+        const float actionsReserve = rowHot ? actionsW : 0.0f;
+
         bool picked = ImGui::InvisibleButton("##pickconv",
-                                            ImVec2(std::max(1.0f, rowW - actionsW - padX), rowH));
+                                            ImVec2(std::max(1.0f, rowW - actionsReserve - padX), rowH));
         bool rowHov = ImGui::IsItemHovered();
         // Picking stays live during a run (multi-session): switching parks the viewed
         // conversation; its run keeps streaming into it in the background.
@@ -456,6 +466,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // Scope color-code: once the model has assessed the session (first routing event),
         // tint the row with a 3px left-edge bar + subtle wash + a tiny class chip on the
         // title line. semanticOnGlass keeps the chip ink legible over dark + light glass.
+        float chipW = 0.0f;   // chip + its gap to the title — the title clip reserves this
         if (c.scopeClass >= 0) {
             float scopeRgba[4];
             scopeClassColor(c.scopeClass, scopeRgba);
@@ -474,9 +485,11 @@ void drawSessionsPanel(AppState& st, bool busy) {
             const char* scopeLbl = c.scopeClass == 0 ? "trivial" : c.scopeClass == 1 ? "standard"
                                  : c.scopeClass == 2 ? "complex" : "epic";
             const ImVec2 lsz = ImGui::CalcTextSize(scopeLbl);
-            // Right-aligned, kept clear of the hover/active trash button zone.
-            const float cx1 = rowMax.x - actionsW - padX;
+            // Right-aligned against whatever sits to its right this frame: the action
+            // buttons on hover/active rows, the row edge on idle ones.
+            const float cx1 = rowMax.x - actionsReserve - padX;
             const float cx0 = cx1 - lsz.x - 8.0f * sc;
+            chipW = (cx1 - cx0) + 6.0f * sc;
             const float cy0 = rowMin.y + padY + (titleH - lsz.y) * 0.5f - 1.0f * sc;
             const float cy1 = cy0 + lsz.y + 2.0f * sc;
             ImVec4 chipBg = scopeCol;
@@ -493,14 +506,15 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // Titles and snippets are user text of arbitrary length and are painted straight onto
         // the draw list, which does NOT clip to the row — a long snippet used to run out past
         // the card, under the scrollbar and off the column edge. Clip both to the room they
-        // actually have (title also yields the action-button zone) with a real ellipsis.
+        // actually have (title also yields the action-button zone and the scope chip — an
+        // unreserved chip used to paint right over the title's tail) with a real ellipsis.
         const float titleY = rowMin.y + padY;
         // In-flight sessions get the animated tesseract icon at the row's left edge; text
         // indents past it only for those rows.
         const float runIndent = running ? drawSessionRunningIcon(dl, surf, rowMin, rowH, padX, sc)
                                         : 0.0f;
         const float textMaxW = std::max(ui::metrics::px(24.0f),
-                                        rowW - padX * 2.0f - actionsW - runIndent);
+                                        rowW - padX * 2.0f - actionsReserve - chipW - runIndent);
         const std::string titleShown = artiEllipsize(title, textMaxW);
         ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
         dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, titleShown.c_str());
@@ -509,16 +523,20 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // reference. Show the linked document's name on the sub line; clicking it jumps to
         // that document's tab when the tab is open. file: links always render (basename);
         // doc: links only resolve while the tab is open, otherwise the badge is hidden.
-        // Resolved BEFORE the subtitle so the sub's clip yields room for the badge.
+        // Resolved BEFORE the subtitle so the sub's clip yields room for the badge. The badge
+        // is skipped on hover/active rows: its right-aligned slot is exactly where the
+        // Archive/Delete action buttons appear, and painting both stacked the two (plus the
+        // badge's invisible click target swallowed the row-action clicks).
         std::string badge;
         int badgeTab = -1;
-        if (c.docLink.rfind("file:", 0) == 0) {
+        const bool showBadge = !(rowHov || active);
+        if (showBadge && c.docLink.rfind("file:", 0) == 0) {
             const std::string p = c.docLink.substr(5);
             const size_t slash = p.find_last_of("/\\");
             badge = slash == std::string::npos ? p : p.substr(slash + 1);
             for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
                 if (st.docTabs[ti].path == p) { badgeTab = ti; break; }
-        } else if (c.docLink.rfind("doc:", 0) == 0) {
+        } else if (showBadge && c.docLink.rfind("doc:", 0) == 0) {
             const std::string id = c.docLink.substr(4);
             for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
                 if (st.docTabs[ti].docId == id) { badgeTab = ti; badge = st.docTabs[ti].title; break; }
@@ -529,8 +547,8 @@ void drawSessionsPanel(AppState& st, bool busy) {
             // Never let a long filename eat the whole sub line — cap at half the row.
             badge = artiEllipsize(badge, std::max(ui::metrics::px(24.0f), rowW * 0.5f - padX));
             badgeW = ImGui::CalcTextSize(badge.c_str()).x + 8.0f * sc;
-            // Right-aligned at the row's true right edge — same exposure rule as the subtitle
-            // itself (the hover/active action buttons draw over the sub line's tail too).
+            // Right-aligned at the row's true right edge — hover/active rows never reach
+            // here (showBadge above), so this never collides with the action buttons.
             badgeX1 = rowMax.x - padX;
             badgeX0 = std::max(rowMin.x + padX + runIndent, badgeX1 - badgeW);
         }

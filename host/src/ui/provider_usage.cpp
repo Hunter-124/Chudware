@@ -147,6 +147,15 @@ void parseBridgeWindows(const nlohmann::json& wins, std::vector<UsageWindow>& ou
         uw.window = jstr(w, "id");
         const std::size_t colon = uw.window.rfind(':');
         if (colon != std::string::npos) uw.window.erase(0, colon + 1);
+        // A bare numeric id (kimi-code sends "<provider>:<index>" -> "0", "1") is a row index,
+        // not a window — the real window length only survives in the window label ("5h limit"),
+        // which is what the compact ring caption derives from.
+        const bool numericId = !uw.window.empty() &&
+            uw.window.find_first_not_of("0123456789") == std::string::npos;
+        if (uw.window.empty() || numericId) {
+            const std::string wl = jstr(w, "windowLabel");
+            if (!wl.empty()) uw.window = wl;
+        }
         if (uw.window.empty()) uw.window = jstr(w, "windowLabel");
         uw.label = jstr(w, "label");
         if (uw.label.empty()) uw.label = jstr(w, "windowLabel");
@@ -409,15 +418,29 @@ std::string usageResetCountdown(const std::string& stamp) {
 }
 
 std::string usageWindowShortLabel(const UsageWindow& w) {
-    // "5h" -> "5H", "7d" -> "7D". Providers that send a prose label ("Weekly limit") fall back
-    // to its first token, uppercased and clipped, so a ring caption never wraps.
-    const std::string& src = !w.window.empty() ? w.window : w.label;
-    std::string out;
-    for (char c : src) {
-        if (out.size() >= 3) break;
-        if (c == ' ' || c == '-' || c == '_') break;
-        out.push_back((char)std::toupper((unsigned char)c));
-    }
+    // "5h" -> "5H", "7d" -> "7D". Filler words ("usage", "window", "limit") are skipped so a
+    // label-derived window ("5h limit") still renders "5H", and a windowless row ("Usage
+    // window") defers to the entry label ("Total quota" -> "TOT"). Capped at 3 chars so a
+    // ring caption never wraps.
+    auto firstRealToken = [](const std::string& src) -> std::string {
+        std::string out;
+        size_t pos = 0;
+        while (pos < src.size() && out.empty()) {
+            const size_t end = src.find_first_of(" \t-_", pos);
+            const std::string tok = src.substr(pos, end == std::string::npos ? end : end - pos);
+            pos = end == std::string::npos ? src.size() : end + 1;
+            std::string low = tok;
+            for (char& c : low) c = (char)std::tolower((unsigned char)c);
+            if (low == "usage" || low == "window" || low == "limit") continue;
+            for (char c : tok) {
+                if (out.size() >= 3) break;
+                out.push_back((char)std::toupper((unsigned char)c));
+            }
+        }
+        return out;
+    };
+    std::string out = firstRealToken(!w.window.empty() ? w.window : w.label);
+    if (out.empty()) out = firstRealToken(w.label);
     return out.empty() ? std::string("USE") : out;
 }
 

@@ -132,6 +132,50 @@ def test_fs_read_routes_documents_through_office_extract():
         assert t["fs_read"](csv, offset=2, limit=1)["shown_lines"] == 1
 
 
+def test_fs_read_document_with_space_and_ampersand_path():
+    """Paths containing spaces and '&' must survive selector splitting + document routing
+    (the user's project literally has a 'CAD & Design Geometry' folder)."""
+    t = _tools()
+    with tempfile.TemporaryDirectory() as d:
+        nested = os.path.join(d, "CAD & Design Geometry")
+        os.makedirs(nested)
+        csv = os.path.join(nested, "parts list.csv")
+        with open(csv, "w") as fh:
+            fh.write("id,name\n1,bolt\n2,nut\n3,washer\n")
+        r = t["fs_read"](csv)
+        assert r["ok"] and r["kind"] == "csv" and "washer" in r["text"]
+        r2 = t["fs_read"](csv + ":2-3")
+        assert r2["ok"] and r2["shown_lines"] == 2 and "bolt" in r2["text"]
+
+
+def test_fs_read_empty_extraction_is_flagged(monkeypatch):
+    """An image-only/scanned document extracts to header lines only — fs_read must not
+    silently report that as a successful read; it must carry a hint."""
+    t = _tools()
+
+    def _fake_extract(_path):
+        return {"ok": True, "kind": "pdf", "text": "# Page 1\n# Page 2\n"}
+
+    monkeypatch.setattr("services.mcp.office_tools.extract_office", _fake_extract)
+    with tempfile.TemporaryDirectory() as d:
+        pdf = os.path.join(d, "scanned.pdf")
+        with open(pdf, "wb") as fh:
+            fh.write(b"%PDF-fake")
+        r = t["fs_read"](pdf)
+        assert r["ok"]  # the file read fine — but not silently
+        assert "hint" in r and "empty" in r["hint"]
+
+    def _real_extract(_path):
+        return {"ok": True, "kind": "pdf", "text": "# Page 1\nactual words\n"}
+
+    monkeypatch.setattr("services.mcp.office_tools.extract_office", _real_extract)
+    with tempfile.TemporaryDirectory() as d:
+        pdf = os.path.join(d, "real.pdf")
+        with open(pdf, "wb") as fh:
+            fh.write(b"%PDF-fake")
+        assert "hint" not in t["fs_read"](pdf)
+
+
 # --------------------------------------------------------------------------- search / list
 
 def test_fs_glob_and_grep():

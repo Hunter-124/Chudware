@@ -59,3 +59,31 @@ def test_extract_via_office_oxide_import_error(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", _no_oxide)
     assert ot._extract_via_office_oxide("/tmp/x.docx", "docx") is None
+
+
+def test_extract_pdf_password_protected_reason(tmp_path):
+    """An encrypted PDF must fail with reason 'password_protected' and an actionable
+    hint — never a generic open_failed and never a traceback."""
+    pypdf = pytest.importorskip("pypdf")
+    pytest.importorskip("pypdfium2")
+    pdf = tmp_path / "locked.pdf"
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.encrypt("hunter2")
+    with open(pdf, "wb") as fh:
+        writer.write(fh)
+    out = ot.extract_office(str(pdf))
+    assert out["ok"] is False
+    assert out["reason"] == "password_protected"
+    assert "decrypt" in out["hint"]
+
+
+def test_extract_pdf_open_failure_stays_open_failed(tmp_path):
+    """A genuinely corrupt PDF keeps the open_failed classification."""
+    pytest.importorskip("pypdfium2")
+    pdf = tmp_path / "broken.pdf"
+    pdf.write_bytes(b"%PDF-1.4 garbage garbage")
+    out = ot.extract_office(str(pdf))
+    assert out["ok"] is False
+    assert out["reason"] == "open_failed"
+    assert out["hint"]

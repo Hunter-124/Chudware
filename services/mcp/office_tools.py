@@ -145,6 +145,16 @@ def _extract_csv(path: str) -> dict:
 
 # --------------------------------------------------------------------------- pdf
 
+def _pdf_error(exc: Exception) -> dict:
+    """Classify a PDF open failure: password-protected files get their own reason with an
+    actionable hint instead of a generic open_failed."""
+    if "password" in str(exc).lower():
+        return {"ok": False, "reason": "password_protected",
+                 "hint": "PDF is password-protected — decrypt it first "
+                         "(e.g. qpdf --decrypt in.pdf out.pdf), then read the output"}
+    return {"ok": False, "reason": "open_failed", "hint": str(exc)}
+
+
 def _parse_page_range(spec: str, count: int) -> list[int]:
     """Parse a 1-based page-range spec ("1-3,5") into a 0-based page-index list.
     Empty spec = every page."""
@@ -171,7 +181,7 @@ def _extract_pdf(path: str) -> dict:
     try:
         doc = pdfium.PdfDocument(str(path))
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": "open_failed", "hint": str(exc)}
+        return _pdf_error(exc)
     try:
         lines: list[str] = []
         for i in range(len(doc)):
@@ -548,7 +558,7 @@ def register_office_tools(mcp) -> None:
         try:
             doc = pdfium.PdfDocument(str(path))
         except Exception as exc:  # noqa: BLE001
-            return _err("open_failed", str(exc))
+            return _to_envelope(_pdf_error(exc))
         try:
             count = len(doc)
             idxs = _parse_page_range(page_range, count)
@@ -615,7 +625,7 @@ def register_office_tools(mcp) -> None:
 
     @mcp.tool()
     def office_read_docx(path: str) -> str:
-        """Returns ``{ok, paragraphs, tables}``."""
+        """Read a .docx file at *path*; returns ``{ok, paragraphs, tables}``."""
         return _to_envelope(_read_docx_structured(path))
 
     @mcp.tool()

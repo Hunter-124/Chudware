@@ -307,16 +307,36 @@ def _kind_for(path: str) -> str:
 
 # --------------------------------------------------------------------------- read cores
 
+def _has_content_lines(lines: list[str], kind: str) -> bool:
+    """True when the extracted text carries at least one real content line. The extractors
+    prefix generated headers ('# Page N' / '# Slide N' / '# sheet-name'), so a document
+    whose extraction is ONLY those headers (scanned/image-only, no text layer) is
+    effectively empty."""
+    header_kinds = {"pptx", "pdf", "xlsx", "xlsm"}
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if kind in header_kinds and s.startswith("# "):
+            continue
+        return True
+    return False
+
+
 def _read_document(path: str, ranges, offset: int, limit: int, raw: bool) -> dict:
     from services.mcp.office_tools import extract_office  # noqa: PLC0415
 
     res = extract_office(path)
     if not res.get("ok"):
         return _err(res.get("reason", "extract_failed"), res.get("hint", ""))
+    kind = res.get("kind", _kind_for(path))
     text = res.get("text", "") or ""
     lines = text.split("\n")
     win = _window_lines(lines, ranges, offset, limit, raw)
-    return _ok(path=path, kind=res.get("kind", _kind_for(path)), is_document=True, **win)
+    if not _has_content_lines(lines, kind):
+        win["hint"] = ("extracted text is empty — the document may be scanned/image-only "
+                       "or have no text layer; OCR it first to get usable text")
+    return _ok(path=path, kind=kind, is_document=True, **win)
 
 
 def _read_text(path: str, ranges, offset: int, limit: int, raw: bool) -> dict:

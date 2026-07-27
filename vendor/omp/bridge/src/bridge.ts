@@ -125,6 +125,19 @@ function collapse(msg: AssistantMessage): Json {
 	for (const part of msg.content ?? []) {
 		if (part.type === "text") text += part.text ?? "";
 		else if (part.type === "thinking") thinking += part.thinking ?? "";
+		else if (part.type === "toolCall") {
+			// CAD harnesses speak the TEXT tool dialect (one fenced ```json {"tool","args"}
+			// block per response — see agent_turn.py's system prompt). A model that switches
+			// to a NATIVE/markup tool call mid-turn (Kimi K3 does this constantly: OMP heals
+			// its markup into structured parts) would otherwise have the call silently
+			// dropped here — the text stream ends right where the call began, surfacing as
+			// "endpoint returned no completion" or a prose-only reply the harness mis-reads
+			// as a finish. Re-serialize the structured call into the harness dialect instead.
+			text +=
+				"```json\n" +
+				JSON.stringify({ tool: part.name, args: part.arguments ?? {} }) +
+				"\n```\n";
+		}
 	}
 	const out: Json = {
 		text,

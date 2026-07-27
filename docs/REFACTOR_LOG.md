@@ -4314,3 +4314,20 @@ detail JSON) alongside the unchanged Plan-section subagent rows. Files:
 `host/src/ui/copilot/cards.cpp`, `host/src/ui/copilot/activity_timeline.cpp`,
 `host/src/ui/copilot/copilot_internal.h`. Gotcha: restored chat history from older
 sessions still carries `class:0` routing cards and renders as before.
+
+### Sessions panel overlap fix + doc-key rekey sweep (2026-07-27)
+Sessions list rows overlapped title text with the Archive/Delete buttons: the title
+clip zone reserved `trashSz` for the delete button while the drawn ImageButton is
+`img + FramePadding*2` wide — action geometry is now computed once per row and shared
+by the clip zone, the invisible pick button, the scope chip and the buttons (both the
+active-doc rows and the "Other sessions" rows, same bug twice). Session durability:
+new `rekeySavedDocSessions` sweep in `syncChatToDoc` migrates any chat-history bucket
+keyed `doc:<id>` to `file:<path>` once its document has a saved path (resident convs
+re-tagged, on-disk buckets merged or moved, held browse pin released) — gated on a
+per-frame docId/path signature so the disk scan only runs on change. The old path only
+migrated when the ACTIVE tab's key changed mid-session, so post-restart orphans
+lingered as "unsaved doc-…" rows. Fresh (no-message) sessions were already never
+persisted (`conversationIsFresh`), which covers "delete empty sessions on close".
+Files: `host/src/ui/copilot/panel.cpp`, `host/src/ui/copilot/conversations.cpp`.
+Gotcha: orphans for docs that were NEVER saved can't rekey (no path exists); they
+stay under Other sessions until their doc is opened and saved once.

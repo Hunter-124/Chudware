@@ -408,7 +408,15 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const char* archLabel = c.archived ? "Restore" : "Archive";
         const float archBtnW = ImGui::CalcTextSize(archLabel).x + 16.0f * sc;
         const float actionGap = 4.0f * sc;
-        const float actionsW = trashSz + archBtnW + actionGap;
+        // Action-zone geometry must be computed ONCE and shared by the title clip and the
+        // buttons below: the reserve used to assume the trash button was trashSz wide, but
+        // the drawn ImageButton is img + FramePadding*2 (wider) — the Archive button slid
+        // left over the title text on active/hovered rows.
+        const float delImg  = trashSz - 8.0f * sc;
+        const float delBtnW = delImg + style.FramePadding.x * 2.0f;
+        const float delBtnH = delImg + style.FramePadding.y * 2.0f;
+        const float rightMargin = 4.0f * sc;
+        const float actionsW = delBtnW + archBtnW + actionGap + rightMargin;
 
         ImGui::PushID(i);
         const ImVec2 rowMin = ImGui::GetCursorScreenPos();
@@ -492,14 +500,11 @@ void drawSessionsPanel(AppState& st, bool busy) {
         bool doDel = false;
         bool doArchiveToggle = false;
         if (rowHov || active) {
-            const float img  = trashSz - 8.0f * sc;
-            const float btnW = img + style.FramePadding.x * 2.0f;
-            const float btnH = img + style.FramePadding.y * 2.0f;
-            const float delX = rowMax.x - btnW - 4.0f * sc;
-            ImGui::SetCursorScreenPos(ImVec2(delX, rowMin.y + (rowH - btnH) * 0.5f));
+            const float delX = rowMax.x - delBtnW - rightMargin;
+            ImGui::SetCursorScreenPos(ImVec2(delX, rowMin.y + (rowH - delBtnH) * 0.5f));
             IconUV trash = ui::getIcon("delete", 20);
             bool del = trash.valid
-                ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(img, img), trash.uv0, trash.uv1)
+                ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(delImg, delImg), trash.uv0, trash.uv1)
                 : ImGui::SmallButton("x");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this session");
             // Destructive row actions are blocked only for the row whose own run is live —
@@ -507,8 +512,8 @@ void drawSessionsPanel(AppState& st, bool busy) {
             doDel = del && !running;
 
             const float archX = delX - archBtnW - actionGap;
-            ImGui::SetCursorScreenPos(ImVec2(archX, rowMin.y + (rowH - btnH) * 0.5f));
-            bool archClick = ImGui::Button(archLabel, ImVec2(archBtnW, btnH));
+            ImGui::SetCursorScreenPos(ImVec2(archX, rowMin.y + (rowH - delBtnH) * 0.5f));
+            bool archClick = ImGui::Button(archLabel, ImVec2(archBtnW, delBtnH));
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(c.archived
                     ? "Restore to the active sessions list"
@@ -676,8 +681,14 @@ void drawSessionsPanel(AppState& st, bool busy) {
             const ImVec2 rowMin = ImGui::GetCursorScreenPos();
             const float  rowW   = ImGui::GetContentRegionAvail().x;
             const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
+            // Same shared geometry as the active-doc rows: the drawn trash button is wider
+            // than trashSz — reserve the REAL width or the button overlaps the label.
+            const float oDelImg  = trashSz - 8.0f * sc;
+            const float oDelBtnW = oDelImg + style.FramePadding.x * 2.0f;
+            const float oDelBtnH = oDelImg + style.FramePadding.y * 2.0f;
+            const float oRight   = 4.0f * sc;
             bool picked = ImGui::InvisibleButton("##pickother",
-                                                ImVec2(std::max(1.0f, rowW - trashSz - padX), rowH));
+                                                ImVec2(std::max(1.0f, rowW - oDelBtnW - oRight - padX), rowH));
             bool rowHov = ImGui::IsItemHovered();
             if (picked) {
                 // Read-only browse: load that key's sessions into view and pin so
@@ -701,7 +712,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
                 ? drawSessionRunningIcon(dl, surf, rowMin, rowH, padX, sc) : 0.0f;
             // Same clip rule as the active-doc rows: draw-list text does not respect the card.
             const float oTextMaxW =
-                std::max(ui::metrics::px(24.0f), rowW - padX * 2.0f - trashSz - runIndent);
+                std::max(ui::metrics::px(24.0f), rowW - padX * 2.0f - oDelBtnW - oRight - runIndent);
             const std::string oLabelShown = artiEllipsize(o.label, oTextMaxW);
             ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
             dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, oLabelShown.c_str());
@@ -720,14 +731,11 @@ void drawSessionsPanel(AppState& st, bool busy) {
             // Per-row delete — same trash affordance as active-doc conversations.
             bool doDel = false;
             if (rowHov) {
-                const float img  = trashSz - 8.0f * sc;
-                const float btnW = img + style.FramePadding.x * 2.0f;
-                const float btnH = img + style.FramePadding.y * 2.0f;
                 ImGui::SetCursorScreenPos(
-                    ImVec2(rowMax.x - btnW - 4.0f * sc, rowMin.y + (rowH - btnH) * 0.5f));
+                    ImVec2(rowMax.x - oDelBtnW - oRight, rowMin.y + (rowH - oDelBtnH) * 0.5f));
                 IconUV trash = ui::getIcon("delete", 20);
                 bool del = trash.valid
-                    ? ImGui::ImageButton("##delother", trash.texId, ImVec2(img, img),
+                    ? ImGui::ImageButton("##delother", trash.texId, ImVec2(oDelImg, oDelImg),
                                          trash.uv0, trash.uv1)
                     : ImGui::SmallButton("x");
                 if (ImGui::IsItemHovered())

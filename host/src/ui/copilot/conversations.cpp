@@ -1065,10 +1065,98 @@ static void wasmApplySharedChatPending(AppState& st) {
 }
 #endif
 
+// Rekey sweep: any chat-history bucket keyed doc:<id> whose document now has a saved file
+// path migrates to file:<path> — resident conversations are re-tagged and the on-disk
+// bucket is merged into the file: key (or MOVED when no file: entry exists yet). The
+// existing migration in loadChatHistoryForKey only fires when the ACTIVE tab's key changes
+// in-session; after a restart (or a save that happened off-screen) the doc: bucket stayed
+// orphaned forever and surfaced as "unsaved doc-…" under Other sessions.
+static void rekeySavedDocSessions(AppState& st) {
+    // docId -> saved path, from open tabs. Cheap per-frame signature so the disk scan runs
+    // only when this set actually changes.
+    std::unordered_map<std::string, std::string> savedDocs;
+    std::string sig;
+    for (const auto& t : st.docTabs) {
+        if (t.docId.empty() || t.path.empty()) continue;
+        savedDocs[t.docId] = t.path;
+        sig += t.docId;
+        sig += '=';
+        sig += t.path;
+        sig += ';';
+    }
+    static std::string s_rekeySig;
+    if (sig == s_rekeySig) return;
+    s_rekeySig = sig;
+    if (savedDocs.empty()) return;
+
+    // 1) Resident conversations: re-tag onto the file: key; remember which old keys they
+    //    covered — the resident copy is newer than the on-disk doc: bucket, so that bucket
+    //    is dropped rather than merged (persistChatHistory writes the file: group).
+    std::set<std::string> residentCovered;
+    bool retagged = false;
+    for (auto& c : st.conversations) {
+        if (c.docKey.rfind("doc:", 0) != 0) continue;
+        auto it = savedDocs.find(c.docKey.substr(4));
+        if (it == savedDocs.end()) continue;
+        residentCovered.insert(c.docKey);
+        c.docKey = "file:" + it->second;
+        retagged = true;
+    }
+
+    // 2) On-disk buckets (load-modify-write, same atomic path as persistChatHistory).
+    namespace fs = std::filesystem;
+    const std::string path = chatHistoryPath();
+    nlohmann::json root = nlohmann::json::object();
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (in) { try { in >> root; } catch (...) { return; } }
+    }
+    if (!root.is_object()) return;
+    bool diskChanged = false;
+    for (const auto& [docId, filePath] : savedDocs) {
+        const std::string oldKey = "doc:" + docId;
+        if (!root.contains(oldKey) || !root[oldKey].is_object()) continue;
+        const std::string newKey = "file:" + filePath;
+        if (residentCovered.count(oldKey)) {
+            root.erase(oldKey);  // newer resident copy covers this bucket
+            diskChanged = true;
+            continue;
+        }
+        const auto& src = root[oldKey];
+        const auto srcConvs = src.value("conversations", nlohmann::json::array());
+        if (root.contains(newKey) && root[newKey].is_object()) {
+            // Merge: append the orphan's conversations after the target's own.
+            auto& dst = root[newKey];
+            auto dstConvs = dst.value("conversations", nlohmann::json::array());
+            for (const auto& jc : srcConvs) dstConvs.push_back(jc);
+            dst["conversations"] = std::move(dstConvs);
+            if (!dst.contains("active")) dst["active"] = 0;
+        } else {
+            root[newKey] = src;
+        }
+        root.erase(oldKey);
+        diskChanged = true;
+    }
+    if (diskChanged) {
+        try {
+            fs::create_directories(appdataAppDir());
+            atomicWriteFileDurable(path, root.dump(1));
+            appstatePersistSync();
+        } catch (...) {
+        }
+    }
+    // A held browse key that just rekeyed points at a gone bucket — release the pin.
+    if (!s_chatKeyHold.empty() && s_chatKeyHold.rfind("doc:", 0) == 0 &&
+        savedDocs.count(s_chatKeyHold.substr(4)))
+        s_chatKeyHold.clear();
+    if (retagged) markChatHistoryDirty();
+}
+
 // Detect a document change and select the right resident conversation set accordingly (called
 // each frame). RESIDENT: never destructively drops the outgoing conversation set — a running
 // turn keeps streaming into it in the background regardless of which document is on screen.
 void syncChatToDoc(AppState& st) {
+    rekeySavedDocSessions(st);
 #ifdef __EMSCRIPTEN__
     wasmKickSharedChatFetch();       // once: async GET full shared store
     wasmApplySharedChatPending(st);  // merge when the GET lands

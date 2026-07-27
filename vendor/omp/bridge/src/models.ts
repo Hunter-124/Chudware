@@ -73,6 +73,9 @@ export function modelInfo(m: Model<Api>): Json {
 		vision: m.input.includes("image"),
 		supportsTools: m.supportsTools ?? true,
 		reasoning: m.reasoning ?? false,
+		// OMP catalog is the source of truth for the effort ladder — the GUI offers
+		// exactly these rungs (K3: low|high|max; current Claude: low|medium|high|xhigh|max).
+		reasoningEfforts: m.thinking?.efforts ?? [],
 		contextWindow: m.contextWindow ?? null,
 		maxTokens: m.maxTokens ?? null,
 		cost: m.cost ?? null,

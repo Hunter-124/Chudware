@@ -80,6 +80,7 @@ struct BridgeModelMeta {
     bool vision = false;
     bool tools = false;
     bool reasoning = false;
+    std::vector<std::string> reasoningEfforts;  // OMP catalog effort ladder; empty = no dial
     int contextWindow = 0;   // tokens; 0 = unknown
     int maxTokens = 0;       // max output tokens; 0 = unknown
     bool hasCost = false;

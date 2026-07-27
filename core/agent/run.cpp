@@ -978,7 +978,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
         const bool turn_ok = turn.value("success", false);
         const std::string stop_reason = turn.value("stop_reason", std::string("unknown"));
-        const std::string status = turn_ok ? "completed" : "failed";
+        // Terminal success status is "done" everywhere in the engine (machine/micro/mission)
+        // and the host keys converged on it — a successful turn reported as "completed"
+        // painted the red "stopped early" card over a clean finish (stop_reason confirmed).
+        const std::string status = turn_ok ? "done" : "failed";
         const std::string role = turn.value("role", std::string("general_agent"));
         events.emit("run_finished", json{{"status", status},
                                          {"stop_reason", stop_reason},

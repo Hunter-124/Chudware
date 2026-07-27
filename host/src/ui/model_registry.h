@@ -403,7 +403,11 @@ inline int reasoningEffortOptions(int provider, const std::string& id,
     struct Opt { const char* label; const char* value; };
     static const Opt kGemini[] = {{"Off", "off"}, {"Low", "low"}, {"Medium", "medium"},
                                   {"High", "high"}, {"Max", "max"}};
-    static const Opt kAnthropic[] = {{"Low", "low"}, {"Medium", "medium"}, {"High", "high"}};
+    // Current Claude scale (claude-opus-5/4-8 etc., OMP catalog anthropic-adaptive).
+    static const Opt kAnthropic[] = {{"Low", "low"}, {"Medium", "medium"}, {"High", "high"},
+                                     {"Xhigh", "xhigh"}, {"Max", "max"}};
+    // Kimi K3's mandatory wire scale — there is NO off/medium rung (a medium pick 400s).
+    static const Opt kKimiK3[] = {{"Low", "low"}, {"High", "high"}, {"Max", "max"}};
     static const Opt kGeneric[] = {{"Off", "off"}, {"Low", "low"}, {"Medium", "medium"},
                                    {"High", "high"}};
     std::string m = id;
@@ -413,7 +417,10 @@ inline int reasoningEffortOptions(int provider, const std::string& id,
     if (provider == PROV_GEMINI || m.find("gemini") != std::string::npos) {
         src = kGemini; n = 5;
     } else if (provider == PROV_ANTHROPIC || m.find("claude") != std::string::npos) {
-        src = kAnthropic; n = 3;
+        src = kAnthropic; n = 5;
+    } else if (m.find("kimi-k3") != std::string::npos || m == "k3" ||
+               m.rfind("k3-", 0) == 0) {
+        src = kKimiK3; n = 3;
     }
     int out = n < maxN ? n : maxN;
     for (int i = 0; i < out; ++i) {

@@ -1366,6 +1366,10 @@ void refreshBridgeModelCatalog(AppState& st, bool force) {
             b.vision = m.value("vision", false);
             b.tools = m.value("supportsTools", false);
             b.reasoning = m.value("reasoning", false);
+            const auto ef = m.find("reasoningEfforts");
+            if (ef != m.end() && ef->is_array())
+                for (const auto& e : *ef)
+                    if (e.is_string()) b.reasoningEfforts.push_back(e.get<std::string>());
             if (m.contains("contextWindow") && m["contextWindow"].is_number())
                 b.contextWindow = m["contextWindow"].get<int>();
             if (m.contains("maxTokens") && m["maxTokens"].is_number())

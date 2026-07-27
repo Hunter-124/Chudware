@@ -10,6 +10,7 @@
  * stays valid without hand-authoring every field.
  */
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { Api, Model } from "@oh-my-pi/pi-catalog";
 
 type ProviderId = Parameters<typeof getBundledModel>[0];
@@ -45,8 +46,13 @@ export function extraModels(provider: string): Model<Api>[] {
 		// $0. This is the same Kimi K3 the metered `moonshot` provider sells, so both
 		// context variants (1M and 256k) get real per-Mtok economics; that keeps the K3
 		// rows (moonshot / kimi-code / zenmux) agreeing instead of one silently reading $0.
-		push(clone("kimi-code", "k3", { cost: K3_COST }));
-		push(clone("kimi-code", "k3-256k", { cost: K3_COST }));
+		// thinking.efforts MUST be overridden too: the bundled kimi-code k3 rows carry the
+		// generic minimal|low|medium|high ladder, but the K3 endpoint's mandatory scale is
+		// low|high|max (matching Moonshot's own native kimi-k3 entry in the same catalog;
+		// a "medium" pick would 400). Everything else flows from OMP's catalog verbatim.
+		const K3_THINKING = { mode: "effort", efforts: [Effort.Low, Effort.High, Effort.Max] } as const;
+		push(clone("kimi-code", "k3", { cost: K3_COST, thinking: K3_THINKING }));
+		push(clone("kimi-code", "k3-256k", { cost: K3_COST, thinking: K3_THINKING }));
 	}
 	return out;
 }

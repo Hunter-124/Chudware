@@ -133,6 +133,23 @@ static const char* providerWireName(int provider) {
 // edited behind the GUI's back) silently beat the picker (tracker O1). saveSettings still runs
 // before each send so descriptor details (base_url / api_key / model_path) match the picker;
 // these fields pin name + model + effort explicitly on top of that.
+// Effort ladder for the picker's current model, OMP bridge catalog first (dynamic — K3 is
+// low|high|max, current Claude low|medium|high|xhigh|max, per the vendored OMP catalog),
+// the static family ladders in model_registry.h otherwise. Returns the rung count.
+static int composerEffortLadder(const Settings& s, const char** outLabels,
+                                const char** outValues, int maxN) {
+    ui::ModelInfo probe;
+    const ui::ModelInfo* probeP = nullptr;
+    if (const ui::BridgeModelMeta* bm = ui::bridgeModelMetaForCad(s.provider, s.model, s.baseUrl);
+        bm && !bm->reasoningEfforts.empty()) {
+        probe = ui::modelInfoFromProbe(s.provider, s.model, bm->name, bm->contextWindow,
+                                       bm->maxTokens, bm->vision, bm->tools,
+                                       bm->reasoningEfforts, "omp");
+        probeP = &probe;
+    }
+    return ui::reasoningEffortOptions(s.provider, s.model, outLabels, outValues, maxN, probeP);
+}
+
 nlohmann::json agentProviderOverride(const Settings& s) {
     nlohmann::json j = nlohmann::json::object();
     const char* name = providerWireName(s.provider);
@@ -149,7 +166,18 @@ nlohmann::json agentProviderOverride(const Settings& s) {
     // llamacpp's Settings::model holds the gguf FILE PATH (the wire model stays "local-gguf");
     // don't clobber the descriptor's model with a filesystem path.
     if (s.provider != ui::PROV_LLAMACPP && s.model[0]) j["model"] = s.model;
-    if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
+    if (s.reasoningEffort[0]) {
+        // Pin only a rung the model's CURRENT ladder actually offers: a stale pick inherited
+        // from another model (e.g. "medium" beside K3's low|high|max) would be rejected or
+        // mis-mapped upstream — omitting it lets the engine apply the model's default effort.
+        const char* lv[8] = {};
+        const char* vv[8] = {};
+        const int n = composerEffortLadder(s, lv, vv, 8);
+        bool valid = n <= 0;  // ladder unknown → don't second-guess the saved value
+        for (int i = 0; i < n; ++i)
+            if (std::strcmp(s.reasoningEffort, vv[i]) == 0) valid = true;
+        if (valid) j["reasoning_effort"] = s.reasoningEffort;
+    }
     return j;
 }
 
@@ -1816,7 +1844,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     Settings& s = st.settings;
     const char* effLabels[8] = {};
     const char* effValues[8] = {};
-    int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+    int nEff = composerEffortLadder(s, effLabels, effValues, 8);
     if (nEff <= 0) {
         static const char* kFbLabels[] = {"Low", "Medium", "High"};
         static const char* kFbValues[] = {"low", "medium", "high"};

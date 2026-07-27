@@ -539,6 +539,29 @@ def test_live_bare_new_part_head_op_with_doc_id_is_a_noop(live):
 
 
 @enginetest
+def test_live_field_batch_bare_new_part_ab_sketch_revolve_builds():
+    """The exact dialect of a real rejected copilot batch (2026-07-27, "build me a
+    mud bucket"): bare {"type":"new_part"} head, a sketch whose lines use a/b
+    endpoints with an id-labeled profile, and a revolve that omits params.angle.
+    All three used to be independent batch-killing rejections."""
+    from services.agent.agent_turn import _bind_tool
+    add_features = _bind_tool("add_features")
+    r = json.loads(add_features(ops=[
+        {"type": "new_part", "name": "Mud_Bucket"},
+        {"type": "sketch", "id": "profile", "plane": "XZ", "entities": [
+            {"type": "line", "a": [25, 0], "b": [25, 100]},
+            {"type": "line", "a": [25, 100], "b": [147, 180]},
+            {"type": "line", "a": [147, 180], "b": [150, 180]},
+            {"type": "line", "a": [150, 180], "b": [28, 0]},
+            {"type": "line", "a": [28, 0], "b": [25, 0]}]},
+        {"type": "revolve", "name": "Bucket", "profile": "profile", "axis": "Z"}]))
+    assert r["ok"], r
+    assert r["changes"]["volume_delta_mm3"] > 0
+    notes = " ".join(r["interpreted"])
+    assert "new_part" in notes and "angle" in notes
+
+
+@enginetest
 def test_live_hole_without_style_end_or_face_builds(live):
     add_features, doc = live
     r = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {

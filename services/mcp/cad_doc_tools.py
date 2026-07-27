@@ -207,13 +207,15 @@ def _normalize_sketch_feature(feat: dict) -> dict:
         ne["construction"] = bool(ne.get("construction", False))
         etype = ne.get("type")
         if etype == "line":
-            p1 = ne.get("p1", ne.get("start", ne.get("from")))
-            p2 = ne.get("p2", ne.get("end", ne.get("to")))
+            # Endpoint aliases models write: p1/p2 canonical; start/end, from/to, and
+            # a/b all seen in live rejected batches (a/b from a 2026-07-27 copilot run).
+            p1 = ne.get("p1", ne.get("start", ne.get("from", ne.get("a"))))
+            p2 = ne.get("p2", ne.get("end", ne.get("to", ne.get("b"))))
             if p1 is not None:
                 ne["p1"] = _xy(p1)
             if p2 is not None:
                 ne["p2"] = _xy(p2)
-            for k in ("start", "end", "from", "to"):
+            for k in ("start", "end", "from", "to", "a", "b"):
                 ne.pop(k, None)
         elif etype in ("circle", "arc"):
             if "center" in ne:
@@ -264,6 +266,14 @@ def _normalize_sketch_feature(feat: dict) -> dict:
     new_feat = dict(feat)
     for k in ("entities", "constraints", "dimensions", "plane"):
         new_feat.pop(k, None)
+    # Models label a sketch with "id":"profile" intending to reference it later as the
+    # extrude/revolve profile — but refs resolve by feature NAME (or "$N"/f-id), so the
+    # label was dead weight and the batch died on "profile 'profile' not found" (live
+    # copilot run, 2026-07-27). Promote it to the display name when none was given.
+    if (not isinstance(new_feat.get("name"), str) or not new_feat["name"].strip()):
+        sid = new_feat.get("id")
+        if isinstance(sid, str) and sid.strip():
+            new_feat["name"] = sid.strip()
     new_params = dict(params)
     new_params.pop("plane", None)
     new_params.pop("dimensions", None)
@@ -1451,6 +1461,15 @@ def _normalize_profile_feature(feat: dict, ftype: str, notes: list) -> dict:
         notes.append(f'{label}: params.mode is required for a {ftype} — defaulted to '
                      f'"{params["mode"]}" (boss adds material, cut removes it)')
 
+    # A revolve with no angle means a FULL revolution — the single most common revolve
+    # intent (a bucket, a knob, a shaft); omitting it used to bounce the whole batch on
+    # "params.angle: required for revolve" (live copilot run, 2026-07-27).
+    if ftype == "revolve" and params.get("angle") is None:
+        params["angle"] = 360
+        changed = True
+        notes.append(f'{label}: params.angle is required for a revolve — defaulted to 360 '
+                     f'(a full revolution; pass angle=180 etc. for a partial one)')
+
     if not changed:
         return feat
     out["params"] = params
@@ -2406,7 +2425,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
           extrude / revolve / loft / sweep
                     params.mode defaults to "boss"; params.sketch:"<name>" becomes
                     refs.profile=[{"kind":"region","sketch":…}]; revolve's params.axis:"Z"
-                    becomes refs.axis:"axis.z".
+                    becomes refs.axis:"axis.z", and a revolve with no angle defaults to
+                    a full 360° revolution.
           any       feature TYPE synonyms are mapped (cube/cuboid/block -> box, cylindrical/
                     rod/tube -> cylinder, ball -> sphere, cut_<shape> -> <shape> with
                     mode:"cut", pocket -> extrude with mode:"cut"); an unknown type is

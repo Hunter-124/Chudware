@@ -42,6 +42,7 @@
 #include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
 #include "doc_tabs.h"
 #include "feature_tree.h"  // openComponentPart + featureTreeActivePath (assembly component ctx)
+#include "file_dialog.h"   // revealInFileManager (assembly component ctx "Open Part Location")
 #include "layout.h"        // ui::overlayColumnEdge — HUD dodges the pinned glass columns
 
 namespace ui {
@@ -322,6 +323,85 @@ static void drawAiActivityBadge(ImVec2 vr0, ImVec2 vr1, const std::string& statu
     dl->AddCircleFilled(dotc, dotR, withAlpha(pal.accent, pulse));
     ui::glassText(dl, nullptr, ImGui::GetFontSize(),
                  ImVec2(dotc.x + dotR + gap, p0.y + padY), surf, label.c_str());
+}
+
+// ---- Tab-switch loading state ------------------------------------------------------
+// Clicking a document tab whose model isn't loaded yet wipes the scene (unloadDocMesh) and then
+// stays silent while the async doc_activate + aicm mesh load run — the click reads as dropped.
+// tabModelLoading() derives "the ACTIVE part/asm tab's model is still on its way" from existing
+// AppState state only (no new fields), and drawTabLoadingOverlay() dims the 3D band with a frosted
+// glass scrim + centered brand mark and busy label until the real mesh commits. The overlay
+// self-clears the frame drainMeshLoads() commits (hasDocMesh flips true and the session's
+// cachedDocMesh fills).
+static bool tabModelLoading(const AppState& st) {
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return false;
+    const AppState::DocTab& tab = st.docTabs[st.activeTab];
+    // Drawing/Schematic/PCB tabs own the central canvas themselves — 3D viewport only.
+    if (tab.kind != AppState::DocTab::TabKind::Part &&
+        tab.kind != AppState::DocTab::TabKind::Assembly)
+        return false;
+    if (tab.docId.empty()) return false;
+    // This tab's doc_activate is coalesced behind another in-flight activation
+    // (switchToTabCore's async-rebuild-coalesced branch).
+    if (st.pendingActivateTab == st.activeTab) return true;
+    // A doc_activate is in flight and the live mirror is not this tab's doc yet — i.e. the
+    // in-flight activation is THIS tab's. A warm/loaded active tab always has a matching mirror,
+    // so a background tab's in-flight activation never trips this.
+    if (st.activationInFlight && st.docMirror.docId() != tab.docId) return true;
+    // Activation landed (mirror adopted, aicm parked on the session); the loader thread is
+    // parsing and drainMeshLoads hasn't committed yet. Blank/empty docs never reach this: no
+    // aicm is parked for them, and the empty-doc commit fills cachedDocMesh immediately.
+    if (!st.hasDocMesh && st.docMirror.docId() == tab.docId && tab.session &&
+        !tab.session->cachedAicmPath.empty() && !tab.session->cachedDocMesh)
+        return true;
+    return false;
+}
+
+static void drawTabLoadingOverlay(AppState& st, const ImVec2& vr0, const ImVec2& vr1,
+                                  const ImVec2& cr0, const ImVec2& cr1) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float S = ui::uiScale;
+    // Frosted full-bleed scrim over the 3D band — the wiped scene reads as cleared, and the
+    // adaptive surface keeps the dim theme-correct over the live backdrop (palette-only colors).
+    // Painted before the HUD pills below so status chrome (busy pill, AI badge) stays on top.
+    const ui::AdaptiveSurface& surf =
+        ui::adaptivePanel(ui::panelId("vp_tab_loading"), ImRect(vr0, vr1), ui::GlassGroup::Hud);
+    ui::glassPanel(dl, ImRect(vr0, vr1), ui::GlassLevel::Regular, 0.0f, surf);
+
+    // Centered in the VISIBLE content rect (cr0/cr1 excludes the pinned glass columns): the app
+    // logo with a gentle alpha pulse (same pulse idiom as the AI badge) over a busyLabel
+    // spinner + "Loading <tab>…". Logo texture can be invalid headless — fall back to text only.
+    const AppState::DocTab& tab = st.docTabs[st.activeTab];
+    const ImVec2 ctr((cr0.x + cr1.x) * 0.5f, (cr0.y + cr1.y) * 0.5f);
+    const float pulse = 0.55f + 0.45f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 3.0f));
+
+    const Tex& logo = st.logoIcon;
+    const bool logoOk = logo.id != 0 && logo.w > 0 && logo.h > 0;
+    const float logoH = logoOk ? 64.0f * S : 0.0f;
+    const float logoW = logoOk ? logoH * (float)logo.w / (float)logo.h : 0.0f;
+    const float rowH  = ImGui::GetTextLineHeight();
+    const float gap   = 14.0f * S;
+    float y = ctr.y - (logoH + (logoOk ? gap : 0.0f) + rowH) * 0.5f;
+
+    if (logoOk) {
+        dl->AddImage((ImTextureID)(intptr_t)logo.id,
+                     ImVec2(ctr.x - logoW * 0.5f, y), ImVec2(ctr.x + logoW * 0.5f, y + logoH),
+                     ImVec2(0, 0), ImVec2(1, 1),
+                     ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 1.0f, 1.0f, pulse)));
+        y += logoH + gap;
+    }
+
+    std::string title = tab.displayTitle();
+    const size_t kMax = 48;
+    if (title.size() > kMax) title = title.substr(0, kMax - 1) + "\xE2\x80\xA6";  // ellipsis
+    const std::string label = "Loading " + title + "\xE2\x80\xA6";
+    // busyLabel draws its brand-mark spinner in a line-height square, then the label inline.
+    const float rowW = rowH + ImGui::GetStyle().ItemInnerSpacing.x +
+                       ImGui::CalcTextSize(label.c_str()).x;
+    const ImVec2 savedCursor = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(ImVec2(ctr.x - rowW * 0.5f, y));
+    ui::busyLabel(label.c_str(), ImGui::ColorConvertFloat4ToU32(surf.textPrimary));
+    ImGui::SetCursorScreenPos(savedCursor);
 }
 
 // drawNewDocChooser is declared in viewport_panel.h (public — hosted at app scope).
@@ -2735,6 +2815,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         ImGui::SetCursorScreenPos(cr0);
         ImGui::InvisibleButton("##viewport3d",
             ImVec2(avail.x > 1.0f ? avail.x : 1.0f, avail.y > 1.0f ? avail.y : 1.0f));
+        // Tab-switch loading state: while the ACTIVE part/asm tab's async activation + mesh load
+        // are still on the way, frost the wiped scene and center a brand mark + "Loading <tab>…"
+        // so the click reads as registered. Painted before the HUD chrome so status pills (busy,
+        // AI badge) stay on top of the scrim; self-clears when the mesh commit lands.
+        if (tabModelLoading(st)) drawTabLoadingOverlay(st, vr0, vr1, cr0, cr1);
         // Task 02: while the in-app copilot is driving the doc, paint an "AI editing" badge over the
         // view so the live edits are clearly attributed to the AI (not the user). Same run-lifecycle
         // signal as the Activity panel; non-intrusive top-center pill.
@@ -3886,6 +3971,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     if (pathOk) openComponentPart(st, vpCompAbsPath);
                     else st.toast(ui::ToastLevel::Warn, "Component has no resolvable source path");
                 }
+                if (haveOsFileManager() && ImGui::MenuItem("Open Part Location"))
+                    revealInFileManager(vpCompAbsPath);
                 if (ImGui::MenuItem("Edit Model"))
                     st.enterComponentEdit(vpCompId, vpCompAbsPath);
                 if (!pathOk) ImGui::EndDisabled();

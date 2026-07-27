@@ -42,6 +42,33 @@ int tabIndexForDoc(AppState& st, const std::string& docId) {
     return -1;
 }
 
+std::string docLabel(AppState& st, const std::string& docId) {
+    const int idx = tabIndexForDoc(st, docId);
+    if (idx >= 0) {
+        const std::string title = st.docTabs[idx].displayTitle();
+        if (!title.empty()) return title;
+    }
+    return "a document";
+}
+
+// aiPulse means "an agent is ACTIVELY editing this doc right now" (not merely "touched
+// since last viewed"): every set site stamps DocTab::lastAgentEditAt, and this per-frame
+// tick clears the glow once the doc has seen no edit event for kAgentEditPulseTimeoutS —
+// even if the user never views the tab. Pure timestamp comparison, so nothing stacks
+// across frames or sleeps; a never-stamped (epoch) timestamp reads as already expired
+// and clears on this frame's tick.
+static constexpr double kAgentEditPulseTimeoutS = 5.0;
+
+void agentEditPulseTimeoutTick(AppState& st) {
+    const auto now = std::chrono::steady_clock::now();
+    for (AppState::DocTab& t : st.docTabs) {
+        if (!t.aiPulse) continue;
+        if (std::chrono::duration<double>(now - t.lastAgentEditAt).count() >
+            kAgentEditPulseTimeoutS)
+            t.aiPulse = false;
+    }
+}
+
 bool pushedSnapshot(const std::string& docId, const json& data,
                     DocMirrorSnapshot& snapshot) {
     if (!data.contains("tree") || !data["tree"].is_object()) return false;
@@ -189,6 +216,7 @@ void openMirrorTab(AppState& st, const std::string& docId, const std::string& na
                  "Live view of the AI's part — it updates as it builds");
     } else {
         st.docTabs[idx].aiPulse = true;  // background reveal; switch-in activates
+        st.docTabs[idx].lastAgentEditAt = std::chrono::steady_clock::now();
         if (takeFocus) {
             // Crash-loop brake: would have taken focus and auto-activated, but repeated
             // engine reconnects mean this doc's activation keeps crashing hostd. Leave the
@@ -424,6 +452,7 @@ void handleEvent(AppState& st, const json& evt) {
         if (idx != st.activeTab) {
             AppState::DocTab& tab = st.docTabs[idx];
             tab.aiPulse = true;  // background activity remains visible in the tab strip
+            tab.lastAgentEditAt = std::chrono::steady_clock::now();
             tab.meshCacheInvalidated = true;
             if (st.renderer) st.renderer->discardCachedMeshes(docId);
             DocMirrorSnapshot snapshot;
@@ -449,6 +478,7 @@ void handleEvent(AppState& st, const json& evt) {
         if (userMidEdit(st) || (st.docTabs[idx].dirty && !st.docTabs[idx].userAdopted)) {
             pendingChanged[docId] = d;  // defer, retry when safe (poller semantics)
             st.docTabs[idx].aiPulse = true;
+            st.docTabs[idx].lastAgentEditAt = std::chrono::steady_clock::now();
             st.docTabs[idx].meshCacheInvalidated = true;
             if (st.renderer) st.renderer->discardCachedMeshes(docId);
             return;
@@ -506,9 +536,9 @@ void handleEvent(AppState& st, const json& evt) {
         }
         if (state == "held")
             st.toast(ui::ToastLevel::Info, "An " + holder + " client is editing " +
-                                               docId + " — edits are briefly locked");
+                                               docLabel(st, docId) + " — edits are briefly locked");
         else if (state == "disconnected")
-            st.toast(ui::ToastLevel::Info, holder + " client disconnected — " + docId +
+            st.toast(ui::ToastLevel::Info, holder + " client disconnected — " + docLabel(st, docId) +
                                                " edit lock released");
         return;
     }
@@ -860,6 +890,10 @@ void watchRevEngReconstruct(const std::string& runId) {
 }
 
 void engineEventsTick(AppState& st) {
+    // Pulse timeout runs in BOTH daemon and legacy mode — the legacy .step handoff poller
+    // (feature_tree.cpp pollAiCadHandoff) stamps the same pulse — so it sits ahead of the
+    // daemon-only gate below, at the very top of the frame.
+    agentEditPulseTimeoutTick(st);
     // The reveng journal tail is a LOCAL FILE read, not a daemon push, so it runs in both
     // daemon and legacy in-process mode — ahead of the daemon-only gate below.
     revengReconstructTick();

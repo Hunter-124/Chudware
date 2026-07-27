@@ -8,6 +8,7 @@
 // per-row appearance/zoom/rollback), a real grabbable rollback bar, and SW-style sketch nesting.
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -5934,7 +5935,11 @@ void pollAiCadHandoff(AppState& st) {
                             if (st.docTabs[i].docId == prevActiveId) { back = i; break; }
                     if (back >= 0) st.activeTab = back;
                     for (int i = 0; i < (int)st.docTabs.size(); ++i)
-                        if (st.docTabs[i].handoffDocId == docId) { st.docTabs[i].aiPulse = true; break; }
+                        if (st.docTabs[i].handoffDocId == docId) {
+                            st.docTabs[i].aiPulse = true;
+                            st.docTabs[i].lastAgentEditAt = std::chrono::steady_clock::now();
+                            break;
+                        }
                 }
                 shownRev[docId] = hd.rev;
                 if (takeFocus)
@@ -5965,6 +5970,7 @@ void pollAiCadHandoff(AppState& st) {
         // this just guarantees no data loss when both sides touch the same part.
         if (st.docTabs[idx].dirty) {
             st.docTabs[idx].aiPulse = true;
+            st.docTabs[idx].lastAgentEditAt = std::chrono::steady_clock::now();
             continue;
         }
 
@@ -5972,7 +5978,10 @@ void pollAiCadHandoff(AppState& st) {
         // Otherwise leave it pending (pulse the tab so the user sees the AI is working there); it
         // applies the next frame they return, never yanking focus.
         if (idx != st.activeTab || userMidEdit) {
-            if (idx != st.activeTab) st.docTabs[idx].aiPulse = true;
+            if (idx != st.activeTab) {
+                st.docTabs[idx].aiPulse = true;
+                st.docTabs[idx].lastAgentEditAt = std::chrono::steady_clock::now();
+            }
             continue;
         }
 

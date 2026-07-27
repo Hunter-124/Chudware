@@ -662,15 +662,18 @@ void chatArtifactReveal(AppState& st, const std::string& path) {
         st.toast(ui::ToastLevel::Warn, "File not found: " + fs::path(path).filename().string());
         return;
     }
+    // A directory target (e.g. an unsaved document's workspace folder) is opened directly;
+    // a file target is revealed/selected inside its containing folder.
+    std::error_code ec;
+    const bool isDir = fs::is_directory(path, ec);
     const std::string q = chatShellQuote(path);
 #ifdef _WIN32
-    std::string cmd = "explorer /select,\"" + q + "\"";
+    std::string cmd = isDir ? "explorer \"" + q + "\"" : "explorer /select,\"" + q + "\"";
 #elif defined(__APPLE__)
-    std::string cmd = "open -R \"" + q + "\"";
+    std::string cmd = isDir ? "open \"" + q + "\"" : "open -R \"" + q + "\"";
 #else
     // No portable select-file on Linux — open the containing folder instead.
-    std::error_code ec;
-    const std::string dir = fs::path(path).parent_path().string();
+    const std::string dir = isDir ? path : fs::path(path).parent_path().string();
     const std::string qd = chatShellQuote(dir.empty() ? std::string(".") : dir);
     std::string cmd = "xdg-open \"" + qd + "\" >/dev/null 2>&1 &";
 #endif

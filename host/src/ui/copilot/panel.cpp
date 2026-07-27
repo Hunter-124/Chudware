@@ -849,7 +849,9 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
         const auto& t = st.docTabs[ti];
         ArtiDocRow r;
         r.label = t.title.empty() ? (t.path.empty() ? t.docId : t.path) : t.title;
-        r.path  = t.path;
+        // Unsaved in-memory docs have no file to reveal — fall back to their save
+        // destination (the project/workspace folder) so the location action always exists.
+        r.path  = !t.path.empty() ? t.path : st.plmProjectPath();
         r.tooltip = r.path.empty() ? r.label : (r.label + "\n" + r.path);
         r.open  = [&st, ti]() { st.switchToTab(ti); };
         rows.push_back(std::move(r));

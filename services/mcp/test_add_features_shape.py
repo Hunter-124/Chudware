@@ -508,6 +508,37 @@ def test_live_bare_feature_dicts_in_ops_build(live):
 
 
 @enginetest
+def test_live_bare_new_part_head_op_mints_the_doc():
+    """A leading bare {"type":"new_part",…} — the exact batch shape a live agent run
+    was rejected over ("new_part is not a feature type", 2026-07-27) — mints the
+    document and the rest of the batch builds into it."""
+    from services.agent.agent_turn import _bind_tool
+    add_features = _bind_tool("add_features")
+    r = json.loads(add_features(ops=[
+        {"type": "new_part", "name": "BareHeadMint"},
+        {"type": "box", "name": "Base",
+         "params": {"length": 40, "width": 30, "height": 20}}]))
+    assert r["ok"], r
+    assert r["doc_id"]
+    assert any("new_part" in n for n in r["interpreted"])
+    assert r["changes"]["volume_delta_mm3"] > 0
+
+
+@enginetest
+def test_live_bare_new_part_head_op_with_doc_id_is_a_noop(live):
+    """With a target doc already given, the bare new_part element is dropped, not
+    mistaken for a feature type."""
+    add_features, doc = live
+    r = json.loads(add_features(doc_id=doc, ops=[
+        {"type": "new_part", "name": "ShouldNotMint"},
+        {"type": "cylinder", "name": "PostAfterBareHead",
+         "params": {"radius": 3, "height": 10}, "at": [30, 20, 10],
+         "centered": False}]))
+    assert r["ok"], r
+    assert r["doc_id"] == doc
+
+
+@enginetest
 def test_live_hole_without_style_end_or_face_builds(live):
     add_features, doc = live
     r = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {

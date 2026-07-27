@@ -2432,9 +2432,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             rib, split, thread, text, import, script, plane, axis, point, csys, sketch3d, …
           WRONG: {"op":"box",…} / {"op":"sketch",…} / {"op":"extrude",…} / {"op":"cylinder",…}
           RIGHT: {"op":"add_feature","feature":{"type":"box"|"cylinder"|"sketch"|…, …}}
-          A leading {"op":"new_part","name":…} is also accepted as a convenience: it mints the
-            document and the rest of the batch builds into it, so you can create-and-build in
-            one call. Everywhere else new_part is the standalone tool, not an op.
+          A leading {"op":"new_part","name":…} (or bare {"type":"new_part",…}) is also
+            accepted as a convenience: it mints the document and the rest of the batch
+            builds into it, so you can create-and-build in one call. Everywhere else
+            new_part is the standalone tool, not an op.
           Live list: engine doc_list_ops (sourced from core/doc/op_registry — single source).
           Call cad_guide() for worked examples and full param shapes.
 
@@ -2501,14 +2502,23 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 background = bg
             ops = list(ops)
             # Model-robustness: `new_part` is a top-level TOOL, not a batch op — but models
-            # reliably open a build batch with {"op":"new_part","name":…} because that reads as
-            # the natural first step. Rejecting the whole batch over it (and over the bare
-            # "No current part" that follows) burns a turn for nothing, so honour the intent:
-            # mint the document here and apply the remaining ops to it.
+            # reliably open a build batch with {"op":"new_part","name":…} (or the bare
+            # {"type":"new_part",…} — a real rejected batch from the field) because that
+            # reads as the natural first step. Rejecting the whole batch over it (and over
+            # the bare "No current part" that follows) burns a turn for nothing, so honour
+            # the intent: mint the document here and apply the remaining ops to it.
             created: Optional[str] = None
-            while (ops and isinstance(ops[0], dict)
-                   and str(ops[0].get("op", "")).strip().lower() == "new_part"):
+            def _is_new_part_head(el: Any) -> bool:
+                if not isinstance(el, dict):
+                    return False
+                word = el.get("op") if el.get("op") is not None else el.get("type")
+                return _slug(word) == "new_part"
+            while ops and _is_new_part_head(ops[0]):
                 head = ops.pop(0)
+                if head.get("op") is None:
+                    interpreted.append(
+                        'read bare {"type":"new_part",…} as the leading {"op":"new_part"} '
+                        "create — new_part is a tool/doc op, never a feature type")
                 if doc_id or created:
                     continue  # a target doc already exists; the extra create is a no-op
                 r = cb.call("doc_new", {"kind": "part",

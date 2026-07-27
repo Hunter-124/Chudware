@@ -195,9 +195,11 @@ void drawProseBox(const char* id, const std::string& text, float maxH) {
 // stay legible over any viewport backdrop.
 namespace ui {
 
-// Title (medium font) + optional one-line subtitle + a hairline rule. Emits at the current
-// cursor and leaves it on the first body row.
-void cpMenuHeader(const ui::Fonts& fonts, const char* title, const char* subtitle) {
+// Title (medium font) + optional one-line subtitle + optional accessory control (drawn just
+// above the rule — e.g. the Sessions "Show archived" checkbox) + a hairline rule. Emits at
+// the current cursor and leaves it on the first body row.
+void cpMenuHeader(const ui::Fonts& fonts, const char* title, const char* subtitle,
+                  const std::function<void()>& accessory) {
     const ui::AdaptiveSurface& surf = chatSurf();
     if (fonts.medium) ImGui::PushFont(fonts.medium);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
@@ -209,6 +211,7 @@ void cpMenuHeader(const ui::Fonts& fonts, const char* title, const char* subtitl
         ImGui::TextWrapped("%s", subtitle);
         ImGui::PopStyleColor();
     }
+    if (accessory) accessory();
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
     const float w = ImGui::GetContentRegionAvail().x;
     const ImVec2 p = ImGui::GetCursorScreenPos();

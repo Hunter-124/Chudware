@@ -339,11 +339,23 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
     ensureConversations(st);
 
-    // One title treatment for every copilot menu (ui_common cpMenu*). Sessions used to bury its
-    // subtitle in a paragraph BELOW the new-session button, which is a big part of why the four
-    // header views read as four unrelated screens.
-    ui::cpMenuHeader(st.fonts, "Sessions",
-                     "Running sessions keep working in the background.");
+    // One title treatment for every copilot menu (ui_common cpMenu*). The "Show archived"
+    // filter sits in the header's accessory slot — above the rule, next to the title cluster
+    // — instead of a full body row between the button and the list.
+    static bool s_showArchived = false;
+    ui::cpMenuHeader(st.fonts, "Sessions", nullptr, [&]{
+        // Checkbox ink must come from the glass surface like every other label in this menu:
+        // the theme's default text tone is tuned for opaque panels and vanished against the
+        // bright viewport backdrop showing through the copilot column.
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::Checkbox("Show archived", &s_showArchived);
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(s_showArchived
+                ? "Showing archived sessions only. Uncheck to return to your active list."
+                : "Archived sessions are hidden from this list \xe2\x80\x94 check to review or "
+                  "restore them. Archiving keeps the full transcript (unlike Delete).");
+    });
 
     // New-session is the one PRIMARY action in the copilot menus, so it uses the accent
     // primaryButton rather than the theme's default slab (which rendered as a flat dark block
@@ -362,20 +374,6 @@ void drawSessionsPanel(AppState& st, bool busy) {
     ImGui::PopStyleVar();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
-
-    static bool s_showArchived = false;
-    // Checkbox ink must come from the glass surface like every other label in this menu: the
-    // theme's default text tone is tuned for opaque panels and vanished against the bright
-    // viewport backdrop showing through the copilot column.
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::Checkbox("Show archived", &s_showArchived);
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(s_showArchived
-            ? "Showing archived sessions only. Uncheck to return to your active list."
-            : "Archived sessions are hidden from this list \xe2\x80\x94 check to review or "
-              "restore them. Archiving keeps the full transcript (unlike Delete).");
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
 
     const ImGuiStyle& style = ImGui::GetStyle();
@@ -467,19 +465,14 @@ void drawSessionsPanel(AppState& st, bool busy) {
         ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, (i % 2) == 1, active, wash);
 
         // Scope color-code: once the model has assessed the session (first routing event),
-        // tint the row with a 3px left-edge bar + subtle wash + a tiny class chip on the
-        // title line. semanticOnGlass keeps the chip ink legible over dark + light glass.
+        // tint the row with a subtle wash + a tiny class chip on the title line.
+        // semanticOnGlass keeps the chip ink legible over dark + light glass. (The old 3px
+        // left-edge bar read as a stray vertical line above the rows — removed.)
         float chipW = 0.0f;   // chip + its gap to the title — the title clip reserves this
         if (c.scopeClass >= 0) {
             float scopeRgba[4];
             scopeClassColor(c.scopeClass, scopeRgba);
             const ImVec4 scopeCol = semanticOnGlass(scopeRgba, surf);
-            const float barW = 3.0f * sc;
-            ImVec4 barCol = scopeCol;
-            barCol.w = 0.95f;
-            dl->AddRectFilled(rowMin, ImVec2(rowMin.x + barW, rowMax.y),
-                              ImGui::ColorConvertFloat4ToU32(barCol), rowRnd,
-                              ImDrawFlags_RoundCornersLeft);
             ImVec4 washCol = scopeCol;
             washCol.w = active ? 0.10f : 0.07f;
             dl->AddRectFilled(rowMin, rowMax, ImGui::ColorConvertFloat4ToU32(washCol),

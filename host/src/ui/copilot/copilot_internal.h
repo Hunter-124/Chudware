@@ -146,7 +146,8 @@ int         effectiveContextWindow(const Settings& s);
 // ---- copilot MENU chrome (ui_common) — Sessions / Tasks / Artifacts / Quick settings --------
 // One title/section/label treatment for all four header views (they share ONE scroll region,
 // so they must share one rhythm). Sizes from ui::metrics::cpMenu*; tones from chatSurf().
-void cpMenuHeader(const ui::Fonts& fonts, const char* title, const char* subtitle = nullptr);
+void cpMenuHeader(const ui::Fonts& fonts, const char* title, const char* subtitle = nullptr,
+                  const std::function<void()>& accessory = nullptr);
 void cpMenuSection(const char* label, int count = -1);
 void cpMenuLabel(const char* label);
 void cpMenuHint(const char* text);

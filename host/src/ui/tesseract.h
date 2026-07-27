@@ -7,9 +7,10 @@
 // so the logo is genuinely the shape it claims to be rather than an illustration of one.
 //
 // PURE DRAW: no ImGui item, no layout, no state. The caller owns the cursor, the hit box and the
-// tint; this only appends lines to `dl`. Cheap enough for a per-frame header mark (32 edges).
+// tint; this only appends lines and vertex dots to `dl`. Cheap enough for a per-frame header mark
+// (32 edges + 16 dots).
 //
-// Three animation styles are offered (user-selectable, Settings -> Appearance -> Brand mark).
+// Four animation styles are offered (user-selectable, Settings -> Appearance -> Brand mark).
 // All use a perspective 4D -> 3D projection, so the mark always reads as the familiar nested
 // "cube inside a cube"; the styles differ in HOW it turns:
 //
@@ -26,6 +27,11 @@
 //   Isoclinic       A double rotation whose two planes turn in LOCKSTEP (one shared phase).
 //                   Every vertex moves at the same speed along a circle — a Hopf fibre — so the
 //                   figure rolls smoothly and never turns inside out.
+//
+//   Octave          A double rotation whose planes are locked at exactly 2:1 (one shared phase,
+//                   the zw plane turning twice per xy turn): the figure folds inside out twice
+//                   for every roll and returns to its start each loop — the only style with a
+//                   short, closed period.
 // -------------------------------------------------------------------------------------------------
 
 #include "imgui.h"
@@ -36,7 +42,8 @@ enum class TesseractAnim : int {
     EightCell      = 0,
     DoubleRotation = 1,
     Isoclinic      = 2,
-    Count          = 3,
+    Octave         = 3,
+    Count          = 4,
 };
 
 // Short UI label for a style (Settings picker). Never null; unknown values clamp to the first.

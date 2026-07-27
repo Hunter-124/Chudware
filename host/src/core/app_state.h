@@ -111,14 +111,19 @@ struct Settings {
     // plan_preference / subagent_preference / advisor_preference strings.
     // planMode stays as the binary gate (planPreference != 0) for legacy call sites
     // and plan_mode bool in config.json (Python still reads it).
-    int planPreference = 2;      // default Encourage (old plan_mode=true)
+    int planPreference = 0;      // default Off — direct tool use in main chat (no forced plan/intake)
     int subagentPreference = 1;  // default Option — model may spawn subagents
     int advisorPreference = 2;   // default Encourage — pull advisor + tone for guidance
-    bool planMode = true;        // binary: planPreference != 0 (Supervised vs Autopilot)
+    bool planMode = false;       // binary: planPreference != 0 (Supervised vs Autopilot)
     bool proactiveAdvisor = false; // opt-in mid-run proactive advisor (cheap gates; not every turn)
     // Opt-in company structure auto-route (agent.corporate_mode). Default off —
     // Agent never auto-invokes company; enable in Settings → AI → Behavior when ready.
     bool corporateMode = false;
+    // Agent-mode auto-route to agent_mission_v1 on build+analyze phrasing (default off —
+    // main chat stays on the direct general_agent tool loop).
+    bool autoMissionRouting = false;
+    // Main-chat general_agent gets the full tool catalog (default on).
+    bool directAgentFullTools = true;
     bool memoryEnabled = true;   // project SQLite memory under .plm/memory.db
     // 0=supervised (default): only main may adopt_role; 1=free: subagents may adopt too.
     int roleAdoption = 0;
@@ -205,9 +210,9 @@ struct Settings {
     bool copilotCollapsed = false;
 
     // Animation style of the copilot brand mark (the live tesseract logo): 0 = 8-cell
-    // inside-out, 1 = double rotation, 2 = isoclinic. Plain int, not ui::TesseractAnim, so
-    // core/ stays free of the UI header; the UI clamps it on read via
-    // ui::tesseractAnimFromInt. Serialized "appearance.brand_anim" (omitted when 0).
+    // inside-out, 1 = double rotation, 2 = isoclinic, 3 = octave (2:1 locked planes). Plain
+    // int, not ui::TesseractAnim, so core/ stays free of the UI header; the UI clamps it on
+    // read via ui::tesseractAnimFromInt. Serialized "appearance.brand_anim" (omitted when 0).
     int brandAnim = 0;
 };
 

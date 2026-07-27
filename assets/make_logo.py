@@ -160,6 +160,18 @@ def draw_mark(img, cx, cy, r, spark=True, on_light=False, ss=SS):
         d.line([pts[a], pts[b]], fill=_lerp(far, near, n01),
                width=max(1, round(base_lw * (ramp0 + ramp1 * n01))))
 
+    # Vertex dots, far to near over the edges — mirrors the dot pass in tesseract.cpp's paint():
+    # they cap the stroke ends at every joint and anchor the eye. The C++ radius is
+    # baseW*(0.95 + 0.55*n01) with baseW = 0.06 of the box radius; expressed off fill_r so the
+    # still keeps the live mark's proportions. The colour ramp is biased a touch nearer than the
+    # edges', echoing the dots' higher alpha floor in the C++.
+    for i in sorted(range(16), key=lambda i: -dep[i]):
+        n01 = 0.5 - dep[i] / (2.0 * depth)
+        dot_r = max(1.0, fill_r * 0.06 * (0.95 + 0.55 * n01))
+        x, y = pts[i]
+        d.ellipse([x - dot_r, y - dot_r, x + dot_r, y + dot_r],
+                  fill=_lerp(far, near, 0.2 + 0.8 * n01))
+
     # The spark seats in the inner cell. It is the one element that cannot survive the small
     # tiers: at 16 px it fills the cell it is meant to sit inside, so it drops out entirely.
     if spark and final_r >= 7.0:

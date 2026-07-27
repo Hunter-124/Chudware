@@ -365,9 +365,11 @@ void loadSettings(Settings& s) {
             return def;
         };
         if (j.contains("plan_preference"))
-            s.planPreference = parsePref(j, "plan_preference", 2);
+            s.planPreference = parsePref(j, "plan_preference", 0);
+        else if (j.contains("plan_mode"))
+            s.planPreference = j.value("plan_mode", false) ? 2 : 0;
         else
-            s.planPreference = j.value("plan_mode", true) ? 2 : 0;
+            s.planPreference = 0;  // default Off — direct agent, no forced plan/intake
         s.planMode = (s.planPreference != 0);
         s.subagentPreference = parsePref(j, "subagent_preference", 1);
         s.advisorPreference = parsePref(j, "advisor_preference", 2);
@@ -382,6 +384,10 @@ void loadSettings(Settings& s) {
                 s.proactiveAdvisor = ag.value("proactive_advisor", false);
             if (ag.contains("corporate_mode"))
                 s.corporateMode = ag.value("corporate_mode", false);
+            if (ag.contains("auto_mission_routing"))
+                s.autoMissionRouting = ag.value("auto_mission_routing", false);
+            if (ag.contains("direct_agent_full_tools"))
+                s.directAgentFullTools = ag.value("direct_agent_full_tools", true);
             if (ag.contains("memory_enabled"))
                 s.memoryEnabled = ag.value("memory_enabled", true);
                 if (ag.contains("role_adoption")) {
@@ -398,6 +404,10 @@ void loadSettings(Settings& s) {
                 s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
             }
         }
+        if (j.contains("auto_mission_routing"))
+            s.autoMissionRouting = j.value("auto_mission_routing", false);
+        if (j.contains("direct_agent_full_tools"))
+            s.directAgentFullTools = j.value("direct_agent_full_tools", true);
         if (j.contains("proactive_advisor"))
             s.proactiveAdvisor = j.value("proactive_advisor", false);
         if (j.contains("corporate_mode"))
@@ -468,16 +478,17 @@ void loadSettings(Settings& s) {
                 }
             }
             // Brand-mark animation style: 0 = ui::TesseractAnim::EightCell (the default),
-            // 1 = DoubleRotation, 2 = Isoclinic.
+            // 1 = DoubleRotation, 2 = Isoclinic, 3 = Octave.
             //
             // MIGRATION. Configs from the brief pre-reduction era encode 0 = SimpleRotation,
             // 1 = DoubleRotation, 2 = EightCell — both dead styles were the same bisecting-plane
             // rotation the modern 0 descends from, and the two-style build already rewrote such
             // configs to 0/1. A stale 2 that never got rewritten now lands on Isoclinic instead:
             // a one-time cosmetic swap the picker undoes in one click, accepted to keep the
-            // encoding dense.
+            // encoding dense. Anything beyond the current Count (a newer config read by an
+            // older build) falls back to the default 8-cell.
             const int ba = app.is_object() ? app.value("brand_anim", 0) : 0;
-            s.brandAnim = (ba >= 0 && ba <= 2) ? ba : 0;
+            s.brandAnim = (ba >= 0 && ba <= 3) ? ba : 0;
         }
         // T-G21: pinned-column vertical-collapse state.
         s.fmCollapsed = j.value("fm_collapsed", false);
@@ -770,6 +781,8 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["advisor_preference"] = prefName(s.advisorPreference);
         j["proactive_advisor"] = s.proactiveAdvisor;
         j["corporate_mode"] = s.corporateMode;
+        j["auto_mission_routing"] = s.autoMissionRouting;
+        j["direct_agent_full_tools"] = s.directAgentFullTools;
         j["memory_enabled"] = s.memoryEnabled;
         j["role_adoption"] = (s.roleAdoption != 0) ? "free" : "supervised";
         j["memory_token_budget"] = s.memoryTokenBudget;
@@ -780,6 +793,8 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         agent["advisor_preference"] = prefName(s.advisorPreference);
         agent["proactive_advisor"] = s.proactiveAdvisor;
         agent["corporate_mode"] = s.corporateMode;
+        agent["auto_mission_routing"] = s.autoMissionRouting;
+        agent["direct_agent_full_tools"] = s.directAgentFullTools;
         agent["subagent_preference"] = prefName(s.subagentPreference);
         agent["memory_enabled"] = s.memoryEnabled;
         agent["role_adoption"] = (s.roleAdoption != 0) ? "free" : "supervised";

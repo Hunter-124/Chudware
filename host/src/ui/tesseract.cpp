@@ -3,7 +3,10 @@
 // Pipeline per vertex:  v4 (±1,±1,±1,±1)  ->  4D rotation (per style)  ->  4D->3D perspective
 // projection  ->  fixed 3/4 camera (yaw + pitch)  ->  3D->2D perspective  ->  screen. Edges are
 // the 32 vertex pairs differing in exactly one coordinate, painted back-to-front with a
-// depth-driven alpha/width ramp so the mark reads as a solid object at 16 px.
+// depth-driven alpha/width ramp, then the 16 vertices are dotted back-to-front on top: the dots
+// cap the butt ends of the edge strokes (a thick AddLine ends square, which notched at every
+// acute-angle joint) and give the eye the anchors that make the 4D motion trackable, so the
+// mark reads as a solid object at 16 px.
 //
 // A STYLE IS DATA, NOT CODE: each one is a short list of rotations in coordinate planes of
 // 4-space driven by one or two independent phases (see AnimDef). One rotation mechanism, one
@@ -78,11 +81,17 @@ const float kDoubleRateB = 0.6180340f;
 // Isoclinic      A double rotation whose two planes turn in LOCKSTEP off a single phase. Every
 //                vertex then moves at the same speed along a circle — a Hopf fibre — so the
 //                figure rolls smoothly and never turns inside out.
+//
+// Octave         A double rotation whose planes are locked at exactly 2:1 off a single phase:
+//                the zw fold runs twice per xy roll, so the figure turns inside out twice and
+//                lands back on its start — a short, closed loop, unlike the never-repeating
+//                double rotation and the inside-out-free isoclinic.
 const AnimDef& animDef(TesseractAnim anim) {
     static const AnimDef defs[(int)TesseractAnim::Count] = {
         /* EightCell      */ { {{2, 3, 0, 1.0f}},                  1, {1.0f, 0.0f},       1 },
         /* DoubleRotation */ { {{0, 1, 0, 1.0f}, {2, 3, 1, 1.0f}}, 2, {1.0f, kDoubleRateB}, 2 },
         /* Isoclinic      */ { {{0, 1, 0, 1.0f}, {2, 3, 0, 1.0f}}, 2, {1.0f, 0.0f},       1 },
+        /* Octave         */ { {{0, 1, 0, 1.0f}, {2, 3, 0, 2.0f}}, 2, {1.0f, 0.0f},       1 },
     };
     return defs[(int)anim];
 }
@@ -214,6 +223,7 @@ const StyleFit& styleFit(TesseractAnim anim) {
         fitStyle(animDef(TesseractAnim::EightCell)),
         fitStyle(animDef(TesseractAnim::DoubleRotation)),
         fitStyle(animDef(TesseractAnim::Isoclinic)),
+        fitStyle(animDef(TesseractAnim::Octave)),
     };
     return s_fit[(int)anim];
 }
@@ -293,13 +303,37 @@ void paint(ImDrawList* dl, ImVec2 center, float size, const AnimDef& def, const 
     for (int k = 0; k < n; ++k) {
         const int idx = order[k];
         // near == -depth; map [-depth,+depth] -> [1,0] and ramp both alpha and stroke so the
-        // silhouette stays legible while the far cell recedes instead of muddying it.
+        // silhouette stays legible while the far cell recedes instead of muddying it. The alpha
+        // floor stays HIGH on purpose: faint dark ink on the light theme's cards reads as a
+        // grey fog where the far edges overlap, so the depth cue is carried mostly by stroke
+        // weight — far edges thin out but stay crisp lines.
         const float near01 = 0.5f - ez[idx] / (2.0f * fit.depth);
-        const float a = alphaBase * (0.34f + 0.66f * near01);
-        const float w = baseW * (0.75f + 0.45f * near01);
+        const float a = alphaBase * (0.55f + 0.45f * near01);
+        const float w = baseW * (0.55f + 0.70f * near01);
         dl->AddLine(pt[e.a[idx]], pt[e.b[idx]],
                     rgb | ((ImU32)(a * 255.0f + 0.5f) << IM_COL32_A_SHIFT),
                     w < 1.0f ? 1.0f : w);
+    }
+
+    // Vertex dots, far to near over the edges. They cap the square stroke ends at every joint
+    // and anchor the eye; the alpha floor sits higher than the edges' so the far cell keeps
+    // its corners even as its edges recede. Radius rides the same depth ramp.
+    int vorder[kNumVerts];
+    for (int i = 0; i < kNumVerts; ++i) vorder[i] = i;
+    for (int k = 1; k < kNumVerts; ++k) {
+        const int   key = vorder[k];
+        const float kz  = depth[key];
+        int j = k - 1;
+        while (j >= 0 && depth[vorder[j]] < kz) { vorder[j + 1] = vorder[j]; --j; }
+        vorder[j + 1] = key;
+    }
+    for (int k = 0; k < kNumVerts; ++k) {
+        const int i = vorder[k];
+        const float near01 = 0.5f - depth[i] / (2.0f * fit.depth);
+        const float a = alphaBase * (0.70f + 0.30f * near01);
+        const float rDot = baseW * (0.90f + 0.50f * near01);
+        dl->AddCircleFilled(pt[i], rDot,
+                            rgb | ((ImU32)(a * 255.0f + 0.5f) << IM_COL32_A_SHIFT));
     }
 }
 
@@ -309,6 +343,7 @@ const char* tesseractAnimName(TesseractAnim anim) {
     switch (anim) {
         case TesseractAnim::DoubleRotation: return "Double rotation";
         case TesseractAnim::Isoclinic:      return "Isoclinic";
+        case TesseractAnim::Octave:         return "Octave";
         case TesseractAnim::EightCell:
         default:                            return "8-cell";
     }
@@ -323,6 +358,10 @@ const char* tesseractAnimBlurb(TesseractAnim anim) {
             return "An isoclinic rotation: both orthogonal 4D planes turn in lockstep, so every "
                    "vertex traces a perfect circle and the figure rolls smoothly without ever "
                    "turning inside out.";
+        case TesseractAnim::Octave:
+            return "A double rotation with its two planes locked at exactly 2:1: the figure "
+                   "turns inside out twice for every roll, then lands back where it started — "
+                   "a short, closed loop.";
         case TesseractAnim::EightCell:
         default:
             return "A simple 4D rotation that folds the fourth axis through the viewing "
@@ -351,6 +390,12 @@ void drawTesseractSpinner(ImDrawList* dl, ImVec2 center, float size, double time
     // Settings in scope.
     const AnimDef& def = animDef(TesseractAnim::EightCell);
     const float phase[1] = {(float)std::fmod(timeSec * (double)kSpinBusy, 6.283185307179586)};
+    // Busy pulse: a gentle brightness swell twice per inside-out cycle so the indicator reads
+    // as actively working, not idling. Only the ink breathes — the fitted projection keeps the
+    // figure's size fixed.
+    const float pulse = 0.82f + 0.18f * std::sin(2.0f * phase[0]);
+    const ImU32 aIn = (col >> IM_COL32_A_SHIFT) & 0xFF;
+    col = (col & ~IM_COL32_A_MASK) | ((ImU32)(aIn * pulse + 0.5f) << IM_COL32_A_SHIFT);
     paint(dl, center, size, def, styleFit(TesseractAnim::EightCell), phase, col, thickness,
           size < kLodDropWAxisPx);
 }

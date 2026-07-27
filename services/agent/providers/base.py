@@ -4,8 +4,66 @@ Messages are dicts: {"role": "user"|"assistant", "content": [parts]}.
 A part is either {"type": "text", "text": str} or {"type": "image", "path": str}.
 Each adapter converts these to its own API's wire format (Anthropic image blocks,
 OpenAI image_url data URIs, etc.), so the loop stays provider-agnostic.
+
+Provider delta sink seam (mirrors core/agent/run.cpp's set_provider_delta_emitter
+/ ProviderDeltaGuard): a thread-local sink a streaming-capable provider feeds raw
+text/thinking fragments into while a completion streams. Display-only — the
+provider's final result still carries the full text. Unset means no streaming,
+zero overhead.
 """
 from __future__ import annotations
+
+import threading
+from typing import Any, Callable
+
+# Sink protocol: callable(delta: str, channel: str) -> None (delta first, like the
+# C++ emitter). MAY expose discard() -> None; providers call it before a resample
+# so buffered fragments from the discarded attempt are dropped.
+DeltaSink = Callable[[str, str], None]
+
+_tls = threading.local()
+
+
+def set_provider_delta_sink(sink: Any) -> Any:
+    """Install (or clear, with None) this thread's provider delta sink.
+
+    Returns the previously installed sink so callers can restore it (nested
+    turns on one dispatch thread must not orphan the parent's stream).
+    """
+    prev = getattr(_tls, "delta_sink", None)
+    _tls.delta_sink = sink
+    return prev
+
+
+def provider_delta_sink() -> Any:
+    """This thread's installed provider delta sink, or None."""
+    return getattr(_tls, "delta_sink", None)
+
+
+class ProviderDeltaGuard:
+    """Install-and-restore guard mirroring C++'s ProviderDeltaGuard.
+
+    On __enter__ installs `sink`; on __exit__ calls ``sink.flush_all()`` when
+    available, then restores the previous sink. Context-manager usage only.
+    """
+
+    def __init__(self, sink: Any) -> None:
+        self._sink = sink
+        self._prev: Any = None
+
+    def __enter__(self) -> Any:
+        self._prev = set_provider_delta_sink(self._sink)
+        return self._sink
+
+    def __exit__(self, *exc: Any) -> bool:
+        flush = getattr(self._sink, "flush_all", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:  # noqa: BLE001 — flushing never breaks the turn
+                pass
+        set_provider_delta_sink(self._prev)
+        return False
 
 
 def text_part(text: str) -> dict:

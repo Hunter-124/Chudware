@@ -32,6 +32,8 @@ import inspect
 import json
 import logging
 import re
+import threading
+import time
 import traceback
 import uuid
 from typing import Any, Callable
@@ -825,7 +827,138 @@ def _maybe_inject_trigger_advisory(
     return block or None
 
 
+class _AssistantDeltaCoalescer:
+    """Python mirror of core/agent/run.cpp's DeltaCoalescer: coalesce streamed
+    provider fragments per channel and emit ``assistant_delta`` events with
+    payload {"text": chunk, "channel": "text"|"thinking"} — byte-identical in
+    shape to what the C++ engine emits, so the GUI needs no new event type.
+
+    Flush rules per channel (exact C++ mirror): buffer reaches 48 chars,
+    contains a newline, or >=60 ms elapsed since that channel's last flush.
+    ``flush_all()`` drains both channels (completion return / turn end).
+    ``discard()`` drops buffered-but-unflushed fragments (resample path).
+    """
+
+    FLUSH_CHARS = 48
+    FLUSH_MS = 60.0
+
+    def __init__(self, emit: Callable[[str, dict], None]) -> None:
+        self._emit = emit  # (kind, payload) -> None
+        self._buf: dict[str, list[str]] = {"text": [], "thinking": []}
+        now = time.monotonic()
+        self._last: dict[str, float] = {"text": now, "thinking": now}
+        self._lock = threading.Lock()
+
+    def __call__(self, delta: str, channel: str) -> None:
+        """Provider delta sink protocol: (delta, channel) like the C++ emitter."""
+        self.feed(delta, channel)
+
+    def feed(self, delta: str, channel: str) -> None:
+        if channel not in self._buf or not delta:
+            return
+        with self._lock:
+            buf = self._buf[channel]
+            buf.append(str(delta))
+            joined = "".join(buf)
+            elapsed_ms = (time.monotonic() - self._last[channel]) * 1000.0
+            if (len(joined) >= self.FLUSH_CHARS or "\n" in joined
+                    or elapsed_ms >= self.FLUSH_MS):
+                self._flush_locked(channel)
+
+    def _flush_locked(self, channel: str) -> None:
+        buf = self._buf[channel]
+        if not buf:
+            return
+        chunk = "".join(buf)
+        buf.clear()
+        self._last[channel] = time.monotonic()
+        try:
+            self._emit("assistant_delta", {"text": chunk, "channel": channel})
+        except Exception:  # noqa: BLE001 — event emission never blocks a turn
+            pass
+
+    def flush_all(self) -> None:
+        with self._lock:
+            self._flush_locked("text")
+            self._flush_locked("thinking")
+
+    def discard(self) -> None:
+        """Drop unflushed fragments from a dead attempt (kimi resample)."""
+        with self._lock:
+            self._buf["text"].clear()
+            self._buf["thinking"].clear()
+
+
 def run_turn(request: str, provider: Any, *, name: str = "dag_node",
+             allowed_tools: list[str] | None = None,
+             system_prompt: str | None = None,
+             max_tool_calls: int | None = None,
+             max_tokens: int | None = None,
+             ledger=None,
+             actor: str | None = None,
+             tool_dispatch: Callable[[str, dict], Any] | None = None,
+             mission_dispatch: Any | None = None,
+             tools_text: str | None = None,
+             on_event: Callable[..., None] | None = None,
+             run_id: str | None = None,
+             node_id: str | None = None,
+             parent_id: str | None = None,
+             subagent_id: str | None = None,
+             capability: Any | None = None,
+             tier: str | None = None,
+             model_id: str | None = None,
+             phase: str | None = None,
+             task_class: str | None = None,
+             msg_idx: int | None = None,
+             doc_id: str | None = None,
+             context_refs=None,
+             mode: str | None = None,
+             plan_only: bool | None = None,
+             options: dict | None = None) -> TurnResult:
+    """Streaming wrapper around :func:`_run_turn_impl`.
+
+    When *on_event* is supplied (GUI turns), installs a thread-local provider
+    delta sink for the duration of the turn so streaming-capable providers
+    (OMP bridge) forward live text/thinking fragments, coalesced into
+    ``assistant_delta`` events on the same on_event path the other agent
+    events use. When *on_event* is None (headless/tests) nothing is installed
+    — zero overhead, today's behaviour byte-for-byte.
+    """
+    if on_event is None:
+        return _run_turn_impl(
+            request, provider, name=name, allowed_tools=allowed_tools,
+            system_prompt=system_prompt, max_tool_calls=max_tool_calls,
+            max_tokens=max_tokens, ledger=ledger, actor=actor,
+            tool_dispatch=tool_dispatch, mission_dispatch=mission_dispatch,
+            tools_text=tools_text, on_event=on_event, run_id=run_id,
+            node_id=node_id, parent_id=parent_id, subagent_id=subagent_id,
+            capability=capability, tier=tier, model_id=model_id, phase=phase,
+            task_class=task_class, msg_idx=msg_idx, doc_id=doc_id,
+            context_refs=context_refs, mode=mode, plan_only=plan_only,
+            options=options)
+
+    from services.agent import agent_events as _ae  # noqa: PLC0415
+    from services.agent.providers import base as _pbase  # noqa: PLC0415
+
+    def _emit_delta(kind: str, payload: dict) -> None:
+        _ae.emit_event(kind, payload, live=on_event, journal=None)
+
+    coalescer = _AssistantDeltaCoalescer(_emit_delta)
+    with _pbase.ProviderDeltaGuard(coalescer):
+        return _run_turn_impl(
+            request, provider, name=name, allowed_tools=allowed_tools,
+            system_prompt=system_prompt, max_tool_calls=max_tool_calls,
+            max_tokens=max_tokens, ledger=ledger, actor=actor,
+            tool_dispatch=tool_dispatch, mission_dispatch=mission_dispatch,
+            tools_text=tools_text, on_event=on_event, run_id=run_id,
+            node_id=node_id, parent_id=parent_id, subagent_id=subagent_id,
+            capability=capability, tier=tier, model_id=model_id, phase=phase,
+            task_class=task_class, msg_idx=msg_idx, doc_id=doc_id,
+            context_refs=context_refs, mode=mode, plan_only=plan_only,
+            options=options)
+
+
+def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
              allowed_tools: list[str] | None = None,
              system_prompt: str | None = None,
              max_tool_calls: int | None = None,

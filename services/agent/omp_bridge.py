@@ -210,7 +210,8 @@ class OmpBridgeClient:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _call_once(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+    def _call_once(self, method: str, params: dict[str, Any], timeout: float,
+                   on_event=None) -> dict[str, Any]:
         if self._proc is None or self._proc.poll() is not None:
             self._stop_locked()
             self._spawn()
@@ -246,9 +247,18 @@ class OmpBridgeClient:
             if not isinstance(msg, dict) or msg.get("id") != req_id:
                 continue
             if "event" in msg and "ok" not in msg:
-                # Streaming notification ({"id":N,"event":"delta","data":{…}}) — the bridge
-                # only emits these for callers that asked for `stream: true`, which no Python
-                # caller does yet. Skip rather than mistake it for a malformed reply.
+                # Streaming notification ({"id":N,"event":"delta","data":{…}}) for OUR id
+                # — the bridge only emits these when params asked for `stream: true`.
+                # Dispatch to the caller's callback when supplied; otherwise skip.
+                # A raising callback must NEVER break the RPC — swallow and keep
+                # reading for the final response line.
+                if on_event is not None:
+                    try:
+                        data = msg.get("data")
+                        on_event(str(msg.get("event") or ""),
+                                 data if isinstance(data, dict) else {})
+                    except Exception:  # noqa: BLE001
+                        pass
                 continue
 
             if msg.get("ok"):
@@ -263,9 +273,15 @@ class OmpBridgeClient:
                 )
             raise BridgeUnavailable(str(error) if error else "unknown OMP bridge RPC error")
 
-    def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 120) -> dict[str, Any]:
+    def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 120,
+             on_event=None) -> dict[str, Any]:
         """Id-correlated call to the bridge. Returns the ``result`` object on
         success (non-object results are wrapped as ``{"value": ...}``).
+
+        *on_event*, when supplied, receives ``(event_kind, data_dict)`` for each
+        streaming notification line (``{"id": N, "event": kind, "data": {...}}``)
+        bearing THIS call's id (emitted before the final response only when the
+        params asked for ``stream: true``). Callback exceptions are swallowed.
 
         Raises :class:`BridgeUnavailable` for every failure mode (bun/script
         missing, spawn failure, child death, timeout, or an ``ok: false``
@@ -277,7 +293,7 @@ class OmpBridgeClient:
             last_exc: Exception | None = None
             for attempt in range(2):
                 try:
-                    return self._call_once(method, body, timeout)
+                    return self._call_once(method, body, timeout, on_event=on_event)
                 except _ChildDead as exc:
                     last_exc = exc
                     self._stop_locked()
@@ -316,11 +332,12 @@ def get_client() -> OmpBridgeClient:
         return _singleton
 
 
-def call(method: str, params: dict[str, Any] | None = None, timeout: float = 120) -> dict[str, Any]:
+def call(method: str, params: dict[str, Any] | None = None, timeout: float = 120,
+         on_event=None) -> dict[str, Any]:
     """Convenience wrapper: ``get_client().call(...)``. See
     :meth:`OmpBridgeClient.call`.
     """
-    return get_client().call(method, params, timeout=timeout)
+    return get_client().call(method, params, timeout=timeout, on_event=on_event)
 
 
 def ping(timeout: float = 10) -> dict[str, Any]:

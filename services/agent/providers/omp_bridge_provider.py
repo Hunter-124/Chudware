@@ -175,6 +175,23 @@ class OmpBridgeProvider(Provider):
     def complete_ex(self, system: str, messages: list[dict],
                     max_tokens: int = 8000) -> tuple[str, str]:
         bridge = _bridge()
+        from . import base as _base  # noqa: PLC0415 — stdlib-only module scope
+        # Live-stream seam: when the calling thread installed a provider delta
+        # sink (agent_turn does for GUI turns), ask the bridge to stream and
+        # forward each fragment to the sink. Deltas are DISPLAY-ONLY — the
+        # final result still carries the full text and is what we return.
+        sink = _base.provider_delta_sink()
+        on_event = None
+        if sink is not None:
+            def on_event(kind: str, data: dict) -> None:  # noqa: F811
+                if kind != "delta" or not isinstance(data, dict):
+                    return
+                frag_text = data.get("text")
+                frag_think = data.get("thinking")
+                if frag_text:
+                    sink(str(frag_text), "text")
+                if frag_think:
+                    sink(str(frag_think), "thinking")
         # K3 dialect re-anchor: see _KIMI_CODE_DIALECT_NOTE. Applies to the system prompt
         # only; user/assistant history stays verbatim.
         system_text = system or ""
@@ -195,6 +212,8 @@ class OmpBridgeProvider(Provider):
             params["baseUrl"] = self.base_url
         if self.reasoning_effort:
             params["reasoningEffort"] = self.reasoning_effort
+        if sink is not None:
+            params["stream"] = True
 
         try:
             # K3 textless-resample: kimi-code thinking-then-stop responses with ZERO text
@@ -212,10 +231,26 @@ class OmpBridgeProvider(Provider):
             wire_messages = params["messages"]
             for attempt in range(attempts):
                 if attempt:
+                    # Resampling: the previous attempt's streamed fragments are
+                    # dead — tell the sink to drop what it buffered so the user
+                    # never sees a half reply followed by the retry's text.
+                    if sink is not None:
+                        discard = getattr(sink, "discard", None)
+                        if callable(discard):
+                            try:
+                                discard()
+                            except Exception:  # noqa: BLE001
+                                pass
                     params["messages"] = wire_messages + [
                         {"role": "user", "content": _KIMI_RESAMPLE_NUDGE}
                     ]
-                result = bridge.call("complete", params, timeout=self.timeout)
+                if sink is not None:
+                    result = bridge.call("complete", params, timeout=self.timeout,
+                                         on_event=on_event)
+                else:
+                    # No sink: send EXACTLY what we send today (no `stream` key,
+                    # no on_event kwarg) — behaviour is byte-identical.
+                    result = bridge.call("complete", params, timeout=self.timeout)
                 if str(result.get("stopReason") or "") == "error":
                     break  # surfaced below with its status — resampling won't help
                 if str(result.get("text") or ""):

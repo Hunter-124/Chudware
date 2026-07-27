@@ -81,6 +81,20 @@ static const char* docIconName(const AppState::DocTab& t) {
 // A single tab, placed explicitly at screen position (x, y0). Returns the tab WIDTH so the caller
 // can advance to the next tab. Records a deferred switch/close into the file statics. Layout:
 // [ title (dirty *) × ]. The whole pill switches; the × hot-zone (submitted on top) closes.
+// How visible a clipped tab's high-contrast edge treatments (accent outline, AI-pulse glow) may
+// be: 1.0 when the tab is fully inside the lane, ramping to 0.0 as the clipped edge reaches
+// fadeW past the lane edge. Without this, a sliced accent outline / glow ring paints a bright
+// vertical fleck right at the clip boundary that the (max-0.62-alpha) dissolve fade can't cover.
+static float tabEdgeFade(float p0x, float p1x, float clipL, float clipR, float fadeW) {
+    if (fadeW < 0.5f) return 1.0f;
+    float a = 1.0f;
+    if (p0x < clipL - 0.5f)
+        a = std::min(a, 1.0f - ImClamp((clipL - p0x) / fadeW, 0.0f, 1.0f));
+    if (p1x > clipR + 0.5f)
+        a = std::min(a, 1.0f - ImClamp((p1x - clipR) / fadeW, 0.0f, 1.0f));
+    return a;
+}
+
 // clipL/clipR bound the visible tab lane (the outer PushClipRect); fadeW is the edge-dissolve
 // width. A tab clipped by a lane edge fades its right-edge separator out over that zone so the
 // separator never reads as a bright vertical fleck where the title is truncated.
@@ -109,6 +123,8 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     ImVec2 p0(x, y0);
     ImVec2 p1(p0.x + tabW, p0.y + tabH);
     const ImRect tabRect(p0, p1);
+    // Dissolve factor for this tab's high-contrast edge strokes when a lane edge clips it.
+    const float edgeA = tabEdgeFade(p0.x, p1.x, clipL, clipR, fadeW);
 
     // Whole-pill click target (switch). The × button sits on top and consumes its own clicks — but
     // ImGui occludes a later item by an earlier overlapping one unless the underlying item opts in,
@@ -152,9 +168,11 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
         const float tsec = (float)ImGui::GetTime();
         const float phase = 0.5f + 0.5f * std::sin(tsec * 3.2f);   // 0..1 breath, ~2 Hz
         const float ar = pal.accent[0], ag = pal.accent[1], ab = pal.accent[2];
+        // edgeA: a clipped pulsing tab dissolves its glow with the rest of the pill — the rings
+        // extend past the pill, so sliced at the lane edge they were the brightest fleck of all.
         for (int k = 3; k >= 1; --k) {                             // outer→inner rings
             const float grow = (float)k * 2.2f * s;
-            const float a = (0.10f + 0.16f * phase) * (float)k / 3.0f;
+            const float a = (0.10f + 0.16f * phase) * (float)k / 3.0f * edgeA;
             const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(ar, ag, ab, a));
             dl->AddRect(ImVec2(p0.x - grow, p0.y - grow),
                         ImVec2(p1.x + grow, p1.y + grow),
@@ -162,7 +180,8 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
         }
         // Warm fill tint — same rounded rect the glass pill will occupy (no square fill under curves).
         dl->AddRectFilled(p0, p1,
-                          ImGui::ColorConvertFloat4ToU32(ImVec4(ar, ag, ab, 0.06f + 0.10f * phase)),
+                          ImGui::ColorConvertFloat4ToU32(
+                              ImVec4(ar, ag, ab, (0.06f + 0.10f * phase) * edgeA)),
                           kTabR);
     }
 
@@ -171,12 +190,16 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     // bar shows behind them — the effect belongs to the active tab + the "+N" overflow chips, not to
     // every file title (Hunter P4: a background was displaying where it isn't supposed to be).
     if (active || hovered || t.aiPulse)
-        ui::glassPanel(dl, tabRect, level, kTabRdp /*dp — glassPanel scales by uiScale*/, surf);
+        ui::glassPanel(dl, tabRect, level, kTabRdp /*dp — glassPanel scales by uiScale*/, surf,
+                       edgeA /*clipped pill dissolves its fill/border with the title*/);
     if (active) {
         // Accent outline on the EXACT same rounded rect as the glass fill (no inset / no radius
         // mismatch). Stroke sits on the pill edge so corner AA of fill + outline share one geometry.
+        // edgeA dissolves the outline when a lane edge clips the active tab — a full-strength
+        // accent stroke sliced at the clip boundary reads as a bright vertical line.
+        float oc[4] = {pal.accent[0], pal.accent[1], pal.accent[2], pal.accent[3] * edgeA};
         dl->AddRect(p0, p1,
-                    ui::Palette::toU32(pal.accent),
+                    ui::Palette::toU32(oc),
                     kTabR,
                     0,
                     std::max(1.0f, 1.5f * s));

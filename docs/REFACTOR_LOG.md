@@ -4331,3 +4331,28 @@ persisted (`conversationIsFresh`), which covers "delete empty sessions on close"
 Files: `host/src/ui/copilot/panel.cpp`, `host/src/ui/copilot/conversations.cpp`.
 Gotcha: orphans for docs that were NEVER saved can't rekey (no path exists); they
 stay under Other sessions until their doc is opened and saved once.
+
+Sessions are now FIRST-CLASS and document-independent (user requirement: "sessions need
+to be saved/stored/handled independent of document, but they can be linked &| reference
+each other"). Conversation::docKey renamed to docLink — an OPTIONAL reference
+("file:<path>" | "doc:<id>"), never an ownership key. Persistence moved off the appdata
+single-file doc-bucket store to ONE FILE PER SESSION under
+<Documents>/Chudware/Sessions (override: CHUDWARE_SESSIONS_DIR, mirroring
+CHUDWARE_BUG_REPORTS_DIR): index.json is the v2 envelope (active id + order), <id>.json
+is one full session object; persist prunes stray transcript files. The legacy appdata
+chat_history.json (v2 flat or v1 doc-buckets) is imported once on first load — bucket
+key becomes the session's docLink. The doc-rekey sweep is now a RELINK sweep: rewrites
+resident docLink doc:<id>→file:<path> and patches the "doc" field in the on-disk
+transcripts. Sessions picker lists ALL sessions regardless of the document on screen
+(no docKey filter); each row carries a doc badge (basename for file: links, open tab's
+title for doc: links — hidden when unresolvable) that jumps to the document's tab via
+switchToTab. Deleted: the whole "Other sessions" orphan section, the held-key browse
+pin (s_chatKeyHold, loadChatHistoryForKey, eraseChatHistoryKeys, applyChatEntry), and
+the "Back to current document" button. closeConversation hops to the nearest
+non-archived session; archiveConversation's same-doc restriction is gone.
+Files: `host/src/core/app_state.h`, `host/src/ui/copilot/copilot_internal.h`,
+`host/src/ui/copilot/conversations.cpp`, `host/src/ui/copilot/panel.cpp`.
+Gotchas: prompt drafts stay doc-keyed in appdata (separate concern); the WASM shared-chat
+merge was rebuilt for the transcript-file layout but is compile-verified only; legacy
+import happens exactly once (guarded by a static in syncChatToDoc) — deleting
+Sessions/index.json re-imports from appdata.

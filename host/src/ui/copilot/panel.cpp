@@ -382,9 +382,8 @@ void drawSessionsPanel(AppState& st, bool busy) {
     int shownIdx = 0;              // per-document row number for the untitled-chat fallback
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
         Conversation& c = st.conversations[i];
-        // st.conversations is a flat, resident, cross-docKey array (background runs stay
-        // alive across document switches) — scope this list to the document on screen.
-        if (c.docKey != st.chatDocKey) continue;
+        // Sessions are document-independent: list ALL of them regardless of the document
+        // on screen. Each row can carry a doc badge linking back to its document.
         if (c.archived != s_showArchived) continue;
         anyRowShown = true;
         ++shownIdx;
@@ -497,6 +496,50 @@ void drawSessionsPanel(AppState& st, bool busy) {
                     artiEllipsize(sub, std::max(ui::metrics::px(24.0f),
                                                 rowW - padX * 2.0f)).c_str());
 
+        // Document badge: sessions are document-independent but optionally carry a docLink
+        // reference. Show the linked document's name on the sub line; clicking it jumps to
+        // that document's tab when the tab is open. file: links always render (basename);
+        // doc: links only resolve while the tab is open, otherwise the badge is hidden.
+        if (!c.docLink.empty()) {
+            std::string badge;
+            int badgeTab = -1;
+            if (c.docLink.rfind("file:", 0) == 0) {
+                const std::string p = c.docLink.substr(5);
+                const size_t slash = p.find_last_of("/\\");
+                badge = slash == std::string::npos ? p : p.substr(slash + 1);
+                for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
+                    if (st.docTabs[ti].path == p) { badgeTab = ti; break; }
+            } else if (c.docLink.rfind("doc:", 0) == 0) {
+                const std::string id = c.docLink.substr(4);
+                for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
+                    if (st.docTabs[ti].docId == id) { badgeTab = ti; badge = st.docTabs[ti].title; break; }
+            }
+            if (!badge.empty()) {
+                const ImVec2 bsz = ImGui::CalcTextSize(badge.c_str());
+                const float bx1 = rowMax.x - actionsW - padX;
+                const float bx0 = std::max(rowMin.x + padX + runIndent, bx1 - bsz.x - 8.0f * sc);
+                const float by0 = rowMin.y + padY + titleH + 2.0f * sc
+                                  + (subH - bsz.y) * 0.5f - 1.0f * sc;
+                const float by1 = by0 + bsz.y + 2.0f * sc;
+                ImVec4 badgeBg(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.10f);
+                if (badgeTab < 0) badgeBg.w = 0.05f;
+                dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
+                                  ImGui::ColorConvertFloat4ToU32(badgeBg),
+                                  ui::metrics::cpMenuChipRound());
+                ImVec4 badgeInk = badgeTab >= 0 ? surf.textSecondary : surf.textTertiary;
+                badgeInk.w = 1.0f;
+                dl->AddText(ImVec2(bx0 + 4.0f * sc, by0 + 1.0f * sc),
+                            ImGui::ColorConvertFloat4ToU32(badgeInk), badge.c_str());
+                ImGui::SetCursorScreenPos(ImVec2(bx0, by0));
+                ImGui::InvisibleButton("##docbadge", ImVec2(bx1 - bx0, by1 - by0));
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", badgeTab >= 0
+                        ? "Jump to this document's tab" : "Document not open");
+                if (ImGui::IsItemClicked() && badgeTab >= 0)
+                    st.switchToTab(badgeTab);
+            }
+        }
+
         bool doDel = false;
         bool doArchiveToggle = false;
         if (rowHov || active) {
@@ -533,245 +576,6 @@ void drawSessionsPanel(AppState& st, bool busy) {
                                       : "No active sessions yet. Start one above.");
     }
 
-    // ---- Other sessions: orphaned keys in chat_history.json (not the active doc) ----
-    // Keeps doc:* / other-file histories visible after an autosave rekey or tab switch.
-    struct OtherSess {
-        std::string key;
-        std::string label;
-        std::string snippet;
-        int nConvs = 0;
-    };
-    std::vector<OtherSess> others;
-    std::vector<std::string> staleEmptyKeys;
-    {
-        nlohmann::json root = nlohmann::json::object();
-        try {
-            std::ifstream in(chatHistoryPath());
-            if (in) in >> root;
-        } catch (...) {
-            root = nlohmann::json::object();
-        }
-        if (root.is_object()) {
-            for (auto it = root.begin(); it != root.end(); ++it) {
-                if (!it.value().is_object()) continue;
-                const std::string& k = it.key();
-                if (k == st.chatDocKey) continue;
-                OtherSess o;
-                o.key = k;
-                // Label = key tail (basename for file:, id for doc:, else raw).
-                if (k.rfind("file:", 0) == 0) {
-                    std::string p = k.substr(5);
-                    size_t slash = p.find_last_of("/\\");
-                    o.label = slash == std::string::npos ? p : p.substr(slash + 1);
-                } else if (k.rfind("doc:", 0) == 0) {
-                    o.label = "unsaved " + k.substr(4);
-                    if (o.label.size() > 28) o.label = o.label.substr(0, 25) + "...";
-                } else {
-                    o.label = k;
-                }
-                const auto& convs = it.value().value("conversations", nlohmann::json::array());
-                o.nConvs = (int)convs.size();
-                // First user-message snippet across conversations.
-                for (const auto& jc : convs) {
-                    for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
-                        if (m.value("u", false)) {
-                            o.snippet = m.value("t", std::string());
-                            break;
-                        }
-                    }
-                    if (!o.snippet.empty()) break;
-                }
-                if (o.snippet.size() > 60) o.snippet = o.snippet.substr(0, 57) + "...";
-                // Fresh sessions are never kept: a bucket whose conversations are ALL empty
-                // (no messages at all) is junk left by older builds — drop it from the list
-                // and queue it for removal from disk below.
-                bool anyContent = !o.snippet.empty();
-                for (const auto& jc : convs) {
-                    if (anyContent) break;
-                    if (!jc.value("msgs", nlohmann::json::array()).empty()) anyContent = true;
-                }
-                if (!anyContent) {
-                    if (o.nConvs > 0) staleEmptyKeys.push_back(k);
-                    continue;
-                }
-                others.push_back(std::move(o));
-            }
-        }
-    }
-    // One-shot cleanup of the all-empty buckets found above (fire-and-forget; the write is
-    // atomic and never touches the active doc key).
-    if (!staleEmptyKeys.empty()) eraseChatHistoryKeys(staleEmptyKeys);
-    if (!others.empty()) {
-        // Group chrome from the SHARED cpMenuSection (section gap + dim label + hairline) rather
-        // than a hand-rolled header, so this group is literally the same widget as the Artifacts
-        // sections.
-        {
-            static double s_clearOtherUntil = 0.0;
-            const double now = ImGui::GetTime();
-            if (s_clearOtherUntil > 0.0 && now > s_clearOtherUntil) s_clearOtherUntil = 0.0;
-            const bool clearPend = s_clearOtherUntil > 0.0;
-
-            const float secY0 = ImGui::GetCursorPosY();
-            ui::cpMenuSection("Other sessions", (int)others.size());
-            const float secY1 = ImGui::GetCursorPosY();
-            // The click-again "Clear all" belongs ON the section's label line. cpMenuSection emits
-            // Dummy(sectionGap) and then the label, so that row starts exactly one item spacing
-            // below where we began — rewind there, draw right-aligned, then restore the section's
-            // cursor so the rows below keep its rhythm.
-            ImGui::SetCursorPosY(secY0 + ui::metrics::cpMenuSectionGap()
-                                 + ImGui::GetStyle().ItemSpacing.y);
-            {
-                const char* clearLbl = clearPend ? "Confirm?" : "Clear all";
-                const float clearW = ImGui::CalcTextSize(clearLbl).x
-                                     + style.FramePadding.x * 2.0f;
-                const float clearX = ImGui::GetContentRegionMax().x - clearW;
-                if (clearX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(clearX);
-                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f * sc, 1.0f * sc));
-                if (clearPend) {
-                    ImGui::PushStyleColor(ImGuiCol_Button,
-                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.70f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.85f));
-                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-                } else {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.10f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.16f));
-                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-                }
-                if (ImGui::SmallButton(clearLbl)) {
-                    if (!clearPend) {
-                        s_clearOtherUntil = now + 4.0;
-                    } else {
-                        std::vector<std::string> drop;
-                        drop.reserve(others.size());
-                        for (const auto& o : others) drop.push_back(o.key);
-                        // If we're browsing one of these keys, bounce back to the live doc first.
-                        bool heldDying = false;
-                        for (const auto& k : drop)
-                            if (!s_chatKeyHold.empty() && k == s_chatKeyHold) { heldDying = true; break; }
-                        if (heldDying) {
-                            s_chatKeyHold.clear();
-                            const std::string live = convDocKey(st);
-                            loadChatHistoryForKey(st, live);
-                            st.chatDocKey = live;
-                        }
-                        eraseChatHistoryKeys(drop);
-                        s_clearOtherUntil = 0.0;
-                        others.clear();
-                    }
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s",
-                        clearPend
-                            ? "Click again to permanently remove all other sessions from local history."
-                            : "Remove all other-document sessions from local chat history.");
-                ImGui::PopStyleColor(4);
-                ImGui::PopStyleVar();
-            }
-            ImGui::SetCursorPosY(secY1);
-        }
-        for (int oi = 0; oi < (int)others.size(); ++oi) {
-            const OtherSess& o = others[oi];
-            ImGui::PushID(10000 + oi);
-            const ImVec2 rowMin = ImGui::GetCursorScreenPos();
-            const float  rowW   = ImGui::GetContentRegionAvail().x;
-            const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
-            // Same shared geometry as the active-doc rows: the drawn trash button is wider
-            // than trashSz — reserve the REAL width or the button overlaps the label.
-            const float oDelImg  = trashSz - 8.0f * sc;
-            const float oDelBtnW = oDelImg + style.FramePadding.x * 2.0f;
-            const float oDelBtnH = oDelImg + style.FramePadding.y * 2.0f;
-            const float oRight   = 4.0f * sc;
-            bool picked = ImGui::InvisibleButton("##pickother",
-                                                ImVec2(std::max(1.0f, rowW - oDelBtnW - oRight - padX), rowH));
-            bool rowHov = ImGui::IsItemHovered();
-            if (picked) {
-                // Read-only browse: load that key's sessions into view and pin so
-                // syncChatToDoc doesn't immediately bounce back to the live doc key.
-                if (!st.chatDocKey.empty()) persistChatHistory(st);
-                loadChatHistoryForKey(st, o.key);
-                st.chatDocKey = o.key;
-                s_chatKeyHold = o.key;
-                st.showSessionsPicker = false;
-                st.showAISettingsOverlay = false;
-            }
-            float wash = rowHov ? 0.42f : 0.22f;
-            ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, (oi % 2) == 1, false, wash);
-            const float titleY = rowMin.y + padY;
-            // Disk JSON can't say "running now" — cross-reference the resident conversation
-            // set, which keeps background runs from other document keys alive in-process.
-            bool otherRunning = false;
-            for (const Conversation& rc : st.conversations)
-                if (rc.docKey == o.key && st.convRunning(rc.id)) { otherRunning = true; break; }
-            const float runIndent = otherRunning
-                ? drawSessionRunningIcon(dl, surf, rowMin, rowH, padX, sc) : 0.0f;
-            // Same clip rule as the active-doc rows: draw-list text does not respect the card.
-            const float oTextMaxW =
-                std::max(ui::metrics::px(24.0f), rowW - padX * 2.0f - oDelBtnW - oRight - runIndent);
-            const std::string oLabelShown = artiEllipsize(o.label, oTextMaxW);
-            ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
-            dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, oLabelShown.c_str());
-            char sub[160];
-            if (!o.snippet.empty())
-                std::snprintf(sub, sizeof(sub), "%s", o.snippet.c_str());
-            else if (o.nConvs == 1)
-                std::snprintf(sub, sizeof(sub), "1 session");
-            else
-                std::snprintf(sub, sizeof(sub), "%d sessions", o.nConvs);
-            dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY + titleH + 2.0f * sc),
-                        ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
-                        artiEllipsize(sub, std::max(ui::metrics::px(24.0f),
-                                                    rowW - padX * 2.0f - runIndent)).c_str());
-
-            // Per-row delete — same trash affordance as active-doc conversations.
-            bool doDel = false;
-            if (rowHov) {
-                ImGui::SetCursorScreenPos(
-                    ImVec2(rowMax.x - oDelBtnW - oRight, rowMin.y + (rowH - oDelBtnH) * 0.5f));
-                IconUV trash = ui::getIcon("delete", 20);
-                bool del = trash.valid
-                    ? ImGui::ImageButton("##delother", trash.texId, ImVec2(oDelImg, oDelImg),
-                                         trash.uv0, trash.uv1)
-                    : ImGui::SmallButton("x");
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Delete this session from local history");
-                doDel = del;
-            }
-
-            ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
-            ImGui::PopID();
-            if (doDel) {
-                // If browsing this orphan, return to the live doc before erasing the key.
-                if (!s_chatKeyHold.empty() && s_chatKeyHold == o.key) {
-                    s_chatKeyHold.clear();
-                    const std::string live = convDocKey(st);
-                    loadChatHistoryForKey(st, live);
-                    st.chatDocKey = live;
-                }
-                eraseChatHistoryKeys({o.key});
-                others.erase(others.begin() + oi);
-                break;
-            }
-        }
-    }
-
-    // If we're browsing a held foreign key, offer a one-click return to the live doc.
-    if (!s_chatKeyHold.empty()) {
-        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
-        if (ImGui::Button("Back to current document", ImVec2(-1, 0))) {
-            if (!st.chatDocKey.empty()) persistChatHistory(st);
-            s_chatKeyHold.clear();
-            const std::string live = convDocKey(st);
-            loadChatHistoryForKey(st, live);
-            st.chatDocKey = live;
-            st.showSessionsPicker = false;
-        }
-    }
 }
 
 // Task-list panel — replaces the chat log; the deterministic plan/checklist for the
@@ -1184,7 +988,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         st.focusSettingsTab = false;
     }
 
-    // Keep the conversation set bound to the active document (swaps history on doc change). Must
+    // Sessions are document-independent and all resident; this only loads history once, keeps
+    // st.chatDocKey (run-launch key) current, and guarantees at least one conversation. Must
     // run BEFORE the header/composer touch st.conversations, so the seeded/persisted chat is
     // adopted rather than cleared.
     syncChatToDoc(st);
@@ -1192,7 +997,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     // T-G17 screenshot hook: CHUDWARE_COPILOT_VIEW forces a Copilot sub-view (and tops up a couple of
     // demo sessions) so the sessions/settings layouts can be captured headless in both themes. Runs
-    // AFTER syncChatToDoc (which rebinds st.conversations to the doc) and re-tops-up each frame so
+    // AFTER syncChatToDoc (which loads/ensures the resident sessions) and re-tops-up each frame so
     // the demo rows survive to the capture frame. Screenshot-only — gated on the env var, no effect
     // in a normal run.
     if (const char* cpView = std::getenv("CHUDWARE_COPILOT_VIEW")) {

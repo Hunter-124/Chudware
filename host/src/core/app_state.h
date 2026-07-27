@@ -701,18 +701,20 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
 std::vector<ChatMsg>* conversationMsgs(AppState& st, const std::string& convId);
 
 // One copilot conversation = its own tab. RESIDENT: every conversation loaded this process stays
-// in AppState::conversations for the app's lifetime, tagged with the document key it belongs to
-// (docKey) — switching/closing a document tab never destroys or reloads a conversation out from
+// in AppState::conversations for the app's lifetime — sessions are FIRST-CLASS, independent of
+// documents; each optionally carries a docLink reference to the document it relates to.
+// Switching/closing a document tab never destroys or reloads a conversation out from
 // under an in-flight run. The ACTIVE (currently viewed) conversation's live messages stay in
 // AppState::chat (so every existing st.chat user keeps working unchanged); every OTHER resident
 // conversation parks its messages here, whether idle or still streaming in the background.
-// Persisted per document to %APPDATA%/Chudware/chat_history.json so conversations survive
-// restarts; each docKey's group is written/loaded independently (see conversations.cpp).
+// Persisted to %APPDATA%/Chudware/chat_history.json as ONE flat session list (v2 schema) so
+// conversations survive restarts independent of any document (see conversations.cpp).
 struct Conversation {
     std::string id;
     std::string title;             // shown on the tab; defaults to "Chat N", renamed to 1st prompt
-    std::string docKey;            // the document this session belongs to (Sessions list scope +
-                                   // chat_history.json partition key); set once at creation.
+    std::string docLink;           // OPTIONAL document reference ("file:<path>" | "doc:<id>") —
+                                   // metadata only (Sessions row badge); the session exists
+                                   // independently of the document.
     std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
     int lastContextTokens = 0;     // per-session context meter (input tokens from last model call)
     std::vector<std::string> queuedPrompts;  // queued while this session's turn was active
@@ -1357,10 +1359,12 @@ struct AppState {
     std::vector<char> code{std::vector<char>(64 * 1024, 0)};
     std::vector<char> prompt{std::vector<char>(2048, 0)};
     std::vector<ChatMsg> chat;                 // the ACTIVE (viewed) conversation's live messages
-    std::vector<Conversation> conversations;   // ALL resident sessions across every doc key visited
-                                               // this process (active's msgs live in `chat`)
+    std::vector<Conversation> conversations;   // ALL resident sessions (document-independent);
+                                               // active's msgs live in `chat`
     int activeConv = -1;                       // index into conversations; -1 = uninitialized
-    std::string chatDocKey;                    // docKey of the currently VIEWED conversation
+    std::string chatDocKey;                    // the CURRENT document's key — run launches +
+                                               // prompt drafts bind to it (refreshed each frame
+                                               // from convDocKey; NOT a session ownership key)
     int convCounter = 0;                       // monotonic id source (no Date/random needed)
     std::vector<char> helpQuestion{std::vector<char>(2048, 0)};
     std::string helpLastQuestion;

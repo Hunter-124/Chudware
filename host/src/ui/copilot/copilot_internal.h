@@ -252,8 +252,8 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
 void drawChatLogWindowed(AppState& st);
 
 // ---- conversations + persistence (conversations) ----
-// Defined early in the monolith (before drawSessionsPanel) — rekey erase + Sessions "Other" pin.
-extern std::string s_chatKeyHold;
+// Sessions are first-class + document-independent (v2 flat store); Conversation::docLink is
+// only a reference. st.chatDocKey = the CURRENT document's key (run launches, prompt drafts).
 std::string chatHistoryPath();
 void        savePromptDraft(AppState& st, bool force = false);
 void        clearPromptDraft(AppState& st);
@@ -261,9 +261,7 @@ std::string convDocKey(AppState& st);
 std::string newConvId(AppState& st);
 void        ensureConversations(AppState& st);
 void        maybePersistChatHistoryDebounced(AppState& st, bool force);
-void        eraseChatHistoryKeys(const std::vector<std::string>& keys);
-void        loadChatHistoryForKey(AppState& st, const std::string& key,
-                                  const std::string& migrateFrom = {});
+void        loadChatHistory(AppState& st);
 void        syncChatToDoc(AppState& st);
 void        parkActiveConversation(AppState& st);
 bool        activeConversationRunning(AppState& st);

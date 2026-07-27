@@ -204,10 +204,10 @@ struct Settings {
     bool fmCollapsed = false;
     bool copilotCollapsed = false;
 
-    // Animation style of the copilot brand mark (the live tesseract logo): 0 = 8-cell simple
-    // rotation, 1 = double rotation. Plain int, not ui::TesseractAnim, so core/ stays free of the
-    // UI header; the UI clamps it on read via ui::tesseractAnimFromInt. Serialized
-    // "appearance.brand_anim" (omitted when 0); loadSettings migrates the older 3-style encoding.
+    // Animation style of the copilot brand mark (the live tesseract logo): 0 = 8-cell
+    // inside-out, 1 = double rotation, 2 = isoclinic. Plain int, not ui::TesseractAnim, so
+    // core/ stays free of the UI header; the UI clamps it on read via
+    // ui::tesseractAnimFromInt. Serialized "appearance.brand_anim" (omitted when 0).
     int brandAnim = 0;
 };
 

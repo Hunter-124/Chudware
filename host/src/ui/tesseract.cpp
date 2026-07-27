@@ -1,14 +1,18 @@
 // tesseract.cpp — see tesseract.h. A real 4-cube, projected every frame.
 //
-// Pipeline per vertex:  v4 (±1,±1,±1,±1)  ->  4D rotation (per style)  ->  4D->3D projection
-// (perspective or orthographic)  ->  fixed 3/4 camera (yaw + pitch)  ->  3D->2D perspective  ->
-// screen. Edges are the 32 vertex pairs differing in exactly one coordinate, painted back-to-front
-// with a depth-driven alpha/width ramp so the mark reads as a solid object at 16 px.
+// Pipeline per vertex:  v4 (±1,±1,±1,±1)  ->  4D rotation (per style)  ->  4D->3D perspective
+// projection  ->  fixed 3/4 camera (yaw + pitch)  ->  3D->2D perspective  ->  screen. Edges are
+// the 32 vertex pairs differing in exactly one coordinate, painted back-to-front with a
+// depth-driven alpha/width ramp so the mark reads as a solid object at 16 px.
+//
+// A STYLE IS DATA, NOT CODE: each one is a short list of rotations in coordinate planes of
+// 4-space driven by one or two independent phases (see AnimDef). One rotation mechanism, one
+// fitter and one painter cover every style — adding a style is adding a table row.
 //
 // The projection distances and the final scale are FITTED ONCE per style (see fitStyle) by
-// sampling a full turn: a per-frame normalize-to-bounds would make the logo breathe, and a
-// hand-picked constant would either clip on the near pass or float in dead space. The fit is a few
-// thousand flops, computed on first use and cached.
+// sampling the style's whole configuration space: a per-frame normalize-to-bounds would make the
+// logo breathe, and a hand-picked constant would either clip on the near pass or float in dead
+// space. The fit is a few thousand flops, computed on first use and cached.
 #include "tesseract.h"
 
 #include <cmath>
@@ -44,58 +48,69 @@ struct EdgeTable {
 };
 const EdgeTable& edges() { static const EdgeTable t; return t; }
 
-// ---- 4D rotation -------------------------------------------------------------------------------
+// ---- animation styles ---------------------------------------------------------------------------
+// One rotation in a coordinate plane of 4-space (axes x, y, z, w = 0..3), driven by one of the
+// style's independent phases: angle = phase[spin.phase] * spin.rate.
+struct PlaneSpin { int i, j; int phase; float rate; };
+struct AnimDef {
+    PlaneSpin spins[2];
+    int     nSpins;
+    float   phaseRate[2];   // phase p advances at kSpin * phaseRate[p]
+    int     nPhases;
+};
 
-// Rotate `p` by `ang` inside the plane spanned by the ORTHONORMAL pair (u, v). The orthogonal
-// complement of that plane is the invariant ("axis") plane, so this is a simple rotation.
-inline Vec4 rotateInPlane(const Vec4& p, const Vec4& u, const Vec4& v, float ang) {
-    const float a = p.x * u.x + p.y * u.y + p.z * u.z + p.w * u.w;
-    const float b = p.x * v.x + p.y * v.y + p.z * v.z + p.w * v.w;
-    const float c = std::cos(ang), s = std::sin(ang);
-    const float da = (a * c - b * s) - a;
-    const float db = (a * s + b * c) - b;
-    return Vec4{p.x + da * u.x + db * v.x,
-                p.y + da * u.y + db * v.y,
-                p.z + da * u.z + db * v.z,
-                p.w + da * u.w + db * v.w};
-}
-
-// The invariant plane of the 8-cell's simple rotation bisects the figure front-left to back-right
-// (the horizontal diagonal (1,0,1,0), with +x right and +z into the screen) and top to bottom (the
-// vertical axis (0,1,0,0)). What turns is therefore its orthogonal complement: the plane spanned by
-// the other horizontal diagonal (1,0,-1,0) and the fourth axis w.
-const float kInvSqrt2 = 0.70710678f;
-constexpr Vec4 kRotU_raw{1.0f, 0.0f, -1.0f, 0.0f};
-inline Vec4 bisectRotU() { return Vec4{kRotU_raw.x * kInvSqrt2, 0.0f, kRotU_raw.z * kInvSqrt2, 0.0f}; }
-inline Vec4 bisectRotV() { return Vec4{0.0f, 0.0f, 0.0f, 1.0f}; }
-
-// Double rotation: two independent turns in the orthogonal coordinate planes xy and zw. The rates
-// are deliberately incommensurate-ish (golden ratio) so the two planes never realign and the
-// figure never settles into a short loop. No point of the figure is fixed for more than an
-// instant: the xy plane momentarily returns to identity once per xy revolution and the zw plane
-// once per zw revolution, but the two never coincide (except at t = 0), so unlike a simple
-// rotation there is no direction that survives the whole animation.
+// Golden-ratio conjugate, incommensurate with 1: the double rotation's two planes never realign,
+// so the motion has no short loop and — unlike a simple rotation — no direction of the figure
+// stays fixed through it.
 const float kDoubleRateB = 0.6180340f;
 
-// `a2` is only read by the double rotation; the 8-cell's simple rotation ignores it.
-Vec4 animate(const Vec4& p, TesseractAnim anim, float a1, float a2) {
-    if (anim == TesseractAnim::DoubleRotation) {
-        const float c1 = std::cos(a1), s1 = std::sin(a1);
-        const float c2 = std::cos(a2), s2 = std::sin(a2);
-        return Vec4{p.x * c1 - p.y * s1,
-                    p.x * s1 + p.y * c1,
-                    p.z * c2 - p.w * s2,
-                    p.z * s2 + p.w * c2};
+// EightCell      A SIMPLE rotation in the zw plane: the fourth axis folds through the viewing
+//                direction, so the inner cell swells toward the camera, swallows the outer one
+//                and the figure turns itself inside out — the canonical tesseract motion.
+//                (Replaces the earlier bisecting-plane rotation fitted against 8-cell-simple.gif,
+//                which kept a whole plane of the figure fixed and read as a flat shimmer at logo
+//                size.)
+//
+// DoubleRotation A DOUBLE rotation: independent turns in the orthogonal coordinate planes xy and
+//                zw at incommensurate rates (kDoubleRateB). The two planes momentarily return to
+//                identity once per own revolution but never coincide (except at t = 0).
+//
+// Isoclinic      A double rotation whose two planes turn in LOCKSTEP off a single phase. Every
+//                vertex then moves at the same speed along a circle — a Hopf fibre — so the
+//                figure rolls smoothly and never turns inside out.
+const AnimDef& animDef(TesseractAnim anim) {
+    static const AnimDef defs[(int)TesseractAnim::Count] = {
+        /* EightCell      */ { {{2, 3, 0, 1.0f}},                  1, {1.0f, 0.0f},       1 },
+        /* DoubleRotation */ { {{0, 1, 0, 1.0f}, {2, 3, 1, 1.0f}}, 2, {1.0f, kDoubleRateB}, 2 },
+        /* Isoclinic      */ { {{0, 1, 0, 1.0f}, {2, 3, 0, 1.0f}}, 2, {1.0f, 0.0f},       1 },
+    };
+    return defs[(int)anim];
+}
+
+// Rotate `p` by `ang` inside coordinate plane (i, j); the other two axes are untouched.
+inline Vec4 rotatePlane(Vec4 p, int i, int j, float ang) {
+    const float c = std::cos(ang), s = std::sin(ang);
+    float* q = &p.x;   // Vec4 is x, y, z, w in declaration order
+    const float a = q[i], b = q[j];
+    q[i] = a * c - b * s;
+    q[j] = a * s + b * c;
+    return p;
+}
+
+Vec4 animate(Vec4 p, const AnimDef& def, const float* phase) {
+    for (int s = 0; s < def.nSpins; ++s) {
+        const PlaneSpin& e = def.spins[s];
+        p = rotatePlane(p, e.i, e.j, phase[e.phase] * e.rate);
     }
-    return rotateInPlane(p, bisectRotU(), bisectRotV(), a1);
+    return p;
 }
 
 // ---- projection --------------------------------------------------------------------------------
 
 // Fixed camera, fitted against the reference animation's frames (see tesseract.h). Only slightly
 // off head-on: face-on the two nested cells sit concentric and the turn reads as a flat shimmer,
-// while a full 3/4 isometric tilt buries the front-left/back-right diagonal the rotation is
-// defined around and turns the edge bundle to mush at header size.
+// while a full 3/4 isometric tilt buries the inside-out motion and turns the edge bundle to mush
+// at header size.
 const float kCamYaw   = 0.35f;   // about +y
 const float kCamPitch = 0.22f;   // about +x
 
@@ -112,10 +127,10 @@ inline Vec3 camera(const Vec3& p) {
 // Fitted constants for one style: the two projection eye distances and the scale that makes the
 // widest frame of the whole animation exactly fill the requested box.
 struct StyleFit {
-    float d4 = 4.0f;    // 4D eye distance
-    float d3 = 8.0f;    // 3D eye distance
-    float scale = 1.0f; // unit box half-extent -> 1.0
-    float depth = 1.0f; // max |camera z|, for the depth ramp
+    float d4;    // 4D eye distance
+    float d3;    // 3D eye distance
+    float scale; // unit box half-extent -> 1.0
+    float depth; // max |camera z|, for the depth ramp
 };
 
 inline Vec3 project4to3(const Vec4& p, float d4) {
@@ -129,44 +144,47 @@ inline ImVec2 project3to2(const Vec3& p, float d3) {
     return ImVec2(p.x * k, p.y * k);
 }
 
-StyleFit fitStyle(TesseractAnim anim) {
-    const bool dbl = anim == TesseractAnim::DoubleRotation;
-    // A simple rotation's configuration space is a circle, so 96 samples of one turn see every
-    // frame it will ever show. The double rotation's is a 2-TORUS: its two planes turn at
-    // incommensurate rates and never realign, so sampling only the line a2 = 0.618*a1 would
-    // under-measure the widest frame and the mark would eventually clip out of its box.
-    const int n1 = dbl ? 48 : 96;
-    const int n2 = dbl ? 48 : 1;
+StyleFit fitStyle(const AnimDef& def) {
+    // Sample every phase over its full circle. One phase (8-cell, isoclinic) makes the
+    // configuration space a circle — 96 samples see every frame it will ever show. Two phases
+    // (double rotation) make it a 2-TORUS: the planes turn at incommensurate rates and never
+    // realign, so sampling only the trajectory line a2 = 0.618*a1 would under-measure the widest
+    // frame and the mark would eventually clip out of its box.
+    const int n1 = def.nPhases > 1 ? 48 : 96;
+    const int n2 = def.nPhases > 1 ? 48 : 1;
     const float st1 = 6.2831853f / (float)n1;
-    const float st2 = dbl ? 6.2831853f / (float)n2 : 0.0f;
-    StyleFit fit;
+    const float st2 = def.nPhases > 1 ? 6.2831853f / (float)n2 : 0.0f;
+    StyleFit fit{};
 
-    // Pass A — how far out of the 3-space does the figure reach? Sets the 4D eye distance so both
+    // Pass A — how far out of the 3-space does the figure reach? Sets the 4D eye distance so all
     // styles get the SAME perspective strength instead of an arbitrary literal that would either
-    // flatten one of them or blow up near the pole. The 1.63 multiplier is what matches the
-    // reference animation's nesting: the near cell projects ~2.1x the far one, where the 2.4 this
-    // started at gave a washed-out 1.6 and the turn barely read as motion.
+    // flatten one of them or blow up near the pole. The 1.63 multiplier gives the near cell
+    // roughly twice the far cell's projected size — enough that the inside-out reads at header
+    // size without a near-pole blow-up (d4 - max|w| stays ~0.89).
     float maxW = 0.0f;
     for (int s1 = 0; s1 < n1; ++s1)
-        for (int s2 = 0; s2 < n2; ++s2)
+        for (int s2 = 0; s2 < n2; ++s2) {
+            const float phase[2] = {s1 * st1, s2 * st2};
             for (int i = 0; i < kNumVerts; ++i) {
-                const float w = std::fabs(animate(unitVertex(i), anim, s1 * st1, s2 * st2).w);
+                const float w = std::fabs(animate(unitVertex(i), def, phase).w);
                 if (w > maxW) maxW = w;
             }
+        }
     fit.d4 = maxW * 1.63f;
 
     // Pass B — the 3D extent after the 4D projection sets the 3D eye distance (mild perspective)
     // and the depth-ramp normalizer.
     float maxR3 = 0.0f, maxZ = 0.0f;
     for (int s1 = 0; s1 < n1; ++s1)
-        for (int s2 = 0; s2 < n2; ++s2)
+        for (int s2 = 0; s2 < n2; ++s2) {
+            const float phase[2] = {s1 * st1, s2 * st2};
             for (int i = 0; i < kNumVerts; ++i) {
-                const Vec3 c = camera(
-                    project4to3(animate(unitVertex(i), anim, s1 * st1, s2 * st2), fit.d4));
+                const Vec3 c = camera(project4to3(animate(unitVertex(i), def, phase), fit.d4));
                 const float r = std::sqrt(c.x * c.x + c.y * c.y + c.z * c.z);
                 if (r > maxR3) maxR3 = r;
                 if (std::fabs(c.z) > maxZ) maxZ = std::fabs(c.z);
             }
+        }
     if (maxR3 < 1e-4f) maxR3 = 1.0f;
     fit.d3 = maxR3 * 3.0f;
     // Rounded up a hair: `depth` normalizes the painter's depth ramp, and a discrete sample grid
@@ -177,14 +195,15 @@ StyleFit fitStyle(TesseractAnim anim) {
     // Pass C — the widest frame of the whole animation fills the box exactly.
     float maxR2 = 0.0f;
     for (int s1 = 0; s1 < n1; ++s1)
-        for (int s2 = 0; s2 < n2; ++s2)
+        for (int s2 = 0; s2 < n2; ++s2) {
+            const float phase[2] = {s1 * st1, s2 * st2};
             for (int i = 0; i < kNumVerts; ++i) {
                 const ImVec2 q = project3to2(
-                    camera(project4to3(animate(unitVertex(i), anim, s1 * st1, s2 * st2), fit.d4)),
-                    fit.d3);
+                    camera(project4to3(animate(unitVertex(i), def, phase), fit.d4)), fit.d3);
                 const float r = std::sqrt(q.x * q.x + q.y * q.y);
                 if (r > maxR2) maxR2 = r;
             }
+        }
     // Same reason as `depth`: a hair of slack so the sampled maximum is never beaten at runtime.
     fit.scale = maxR2 > 1e-4f ? (1.0f / (maxR2 * 1.005f)) : 1.0f;
     return fit;
@@ -192,8 +211,9 @@ StyleFit fitStyle(TesseractAnim anim) {
 
 const StyleFit& styleFit(TesseractAnim anim) {
     static const StyleFit s_fit[(int)TesseractAnim::Count] = {
-        fitStyle(TesseractAnim::EightCell),
-        fitStyle(TesseractAnim::DoubleRotation),
+        fitStyle(animDef(TesseractAnim::EightCell)),
+        fitStyle(animDef(TesseractAnim::DoubleRotation)),
+        fitStyle(animDef(TesseractAnim::Isoclinic)),
     };
     return s_fit[(int)anim];
 }
@@ -210,26 +230,22 @@ const float kSpinBusy = 1.9f;
 // visibly cleaner from 18 px down, and indistinguishable above it.
 const float kLodDropWAxisPx = 18.0f;
 
-// The two plane angles at a wall-clock time. Each is wrapped INDEPENDENTLY. Deriving the second
-// from the already-wrapped first is the obvious shortcut and it is wrong: the zw plane would snap
-// back 3.88 rad on every xy revolution, teleporting vertices ~13 px on a 32 px mark every 10 s.
-// Not wrapping at all is also wrong: a float angle accumulated from uptime steps by 0.1 deg after
-// a few hours, which reads as a stutter.
-inline void animAngles(TesseractAnim anim, double timeSec, float& a1, float& a2) {
+// The phase angles at a wall-clock time, each wrapped INDEPENDENTLY in double. Deriving a later
+// phase from the already-wrapped first is the obvious shortcut and it is wrong: the zw plane
+// would snap back 3.88 rad on every xy revolution, teleporting vertices ~13 px on a 32 px mark
+// every 10 s. Not wrapping at all is also wrong: a float angle accumulated from uptime steps by
+// 0.1 deg after a few hours, which reads as a stutter.
+inline void animAngles(const AnimDef& def, double timeSec, float* phase) {
     const double kTau = 6.283185307179586;
-    const double base = timeSec * (double)kSpin;
-    a1 = (float)std::fmod(base, kTau);
-    a2 = anim == TesseractAnim::DoubleRotation
-             ? (float)std::fmod(base * (double)kDoubleRateB, kTau)
-             : 0.0f;
+    for (int p = 0; p < def.nPhases; ++p)
+        phase[p] = (float)std::fmod(timeSec * (double)(kSpin * def.phaseRate[p]), kTau);
 }
 
 // Shared painter. `dropWAxis` omits the 8 edges along the 4th axis (the ones joining the two
 // bounding cells); below ~14 px those edges are shorter than the stroke is wide and the figure
 // collapses into a solid patch, whereas the 24 that remain still read as a cube inside a cube.
-void paint(ImDrawList* dl, ImVec2 center, float size, TesseractAnim anim, float a1, float a2,
-           ImU32 col, float thickness, bool dropWAxis) {
-    const StyleFit& fit = styleFit(anim);
+void paint(ImDrawList* dl, ImVec2 center, float size, const AnimDef& def, const StyleFit& fit,
+           const float* phase, ImU32 col, float thickness, bool dropWAxis) {
     // 0.030 of the box: measured against rendered filmstrips at 96 px and 20 px. Anything near
     // 0.05 fuses the 32 edges into a white blob at header size.
     const float baseW = thickness > 0.0f ? thickness
@@ -245,7 +261,7 @@ void paint(ImDrawList* dl, ImVec2 center, float size, TesseractAnim anim, float 
     ImVec2 pt[kNumVerts];
     float  depth[kNumVerts];   // camera z, +into the screen
     for (int i = 0; i < kNumVerts; ++i) {
-        const Vec3 c = camera(project4to3(animate(unitVertex(i), anim, a1, a2), fit.d4));
+        const Vec3 c = camera(project4to3(animate(unitVertex(i), def, phase), fit.d4));
         const ImVec2 q = project3to2(c, fit.d3);
         // ImGui screen space is y-down; the model is y-up.
         pt[i] = ImVec2(center.x + q.x * fit.scale * r, center.y - q.y * fit.scale * r);
@@ -292,6 +308,7 @@ void paint(ImDrawList* dl, ImVec2 center, float size, TesseractAnim anim, float 
 const char* tesseractAnimName(TesseractAnim anim) {
     switch (anim) {
         case TesseractAnim::DoubleRotation: return "Double rotation";
+        case TesseractAnim::Isoclinic:      return "Isoclinic";
         case TesseractAnim::EightCell:
         default:                            return "8-cell";
     }
@@ -302,10 +319,15 @@ const char* tesseractAnimBlurb(TesseractAnim anim) {
         case TesseractAnim::DoubleRotation:
             return "A 3D projection of a tesseract performing a double rotation about two "
                    "orthogonal planes in 4-dimensional space.";
+        case TesseractAnim::Isoclinic:
+            return "An isoclinic rotation: both orthogonal 4D planes turn in lockstep, so every "
+                   "vertex traces a perfect circle and the figure rolls smoothly without ever "
+                   "turning inside out.";
         case TesseractAnim::EightCell:
         default:
-            return "A 3D projection of an 8-cell performing a simple rotation about a plane "
-                   "which bisects the figure from front-left to back-right and top to bottom.";
+            return "A simple 4D rotation that folds the fourth axis through the viewing "
+                   "direction: the inner cube swells toward you, swallows the outer one, and the "
+                   "figure turns itself inside out.";
     }
 }
 
@@ -314,18 +336,22 @@ void drawTesseract(ImDrawList* dl, ImVec2 center, float size, double timeSec,
     if (!dl || size <= 1.0f) return;
     if (anim < TesseractAnim::EightCell || anim >= TesseractAnim::Count)
         anim = TesseractAnim::EightCell;
-    float a1, a2;
-    animAngles(anim, timeSec, a1, a2);
-    paint(dl, center, size, anim, a1, a2, col, thickness, size < kLodDropWAxisPx);
+    const AnimDef& def = animDef(anim);
+    float phase[2];
+    animAngles(def, timeSec, phase);
+    paint(dl, center, size, def, styleFit(anim), phase, col, thickness,
+          size < kLodDropWAxisPx);
 }
 
 void drawTesseractSpinner(ImDrawList* dl, ImVec2 center, float size, double timeSec, ImU32 col,
                           float thickness) {
     if (!dl || size <= 1.0f) return;
-    // Always the 8-cell's simple rotation, never the user's brand-mark choice: a busy indicator
-    // has to read instantly at 14 px, and it is drawn from leaf widgets with no Settings in scope.
-    const float ang = (float)std::fmod(timeSec * (double)kSpinBusy, 6.283185307179586);
-    paint(dl, center, size, TesseractAnim::EightCell, ang, 0.0f, col, thickness,
+    // Always the 8-cell's inside-out rotation, never the user's brand-mark choice: a busy
+    // indicator has to read instantly at 14 px, and it is drawn from leaf widgets with no
+    // Settings in scope.
+    const AnimDef& def = animDef(TesseractAnim::EightCell);
+    const float phase[1] = {(float)std::fmod(timeSec * (double)kSpinBusy, 6.283185307179586)};
+    paint(dl, center, size, def, styleFit(TesseractAnim::EightCell), phase, col, thickness,
           size < kLodDropWAxisPx);
 }
 

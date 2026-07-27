@@ -73,25 +73,19 @@ def _face_grad(img, poly, c1, c2):
 
 _CAM_YAW, _CAM_PITCH = 0.35, 0.22
 _D4_FACTOR = 1.63
-_INV_SQRT2 = 0.7071067811865476
 
 # 16 vertices (+-1, +-1, +-1, +-1); 32 edges = the pairs differing in exactly one coordinate.
 _VERTS = [(1.0 if i & 1 else -1.0, 1.0 if i & 2 else -1.0,
            1.0 if i & 4 else -1.0, 1.0 if i & 8 else -1.0) for i in range(16)]
 _EDGES = [(i, i ^ b) for i in range(16) for b in (1, 2, 4, 8) if i ^ b > i]
 
-# Simple rotation: the invariant plane bisects the figure front-left to back-right (1,0,1,0) and
-# top to bottom (0,1,0,0), so what turns is its orthogonal complement, span{(1,0,-1,0), w}.
-_ROT_U = (_INV_SQRT2, 0.0, -_INV_SQRT2, 0.0)
-_ROT_V = (0.0, 0.0, 0.0, 1.0)
 
-
+# Simple rotation in the zw plane: the fourth axis folds through the viewing direction, so the
+# inner cell swells toward the camera, swallows the outer one and the figure turns itself inside
+# out. Mirrors the EightCell row of animDef() in tesseract.cpp (rotatePlane(p, 2, 3, theta)).
 def _rotate4(p, theta):
-    a = sum(p[i] * _ROT_U[i] for i in range(4))
-    b = sum(p[i] * _ROT_V[i] for i in range(4))
-    da = (a * math.cos(theta) - b * math.sin(theta)) - a
-    db = (a * math.sin(theta) + b * math.cos(theta)) - b
-    return tuple(p[i] + da * _ROT_U[i] + db * _ROT_V[i] for i in range(4))
+    c, s = math.cos(theta), math.sin(theta)
+    return (p[0], p[1], p[2] * c - p[3] * s, p[2] * s + p[3] * c)
 
 
 def _camera(p):

@@ -464,15 +464,16 @@ void loadSettings(Settings& s) {
                 }
             }
             // Brand-mark animation style: 0 = ui::TesseractAnim::EightCell (the default),
-            // 1 = DoubleRotation.
+            // 1 = DoubleRotation, 2 = Isoclinic.
             //
-            // MIGRATION. Configs written before the styles were reduced to two encode
-            // 0 = SimpleRotation, 1 = DoubleRotation, 2 = EightCell. SimpleRotation is gone and
-            // the surviving 8-cell IS that same bisecting-plane rotation, so both 0 and 2 land on
-            // the new 0. A bare range clamp would map the old 2 onto DoubleRotation instead —
-            // silently swapping the style of every user who had picked the 8-cell.
+            // MIGRATION. Configs from the brief pre-reduction era encode 0 = SimpleRotation,
+            // 1 = DoubleRotation, 2 = EightCell — both dead styles were the same bisecting-plane
+            // rotation the modern 0 descends from, and the two-style build already rewrote such
+            // configs to 0/1. A stale 2 that never got rewritten now lands on Isoclinic instead:
+            // a one-time cosmetic swap the picker undoes in one click, accepted to keep the
+            // encoding dense.
             const int ba = app.is_object() ? app.value("brand_anim", 0) : 0;
-            s.brandAnim = (ba == 1) ? 1 : 0;
+            s.brandAnim = (ba >= 0 && ba <= 2) ? ba : 0;
         }
         // T-G21: pinned-column vertical-collapse state.
         s.fmCollapsed = j.value("fm_collapsed", false);
@@ -667,27 +668,26 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["api_key"] = s.apiKey[0] ? s.apiKey : "lm-studio";
         j["openai"] = {{"base_url", s.baseUrl}, {"vision", s.vision}};
     } else if (s.provider == 5) {
-        // Cloud OpenAI-compatible API (DashScope / DeepSeek / OpenRouter / Moonshot).
-        // Moonshot is a first-class wire provider ("moonshot") with keys.moonshot; other cloud
-        // slots still resolve as provider "openai" + a cloud base_url so the offline (ITAR)
-        // guard refuses them while local stays allowed.
-        const bool isMoonshot =
-            std::string(s.baseUrl).find("moonshot.ai") != std::string::npos;
-        if (isMoonshot) {
-            j["provider"] = "moonshot";
-            j["model"] = s.model[0] ? s.model : "kimi-k3";
-            j["api_key"] = s.moonshotKey;
-            j["openai"] = {{"base_url", s.baseUrl[0] ? s.baseUrl
-                                                     : "https://api.moonshot.ai/v1"},
-                           {"vision", s.vision}};
-        } else {
-            j["provider"] = "openai";
-            j["model"] = s.model[0] ? s.model : "qwen-max";
-            j["api_key"] = s.cloudKey;
-            j["openai"] = {{"base_url", s.baseUrl[0] ? s.baseUrl
-                                                     : "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
-                           {"vision", s.vision}};
-        }
+        // Shared cloud slot, discriminated by base_url: ui::cloudServiceKey() names the service
+        // and ui::cloudServiceWireName() gives the provider name resolve_provider expects —
+        // native "moonshot" / generic "openai", or an OMP bridge id (openrouter, deepseek,
+        // alibaba-coding-plan, amazon-bedrock, azure, google-antigravity, aimlapi). Persisting
+        // the CLASSIFIED name keeps config.json agreeing with the per-send override
+        // agentProviderOverride pins, so an ambient re-resolution can't silently route the pick
+        // through a different transport. Every service here is a cloud endpoint, so the offline
+        // (ITAR) guard still refuses them while local stays allowed.
+        const char* svc = ui::cloudServiceKey(s.baseUrl);
+        const bool isMoonshot = std::strcmp(svc, "moonshot") == 0;
+        j["provider"] = ui::cloudServiceWireName(svc);
+        j["model"] = s.model[0] ? s.model : (isMoonshot ? "kimi-k3" : "qwen-max");
+        // Bridge-catalog services keep their credential in the bridge's own AuthStorage (Settings
+        // → Providers sign-in). Handing them the SHARED slot's unrelated key would win over that
+        // lookup in resolve_provider and break the sign-in, so omit api_key entirely for them.
+        if (ui::cloudServiceUsesLocalKey(svc))
+            j["api_key"] = isMoonshot ? s.moonshotKey : s.cloudKey;
+        j["openai"] = {{"base_url", s.baseUrl[0] ? s.baseUrl
+                                                 : "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
+                       {"vision", s.vision}};
     } else if (s.provider == 6) {
         // xAI Grok. Prefer API-key path when xaiKey is set; otherwise wire as xai-sub so the
         // agent uses the SuperGrok / X Premium+ OAuth credential from subscription_auth.

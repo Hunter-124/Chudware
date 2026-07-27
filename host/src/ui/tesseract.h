@@ -9,22 +9,23 @@
 // PURE DRAW: no ImGui item, no layout, no state. The caller owns the cursor, the hit box and the
 // tint; this only appends lines to `dl`. Cheap enough for a per-frame header mark (32 edges).
 //
-// Two animation styles are offered (user-selectable, Settings -> Appearance -> Brand mark). Both
-// use a perspective 4D -> 3D projection, so the mark always reads as the familiar nested
-// "cube inside a cube" turning itself inside out:
+// Three animation styles are offered (user-selectable, Settings -> Appearance -> Brand mark).
+// All use a perspective 4D -> 3D projection, so the mark always reads as the familiar nested
+// "cube inside a cube"; the styles differ in HOW it turns:
 //
-//   EightCell       An 8-cell in a SIMPLE 4D rotation: one invariant plane stays fixed and its
-//                   orthogonal complement turns. The fixed plane bisects the figure from
-//                   front-left to back-right and from top to bottom, i.e. span{ (1,0,1,0),
-//                   (0,1,0,0) }; the rotating plane is therefore span{ (1,0,-1,0), (0,0,0,1) }.
-//                   Modelled on the reference animation at
-//                   https://commons.wikimedia.org/wiki/File:8-cell-simple.gif — the camera and
-//                   the 4D eye distance below were fitted against its frames, not guessed.
+//   EightCell       A SIMPLE 4D rotation in the zw plane: the fourth axis folds through the
+//                   viewing direction, so the inner cell swells toward the camera, swallows the
+//                   outer one and the figure turns itself inside out — the canonical tesseract
+//                   motion, and the one the busy spinner always uses.
 //
 //   DoubleRotation  A DOUBLE rotation: two independent turns in two orthogonal 4D planes (xy and
 //                   zw) at incommensurate rates, so the two planes never realign, the motion has
 //                   no short loop, and — unlike a simple rotation — no direction of the figure
 //                   stays fixed through it.
+//
+//   Isoclinic       A double rotation whose two planes turn in LOCKSTEP (one shared phase).
+//                   Every vertex moves at the same speed along a circle — a Hopf fibre — so the
+//                   figure rolls smoothly and never turns inside out.
 // -------------------------------------------------------------------------------------------------
 
 #include "imgui.h"
@@ -34,7 +35,8 @@ namespace ui {
 enum class TesseractAnim : int {
     EightCell      = 0,
     DoubleRotation = 1,
-    Count          = 2,
+    Isoclinic      = 2,
+    Count          = 3,
 };
 
 // Short UI label for a style (Settings picker). Never null; unknown values clamp to the first.
@@ -42,9 +44,8 @@ const char* tesseractAnimName(TesseractAnim anim);
 // One-line description for the same picker (tooltip / caption under the preview).
 const char* tesseractAnimBlurb(TesseractAnim anim);
 
-// Clamp an arbitrary int (a persisted setting) onto a valid style. Callers loading a config
-// written before the styles were reduced to two must migrate the value FIRST — see
-// loadSettings(): a bare clamp would silently turn the old 8-cell into the double rotation.
+// Clamp an arbitrary int (a persisted setting) onto a valid style. Out-of-range values (older
+// config encodings) fall back to the default 8-cell.
 inline TesseractAnim tesseractAnimFromInt(int v) {
     if (v < 0 || v >= (int)TesseractAnim::Count) return TesseractAnim::EightCell;
     return (TesseractAnim)v;
@@ -64,8 +65,8 @@ void drawTesseract(ImDrawList* dl, ImVec2 center, float size, double timeSec,
 // shipping one there would be worse than the thing it replaced.
 inline constexpr float kTesseractSpinnerMinPx = 12.0f;
 
-// Busy / loading flavour of the same mark: a fixed style (always the simple rotation, for
-// legibility at indicator sizes), a livelier spin, and a reduced edge set below ~18 px. Use this
+// Busy / loading flavour of the same mark: a fixed style (always the 8-cell's inside-out, the
+// most legible motion at indicator sizes), a livelier spin, and a reduced edge set below ~18 px. Use this
 // wherever the product needs to say "working" so every such indicator is the brand mark in
 // motion rather than a generic arc. `size` is the ink box, as above; guard the call with
 // `size >= kTesseractSpinnerMinPx`.

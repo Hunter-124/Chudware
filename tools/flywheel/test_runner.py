@@ -66,7 +66,7 @@ def _init_git_repo(repo_dir: Path) -> None:
     """Initialise a minimal git repo suitable for claim_job tests."""
     subprocess.run(["git", "init"], cwd=str(repo_dir), capture_output=True, check=True)
     subprocess.run(
-        ["git", "config", "user.email", "test@ai-cad.local"],
+        ["git", "config", "user.email", "test@chudware.local"],
         cwd=str(repo_dir), capture_output=True, check=True,
     )
     subprocess.run(

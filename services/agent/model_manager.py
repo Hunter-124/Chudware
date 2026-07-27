@@ -153,7 +153,7 @@ class ModelProvisionError(RuntimeError):
 _HF_BASE = "https://huggingface.co/{repo}/resolve/main/{filename}"
 
 _USER_AGENT = (
-    "Mozilla/5.0 (compatible; ai-cad-model-manager/1.0; "
+    "Mozilla/5.0 (compatible; chudware-model-manager/1.0; "
     "+https://github.com/your-org/CAD)"
 )
 

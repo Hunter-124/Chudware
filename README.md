@@ -8,12 +8,14 @@ document model sits under every domain — and the same UI tree compiles to WASM
 app, so desktop and web stay at parity by construction.
 
 Naming: the product is **Chudware** (chudware.com). The GUI target is `Chudware`; the binary
-is `chudware`. `CHUDWARE_*` env vars are canonical; legacy `AI_CAD_*`/`AICAD_*`/`BILLET_*`/
-`SHOPCRAFT_*` are still honored (mapped to `CHUDWARE_*` at startup). The MCP server id is
-`chudware`. Persisted on-disk / wire formats are intentionally NOT renamed for data
-compatibility: the appdata dir reads an existing `Billet`/`AI-CAD` install wholesale (fresh
-installs use `Chudware/`, no migration); the PLM vault dir `.aicadvault`, mesh format
-`.aicm`, git refs `refs/aicad/*`, and `aicad.<x>/<n>` contract schema ids are preserved.
+is `chudware`. `CHUDWARE_*` env vars are the only honored prefix (the legacy
+`AI_CAD_*`/`AICAD_*`/`BILLET_*`/`SHOPCRAFT_*` mapping was removed). The MCP server id is
+`chudware`. Data dirs are unconditionally `Chudware/`: the appdata root and the
+`~/Documents/Chudware` workspace (sessions in `Sessions/`). A pre-rename `Billet`/`AI-CAD`
+install is copied forward once (copy-if-missing, skipping venvs/payloads; the old dir is
+never moved or deleted). Persisted wire formats are intentionally NOT renamed for data
+compatibility: the PLM vault dir `.aicadvault`, mesh format `.aicm`, git refs
+`refs/aicad/*`, and `aicad.<x>/<n>` contract schema ids are preserved.
 
 ## Features
 

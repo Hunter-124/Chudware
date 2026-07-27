@@ -23,7 +23,7 @@ CefMainArgs main_args(int argc, char** argv);
 std::string executable_dir();
 
 // Absolute path to the subprocess helper binary next to the app
-// (ai_cad_cef_helper[.exe]). Written into CefSettings.browser_subprocess_path.
+// (chudware_cef_helper[.exe]). Written into CefSettings.browser_subprocess_path.
 std::string helper_path();
 
 // Absolute, writable base dir for CEF's own cache/cookie tree, set as
@@ -38,9 +38,9 @@ std::string helper_path();
 // ("Opening in existing browser session") while the daemon held SingletonLock,
 // and a second CefInitialize from the vendor wizard then SIGTRAP'd in
 // SetSamplingProfiler (coredump 2026-07-10). Linux defaults:
-//   GUI:    …/ai-cad/cef_cache_gui
-//   daemon: …/ai-cad/cef_cache_daemon
-// Windows: %LOCALAPPDATA%\ai-cad\cef_cache_{gui,daemon}. Override both with
+//   GUI:    …/chudware/cef_cache_gui
+//   daemon: …/chudware/cef_cache_daemon
+// Windows: %LOCALAPPDATA%\chudware\cef_cache_{gui,daemon}. Override both with
 // CHUDWARE_CEF_CACHE_ROOT (tests / --cef-shot isolation).
 std::string cache_root();
 

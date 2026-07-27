@@ -148,8 +148,9 @@ public:
     }
 
     std::string defaultRoot() override {
-        // Mirrors defaultWorkspaceDir() in app_state.cpp (a legacy Documents/Billet or Documents/AI-CAD if present, else
-        // Documents/Chudware). Kept local so fs_backend has no app_state dependency.
+        // Mirrors defaultWorkspaceDir() in app_state.cpp: always Documents/Chudware
+        // (the one-time legacy Documents merge runs there at GUI startup). Kept local
+        // so fs_backend has no app_state dependency.
 #ifdef _WIN32
         const char* up = std::getenv("USERPROFILE");
         const fs::path base = up && *up ? fs::path(up) / "Documents" : fs::path(".");
@@ -157,9 +158,6 @@ public:
         const char* home = std::getenv("HOME");
         const fs::path base = home && *home ? fs::path(home) / "Documents" : fs::path(".");
 #endif
-        std::error_code ec;
-        for (const char* legacy : {"Billet", "AI-CAD"})
-            if (fs::exists(base / legacy, ec)) return (base / legacy).string();
         return (base / "Chudware").string();
     }
 

@@ -78,12 +78,56 @@ std::string appdataDir() {
     return ".";
 #endif
 }
-// Chudware deep-rename, alias/read-both rule (mirrors engine/paths.py active_root() and
-// core/agent/paths.cpp pick_app_dir() EXACTLY): once the Chudware dir holds a real install
-// marker (config.json) it wins; otherwise an existing legacy data dir is kept using wholesale
-// (it holds the live runtime venv/config — venvs do not survive relocation), preferring the
-// most recent legacy name (Billet) over the oldest (AI-CAD). Fresh installs get Chudware.
-// Never moves or deletes the old dir.
+// Chudware is now the UNCONDITIONAL data dir. Machines whose data still sits under a
+// pre-rename root ("Billet" / "AI-CAD") get it copied over once (copy-if-missing merge; the
+// old dir is never moved or deleted); if the copy can't complete we keep using the legacy
+// root for that boot so nothing breaks. Managed venvs and heavy payloads are skipped —
+// venvs do not survive relocation and payloads re-provision; absolute paths inside the old
+// tree (e.g. a llamacpp model_path) stay valid because the old tree is left in place.
+static bool chudwareCopyTreeIfMissing(const std::filesystem::path& src,
+                                      const std::filesystem::path& dst) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::is_regular_file(src, ec)) {
+        if (fs::exists(dst, ec)) return true;
+        fs::create_directories(dst.parent_path(), ec);
+        ec.clear();
+        fs::copy_file(src, dst, ec);
+        // A concurrent process winning the same copy is not a failure.
+        if (ec && fs::exists(dst, ec)) ec.clear();
+        return !ec;
+    }
+    fs::create_directories(dst, ec);
+    bool ok = !ec;
+    for (const auto& de : fs::directory_iterator(src, ec))
+        ok = chudwareCopyTreeIfMissing(de.path(), dst / de.path().filename()) && ok;
+    if (ec) ok = false;
+    return ok;
+}
+
+// One-time appdata migration: copy a legacy install (marker: config.json) into the
+// Chudware root, skipping venvs / re-provisionable payloads. Returns false (caller keeps
+// using the legacy root) if anything couldn't be copied.
+static bool chudwareMigrateLegacyAppdata(const std::filesystem::path& oldRoot,
+                                         const std::filesystem::path& newRoot) {
+    namespace fs = std::filesystem;
+    static const std::set<std::string> kSkip = {
+        "runtime",   "mcp-venv",  "torch-venv",  // venvs: absolute paths baked in
+        "models",    "llamacpp",                 // GBs of re-downloadable payloads
+        "cache",     "prof",                     // regenerable
+        "cef_cache", "cef_cache_daemon", "cef_cache_gui",
+    };
+    std::error_code ec;
+    fs::create_directories(newRoot, ec);
+    bool ok = !ec;
+    for (const auto& de : fs::directory_iterator(oldRoot, ec)) {
+        if (kSkip.count(de.path().filename().string())) continue;
+        ok = chudwareCopyTreeIfMissing(de.path(), newRoot / de.path().filename()) && ok;
+    }
+    if (ec) ok = false;
+    return ok;
+}
+
 std::string appdataAppDir() {
     static const std::string cached = [] {
         namespace fs = std::filesystem;
@@ -92,15 +136,19 @@ std::string appdataAppDir() {
         std::error_code ec;
         std::string chosen = neu.string();
         if (!fs::exists(neu / "config.json", ec)) {
-            // Prefer a legacy dir with a real install marker (config.json), newest name
-            // first, so a stray cache-only dir can't shadow a real install; else keep an
-            // existing legacy dir wholesale.
-            bool picked = false;
-            for (const char* legacy : {"Billet", "AI-CAD"})
-                if (fs::exists(base / legacy / "config.json", ec)) { chosen = (base / legacy).string(); picked = true; break; }
-            if (!picked)
-                for (const char* legacy : {"Billet", "AI-CAD"})
-                    if (fs::exists(base / legacy, ec)) { chosen = (base / legacy).string(); break; }
+            // Legacy install present? Copy it forward once (newest legacy name first);
+            // only a FAILED copy keeps the legacy root in use.
+            for (const char* legacy : {"Billet", "AI-CAD"}) {
+                const fs::path old = base / legacy;
+                if (!fs::exists(old / "config.json", ec)) continue;
+                if (chudwareMigrateLegacyAppdata(old, neu)) {
+                    std::fprintf(stderr, "[chudware] migrated data dir %s -> %s\n",
+                                 old.string().c_str(), neu.string().c_str());
+                } else {
+                    chosen = old.string();
+                }
+                break;
+            }
         }
         std::fprintf(stderr, "[chudware] data dir: %s\n", chosen.c_str());
         return chosen;
@@ -168,9 +216,65 @@ bool appstatePersistReady() { return true; }
 void appstatePersistSync() {}
 #endif
 
-// Default workspace dir under Documents — same alias rule: an existing Documents/Billet or Documents/AI-CAD
-// keeps being used wholesale; otherwise the default is Documents/Chudware (created on first use by
-// the File Explorer). Falls back to the appdata base when no home/Documents resolves.
+// Default workspace dir under Documents: always Documents/Chudware (created on first use by
+// the File Explorer). Pre-rename Documents/Billet or Documents/AI-CAD content is copied
+// forward once (copy-if-missing merge; the old dir is left untouched). Falls back to the
+// appdata base when no home/Documents resolves.
+static void chudwareMergeSessionIndex(const std::filesystem::path& srcDir,
+                                      const std::filesystem::path& dstDir) {
+    // Union-merge the v2 session envelope: keep the target's order, append ids only the
+    // legacy index lists, keep the target's active id (fall back to the legacy one). Orphan
+    // transcript files are invisible to the loader, so the index must name every copied id.
+    namespace fs = std::filesystem;
+    namespace json = nlohmann;
+    auto readIndex = [](const fs::path& p) {
+        json::json j = json::json::object();
+        std::ifstream in(p);
+        if (in) { try { in >> j; } catch (...) { j = json::json::object(); } }
+        return j;
+    };
+    const json::json dstIdx = readIndex(dstDir / "index.json");
+    const json::json srcIdx = readIndex(srcDir / "index.json");
+    if (!srcIdx.is_object() || !srcIdx.contains("order")) return;  // nothing to merge
+    std::set<std::string> seen;
+    json::json order = json::json::array();
+    auto pushId = [&](const std::string& id) {
+        if (!id.empty() && seen.insert(id).second) order.push_back(id);
+    };
+    if (dstIdx.is_object() && dstIdx.contains("order") && dstIdx["order"].is_array())
+        for (const auto& j : dstIdx["order"])
+            if (j.is_string()) pushId(j.get<std::string>());
+    if (srcIdx["order"].is_array())
+        for (const auto& j : srcIdx["order"])
+            if (j.is_string()) pushId(j.get<std::string>());
+    std::string active = dstIdx.value("active", std::string());
+    if (active.empty()) active = srcIdx.value("active", std::string());
+    const json::json merged = {{"version", 2}, {"active", active}, {"order", order}};
+    std::error_code ec;
+    fs::create_directories(dstDir, ec);
+    std::ofstream out(dstDir / "index.json", std::ios::trunc);
+    if (out) out << merged.dump(1);
+}
+
+static void chudwareMigrateLegacyWorkspace(const std::filesystem::path& base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    for (const char* legacy : {"Billet", "AI-CAD"}) {
+        const fs::path src = base / legacy;
+        if (!fs::exists(src, ec)) continue;
+        for (const auto& de : fs::directory_iterator(src, ec)) {
+            const fs::path to = base / "Chudware" / de.path().filename();
+            if (de.path().filename() == "Sessions" && de.is_directory(ec)) {
+                chudwareCopyTreeIfMissing(de.path(), to);
+                chudwareMergeSessionIndex(de.path(), to);
+            } else {
+                chudwareCopyTreeIfMissing(de.path(), to);
+            }
+        }
+        ec.clear();
+    }
+}
+
 std::string defaultWorkspaceDir() {
 #ifdef __EMSCRIPTEN__
     return "/workspace";
@@ -183,9 +287,11 @@ std::string defaultWorkspaceDir() {
     const char* home = std::getenv("HOME");
     const fs::path base = home && *home ? fs::path(home) / "Documents" : fs::path(appdataDir());
 #endif
-    std::error_code ec;
-    for (const char* legacy : {"Billet", "AI-CAD"})
-        if (fs::exists(base / legacy, ec)) return (base / legacy).string();
+    static const bool migrated = [&] {
+        chudwareMigrateLegacyWorkspace(base);
+        return true;
+    }();
+    (void)migrated;
     return (base / "Chudware").string();
 #endif
 }

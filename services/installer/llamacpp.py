@@ -256,7 +256,7 @@ def ensure_server_running(cfg: dict | None = None) -> dict:
     log = open(log_dir / "llamacpp-server.log", "ab")
     # Provenance line so the log always records which variant/offload was chosen.
     log.write(
-        (f"[ai-cad] launching llama-server variant={variant} "
+        (f"[chudware] launching llama-server variant={variant} "
          f"n_gpu_layers={gpu_layers} parallel={parallel} ctx_size={ctx_size} "
          f"server={server}\n").encode()
     )

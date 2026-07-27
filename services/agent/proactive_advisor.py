@@ -22,7 +22,7 @@ import re
 import time
 from typing import Any, Callable
 
-_log = logging.getLogger("ai-cad.proactive_advisor")
+_log = logging.getLogger("chudware.proactive_advisor")
 
 # Cooldown / caps (deliberately conservative — over-firing trains models to ignore us).
 _MIN_TOOL_GAP = 3

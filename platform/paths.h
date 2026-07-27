@@ -23,7 +23,7 @@ std::string tempDir();
 std::string imguiIniPath();
 std::string documentsDir();
 
-// Bundled runtime assets beside the exe (AI-CAD2: resources/; host: assets/).
+// Bundled runtime assets beside the exe (host GUI: assets/; the retired shell used resources/).
 std::string resourcesDir();
 std::string assetsDir();
 

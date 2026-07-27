@@ -7,24 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-def _apply_legacy_env_compat() -> None:
-    """Map legacy BILLET_WEB_*/AICAD_*/BILLET_*/SHOPCRAFT_* env vars onto their CHUDWARE_*
-    equivalents when the new name is unset. The gateway reads os.environ directly (it does
-    not import services.paths), so without this a pre-Chudware-rebrand gateway.env would
-    silently fall back to defaults (wrong data root, missing session image) with no error."""
-    prefixes = ("BILLET_WEB_", "AI_CAD_", "AICAD_", "BILLET_", "SHOPCRAFT_")
-    replacements = {"BILLET_WEB_": "CHUDWARE_WEB_"}
-    for key in list(os.environ.keys()):
-        for pfx in prefixes:
-            if key.startswith(pfx) and len(key) > len(pfx):
-                new_pfx = replacements.get(pfx, "CHUDWARE_")
-                os.environ.setdefault(new_pfx + key[len(pfx):], os.environ[key])
-                break
-
-
-_apply_legacy_env_compat()
-
-
 def _env(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name, default)
 

@@ -104,7 +104,7 @@ def init_training_repo(
     if not git_dir.exists():
         _git("init", cwd=repo_path)
         # Set a baseline identity so DVC commits work in CI
-        _git("config", "user.email", "flywheel@ai-cad.local", cwd=repo_path)
+        _git("config", "user.email", "flywheel@chudware.local", cwd=repo_path)
         _git("config", "user.name", "Flywheel", cwd=repo_path)
 
     # DVC init (idempotent)

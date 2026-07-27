@@ -225,8 +225,8 @@ def test_knowledge_root_env_override():
 
     saved = os.environ.get("CHUDWARE_KNOWLEDGE_DIR")
     try:
-        os.environ["CHUDWARE_KNOWLEDGE_DIR"] = "/tmp/ai-cad-knowledge-test"
-        assert str(cache_mod.knowledge_root()) == "/tmp/ai-cad-knowledge-test"
+        os.environ["CHUDWARE_KNOWLEDGE_DIR"] = "/tmp/chudware-knowledge-test"
+        assert str(cache_mod.knowledge_root()) == "/tmp/chudware-knowledge-test"
     finally:
         if saved is None:
             os.environ.pop("CHUDWARE_KNOWLEDGE_DIR", None)

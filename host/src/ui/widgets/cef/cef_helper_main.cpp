@@ -1,4 +1,4 @@
-// cef/cef_helper_main.cpp — the CEF subprocess helper (ai_cad_cef_helper).
+// cef/cef_helper_main.cpp — the CEF subprocess helper (chudware_cef_helper).
 //
 // SCAFFOLDING (docs/cef_webview.md phase 2); built only with CHUDWARE_ENABLE_CEF.
 //

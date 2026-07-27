@@ -14,12 +14,14 @@ drawings, sheet metal, CAM, ECAD/firmware, FEA/CFD, sourcing/BOM — one documen
 model under all of it.
 
 Naming (compat rules live in README.md): the product is **Chudware** (chudware.com). The
-GUI target is `Chudware` and the binary is `chudware`. `CHUDWARE_*` env vars are canonical;
-legacy `AI_CAD_*`/`AICAD_*`/`BILLET_*`/`SHOPCRAFT_*` are still honored (mapped at startup).
-The MCP server id is `chudware`. Back-compat that is NOT renamed (persisted on-disk / wire
-formats): the appdata dir reads a legacy `Billet`/`AI-CAD` install wholesale (new installs
-use `Chudware/`, no migration); PLM vault dir `.aicadvault`, mesh format `.aicm`, git refs
-`refs/aicad/*`, and `aicad.<x>/<n>` contract schema ids are kept for data compatibility.
+GUI target is `Chudware` and the binary is `chudware`. `CHUDWARE_*` env vars are the only
+honored prefix (the legacy `AI_CAD_*`/`AICAD_*`/`BILLET_*`/`SHOPCRAFT_*` mapping was
+removed). The MCP server id is `chudware`. Data dirs are unconditionally `Chudware/`
+(appdata root + `~/Documents/Chudware` workspace, sessions in `Sessions/`); a pre-rename
+`Billet`/`AI-CAD` install is copied forward once (copy-if-missing; old dirs never moved
+or deleted). Back-compat that is NOT renamed (persisted on-disk / wire formats): PLM
+vault dir `.aicadvault`, mesh format `.aicm`, git refs `refs/aicad/*`, and
+`aicad.<x>/<n>` contract schema ids are kept for data compatibility.
 
 Architecture in one paragraph: the pure C++/CUDA kernel `libchudware` (under
 `core/`) IS the engine — the legacy Python engine (`engine_oracle/` + the root

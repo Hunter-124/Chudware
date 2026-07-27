@@ -25,7 +25,7 @@ tmp="$out.partial"
 TAR=(tar -czf "$tmp"
     --exclude='homes/*/.cache'
     --exclude='homes/*/.local/share/Trash'
-    --exclude='homes/*/.local/share/ai-cad/cef_cache*'
+    --exclude='homes/*/.local/share/chudware/cef_cache*'
     --exclude='tmp'
     --exclude='logs'
     -C "$(dirname "$DATA_ROOT")" "$(basename "$DATA_ROOT")")

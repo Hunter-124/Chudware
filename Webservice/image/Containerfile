@@ -108,7 +108,7 @@ COPY entrypoint.sh /usr/local/bin/chudware-entrypoint.sh
 RUN chmod 755 /usr/local/bin/chudware-entrypoint.sh \
     && chmod 755 /opt/chudware/bin/chudware \
     && ( [ -x /opt/chudware/bin/chudware-hostd ] && chmod 755 /opt/chudware/bin/chudware-hostd || true ) \
-    && ( [ -x /opt/chudware/bin/ai_cad_cef_helper ] && chmod 755 /opt/chudware/bin/ai_cad_cef_helper || true ) \
+    && ( [ -x /opt/chudware/bin/chudware_cef_helper ] && chmod 755 /opt/chudware/bin/chudware_cef_helper || true ) \
     && test -f /opt/chudware/app/requirements.txt \
     && test -d /opt/chudware/app/engine \
     && test -d /opt/chudware/app/agent/prompts \

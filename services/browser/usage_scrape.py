@@ -71,10 +71,10 @@ def daemon_cache_root() -> Path:
         return Path(ov)
     if xdg := os.environ.get("XDG_DATA_HOME"):
         if xdg.strip():
-            return Path(xdg) / "ai-cad" / "cef_cache_daemon"
+            return Path(xdg) / "chudware" / "cef_cache_daemon"
     home = os.environ.get("HOME") or ""
     if home:
-        return Path(home) / ".local" / "share" / "ai-cad" / "cef_cache_daemon"
+        return Path(home) / ".local" / "share" / "chudware" / "cef_cache_daemon"
     return Path.cwd() / "cef_cache_daemon"
 
 

@@ -20,7 +20,7 @@ try:  # services.paths gives the app's %APPDATA%/Chudware root; degrade for a ba
 
     _APP_ROOT = _paths.ROOT
 except Exception:  # noqa: BLE001
-    _APP_ROOT = Path(os.path.expanduser("~/.ai-cad"))
+    _APP_ROOT = Path(os.path.expanduser("~/.chudware"))
 
 _ARTIFACTS = "artifacts"
 _PREVIEWS = ".previews"

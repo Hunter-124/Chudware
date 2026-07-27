@@ -1,7 +1,8 @@
-// core/agent/paths.cpp — see paths.h. Mirrors engine/paths.py exactly.
+// core/agent/paths.cpp — see paths.h. Mirrors services/paths.py exactly.
 #include "agent/paths.h"
 
 #include <cstdlib>
+#include <set>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -29,22 +30,51 @@ fs::path expand_home_roaming() {
 }  // namespace
 
 namespace {
-// Alias rule (mirrors engine/paths.py active_root() and app_state.cpp appdataAppDir()):
-// once Chudware holds a real install marker (config.json) it wins; otherwise an existing
-// legacy install dir is kept using wholesale (it holds the live venv/config — venvs do not
-// survive relocation), preferring the most recent legacy name (Billet) over the oldest
-// (AI-CAD). Fresh machines get Chudware. No destructive migration; the old dir is never moved.
+// Copy-if-missing tree merge used by the one-time legacy migration below. Best-effort:
+// returns false if anything couldn't be copied (caller then keeps the legacy root for
+// this boot rather than stranding data).
+bool copy_tree_if_missing(const fs::path& src, const fs::path& dst) {
+    std::error_code ec;
+    if (fs::is_regular_file(src, ec)) {
+        if (fs::exists(dst, ec)) return true;
+        fs::create_directories(dst.parent_path(), ec);
+        ec.clear();
+        fs::copy_file(src, dst, ec);
+        if (ec && fs::exists(dst, ec)) ec.clear();  // benign race with a concurrent copy
+        return !ec;
+    }
+    fs::create_directories(dst, ec);
+    bool ok = !ec;
+    for (const auto& de : fs::directory_iterator(src, ec))
+        ok = copy_tree_if_missing(de.path(), dst / de.path().filename()) && ok;
+    if (ec) ok = false;
+    return ok;
+}
+
+// Chudware is the unconditional data dir (mirrors app_state.cpp appdataAppDir() and
+// services/paths.py active_root()).
 fs::path pick_app_dir(const fs::path& base) {
     const fs::path neu = base / "Chudware";
     std::error_code ec;
     if (fs::exists(neu / "config.json", ec)) return neu;
-    // Prefer a legacy dir that holds a real install marker (config.json), newest name
-    // first — a stray cache-only dir must never shadow a real install.
-    for (const char* legacy : {"Billet", "AI-CAD"})
-        if (fs::exists(base / legacy / "config.json", ec)) return base / legacy;
-    // No marker anywhere: keep an existing legacy dir wholesale if present.
-    for (const char* legacy : {"Billet", "AI-CAD"})
-        if (fs::exists(base / legacy, ec)) return base / legacy;
+    // Pre-rename install present (marker: config.json)? Copy it forward once —
+    // copy-if-missing, skipping venvs / re-provisionable payloads; the old dir is
+    // never moved or deleted. Only a FAILED copy keeps the legacy root in use.
+    static const std::set<std::string> kSkip = {
+        "runtime", "mcp-venv", "torch-venv", "models", "llamacpp", "cache", "prof",
+        "cef_cache", "cef_cache_daemon", "cef_cache_gui",
+    };
+    for (const char* legacy : {"Billet", "AI-CAD"}) {
+        const fs::path old = base / legacy;
+        if (!fs::exists(old / "config.json", ec)) continue;
+        bool ok = true;
+        for (const auto& de : fs::directory_iterator(old, ec)) {
+            if (kSkip.count(de.path().filename().string())) continue;
+            ok = copy_tree_if_missing(de.path(), neu / de.path().filename()) && ok;
+        }
+        if (ec) ok = false;
+        return ok ? neu : old;
+    }
     return neu;
 }
 }  // namespace

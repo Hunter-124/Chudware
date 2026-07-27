@@ -27,7 +27,7 @@ import sys
 import traceback
 from typing import Callable
 
-log = logging.getLogger("ai-cad.worker")
+log = logging.getLogger("chudware.worker")
 EmitFn = Callable[[dict], None]
 
 from services import paths  # type: ignore  # re-homed from engine_oracle/paths.py

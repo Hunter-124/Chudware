@@ -96,5 +96,5 @@ try:
     WORKER_METHODS.update(_EMBED_METHODS)
 except Exception as _embed_err:  # noqa: BLE001 — embed seam is optional; methods above still register
     import logging
-    logging.getLogger("ai-cad.worker").warning(
+    logging.getLogger("chudware.worker").warning(
         "embed_rpc unavailable — embed methods not registered: %s", _embed_err)

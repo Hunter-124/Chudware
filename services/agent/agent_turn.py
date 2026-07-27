@@ -36,7 +36,7 @@ import traceback
 import uuid
 from typing import Any, Callable
 
-_log_mod = logging.getLogger("ai-cad.agent_turn")
+_log_mod = logging.getLogger("chudware.agent_turn")
 
 # stop_reason values node_runner._map_verdict understands.
 _DONE = "confirmed"
@@ -506,11 +506,11 @@ def _with_usage(result: dict, tu_mod: Any = None) -> dict:
     return result
 
 _SYSTEM_BASE = (
-    "You are an Chudware role agent executing one node of a mission. You may call "
+    "You are a Chudware agent executing a task. You may call "
     "tools to inspect and modify the engine. To call a tool, reply with a single "
     "fenced json block:\n"
     "```json\n{\"tool\": \"<tool_name>\", \"args\": {<kwargs>}}\n```\n"
-    "After you see the tool result, either call another tool or, when the node's "
+    "After you see the tool result, either call another tool or, when the task's "
     "goal is met, finish with ONE of these fenced JSON forms (both accepted):\n"
     "```json\n{\"done\": true, \"handoff\": {<structured summary>}}\n```\n"
     "or the role handoff envelope (preferred when your role card defines one):\n"
@@ -2857,21 +2857,25 @@ def _ask_user_sync(questions: Any = None, question: Any = None,
                    scope: str = "run", run_id: str | None = None,
                    doc_id: str | None = None, revision: int | None = None,
                    **_ignored: Any) -> dict:
-    """Synchronous ``ask_user`` for a turn that has no mission dispatcher.
+    """Ask the human a typed batch of questions and return machine-readable answers.
 
-    The MCP ``ask_user`` is ``async def`` and takes a FastMCP ``Context`` (it
-    raises a client elicitation), so ``_directly_callable`` correctly refuses to
-    bind it — but the tool is advertised in role cards everywhere, which made it
-    fail on EVERY call outside a mission.  That is the "advertised but
-    impossible" defect class, and it does not need a new capability to fix: the
-    interaction CORE (``services.agent.interaction.ask_user``) is synchronous and
-    already defines the honest no-human path (contract §4) — record each
-    question, answer it with its ``suggested`` default, stamp
-    ``source: "default"``.  ``MissionDispatch.ask_user`` does exactly this with a
-    mission ledger; binding the same core here makes the tool behave identically
-    with and without one.
+    Batch every unknown into ONE call (at most 4 questions), each with a
+    ``suggested`` default.  With no human on the line (headless turn) each
+    question is answered with its suggested default, stamped
+    ``source: "default"`` (contract §4) — the call never wedges and never
+    fabricates a human answer.
 
-    It never fabricates a human answer.  ``blocking`` is forced off because this
+    Binding note (why this exists): the MCP ``ask_user`` is ``async def`` and
+    takes a FastMCP ``Context`` (it raises a client elicitation), so
+    ``_directly_callable`` correctly refuses to bind it — but the tool is
+    advertised in role cards everywhere, which made it fail on EVERY call
+    outside a mission.  That is the "advertised but impossible" defect class,
+    and it does not need a new capability to fix: the interaction CORE
+    (``services.agent.interaction.ask_user``) is synchronous and already
+    defines the honest no-human path — record each question, answer it with
+    its ``suggested`` default.  ``MissionDispatch.ask_user`` does exactly this
+    with a mission ledger; binding the same core here makes the tool behave
+    identically with and without one.  ``blocking`` is forced off because this
     turn has no transport to prompt through — a blocking batch would raise.
     """
     from services.agent.interaction import MemoryLedger, ask_user  # noqa: PLC0415

@@ -174,39 +174,6 @@ void installCrashHandler() {}
 
 
 
-// ---- Chudware env-var shim -------------------------------------------------------------------
-// CHUDWARE_* is the canonical public env-var prefix (deep-rename); CHUDWARE_* / CHUDWARE_* remain the
-// internal transport read throughout the codebase. For every CHUDWARE_X present in the
-// environment, set CHUDWARE_X and CHUDWARE_X when not already set, so a user exporting only the new
-// names reaches every legacy read site. Never overwrites an explicitly-set legacy var.
-void propagateChudwareEnv() {
-#ifdef _WIN32
-    char** envp = _environ;
-#else
-    char** envp = environ;
-#endif
-    if (!envp) return;
-    constexpr const char* kPrefix = "CHUDWARE_";
-    constexpr size_t kPrefixLen = 7;
-    for (char** e = envp; *e; ++e) {
-        const char* kv = *e;
-        if (std::strncmp(kv, kPrefix, kPrefixLen) != 0) continue;
-        const char* eq = std::strchr(kv, '=');
-        if (!eq) continue;
-        const std::string suffix(kv + kPrefixLen, static_cast<size_t>(eq - (kv + kPrefixLen)));
-        if (suffix.empty()) continue;
-        const std::string value(eq + 1);
-        for (const std::string& legacy : {"CHUDWARE_" + suffix, "CHUDWARE_" + suffix}) {
-            if (!std::getenv(legacy.c_str())) {
-#ifdef _WIN32
-                _putenv_s(legacy.c_str(), value.c_str());
-#else
-                setenv(legacy.c_str(), value.c_str(), 0);
-#endif
-            }
-        }
-    }
-}
 
 GLFWwindow* makeContext(int w, int h, bool visible) {
     if (!glfwInit()) {
@@ -349,40 +316,6 @@ int buildAndRender(const std::string& src, const std::string& out) {
     }
     w.stop();
     return renderContact(stl, out);
-}
-
-// Map legacy AI_CAD_/AICAD_/BILLET_/SHOPCRAFT_ environment variables onto their CHUDWARE_
-// equivalents when the new name is unset, so pre-rename scripts and environments keep
-// working after the Chudware rename. Runs before anything reads config/env.
-static void applyLegacyEnvCompat() {
-#if defined(_WIN32)
-    char** envp = _environ;
-#else
-    char** envp = environ;  // extern "C" declared at file scope above (line 167)
-#endif
-    if (!envp) return;
-    static const char* kPrefixes[] = {"AI_CAD_", "AICAD_", "BILLET_", "SHOPCRAFT_"};
-    std::vector<std::string> entries;
-    for (char** e = envp; *e; ++e) entries.emplace_back(*e);  // snapshot: setenv may realloc environ
-    for (const std::string& kv : entries) {
-        const std::size_t eq = kv.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string key = kv.substr(0, eq);
-        for (const char* pfx : kPrefixes) {
-            const std::size_t plen = std::strlen(pfx);
-            if (key.size() > plen && key.compare(0, plen, pfx) == 0) {
-                const std::string neu = "CHUDWARE_" + key.substr(plen);
-                if (!std::getenv(neu.c_str())) {
-#if defined(_WIN32)
-                    _putenv_s(neu.c_str(), kv.substr(eq + 1).c_str());
-#else
-                    setenv(neu.c_str(), kv.substr(eq + 1).c_str(), 0);
-#endif
-                }
-                break;
-            }
-        }
-    }
 }
 
 // ---- single-instance guard (desktop GUI) -----------------------------------------------------
@@ -579,7 +512,6 @@ std::string guiTakeActivationDoc() {
 #endif  // !__EMSCRIPTEN__
 
 int main(int argc, char** argv) {
-    applyLegacyEnvCompat();  // legacy env-var back-compat (pre-Chudware rename)
 #ifdef __EMSCRIPTEN__
     // Web client: skip desktop CLI modes entirely. Report progress via Module.setStatus
     // (shell.html) which is reliable from the browser main thread.
@@ -596,7 +528,6 @@ int main(int argc, char** argv) {
     // Mount IDBFS at /persist and populate from IndexedDB BEFORE any appdata
     // read (loadSettings / chat_history). Blocks via ASYNCIFY until ready.
     appstateInitPersist();
-    propagateChudwareEnv();
     ensurePromptsDir();
     EM_ASM({
         try {
@@ -616,11 +547,8 @@ int main(int argc, char** argv) {
     }, rc);
     return rc;
 #else
-    // FIRST: mirror CHUDWARE_* env vars onto the legacy CHUDWARE_*/CHUDWARE_* names every
-    // subsystem (and every child process we spawn) actually reads.
-    propagateChudwareEnv();
 #ifdef CHUDWARE_ENABLE_CEF
-    // A separate subprocess executable (ai_cad_cef_helper) is configured via
+    // A separate subprocess executable (chudware_cef_helper) is configured via
     // CefSettings.browser_subprocess_path, so this main binary is ALWAYS the
     // browser process and must NOT call CefExecuteProcess. Initialise CEF HERE,
     // before GLFW/X11 grab the display and signal handlers — CefInitialize wants

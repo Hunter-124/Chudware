@@ -108,7 +108,7 @@ fi
 cp -a "$CEF_STRIPPED" "$STAGE/bin/libcef.so"
 
 for f in \
-    ai_cad_cef_helper chrome-sandbox icudtl.dat v8_context_snapshot.bin \
+    chudware_cef_helper chrome-sandbox icudtl.dat v8_context_snapshot.bin \
     chrome_100_percent.pak chrome_200_percent.pak resources.pak \
     libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 \
     vk_swiftshader_icd.json
@@ -130,7 +130,7 @@ if [ -d "$CEF_SRC/locales" ]; then
     fi
     echo "    locales/ (en subset or full)"
 fi
-chmod +x "$STAGE/bin/ai_cad_cef_helper" 2>/dev/null || true
+chmod +x "$STAGE/bin/chudware_cef_helper" 2>/dev/null || true
 chmod 4755 "$STAGE/bin/chrome-sandbox" 2>/dev/null || true
 
 # ---- Python app tree (AI agent worker runtime) ------------------------------

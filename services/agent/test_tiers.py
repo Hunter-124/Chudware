@@ -346,7 +346,7 @@ class TestProviderForTier:
         assert cfg["llamacpp"]["model"] == "qwen3-4b"
         assert cfg["llamacpp"]["model_path"] == "/models/qwen3-4b.gguf"
 
-    def test_ai_cad_provider_env_override_wins_even_for_local_tier(self, monkeypatch):
+    def test_chudware_provider_env_override_wins_even_for_local_tier(self, monkeypatch):
         """A human forcing CHUDWARE_PROVIDER (e.g. to point a 'local' tier cell at a
         frontier key for comparison, or a test pinning 'mock') always wins over
         the local-tier bundled-model resolution."""
@@ -447,6 +447,24 @@ class TestTrimToolSchema:
 
     def test_non_dict_unchanged(self):
         assert trim_tool_schema("not a dict") == "not a dict"  # type: ignore[arg-type]
+
+    def test_abbreviation_not_a_sentence_boundary(self):
+        schema = {"description": "Find paths matching a glob (e.g. corpus/**). More detail."}
+        result = trim_tool_schema(schema)
+        assert result["description"] == "Find paths matching a glob (e.g. corpus/**)."
+
+    def test_i_e_abbreviation_not_a_boundary(self):
+        schema = {"description": "Read helpers (i.e. fs_read) first. Then act."}
+        result = trim_tool_schema(schema)
+        assert result["description"] == "Read helpers (i.e. fs_read) first."
+
+    def test_version_number_not_a_boundary(self):
+        schema = {"description": "Requires v1.2 features only"}
+        assert trim_tool_schema(schema)["description"] == "Requires v1.2 features only"
+
+    def test_decimal_not_a_boundary(self):
+        schema = {"description": "Tolerance 0.5 mm nominal"}
+        assert trim_tool_schema(schema)["description"] == "Tolerance 0.5 mm nominal"
 
 
 # ---------------------------------------------------------------------------

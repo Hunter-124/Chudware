@@ -1649,7 +1649,7 @@ void seedFirmwareShotFixture() {
     };
 
     s.simDone = true; s.simPassed = true; s.simMs = 2210.0;
-    s.uartLog = "boot: blinky v0.1\nhello from PA5 blink loop\nAICAD_GPIO_EVT PA5=1 t=100ms\n"
+    s.uartLog = "boot: blinky v0.1\nhello from PA5 blink loop\nCHUDWARE_GPIO_EVT PA5=1 t=100ms\n"
                 "CHUDWARE_GPIO_EVT PA5=0 t=200ms\nloop tick 1\nloop tick 2\n";
     s.assertionLines = {"PASS  uart:hello", "PASS  gpio:PA5=1@>50ms"};
     s.tracePath = "/tmp/chudware-firmware/fw_canned/build/blinky.elf.trace.json";

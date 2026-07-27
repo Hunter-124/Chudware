@@ -81,7 +81,7 @@ if [ -f "$CEF_SRC/libcef.so" ]; then
         strip --strip-debug -o "$CEF_STRIPPED" "$CEF_SRC/libcef.so"
     fi
     cp "$CEF_STRIPPED" "$APPDIR/usr/bin/libcef.so"
-    for f in ai_cad_cef_helper chrome-sandbox icudtl.dat v8_context_snapshot.bin \
+    for f in chudware_cef_helper chrome-sandbox icudtl.dat v8_context_snapshot.bin \
              chrome_100_percent.pak chrome_200_percent.pak resources.pak \
              libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 \
              vk_swiftshader_icd.json; do

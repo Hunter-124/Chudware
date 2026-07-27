@@ -8,7 +8,9 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -48,30 +50,61 @@ bool dirExists(const std::string &p) {
 // of this rule and the Python worker resolves the same root independently.
 const char *const kLegacyAppNames[] = {"Billet", "AI-CAD"};
 
+// Copy-if-missing tree merge for the one-time legacy migration. Best-effort:
+// false when anything couldn't be copied (caller keeps the legacy root this boot).
+bool copyTreeIfMissing(const std::filesystem::path &src,
+                       const std::filesystem::path &dst) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (fs::is_regular_file(src, ec)) {
+    if (fs::exists(dst, ec))
+      return true;
+    fs::create_directories(dst.parent_path(), ec);
+    ec.clear();
+    fs::copy_file(src, dst, ec);
+    if (ec && fs::exists(dst, ec))
+      ec.clear(); // benign race with a concurrent copy
+    return !ec;
+  }
+  fs::create_directories(dst, ec);
+  bool ok = !ec;
+  for (const auto &de : fs::directory_iterator(src, ec))
+    ok = copyTreeIfMissing(de.path(), dst / de.path().filename()) && ok;
+  if (ec)
+    ok = false;
+  return ok;
+}
+
 std::string appdataRoot() {
-  // Chudware alias rule, mirroring services/paths.py active_root(): read-both,
-  // NEVER migrate. A machine whose live data still sits under a pre-rename root
-  // keeps using that root for both reads and writes — the managed runtime venv
-  // lives inside it and does not survive relocation, and a split root (reads old,
-  // writes new) loses the user's config and chat history. Fresh installs get
-  // Chudware. Nothing here creates a legacy root: it is only ever returned when it
-  // already exists on disk.
+  // Chudware is the unconditional data root, mirroring services/paths.py
+  // active_root(): a pre-rename install (marker: config.json) is copied forward
+  // ONCE — copy-if-missing, skipping venvs / re-provisionable payloads; the old
+  // dir is never moved or deleted. Only a failed copy keeps the legacy root in
+  // use. Fresh installs get Chudware.
   const std::string base = env_or("APPDATA", "");
   const std::string neu = base + "\\Chudware";
   if (fileExists(neu + "\\config.json"))
     return neu;
-  // A legacy root with a REAL install marker wins; a stray empty or cache-only
-  // legacy dir must not flip the root away from live data.
+  namespace fs = std::filesystem;
+  static const std::set<std::string> kSkip = {
+      "runtime",   "mcp-venv", "torch-venv",     "models",   "llamacpp",
+      "cache",     "prof",     "cef_cache",      "cef_cache_daemon",
+      "cef_cache_gui",
+  };
   for (const char *name : kLegacyAppNames) {
-    const std::string old = base + "\\" + name;
-    if (fileExists(old + "\\config.json"))
-      return old;
-  }
-  // No marker anywhere: keep an existing legacy dir wholesale if present.
-  for (const char *name : kLegacyAppNames) {
-    const std::string old = base + "\\" + name;
-    if (dirExists(old))
-      return old;
+    const fs::path old = fs::path(base) / name;
+    std::error_code ec;
+    if (!fs::exists(old / "config.json", ec))
+      continue;
+    bool ok = true;
+    for (const auto &de : fs::directory_iterator(old, ec)) {
+      if (kSkip.count(de.path().filename().string()))
+        continue;
+      ok = copyTreeIfMissing(de.path(), fs::path(neu) / de.path().filename()) && ok;
+    }
+    if (ec)
+      ok = false;
+    return ok ? neu : old.string();
   }
   return neu;
 }
@@ -379,6 +412,7 @@ bool repairRuntime(std::string &log) { return provisionRuntime(true, log); }
 
 #include <cstdlib>
 #include <filesystem>
+#include <set>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -410,13 +444,35 @@ std::string shq(const std::string &s) {
 // of this rule and the Python worker resolves the same root independently.
 const char *const kLegacyAppNames[] = {"Billet", "AI-CAD"};
 
+// Copy-if-missing tree merge for the one-time legacy migration. Best-effort:
+// false when anything couldn't be copied (caller keeps the legacy root this boot).
+bool copyTreeIfMissing(const fs::path &src, const fs::path &dst) {
+  std::error_code ec;
+  if (fs::is_regular_file(src, ec)) {
+    if (fs::exists(dst, ec))
+      return true;
+    fs::create_directories(dst.parent_path(), ec);
+    ec.clear();
+    fs::copy_file(src, dst, ec);
+    if (ec && fs::exists(dst, ec))
+      ec.clear(); // benign race with a concurrent copy
+    return !ec;
+  }
+  fs::create_directories(dst, ec);
+  bool ok = !ec;
+  for (const auto &de : fs::directory_iterator(src, ec))
+    ok = copyTreeIfMissing(de.path(), dst / de.path().filename()) && ok;
+  if (ec)
+    ok = false;
+  return ok;
+}
+
 // XDG data root for the managed runtime/cache (mirrors %APPDATA% on Windows).
-// Chudware alias rule, mirroring services/paths.py active_root(): read-both, NEVER
-// migrate. A machine whose live data still sits under a pre-rename root keeps using
-// that root for both reads and writes — the managed runtime venv lives inside it and
-// does not survive relocation, and a split root (reads old, writes new) loses the
-// user's config and chat history. Fresh installs get Chudware. Nothing here creates
-// a legacy root: it is only ever returned when it already exists on disk.
+// Chudware is the unconditional data root, mirroring services/paths.py
+// active_root(): a pre-rename install (marker: config.json) is copied forward
+// ONCE — copy-if-missing, skipping venvs / re-provisionable payloads; the old dir
+// is never moved or deleted. Only a failed copy keeps the legacy root in use.
+// Fresh installs get Chudware.
 std::string appdataRoot() {
   fs::path base;
   std::string xdg = env_or("XDG_DATA_HOME", "");
@@ -431,15 +487,25 @@ std::string appdataRoot() {
   std::error_code ec;
   if (fs::exists(neu / "config.json", ec))
     return neu.string();
-  // A legacy root with a REAL install marker wins; a stray empty or cache-only
-  // legacy dir must not flip the root away from live data.
-  for (const char *name : kLegacyAppNames)
-    if (fs::exists(base / name / "config.json", ec))
-      return (base / name).string();
-  // No marker anywhere: keep an existing legacy dir wholesale if present.
-  for (const char *name : kLegacyAppNames)
-    if (fs::is_directory(base / name, ec))
-      return (base / name).string();
+  static const std::set<std::string> kSkip = {
+      "runtime",   "mcp-venv", "torch-venv",     "models",   "llamacpp",
+      "cache",     "prof",     "cef_cache",      "cef_cache_daemon",
+      "cef_cache_gui",
+  };
+  for (const char *name : kLegacyAppNames) {
+    const fs::path old = base / name;
+    if (!fs::exists(old / "config.json", ec))
+      continue;
+    bool ok = true;
+    for (const auto &de : fs::directory_iterator(old, ec)) {
+      if (kSkip.count(de.path().filename().string()))
+        continue;
+      ok = copyTreeIfMissing(de.path(), neu / de.path().filename()) && ok;
+    }
+    if (ec)
+      ok = false;
+    return ok ? neu.string() : old.string();
+  }
   return neu.string();
 }
 std::string runCapture(const std::string &cmd) {

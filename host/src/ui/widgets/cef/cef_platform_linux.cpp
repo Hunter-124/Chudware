@@ -25,7 +25,7 @@ std::string executable_dir() {
 }
 
 std::string helper_path() {
-    return executable_dir() + "/ai_cad_cef_helper";
+    return executable_dir() + "/chudware_cef_helper";
 }
 
 namespace {
@@ -43,9 +43,9 @@ std::string cache_root() {
     // GUI vs daemon: separate ProcessSingleton roots (see cef_platform.h).
     const char* leaf = g_daemon_process ? "cef_cache_daemon" : "cef_cache_gui";
     if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0])
-        return std::string(xdg) + "/ai-cad/" + leaf;
+        return std::string(xdg) + "/chudware/" + leaf;
     if (const char* home = std::getenv("HOME"); home && home[0])
-        return std::string(home) + "/.local/share/ai-cad/" + leaf;
+        return std::string(home) + "/.local/share/chudware/" + leaf;
     return executable_dir() + "/" + leaf;   // last-resort fallback
 }
 

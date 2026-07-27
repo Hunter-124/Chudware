@@ -25,7 +25,7 @@ std::string executable_dir() {
 }
 
 std::string helper_path() {
-    return executable_dir() + "\\ai_cad_cef_helper.exe";
+    return executable_dir() + "\\chudware_cef_helper.exe";
 }
 
 namespace {
@@ -40,9 +40,9 @@ std::string cache_root() {
     const char* leaf = g_daemon_process ? "cef_cache_daemon" : "cef_cache_gui";
     char buf[MAX_PATH];
     if (SUCCEEDED(::SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf)))
-        return std::string(buf) + "\\ai-cad\\" + leaf;
+        return std::string(buf) + "\\chudware\\" + leaf;
     if (const char* la = std::getenv("LOCALAPPDATA"); la && la[0])
-        return std::string(la) + "\\ai-cad\\" + leaf;
+        return std::string(la) + "\\chudware\\" + leaf;
     return executable_dir() + "\\" + leaf;   // last-resort fallback
 }
 

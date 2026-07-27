@@ -931,7 +931,7 @@ def _install_clean_stdout():
         from io import FileIO, TextIOWrapper
 
         real_fd = os.dup(1)  # the genuine JSON-RPC pipe to the MCP client
-        log_path = os.path.join(tempfile.gettempdir(), "ai-cad-mcp-native.log")
+        log_path = os.path.join(tempfile.gettempdir(), "chudware-mcp-native.log")
         log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         os.dup2(log_fd, 1)  # fd 1 -> log; sys.stdout follows, so stray prints are harmless too
         os.close(log_fd)

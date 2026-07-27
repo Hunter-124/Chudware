@@ -108,19 +108,19 @@ set_source_files_properties(
 # --- mandatory subprocess helper (its own executable) ---------------------------
 # CEF's render/GPU/utility processes re-exec this; CefExecuteProcess() dispatches
 # them. Must sit next to Chudware at runtime.
-add_executable(ai_cad_cef_helper
+add_executable(chudware_cef_helper
   src/ui/widgets/cef/cef_helper_main.cpp
   src/ui/widgets/cef/cef_app.cpp
   src/ui/widgets/cef/cef_stealth.cpp)   # render-process OnContextCreated injects this
 if(WIN32)
-  target_sources(ai_cad_cef_helper PRIVATE src/ui/widgets/cef/cef_platform_windows.cpp)
+  target_sources(chudware_cef_helper PRIVATE src/ui/widgets/cef/cef_platform_windows.cpp)
 else()
-  target_sources(ai_cad_cef_helper PRIVATE src/ui/widgets/cef/cef_platform_linux.cpp)
+  target_sources(chudware_cef_helper PRIVATE src/ui/widgets/cef/cef_platform_linux.cpp)
 endif()
-set_executable_target_properties(ai_cad_cef_helper)
-target_compile_definitions(ai_cad_cef_helper PRIVATE CHUDWARE_ENABLE_CEF=1)
-target_include_directories(ai_cad_cef_helper PRIVATE "${CEF_ROOT}" ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(ai_cad_cef_helper libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+set_executable_target_properties(chudware_cef_helper)
+target_compile_definitions(chudware_cef_helper PRIVATE CHUDWARE_ENABLE_CEF=1)
+target_include_directories(chudware_cef_helper PRIVATE "${CEF_ROOT}" ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(chudware_cef_helper libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
 # Helper TUs also include CEF headers (C++20 concepts on CEF 149+).
 set_source_files_properties(
   src/ui/widgets/cef/cef_helper_main.cpp
@@ -128,7 +128,7 @@ set_source_files_properties(
   src/ui/widgets/cef/cef_stealth.cpp
   src/ui/widgets/cef/cef_platform_linux.cpp
   src/ui/widgets/cef/cef_platform_windows.cpp
-  TARGET_DIRECTORY ai_cad_cef_helper
+  TARGET_DIRECTORY chudware_cef_helper
   PROPERTIES COMPILE_OPTIONS "${_CEF_CXX20}")
 
 # --- stage the CEF runtime next to Chudware ---------------------------------------
@@ -137,6 +137,6 @@ copy_files(Chudware "${CEF_BINARY_FILES}"   "${CEF_BINARY_DIR}"   "${CEF_TARGET_
 copy_files(Chudware "${CEF_RESOURCE_FILES}" "${CEF_RESOURCE_DIR}" "${CEF_TARGET_OUT_DIR}")
 add_custom_command(TARGET Chudware POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          "$<TARGET_FILE:ai_cad_cef_helper>" "${CEF_TARGET_OUT_DIR}")
+          "$<TARGET_FILE:chudware_cef_helper>" "${CEF_TARGET_OUT_DIR}")
 
 message(STATUS "Chudware: CEF backend enabled (CEF_ROOT=${CEF_ROOT}).")

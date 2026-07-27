@@ -50,7 +50,7 @@ if "services.paths" not in sys.modules:
 else:
     _engine_paths = sys.modules["services.paths"]
 if not hasattr(_engine_paths, "DATA"):
-    _engine_paths.DATA = Path("/tmp/ai_cad_test_data")  # legacy attr some shadow tests read
+    _engine_paths.DATA = Path("/tmp/chudware_test_data")  # legacy attr some shadow tests read
 
 # ---------------------------------------------------------------------------
 # services.agent.config stub — injected via a session-scoped autouse fixture

@@ -707,15 +707,19 @@ float drawDocTabs(AppState& st, float availW) {
         tabsR = tabsL + tabsW;   // keep consistent if clamped
 
         maxScroll = std::max(0.0f, fullContentW - tabsW);
-        if (!overflow) s_scrollX = 0.0f;
-        s_scrollX = std::min(std::max(s_scrollX, 0.0f), maxScroll);
+        // Count hidden tabs against a CLAMPED VIEW of the scroll — but never write the clamp back
+        // here: pass 0 runs with no chips reserved, so clamping the persistent s_scrollX inside
+        // this loop permanently ate the chip width off the reachable scroll range (the right end
+        // could never be scrolled into view). The real clamp happens once, after the final
+        // geometry is settled (below the loop).
+        const float viewScroll = overflow ? std::min(std::max(s_scrollX, 0.0f), maxScroll) : 0.0f;
 
         nLeft = 0;
         nRight = 0;
         leftTitles.clear();
         rightTitles.clear();
         for (int i = 0; i < nTabs; ++i) {
-            const float x = tabsL + tabOff[i] - s_scrollX;
+            const float x = tabsL + tabOff[i] - viewScroll;
             const float xr = x + tabWs[i];
             if (xr <= tabsL + 0.5f) {
                 ++nLeft;
@@ -738,6 +742,11 @@ float drawDocTabs(AppState& st, float availW) {
         leftChipW = nextLeft;
         rightChipW = nextRight;
     }
+
+    // NOW clamp the persistent scroll against the FINAL geometry (chips settled) — see the in-loop
+    // comment above. Overflow-off collapses the scroll to flush-left.
+    if (!overflow) s_scrollX = 0.0f;
+    s_scrollX = std::min(std::max(s_scrollX, 0.0f), maxScroll);
 
 // Wheel over the strip scrolls it horizontally (horizontal wheel, or a plain wheel as a fallback
     // so a trackpad / mouse without an H-wheel still works).
@@ -827,9 +836,11 @@ float drawDocTabs(AppState& st, float availW) {
     // "+" New-Document button, pinned at the far right of the strip — opens the chooser popup (Wave 2).
     // Clicking it (or Ctrl+N via openNewDocChooser()) sets wantNewDocChooser.
     {
-        // Pinned at the far right only when the lane overflows; otherwise it hugs the last tab so the
-        // band (which hugs its content) doesn't leave the button stranded outside the glass.
-        const float btnX = overflow ? (outerR + gap) : (outerL + fullContentW + gap);
+        // Pinned at the far right, OUTSIDE the scroll lane — always visible, never scrolled and
+        // never painted over a tab. The 3×gap keeps a flush-scrolled last tab visually clear of the
+        // nub (its slot was already reserved out of outerW above). Otherwise it hugs the last tab
+        // so the band (which hugs its content) doesn't leave it stranded outside the glass.
+        const float btnX = overflow ? (outerR + 3.0f * gap) : (outerL + fullContentW + gap);
         const float btnSide = tabLaneH;           // matches the pill row's height
         const ImVec2 p0(btnX, tabY0);
         ImGui::SetCursorScreenPos(p0);
@@ -994,9 +1005,5 @@ void createNewDoc(AppState& st, int kindOrd) {
 // Wave 2: request the New-Document chooser popup open on the next strip draw (e.g. a Ctrl+N hook in
 // app.cpp). Safe to call anytime; the flag is consumed inside drawDocTabs.
 void openNewDocChooser() { s_openChooser = true; }
-
-// Screenshot/debug hook (CHUDWARE_SHOT=doctabs): pre-set the lane scroll; the next layout pass
-// clamps it into [0, maxScroll].
-void debugSetDocTabScroll(float scrollX) { s_scrollX = scrollX; }
 
 }  // namespace ui

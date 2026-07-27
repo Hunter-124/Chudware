@@ -2904,13 +2904,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.docTabs.push_back(std::move(t));
     }
     st.activeTab = 7;
-    // CHUDWARE_SHOT_DOCSCROLL=<px>: debug hook — pre-scroll the strip (clamped at first layout) and
-    // select the FIRST ("first") or LAST ("last") tab, to photograph scroll-extreme states headless.
-    if (const char* ds = std::getenv("CHUDWARE_SHOT_DOCSCROLL")) {
-      if (std::strcmp(ds, "first") == 0) st.activeTab = 0;
-      else if (std::strcmp(ds, "last") == 0) st.activeTab = (int)st.docTabs.size() - 1;
-      ui::debugSetDocTabScroll(std::strcmp(ds, "first") == 0 ? 0.0f : 1.0e9f);
-    }
   }
   st.wantEcad = shot && shotMode &&
                 std::strcmp(shotMode, "ecad") == 0; // Wave N: ECAD GUI shot

@@ -12,6 +12,7 @@ as SCHEMA-only here and marked gated — no live provider is exercised.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -362,3 +363,63 @@ def test_agent_turn_run_id_without_sink_persists_to_journal(tmp_path, monkeypatc
     # target derives from the tool-call args ({"part": "Bracket"}), NOT the request.
     assert tool_calls[0]["target"] == "Bracket"
     assert tool_calls[0]["run_id"] == "m20_headless"
+
+
+def test_derive_artifacts_suppresses_internal_scratch(tmp_path):
+    """cad_common._tmp() scratch files (chudware_mcp_*) must never surface in the
+    GUI Artifacts panel, while real export deliverables survive."""
+    import tempfile
+    scratch = os.path.join(tempfile.gettempdir(), "chudware_mcp_klyzyi3m.step+")
+    real_export = str(tmp_path / "CD-900_Flyswatter.step")
+    arts = ae.derive_artifacts({"step_path": scratch, "stl_path": real_export})
+    paths = [a["path"] for a in arts]
+    assert scratch not in paths
+    assert real_export in paths
+
+
+def test_derive_artifacts_keeps_user_file_under_temp_dir(tmp_path):
+    """Location alone is never a suppression signal: a user-requested export that
+    merely lives under the system temp dir (no scratch prefix) is a deliverable."""
+    import tempfile
+    user_file = os.path.join(tempfile.gettempdir(), "my_part_export.step")
+    arts = ae.derive_artifacts({"step_path": user_file})
+    assert user_file in [a["path"] for a in arts]
+
+
+def test_tool_call_read_tool_yields_no_artifacts(tmp_path):
+    """Read tools (fs_read, fs_list, read-like describe_*) must NOT contribute
+    artifacts — their results are full of paths they merely touched, which was
+    the '93 Produced This Session rows' pollution."""
+    touched = str(tmp_path / "guide.md")
+    _, p = ae.tool_call_event(
+        "n", "fs_read", {"path": touched},
+        {"ok": True, "path": touched, "content": "..."},
+        ok=True, latency_ms=1.0)
+    assert "artifacts" not in p
+    _, p2 = ae.tool_call_event(
+        "n", "fs_list", {"path": str(tmp_path)},
+        {"ok": True, "paths": [touched, str(tmp_path / "other.step")]},
+        ok=True, latency_ms=1.0)
+    assert "artifacts" not in p2
+
+
+def test_tool_call_producer_tool_yields_export_path(tmp_path):
+    """A producing tool still surfaces its real export deliverable."""
+    export = str(tmp_path / "CD-900_Flyswatter.step")
+    _, p = ae.tool_call_event(
+        "n", "export_part", {"fmt": "step", "path": export},
+        {"ok": True, "path": export},
+        ok=True, latency_ms=1.0)
+    paths = [a["path"] for a in p.get("artifacts", [])]
+    assert export in paths
+
+
+def test_tool_call_explicit_artifacts_honoured_for_any_tool(tmp_path):
+    """An explicit artifacts= argument is a caller asserting a real deliverable —
+    it must pass through regardless of the tool name."""
+    deliverable = str(tmp_path / "summary.png")
+    explicit = [{"path": deliverable, "kind": "image"}]
+    _, p = ae.tool_call_event(
+        "n", "measure_part", {"part": "P"}, {"ok": True},
+        ok=True, latency_ms=1.0, artifacts=explicit)
+    assert p["artifacts"] == explicit

@@ -23,7 +23,9 @@ import hashlib
 import inspect
 import itertools
 import json
+import os
 import secrets
+import tempfile
 from typing import Any, Callable, Optional
 
 # A per-process monotonic counter. `seq` is advisory only (see contract §2.1): a
@@ -336,6 +338,34 @@ def _error_text(result: Any) -> str:
         return str(payload)
 
 
+# Producer allowlist (2026-07-27): ONLY these tools contribute auto-derived
+# artifacts to the GUI Artifacts panel. The panel showed 93 junk rows because
+# derive_artifacts ran on EVERY tool result — read tools (fs_read / fs_list /
+# cad_guide / describe_*) return text full of paths they merely touched, and each
+# one surfaced as a "produced" file. Allowlist (not reader-denylist) on purpose:
+# a future read-only tool must default to NO artifacts, never to polluting the
+# panel. Every name below is verified against the live tool_registry catalog.
+_ARTIFACT_PRODUCER_TOOLS = frozenset({
+    # CAD file/export deliverables
+    "export_part", "save_part", "export_drawing", "make_drawing",
+    # CAD render deliverables (the artifacts field's original 2026-07-17
+    # purpose: expand render/export rows inline)
+    "render_part", "render_views", "contact_sheet", "doc_sketch_contact_sheet",
+    "review_drawing",
+    # CAD document/report writers (services/deliverables + layout plan)
+    "make_report", "make_workbook", "make_presentation", "layout_plan_report",
+    # CAM deliverables (gcode / .cam+ job / operator setup sheet)
+    "cam_post", "cam_save", "cam_setup_sheet",
+    # ECAD + reverse-engineering export bundles
+    "ecad_export", "export_reveng_bundle",
+    # Workspace filesystem writers
+    "fs_write", "fs_edit",
+    # Office document writers
+    "office_edit_doc", "office_edit_docx", "office_edit_pdf",
+    "office_edit_pptx", "office_edit_xlsx", "office_edit_csv",
+})
+
+
 def tool_call_event(
     node_id: str, tool_name: str, args: dict | None, result: Any, *,
     ok: bool, latency_ms: float, span_id: str | None = None,
@@ -378,7 +408,10 @@ def tool_call_event(
     # Additive (2026-07-17): filesystem paths of render/export deliverables so the
     # GUI can expand a tool-call row inline. Cap 8; omit when none.
     arts = artifacts
-    if arts is None:
+    if arts is None and tool_name in _ARTIFACT_PRODUCER_TOOLS:
+        # An explicitly passed artifacts= is honoured for ANY tool (the caller is
+        # asserting a real deliverable); auto-derivation is producer-gated so read
+        # tools (fs_read, describe_*, list_*) never pollute the Artifacts panel.
         try:
             arts = derive_artifacts(result)
         except Exception:  # noqa: BLE001
@@ -386,6 +419,33 @@ def tool_call_event(
     if arts:
         payload["artifacts"] = arts[:8]
     return "agent.tool_call", payload
+
+
+# Internal scratch prefix minted by services/mcp/cad_common._tmp() (and its
+# callers) via tempfile.mkstemp — those files are transient tool plumbing, NOT
+# user deliverables, and must never surface in the GUI Artifacts panel.
+_SCRATCH_PREFIX = "chudware_mcp_"
+
+
+def _is_internal_scratch(path: str) -> bool:
+    """True for internal scratch paths (cad_common._tmp tempfiles).
+
+    The primary signal is the ``chudware_mcp_`` basename prefix — a scratch file
+    is suppressed wherever it lives. Location alone is NEVER enough: a file the
+    user explicitly asked for under a temp-ish directory is a real deliverable
+    and must survive. The system-temp-dir check (symlink-resolved so /tmp vs
+    /private/tmp both match) only ever ADDS suppression for prefixed names.
+    """
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if base.startswith(_SCRATCH_PREFIX):
+        return True
+    try:
+        tmp = os.path.realpath(tempfile.gettempdir())
+        real = os.path.realpath(path)
+    except Exception:  # noqa: BLE001
+        return False
+    return (real.startswith(tmp + os.sep)
+            and os.path.basename(real).startswith(_SCRATCH_PREFIX))
 
 
 def derive_artifacts(result: Any, *, limit: int = 8) -> list[dict]:
@@ -418,6 +478,8 @@ def derive_artifacts(result: Any, *, limit: int = 8) -> list[dict]:
                 return
         p = path.strip()
         if not p or p in seen:
+            return
+        if _is_internal_scratch(p):
             return
         # Only treat path-looking strings as artifacts (absolute/relative file paths).
         if not (p.startswith("/") or p.startswith(".") or (len(p) > 2 and p[1] == ":")

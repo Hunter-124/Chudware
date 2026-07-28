@@ -481,8 +481,10 @@ if _KNOWN_SO.exists() and not os.environ.get("CHUDWARE_LIBCHUDWARE"):
     os.environ["CHUDWARE_LIBCHUDWARE"] = str(_KNOWN_SO)
 try:
     from services.mcp.core_bridge import call as _core_call, CoreError
-    # Try a no-op call to confirm availability
-    _core_call("doc_new", {"kind": "part", "name": "link_dim_probe"})
+    # Read-only probe to confirm availability: doc_list mints NOTHING. (The old
+    # probe called doc_new, which leaked a real never-closed "link_dim_probe"
+    # document into the user's live shared daemon on every suite import.)
+    _core_call("doc_list")
     _LIBCHUDWARE_AVAILABLE = True
 except Exception:
     pass

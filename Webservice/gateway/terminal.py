@@ -992,9 +992,14 @@ async def admin_terminal(ws: WebSocket) -> None:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Only report an exit when the pty actually ended (session gone / shell
-        # exit) while the browser is still watching — not on a plain detach.
-        if shell_died and ws.client_state == WebSocketState.CONNECTED:
+        # Only report an exit when the SESSION is really gone. `shell_died` just
+        # means our `tmux attach` client died — which also happens on a plain
+        # detach and, crucially, every time the gateway restarts (deploy). The
+        # tmux server lives in its own systemd scope and survives that, so
+        # reporting "exit" there makes the browser mark the tab dead and refuse
+        # to reconnect, stranding a session that is still running.
+        session_gone = not (tmux_name and _session_exists(tmux_name))
+        if shell_died and session_gone and ws.client_state == WebSocketState.CONNECTED:
             try:
                 await ws.send_text(
                     json.dumps(

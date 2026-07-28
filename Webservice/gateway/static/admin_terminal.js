@@ -782,10 +782,31 @@
       }
     };
 
+    // Close codes the SERVER chose deliberately. Reconnecting through these is
+    // wrong: 4408 would silently undo the idle timeout, 4429 would retry-storm
+    // the session cap (each attempt can mint another session), and 4403/4404
+    // can never succeed on retry. Anything else (1006 on a gateway restart,
+    // network blips) is still transient and worth retrying.
+    var FATAL_CLOSE = {
+      4403: "not authorized for this terminal",
+      4404: "terminal is disabled on this deployment",
+      4408: "closed after being idle",
+      4429: "too many terminal sessions open",
+      1008: "rejected by the server",
+      1009: "message too large",
+    };
+
     ws.onclose = function (ev) {
       if (tab._closed) return;
       if (tab._ended) {
         renderPicker();
+        return;
+      }
+      var fatal = ev && FATAL_CLOSE[ev.code];
+      if (fatal) {
+        term.writeln(
+          "\r\n\x1b[2m[" + fatal + " — press the session pill to rejoin]\x1b[0m"
+        );
         return;
       }
       tab._retries = (tab._retries || 0) + 1;

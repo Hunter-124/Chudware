@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
@@ -103,7 +104,7 @@ def test_approving_a_pending_account_grants_access(env):
 
 def test_suspending_revokes_access_immediately(env):
     accounts, client = env
-    accounts.set_status("stranger@gmail.com", "active") or accounts.ensure_account("stranger@gmail.com")
+    accounts.ensure_account("stranger@gmail.com")
     accounts.set_status("stranger@gmail.com", "active")
     assert client.get("/whoami", headers=hdr("stranger@gmail.com")).status_code == 200
 

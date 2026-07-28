@@ -644,7 +644,10 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
         // On the auto-size frame winW is tiny — fall back to the label width so the popup
         // measures itself from the widest row; from the next frame on, winW - 2*border is
         // the full interior and the fill bleeds edge to edge.
-        const float rowW = ImMax(winW - 2.0f * border, textW);
+        const float rowW = ImMax(winW - 2.0f * border, textW) - 8.0f * sc;
+        // Indent the LABEL only — the hover fill is drawn from the window's inner edge
+        // regardless of cursor x, so this nudges the text right without shrinking the fill.
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 8.0f * sc);
         const ImVec2 pos = ImGui::GetCursorScreenPos();
         const bool clicked = ImGui::Selectable(label, false, ImGuiSelectableFlags_None,
                                                ImVec2(rowW, 0.0f));

@@ -2686,6 +2686,7 @@ static void aiVcFetchTimeline(AppState& st, bool force = false) {
                 cp.features = c["features_count"].get<int>();
             // v2: kind / msg_idx / call:{turn,i}
             cp.kind = c.value("kind", std::string());
+            cp.sessionId = c.value("session_id", std::string());
             if (c.contains("msg_idx") && !c["msg_idx"].is_null()) {
                 if (c["msg_idx"].is_number_integer()) cp.msgIdx = c["msg_idx"].get<int>();
                 else if (c["msg_idx"].is_number()) cp.msgIdx = (int)c["msg_idx"].get<double>();
@@ -3118,9 +3119,10 @@ static void drawAiVcChatRewind(AppState& st, int msgIdx) {
 // Non-mutating finished turns (turnNum <= 0) get the always-visible chat-only rewind —
 // revert is offered at ANY point in the chat, and the wording never implies geometry was
 // restored when no checkpoint exists for that point.
-// Glyph language (◁◁) for Before; text "After" kept. Inline confirm = click again.
-// When call granularity is present, Before uses call:<turn>:<i> for the first tool of the turn
-// if known; otherwise degrades to turn-level "turn:N-1" / "turn:N".
+// Rewind-only (◁◁): there is no "After" counterpart. "After step N" is the same state as
+// "before step N+1", so the second button only ever doubled the chrome — and per-tool-call
+// rewinds (drawAiVcCallRewind) now reach every intermediate point anyway. Inline confirm =
+// click again. Before uses call:<turn>:0 when call granularity exists, else turn-level.
 // alwaysShow=false keeps the legacy hover-latched behavior for any caller that still anchors
 // the row on a preceding label item.
 void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum, bool alwaysShow) {
@@ -3194,9 +3196,7 @@ void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum, bool alwaysShow)
                 } else {
                     to = "turn:" + std::to_string(turnNum);
                 }
-                aiVcRequestRollback(st, to,
-                                    kind == 1 ? "Restored to before this step"
-                                              : "Restored to after this step");
+                aiVcRequestRollback(st, to, "Restored to before this step");
             }
         }
         if (ImGui::IsItemHovered()) {
@@ -3207,36 +3207,86 @@ void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum, bool alwaysShow)
         ImGui::PopID();
     };
 
-    auto textBtn = [&](int kind, const char* idle, const char* tip) {
-        ImGui::SameLine(0, 4.0f * sc);
-        const bool isPend = pending && s_aiVc.confirmKind == kind;
-        if (isPend) {
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 0.55f));
-            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-        }
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * sc, 1.0f * sc));
-        if (ImGui::SmallButton(isPend ? "Confirm?" : idle)) {
-            if (!isPend) {
-                s_aiVc.confirmMsgIdx = msgIdx;
-                s_aiVc.confirmKind = kind;
-                s_aiVc.confirmUntil = now + 4.0;
-            } else {
-                aiVcRequestRollback(st, "turn:" + std::to_string(turnNum),
-                                    "Restored to after this step");
-            }
-        }
-        ImGui::PopStyleVar();
-        if (isPend) ImGui::PopStyleColor(2);
-        if (ImGui::IsItemHovered()) {
-            s_hovMsg = msgIdx;
-            s_hovUntil = now + 0.6;
-            ImGui::SetTooltip("%s", isPend ? "Click again to confirm." : tip);
-        }
-    };
-
     glyphBtn(1, "Restore the part to the state before this step.");
-    textBtn(2, "After", "Restore the part to the state after this step.");
+}
+
+// The checkpoint holding the state BEFORE tool call `callI`, or "" when it cannot be
+// identified beyond doubt.
+//
+// The target is the checkpoint's own ID, never a synthesized "call:<turn>:<i>" string:
+//  - call.i IS the 0-based tool ordinal within a run (agent_turn passes
+//    tool_calls_made - 1), which is exactly what the timeline counts;
+//  - but call.turn is only a chat msg_idx when the turn had one and otherwise falls back
+//    to tool_calls_made, so it is NOT the GUI's turn ordinal — matching it would miss;
+//  - and call.i restarts at 0 every run, so on a document edited across several runs the
+//    same (call.i, tool) pair recurs. Scope to ONE run via session_id.
+//
+// Each call writes TWO chain records — the pre-call snapshot and the post-call one — in
+// chain order. We want the pre-call state, i.e. the FIRST match. Rollback resolution is an
+// exact id lookup, so a row we cannot place in the newest run gets no glyph at all rather
+// than a button that would restore the wrong state.
+std::string aiVcCallCheckpointId(int callI, const std::string& toolName) {
+    if (callI < 0 || toolName.empty()) return {};
+    // Newest run present in the timeline (checkpoints arrive oldest-first).
+    std::string newestSession;
+    for (const auto& cp : s_aiVc.checkpoints)
+        if (!cp.sessionId.empty()) newestSession = cp.sessionId;
+    if (newestSession.empty()) return {};
+    for (const auto& cp : s_aiVc.checkpoints)
+        if (cp.sessionId == newestSession && cp.callI == callI && cp.label == toolName &&
+            !cp.id.empty())
+            return cp.id;   // first match in chain order == the pre-call snapshot
+    return {};
+}
+
+// Per-tool-call rewind: restore the part to the state BEFORE this individual call.
+// There is deliberately no "after" counterpart — "after call i" is the same state as
+// "before call i+1", so one direction covers every point in the turn without doubling
+// the chrome. Same glyph and click-again-confirm as every other rewind in the chat.
+void drawAiVcCallRewind(AppState& st, int callI, const std::string& toolName) {
+    if (!s_aiVc.available || s_aiVc.busy) return;
+    const std::string cpId = aiVcCallCheckpointId(callI, toolName);
+    if (cpId.empty()) return;
+    const float sc = ui::uiScale;
+    const double now = ImGui::GetTime();
+    if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
+        s_aiVc.confirmMsgIdx = -1;
+        s_aiVc.confirmKind = 0;
+        s_aiVc.confirmCallI = -1;
+    }
+    // Call-scoped confirms key on kind 4 + the call index so two rows in the same turn
+    // never share a pending state.
+    const bool pending = s_aiVc.confirmKind == 4 && s_aiVc.confirmCallI == callI;
+    ImGui::SameLine(0, 8.0f * sc);
+    const float sz = ImGui::GetTextLineHeight();
+    ImGui::PushID(callI + 900);
+    const bool clicked = ImGui::InvisibleButton("##call_rw", ImVec2(sz * 1.15f, sz));
+    const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ui::AdaptiveSurface& surf = chatSurf();
+    if (pending || ImGui::IsItemHovered())
+        dl->AddRectFilled(bmn, bmx,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                  surf.textPrimary.z, pending ? 0.18f : 0.10f)),
+            ui::metrics::rounding(4.0f));
+    const float rp = sz * 0.18f;
+    drawDoubleRewindGlyph(dl, ImVec2(bmn.x + rp, bmn.y + rp), ImVec2(bmx.x - rp, bmx.y - rp),
+        ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
+    if (clicked) {
+        if (!pending) {
+            s_aiVc.confirmMsgIdx = -1;
+            s_aiVc.confirmKind = 4;
+            s_aiVc.confirmCallI = callI;
+            s_aiVc.confirmUntil = now + 4.0;
+        } else {
+            aiVcRequestRollback(st, cpId, "Restored to before this step");
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", pending
+            ? "Click again to confirm."
+            : "Restore the part to the state before this step.");
+    ImGui::PopID();
 }
 
 

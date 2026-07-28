@@ -203,7 +203,9 @@ struct AiVcCheckpoint {
     std::string kind;          // "prompt" | "tool" | ""
     int         msgIdx = -1;   // chat message ordinal for kind=prompt
     int         callTurn = -1; // call.turn for kind=tool
-    int         callI = -1;    // call.i for kind=tool
+    int         callI = -1;    // call.i for kind=tool — 0-based tool ordinal WITHIN a run,
+                               // so it only identifies a call together with sessionId.
+    std::string sessionId;     // run that authored this checkpoint (call.i restarts per run)
 };
 
 struct AiVcUi {
@@ -287,6 +289,13 @@ void commitEditStageOnSend(AppState& st);
 // action row (the chat-log default, matching the user bubble's own meta bar); false keeps
 // the hover-latched variant that anchors on a preceding label item.
 void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum, bool alwaysShow = true);
+// Per-tool-call "before" rewind glyph, drawn on each tool-call row. Draws nothing unless
+// exactly one checkpoint matches (call ordinal + tool name), so it never offers a restore
+// the backend would refuse or, worse, resolve to the wrong state. There is no "after"
+// counterpart by design — "after call i" is "before call i+1", so before-only already
+// reaches every point in the turn.
+void drawAiVcCallRewind(AppState& st, int callI, const std::string& toolName);
+std::string aiVcCallCheckpointId(int callI, const std::string& toolName);
 
 // ---- chat log (chat_log) ----
 void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,

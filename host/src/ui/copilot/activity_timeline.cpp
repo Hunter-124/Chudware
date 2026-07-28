@@ -824,7 +824,7 @@ static bool toolRowIsGuardRefusal(const ActivityItem& a) {
 // "skipped" glyph + iterBuilt blue chip. `failCount` > 1 collapses consecutive identical
 // tool+target fails into one row (drawAgentTimeline computes the run).
 static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& fonts,
-                                int failCount, bool liveFrontier) {
+                                int failCount, bool liveFrontier, int callI = -1) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     // Split the packed detail FIRST: whether this row is a genuine failure or the harness's own
@@ -904,6 +904,10 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         ImGui::TextUnformatted(meta);
         ImGui::PopStyleColor();
     }
+    // Per-call rewind: restore the part to the state BEFORE this individual tool call.
+    // Self-gating — it draws nothing unless exactly one checkpoint matches this call
+    // ordinal AND tool name, so read-only calls and pre-checkpoint history get no glyph.
+    drawAiVcCallRewind(st, callI, a.title);
     if (!a.reason.empty()) dimText(a.reason.c_str());   // the human target — "what it acts on"
     if (guard) {
         // What happened, in the user's terms — collapsed AND expanded, because it is the row's
@@ -1017,7 +1021,8 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
 }
 
 void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
-    // Standalone caller (outside the turn timeline): never the live frontier -> collapsed.
+    // Standalone caller (outside the turn timeline): never the live frontier -> collapsed,
+    // and with no turn/call ordinal there is no per-call rewind to offer.
     drawToolCallRowImpl(st, a, fonts, /*failCount=*/1, /*liveFrontier=*/false);
 }
 
@@ -1044,6 +1049,11 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         if (a.rowKind == 10 && a.stage == "class:pending") continue;
         lastVisible = i;
     }
+    // Tool-call ordinal within the turn — the `i` of an AI-VC "call:<turn>:<i>" target.
+    // Counted over rowKind-3 rows only (the timeline also carries thinking, context and
+    // card rows), and NOT over the synthesized "Session files" artifact row, which is a
+    // presentation row rather than a call the engine checkpointed.
+    int toolOrdinal = -1;
     for (size_t i = 0; i < m.activity.size(); ++i) {
         ActivityItem& a = m.activity[i];
         // Hidden meta row carrying stop_reason / error_detail — never drawn as a card.
@@ -1080,9 +1090,18 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
                 drawIdx = j - 1;
                 i = j - 1;  // loop ++i advances past the coalesced run
             }
+            // This row's call ordinal. The synthesized "Session files" row is presentation,
+            // not a checkpointed call, so it never consumes an index. A coalesced run of
+            // identical failures draws ONE row but consumed failCount calls, so the ordinal
+            // advances by all of them — the row itself rewinds to before the FIRST attempt.
+            int callIdx = -1;
+            if (a.stage != "artifacts") {
+                callIdx = ++toolOrdinal;
+                if (failCount > 1) toolOrdinal += failCount - 1;
+            }
             // Frontier for the coalesced row is judged by the row actually drawn (drawIdx).
             drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount,
-                                turnRunning && (drawIdx == lastVisible));
+                                turnRunning && (drawIdx == lastVisible), callIdx);
         } else if (a.rowKind == 10) {
             drawClassificationCard(a, fonts, turnRunning);
         } else if (a.rowKind == 19) {

@@ -793,6 +793,10 @@ class AiVcStore:
             "raw_bytes": r.get("raw_bytes", 0),
             "msg_idx": r.get("msg_idx"),
             "call": r.get("call"),
+            # The run that authored this checkpoint. call.i restarts at 0 every run, so
+            # without this a consumer cannot tell "call 2 of this run" from "call 2 of a
+            # run three sessions ago" on the same document.
+            "session_id": r.get("session_id"),
             "storage_kind": AiVcStore._storage_kind_of(r),
             "file": r.get("file"),
         }

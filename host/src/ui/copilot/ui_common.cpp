@@ -630,12 +630,15 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
         return;
     }
     const std::string& all = copyAll.empty() ? copyText : copyAll;
-    // Plain Selectable (no explicit size, no MenuItem): with size_arg.x == 0 it already fills
-    // the popup's content width every frame — no MenuColumns cache to lag on a freshly opened
-    // popup, and no gap beyond the WindowPadding pushed above.
+    // size_arg.x must be the full content width: with size_arg.x == 0 Selectable sizes the
+    // item (and therefore the highlight rect) to the LABEL width only, leaving a blank gap to
+    // the right of the text — exactly the look reported. GetContentRegionAvail() is identical
+    // on every row (cursor x returns to the padding edge after each NewLine), so each row's
+    // highlight spans the whole popup interior.
     auto copyRow = [&](const char* label, bool enabled, const std::string& text) {
         ImGui::BeginDisabled(!enabled);
-        const bool clicked = ImGui::Selectable(label, false);
+        const bool clicked = ImGui::Selectable(label, false, ImGuiSelectableFlags_None,
+                                               ImVec2(ImGui::GetContentRegionAvail().x, 0.0f));
         ImGui::EndDisabled();
         if (clicked) {  // BeginDisabled already keeps a disabled row from ever registering one
             chatCopyToClipboard(text);

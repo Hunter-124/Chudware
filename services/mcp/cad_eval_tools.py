@@ -47,8 +47,15 @@ from .cad_common import (
 # kwargs — query_geometry(of="face", side="top") — means exactly the documented dict, so
 # assemble it rather than refusing the call.
 _QUERY_KEYS = ("of", "side", "surf", "surface", "shape", "parallel", "perpendicular",
-               "pick", "near", "count", "index", "body_id")
-_QUERY_KEY_CANON = {"surface": "surf", "shape": "surf"}
+               "pick", "near", "count", "limit", "max", "max_results",
+               "index", "body_id")
+_QUERY_KEY_CANON = {"surface": "surf", "shape": "surf",
+                    # `count` IS a result cap (core/doc/picks.cpp truncates the
+                    # match set to it), so the spellings every model reaches
+                    # for — limit/max/max_results — are the same intent, not a
+                    # new concept. Live 2026-07-27 (claude-opus, flyswatter):
+                    # query_geometry(..., limit=30) was rejected outright.
+                    "limit": "count", "max": "count", "max_results": "count"}
 
 # Spellings of the `query` PARAMETER itself (as opposed to a key inside it).
 _QUERY_SPELLINGS = ("target", "q", "face", "edge", "selector", "where")
@@ -225,9 +232,21 @@ def _read_query(tool: str, query, kwargs: dict, notes: list) -> tuple:
     geometry vocabulary (a part or feature name attached to the call), which the caller
     verifies rather than ignores. Every rewrite lands in `notes`."""
     flat: dict = {}
+    spelled_flat: dict = {}   # canonical key -> the spelling it arrived under
     for key in list(kwargs):
         if key in _QUERY_KEYS:
-            flat[_QUERY_KEY_CANON.get(key, key)] = kwargs.pop(key)
+            canon = _QUERY_KEY_CANON.get(key, key)
+            value = kwargs.pop(key)
+            # Two spellings of the SAME key (count=5 beside limit=30) must not
+            # collapse silently — that is one value, so pass it once.
+            if canon in flat and flat[canon] != value:
+                raise ValueError(
+                    f"{tool}(): the query key {canon!r} arrived twice with "
+                    f"different values ({flat[canon]!r} as "
+                    f"{spelled_flat[canon]!r}, {value!r} as {key!r}) — that "
+                    f"is one query, so pass it once.")
+            flat[canon] = value
+            spelled_flat[canon] = key
 
     spelled = [(k, v) for k, v in _take_alias(kwargs, _QUERY_SPELLINGS) if v is not None]
     if query is not None:
@@ -446,6 +465,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
           of="face", side="top", …         the query written FLAT across top-level kwargs —
                                            assembled into {"of":"face","side":"top"}
           surface= / shape=                spellings of `surf`
+          limit= / max= / max_results=     spellings of `count` (a result cap)
         A spelling that is NOT query vocabulary (target="bushing_body") is read as the SUBJECT
         — the part or feature the query is about: an open document's id/name selects that
         document, a feature name is reported (this tool always searches the whole document),
@@ -467,7 +487,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 "query_geometry", extra,
                 'it takes query=, doc_id=, the query spellings (target/q/face/edge/selector/'
                 'where) or the query keys written flat (of/side/surf/parallel/perpendicular/'
-                'pick/near/count/index/body_id).')
+                'pick/near/count/limit/max/max_results/index/body_id).')
 
             # A non-vocabulary spelling names the SUBJECT. When it is an open document and no
             # doc_id was given, that IS the document the model meant — adopt it and say so.

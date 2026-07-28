@@ -160,6 +160,87 @@ def test_no_query_at_all_teaches_the_accepted_forms(part):
 
 
 # --------------------------------------------------------------------------
+# limit / max / max_results: spellings of the `count` result cap
+# (live 2026-07-27, claude-opus flyswatter run: query_geometry(..., limit=30)
+# was rejected outright and cost a billed completion)
+# --------------------------------------------------------------------------
+
+def test_limit_is_folded_into_count(part):
+    """`count` IS a result cap (core/doc/picks.cpp truncates the match set to
+    it), so limit= is the same intent under its most common spelling."""
+    out = _call("query_geometry", query={"of": "face"}, limit=2, doc_id=part)
+    assert out["ok"] is True, out
+    assert out["query"]["count"] == 2            # folded into the resolved query
+    assert out["count"] == 2                     # and it actually caps the set
+    assert len(out["matches"]) == 2
+    assert "flat" in _notes(out)
+
+
+def test_max_and_max_results_are_folded_into_count(part):
+    for spelling in ("max", "max_results"):
+        out = _call("query_geometry", query={"of": "face"}, doc_id=part,
+                    **{spelling: 1})
+        assert out["ok"] is True, (spelling, out)
+        assert out["query"]["count"] == 1
+        assert out["count"] == 1
+
+
+def test_count_and_limit_together_conflict_instead_of_one_winning(part):
+    """Two spellings of the same cap with different values must not collapse
+    silently — that is one value, passed once."""
+    out = _call("query_geometry", query={"of": "face"}, count=1, limit=2,
+                doc_id=part)
+    assert out["ok"] is False
+    assert "arrived twice" in out["error"]
+    assert "limit" in out["error"]
+
+
+def test_canonical_count_is_untouched(part):
+    out = _call("query_geometry", query={"of": "face", "count": 1}, doc_id=part)
+    assert out["ok"] is True
+    assert out["query"] == {"of": "face", "count": 1}  # echo stays verbatim
+
+
+# --------------------------------------------------------------------------
+# undo_denied: the refusal is correct policy but was a dead end — it named
+# alternatives without their call shapes and never mentioned the op the model
+# actually wanted (removing/altering a just-added feature).
+# --------------------------------------------------------------------------
+
+def test_undo_denied_teaches_the_way_out():
+    from services.mcp.cad_common import _err
+    from services.mcp.core_bridge import CoreError
+    out = json.loads(_err(CoreError(
+        "undo is disabled for mcp/agent connections; agents use "
+        "doc_checkpoint/doc_revert or PLM rollback", "undo_denied")))
+    assert out["ok"] is False and out["code"] == "undo_denied"
+    hint = out["hint"]
+    # the policy does not change and retrying is pointless — say so
+    assert "will fail identically" in hint
+    # (a) the checkpoint/revert pair, with its call shapes
+    assert "doc_checkpoint(doc_id)" in hint and "doc_revert(doc_id" in hint
+    assert "plm_rollback" in hint and "plm_timeline" in hint
+    # (b) removing/altering a just-added feature is an OP, named by its real op name
+    assert 'ops=[{"op":"delete_feature","id":"fN"}]' in hint
+    assert '"op":"edit_feature"' in hint
+    # and the same content as a machine-readable block
+    alt = out["alternatives"]
+    assert "delete_feature" in alt["remove_a_feature"]
+    assert "edit_feature" in alt["alter_a_feature"]
+    assert "plm_rollback" in alt["rollback_document"]
+
+
+def test_other_core_errors_are_untouched():
+    """Only undo_denied gets the envelope; every other engine error renders
+    exactly as before."""
+    from services.mcp.cad_common import _err
+    from services.mcp.core_bridge import CoreError
+    out = json.loads(_err(CoreError("boom", "invalid_op", {"x": 1})))
+    assert out == {"ok": False, "error": "boom", "code": "invalid_op",
+                   "detail": {"x": 1}}
+
+
+# --------------------------------------------------------------------------
 # The "no bodies" message: which situation, and what to call next
 # --------------------------------------------------------------------------
 

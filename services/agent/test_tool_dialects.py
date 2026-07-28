@@ -16,6 +16,8 @@ After the fix the same prompt completes in two calls with zero failures.
 """
 from __future__ import annotations
 
+import json
+
 from services.agent.agent_turn import (
     _dispatch_tool,
     _normalize_directive,
@@ -122,3 +124,152 @@ class TestEmptyFinishMessage:
         """_handoff_text still wins; synthesis only fills a genuine gap."""
         from services.agent.agent_turn import _handoff_text
         assert _handoff_text({"summary": "I built the cube."}) == "I built the cube."
+
+
+class TestArgSynonyms:
+    """Live 2026-07-27 (claude-opus, flyswatter run): export_part(format="step")
+    was rejected with "no parameter of that name and no unambiguous synonym"
+    and cost a billed completion, even though `format` IS the canonical
+    English name of the tool's `fmt` parameter."""
+
+    @staticmethod
+    def _export_spec():
+        from services.agent import agent_turn as at
+        fn = at._bind_tool("export_part")
+        assert fn is not None, "export_part does not resolve in the MCP registry"
+        return at, fn
+
+    def test_format_maps_to_fmt(self):
+        from services.agent.agent_turn import _reconcile_kwargs
+        at, fn = self._export_spec()
+        kwargs, notes, err = _reconcile_kwargs(
+            "export_part", fn,
+            {"doc_id": "d1", "path": "/tmp/x.step", "format": "step"})
+        assert err is None, err
+        assert kwargs["fmt"] == "step"
+        assert kwargs["path"] == "/tmp/x.step"
+        assert any("format" in n and "fmt" in n for n in notes)
+
+    def test_file_format_maps_to_fmt(self):
+        from services.agent.agent_turn import _reconcile_kwargs
+        at, fn = self._export_spec()
+        kwargs, _notes, err = _reconcile_kwargs(
+            "export_part", fn, {"doc_id": "d1", "file_format": "stl"})
+        assert err is None, err
+        assert kwargs["fmt"] == "stl"
+
+    def test_type_maps_to_fmt_for_export_part_only(self):
+        """`type` is too generic to map globally; export_part has no other
+        parameter a str type= could mean, so the per-tool table maps it."""
+        from services.agent.agent_turn import _reconcile_kwargs
+        at, fn = self._export_spec()
+        kwargs, _notes, err = _reconcile_kwargs(
+            "export_part", fn, {"doc_id": "d1", "type": "step"})
+        assert err is None, err
+        assert kwargs["fmt"] == "step"
+        # A tool with no `fmt` parameter must NOT swallow `type` silently.
+        fs = at._bind_tool("fs_read")
+        _k, _n, err2 = _reconcile_kwargs("fs_read", fs,
+                                         {"path": "a.txt", "type": "step"})
+        assert err2 is not None and "type" in err2["unknown_params"]
+
+    def test_canonical_fmt_is_untouched(self):
+        from services.agent.agent_turn import _reconcile_kwargs
+        _at, fn = self._export_spec()
+        kwargs, notes, err = _reconcile_kwargs(
+            "export_part", fn, {"doc_id": "d1", "fmt": "step"})
+        assert err is None and kwargs["fmt"] == "step" and not notes
+
+
+class TestOpToolMigration:
+    """Live 2026-07-27 (claude-opus, flyswatter run): a top-level
+    edit_feature(doc_id, feature="f2", params={...}) call was rejected as a
+    non-existent tool and cost a full completion even though the mapping to
+    add_features(ops=[...]) is total and unambiguous. Clean shapes now
+    migrate and execute; ambiguous ones still get the teaching error."""
+
+    def test_edit_feature_with_feature_key(self):
+        """The verbatim recorded call shape."""
+        from services.agent.agent_turn import _migrate_op_tool
+        out = _migrate_op_tool("edit_feature",
+                               {"doc_id": "d1", "feature": "f2",
+                                "params": {"radius": 3}})
+        assert out is not None
+        kwargs, note = out
+        assert kwargs == {"doc_id": "d1", "ops": [
+            {"op": "edit_feature", "id": "f2", "params": {"radius": 3}}]}
+        assert "edit_feature" in note and "add_features" in note
+
+    def test_delete_feature_with_feature_id_alias(self):
+        from services.agent.agent_turn import _migrate_op_tool
+        kwargs, _note = _migrate_op_tool(
+            "delete_feature", {"doc_id": "d1", "feature_id": "f7"})
+        assert kwargs == {"doc_id": "d1",
+                          "ops": [{"op": "delete_feature", "id": "f7"}]}
+
+    def test_add_feature_flat_shape(self):
+        from services.agent.agent_turn import _migrate_op_tool
+        kwargs, _note = _migrate_op_tool(
+            "add_feature",
+            {"doc_id": "d1", "type": "box", "name": "Lid",
+             "params": {"length": 10, "width": 5, "height": 2}})
+        assert kwargs == {"doc_id": "d1", "ops": [{"op": "add_feature",
+            "feature": {"type": "box", "name": "Lid",
+                        "params": {"length": 10, "width": 5, "height": 2}}}]}
+
+    def test_add_feature_feature_dict_shape(self):
+        from services.agent.agent_turn import _migrate_op_tool
+        feat = {"type": "cylinder", "params": {"radius": 2, "height": 9}}
+        kwargs, _note = _migrate_op_tool("add_feature",
+                                         {"doc_id": "d1", "feature": feat})
+        assert kwargs == {"doc_id": "d1",
+                          "ops": [{"op": "add_feature", "feature": feat}]}
+
+    def test_ambiguous_shapes_fall_back_to_the_teaching_error(self):
+        """No silent guesses: anything that does not map cleanly returns None
+        so the dispatch path emits the redirect teaching error instead."""
+        from services.agent.agent_turn import _migrate_op_tool
+        # an edit carrying nothing to change
+        assert _migrate_op_tool("edit_feature",
+                                {"doc_id": "d1", "feature": "f2"}) is None
+        # leftover keys the migration cannot account for
+        assert _migrate_op_tool("delete_feature",
+                                {"doc_id": "d1", "id": "f2",
+                                 "extra": 1}) is None
+        # two different target spellings = ambiguity
+        assert _migrate_op_tool("edit_feature",
+                                {"doc_id": "d1", "feature": "f2", "id": "f3",
+                                 "params": {"r": 1}}) is None
+        # no doc_id at all
+        assert _migrate_op_tool("delete_feature", {"id": "f2"}) is None
+        # a name that is not op-shaped
+        assert _migrate_op_tool("explode_part",
+                                {"doc_id": "d1", "id": "f2"}) is None
+
+    def test_dispatch_migrates_and_executes(self):
+        """End-to-end through _dispatch_tool: the call reaches add_features
+        (which then fails honestly on the unknown doc — an ENGINE error about
+        the document, never an unknown_tool rejection of the name)."""
+        from services.agent.agent_turn import _dispatch_tool
+        try:
+            r = _dispatch_tool("edit_feature",
+                               {"doc_id": "no_such_doc_xyz",
+                                "feature": "f2", "params": {"radius": 3}})
+        except Exception as exc:  # engine error = the migration executed
+            text = str(exc)
+        else:
+            text = r if isinstance(r, str) else json.dumps(r)
+        assert "unknown_tool" not in text
+        assert "there is no 'edit_feature' tool" not in text
+        assert "no_such_doc_xyz" in text or "no such" in text.lower()
+
+    def test_dispatch_ambiguous_shape_still_teaches(self):
+        from services.agent.agent_turn import _dispatch_tool
+        r = _dispatch_tool("edit_feature", {"doc_id": "d1", "feature": "f2"})
+        assert r["ok"] is False and r["status"] == "unknown_tool"
+        assert "editing is an OP" in r["error"]
+
+    def test_delete_and_add_redirects_exist_for_the_fallback(self):
+        from services.agent.agent_turn import _unresolved_tool_error
+        assert "delete_feature" in _unresolved_tool_error("delete_feature")["error"]
+        assert "add_features" in _unresolved_tool_error("add_feature")["error"]

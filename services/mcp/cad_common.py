@@ -391,9 +391,64 @@ def _dumps(obj: Any) -> str:
     return out
 
 
+def _teach_undo_denied(e: "CoreError") -> str:
+    """The daemon's bare ``undo_denied`` refusal names alternatives without
+    their call shapes — a dead end the model burns completions on. Worse, the
+    usual reason an agent reaches for undo ("remove/alter the feature I just
+    added") is not a checkpoint problem at all: it is an OP inside the
+    modelling batch. The policy is unchanged — this only teaches the way out.
+    """
+    out = {
+        "ok": False,
+        "error": str(e),
+        "code": e.code,
+        "hint": (
+            "undo/redo is refused for agent sessions by daemon policy "
+            "(multi-writer safety) and there is no way to enable it from "
+            "here — retrying undo() will fail identically. What to do instead "
+            "depends on what you actually want:\n"
+            "1) REMOVE or ALTER a feature you just added (the usual reason "
+            "for wanting undo): that is an OP inside the modelling batch, not "
+            "a history operation —\n"
+            "   add_features(doc_id=..., ops=[{\"op\":\"delete_feature\","
+            "\"id\":\"fN\"}])\n"
+            "   add_features(doc_id=..., ops=[{\"op\":\"edit_feature\","
+            "\"id\":\"fN\",\"params\":{...}}])\n"
+            "   get_part(doc_id) / describe_part(doc_id) lists the feature "
+            "ids to target.\n"
+            "2) ROLL THE WHOLE DOCUMENT back to an earlier state: the daemon "
+            "auto-checkpoints before destructive ops via the engine calls "
+            "doc_checkpoint(doc_id) -> {\"checkpoint\": \"<id>\"} and "
+            "doc_revert(doc_id, checkpoint=\"<id>\") — those are "
+            "engine-internal; the tools YOU can call are "
+            "plm_timeline(doc_id=\"...\") to list checkpoints, then "
+            "plm_rollback(to=\"-1\", doc_id=\"...\") to restore one "
+            "(to= a checkpoint id, \"-N\" relative from newest, "
+            "\"turn:<n>\", or \"call:<turn>:<i>\")."
+        ),
+        "alternatives": {
+            "remove_a_feature":
+                'add_features(ops=[{"op":"delete_feature","id":"fN"}])',
+            "alter_a_feature":
+                'add_features(ops=[{"op":"edit_feature","id":"fN","params":{...}}])',
+            "rollback_document":
+                'plm_timeline(doc_id="...") then plm_rollback(to="-1", doc_id="...")',
+            "engine_checkpoint_pair":
+                'doc_checkpoint(doc_id) -> {"checkpoint": id}; '
+                'doc_revert(doc_id, checkpoint=id) — engine-internal, '
+                'already run automatically before destructive ops',
+        },
+    }
+    if e.detail is not None:
+        out["detail"] = e.detail
+    return _dumps(out)
+
+
 def _err(e: Exception) -> str:
     """Render an engine error as a structured, fixable result (not a transport failure)."""
     if isinstance(e, CoreError):
+        if e.code == "undo_denied":
+            return _teach_undo_denied(e)
         out = {"ok": False, "error": str(e)}
         if e.code:
             out["code"] = e.code

@@ -3756,6 +3756,12 @@ _CONCEPT_REDIRECTS: dict[str, str] = {
     "edit_feature": ('editing is an OP, not a tool: '
                      'add_features(ops=[{"op":"edit_feature","id":"f2",'
                      '"params":{...}}]).'),
+    "delete_feature": ('deleting is an OP, not a tool: '
+                       'add_features(ops=[{"op":"delete_feature","id":"f2"}]). '
+                       'get_part() or describe_part() first to see the feature ids.'),
+    "add_feature": ('adding is an OP inside the modelling batch, not a tool: '
+                    'add_features(ops=[{"op":"add_feature","feature":'
+                    '{"type":"box","name":"Lid","params":{...}}}]).'),
     "edit_assembly": ('assembly edits are OPS: add_features(ops=[{"op":'
                       '"asm_edit_component",...}]) / asm_add_mate. '
                       'describe_assembly() shows what is there.'),
@@ -3791,6 +3797,70 @@ def _canonical_tool_name(tool: str) -> str | None:
     if not folded or folded == tool:
         return None
     return folded if _bind_tool(folded) is not None else None
+
+
+# Op-shaped pseudo-tools. A top-level edit_feature/delete_feature/add_feature
+# call carrying a doc_id is NOT a concept confusion — the model knows exactly
+# what it wants; only the SHAPE is wrong (these are ops inside the modelling
+# batch, not tools of their own). Live 2026-07-27 (claude-opus, flyswatter
+# run): edit_feature(doc_id, feature="f2", params={...}) cost a full billed
+# completion on the teaching error even though the mapping is total and
+# unambiguous. Rewrite it to the equivalent add_features(ops=[...]) and
+# execute, exactly as _migrate_ref_slots / _unwrap_enum_dims auto-repair
+# malformed input. Anything that does not map cleanly still gets the teaching
+# error — never a silent guess.
+_OP_TOOL_WORDS = {"edit_feature", "delete_feature", "add_feature"}
+# Spellings of the op's target-feature key, canonical first. Mirrors
+# cad_doc_tools._OP_TARGET_ALIASES so both layers read the same dialect.
+_OP_TOOL_TARGET_KEYS = ("id", "feature_id", "featureId", "feature",
+                        "target", "target_id", "fid")
+
+
+def _migrate_op_tool(tool: str, args: dict) -> tuple[dict, str] | None:
+    """Rewrite an op-shaped pseudo-tool call to add_features(ops=[...]).
+
+    Returns ``(kwargs, note)`` for the migration, or None when the arguments
+    do not map cleanly (unknown leftover keys, a missing/ambiguous target, an
+    edit with no params) — the caller then falls back to the teaching error.
+    """
+    op_word = _fold_tool_name(tool)
+    if op_word not in _OP_TOOL_WORDS:
+        return None
+    a = dict(args or {})
+    doc_id = a.pop("doc_id", None)
+    if not doc_id:
+        return None
+    if op_word == "add_feature":
+        feature = a.pop("feature", None)
+        if feature is None and isinstance(a.get("type"), str):
+            feature = {"type": a.pop("type")}
+            for k in ("name", "params", "refs", "entities"):
+                if k in a:
+                    feature[k] = a.pop(k)
+        if not isinstance(feature, dict) or a:
+            return None
+        op: dict = {"op": "add_feature", "feature": feature}
+    else:
+        found = [(k, a.pop(k)) for k in list(a)
+                 if k in _OP_TOOL_TARGET_KEYS and a.get(k) is not None]
+        if len(found) != 1 or not isinstance(found[0][1], str) \
+                or not found[0][1].strip():
+            return None
+        op = {"op": op_word, "id": found[0][1]}
+        if op_word == "edit_feature":
+            params = a.pop("params", None)
+            # An edit carrying nothing to change is not a clean mapping — let
+            # the teaching error name the full shape instead of guessing.
+            if not isinstance(params, dict) or not params:
+                return None
+            op["params"] = params
+        if a:
+            return None
+    note = (f"interpreted tool '{tool}' as "
+            f"add_features(ops=[{json.dumps(op, sort_keys=True)}]) — "
+            f"{op_word} is an OP inside the modelling batch, not a tool of "
+            f"its own; call add_features directly next time")
+    return {"doc_id": doc_id, "ops": [op]}, note
 
 
 def _unresolved_tool_error(tool: str) -> dict:
@@ -3914,6 +3984,27 @@ def _signature_spec(fn: Any) -> dict:
     return spec
 
 
+# Explicit argument-name synonyms the affix heuristic in _map_arg_name can
+# never reach ("format" shares no prefix/suffix with "fmt"). Live 2026-07-27
+# (claude-opus, flyswatter run): export_part(format="step") was rejected
+# "no parameter of that name and no unambiguous synonym" even though `format`
+# IS the canonical English name of that parameter. Keyed by the NORMALISED
+# supplied name -> normalised target; applied only when exactly one free
+# parameter matches the target and its annotation admits the value, so a
+# synonym can never outvote a real parameter or force a wrong-typed call.
+_ARG_SYNONYMS: dict[str, str] = {
+    "format": "fmt",
+    "fileformat": "fmt",
+}
+
+# Synonyms that are only unambiguous for ONE tool. "type" is far too generic
+# to map globally, but export_part(fmt, path, doc_id) has no other parameter
+# a str `type=` could mean.
+_TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
+    "export_part": {"type": "fmt"},
+}
+
+
 def _norm_arg(name: str) -> str:
     return str(name).lower().replace("_", "").replace("-", "")
 
@@ -3959,13 +4050,16 @@ def _annotation_admits(ann: str, value: Any) -> bool:
     return False
 
 
-def _map_arg_name(supplied: str, value: Any, spec: dict, used: set[str]) -> str | None:
+def _map_arg_name(supplied: str, value: Any, spec: dict, used: set[str],
+                  synonyms: dict[str, str] | None = None) -> str | None:
     """Map a supplied argument name onto a real parameter, or None.
 
     Only UNAMBIGUOUS mappings are made: an exact match ignoring case and
-    underscores, or an affix relation (one name is a prefix/suffix of the other,
-    e.g. shaft_diameter → diameter) that exactly ONE free parameter satisfies
-    and whose annotation admits the supplied value."""
+    underscores, an explicit _ARG_SYNONYMS / per-tool synonym whose target is
+    exactly one free parameter, or an affix relation (one name is a
+    prefix/suffix of the other, e.g. shaft_diameter → diameter) that exactly
+    ONE free parameter satisfies and whose annotation admits the supplied
+    value."""
     free = [p for p in spec["params"] if p not in used]
     ns = _norm_arg(supplied)
     if not ns:
@@ -3973,6 +4067,13 @@ def _map_arg_name(supplied: str, value: Any, spec: dict, used: set[str]) -> str 
     exact = [p for p in free if _norm_arg(p) == ns]
     if exact:
         return exact[0] if len(exact) == 1 else None
+    if synonyms:
+        want = synonyms.get(ns)
+        if want:
+            cand = [p for p in free if _norm_arg(p) == want]
+            if len(cand) == 1 and _annotation_admits(
+                    spec["ann"].get(cand[0], ""), value):
+                return cand[0]
     affix = []
     for p in free:
         np = _norm_arg(p)
@@ -4088,11 +4189,13 @@ def _reconcile_kwargs(tool: str, fn: Any, supplied: dict,
     notes: list[str] = []
     unmapped: list[str] = []
     used = {k for k in supplied if k in params}
+    synonyms = dict(_ARG_SYNONYMS)
+    synonyms.update(_TOOL_ARG_SYNONYMS.get(tool) or {})
     for name, value in (supplied or {}).items():
         if name in params:
             kwargs[name] = value
             continue
-        target = _map_arg_name(name, value, spec, used)
+        target = _map_arg_name(name, value, spec, used, synonyms)
         if target is None:
             unmapped.append(name)
             continue
@@ -4217,6 +4320,7 @@ def _dispatch_tool(
             # Custom turn tool_dispatch has signature (tool, args).
             return _inner(tool, merged or {})
         name, renamed = tool, []
+        call_args = merged or {}
         fn = _bind_tool(tool)
         if fn is None:
             # "add-features" / "mcp__chudware__add_features" can only mean one
@@ -4229,10 +4333,23 @@ def _dispatch_tool(
                 renamed = [f"interpreted tool '{tool}' as '{canon}' — same tool, "
                            f"different punctuation; use '{canon}'"]
         if fn is None:
+            # An op-shaped pseudo-tool (edit_feature/delete_feature/
+            # add_feature with a doc_id) is a total, unambiguous misspelling
+            # of add_features(ops=[...]) — migrate and EXECUTE it instead of
+            # spending a billed completion on the teaching error. Ambiguous
+            # shapes fall through to the teaching error unchanged.
+            migrated = _migrate_op_tool(tool, call_args)
+            if migrated is not None:
+                mig_kwargs, mig_note = migrated
+                mig_fn = _bind_tool("add_features")
+                if mig_fn is not None:
+                    fn, name = mig_fn, "add_features"
+                    call_args, renamed = mig_kwargs, [mig_note]
+        if fn is None:
             # A dead end teaches nothing: say unknown-vs-unbound and name the
             # closest real tools instead of raising a bare KeyError.
             return _unresolved_tool_error(tool)
-        kwargs, notes, arg_error = _reconcile_kwargs(name, fn, merged or {},
+        kwargs, notes, arg_error = _reconcile_kwargs(name, fn, call_args,
                                                      config_keys)
         if arg_error is not None:
             return arg_error

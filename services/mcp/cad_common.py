@@ -6,6 +6,7 @@ Imported by the cad_*_tools family modules; re-exported through the cad_tools fa
 from __future__ import annotations
 
 import contextlib
+import ast
 import json
 import math
 import os
@@ -74,6 +75,104 @@ def _doc_revision(doc_id: str) -> Optional[int]:
 
 
 # --------------------------------------------------------------------------- helpers
+
+# --------------------------------------------------------------------------- model-dialect guards
+# LIVE CRASH (run-97813015264134): the model sent `"feature": "{'type': 'cylinder', ...,
+# 'expr': None}"` — a PYTHON REPR STRING (single-quoted, bare None/True/False) where an
+# object belonged — and a bare `.get()` on it blew up with `'str' object has no attribute
+# 'get'`: a transport-level crash that taught the model nothing. Every tool that reaches into
+# a model-supplied "structured" argument (ops list, feature dict, refs/params, selector list,
+# view spec) MUST run it through this first. json.loads handles the common double-encoded
+# case; ast.literal_eval (Python-literal syntax: single quotes, None/True/False, tuples) is
+# strictly needed for the observed repr shape json.loads cannot parse. Never raises, never
+# stringifies — the ORIGINAL value comes back untouched when neither parses, so a genuine
+# non-string argument (already a dict/list) passes through for free and a genuinely broken
+# string still reaches the caller's own type check (and its teaching error) unchanged.
+def coerce_json_or_repr(value: Any) -> Any:
+    """If `value` is a str that encodes a dict/list/etc as JSON or a Python repr, decode it;
+    otherwise return `value` unchanged. Safe on any input — this never raises."""
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if not s or s[0] not in "{[('\"" and s not in ("None", "True", "False"):
+        return value  # not literal-shaped (e.g. a plain doc_id) — don't even try
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return value
+
+
+def _describe_type(value: Any) -> str:
+    """A short, model-legible description of what was actually received, for teaching errors."""
+    if isinstance(value, str):
+        preview = value if len(value) <= 60 else value[:57] + "..."
+        return f"str ({preview!r})"
+    return type(value).__name__
+
+
+def require_mapping(value: Any, arg_name: str, shape_hint: str = "a JSON object") -> dict:
+    """Coerce + type-check a structured argument that MUST be a mapping (dict). Raises a
+    teaching ValueError naming the argument, the type actually received, and the accepted
+    shape — never lets a bare `.get()`/subscript on the wrong type leak a raw AttributeError/
+    TypeError to the model (the `'str' object has no attribute 'get'` crash)."""
+    coerced = coerce_json_or_repr(value)
+    if not isinstance(coerced, dict):
+        raise ValueError(
+            f"{arg_name} must be {shape_hint} (a mapping), got {_describe_type(value)}. "
+            f"If you meant to send an object, pass real JSON — not a quoted Python repr string.")
+    return coerced
+
+
+def require_list(value: Any, arg_name: str, shape_hint: str = "a JSON array") -> list:
+    """Coerce + type-check a structured argument that MUST be a list (ops batches, refs
+    lists, selector lists). A bare scalar/dict is wrapped as a single-element list ONLY when
+    it plainly isn't itself a stringified list (models routinely send one op object instead
+    of a one-item batch); anything else raises the same teaching shape as `require_mapping`."""
+    coerced = coerce_json_or_repr(value)
+    if isinstance(coerced, list):
+        return coerced
+    if isinstance(coerced, tuple):
+        return list(coerced)
+    if isinstance(coerced, dict):
+        return [coerced]  # one op/ref sent bare instead of wrapped in a batch
+    raise ValueError(
+        f"{arg_name} must be {shape_hint} (a list), got {_describe_type(value)}. "
+        f"If you meant to send a list, pass real JSON — not a quoted Python repr string.")
+
+
+# Words a model sends to mean "I am explicitly leaving this OPTIONAL slot empty" instead of
+# omitting the argument — the same vocabulary cad_doc_tools' add_features refs-slot fix
+# teaches (live 2026-07-28: refs.faces:"none" and refs.remove:[] were both hard-rejected
+# instead of read as "no selection"). Shared here so every OTHER selector-taking tool
+# (asm_mate operand shape, simulate_motion/motion_fea_handoff mate_id, drawing view_id, …)
+# treats the same placeholder words the same way instead of rejecting them one-by-one.
+_EMPTY_SLOT_WORDS = frozenset({"none", "null", "nil", "nothing", "no", "n_a", "na",
+                               "", "empty", "undefined", "not_applicable"})
+
+
+def _is_empty_slot_word(v: Any) -> bool:
+    """True when `v` is a string a model sent to mean "nothing here" (case/punct-insensitive
+    match against _EMPTY_SLOT_WORDS), or an empty list/tuple/dict. `None` is NOT included —
+    it already means "omitted" in Python and callers usually branch on it separately."""
+    if isinstance(v, str):
+        return re.sub(r"[^a-z0-9]+", "_", v.strip().lower()).strip("_") in _EMPTY_SLOT_WORDS
+    if isinstance(v, (list, tuple, dict)):
+        return len(v) == 0
+    return False
+
+
+def _normalize_optional_slot(v: Any) -> Any:
+    """Collapse an explicit empty-placeholder value ('', "none", "null", [], {}, …) to `None`
+    so an OPTIONAL id/selector argument reads identically whether the model omitted it or
+    explicitly emptied it — instead of failing a literal lookup for a mate/view/component
+    named "none". Non-empty values pass through unchanged."""
+    if v is None or _is_empty_slot_word(v):
+        return None
+    return v
 
 
 def _face_hist(doc_id: str) -> dict:

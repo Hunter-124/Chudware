@@ -137,6 +137,20 @@ _REMOVAL_WORDS = frozenset({
     "carve", "excavate", "recess", "cutout", "cut_out", "notch",
 })
 
+# Live "suppress"->set_suppressed (dbg-fix5-1: {"op":"suppress","target":"f3"} got
+# "closest: set_suppressed, ..." only because "suppress" is a SUBSTRING of
+# "set_suppressed" — plain scoring luck. Its natural sibling "unsuppress" (and the
+# analogous "change_units" for set_units) share NO substring with the canonical name,
+# so _score_match returns 0 for them and the model falls into the generic "nothing is
+# close" vocabulary dump instead of a precise pointer. Each entry here maps to exactly
+# ONE real op — there is no other doc op an "unsuppress"/"change_units" call could mean.
+_OP_SYNONYMS: dict[str, str] = {
+    "unsuppress": "set_suppressed",
+    "un_suppress": "set_suppressed",
+    "change_units": "set_units",
+    "convert_units": "set_units",
+}
+
 
 def doc_op_kinds() -> list[str]:
     return list(DOC_OP_KINDS)
@@ -144,8 +158,13 @@ def doc_op_kinds() -> list[str]:
 
 def suggest_doc_ops(unknown: str, n: int = 5,
                     feature_types: Iterable[str] | None = None) -> list[str]:
-    """Closest N op kinds. Feature-type confusion pins ``add_feature`` first."""
+    """Closest N op kinds. Feature-type confusion pins ``add_feature`` first.
+
+    An exact hit in ``_OP_SYNONYMS`` is pinned first — those names have no shared
+    substring with their real op, so plain scoring would otherwise miss them.
+    """
     q = (unknown or "").lower()
+    synonym = _OP_SYNONYMS.get(q)
     scored = [(_score_match(q, k), k) for k in DOC_OP_KINDS]
     ftypes = list(feature_types) if feature_types is not None else list(COMMON_FEATURE_TYPES)
     is_ft = any(
@@ -159,7 +178,10 @@ def suggest_doc_ops(unknown: str, n: int = 5,
     scored.sort(key=lambda p: (-p[0], p[1]))
     # A zero score is "no genuine relation" (see _score_match). A misleading list is
     # worse than none: it sent a model chasing eq_set/rename after writing op:"cut".
-    return [k for sc, k in scored[: max(0, n)] if sc > 0]
+    rest = [k for sc, k in scored[: max(0, n)] if sc > 0]
+    if synonym is None:
+        return rest
+    return [synonym] + [k for k in rest if k != synonym][: max(0, n - 1)]
 
 
 def unknown_doc_op_message(index: int, kind: str,

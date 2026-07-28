@@ -141,3 +141,40 @@ class TestToolNameFolding:
         """difflib scored hyphenated names against underscore names poorly."""
         err = at._unresolved_tool_error("describe-parts")
         assert "describe_part" in err["closest_tools"]
+
+class TestClassAAdvertisedToolsBind:
+    """Main's ledger forensics (2026-07-28, ``local://ledger-gaps.md``) flagged
+    ``"tool 'X' could not be resolved"`` — 65+ occurrences across cycle-1-real-r2/
+    r3/r4-cuda, local-1 and post-mega* bench batches — as the single highest-
+    frequency agent-facing failure in the corpus. All of those ledgers predate
+    2026-07-26 (commit 2b40e2cd, "bind 93 dead tools, teach bad args, widen
+    ledger vocabulary"), which rewrote ``_bind_tool`` to fall back onto the
+    real MCP server registry instead of ``reviewer_exec``'s hand-maintained
+    module list. This class proves the fix still holds for every name in that
+    report: a regression here means Class A silently reopened.
+    """
+
+    @pytest.mark.parametrize("name", [
+        "ledger_get", "ledger_note", "ask_user", "dag_plan", "dag_status",
+        "buildgraph_plan", "buildgraph_status", "describe_project",
+        "describe_part", "part_search", "part_place", "fit_calc",
+        "council_convene", "dag_replan",
+    ])
+    def test_advertised_tool_binds_outside_a_mission(self, name):
+        assert at._bind_tool(name) is not None, (
+            f"{name!r} is advertised (role card / MCP registry) but "
+            f"_bind_tool returned None — Class A has reopened for this name")
+
+    def test_delegate_is_correctly_diagnosed_as_mission_scoped_not_dead(self):
+        """``delegate`` is the one name in the report that genuinely does NOT
+        bind outside a mission — it lives on ``MissionDispatch`` (needs a
+        live ledger/run_id/delegation tree), not the MCP server registry.
+        That is not a dead advertisement: the error must say so precisely,
+        not hand back the old bare "could not be resolved"."""
+        assert at._bind_tool("delegate") is None
+        assert "delegate" in at._known_tool_names()
+        err = at._unresolved_tool_error("delegate")
+        assert err["status"] == "known_but_unbound"
+        assert err["harness_bug"] is True
+        assert "mission" in err["error"].lower()
+        assert "could not be resolved" in err["error"]

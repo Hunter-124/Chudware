@@ -5242,3 +5242,37 @@ accepted, nothing newly rejected, only the text. The substring contracts consume
 pattern-match on are preserved deliberately: core/agent/run.cpp::looks_like_unknown_op_error
 still finds "is not a feature type" / "unknown op" / "no compiler for feature type", and
 services/mcp/test_bugreport_tools.py still finds "not a sketch entity type".
+
+Parallel gap sweep across the rest of the tooling (2026-07-28), five agents, driven by the
+same six classes the live orb run exposed. Two of the five findings were CORRECTIONS to the
+forensics rather than fixes, which is the right outcome: the ledger corpus spans months, so
+a class can be real in the data and already dead in the code.
+- Ledger forensics (32 live runs, 93 bench ledgers) ranked "tool 'X' could not be resolved"
+  (65+) and "register_*_tools.<locals>.X() got an unexpected keyword argument" (20+) as the
+  top two agent-facing failures. BOTH were verified stale: commit 2b40e2cd (2026-07-26)
+  already rebound the tools and added `_reconcile_kwargs`. 13/14 named tools bind today;
+  the 14th (`delegate`) correctly refuses outside a mission and says why. Pinned by
+  services/agent/test_tool_binding_gaps.py::TestClassAAdvertisedToolsBind so it cannot
+  silently reopen.
+- STILL OPEN, and a genuinely new find: `_reconcile_kwargs` lives on the agent_turn path
+  ONLY. A real MCP client calling FastMCP directly gets none of it —
+  `cam_set_stock(setup=…)` (the natural synonym for `setup_id`) raises a raw pydantic
+  ToolError with no synonym mapping and no teaching text. The synonym layer is on the wrong
+  side of the transport boundary; it belongs at registration or in FastMCP middleware.
+- Fixed: `coerce_json_or_repr` / `require_mapping` / `require_list` in cad_common.py, then
+  applied across cad_asm_tools.py, cam_tools.py, cad_drawing_tools.py. Three of those were
+  worse than crashes — `simulate_motion` SILENTLY DISCARDED a stringified `dynamics` config
+  and ran defaults, and `motion_fea_handoff` iterated a stringified fixtures list CHARACTER
+  BY CHARACTER into garbage face queries. Reported unswept: plm, sim, gsl, sketch3d, parts,
+  reveng, ecad.
+- `asm_mate` accepted only the exact `{"component","query"}` dict; a bare component id, a
+  one-element list, and `{"kind":"component","id":…}` were all pydantic-blocked before our
+  code ran ("Input should be a valid dictionary" — contentless). All three are reshaped now;
+  a genuinely empty ref gets a teaching error instead of a guess.
+Separately, a PRE-EXISTING test failure was diagnosed rather than inherited:
+test_cad_tools.py::test_engine_builds_from_the_dimension_dialect calls new_part("dialect_unit")
+three times, and new_part RESUMES a part of the same name by design — so the second cube was
+built inside the first and the engine rightly said "boss added no material". Verified failing
+at d2d88005 (before this session) in a pinned worktree. The test now uses distinct names, and
+new_part's resume note reports the feature count it resumed onto, so an agent that believes it
+started an empty part is told otherwise before it builds a second body at the origin.

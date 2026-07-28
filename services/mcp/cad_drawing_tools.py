@@ -13,6 +13,9 @@ from .cad_common import (
     _resolve_drawing_view_id,
     _tmp,
     cb,
+    coerce_json_or_repr,
+    require_list,
+    require_mapping,
     sh,
 )
 
@@ -64,6 +67,13 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": False,
                                "error": f"make_drawing: document {d!r} has no geometry to draw"})
 
+            # LIVE-DIALECT guard: `views`/`sections` used to forward a stringified list
+            # untouched to the engine (a contentless engine-side rejection); `title` used to
+            # SILENTLY drop a stringified dict via the bare isinstance() check (no error at
+            # all — the class-5 "reports success but ignored the arg" failure). Coerce all three.
+            views = require_list(views, "views", 'a list of view names, e.g. ["front","top"]') if views else None
+            sections = require_list(sections, "sections", "a list of section-request dicts") if sections else None
+            title = require_mapping(title, "title", "a title-block fields dict") if title else None
             spec = {"views": views or ["front", "top", "right", "iso"],
                     "model_items": bool(model_items), "hole_callouts": bool(hole_callouts)}
             if sections:
@@ -243,6 +253,11 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            # LIVE-DIALECT guard: point args as stringified lists used to forward untouched
+            # to the engine, producing a contentless engine-side rejection.
+            a = require_list(a, "a", "a [x,y] sheet-mm point")
+            b = require_list(b, "b", "a [x,y] sheet-mm point")
+            pos = require_list(pos, "pos", "a [x,y] sheet-mm point") if pos else None
             # D7: resolve orientation strings ("front"/"top"/…) to numeric view ids.
             view_id = _resolve_drawing_view_id(d, view_id)
             params = {"doc_id": d, "view_id": view_id, "type": dtype, "a": a, "b": b}
@@ -274,10 +289,15 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            # LIVE-DIALECT guard: point args / `datums` as stringified lists — `for it in
+            # datums` would otherwise iterate a string's CHARACTERS silently.
+            a = require_list(a, "a", "a [x,y] sheet-mm point")
+            pos = require_list(pos, "pos", "a [x,y] sheet-mm point")
+            datums = require_list(datums, "datums", 'a list of datum letters, e.g. ["A","B"]') if datums else []
             # D7: resolve orientation strings ("front"/"top"/…) to numeric view ids.
             view_id = _resolve_drawing_view_id(d, view_id)
             dl = []
-            for it in (datums or []):
+            for it in datums:
                 dl.append(it if isinstance(it, dict) else {"ref": str(it)})
             spec = {"symbol": symbol, "tol_value": tolerance, "tol_diameter": bool(diameter),
                     "tol_modifier": modifier, "datums": dl, "a": a, "pos": pos}
@@ -298,6 +318,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            a = require_list(a, "a", "a [x,y] sheet-mm point")
+            pos = require_list(pos, "pos", "a [x,y] sheet-mm point")
             # D7: resolve orientation strings ("front"/"top"/…) to numeric view ids.
             view_id = _resolve_drawing_view_id(d, view_id)
             spec = {"label": label, "a": a, "pos": pos}
@@ -315,6 +337,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         machining: any|required|prohibited. a is the surface point, pos the symbol (sheet mm)."""
         try:
             d = _doc(doc_id)
+            a = require_list(a, "a", "a [x,y] sheet-mm point")
+            pos = require_list(pos, "pos", "a [x,y] sheet-mm point")
             spec = {"value": ra, "machining": machining, "all_around": bool(all_around),
                     "a": a, "pos": pos}
             r = cb.call("drawing_add_surface_finish", {"doc_id": d, "view_id": view_id, "spec": spec})
@@ -362,6 +386,9 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            # LIVE-CRASH guard: `sorted(fields.keys())` blows up on a stringified fields dict
+            # with a bare AttributeError (identical shape to run-97813015264134).
+            fields = require_mapping(fields, "fields", "a title-block fields dict")
             r = cb.call("drawing_set_titleblock", {"doc_id": d, "sheet_id": "s1", "fields": fields})
             tb = r.get("title_block") or {}
             return _dumps({"ok": True, "sheet_id": r.get("sheet_id", "s1"),

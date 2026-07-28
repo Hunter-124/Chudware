@@ -19,7 +19,10 @@ from mcp.server.fastmcp import FastMCP
 
 from . import core_bridge as cb
 from .core_bridge import CoreError
-from .cad_common import _sanitize_output_path, _wire_materials_registry  # engine-side registry env default
+from .cad_common import (  # engine-side registry env default + model-dialect guards
+    _describe_type, _sanitize_output_path, _wire_materials_registry,
+    coerce_json_or_repr, require_mapping,
+)
 from .cad_tools import _CUR  # the "current part" doc_id (shared with the modeling tools)
 
 # The "current CAM job" so single-argument calls just work.
@@ -102,7 +105,10 @@ def add_tool_from_dict(tool: dict) -> dict:
     ``cam_tool_import`` tool (services/mcp/parts_tools.py). Fills the same
     defaults cam_add_tool historically applied; raises when no CAM job is
     current (callers surface that as data)."""
-    t = dict(tool or {})
+    # LIVE-DIALECT guard: `dict(tool or {})` crashes on a stringified tool dict (a bare
+    # ValueError with no naming of the offence) — this seam is shared with parts_tools.py's
+    # cam_tool_import, which forwards a model-supplied `tool` verbatim. Coerce first.
+    t = dict(require_mapping(tool, "tool", "a tool dict, e.g. {'number':1,'type':'endmill_flat'}")) if tool else {}
     number = int(t.get("number", 0))
     t.setdefault("type", "endmill_flat")
     t.setdefault("diameter", 6.0)
@@ -229,6 +235,8 @@ def register_cam_tools(mcp: FastMCP) -> None:
         feeds row)."""
         try:
             resolved, note = _resolve_cam_material(material)
+            # LIVE-DIALECT guard: `dict(stock or {...})` crashes on a stringified stock dict.
+            stock = require_mapping(stock, "stock", "a stock dict, e.g. {'type':'box_offset'}") if stock else None
             st = dict(stock or {"type": "box_offset", "off_ztop": 1.0})
             st["material"] = resolved
             mach: dict = {"kind": machine}
@@ -285,7 +293,9 @@ def register_cam_tools(mcp: FastMCP) -> None:
                         mach[dst] = hit[src]
             setup = {"name": name, "machine": mach, "stock": st}
             if wcs:
-                setup["wcs"] = wcs
+                # LIVE-DIALECT guard: a stringified `wcs` would otherwise pass through
+                # untouched to the engine and produce a contentless engine-side rejection.
+                setup["wcs"] = require_mapping(wcs, "wcs", "a WCS dict, e.g. {'origin':[x,y,z]}")
             r = _apply([{"op": "add_setup", "setup": setup, "ref": "_s"}])
             r["setup_id"] = r.get("id_map", {}).get("_s")
             if note:
@@ -305,6 +315,10 @@ def register_cam_tools(mcp: FastMCP) -> None:
         from_sim form: {"type":"from_sim","setup_id":"<id>"} uses the remaining
         stock mesh from a prior cam_simulate of that setup."""
         try:
+            # LIVE-CRASH guard (identical shape to run-97813015264134's `'str' object has
+            # no attribute 'get'`): `stock.get(...)` below blows up on a stringified stock
+            # dict with a bare AttributeError. Coerce/type-check first.
+            stock = require_mapping(stock, "stock", "a stock dict, e.g. {'type':'box',...}")
             r = _apply([{"op": "set_stock", "setup_id": setup_id, "stock": stock}])
             r["changes"] = f"stock on setup {setup_id} set to type={stock.get('type', '?')}"
             return _dumps(r)
@@ -325,6 +339,12 @@ def register_cam_tools(mcp: FastMCP) -> None:
         stepdown, stock_to_leave, direction, lead_in/out, cycle, peck, comp_side, ...).
         Feeds/speeds auto-resolve from material+tool unless you pin rpm/feed/etc in params."""
         try:
+            # LIVE-DIALECT guard: `geometry.get(k)` below (and the bare `op.update(params)`)
+            # crash on stringified dicts — same shape as the run-97813015264134 'str' object
+            # has no attribute 'get' failure. Coerce each optional structured arg up front.
+            geometry = require_mapping(geometry, "geometry", "a geometry dict") if geometry else None
+            heights = require_mapping(heights, "heights", "a heights dict, e.g. {'clearance':5}") if heights else None
+            params = require_mapping(params, "params", "an op-params dict, e.g. {'stepover':2}") if params else None
             op: dict = {"type": type, "tool_number": tool_number}
             if name:
                 op["name"] = name
@@ -353,6 +373,8 @@ def register_cam_tools(mcp: FastMCP) -> None:
     def cam_update_operation(op_id: str, params: dict) -> str:
         """Update fields on an existing operation (merge). e.g. {"stepover":2,"feed":900}."""
         try:
+            # LIVE-CRASH guard: `params.keys()` blows up on a stringified params dict.
+            params = require_mapping(params, "params", "an op-params dict, e.g. {'stepover':2}")
             r = _apply([{"op": "update_operation", "op_id": op_id, "operation": params}])
             keys = ", ".join(sorted(params.keys())) if params else "(no fields given)"
             r["changes"] = f"operation {op_id} updated: {keys}"

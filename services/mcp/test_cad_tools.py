@@ -1629,6 +1629,120 @@ def test_assembly_tools_end_to_end(tmp_path):
     _call("close_part", {"doc_id": plate})
 
 
+def test_asm_mate_operand_shapes(tmp_path):
+    """Class-2/4 selector-shape gaps in asm_mate `a`/`b` — hunted alongside cad_doc_tools'
+    refs.base/refs.tool boolean-operand fix. A bare component-id string, a one-element list
+    wrapping the operand dict, and the {"kind":"component","id":...} selector shape other ref
+    slots use are all read-equivalent to {"component": "kN", "query": ...} instead of being
+    hard-rejected; a genuinely empty/placeholder operand still raises a teaching error."""
+    r, _ = _call("new_part", {"name": "op_plate"})
+    plate = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": plate, "ops": [
+        cb.feat("box", "Plate", {"length": cb.dim(60), "width": cb.dim(40),
+                                 "height": cb.dim(10)}),
+        cb.feat("hole", "Bore", {"style": "simple", "end": "through_all",
+                                 "diameter": cb.dim(8), "positions": [[15, 5]]},
+                {"face": {"of": "face", "side": "top"}}),
+    ]})
+    assert r["ok"], r
+    plate_path = str(tmp_path / "op_plate.step+")
+    _call("save_part", {"doc_id": plate, "path": plate_path})
+
+    r, _ = _call("new_part", {"name": "op_pin"})
+    pin = r["doc_id"]
+    _call("add_features", {"doc_id": pin, "ops": [
+        cb.feat("cylinder", "Pin", {"radius": cb.dim(4), "height": cb.dim(20)})]})
+    pin_path = str(tmp_path / "op_pin.step+")
+    _call("save_part", {"doc_id": pin, "path": pin_path})
+
+    r, _ = _call("new_assembly", {"name": "op_asm"})
+    asm = r["doc_id"]
+    _call("asm_add_component", {"doc_id": asm, "path": plate_path, "fixed": True})
+    _call("asm_add_component", {"doc_id": asm, "path": pin_path, "at": [15, 5, 30]})
+
+    good_query = {"of": "face", "surf": "round"}
+
+    # bare component-id string in place of {"component": "kN"} (query defaults to "top",
+    # exactly like the dict path already does when `query` is omitted).
+    r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric", "solve": False,
+                              "a": "k1", "b": {"component": "k2", "query": good_query}})
+    assert r["ok"] and r["mate"], r
+
+    # one-element list wrapping the operand dict.
+    r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric", "solve": False,
+                              "a": [{"component": "k1", "query": good_query}],
+                              "b": {"component": "k2", "query": good_query}})
+    assert r["ok"] and r["mate"], r
+
+    # {"kind":"component","id":...} selector shape (the pattern other ref slots use).
+    r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric", "solve": False,
+                              "a": {"kind": "component", "id": "k1", "query": good_query},
+                              "b": {"component": "k2", "query": good_query}})
+    assert r["ok"] and r["mate"], r
+
+    # genuinely empty operand still teaches instead of guessing.
+    r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric", "solve": False,
+                              "a": "none", "b": {"component": "k2", "query": good_query}})
+    assert r["ok"] is False and "empty" in r["error"], r
+
+    r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric", "solve": False,
+                              "a": {}, "b": {"component": "k2", "query": good_query}})
+    assert r["ok"] is False and "component" in r["error"], r
+
+    # a multi-item list is ambiguous, not silently the first element.
+    r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric", "solve": False,
+                              "a": [{"component": "k1", "query": good_query},
+                                    {"component": "k1", "query": good_query}],
+                              "b": {"component": "k2", "query": good_query}})
+    assert r["ok"] is False and "list" in r["error"], r
+
+    _call("close_part", {"doc_id": asm})
+    _call("close_part", {"doc_id": pin})
+    _call("close_part", {"doc_id": plate})
+
+
+def test_simulate_motion_mate_id_placeholder(tmp_path):
+    """Class-2 selector-shape gap: simulate_motion's mate_id="" / "none" / "null" must read
+    the same as omitting it (auto-pick), not fail a literal lookup for a mate named that."""
+    r, _ = _call("new_part", {"name": "mp_plate"})
+    plate = r["doc_id"]
+    _call("add_features", {"doc_id": plate, "ops": [
+        cb.feat("box", "Plate", {"length": cb.dim(60), "width": cb.dim(40),
+                                 "height": cb.dim(10)})]})
+    plate_path = str(tmp_path / "mp_plate.step+")
+    _call("save_part", {"doc_id": plate, "path": plate_path})
+
+    r, _ = _call("new_part", {"name": "mp_arm"})
+    arm = r["doc_id"]
+    _call("add_features", {"doc_id": arm, "ops": [
+        cb.feat("cylinder", "Arm", {"radius": cb.dim(4), "height": cb.dim(20)})]})
+    arm_path = str(tmp_path / "mp_arm.step+")
+    _call("save_part", {"doc_id": arm, "path": arm_path})
+
+    r, _ = _call("new_assembly", {"name": "mp_asm"})
+    asm = r["doc_id"]
+    _call("asm_add_component", {"doc_id": asm, "path": plate_path, "fixed": True})
+    _call("asm_add_component", {"doc_id": asm, "path": arm_path, "at": [10, 10, 30]})
+    r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "distance", "value": 5.0,
+                              "solve": True,
+                              "a": {"component": "k1", "query": {"of": "face", "side": "top"}},
+                              "b": {"component": "k2", "query": {"of": "face", "side": "bottom"}}})
+    assert r["ok"], r
+
+    baseline, _ = _call("simulate_motion", {"doc_id": asm, "stop": 10.0, "steps": 3,
+                                            "check_interference": False})
+    assert baseline["ok"], baseline
+
+    for placeholder in ("", "none", "None", "null", "N/A"):
+        r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": placeholder, "stop": 10.0,
+                                         "steps": 3, "check_interference": False})
+        assert r["ok"] and r["mate_id"] == baseline["mate_id"], (placeholder, r)
+
+    _call("close_part", {"doc_id": asm})
+    _call("close_part", {"doc_id": arm})
+    _call("close_part", {"doc_id": plate})
+
+
 # ------------------------------------------------------------------ LLM placement dialect
 # A live run died on the op below: the model spelled a cylinder's placement the way most CAD
 # APIs do — placement:{origin,direction} + boolean:"union" — and the engine's now-CLOSED
@@ -1902,7 +2016,10 @@ def test_engine_builds_from_the_dimension_dialect():
 
     # unit-suffixed cubes: "25mm" == "2.5cm", and 1in is 25.4mm on a side
     for spelling, side in (("25mm", 25.0), ("2.5cm", 25.0), ("1in", 25.4)):
-        cube = _call("new_part", {"name": "dialect_unit"})[0]["doc_id"]
+        # Distinct names per spelling: new_part RESUMES a part of the same name (that is
+        # its contract), so reusing "dialect_unit" built the second cube INSIDE the first
+        # and the engine rightly answered "boss added no material".
+        cube = _call("new_part", {"name": f"dialect_unit_{spelling}"})[0]["doc_id"]
         r, _ = _call("add_features", {"doc_id": cube, "ops": [
             {"op": "add_feature", "feature": {
                 "type": "box", "name": "C",

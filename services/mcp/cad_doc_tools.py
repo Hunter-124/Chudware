@@ -4078,11 +4078,19 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     # next add_features' write-diff ("0.0 -> X" instead of the true delta).
                     # Only seed it if this process has never tracked this doc before.
                     _LAST_VOLUME.setdefault(did, existing[0].get("volume", 0.0))
+                    # Say what was RESUMED, not just that it was. An agent that believes
+                    # it started an empty part builds its next body at the origin and gets
+                    # "boss added no material (it is buried inside the body)" — an error
+                    # about geometry for what is really a document mix-up.
+                    built = existing[0].get("feature_count")
+                    carries = (f"; it already carries {built} feature(s) — build ON them, "
+                               f"or call new_part(fresh=True) for an empty document"
+                               if isinstance(built, int) and built > 0 else "")
                     out = {"ok": True, "doc_id": did, "name": existing[0].get("name") or name,
                            "revision": existing[0].get("revision", 0), "reused": True,
+                           "feature_count": built,
                            "note": f'resumed the existing part "{name}" (doc_id={did}) instead '
-                                   "of minting a duplicate; call new_part(fresh=True) to force "
-                                   "a separate document"}
+                                   "of minting a duplicate" + carries}
                     return _dumps(out)
             r = cb.call("doc_new", {"kind": "part", "name": name})
             did = r.get("doc_id")

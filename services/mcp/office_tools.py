@@ -614,7 +614,14 @@ def register_office_tools(mcp) -> None:
                             "PDF text content cannot be edited directly — extract to docx, "
                             "edit, then re-export to PDF via render_document")
             else:
-                return _err("invalid_op", f"unknown op '{kind}'")
+                # class-3 CONTENTLESS ERROR: this used to name neither the offending
+                # value nor the accepted vocabulary — "unknown op 'x'" and nothing
+                # else. The vocabulary here is closed and small; say it.
+                return _err("invalid_op",
+                            f"unknown op '{kind}'. PDF ops: rotate, delete, merge, "
+                            f"set_metadata (page-level only — edit_text/replace_text/"
+                            f"reflow are recognized but unsupported, see reason "
+                            f"'unsupported_op' above)")
         dest = out_path or path
         try:
             with open(dest, "wb") as f:

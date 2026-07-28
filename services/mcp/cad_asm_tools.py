@@ -10,16 +10,21 @@ from .cad_common import (
     _CUR,
     _autosave,
     _autosave_all_open,
+    _describe_type,
     _doc,
     _dumps,
     _err,
+    _is_empty_slot_word,
     _merge_face_sets,
+    _normalize_optional_slot,
     _persist_study,
     _publish_current,
     _resolve_face_points,
     _resolve_material,
     _tmp,
     cb,
+    coerce_json_or_repr,
+    require_list,
     sh,
 )
 
@@ -152,8 +157,50 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
 
 
+    def _normalize_mate_operand(tag: str, raw) -> dict:
+        """Reshape asm_mate's `a`/`b` operand into {"component": "kN", "query": ...}.
+
+        Besides the canonical dict, accepts: a one-element list wrapping it (the same
+        list-vs-object confusion cad_doc_tools' refs.base/refs.tool fix normalizes for
+        boolean operands); a bare component-id string ("k1" instead of {"component":"k1"} —
+        `query` then defaults to "top" exactly as it already does when the dict omits it);
+        and the {"kind":"component","id":"k1",...} selector shape models reach for because
+        OTHER ref slots use it. A multi-item list or a genuinely empty/placeholder value
+        raises a teaching ValueError instead of guessing which component was meant.
+        """
+        v = coerce_json_or_repr(raw)
+        if isinstance(v, list):
+            if len(v) != 1:
+                raise ValueError(
+                    f"{tag} must name ONE component ({{'component': 'kN', 'query': ...}}, "
+                    f"or a bare component id) — got a {len(v)}-item list. asm_mate mates "
+                    f"exactly two single component faces per call.")
+            v = coerce_json_or_repr(v[0])
+        if isinstance(v, str):
+            s = v.strip()
+            if not s or _is_empty_slot_word(s):
+                raise ValueError(
+                    f"{tag} is empty — asm_mate needs a component on both sides "
+                    f"({{'component': 'kN', 'query': ...}} or a bare component id string).")
+            return {"component": s}
+        if isinstance(v, dict):
+            if "component" not in v and v.get("kind") in ("component", "part") and v.get("id"):
+                out = {"component": v["id"]}
+                if "query" in v:
+                    out["query"] = v["query"]
+                return out
+            if "component" not in v:
+                raise ValueError(
+                    f"{tag} must be {{'component': 'kN', 'query': ...}}, got a dict "
+                    f"with keys {sorted(v)} (missing 'component').")
+            return v
+        raise ValueError(f"{tag} must be {{'component': 'kN', 'query': ...}}, got "
+                          f"{_describe_type(raw)}")
+
+
     @mcp.tool()
-    def asm_mate(mate_type: str, a: dict, b: dict, value: Optional[float] = None,
+    def asm_mate(mate_type: str, a: Union[dict, str, list], b: Union[dict, str, list],
+                 value: Optional[float] = None,
                  align: str = "aligned", solve: bool = True,
                  doc_id: Optional[str] = None) -> str:
         """Add a MATE between two components of the current assembly (and solve it).
@@ -180,11 +227,17 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             if not comps:
                 return _dumps({"ok": False, "error": "assembly has no components — "
                                "asm_add_component first (or is this a part doc?)"})
+            # LIVE-DIALECT (run-97813015264134 pattern): a model can send `a`/`b` as a
+            # stringified dict ("{'component': 'k1', ...}"), a bare component-id string, a
+            # one-element list, or the {"kind":"component","id":...} selector shape other ref
+            # slots use — _normalize_mate_operand reshapes every equivalent form; only a
+            # genuinely unresolvable value raises.
             refs = []
-            for tag, ref in (("a", a), ("b", b)):
-                if not isinstance(ref, dict) or "component" not in ref:
-                    return _dumps({"ok": False, "error":
-                                   f"{tag} must be {{'component': 'kN', 'query': ...}}"})
+            for tag, raw in (("a", a), ("b", b)):
+                try:
+                    ref = _normalize_mate_operand(tag, raw)
+                except ValueError as e:
+                    return _dumps({"ok": False, "error": str(e)})
                 kid = ref["component"]
                 if kid not in comps:
                     return _dumps({"ok": False, "error": f"{tag}: no component '{kid}' "
@@ -353,6 +406,10 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                                  "no mates added). Build/open an assembly with mates first.")
             drivable = [m for m in mates
                         if m.get("type") in _DRIVABLE_MATE_TYPES and not m.get("suppressed")]
+            # LIVE-DIALECT pattern (refs.faces:"none" analogue): a model saying mate_id="" /
+            # "none" MEANS "no specific mate — auto-pick", the same as omitting the arg. A
+            # literal lookup for a mate named "none" always fails, so normalize first.
+            mate_id = _normalize_optional_slot(mate_id)
             if mate_id is None:
                 if len(drivable) == 1:
                     mate = drivable[0]
@@ -473,11 +530,16 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             # Kinematics-only calls never reach this branch — their result shape is
             # regression-frozen above.
             if dynamics is not None:
+                # LIVE-DIALECT guard: a stringified `dynamics` dict used to fail the bare
+                # isinstance() check and get silently replaced with {} — turning dynamics ON
+                # but discarding every config the model actually sent, with no error at all
+                # (the class-5 "reports success but did the wrong thing" failure). Coerce first.
+                dyn = coerce_json_or_repr(dynamics)
                 r_dyn = cb.call("simulate_motion", {
                     "doc_id": d, "mate_id": mate_id, "start": float(start),
                     "stop": float(stop), "steps": int(steps),
                     "check_interference": False, "min_clearance_mm": 0.0,
-                    "dynamics": dynamics if isinstance(dynamics, dict) else {}})
+                    "dynamics": dyn if isinstance(dyn, dict) else {}})
                 out["dynamics"] = r_dyn.get("dynamics") or {
                     "warnings": ["engine returned no dynamics block"]}
             return _dumps(out)
@@ -532,6 +594,17 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            # LIVE-DIALECT guard: `fixtures` is iterated bare (`for q in fixtures`) below —
+            # a stringified list ("[{'of': 'face', ...}]") would silently iterate its
+            # CHARACTERS instead of raising cleanly. Coerce/type-check up front.
+            fixtures = require_list(fixtures, "fixtures",
+                                     'a list of face queries, e.g. ["bottom"] or '
+                                     '[{"of":"face","near":[x,y,z]}]')
+            # Same "no specific mate" placeholder as simulate_motion (mate_id="" / "none" /
+            # "null") — normalize BEFORE it's used to pick `start`'s default below, or the
+            # literal-string lookup silently misses and `start` is computed from the wrong
+            # (or no) mate while the later simulate_motion call auto-picks a different one.
+            mate_id = _normalize_optional_slot(mate_id)
             if stop is None:
                 raise ValueError("motion_fea_handoff: `stop` is required (end of the sweep).")
             mates = _asm_mates(d)

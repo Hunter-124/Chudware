@@ -39,6 +39,28 @@ def test_unknown_box_points_at_add_feature():
     sug = suggest_doc_ops("box", 5)
     assert sug[0] == "add_feature"
 
+def test_suppress_synonym_resolves_by_substring_luck():
+    """Live dbg-fix5-1: {"op":"suppress","target":"f3"} -> closest lists
+    set_suppressed first (a substring match, not a curated alias)."""
+    from services.mcp.op_registry import suggest_doc_ops
+    sug = suggest_doc_ops("suppress", 5)
+    assert sug[0] == "set_suppressed"
+
+
+def test_op_synonyms_without_shared_substring_still_resolve():
+    """"unsuppress"/"change_units" share NO substring with their real op, so
+    plain scoring returns nothing for them (see _score_match) — the curated
+    _OP_SYNONYMS table is what rescues these siblings of the observed
+    "suppress" failure (dbg-fix5-1)."""
+    from services.mcp.op_registry import suggest_doc_ops, unknown_doc_op_message
+    assert suggest_doc_ops("unsuppress", 5)[0] == "set_suppressed"
+    assert suggest_doc_ops("un_suppress", 5)[0] == "set_suppressed"
+    assert suggest_doc_ops("change_units", 5)[0] == "set_units"
+    assert suggest_doc_ops("convert_units", 5)[0] == "set_units"
+    msg = unknown_doc_op_message(0, "unsuppress")
+    assert "set_suppressed" in msg
+
+
 
 def test_suggest_prefers_sketch_family():
     from services.mcp.op_registry import suggest_doc_ops

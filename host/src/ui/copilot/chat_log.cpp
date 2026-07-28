@@ -387,7 +387,7 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
 }
 
 static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
-                              int msgIdx = -1, int turnNum = 0) {
+                              int msgIdx = -1, int turnNum = 0, bool isLastTurn = false) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& turnSurf = chatSurf();
     const float sc = ui::uiScale;
@@ -405,7 +405,18 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // reachable at any point in the chat. turnNum > 0 already implies chatMsgMutatedDoc
     // (turn numbers are only assigned to mutating turns in drawChatLogWindowed).
     const bool vcMutated = msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m);
-    const bool vcRestore = msgIdx >= 0 && !m.running && s_aiVc.available && !s_aiVc.busy;
+    const bool vcRestore = msgIdx >= 0 && !m.running && s_aiVc.available && !s_aiVc.busy &&
+                           !isLastTurn;   // the last turn IS the current state — nothing to restore to
+    // Drawn ONCE, INSIDE the turn's card as a bottom bar (same slot the user bubble's
+    // rewind/edit pair occupies) — never floating below the card, which read as a stray
+    // glyph detached from the box it restores. Turns with no card fall back to a bottom row.
+    bool restoreDrawn = false;
+    auto restoreBar = [&] {
+        if (!vcRestore || restoreDrawn) return;
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
+        drawAiVcTurnRestore(st, msgIdx, turnNum);
+        restoreDrawn = true;
+    };
     const bool metaInCard = !vcMutated &&
         (proseCard || m.errKind != ERR_NONE || m.resultPartial);
     bool metaDrawn = false;
@@ -504,6 +515,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             const ImVec2 ws = ImGui::GetWindowSize();
             chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), prose);
         }
+        restoreBar();
         ImGui::EndChild();
         ImGui::PopStyleVar();  // ##prose WindowPadding
         ImRect proseRect = endGlassBubble(gb);
@@ -605,6 +617,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             const ImVec2 ws = ImGui::GetWindowSize();
             chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), body);
         }
+        restoreBar();
         ImGui::EndChild();
         ImGui::PopStyleVar();   // ##partialcard WindowPadding
         ImRect cardRect = endGlassBubble(gb);
@@ -739,6 +752,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 const ImVec2 ws = ImGui::GetWindowSize();
                 chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), fullErr);
             }
+            restoreBar();
             ImGui::EndChild();
             ImGui::PopStyleVar();   // ##errcard WindowPadding
             ImRect cardRect = endGlassBubble(gb);
@@ -773,11 +787,11 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (!m.running)
         drawProviderLog(m, fonts);
 
-    // (10) Restore/rewind action row — the LAST thing in the turn, mirroring the user
-    // bubble's bottom meta bar so revert sits in the same place on both sides of the chat.
-    // Mutating turns get Before/After (checkpoint-backed); every other finished turn gets
-    // the chat-only rewind, so a revert point is reachable anywhere in the transcript.
-    if (vcRestore) {
+    // (10) Restore/rewind fallback — only for turns whose content drew NO card (bare
+    // activity/error streams with an empty body). Card-bearing turns already host the
+    // restore bar inside the card bottom via restoreBar() above, mirroring the user
+    // bubble's meta bar.
+    if (vcRestore && !restoreDrawn) {
         ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         drawAiVcTurnRestore(st, msgIdx, turnNum);
     }
@@ -824,6 +838,11 @@ void drawChatLogWindowed(AppState& st) {
     const float slack   = ImGui::GetWindowSize().y;   // one extra viewport of buffer each side
     // 1-based index of finished assistant turns that mutated the doc — matches AI-VC turn labels.
     int mutTurn = 0;
+    // The LATEST assistant turn is the state the user is already at — offering a restore
+    // there is a no-op button. Find it once so drawAssistantTurn can suppress its bar.
+    int lastAssistantIdx = -1;
+    for (size_t k = 0; k < st.chat.size(); ++k)
+        if (!st.chat[k].fromUser) lastAssistantIdx = (int)k;
     for (size_t mi = 0; mi < st.chat.size(); ++mi) {
         ChatMsg& m = st.chat[mi];
         ImGui::PushID((int)mi);
@@ -848,7 +867,8 @@ void drawChatLogWindowed(AppState& st) {
         if (m.fromUser) {
             drawUserBlock(st, m, fonts, logW, (int)mi);
         } else {
-            drawAssistantTurn(st, m, fonts, logW, (int)mi, thisTurn);
+            drawAssistantTurn(st, m, fonts, logW, (int)mi, thisTurn,
+                              (int)mi == lastAssistantIdx);
             ImGui::Dummy(ImVec2(0, ui::metrics::cpChatTurnGap()));   // gap to the next TURN
         }
         ImGui::EndGroup();

@@ -3160,13 +3160,16 @@ void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum, bool alwaysShow)
     auto glyphBtn = [&](int kind, const char* tip) {
         ImGui::SameLine(0, 6.0f * sc);
         const bool isPend = pending && s_aiVc.confirmKind == kind;
-        const float sz = ImGui::GetFrameHeight();
+        // Same square footprint + glyph inset as the user bubble's rewind/edit buttons
+        // (btnSz = 0.78 * frame height, rp = 0.18 pad) so the affordance reads identically
+        // on both sides of the chat.
+        const float btnSz = ImGui::GetFrameHeight() * 0.78f;
         ImGui::PushID(kind + 400);
         if (isPend) {
             ImGui::PushStyleColor(ImGuiCol_Button,
                 ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 0.55f));
         }
-        const bool clicked = ImGui::InvisibleButton("##rw", ImVec2(sz * 1.15f, sz));
+        const bool clicked = ImGui::InvisibleButton("##rw", ImVec2(btnSz, btnSz));
         const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ui::AdaptiveSurface& surf = chatSurf();
@@ -3178,7 +3181,9 @@ void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum, bool alwaysShow)
                 ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
                                                       surf.textPrimary.z, isPend ? 0.18f : 0.10f)),
                 ui::metrics::rounding(4.0f));
-        drawDoubleRewindGlyph(dl, bmn, bmx, col);
+        const float rp = btnSz * 0.18f;
+        drawDoubleRewindGlyph(dl, ImVec2(bmn.x + rp, bmn.y + rp),
+                              ImVec2(bmx.x - rp, bmx.y - rp), col);
         if (isPend) ImGui::PopStyleColor();
         if (clicked) {
             if (!isPend) {

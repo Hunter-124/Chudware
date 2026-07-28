@@ -90,6 +90,12 @@ a { color: var(--accent-hi); }
 
 a:hover { color: var(--text); }
 
+code {
+  font-family: var(--mono);
+  font-size: 0.875em;
+  color: var(--text);
+}
+
 img, svg { display: block; max-width: 100%; }
 
 :focus-visible {

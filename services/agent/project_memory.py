@@ -170,11 +170,45 @@ def _bridge_remember(bridge, project_root: str | Path, text: str, kind: str, sou
     return None if raw_id is None else _stable_int_id(raw_id)
 
 
+def _apply_token_budget(
+    items: list[dict[str, Any]], limit: int, token_budget: int
+) -> list[dict[str, Any]]:
+    """Trim ranked *items* to *token_budget* / *limit*, rewriting ``tokens``.
+
+    Shared by both backends. The first hit is truncated rather than dropped when
+    it alone overruns, so recall is never empty while the store has data.
+    ``tokens`` is always this module's own estimate of the returned text: a
+    backend-supplied count may describe untruncated text or a different
+    tokenizer, and the cap must reflect what the caller actually gets.
+    """
+    out: list[dict[str, Any]] = []
+    used = 0
+    for item in items:
+        content = str(item.get("content") or "")
+        tok = estimate_tokens(content)
+        if out and used + tok > token_budget:
+            continue
+        if not out and tok > token_budget:
+            content = content[: max(32, token_budget * 4 - 1)].rstrip() + "…"
+            tok = estimate_tokens(content)
+            item = dict(item)
+            item["content"] = content
+        item["tokens"] = tok
+        out.append(item)
+        used += tok
+        if len(out) >= limit or used >= token_budget:
+            break
+    return out
+
+
 def _bridge_recall(bridge, project_root: str | Path, query: str, limit: int, token_budget: int,
                     kind: str | None) -> list[dict[str, Any]]:
     """``recall`` via bridge ``memory_recall``; maps mnemopi ``RecallResult`` fields
-    (vendor/omp/packages/mnemopi/src/types.ts) onto this module's hit shape. The
-    bridge is handed ``tokenBudget`` and trusted to honor it server-side.
+    (vendor/omp/packages/mnemopi/src/types.ts) onto this module's hit shape.
+
+    ``tokenBudget`` is passed through as a hint, but mnemopi ranks by relevance
+    and may return more text than that, so the budget is re-enforced locally via
+    ``_apply_token_budget`` — same cap the SQLite path gets.
     """
     root = str(Path(project_root).expanduser().resolve())
     params: dict[str, Any] = {"root": root, "query": query, "limit": limit, "tokenBudget": token_budget}
@@ -211,7 +245,7 @@ def _bridge_recall(bridge, project_root: str | Path, query: str, limit: int, tok
             "score": score,
             "tokens": tok,
         })
-    return out
+    return _apply_token_budget(out, limit, token_budget)
 
 
 def _bridge_stats(bridge, project_root: str | Path) -> dict[str, Any]:
@@ -383,31 +417,19 @@ def recall(
         except sqlite3.Error:
             return []
 
-    out: list[dict[str, Any]] = []
-    used = 0
-    for r in rows:
-        content = str(r["content"] or "")
-        tok = estimate_tokens(content)
-        if out and used + tok > token_budget:
-            continue
-        if not out and tok > token_budget:
-            # Always allow one truncated hit so recall is never empty when DB has data.
-            content = content[: max(32, token_budget * 4 - 1)].rstrip() + "…"
-            tok = estimate_tokens(content)
-        item = {
+    candidates = [
+        {
             "id": int(r["id"]),
-            "content": content,
+            "content": str(r["content"] or ""),
             "kind": str(r["kind"] or "note"),
             "source": str(r["source"] or ""),
             "importance": float(r["importance"] or 0.5),
             "score": float(r["score"] or 0.0),
-            "tokens": tok,
+            "tokens": 0,
         }
-        out.append(item)
-        used += tok
-        if len(out) >= limit or used >= token_budget:
-            break
-    return out
+        for r in rows
+    ]
+    return _apply_token_budget(candidates, limit, token_budget)
 
 
 def format_for_context(hits: list[dict[str, Any]], *, header: str = "Project memory") -> str:

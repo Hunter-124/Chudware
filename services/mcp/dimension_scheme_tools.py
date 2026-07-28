@@ -45,12 +45,25 @@ from mcp_server.cad_tools import _dumps, _err, _doc
 # (core/dfm/process_profiles.cpp); reached via core_bridge, lazily, so this module still
 # imports + runs its offline fixture mode with no engine present.
 def _get_profile(process: str) -> dict:
-    """dfm_get_profile RPC; raises ValueError on the oracle's unknown-process envelope."""
+    """dfm_get_profile RPC.
+
+    Raises ``ValueError`` naming the requested process and listing the known ones on
+    the oracle's unknown-process envelope OR on an ``ok: true`` envelope that carries
+    no profile. It must never hand back an empty/None profile: callers read
+    ``params.hole_comp_mm`` off it, and a silent blank there becomes a wrong modeled
+    diameter (an FDM hole 0.20 mm undersize) or an AttributeError several frames away.
+    """
     from mcp_server import core_bridge as cb
-    r = cb.call("dfm_get_profile", {"process": process})
+    r = cb.call("dfm_get_profile", {"process": process}) or {}
     if not r.get("ok"):
-        raise ValueError(r.get("error") or "dfm_get_profile failed")
-    return r.get("result") or {}
+        raise ValueError(r.get("error") or
+                         f"dfm_get_profile failed for process {process!r}. "
+                         f"Known processes: {_known_processes()}.")
+    profile = r.get("result")
+    if not profile:
+        raise ValueError(f"dfm_get_profile returned an empty DfM profile for process "
+                         f"{process!r}. Known processes: {_known_processes()}.")
+    return profile
 
 
 def _resolve_process(request: str) -> dict:
@@ -72,6 +85,31 @@ def _known_processes() -> list:
     except Exception:  # noqa: BLE001
         pass
     return ["fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"]
+
+
+def _profile_params(process: str) -> dict | None:
+    """The DfM params dict for ``process``, or ``None`` when there is no engine bridge.
+
+    Two failure modes that used to look identical are now separated:
+
+    * **No bridge at all** — this module's documented offline mode (fixture sketches, no
+      engine). Returns ``None``; callers plan with zero compensation.
+    * **Bridge up, profile unresolvable** — a real lookup gap. Propagates the teaching
+      ``ValueError`` from :func:`_get_profile` naming the process and the known list,
+      instead of quietly planning an uncompensated hole.
+    """
+    try:
+        from mcp_server import core_bridge as cb
+    except Exception:  # noqa: BLE001 — no engine package: offline mode
+        return None
+    try:
+        up = bool(cb.available())
+    except Exception:  # noqa: BLE001
+        up = False
+    if not up:
+        return None
+    profile = _get_profile(process)
+    return profile.get("params") or profile
 
 try:
     from mcp_server.cad_tools import _CB as _cb_module  # noqa: F401 — presence check
@@ -235,14 +273,12 @@ def _plan_from_entities(entities: list[dict], process: str, it_grade: int,
     process_profiles, via ``_get_profile``) — never invented.
     """
     # Pull the hole compensation from the DFM profile (real values, never invented).
-    # get_profile() wraps the DFM fields under a "params" key; fall back to top-level
-    # for forward-compatibility.
-    try:
-        profile = _get_profile(process)
-        params = profile.get("params") or profile  # nested or flat
-        hole_comp_mm: float = float(params.get("hole_comp_mm") or 0.0)
-    except Exception:
-        hole_comp_mm = 0.0
+    # _profile_params() nests the DFM fields under "params" and falls back to top-level
+    # for forward-compatibility. It returns None ONLY in offline mode (no engine bridge);
+    # an unresolvable process on a live bridge raises the teaching ValueError rather than
+    # silently planning an uncompensated hole.
+    params = _profile_params(process)
+    hole_comp_mm: float = float((params or {}).get("hole_comp_mm") or 0.0)
 
     items: list[dict] = []
     priority = 1

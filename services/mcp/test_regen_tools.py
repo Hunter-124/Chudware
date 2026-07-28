@@ -5,6 +5,7 @@ import json
 import random
 
 from services.agent import regen_diagnosis as RD
+from services.agent.providers.base import ProviderUnreachable
 from services.agent.providers.mock_provider import MockProvider
 from services.mcp import regen_tools as RT
 from tools.flywheel.bench.corpus import regen_corpus as RC
@@ -49,12 +50,41 @@ def test_seam_returns_card_and_logs_ip18():
 def test_seam_degrades_without_provider():
     doc = _corrupt("bad_selector", seed=3)
     out = RT.diagnose_failed_document(doc, provider=None)
-    # _resolve_provider() yields None here (no credentials) -> honest failure + the failures list
+    # Three legitimate outcomes, depending on the machine's configured provider:
+    #   * one resolves and answers      -> ok, with a fix
+    #   * none resolves (no credentials) -> honest failure
+    #   * one resolves but is DOWN       -> honest failure (a configured-but-not-running
+    #     local LM Studio used to raise ProviderUnreachable straight out of the tool)
+    # The invariant under test is that the no-model path still DETECTS the failure:
+    # detect_failures is pure analysis, so a missing model costs the fix, not the diagnosis.
     if out["ok"]:                                    # a local provider happened to resolve
         assert out["card"]["fix_ops"] is not None
     else:
-        assert "no provider configured" in out["reason"]
+        assert ("no provider configured" in out["reason"]
+                or "provider unreachable" in out["reason"]), out["reason"]
         assert any(f["kind"] == "bad_selector" for f in out["failures"])
+
+
+def test_unreachable_provider_degrades_instead_of_raising():
+    """A configured provider that cannot be reached must not crash the diagnosis.
+
+    Regression: openai_provider raised a bare RuntimeError for a refused connection, so
+    a user with LM Studio configured but not running got an exception out of
+    regen_diagnose instead of the failure list the tool promises in its docstring.
+    """
+    class _Down:
+        def complete(self, *a, **k):
+            raise ProviderUnreachable("Could not reach the model server at http://localhost:1234/v1")
+
+        def complete_ex(self, *a, **k):
+            raise ProviderUnreachable("Could not reach the model server at http://localhost:1234/v1")
+
+    doc = _corrupt("bad_selector", seed=3)
+    out = RT.diagnose_failed_document(doc, provider=_Down())
+    assert out["ok"] is False
+    assert "provider unreachable" in out["reason"]
+    assert "localhost:1234" in out["reason"]          # names the endpoint that is down
+    assert any(f["kind"] == "bad_selector" for f in out["failures"])
 
 
 def test_tool_registration_and_json_contract():

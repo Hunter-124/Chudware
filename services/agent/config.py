@@ -1554,6 +1554,36 @@ def _provider_cfg_section(cfg: dict, name: str) -> dict:
     return {}
 
 
+def _openrouter_api_key(cfg: dict) -> str | None:
+    """Every place an OpenRouter credential may live, newest-wins order.
+
+    OpenRouter has exactly ONE credential form in CAD: an API key. The blessed PKCE
+    login (providers/oauth_pkce.py) mints a key and stores it like any other, so unlike
+    Claude Pro/Kimi-For-Coding there is no OAuth-only sign-in that could authenticate a
+    keyless client. Single source of truth for both the native adapter branch and the
+    OMP-bridge branch's keyless refusal below.
+    """
+    oc = cfg.get("openrouter")
+    keys_map = cfg.get("keys")
+    return (
+        (oc.get("api_key") if isinstance(oc, dict) else None)
+        or cfg.get("api_key")
+        or cfg.get("openrouter_api_key")
+        or (keys_map.get("openrouter") if isinstance(keys_map, dict) else None)
+        or os.environ.get("OPENROUTER_API_KEY")
+    )
+
+
+def _refuse_keyless_openrouter() -> None:
+    """mega-6: never construct a keyless OpenRouter client — complete would 401 as
+    provider_auth and kill every depth-0 auto_pick free leaf."""
+    raise ValueError(
+        "openrouter provider requires an API key "
+        "(config openrouter.api_key / keys.openrouter / OPENROUTER_API_KEY); "
+        "auto_pick must skip keyless openrouter"
+    )
+
+
 def _resolve_via_routing(role: str | None, cfg: dict) -> tuple[str, str | None, str | None] | None:
     """Resolve *role* against routing.yaml (contract §14). Returns
     ``(provider_name, model_id, base_url)`` or ``None`` when routing.yaml has no
@@ -1733,6 +1763,17 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             or flat_key
             or next((keys_map[k] for k in aliases if keys_map.get(k)), None)
         )
+        if name == "openrouter":
+            # mega-6, re-armed: openrouter joined OMP_BRIDGE_PROVIDER_IDS, which shadows the
+            # native branch below and with it the keyless refusal. The sidecar's "no apiKey
+            # -> resolve from AuthStorage" fallback only rescues OAuth subscriptions;
+            # OpenRouter has no OAuth-only form (see _openrouter_api_key), so a keyless
+            # construction here is a guaranteed 401 deferred to request time.
+            # The legacy flat slot is forwarded too, so the credential we actually send and
+            # the guard agree. Env stays the sidecar's own job.
+            key = key or cfg.get("openrouter_api_key")
+            if not _openrouter_api_key(cfg):
+                _refuse_keyless_openrouter()
         model = cfg.get("model") or pc.get("model") or ""
         caps = _catalog_caps(name, model, cfg)
         vision = pc["vision"] if "vision" in pc else caps.get("vision", True)
@@ -1790,23 +1831,10 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         # mega-16: also honour config.keys.openrouter (GUI keys map).
         from .providers.openrouter_provider import OpenRouterProvider, DEFAULT_MODEL
 
-        oc = cfg.get("openrouter", {}) or {}
-        keys_map = cfg.get("keys") or {}
-        key = (
-            (oc.get("api_key") if isinstance(oc, dict) else None)
-            or cfg.get("api_key")
-            or cfg.get("openrouter_api_key")
-            or (keys_map.get("openrouter") if isinstance(keys_map, dict) else None)
-            or os.environ.get("OPENROUTER_API_KEY")
-        )
+        oc = cfg.get("openrouter") or {}
+        key = _openrouter_api_key(cfg)
         if not key:
-            # mega-6: never construct a keyless OpenRouter client — complete would
-            # 401 as provider_auth and kill every depth-0 auto_pick free leaf.
-            raise ValueError(
-                "openrouter provider requires an API key "
-                "(config openrouter.api_key / keys.openrouter / OPENROUTER_API_KEY); "
-                "auto_pick must skip keyless openrouter"
-            )
+            _refuse_keyless_openrouter()
         model = cfg.get("model", DEFAULT_MODEL)
         caps = _catalog_caps("openrouter", model, cfg)
         vision = (

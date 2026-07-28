@@ -24,6 +24,20 @@ DeltaSink = Callable[[str, str], None]
 _tls = threading.local()
 
 
+class ProviderUnreachable(RuntimeError):
+    """The provider resolved but could not be reached (connection refused, timeout).
+
+    Distinct from a bad request, bad credentials, or a model error: nothing about the
+    CALL was wrong, the server simply is not answering — overwhelmingly a local
+    LM Studio/Ollama endpoint that is configured but not running.
+
+    Subclasses RuntimeError so every existing ``except RuntimeError`` handler keeps
+    working unchanged. The point is to let a caller that still has a useful non-LLM
+    answer (regen diagnosis detects failures without a model) degrade to it instead of
+    propagating a crash into an agent turn.
+    """
+
+
 def set_provider_delta_sink(sink: Any) -> Any:
     """Install (or clear, with None) this thread's provider delta sink.
 

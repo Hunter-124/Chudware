@@ -9,7 +9,7 @@ import base64
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .base import Provider
+from .base import Provider, ProviderUnreachable
 
 DEFAULT_MODEL = "gpt-4o"
 
@@ -170,7 +170,7 @@ class OpenAIProvider(Provider):
             )
         except APITimeoutError as e:
             url = self.base_url or "https://api.openai.com/v1"
-            raise RuntimeError(
+            raise ProviderUnreachable(
                 f"The model server at {url} did not respond within {self.timeout:.0f}s "
                 f"(model={self.model!r} may still be loading, or the request is too large). "
                 f"Try again once it is warm, lower the load, or switch provider. ({e})"
@@ -179,7 +179,7 @@ class OpenAIProvider(Provider):
             # The single most common local-model failure: the server isn't there. Name the
             # endpoint so the user can tell "server down" apart from auth/model problems.
             url = self.base_url or "https://api.openai.com/v1"
-            raise RuntimeError(
+            raise ProviderUnreachable(
                 f"Could not reach the model server at {url} — connection refused/failed. "
                 f"If you use LM Studio (or another local server), make sure it is running "
                 f"and its local server is started, then try again. ({e})"

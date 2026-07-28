@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Optional
 
+from services.agent.providers.base import ProviderUnreachable
 from services.agent.regen_diagnosis import detect_failures
 
 
@@ -79,6 +80,20 @@ def _verify(document: dict, diagnosis, reference_document: Optional[dict]):
         "mode": "live-rebuild-only", "rebuilt": res["rebuilt"], "rebuild_error": res.get("error")}
 
 
+def _no_llm_result(document: dict, reason: str) -> dict:
+    """The honest ``ok=False`` card: no model was consulted, but the failures still are.
+
+    ``detect_failures`` is pure analysis, so a missing or unreachable provider costs the
+    caller the PROPOSED FIX, not the diagnosis. Returning the failure list keeps the tool
+    useful and gives an agent something concrete to act on.
+    """
+    return {
+        "ok": False,
+        "reason": reason,
+        "failures": [f.to_dict() for f in detect_failures(document)],
+    }
+
+
 def diagnose_failed_document(document: dict, *, provider=None,
                              reference_document: Optional[dict] = None,
                              engine_error: Optional[str] = None,
@@ -88,15 +103,14 @@ def diagnose_failed_document(document: dict, *, provider=None,
     ``document`` is a full aicad.part/1 doc or a ``{revision, tree, owner_map}`` wrapper.
     ``reference_document`` (optional) is the last known-good revision, enabling the compare_parts
     drift check. ``provider`` defaults to the configured agent provider; when none is resolvable
-    the tool returns ``ok=False`` with the detected failures (still useful) rather than guessing.
+    -- or one resolves but cannot be reached -- the tool returns ``ok=False`` with the detected
+    failures (still useful) rather than guessing.
     """
     prov = provider or _resolve_provider()
     if prov is None:
-        return {
-            "ok": False,
-            "reason": "no provider configured for regen diagnosis (set one to enable IP-18 fixes)",
-            "failures": [f.to_dict() for f in detect_failures(document)],
-        }
+        return _no_llm_result(
+            document,
+            "no provider configured for regen diagnosis (set one to enable IP-18 fixes)")
     if on_event is None:
         # T-BL22: no caller sink (the MCP tool path) -> journal the IP-18 correction trace
         # to CACHE/telemetry/events.jsonl instead of dropping it on the floor.
@@ -105,7 +119,14 @@ def diagnose_failed_document(document: dict, *, provider=None,
     from services.agent.regen_diagnosis import diagnose
     from services.agent.regen_card import build_fix_preview
 
-    d = diagnose(document, prov, engine_error=engine_error, on_event=on_event, consent_fn=consent_fn)
+    try:
+        d = diagnose(document, prov, engine_error=engine_error,
+                     on_event=on_event, consent_fn=consent_fn)
+    except ProviderUnreachable as e:
+        # A configured-but-down endpoint (typically a local LM Studio that is not
+        # running) must not turn a diagnosis into a crash: failure DETECTION needs no
+        # model, so hand back the same honest card the no-provider path returns.
+        return _no_llm_result(document, f"provider unreachable: {e}")
     score, detail = _verify(document, d, reference_document) if verify else (None, {})
     card = build_fix_preview(document, d, verifier_score=score, verifier_detail=detail)
     return {"ok": True, "artifact_id": d.artifact_id, "card": card}

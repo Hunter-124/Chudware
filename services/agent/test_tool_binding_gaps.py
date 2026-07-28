@@ -63,7 +63,27 @@ class TestAskUserBinding:
         assert r["status"] == "bad_arguments"
         assert r["example"], "an error that shows no correct shape teaches nothing"
 
-    def test_doc_scope_persists_and_replays(self, ):
+    @staticmethod
+    def _clear_doc_interaction(doc_id: str) -> None:
+        """Drop any prior ``ask_user`` Q/A from the doc's intake meta record.
+
+        Two correct behaviours conspire against a naive re-run of this test:
+        ``new_part`` RESUMES an already-open part of the same name instead of
+        minting a duplicate, and doc-scoped answers persist inside the document
+        (contract §5 / T-BL25 cross-session no-re-ask).  So against a live
+        daemon the second run of this test inherits the first run's answer and
+        sees ``resumed`` on the very FIRST ask.  Clear the record so the two
+        asks below are genuinely the first and the second.
+        """
+        from services.mcp import core_bridge as cb
+        from services.mcp.intake_ledger import K_INTAKE
+        state = cb.call("doc_get_meta", {"doc_id": doc_id, "key": K_INTAKE}).get("value")
+        if not isinstance(state, dict) or "interaction" not in state:
+            return
+        state.pop("interaction")
+        cb.call("doc_set_meta", {"doc_id": doc_id, "key": K_INTAKE, "value": state})
+
+    def test_doc_scope_persists_and_replays(self):
         """A doc-scoped answer must not be re-asked — contract §5."""
         new_part = at._bind_tool("new_part")
         if new_part is None:
@@ -72,13 +92,17 @@ class TestAskUserBinding:
         doc_id = json.loads(new_part(name="ask_user_scope")).get("doc_id")
         if not doc_id:
             pytest.skip("engine unavailable")
+        self._clear_doc_interaction(doc_id)
         fn = at._bind_tool("ask_user")
         q = [{"id": "finish", "kind": "text", "prompt": "Surface finish?",
               "suggested": "as-printed"}]
-        first = fn(questions=q, scope="doc", doc_id=doc_id)
-        second = fn(questions=q, scope="doc", doc_id=doc_id)
-        assert first["answers"]["finish"]["source"] == "default"
-        assert second["answers"]["finish"]["source"] == "resumed"
+        try:
+            first = fn(questions=q, scope="doc", doc_id=doc_id)
+            second = fn(questions=q, scope="doc", doc_id=doc_id)
+            assert first["answers"]["finish"]["source"] == "default"
+            assert second["answers"]["finish"]["source"] == "resumed"
+        finally:
+            self._clear_doc_interaction(doc_id)
 
 
 # --------------------------------------------------------------------------- #

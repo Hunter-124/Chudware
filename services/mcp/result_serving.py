@@ -54,6 +54,14 @@ _NEVER_DROP: frozenset[str] = frozenset({
     "analysis",
     "backend",
     "meta",
+    # Input-dialect echo: how the tool re-read the caller's arguments. Bounded
+    # (scalars + the caller's own facets/vendors) and the ONLY way the model
+    # learns the canonical spelling of what it asked for, so budget pressure
+    # must never silently drop it — dropping it turns a rewritten query into a
+    # silent rewrite.
+    "applied",
+    "interpreted",
+    "interpreted_args",
     "power",  # board-level totals — small, always pertinent
     "erc",    # keep error/warning counts (groups may be dropped separately)
     "drc",
@@ -70,7 +78,6 @@ _SOFT_DROP: tuple[str, ...] = (
     "violations",
     "fix_hints",
     "notices",
-    "applied",
     "facet_summary",
     "members",
     "pins",

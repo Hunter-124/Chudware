@@ -15,6 +15,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 
 # Endpoints/markers that indicate consumer-subscription OAuth token reuse for Claude/Gemini.
@@ -45,11 +47,40 @@ ALLOWLIST = {
 }
 SCAN_EXT = {".py", ".cpp", ".h", ".hpp", ".ps1", ".js", ".ts", ".json", ".toml", ".cfg"}
 
+# A path `git ls-files` MUST report. If it doesn't, the scan is not looking at this repo.
+SCAN_SENTINEL = "services/agent/providers/sub_auth.py"
 
-def _tracked_files():
-    out = subprocess.run(["git", "-C", str(REPO), "ls-files"],
-                         capture_output=True, text=True, check=True).stdout
-    return [f for f in out.splitlines() if Path(f).suffix in SCAN_EXT]
+
+def _require_plausible_scan(files: list[str]) -> list[str]:
+    """Fail loudly when *files* cannot possibly be this repo's tracked sources.
+
+    A grep-style guard that scans zero files still reaches its assertion and reports
+    green — a false negative in exactly the environments nobody watches: `git archive`
+    exports, sdists, and CI checkouts with no .git, where `git ls-files` returns
+    nothing (or errors) and the prohibition is never actually evaluated. Refuse to
+    issue a clean bill of health for a scan that did not happen.
+    """
+    if SCAN_SENTINEL not in files:
+        raise AssertionError(
+            f"cannot scan repo, guard did not run: `git ls-files` under {REPO} yielded "
+            f"{len(files)} scannable file(s), none of them the known-tracked sentinel "
+            f"{SCAN_SENTINEL!r}. The consumer-OAuth prohibition was NOT checked; this "
+            "run proves nothing."
+        )
+    return files
+
+
+def _tracked_files() -> list[str]:
+    try:
+        out = subprocess.run(["git", "-C", str(REPO), "ls-files"],
+                             capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AssertionError(
+            f"cannot scan repo, guard did not run: `git ls-files` failed under {REPO} "
+            f"({exc}). The consumer-OAuth prohibition was NOT checked."
+        ) from exc
+    return _require_plausible_scan(
+        [f for f in out.splitlines() if Path(f).suffix in SCAN_EXT])
 
 
 def test_no_consumer_oauth_token_reuse():
@@ -68,6 +99,27 @@ def test_no_consumer_oauth_token_reuse():
         "Consumer Claude/Gemini subscription-OAuth endpoint detected in non-allowlisted "
         "file (contract §4.2). If this is a new subscription-auth provider, add it to the "
         "ALLOWLIST in this test (§4.4):\n  " + "\n  ".join(hits))
+
+
+def test_scan_guard_refuses_to_pass_on_a_vacuous_file_list():
+    """A scan that saw nothing must fail loudly, never silently pass.
+
+    Regression: run from a `git archive` export (no .git), `git ls-files` yielded an
+    empty list, so the prohibition above looped zero times and asserted `not []` —
+    green without checking a single file.
+    """
+    with pytest.raises(AssertionError, match="guard did not run"):
+        _require_plausible_scan([])
+    with pytest.raises(AssertionError, match="guard did not run"):
+        _require_plausible_scan(["README.md", "setup.py"])
+    assert _require_plausible_scan([SCAN_SENTINEL, "x.py"]) == [SCAN_SENTINEL, "x.py"]
+
+
+def test_scan_sentinel_is_actually_tracked():
+    """The sentinel is only a valid liveness check while git really tracks it."""
+    tracked = subprocess.run(["git", "-C", str(REPO), "ls-files", "--error-unmatch",
+                              SCAN_SENTINEL], capture_output=True, text=True)
+    assert tracked.returncode == 0, tracked.stderr
 
 
 def test_openrouter_pkce_is_present_as_the_blessed_path():

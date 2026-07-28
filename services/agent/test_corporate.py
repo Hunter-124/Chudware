@@ -494,7 +494,13 @@ class TestFlatMode:
         # Dispatch still has no active org
         assert md.org_chart is None or not getattr(md.org_chart, "active", False)
 
-    def test_mission_dispatch_activate_and_route(self):
+    def test_mission_dispatch_activate_and_route(self, monkeypatch):
+        # corporate_activate() reads the LIVE config.json (there is no cfg
+        # parameter), and the org chart freezes max_subagent_depth from it at
+        # build time. A dev whose Settings has max_subagent_depth=1 caps heads
+        # at depth 1, so the depth-2 worker spawn below is refused. Pin the
+        # same cfg every other test in this file passes explicitly.
+        monkeypatch.setattr(agent_config, "load_config", lambda *a, **k: _cfg_on())
         md = MissionDispatch(run_id="r_corp_md")
         out = md.corporate_activate(
             tasks=_mixed_tasks(),

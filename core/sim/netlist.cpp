@@ -918,7 +918,17 @@ const std::map<std::string, SymbolSim>& symbol_sim_table() {
         // Diodes: pins numbered "K"/"A" (number == name), pin_order [A, K].
         json d_order = json::array({"A", "K"});
         m["Device:D"]     = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "K"}, {"A", "A"}}};
-        m["Device:LED"]   = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "K"}, {"A", "A"}}};
+        // An LED is NOT a silicon rectifier. Without its own junction parameters Device:LED
+        // fell through to the default small-signal diode (IS=1e-14, N=1) and conducted at
+        // ~0.74 V, so EVERY simulated LED circuit reported a physically impossible operating
+        // point (wrong LED current, wrong headroom, wrong dropper-resistor verdict). These are
+        // generic RED-LED Shockley parameters: N=2 with IS=2.3e-19 puts the forward drop at
+        // 2.00 V over the whole 1-20 mA indicator range (2.00 V @ 10 mA, 1.99 V @ 9 mA), with a
+        // 2 ohm bulk series resistance. `params` on the sim spec is forwarded to the device
+        // below and takes precedence over spice.cpp's defaults (mp() reads device params first).
+        m["Device:LED"]   = {json{{"model", "D"}, {"pin_order", d_order},
+                                  {"params", json{{"IS", 2.3e-19}, {"N", 2.0}, {"RS", 2.0}}}},
+                             {{"K", "K"}, {"A", "A"}}};
         m["Device:Zener"] = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "K"}, {"A", "A"}}};
         // BJTs: pins numbered "B"/"C"/"E" (number == name), pin_order [B, C, E].
         json q_order = json::array({"B", "C", "E"});
@@ -1133,7 +1143,12 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
         }
 
         std::string kind = model_to_kind(model_name, ref);
-        devices.push_back(make_dev(kind, ref, node_list, float_value, nullptr, json::object()));
+        // Device parameters carried by the sim spec (symbol library or an inline comp["sim"]),
+        // e.g. the LED's junction model. Empty for every part that does not declare any.
+        json dev_params = sim.contains("params") && sim["params"].is_object()
+                              ? sim["params"]
+                              : json::object();
+        devices.push_back(make_dev(kind, ref, node_list, float_value, nullptr, dev_params));
     }
 
     // Inline X instances (built-in subckts) + pull in the models the built-ins need.

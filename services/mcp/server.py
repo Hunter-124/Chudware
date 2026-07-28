@@ -602,6 +602,22 @@ from services.mcp.reveng_build_tools import register_reveng_build_tools
 register_reveng_session_tools(_reg.view(mcp, "reveng"))
 register_reveng_build_tools(_reg.view(mcp, "reveng"))
 
+# Org layer (T-W22, aicad.org/1 §18): channel_send / request_raise / request_resolve /
+# council_convene. These were previously registered ONLY lazily — reviewer_exec activates
+# org_tools on demand, and tool_registry.warm_catalog() faked a registration against a
+# throwaway MCP. Consequence: the family never reached this server's FastMCP registry or
+# the catalog, so the Settings -> AI -> Tools "org" checkbox governed nothing and
+# test_registration_catalog reported 'org' as a phantom family. The tools are real and
+# resolve through dispatch (reviewer_exec._resolve_fn / agent_turn._bind_tool), so the fix
+# is to register them here like every other family rather than delete the toggle.
+from mcp_server.org_tools import register_org_tools
+register_org_tools(_reg.view(mcp, "org"))
+
+# Freeze what a full server import contributes to the process-wide catalog, so
+# tool_registry.warm_catalog() can genuinely RE-register after a clear_catalog()
+# instead of relying on a one-shot import side effect. See tool_registry.warm_catalog.
+_reg.mark_warm_baseline()
+
 # ---------------------------------------------------------------------------
 # Argument teaching (bench evidence: ~40 recorded run failures were "unexpected
 # keyword argument" / opaque pydantic dumps, plus a silent-drop class that never

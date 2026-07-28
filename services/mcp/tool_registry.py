@@ -93,7 +93,20 @@ def catalog() -> dict[str, dict]:
     return _CATALOG
 
 
-_WARMED = False
+# --- warm/clear semantics -------------------------------------------------
+# ``_WARM_BASELINE`` is the set of catalog entries a FULL ``mcp_server.server``
+# import contributes, captured by :func:`mark_warm_baseline` from server.py's module
+# body. It is a *memory of content*, never an "already warmed" latch: it survives
+# :func:`clear_catalog` precisely so a later :func:`warm_catalog` can rebuild the
+# catalog without re-importing (a re-import is a no-op once the module is in
+# ``sys.modules``, which is what used to make warming permanently dead).
+_WARM_BASELINE: dict[str, dict] | None = None
+# True once the baseline has been applied to the CURRENT catalog generation.
+# ``clear_catalog`` starts a new generation and resets this.
+_WARM_APPLIED = False
+# The import is attempted at most once per process; a failed import (no ``mcp`` SDK)
+# is deterministic and must not be retried on every family resolution.
+_WARM_IMPORT_TRIED = False
 
 
 class _NullMCP:
@@ -106,41 +119,85 @@ class _NullMCP:
         return deco
 
 
-def warm_catalog() -> None:
-    """Best-effort, memoized: trigger server.py's module-level family registrations.
+def mark_warm_baseline() -> None:
+    """Record the current catalog as the canonical "fully warmed" contents.
 
-    ``_CATALOG`` above is populated only as an import side-effect of
-    ``services/mcp/server.py`` (its module-level ``register_*_tools(_reg.view(mcp,
-    "<family>"))`` calls). The live GUI worker process never imports server.py, so
-    without this, ``family:X`` resolution (roles.py ``concrete_tools``,
-    tool_categories._expand_token) always sees an empty/near-empty catalog. Callers
-    that resolve families from the catalog should call this first; it is a no-op
-    after the first call and never raises.
+    Called once from ``services/mcp/server.py``'s module body, after every
+    ``register_*_tools(view(mcp, ...))`` call site has run. This decouples
+    :func:`warm_catalog` from the import side effect: whoever imports server.py
+    first (a test module, the MCP entry point, ``warm_catalog`` itself) hands the
+    registry a replayable snapshot, so warming still works for every later caller
+    even after a :func:`clear_catalog`.
     """
-    global _WARMED
-    if _WARMED:
-        return
-    _WARMED = True
-    try:
-        import mcp_server.server  # noqa: F401 — side-effect: populates _CATALOG via its module-level _reg.view registrations
-    except Exception:  # noqa: BLE001 — best-effort; a heavy/failed import must never break role loading
-        pass
-    # The org family (channel_send / request_raise / request_resolve /
-    # council_convene) is lazily registered in production (reviewer_exec /
-    # corporate activation), so server.py never warms it. Role cards reference
-    # these tools and the Tools panel lists them — register them up front so
-    # family:org resolution and the catalog see them unconditionally.
-    try:
-        from services.mcp.org_tools import register_org_tools
+    global _WARM_BASELINE, _WARM_APPLIED
+    _WARM_BASELINE = {name: dict(meta) for name, meta in _CATALOG.items()}
+    _WARM_APPLIED = True
 
-        register_org_tools(view(_NullMCP(), "org"))
-    except Exception:  # noqa: BLE001 — best-effort, same contract as above
-        pass
+
+def warm_catalog() -> None:
+    """Ensure the catalog holds every family a full server import registers.
+
+    Semantics: *reset-to-warm*. Idempotent, never raises, and — unlike the old
+    one-shot version — genuinely re-registers after :func:`clear_catalog`.
+
+    ``_CATALOG`` is normally populated as an import side-effect of
+    ``services/mcp/server.py``. The live GUI worker process never imports server.py,
+    so without this, ``family:X`` resolution (roles.py ``concrete_tools``,
+    tool_categories._expand_token) sees a near-empty catalog. Callers that resolve
+    families from the catalog should call this first.
+
+    Two failure modes this deliberately does NOT have any more:
+      * it no longer latches on "have I run once" — it latches on "is the baseline
+        present in the CURRENT catalog generation", so a clear/warm pair restores
+        the full catalog (previously the families only server.py registers —
+        ascii2d, office, power_budget, heatsink, ecad_thermal — were unrecoverable);
+      * it no longer depends on the import *side effect*, so a module that imported
+        server.py earlier for its own reasons cannot turn warming into a no-op.
+
+    Existing entries are never overwritten: a caller that deliberately retagged a
+    tool keeps its tag.
+    """
+    global _WARM_APPLIED, _WARM_IMPORT_TRIED
+    if _WARM_APPLIED:
+        return
+    if _WARM_BASELINE is None and not _WARM_IMPORT_TRIED:
+        _WARM_IMPORT_TRIED = True
+        try:
+            # side-effect: registers every family AND calls mark_warm_baseline().
+            import mcp_server.server  # noqa: F401
+        except Exception:  # noqa: BLE001 — best-effort; a heavy/failed import must never break role loading
+            pass
+    if _WARM_BASELINE:
+        for name, meta in _WARM_BASELINE.items():
+            _CATALOG.setdefault(name, dict(meta))
+    else:
+        # server.py unavailable (no `mcp` SDK in this interpreter). The org family is
+        # pure-Python and role cards reference it, so register it directly rather than
+        # leaving family:org unresolvable.
+        try:
+            from services.mcp.org_tools import register_org_tools
+
+            register_org_tools(view(_NullMCP(), "org"))
+        except Exception:  # noqa: BLE001 — best-effort, same contract as above
+            pass
+    _WARM_APPLIED = True
 
 
 def clear_catalog() -> None:
-    """Reset the catalog (tests), then re-record always-on meta-tools."""
+    """Reset to a genuine CLEAN ROOM: only the always-on meta-tools remain.
+
+    Semantics: *clean room*, not reset-to-warm. Callers that build a controlled
+    catalog (``services/agent/test_roles.py::_build_catalog``,
+    ``test_registration_catalog``) get exactly what they register afterwards and
+    nothing else — no implicit replay of the server baseline.
+
+    It also disarms :func:`warm_catalog`'s applied-flag, so a caller that wants the
+    full catalog back says so explicitly by calling ``warm_catalog()``; that now
+    restores everything instead of being a permanent no-op.
+    """
+    global _WARM_APPLIED
     _CATALOG.clear()
+    _WARM_APPLIED = False
     ensure_meta_tools()
 
 
@@ -273,14 +330,105 @@ def deny_reason(name: str) -> str | None:
             f"(set CHUDWARE_TOOLS_ALLOW or the DAG node tools: list to permit it)")
 
 
+def _family_of(name: str) -> str:
+    return str((_CATALOG.get(name) or {}).get("family") or "")
+
+
 def refusal(name: str) -> dict:
-    """The contract-shaped refusal payload for a disallowed dispatch (contract §6.1)."""
-    return {
-        "ok": False,
-        "reason": deny_reason(name) or f"tool {name!r} is not permitted",
-        "hint": ("This tool is gated by the per-context allow-list. Permit it via the DAG "
-                 "node's tools: list, or CHUDWARE_TOOLS_ALLOW / CHUDWARE_TOOLS_DENY_RISK."),
-    }
+    """The contract-shaped refusal payload for a disallowed dispatch (contract §6.1).
+
+    Always machine-readable: ``ok``/``reason``/``family``/``hint``. When the block came
+    from the per-family Settings toggle the hint names the family and the exact place to
+    turn it back on, because that is the only refusal a *user* (not a DAG node) causes.
+    """
+    reason = deny_reason(name) or f"tool {name!r} is not permitted"
+    fam = _family_of(name)
+    if "agent.tool_families" in reason and fam:
+        hint = (f"Tool family {fam!r} is turned OFF. Re-enable it in the app under "
+                f"Settings -> AI -> Tools (or set agent.tool_families.{fam} = true in "
+                f"config.json), then retry the same call. No other tool in family "
+                f"{fam!r} will run until then — do not retry it in a loop.")
+    elif "Settings -> AI -> Tools" in reason or "Settings → AI → Tools" in reason:
+        hint = (f"Tool {name!r} is switched off per-tool. Re-enable it in the app under "
+                f"Settings -> AI -> Tools, then retry the same call.")
+    else:
+        hint = ("This tool is gated by the per-context allow-list. Permit it via the DAG "
+                "node's tools: list, or CHUDWARE_TOOLS_ALLOW / CHUDWARE_TOOLS_DENY_RISK.")
+    out = {"ok": False, "reason": reason, "hint": hint}
+    if fam:
+        out["family"] = fam
+    return out
+
+
+# --- refusal SHAPING -------------------------------------------------------------------
+# FastMCP builds each tool's output schema from its return annotation and validates the
+# return value against it.  365 of the registered tools declare ``-> str``, so handing
+# back the refusal *dict* raised ``pydantic ValidationError`` -> ``ToolError``: the model
+# saw an opaque schema crash ("Input should be a valid string") instead of "that family is
+# disabled".  The guard therefore renders the refusal into the shape the tool PROMISED,
+# decided once at registration time (zero per-call cost).
+_STR_ANNOTATIONS = frozenset({"str", "builtins.str", "typing.Text", "Text"})
+_DICT_ANNOTATIONS = frozenset({"dict", "builtins.dict", "Any", "typing.Any", "object"})
+_LIST_ANNOTATIONS = frozenset({"list", "builtins.list", "tuple", "builtins.tuple"})
+
+
+def _annotation_token(fn) -> str:
+    """The declared return annotation as a bare token.
+
+    Tool modules use ``from __future__ import annotations``, so the annotation is usually
+    already a *string*; when it is a real object we take its ``__name__``.  Subscripted
+    generics (``dict[str, Any]``, ``Optional[str]``) reduce to their head token.
+    """
+    ann = getattr(fn, "__annotations__", {}).get("return", None)
+    if ann is None:
+        return ""
+    text = ann if isinstance(ann, str) else (getattr(ann, "__name__", None) or str(ann))
+    text = text.strip()
+    for cut in ("[", "|"):
+        if cut in text:
+            text = text.split(cut, 1)[0].strip()
+    return text
+
+
+def _refusal_shaper(fn):
+    """Return ``shape(payload) -> value`` conforming to *fn*'s declared output schema.
+
+    * declared ``str`` (or nothing / ``Any`` / ``dict``) — JSON text / the dict itself;
+      both are machine-readable and both validate.
+    * declared ``list`` — a one-element list holding the JSON text.
+    * anything else (``Image``, ``int``, a model class) cannot carry a refusal at all, so
+      the guard raises instead. FastMCP renders a raised error as a normal tool error with
+      our message, which is still actionable — never a pydantic schema traceback.
+    """
+    token = _annotation_token(fn)
+    if token in _STR_ANNOTATIONS:
+        return lambda payload: _json_dumps(payload)
+    if token in _LIST_ANNOTATIONS:
+        return lambda payload: [_json_dumps(payload)]
+    if token == "" or token in _DICT_ANNOTATIONS:
+        return lambda payload: payload
+    return _RaiseShaper()
+
+
+def _json_dumps(payload: dict) -> str:
+    import json  # stdlib, deferred: refusals are the cold path
+    return json.dumps(payload, ensure_ascii=False)
+
+
+class _RaiseShaper:
+    """Shaper for tools whose declared return type cannot hold a refusal payload."""
+
+    def __call__(self, payload: dict):
+        raise _tool_error(str(payload.get("reason") or "tool refused")
+                          + " " + str(payload.get("hint") or ""))
+
+
+def _tool_error(message: str) -> Exception:
+    try:
+        from mcp.server.fastmcp.exceptions import ToolError  # deferred: optional dep
+        return ToolError(message)
+    except Exception:  # noqa: BLE001 — mcp package absent (unit tests / DAG-only runs)
+        return RuntimeError(message)
 
 
 # --------------------------------------------------------------------------- guard + view
@@ -312,33 +460,42 @@ def _guard(fn, name):
     preserves *fn*'s signature (via functools.wraps' ``__wrapped__``) so FastMCP still
     introspects the real parameters, and matches its sync/async-ness.
 
+    Every refusal leaving this wrapper — allow-list, disabled family, per-tool toggle, or
+    workspace write-lease — is rendered by :func:`_refusal_shaper` into the shape *fn*
+    declared it returns, so FastMCP's output-schema validation can never turn a refusal
+    into a ``ToolError: 1 validation error`` crash (see _refusal_shaper).
+
     T-W16 extension: mutating tools that carry a ``doc_id`` keyword argument are also
     checked against the active workspace lease registry.  Read tools are never checked
     (classify_risk fast-path).  If no workspace session is active the check is a no-op.
     """
+    shape = _refusal_shaper(fn)
+
     if inspect.iscoroutinefunction(fn):
         @wraps(fn)
         async def aguard(*args, **kwargs):
             if not is_allowed(name):
-                return refusal(name)
+                return shape(refusal(name))
             doc_id = kwargs.get("doc_id")
             if doc_id:
                 denial = _workspace_lease_refusal(doc_id, name)
                 if denial is not None:
-                    return denial
+                    return shape(denial)
             return await fn(*args, **kwargs)
+        aguard._refusal_shaper = shape  # type: ignore[attr-defined]  # tests/introspection
         return aguard
 
     @wraps(fn)
     def guard(*args, **kwargs):
         if not is_allowed(name):
-            return refusal(name)
+            return shape(refusal(name))
         doc_id = kwargs.get("doc_id")
         if doc_id:
             denial = _workspace_lease_refusal(doc_id, name)
             if denial is not None:
-                return denial
+                return shape(denial)
         return fn(*args, **kwargs)
+    guard._refusal_shaper = shape  # type: ignore[attr-defined]  # tests/introspection
     return guard
 
 

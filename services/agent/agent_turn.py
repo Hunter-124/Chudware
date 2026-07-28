@@ -1254,10 +1254,18 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     try:
         from services.agent.config import bugreport_floor  # noqa: PLC0415
         _br_floor = set(bugreport_floor())
-        if _br_floor:
+        # Only widen a turn that HAS an allowlist. ``allowed_tools is None``
+        # means "no allowlist in force": ``allow`` stays empty and the gate
+        # below (``if allow and tool not in allow``) waves every tool through,
+        # bug reports included. Unioning the floor into that empty set would
+        # convert unrestricted into an allowlist of exactly ONE tool and deny
+        # every real call the model makes — which is what it used to do to any
+        # caller that passed no allowlist (e.g. run_turn(subagent_id=...)).
+        # An explicit empty list is still a real restriction and still gets the
+        # floor.
+        if _br_floor and allowed_tools is not None:
             allow |= _br_floor
-            if allowed_tools is not None:
-                allowed_tools = sorted(set(allowed_tools) | _br_floor)
+            allowed_tools = sorted(set(allowed_tools) | _br_floor)
     except Exception:  # noqa: BLE001 — the floor never breaks a turn
         pass
     actor = actor or name
@@ -4878,9 +4886,20 @@ def _ecad_chain_need(
         and _ecad_place_is_passive(c)
         for c in calls
     )
+    # Once a board product exists, the schematic netlist has already been
+    # exported. Forcing more schematic authoring (passive / power / wire)
+    # would silently invalidate that board — the chain has no path back to
+    # regenerating it (``has_board`` stays True), so the run would end with a
+    # board that does not match its schematic. Only force these steps while
+    # still upstream of the board, and otherwise advance the board-side chain
+    # (optimize → DRC → ERC → simulate). The pre-existing ``not has_board``
+    # guard on the second wire branch below already encoded this intent.
     # 1) IC-only: rebond orphan power before placing Device:R (mega-18 a1).
     #    When no power yet, place passive first (mega-11 IC-only → Device:R).
-    if n_place >= 1 and not has_passive and "ecad_place_symbol" in allow_set:
+    if (
+        n_place >= 1 and not has_passive and not has_board
+        and "ecad_place_symbol" in allow_set
+    ):
         if (
             power_ok
             and not power_ready
@@ -4892,6 +4911,7 @@ def _ecad_chain_need(
     # 2) First power port when none yet (or no existing power symbols).
     if (
         n_place >= 1
+        and not has_board
         and "ecad_add_power" in allow_set
         and not power_ok
     ):
@@ -4901,6 +4921,7 @@ def _ecad_chain_need(
     #     rails; pin-coincident ports clear power_not_driven.
     if (
         n_place >= 1
+        and not has_board
         and "ecad_add_power" in allow_set
         and power_ok
         and _ecad_should_retry_add_power(calls)
@@ -4908,7 +4929,10 @@ def _ecad_chain_need(
     ):
         return "ecad_add_power"
     # 3) Cross-ref wire.
-    if n_place >= 1 and not has_cross and "ecad_wire" in allow_set:
+    if (
+        n_place >= 1 and not has_cross and not has_board
+        and "ecad_wire" in allow_set
+    ):
         return "ecad_wire"
     # 4) Board when power-satisfied (mega-19 D) + cross wire.
     if (

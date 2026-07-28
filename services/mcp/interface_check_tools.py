@@ -30,9 +30,11 @@ JSON CONTRACT  (interface_check return — consumed by T-BL50; keep stable)
   "doc_id": str,
   "tool": "interface_check",
   "version": 1,
-  "components": [                 # the bodies/components compared (world-frame bboxes)
+  "components": [                 # every body in the doc, i.e. the pairing CANDIDATES
       {"id": "f2", "name": "bracket", "bbox": {...}}, ...
   ],
+  "body_count": int,              # how many bodies the verdict weighed (scratch bodies included)
+  "pair_selection": "explicit"|"proximity"|"none",   # which rule produced `pairs`
   "pairs": [                      # one entry per interface (component pair) examined
     {
       "a": "f2", "b": "f3",
@@ -515,6 +517,7 @@ def run_interface_check(
                            "components": [{"id": b.get("component") or b.get("name"),
                                            "name": b.get("name"), "bbox": b.get("bbox")}
                                           for b in bodies],
+                           "body_count": len(bodies), "pair_selection": "none",
                            "pairs": [], "findings": [],
                            "summary": "interface_check needs >=2 components/bodies; nothing to compare.",
                            "scope_note": V1_SCOPE_NOTE})
@@ -528,10 +531,56 @@ def run_interface_check(
         id_to_meta = {c["id"]: c for c in comp_meta}
 
         # Determine which pairs to examine.
+        #
+        # `components` MUST be validated before use. It used to be filtered with a silent
+        # `if c in id_to_meta`, so naming a component that does not exist in this document
+        # produced zero pairs, no findings and ok=True — a FALSE PASS. The caller asked "do
+        # these two line up?" and was told "yes", while the summary blamed proximity_mm and
+        # never mentioned that the ids were unknown. Refuse instead, and teach: name the bad
+        # value, list the ids this document actually has, and show the corrected call.
         pairs_to_check: list[tuple] = []
-        if components and len(components) >= 2:
+        pair_selection = "proximity"
+        if components:
+            if not isinstance(components, (list, tuple)):
+                return _dumps({
+                    "ok": False, "doc_id": d, "tool": "interface_check", "version": 1,
+                    "code": "bad_components",
+                    "error": f"`components` must be a list of component ids, got "
+                             f"{type(components).__name__}. Available in this document: "
+                             f"{[c['id'] for c in comp_meta]}. "
+                             f"Corrected call: interface_check(doc_id={d!r}, "
+                             f"components={[c['id'] for c in comp_meta[:2]]})",
+                    "available_components": [c["id"] for c in comp_meta]})
+            unknown = [c for c in components if c not in id_to_meta]
+            if unknown:
+                return _dumps({
+                    "ok": False, "doc_id": d, "tool": "interface_check", "version": 1,
+                    "code": "unknown_component",
+                    "error": f"unknown component id(s) {unknown} — this document has "
+                             f"{len(comp_meta)} body/bodies with ids "
+                             f"{[c['id'] for c in comp_meta]}. Component ids come from "
+                             f"interface_check(doc_id) with no `components` (its "
+                             f"`components[].id`), or from describe_assembly/"
+                             f"asm_world_bodies. Corrected call: "
+                             f"interface_check(doc_id={d!r}, "
+                             f"components={[c['id'] for c in comp_meta[:2]]})",
+                    "unknown_components": unknown,
+                    "available_components": [c["id"] for c in comp_meta]})
+            named = [id_to_meta[c] for c in dict.fromkeys(components)]
+            if len(named) < 2:
+                return _dumps({
+                    "ok": False, "doc_id": d, "tool": "interface_check", "version": 1,
+                    "code": "components_needs_pair",
+                    "error": f"`components` names {len(named)} distinct component(s) "
+                             f"{[c['id'] for c in named]}; an interface is between TWO, so "
+                             f"name at least two. Available: "
+                             f"{[c['id'] for c in comp_meta]}. Omit `components` entirely to "
+                             f"check every adjacent pair automatically, or use the corrected "
+                             f"call: interface_check(doc_id={d!r}, "
+                             f"components={[c['id'] for c in comp_meta[:2]]})",
+                    "available_components": [c["id"] for c in comp_meta]})
+            pair_selection = "explicit"
             # explicit list: check all unordered pairs among the named components
-            named = [id_to_meta[c] for c in components if c in id_to_meta]
             for i in range(len(named)):
                 for j in range(i + 1, len(named)):
                     pairs_to_check.append((named[i], named[j]))
@@ -585,20 +634,29 @@ def run_interface_check(
 
         fails = [f for f in all_findings if f["severity"] == "fail"]
         ok = len(fails) == 0
+        # The scope the verdict covers is part of the verdict. Without it a caller who left a
+        # scratch body in the document reads "All 1 interface(s) aligned" and cannot tell that
+        # the tool weighed 5 bodies, nor which pairing rule produced the pairs it reports.
+        scope = (f"scope: {len(comp_meta)} body/bodies in the document, "
+                 f"{len(pairs_to_check)} pair(s) checked "
+                 + ("(explicit components=[...])" if pair_selection == "explicit"
+                    else f"(auto: bbox gap <= proximity_mm {proximity_mm} mm)") + ".")
         if not pairs_to_check:
             summary = ("No adjacent component pairs found within proximity_mm "
-                       f"({proximity_mm} mm) — name components=[a,b] to force a check.")
+                       f"({proximity_mm} mm) among the {len(comp_meta)} bodies of this "
+                       "document — name components=[a,b] to force a check.")
         elif ok:
             summary = (f"All {len(pairs_to_check)} interface(s) aligned "
-                       f"({len(all_findings)} advisory note(s)).")
+                       f"({len(all_findings)} advisory note(s)). {scope}")
         else:
             summary = (f"{len(fails)} interface alignment failure(s) across "
                        f"{len(pairs_to_check)} interface(s): "
-                       + "; ".join(sorted({f['check'] for f in fails})) + ".")
+                       + "; ".join(sorted({f['check'] for f in fails})) + f". {scope}")
 
         return _dumps({
             "ok": ok, "doc_id": d, "tool": "interface_check", "version": 1,
             "components": [{"id": c["id"], "name": c["name"], "bbox": c["bbox"]} for c in comp_meta],
+            "body_count": len(comp_meta), "pair_selection": pair_selection,
             "pairs": pair_results, "findings": all_findings,
             "summary": summary, "scope_note": V1_SCOPE_NOTE,
         })
@@ -637,7 +695,10 @@ def register_interface_check_tools(mcp: "FastMCP") -> None:
           doc_id:       assembly / multi-body part doc (default: current). Call solve_mates first
                         on a mate-driven assembly so components sit at their solved placement.
           components:   optional [a, b, ...] component/body ids to force-check as pairs (bypasses
-                        the proximity heuristic). Omit to auto-detect adjacent pairs.
+                        the proximity heuristic). Needs at least TWO distinct KNOWN ids: an id
+                        this document does not have is refused (code "unknown_component", with
+                        the available ids), never silently dropped. Omit to auto-detect adjacent
+                        pairs. The ids are the `components[].id` of an un-scoped call.
           fastener:     optional thread designation ("M6", "1/4-20") to run the pass-through check.
           proximity_mm: bbox adjacency gap for auto-pair detection (default 2.0 mm).
 

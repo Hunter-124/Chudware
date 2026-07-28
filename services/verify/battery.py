@@ -442,9 +442,16 @@ def _adapt_check_kwargs(
                 if feats:
                     pair = ("top", "bottom")
                 else:
+                    # Distinct, actionable cause: an empty document cannot be
+                    # measured at all. Saying "no geometrically valid
+                    # endpoints" here misleads the model into retrying with
+                    # other queries when the real fix is to build geometry.
                     return None, _skip_json(
                         check_name,
-                        "no geometrically valid measure endpoints (honest SKIP)",
+                        f"document {doc_id!r} has no features - nothing to "
+                        "measure; create geometry first (e.g. "
+                        "add_features(doc_id, [{'type': 'box', ...}])) then "
+                        "re-run measure_between (honest SKIP)",
                     )
             if not _valid_endpoint(call_kwargs.get("a_query")):
                 call_kwargs["a_query"] = pair[0]

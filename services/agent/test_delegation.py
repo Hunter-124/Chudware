@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from services.agent.delegation import (
     DEPTH_CAP,
@@ -44,6 +44,31 @@ from services.agent.routing import (
     ModelEntry,
     load_routing,
 )
+
+
+# ---------------------------------------------------------------------------
+# Hermeticity: DelegationTree falls back to agent.max_subagent_depth from the
+# developer's live config.json when the kwarg is omitted. These are unit tests
+# of tree mechanics, so pin the getter to the documented default — otherwise a
+# local Settings toggle (e.g. max_subagent_depth 0 or 1) turns the file red.
+# Tests that assert on the cap itself pass max_subagent_depth explicitly.
+# ---------------------------------------------------------------------------
+
+_depth_patch = None
+
+
+def setUpModule() -> None:
+    global _depth_patch
+    _depth_patch = patch(
+        "services.agent.config.get_max_subagent_depth",
+        return_value=DEFAULT_MAX_SUBAGENT_DEPTH,
+    )
+    _depth_patch.start()
+
+
+def tearDownModule() -> None:
+    if _depth_patch is not None:
+        _depth_patch.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +485,11 @@ class TestBudgetInheritanceRevocation(unittest.TestCase):
             orchestrator_budget=1000,
             ledger=self.ledger,
             routing=self.routing,
+            # Pin the hard nesting cap: this class exercises budget accrual and
+            # cascade revocation, not agent.max_subagent_depth. Left unset it
+            # would be read from the developer's config.json and a local
+            # setting of 1 would refuse the depth-2 spawn in test_cascade_revoke.
+            max_subagent_depth=8,
         )
 
     def _start_d1(self, budget: int = 600) -> Any:
@@ -881,7 +911,8 @@ class TestKillSwitch(unittest.TestCase):
         """Pending nodes (awaiting overseer approval) are also revoked by kill()."""
         ledger = _MockLedger()
         tree = DelegationTree(run_id="r_kill4", orchestrator_budget=50_000,
-                              ledger=ledger, routing=_two_source_routing())
+                              ledger=ledger, routing=_two_source_routing(),
+                              max_subagent_depth=8)
         d1 = tree.request_delegation("orchestrator", "phase", 5000, kind="worker")
         # d2 is depth-2 worker → pending, awaiting overseer.
         d2 = tree.request_delegation("sketcher", "sub-task", 1000,
@@ -925,7 +956,7 @@ class TestSoftLimitAdvisory(unittest.TestCase):
         ledger = _MockLedger()
         tree = DelegationTree(run_id="r_soft2", orchestrator_budget=100_000,
                               ledger=ledger, routing=_two_source_routing(),
-                              soft_depth_limit=5)
+                              soft_depth_limit=5, max_subagent_depth=8)
         # Spawn only 2 deep — no warning expected.
         d1 = tree.request_delegation("sketcher", "depth 1", 500, kind="ponder")
         tree.request_delegation("sketcher", "depth 2", 200,

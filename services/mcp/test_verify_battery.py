@@ -710,10 +710,16 @@ def test_forced_wire_args_use_place_refs_and_pins():
         },
     ]
     args = _ecad_forced_tool_args("ecad_wire", calls)
-    assert args["from_ref"] == "R1"
-    assert args["to_ref"] == "U1"
-    assert args["from_pin"] == "1"
-    assert args["to_pin"] == "3"
+    # ecad_wire emits a symmetric ``sch_connect`` op (services/mcp/
+    # ecad_sch_tools.py:261) — from/to only order the human-readable hint, so
+    # the contract is WHICH pins get joined, not their orientation. Assert the
+    # endpoint pair: the resistor's pin 1 must bond to U1's VCC pin 3, both
+    # derived from the placement refs/pins in the ledger.
+    ends = {
+        (args["from_ref"], str(args["from_pin"])),
+        (args["to_ref"], str(args["to_pin"])),
+    }
+    assert ends == {("R1", "1"), ("U1", "3")}, args
 
 
 def test_chain_need_forces_erc_after_drc():

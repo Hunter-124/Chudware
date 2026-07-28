@@ -303,7 +303,12 @@ def _make_symbols() -> dict:
             _line(1.0, 2.8, 0.6, 2.8),
             _line(1.0, 2.8, 1.0, 2.4),
         ],
-        sim={"model": "D", "pin_order": ["A", "K"]},
+        # An LED is not a silicon rectifier: without junction parameters it fell through to the
+        # solver's default diode (IS=1e-14, N=1) and conducted at ~0.74 V, making every simulated
+        # LED circuit physically wrong. Generic RED-LED Shockley model — 2.00 V forward drop
+        # across the 1-20 mA indicator range. Ported in core/sim/netlist.cpp symbol_sim_table().
+        sim={"model": "D", "pin_order": ["A", "K"],
+             "params": {"IS": 2.3e-19, "N": 2.0, "RS": 2.0}},
         footprint_filters=["LED_*"],
     )
 

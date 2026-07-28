@@ -1415,21 +1415,6 @@ def _disable_live_provider():
 # returned by test_register() explicitly; under pytest we provide a module-scoped fixture
 # that registers the tools once with the live provider disabled (same as main()).
 
-_PYTEST_PROVIDER_RESTORE = None
-
-
-def pytest_configure(config):  # noqa: ANN001 — pytest hook
-    """Disable the live provider for the whole pytest session of this file."""
-    global _PYTEST_PROVIDER_RESTORE
-    _PYTEST_PROVIDER_RESTORE = _disable_live_provider()
-
-
-def pytest_unconfigure(config):  # noqa: ANN001 — pytest hook
-    restore = globals().get("_PYTEST_PROVIDER_RESTORE")
-    if callable(restore):
-        restore()
-
-
 try:
     import pytest
 except ImportError:  # pragma: no cover — pytest absent when run via main()
@@ -1437,8 +1422,20 @@ except ImportError:  # pragma: no cover — pytest absent when run via main()
 
 
 if pytest is not None:
+    # The provider pin MUST be a fixture, not a pytest_configure/pytest_unconfigure pair.
+    # pytest only collects those hooks from conftest.py and installed plugins — a plain test
+    # MODULE is neither, so the hooks defined here were never called and every ecad_design
+    # test silently planned against the developer's REAL configured provider (a live model),
+    # which is exactly the non-determinism _disable_live_provider() exists to prevent.
+    @pytest.fixture(scope="module", autouse=True)
+    def _no_live_provider():
+        """Pin agent.config.get_provider to None for every test in this module."""
+        restore = _disable_live_provider()
+        yield
+        restore()
+
     @pytest.fixture(scope="module")
-    def tools():
+    def tools(_no_live_provider):
         """Module-scoped registered ECAD tool dict (provider disabled like main())."""
         return test_register()
 

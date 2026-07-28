@@ -33,20 +33,22 @@ from services.agent import agent_turn as at
 from services.agent import arg_reconciliation as recon
 
 
-def _mcp_server():
-    """Import services/mcp/server.py LAZILY, never at module scope.
+import services.mcp.server as mcp_server
 
-    server.py registers ~400 tools into the process-wide tool_registry catalog as
-    an import side-effect, and ``tool_registry.warm_catalog`` warms by importing it.
-    A module-scope import here runs during pytest COLLECTION, before any test — so
-    by the time a later suite calls ``clear_catalog()`` (``test_roles._build_catalog``
-    does, rebuilding only from a ``*_tools.py`` glob) the subsequent ``warm_catalog``
-    is a no-op: the module is already in ``sys.modules``, so re-importing it has no
-    side effect and the families that only server.py registers (ascii2d, office,
-    power_budget, heatsink, ecad_thermal) stay missing for the rest of the session.
-    That is what broke test_tool_guidance's collection-time registry snapshot.
+
+def _mcp_server():
+    """The imported server module.
+
+    This used to be a deliberately DEFERRED import: server.py registers ~400 tools
+    into the process-wide tool_registry catalog as an import side-effect, and
+    ``tool_registry.warm_catalog`` used to warm purely by importing it — so a
+    module-scope import here (running at pytest COLLECTION time) made every later
+    ``warm_catalog()`` a no-op once some suite called ``clear_catalog()``.
+    ``tool_registry.mark_warm_baseline`` fixed that at the root: warming now replays a
+    content snapshot instead of relying on the one-shot import side effect, so this
+    import is safe at module scope again (see tool_registry.warm_catalog docstring and
+    test_tool_registry's clear/warm regression tests).
     """
-    import services.mcp.server as mcp_server  # noqa: PLC0415 — deliberately deferred
     return mcp_server
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]

@@ -132,6 +132,27 @@ def test_attributes_are_not_smuggled_into_facets():
     assert out["applied"]["facets"] == {}
 
 
+def test_the_interpretation_echo_survives_output_budget_pressure():
+    """The echo must NAME the rewrite, and must outlive the token budget.
+
+    Regression: `applied` (and `interpreted`) sat in
+    result_serving._SOFT_DROP, so a search big enough to need trimming had its
+    read-back deleted BEFORE the result list was even sampled. The model then
+    saw hits for a query it never wrote, with no record of the rewrite — the
+    silent-rewrite defect this echo exists to prevent.
+    """
+    out = _call("part_search", part_type="bushing", bore_mm=20)
+    assert out["meta"]["truncated"] is True, "expected a budget-trimmed payload"
+    dropped = out["meta"]["omitted_keys"]
+    for key in ("applied", "interpreted", "interpreted_args"):
+        assert key not in dropped, f"{key} was sacrificed to the token budget"
+    # Names the transformation, not merely present / not merely non-empty.
+    assert out["applied"]["query"] == "bushing bore 20mm"
+    assert out["applied"]["facets"] == {}
+    note = _notes(out)
+    assert "bore_mm" in note and "bore 20mm" in note
+
+
 def test_nothing_to_search_for_is_a_teaching_error():
     out = _call("part_search")
     assert out["ok"] is False

@@ -179,18 +179,22 @@ def inverting_amp(gain: float = 10.0) -> dict:
     }
 
 
-def led_driver(vsupply: float = 3.3, vf: float = 1.8, current: float = 0.01) -> dict:
+# Forward drop of the library's Device:LED SPICE model (generic red LED, IS=2.3e-19/N=2/RS=2).
+# The design value and the simulated device are the SAME LED, so a sized dropper resistor and
+# the op-point self-check agree instead of the check being calibrated to a modelling error.
+LED_MODEL_VF = 2.0
+
+
+def led_driver(vsupply: float = 3.3, vf: float = LED_MODEL_VF, current: float = 0.01) -> dict:
     """A series current-limited LED driver: V1 (vsupply) -> R (limit) -> LED -> GND.
 
     The current-limit resistor is the textbook ``R = (Vsupply - Vf) / I`` for the requested LED
     forward voltage ``vf`` and target current ``current`` (default 10 mA). R is rounded to a sane
     value so the BOM is real.
 
-    Simulation note: the starter LED uses the generic Shockley diode model (IS=1e-14), whose forward
-    drop is ~0.73 V at these currents — lower than a real LED's ~1.8 V — so the self-check expects
-    the MODEL forward voltage V(LED_A) (a stable, model-determined value), not the design ``vf``.
-    The DESIGNED resistor still uses the real ``vf`` so the schematic/BOM is correct for a physical
-    LED, while the op-point self-check honestly confirms the LED conducts.
+    The op-point self-check probes the anode against ``LED_MODEL_VF``, the forward voltage the
+    library LED actually exhibits. Passing ``vf`` far from it is legitimate (a blue/white LED) but
+    the check will then report a MISS — honestly, because the simulated part is a red LED.
     """
     vsupply = float(vsupply)
     vf = max(min(float(vf), vsupply * 0.95), 0.0)
@@ -215,9 +219,9 @@ def led_driver(vsupply: float = 3.3, vf: float = 1.8, current: float = 0.01) -> 
         "study": {
             "analysis": "op",
             "params": {},
-            # Expect the LED to conduct at its (model) forward voltage. Generous tol because the
-            # generic diode model's drop varies with current; this confirms the LED is forward-biased.
-            "expect": {"probe": "V(LED_A)", "value": 0.73, "tol": 0.25},
+            # The anode sits one LED drop above ground: confirms the LED is forward-biased AND
+            # that the dropper resistor leaves it the headroom the design assumed. 5% relative.
+            "expect": {"probe": "V(LED_A)", "value": LED_MODEL_VF, "tol": 0.05},
         },
         "notes": (f"R1={_fmt_ohms(r)} = (Vsupply-Vf)/I = ({_trim(vsupply)}-{_trim(vf)})/"
                   f"{_trim(current)} ; LED current ~= {_trim(current*1000)} mA. "

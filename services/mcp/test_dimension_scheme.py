@@ -13,6 +13,7 @@ import json
 import sys
 import types
 import unittest
+import unittest.mock
 
 # ---------------------------------------------------------------------------
 # Stubs so imports succeed without libchudware.so or live MCP server
@@ -125,12 +126,6 @@ def _install_stubs():
 _restore_stubs = _install_stubs()
 try:
     from services.research.fits import fit_calc, recommend_fit  # noqa: E402
-    # engine_oracle/dfm was ported to core (T-RF19); resolve profiles via the RPC.
-    from services.mcp import core_bridge as _cb  # noqa: E402
-
-    def get_profile(name):
-        return _cb.call("dfm_get_profile", {"process": name}).get("result")
-
     # Import dimension_scheme internals directly (not via MCP)
     from services.mcp.dimension_scheme_tools import (  # noqa: E402
         _plan_from_entities,
@@ -142,6 +137,21 @@ try:
     )
 finally:
     _restore_stubs()
+
+
+def get_profile(name: str) -> dict:
+    """The DfM profile for `name`, resolved through the PRODUCT's own lookup.
+
+    Deliberately NOT bound at import time: `_install_stubs()` above registers a fake
+    `core_bridge` whose `call()` returns `{}`, so a module-level `from services.mcp import
+    core_bridge as _cb` captured that stub in a clean process and this helper handed back
+    `None`. It only ever produced a real profile when some earlier test in the same
+    process had already imported the real core_bridge — an order-dependent false green.
+    Resolving lazily via `dimension_scheme_tools._get_profile` (a) always sees the real
+    bridge and (b) raises a teaching ValueError instead of returning None.
+    """
+    from services.mcp.dimension_scheme_tools import _get_profile
+    return _get_profile(name)
 
 
 class TestBoltPatternRule(unittest.TestCase):
@@ -398,6 +408,48 @@ class TestProcessDifferentiation(unittest.TestCase):
         for item in fdm_plan:
             self.assertAlmostEqual(item["hole_comp_mm"], expected_fdm_comp, places=6,
                                    msg="FDM hole_comp must match process_profiles")
+
+    # ── the lookup must fail loudly, never degrade to "no compensation" ──────────
+
+    def test_unknown_process_profile_raises_teaching_error(self):
+        """A process the DfM oracle does not know must raise, naming it AND the menu.
+
+        Returning None/{} here is the defect class this repo is eliminating: the caller
+        reads params.hole_comp_mm off it and either explodes with an AttributeError two
+        frames later or — worse — plans an uncompensated hole that silently prints
+        0.20 mm undersize.
+        """
+        from services.mcp.dimension_scheme_tools import _get_profile
+        with self.assertRaises(ValueError) as ctx:
+            _get_profile("lost_wax")
+        msg = str(ctx.exception)
+        self.assertIn("lost_wax", msg, "the error must name the requested process")
+        for known in ("fdm", "cnc_mill"):
+            self.assertIn(known, msg, "the error must list the available processes")
+
+    def test_planner_does_not_swallow_an_unresolvable_process(self):
+        """_plan_from_entities must propagate the teaching error, not plan comp=0.0.
+
+        A silent 0.0 is indistinguishable from a legitimate CNC plan, so an agent asking
+        for a misspelled process would get a confidently wrong scheme.
+        """
+        entities = _make_bore_sketch(self.NOMINAL_MM)
+        with self.assertRaises(ValueError) as ctx:
+            _plan_from_entities(entities, "lost_wax", it_grade=9,
+                                nominal_fallback_mm=self.NOMINAL_MM)
+        self.assertIn("lost_wax", str(ctx.exception))
+
+    def test_offline_mode_still_plans_with_zero_compensation(self):
+        """With NO engine bridge the planner degrades (comp 0.0) instead of raising —
+        that offline path is this module's documented fixture mode and must survive the
+        loud-lookup change above."""
+        import mcp_server.core_bridge as cb
+        with unittest.mock.patch.object(cb, "available", lambda: False):
+            plan = _plan_from_entities(_make_bore_sketch(self.NOMINAL_MM), "fdm",
+                                       it_grade=12, nominal_fallback_mm=self.NOMINAL_MM)
+        self.assertTrue(plan, "offline mode must still emit a plan")
+        for item in plan:
+            self.assertAlmostEqual(item["hole_comp_mm"], 0.0, places=6)
 
 
 class TestSketchHealthText(unittest.TestCase):

@@ -12,6 +12,7 @@ Run:  python -m pytest services/mcp/test_interface_check.py -v
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -50,9 +51,21 @@ def _call(name: str, args: dict):
 # Misaligned variant: the copy is ALSO shifted +dx in X, so its whole hole pattern is offset dx
 #                   in X relative to A while the contact faces stay flush.
 
+# Every test needs its OWN document: new_part(name=...) deliberately RESUMES an already-open
+# part of that name (cad_doc_tools.py:4426 — "a part of that name that is ALREADY OPEN is
+# resumed, not duplicated"), so a fixed name made all six stack tests build into
+# doc-cpp00000001 and each one saw the bodies left by its predecessors.
+_STACK_SEQ = itertools.count(1)
+
+
+def _fresh_doc(prefix: str) -> str:
+    r, _ = _call("new_part", {"name": f"{prefix}_{next(_STACK_SEQ)}", "fresh": True})
+    assert r and r.get("ok") and not r.get("reused"), r
+    return r["doc_id"]
+
+
 def _build_stack(dx: float):
-    r, _ = _call("new_part", {"name": "stack"})
-    doc = r["doc_id"]
+    doc = _fresh_doc("stack")
     ops = [
         cb.feat("box", "Bracket", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(10)}),
         {"op": "add_feature", "feature": {
@@ -185,13 +198,67 @@ def test_interface_check_fastener_passthrough_passes_when_clear():
 
 def test_interface_check_single_body_is_noop():
     """<2 bodies -> nothing to compare, ok True, no pairs."""
-    r, _ = _call("new_part", {"name": "solo"})
-    doc = r["doc_id"]
+    doc = _fresh_doc("solo")
     _call("add_features", {"ops": [
         cb.feat("box", "B", {"length": cb.dim(20), "width": cb.dim(20), "height": cb.dim(10)})],
         "doc_id": doc})
     r2, _ = _call("interface_check", {"doc_id": doc})
     assert r2["ok"] is True and r2["pairs"] == [], r2
+
+
+def test_unknown_component_is_refused_not_a_silent_pass():
+    """An id this document does not have used to be filtered out silently, leaving zero pairs,
+    zero findings and ok=True — the caller asked "do these two line up?" and was told YES about
+    components that do not exist. It must be a teaching refusal instead."""
+    doc = _build_stack(dx=0.0)
+    r, _ = _call("interface_check", {"doc_id": doc, "components": ["bogusA", "bogusB"]})
+    assert r["ok"] is False, r
+    assert r["code"] == "unknown_component", r
+    assert r["unknown_components"] == ["bogusA", "bogusB"], r
+    # teaches: the offending values, the accepted set, and the corrected call.
+    assert "bogusA" in r["error"], r
+    assert set(r["available_components"]) == {"f2", "f3"}, r
+    assert "f2" in r["error"] and "interface_check(doc_id=" in r["error"], r
+
+
+def test_partially_unknown_components_is_refused():
+    """One good id + one bogus id is still a refusal — not a check of the good one alone."""
+    doc = _build_stack(dx=0.0)
+    r, _ = _call("interface_check", {"doc_id": doc, "components": ["f2", "nope"]})
+    assert r["ok"] is False and r["code"] == "unknown_component", r
+    assert r["unknown_components"] == ["nope"], r
+
+
+def test_single_component_is_refused_not_silently_widened():
+    """A 1-element components list used to fall through to whole-doc proximity pairing, so the
+    caller got a verdict about a pair it never named, reported as if it had asked for it."""
+    doc = _build_stack(dx=0.0)
+    r, _ = _call("interface_check", {"doc_id": doc, "components": ["f2"]})
+    assert r["ok"] is False and r["code"] == "components_needs_pair", r
+    assert "f3" in r["error"], r
+
+
+def test_verdict_surfaces_the_scope_it_considered():
+    """The verdict names how many bodies it weighed and which pairing rule it used, so a doc
+    carrying a scratch body cannot yield a silently narrow-looking clash report."""
+    doc = _build_stack(dx=0.0)
+    r, _ = _call("interface_check", {"doc_id": doc, "components": ["f2", "f3"]})
+    assert r["body_count"] == 2, r
+    assert r["pair_selection"] == "explicit", r
+    assert "scope: 2 body/bodies" in r["summary"], r["summary"]
+
+    # A third, unrelated scratch body 300 mm away (a transform copy — a plain box at an offset
+    # fuses into the existing body instead of becoming its own). Only the bracket/plate pair is
+    # adjacent, so `pairs` still has 1 entry: "All 1 interface(s) aligned" on its own would hide
+    # that the doc holds 3 bodies. body_count/pair_selection + the scope line say so.
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "Scratch", {"translate": [300.0, 0.0, 0.0], "copy": True})]})
+    r2, _ = _call("interface_check", {"doc_id": doc})
+    assert r2["body_count"] == 3, r2
+    assert r2["pair_selection"] == "proximity", r2
+    assert len(r2["pairs"]) == 1, r2
+    assert "scope: 3 body/bodies" in r2["summary"], r2["summary"]
+    assert "1 pair(s) checked" in r2["summary"], r2["summary"]
 
 
 def test_interface_check_in_design_review_battery():

@@ -145,6 +145,75 @@ class TestRegistrationCatalog(unittest.TestCase):
                 self.assertIsNone(reg.deny_reason(probe))
 
 
+class TestWarmClearCatalogSemantics(unittest.TestCase):
+    """clear_catalog() = clean room; warm_catalog() = reset-to-warm. Both must hold
+    in the SAME process, in either order, however many times.
+
+    Regression: warm_catalog() used to warm purely as a side effect of the FIRST
+    ``import mcp_server.server``. Once anything imported server.py (this very module
+    does, at collection time) the memo latched, so after a clear_catalog() the
+    families only server.py registers — ascii2d, office, power_budget, heatsink,
+    ecad_thermal — could never be restored, and every later caller in the process
+    silently saw a short catalog (this broke services/agent/test_tool_guidance.py).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if _IMPORT_ERROR is not None:
+            raise unittest.SkipTest(f"services.mcp.server import failed: {_IMPORT_ERROR!r}")
+        cls.office_tools = sorted(
+            n for n, m in _CATALOG_SNAPSHOT.items() if m.get("family") == "office")
+        if not cls.office_tools:
+            raise unittest.SkipTest("no family 'office' tool in the post-import catalog")
+
+    def tearDown(self):
+        # Leave the process-wide catalog as this module found it, for sibling files.
+        reg.clear_catalog()
+        for name, meta in _CATALOG_SNAPSHOT.items():
+            reg.record(name, meta.get("family"), meta.get("risk"))
+
+    def test_clear_then_warm_restores_server_only_families(self):
+        probe = self.office_tools[0]
+        reg.clear_catalog()
+        self.assertNotIn(probe, reg.catalog(),
+                         "clear_catalog() must actually empty the catalog")
+
+        reg.warm_catalog()
+        cat = reg.catalog()
+        self.assertIn(probe, cat,
+                      "warm_catalog() after clear_catalog() did not restore the "
+                      "server-only 'office' family — the one-shot-import landmine is back")
+        self.assertEqual(cat[probe].get("family"), "office")
+        families = {m.get("family") for m in cat.values()}
+        for fam in ("office", "ecad", "gsl", "org"):
+            self.assertIn(fam, families, f"family {fam!r} missing after clear+warm")
+
+        # And it stays restored across a second warm (idempotent, not destructive).
+        reg.warm_catalog()
+        self.assertIn(probe, reg.catalog())
+
+    def test_clear_catalog_is_a_genuine_clean_room(self):
+        """A caller asking for a clean room gets ONLY the always-on meta-tools —
+        clear_catalog() must never implicitly replay the warm baseline."""
+        reg.clear_catalog()
+        cat = reg.catalog()
+        expected = {name for name, _fam, _risk in reg._META_TOOLS}
+        self.assertEqual(set(cat), expected,
+                         "clear_catalog() leaked non-meta entries into a clean room")
+
+        # A clean room that then registers exactly one family sees exactly that family.
+        reg.record("clean_room_probe", "cad", reg.RISK_READ)
+        self.assertEqual({m["family"] for m in reg.catalog().values()},
+                         {"workspace", "cad"})
+
+    def test_org_family_is_registered_on_the_live_server(self):
+        """The Settings -> AI -> Tools 'org' toggle governs real, registered tools."""
+        for name in ("channel_send", "request_raise", "request_resolve", "council_convene"):
+            self.assertIn(name, _TOOL_NAMES, f"{name} not on the FastMCP server")
+            self.assertEqual((_CATALOG_SNAPSHOT.get(name) or {}).get("family"), "org",
+                             f"{name} is not catalog-tagged family 'org'")
+
+
 if __name__ == "__main__":
     # Also runnable as: python -m services.mcp.test_registration_catalog
     unittest.main(verbosity=2)

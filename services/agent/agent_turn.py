@@ -2637,7 +2637,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         except Exception:  # noqa: BLE001
                             pass
             except Exception as exc:  # noqa: BLE001 — dispatch error fed back to model
-                result = {"ok": False, "error": str(exc)}
+                if _is_internal_dispatch_fault(exc):
+                    result = _internal_fault_result(exc, tool)
+                else:
+                    result = {"ok": False, "error": str(exc)}
                 ok = False
         _latency_ms = (_time.monotonic() - _t0) * 1000.0
         # mega-19: keep full result in-process so place pin lists survive for
@@ -3662,9 +3665,9 @@ def _ask_user_sync(questions: Any = None, question: Any = None,
     identically with and without one.  ``blocking`` is forced off because this
     turn has no transport to prompt through — a blocking batch would raise.
     """
-    from services.agent.interaction import MemoryLedger, ask_user  # noqa: PLC0415
-    from services.agent.mission_dispatch import (  # noqa: PLC0415
-        _TOP_LEVEL_QUESTION_ALIASES, _normalize_questions,
+    from services.agent.interaction import (  # noqa: PLC0415
+        MemoryLedger, TOP_LEVEL_QUESTION_ALIASES, ask_user,
+        ask_user_bad_arguments_error, normalize_questions,
     )
 
     raw = questions if questions is not None else question
@@ -3672,23 +3675,14 @@ def _ask_user_sync(questions: Any = None, question: Any = None,
         # Same dialect widening as MissionDispatch.ask_user: models put the
         # question under whatever key they like and those used to vanish into
         # **_ignored, making the call look argument-less.
-        for _alias in _TOP_LEVEL_QUESTION_ALIASES:
+        for _alias in TOP_LEVEL_QUESTION_ALIASES:
             if extra.get(_alias):
                 raw = extra[_alias]
                 break
-    norm = _normalize_questions(raw)
+    norm = normalize_questions(raw)
     norm = [q for q in norm if str(q.get("prompt") or "").strip()]
     if not norm:
-        return {"ok": False, "status": "bad_arguments",
-                "error": ("ask_user got no question text. Batch every unknown into "
-                          "ONE call, at most 4, each with a suggested default — see "
-                          "cad_guide('interaction'). If you cannot phrase a concrete "
-                          "question, do NOT retry this tool: state your assumption, "
-                          "continue, and raise the open question in your final "
-                          "message instead."),
-                "example": [{"id": "material", "kind": "choice",
-                             "prompt": "What material?", "suggested": "PLA",
-                             "options": ["PLA", "PETG", "aluminium 6061"]}]}
+        return ask_user_bad_arguments_error()
 
     # Answers persist where there is somewhere to persist them: a doc-scoped
     # batch lands in the .step+ record and replays on reopen.  With neither a run
@@ -3986,150 +3980,11 @@ def _signature_spec(fn: Any) -> dict:
     return spec
 
 
-# Explicit argument-name synonyms the affix heuristic in _map_arg_name can
-# never reach ("format" shares no prefix/suffix with "fmt"). Live 2026-07-27
-# (claude-opus, flyswatter run): export_part(format="step") was rejected
-# "no parameter of that name and no unambiguous synonym" even though `format`
-# IS the canonical English name of that parameter. Keyed by the NORMALISED
-# supplied name -> normalised target; applied only when exactly one free
-# parameter matches the target and its annotation admits the value, so a
-# synonym can never outvote a real parameter or force a wrong-typed call.
-_ARG_SYNONYMS: dict[str, str] = {
-    "format": "fmt",
-    "fileformat": "fmt",
-}
-
-# Synonyms that are only unambiguous for ONE tool. "type" is far too generic
-# to map globally, but export_part(fmt, path, doc_id) has no other parameter
-# a str `type=` could mean.
-_TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
-    "export_part": {"type": "fmt"},
-}
-
-
-def _norm_arg(name: str) -> str:
-    return str(name).lower().replace("_", "").replace("-", "")
-
-
-def _annotation_admits(ann: str, value: Any) -> bool:
-    """True when *value* is plausibly what annotation *ann* asks for.
-
-    The synonym mapper's safety catch: describe_project(run_id="m1") must NOT be
-    rewritten to run=<str> when ``run`` is annotated ``Optional[dict]`` — a
-    silently wrong call is worse than an honest teaching error.  Ambiguous or
-    absent annotations admit everything (we only ever REFUSE on a clear clash)."""
-    if not ann or value is None:
-        return True
-    kinds = {
-        "dict": ("dict" in ann or "mapping" in ann),
-        "list": ("list" in ann or "sequence" in ann or "tuple" in ann),
-        "str": ("str" in ann),
-        "num": ("int" in ann or "float" in ann),
-        "bool": ("bool" in ann),
-    }
-    hit = [k for k, v in kinds.items() if v]
-    if len(hit) != 1:
-        return True  # union / unannotated / unrecognised → cannot judge
-    kind = hit[0]
-    if kind == "dict":
-        return isinstance(value, dict)
-    if kind == "list":
-        return isinstance(value, (list, tuple))
-    if kind == "bool":
-        return isinstance(value, bool)
-    if kind == "str":
-        return isinstance(value, str)
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, (int, float)):
-        return True
-    if isinstance(value, str):
-        try:
-            float(value)
-            return True
-        except ValueError:
-            return False
-    return False
-
-
-def _map_arg_name(supplied: str, value: Any, spec: dict, used: set[str],
-                  synonyms: dict[str, str] | None = None) -> str | None:
-    """Map a supplied argument name onto a real parameter, or None.
-
-    Only UNAMBIGUOUS mappings are made: an exact match ignoring case and
-    underscores, an explicit _ARG_SYNONYMS / per-tool synonym whose target is
-    exactly one free parameter, or an affix relation (one name is a
-    prefix/suffix of the other, e.g. shaft_diameter → diameter) that exactly
-    ONE free parameter satisfies and whose annotation admits the supplied
-    value."""
-    free = [p for p in spec["params"] if p not in used]
-    ns = _norm_arg(supplied)
-    if not ns:
-        return None
-    exact = [p for p in free if _norm_arg(p) == ns]
-    if exact:
-        return exact[0] if len(exact) == 1 else None
-    if synonyms:
-        want = synonyms.get(ns)
-        if want:
-            cand = [p for p in free if _norm_arg(p) == want]
-            if len(cand) == 1 and _annotation_admits(
-                    spec["ann"].get(cand[0], ""), value):
-                return cand[0]
-    affix = []
-    for p in free:
-        np = _norm_arg(p)
-        if min(len(np), len(ns)) < 3:
-            continue  # 1–2 char names collide by accident, never by intent
-        if ns.startswith(np) or ns.endswith(np) or np.startswith(ns) or np.endswith(ns):
-            affix.append(p)
-    if len(affix) != 1:
-        return None
-    target = affix[0]
-    return target if _annotation_admits(spec["ann"].get(target, ""), value) else None
-
-
-def _bad_kwargs_error(tool: str, spec: dict, supplied: dict,
-                      unmapped: list[str], config_keys: set[str]) -> dict:
-    """Teaching error for argument names that are not parameters of *tool*."""
-    params = spec["params"]
-    req = spec["required"]
-    good = {k: v for k, v in supplied.items() if k in params}
-    corrected = [f"{k}={v!r}" for k, v in good.items()]
-    corrected += [f"{p}=<{p}>" for p in params if p in req and p not in good]
-    payload = {
-        "ok": False,
-        "status": "unknown_argument",
-        "error": (
-            f"{tool}() got unknown argument(s) "
-            f"{', '.join(repr(u) for u in unmapped)} — no parameter of that name "
-            f"and no unambiguous synonym. The call was NOT made (nothing was "
-            f"dropped silently). Re-issue it using only the accepted parameters."
-        ),
-        "accepted_params": [
-            f"{p} (required)" if p in req else f"{p} (optional)" for p in params
-        ],
-        "unknown_params": list(unmapped),
-        "hint": f"{tool}({', '.join(corrected)})",
-    }
-    from_config = [u for u in unmapped if u in config_keys]
-    if from_config:
-        # Not the model's mistake: a param_default the user configured is not a
-        # parameter of this tool. Say so, or the model burns the turn rephrasing.
-        payload["from_config"] = from_config
-        payload["error"] += (
-            f" NOTE: {', '.join(repr(c) for c in from_config)} came from "
-            f"agent.tool_options param_defaults (Settings → AI → Tools), NOT "
-            f"from your call — you cannot fix it by rephrasing; report it."
-        )
-    try:
-        from services.agent.tool_hints import hint_for  # noqa: PLC0415
-        extra = hint_for(tool)
-        if extra:
-            payload["tool_hint"] = extra
-    except Exception:  # noqa: BLE001
-        pass
-    return payload
+from services.agent.arg_reconciliation import (
+    resolve_unknown as _resolve_unknown,
+    synonyms_for as _synonyms_for,
+    unknown_arg_payload as _unknown_arg_payload,
+)
 
 
 def _missing_kwargs_error(tool: str, spec: dict, missing: list[str]) -> dict:
@@ -4191,13 +4046,12 @@ def _reconcile_kwargs(tool: str, fn: Any, supplied: dict,
     notes: list[str] = []
     unmapped: list[str] = []
     used = {k for k in supplied if k in params}
-    synonyms = dict(_ARG_SYNONYMS)
-    synonyms.update(_TOOL_ARG_SYNONYMS.get(tool) or {})
+    synonyms = _synonyms_for(tool)
     for name, value in (supplied or {}).items():
         if name in params:
             kwargs[name] = value
             continue
-        target = _map_arg_name(name, value, spec, used, synonyms)
+        target = _resolve_unknown(name, value, params, spec["ann"], used, synonyms)
         if target is None:
             unmapped.append(name)
             continue
@@ -4205,8 +4059,8 @@ def _reconcile_kwargs(tool: str, fn: Any, supplied: dict,
         used.add(target)
         notes.append(f"interpreted {name!r} as {target!r}")
     if unmapped:
-        return {}, [], _bad_kwargs_error(tool, spec, supplied, unmapped,
-                                         config_keys or set())
+        return {}, [], _unknown_arg_payload(tool, params, spec["required"], supplied,
+                                            unmapped, config_keys or set())
     # Required parameters the model omitted. This check MUST run for an empty
     # payload too: `not supplied` used to return early, so a bare {} call went
     # straight to fn() and surfaced a raw TypeError instead of a teaching error.
@@ -4239,6 +4093,68 @@ def _attach_arg_notes(result: Any, notes: list[str]) -> Any:
     return result
 
 
+_INTERNAL_FAULT_TYPES = (AttributeError, KeyError, IndexError, UnboundLocalError)
+
+
+def _is_internal_dispatch_fault(exc: BaseException) -> bool:
+    """True when *exc* is a HARNESS/TOOL-BODY bug, not a legitimate tool
+    rejection (ValueError/RuntimeError with a teaching message) and not an
+    argument-binding TypeError from ``fn(**kwargs)`` with the wrong keywords
+    (that path is already taught well by ``_reconcile_kwargs`` / the
+    cleaned-kwargs retry in ``_resolve_tool_dispatch``).
+
+    AttributeError/KeyError/IndexError/UnboundLocalError never legitimately
+    come from a tool's own rejection path (those use ValueError/RuntimeError
+    with a message) — they mean OUR code indexed/attributed something wrong,
+    so they are always internal.
+
+    A TypeError is ambiguous: CPython raises "unexpected/missing keyword
+    argument" at the CALL boundary, before the callee's frame is ever
+    pushed — that traceback is exactly one frame deep (the caller). A
+    TypeError raised INSIDE the tool body first pushes the callee's frame
+    (and usually more), so its traceback is at least two frames deep. Use
+    that depth, never the message text, to tell them apart.
+    """
+    if isinstance(exc, _INTERNAL_FAULT_TYPES):
+        return True
+    if isinstance(exc, TypeError):
+        depth = 0
+        tb = exc.__traceback__
+        while tb is not None:
+            depth += 1
+            tb = tb.tb_next
+        return depth >= 2
+    return False
+
+
+def _internal_fault_result(exc: BaseException, tool: str) -> dict:
+    """Build the tool-facing payload for an internal harness/tool-body fault.
+
+    Logs the FULL traceback server-side (same convention as the provider-error
+    path, see the ``_log_mod.error(...)`` calls around ``classify_provider_error``
+    above) so the next occurrence is diagnosable without re-deriving it from a
+    screenshot, and tells the model the truth: retrying the identical call will
+    fail again the same way, this is not a bad argument.
+    """
+    _log_mod.error(
+        "internal tool-dispatch fault tool=%s type=%s: %s\n%s",
+        tool, type(exc).__name__, exc, traceback.format_exc(),
+    )
+    return {
+        "ok": False,
+        "reason": "internal_error",
+        "internal_error": True,
+        "error": (
+            f"INTERNAL HARNESS FAULT in tool '{tool}': "
+            f"{type(exc).__name__}: {exc}. This is a bug in OUR tool "
+            f"implementation, NOT a problem with your call's arguments — "
+            f"retrying the identical call will fail again the same way. "
+            f"Try a different tool or a materially different argument shape, "
+            f"or report that this operation is currently broken."
+        ),
+    }
+
+
 def _dispatch_tool(
     tool: str,
     args: dict,
@@ -4261,7 +4177,19 @@ def _dispatch_tool(
     the turn supplied a custom tool_dispatch). If *_loop_guard* (a ToolCallLoopGuard,
     see tool_loop_guard.py) is provided and this exact (tool, args) pair repeats the
     immediately-prior successful call past its threshold, the call is refused
-    (RuntimeError with a corrective message) rather than dispatched again."""
+    (RuntimeError with a corrective message) rather than dispatched again.
+
+    _loop_guard also gets ``note_outcome`` fed after every dispatch it allowed
+    through: a result shaped like one of our own teaching-error payloads
+    (``ok: False`` with ``status`` in ``tool_loop_guard.VALIDATION_FAILURE_STATUSES``
+    — unresolved tool, bad/unknown/missing keyword arguments, or ask_user's
+    unparseable-batch rejection) means the call never did its real work, so a
+    repeat gets extra slack from the guard: the model is reacting to the
+    teaching error, not stuck in a no-op loop (live 2026-07-27: ask_user
+    called with {} got exactly this "bad_arguments" teaching payload twice,
+    and the guard refused the model's third attempt before it could act on
+    the "do NOT retry" instruction the payload itself already carried). A raised
+    exception (the tool body actually ran and threw) never gets this slack."""
 
     if _loop_guard is not None:
         detection = _loop_guard.check(tool, args)
@@ -4401,6 +4329,13 @@ def _dispatch_tool(
     try:
         result = _call_with_timeout() if timeout_f > 0 else _call()
     except Exception as exc:  # noqa: BLE001
+        if _loop_guard is not None:
+            # Raised out of fn(**kwargs) (or _inner) — the tool body ran and
+            # threw; a genuine tool-side failure, not an arg-validation miss.
+            try:
+                _loop_guard.note_outcome(tool, args, failed_before_body=False)
+            except Exception:  # noqa: BLE001
+                pass
         hint = None
         try:
             from services.agent.tool_hints import hint_for  # noqa: PLC0415
@@ -4410,6 +4345,18 @@ def _dispatch_tool(
         if hint:
             raise type(exc)(f"{exc} Hint: {hint}") from exc
         raise
+    if _loop_guard is not None:
+        try:
+            from services.agent.tool_loop_guard import (  # noqa: PLC0415
+                VALIDATION_FAILURE_STATUSES,
+            )
+            failed_before_body = (
+                isinstance(result, dict) and result.get("ok") is False
+                and result.get("status") in VALIDATION_FAILURE_STATUSES
+            )
+            _loop_guard.note_outcome(tool, args, failed_before_body=failed_before_body)
+        except Exception:  # noqa: BLE001
+            pass
     return result
 
 
@@ -6996,7 +6943,10 @@ def _ecad_dispatch_forced_step(
         if isinstance(payload, dict) and "ok" in payload:
             ok = bool(payload.get("ok"))
     except Exception as exc:  # noqa: BLE001
-        result = {"ok": False, "error": str(exc)}
+        if _is_internal_dispatch_fault(exc):
+            result = _internal_fault_result(exc, tool)
+        else:
+            result = {"ok": False, "error": str(exc)}
         ok = False
     call_rec = {
         "tool": tool, "args": call_args, "ok": ok,
@@ -7590,6 +7540,12 @@ def _resolve_tool_dispatch(dispatch: Callable | None = None) -> Callable | None:
             # required kwargs (fw_sources missing project_id) into opaque
             # failures and burned BUILD budgets. Retry once after dropping
             # only keys the signature does not accept; otherwise surface error.
+            # A TypeError raised INSIDE the tool body (traceback depth >= 2)
+            # is an internal harness fault, not an argument-shape problem —
+            # classify it before touching the has_var/cleaned-kwargs retry,
+            # which exists only to teach genuine argument-binding errors.
+            if _is_internal_dispatch_fault(te):
+                return _internal_fault_result(te, tool)
             if has_var:
                 return {"ok": False, "error": str(te)}
             cleaned = {k: v for k, v in (args or {}).items() if k in accepts}
@@ -7597,11 +7553,17 @@ def _resolve_tool_dispatch(dispatch: Callable | None = None) -> Callable | None:
                 try:
                     return fn(**cleaned)
                 except TypeError as te2:
+                    if _is_internal_dispatch_fault(te2):
+                        return _internal_fault_result(te2, tool)
                     return {"ok": False, "error": str(te2)}
                 except Exception as exc:  # noqa: BLE001
+                    if _is_internal_dispatch_fault(exc):
+                        return _internal_fault_result(exc, tool)
                     return {"ok": False, "error": str(exc)}
             return {"ok": False, "error": str(te)}
         except Exception as exc:  # noqa: BLE001
+            if _is_internal_dispatch_fault(exc):
+                return _internal_fault_result(exc, tool)
             return {"ok": False, "error": str(exc)}
 
     return _dispatch

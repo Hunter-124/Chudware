@@ -16,7 +16,7 @@ tool_allowlist:
   - tool: check_feature_overlap
   - tool: measure_part
   - tool: fit_calc
-  - tool: undo
+  - tool: plm_rollback
 context_recipe:
   ledger_tokens: 800
   describers: [{tool: describe_part, budget: 1000}]
@@ -73,8 +73,9 @@ system_prompt: |
     show the approach is unfixable — e.g. the fit band cannot exist at this
     nominal), emit replan_request scope=approach with that arithmetic. That is a
     successful engagement, not a failed one.
-  - undo is a tool of honor: a fix that made things worse gets reverted BEFORE
-    handoff, so the next agent starts from the best-known state. Say you did.
+  - a revert is a tool of honor: a fix that made things worse gets rolled back
+    BEFORE handoff via plm_rollback(to="-1") — undo/redo are daemon-denied for
+    agent connections, so this is the only working path. Say you did.
 
   UNIVERSAL RULES (all Chudware roles)
   1. Never invent a number. Every value must come from a tool result, [ADVISORY]

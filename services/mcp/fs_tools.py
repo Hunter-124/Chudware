@@ -269,6 +269,22 @@ def _cad_redirect(path: str, kind: str) -> dict:
                 "then read the model with describe_part / measure_part / inspect_part")
     return _err("use_import_part", hint)
 
+
+def _reader_for(name: str) -> str:
+    """The tool that can actually READ *name*, or "" when fs_read is the right reader.
+
+    Listings carry this so a model never has to discover the redirect the expensive way:
+    the live desktop runs show fs_read being called on a ``.step+`` straight out of an
+    fs_list result, burning a call and surfacing a red failure card for what is only a
+    routing hint.
+    """
+    kind = _kind_for(name)
+    if kind in CAD_EXTS:
+        return "import_part"
+    if kind in DOC_EXTS:
+        return "fs_read"
+    return ""
+
 # Destructive shell shapes refused outright (ported/trimmed from the oh-my-pi bash tool's
 # CRITICAL_BASH_PATTERNS). Intentionally tight — the cost of a false negative is a wiped host.
 _CRITICAL_SHELL_PATTERNS = [
@@ -511,8 +527,21 @@ def _list_dir(path: str, show_hidden: bool) -> dict:
             size = e.stat().st_size if not is_dir else 0
         except OSError:
             is_dir, size = False, 0
-        rows.append({"name": e.name + ("/" if is_dir else ""), "dir": is_dir, "size": size})
-    return _ok(path=str(p), entries=rows, count=len(rows))
+        row = {"name": e.name + ("/" if is_dir else ""), "dir": is_dir, "size": size}
+        if not is_dir:
+            reader = _reader_for(e.name)
+            if reader == "import_part":
+                row["open_with"] = "import_part"
+        rows.append(row)
+    geometry = sorted({r["name"] for r in rows if r.get("open_with") == "import_part"})
+    out = _ok(path=str(p), entries=rows, count=len(rows))
+    if geometry:
+        out["note"] = (
+            f"{len(geometry)} CAD/geometry file(s) here are NOT readable with fs_read — "
+            'open one with import_part(path="...") to get a doc_id, then read it with '
+            "describe_part / measure_part / inspect_part"
+        )
+    return out
 
 
 # =========================================================================== registration
@@ -566,7 +595,12 @@ def register_fs_tools(mcp) -> None:
     @mcp.tool()
     def fs_list(path: str = ".", show_hidden: bool = False) -> dict:
         """List a directory's entries (name, dir flag, size). Capped at 1000 entries.
-        Risk: read."""
+
+        A CAD/geometry file (.step+/.step/.stl/.dxf/…) is tagged ``open_with:
+        "import_part"`` and summarised in ``note`` — those are NOT readable with fs_read;
+        call import_part(path=...) for a doc_id and read the model with describe_part /
+        measure_part / inspect_part. Risk: read.
+        """
         blocked = _sensitive_block(path)
         if blocked:
             return blocked
@@ -580,7 +614,11 @@ def register_fs_tools(mcp) -> None:
     @mcp.tool()
     def fs_glob(pattern: str, path: str = ".", limit: int = 0) -> dict:
         """Find paths matching a glob (e.g. 'src/**/*.py'). Returns matches newest-first.
-        Capped at 1000. Risk: read."""
+        Capped at 1000.
+
+        Any CAD/geometry match is also listed under ``open_with_import_part`` — read those
+        with import_part(path=...), never fs_read. Risk: read.
+        """
         blocked = _sensitive_block(path)
         if blocked:
             return blocked
@@ -597,8 +635,15 @@ def register_fs_tools(mcp) -> None:
         except OSError:
             hits.sort()
         truncated = len(hits) > cap
-        return _ok(pattern=pattern, matches=hits[:cap], count=min(len(hits), cap),
-                   truncated=truncated)
+        shown = hits[:cap]
+        out = _ok(pattern=pattern, matches=shown, count=len(shown), truncated=truncated)
+        geometry = [h for h in shown if _reader_for(h) == "import_part"]
+        if geometry:
+            out["open_with_import_part"] = geometry
+            out["note"] = ("these are CAD/geometry files — fs_read cannot read them; call "
+                           'import_part(path="...") for a doc_id, then describe_part / '
+                           "measure_part / inspect_part")
+        return out
 
     @mcp.tool()
     def fs_grep(pattern: str, path: str = ".", glob: str = "", ignore_case: bool = False,

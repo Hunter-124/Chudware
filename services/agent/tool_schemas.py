@@ -30,6 +30,29 @@ from services.agent.tiers import _count_tokens, trim_tool_schema
 # (tiers.yaml is the source; this is a fallback, not a new budget.)
 DEFAULT_TOOLS_BUDGET_TOKENS = 2500
 
+
+def tier_tools_slot(tier: str | None) -> tuple[int, bool]:
+    """``(budgets.tools, tool_schema_trim)`` for *tier*, from tiers.yaml.
+
+    Every caller used to omit both, so every run — frontier desktop copilot
+    included — silently got this module's local-24k fallback (2500 tokens,
+    first-sentence trim) instead of its own tier's allocation. Frontier grants
+    10000 and sets ``tool_schema_trim: false``; at 2500 the single most-called
+    tool (``add_features``, ~2750 tokens of authored guidance) cannot fit at all.
+
+    Unknown/unset tier falls back to the conservative default rather than
+    guessing generously — an over-large slot is a real context cost.
+    """
+    if tier:
+        try:
+            from services.agent.tiers import load_tier  # noqa: PLC0415
+            profile = load_tier(tier)
+        except Exception:  # noqa: BLE001 — an unknown tier name is not fatal
+            pass
+        else:
+            return int(profile.budgets.tools), bool(profile.tool_schema_trim)
+    return DEFAULT_TOOLS_BUDGET_TOKENS, True
+
 # Params that are call-plumbing, not model-suppliable semantics.
 _SKIP_PARAMS = frozenset({"self", "ctx", "context"})
 
@@ -117,13 +140,30 @@ def _description_line(desc: str, *, trim: bool) -> str:
     return " ".join(out.split())
 
 
+def _description_block(desc: str) -> str:
+    """The WHOLE docstring, indented into the tools block.
+
+    Unlike ``_description_line`` this preserves line structure: the authored
+    guidance is mostly worked examples (JSON op envelopes, ref selectors, alias
+    tables) whose meaning lives in their line breaks and indentation. Blank lines
+    keep the block indent so the slot can never break out of its own frame.
+    """
+    out = []
+    for raw in desc.strip().splitlines():
+        line = raw.rstrip()
+        out.append(f"    {line}" if line else "    ")
+    return "\n".join(out)
+
+
 def render_tools_block(
     allowed_tools: list[str],
     *,
     resolver: Callable[[str], Callable[..., Any] | None],
     budget_tokens: int | None = None,
-    trim: bool = True,
+    trim: bool | None = None,
+    tier: str | None = None,
     include_category_menu: bool | None = None,
+    expand: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Render the §9.1 tools slot for *allowed_tools* and MEASURE its cost.
 
@@ -132,19 +172,30 @@ def render_tools_block(
         resolver: ``(tool_name) -> callable | None`` — MUST be the same resolution
             the dispatcher uses (mission-scoped first, then the global registry),
             so the rendered schema is dispatch-faithful.
-        budget_tokens: the tier's ``budgets.tools`` (default: local-24k's 2500).
-        trim: the tier's ``tool_schema_trim`` dial.
+        budget_tokens: the tier's ``budgets.tools``. Omit to take it from *tier*.
+        trim: the tier's ``tool_schema_trim`` dial. Omit to take it from *tier*.
+        tier: tier name, used to resolve the two above from tiers.yaml when they
+            are not passed explicitly. Omit both and pass no tier and you get the
+            conservative local-24k fallback.
         include_category_menu: when True, append a compact category pack menu +
             enable_tools / list_tool_categories meta schemas (anti-context-flood).
             Default: auto when the allowlist looks restricted (contains the meta
             tools or is a finite floor, not the full catalog).
+        expand: spend leftover budget upgrading tools from their first-paragraph
+            floor to their FULL authored docstring, in allowlist order. On by
+            default — the floor alone discards ~87% of the guidance the tools were
+            written to give. Pass False for a floor-only render (prompt previews,
+            and as the kill switch if a tier ever needs the slot minimal).
 
     Returns:
         ``(text, meta)`` where meta = {tokens, budget_tokens, rendered, omitted,
-        unresolved, trimmed, categories} — tokens is the MEASURED count of the
-        returned text.
+        unresolved, trimmed, expanded, categories} — tokens is the MEASURED count
+        of the returned text, and ``expanded`` names the tools that got their full
+        docstring.
     """
-    budget = int(budget_tokens) if budget_tokens else DEFAULT_TOOLS_BUDGET_TOKENS
+    tier_budget, tier_trim = tier_tools_slot(tier)
+    budget = int(budget_tokens) if budget_tokens else tier_budget
+    trim = tier_trim if trim is None else bool(trim)
     lines: list[str] = ["[TOOLS] Call tools with EXACTLY these kwargs:"]
     rendered: list[str] = []
     unresolved: list[str] = []
@@ -159,12 +210,16 @@ def render_tools_block(
             "enable_tools" in allow_list or "list_tool_categories" in allow_list
         )
 
+    # Pass 1 — every tool at its FLOOR cost (first sentence / first paragraph), so
+    # one tool's prose can never push another tool out of the slot entirely.
+    slots: list[dict[str, Any]] = []
     for tool in allow_list:
         fn = None
         try:
             fn = resolver(tool)
         except Exception:  # noqa: BLE001 — a broken resolver entry is unresolved
             fn = None
+        full: str | None = None
         if fn is None:
             # Built-in meta-tool schemas when no live callable is registered yet.
             entry = _FALLBACK_SCHEMAS.get(tool) or f"- {tool}(…)  # schema unavailable"
@@ -188,21 +243,45 @@ def render_tools_block(
             except Exception:  # noqa: BLE001
                 pass
             desc = _description_line(schema["description"], trim=use_trim)
-            entry = f"- {schema['signature']}"
-            if desc:
-                entry += f"\n    {desc}"
-            if note:
-                entry += f"\n    Note: {note}"
+            head = f"- {schema['signature']}"
+            tail = f"\n    Note: {note}" if note else ""
+            entry = head + (f"\n    {desc}" if desc else "") + tail
+            body = (schema["description"] or "").strip()
+            block = _description_block(body) if body else ""
+            # Only worth an upgrade when there is genuinely more to say.
+            if block and block != f"    {desc}":
+                full = f"{head}\n{block}{tail}"
         cost = _count_tokens(entry)
         if used + cost > budget:
             omitted.append(tool)
             continue
-        lines.append(entry)
+        slots.append({"tool": tool, "text": entry, "cost": cost, "full": full})
         used += cost
         if fn is None and tool not in _FALLBACK_SCHEMAS:
             unresolved.append(tool)
         else:
             rendered.append(tool)
+
+    # Pass 2 — spend what the tier actually allocated. Everything after a docstring's
+    # first paragraph used to be discarded unconditionally, which threw away 87% of
+    # the authored guidance (add_features shipped 77 of its 10,989 chars) while the
+    # slot sat at ~15% of its own budget. That gap is why models learned op shapes
+    # from rejection messages instead of from the tool. Upgrade in allowlist order:
+    # role cards lead with the tools the role exists to call.
+    expanded: list[str] = []
+    if expand:
+        for slot in slots:
+            block = slot["full"]
+            if not block:
+                continue
+            full_cost = _count_tokens(block)
+            if used - slot["cost"] + full_cost > budget:
+                continue
+            used += full_cost - slot["cost"]
+            slot["text"], slot["cost"] = block, full_cost
+            expanded.append(slot["tool"])
+
+    lines.extend(slot["text"] for slot in slots)
 
     categories_listed: list[str] = []
     if include_category_menu:
@@ -244,6 +323,7 @@ def render_tools_block(
         "omitted": omitted,
         "unresolved": unresolved,
         "trimmed": bool(trim),
+        "expanded": expanded,
         "categories": categories_listed,
     }
     return text, meta

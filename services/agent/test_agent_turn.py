@@ -561,3 +561,131 @@ def test_scrub_secrets_redacts_keys():
     detail = agent_turn.format_error_detail("a\nb\n" + ("z" * 500), limit=80)
     assert "\n" not in detail
     assert len(detail) <= 80
+
+
+def test_internal_dispatch_fault_teaches_not_masquerades_as_arg_error(caplog):
+    """A tool_dispatch AttributeError (harness bug, e.g. live
+    'str' object has no attribute 'get') must come back reason=internal_error
+    with a message that does NOT masquerade as an argument-teaching error, and
+    the full traceback must be logged server-side."""
+    import logging
+    provider = _ScriptedProvider([
+        '```json\n{"tool": "add_features", "args": {"doc_id": "d1"}}\n```',
+        '```json\n{"done": true, "handoff": {}}\n```',
+    ])
+
+    def _dispatch(tool, args):
+        return "oops".get("foo")  # AttributeError: 'str' object has no attribute 'get'
+
+    with caplog.at_level(logging.ERROR, logger="chudware.agent_turn"):
+        res = agent_turn.run_turn("build it", provider, allowed_tools=["add_features"],
+                                  tool_dispatch=_dispatch)
+    call = res.result["calls"][0]
+    assert call["ok"] is False
+    err_payload = call["result"]
+    assert isinstance(err_payload, dict)
+    assert err_payload["reason"] == "internal_error"
+    assert err_payload["internal_error"] is True
+    msg = err_payload["error"].lower()
+    assert "unknown argument" not in msg
+    assert "got unexpected keyword" not in msg
+    assert "not a problem with your call" in msg
+    assert "attributeerror" in msg
+    assert any("internal tool-dispatch fault" in r.message for r in caplog.records)
+
+
+def test_legitimate_value_error_keeps_current_behavior():
+    """A tool-raised ValueError (teaching rejection) must NOT be reclassified
+    as an internal fault — behaviour is unchanged from before this fix."""
+    provider = _ScriptedProvider([
+        '```json\n{"tool": "measure_part", "args": {}}\n```',
+        '```json\n{"done": true, "handoff": {}}\n```',
+    ])
+
+    def _dispatch(tool, args):
+        raise ValueError("doc_id is required")
+
+    res = agent_turn.run_turn("check", provider, allowed_tools=["measure_part"],
+                              tool_dispatch=_dispatch)
+    call = res.result["calls"][0]
+    assert call["ok"] is False
+    result = call["result"]
+    assert isinstance(result, dict)
+    assert result.get("reason") != "internal_error"
+    assert "internal_error" not in result
+    assert "doc_id is required" in result["error"]
+
+
+def test_is_internal_dispatch_fault_classifies_by_type_and_depth():
+    try:
+        raise AttributeError("'str' object has no attribute 'get'")
+    except AttributeError as e:
+        assert agent_turn._is_internal_dispatch_fault(e) is True
+    try:
+        raise ValueError("teaching message")
+    except ValueError as e:
+        assert agent_turn._is_internal_dispatch_fault(e) is False
+    try:
+        raise RuntimeError("teaching message")
+    except RuntimeError as e:
+        assert agent_turn._is_internal_dispatch_fault(e) is False
+
+    def _needs_doc_id(doc_id):
+        return doc_id
+
+    try:
+        _needs_doc_id(wrong_kw=1)  # argument-binding TypeError, depth 1
+    except TypeError as e:
+        assert agent_turn._is_internal_dispatch_fault(e) is False
+
+    def _raises_inside():
+        return "oops".get("x")  # body-raised, but wrap as TypeError below
+
+    def _wraps_typeerror():
+        try:
+            _raises_inside()
+        except AttributeError as inner:
+            raise TypeError(str(inner)) from inner
+
+    try:
+        _wraps_typeerror()  # TypeError raised INSIDE a nested call, depth >= 2
+    except TypeError as e:
+        assert agent_turn._is_internal_dispatch_fault(e) is True
+
+
+def test_resolve_tool_dispatch_bad_kwarg_typeerror_unaffected(monkeypatch):
+    """A genuine bad-kwarg call through _resolve_tool_dispatch's fallback
+    dispatcher must keep its existing has_var/cleaned-kwargs retry behaviour
+    — never reclassified as an internal fault."""
+    def _fake_tool(doc_id):
+        return {"ok": True, "doc_id": doc_id}
+
+    monkeypatch.setattr(
+        agent_turn, "_bind_tool",
+        lambda name: _fake_tool if name == "measure_part" else None,
+    )
+    disp = agent_turn._resolve_tool_dispatch()
+    result = disp("measure_part", {"wrong_kw": 1})
+    assert result["ok"] is False
+    assert result.get("reason") != "internal_error"
+    assert "missing" in result["error"].lower() or "argument" in result["error"].lower()
+
+
+def test_resolve_tool_dispatch_body_fault_is_internal_and_logged(monkeypatch, caplog):
+    """A tool body that raises AttributeError through _resolve_tool_dispatch's
+    fallback dispatcher must be classified internal and its traceback logged."""
+    import logging
+
+    def _fake_tool(doc_id=None):
+        return "oops".get("x")  # AttributeError raised inside the tool body
+
+    monkeypatch.setattr(
+        agent_turn, "_bind_tool",
+        lambda name: _fake_tool if name == "measure_part" else None,
+    )
+    disp = agent_turn._resolve_tool_dispatch()
+    with caplog.at_level(logging.ERROR, logger="chudware.agent_turn"):
+        result = disp("measure_part", {"doc_id": "d1"})
+    assert result["reason"] == "internal_error"
+    assert result["internal_error"] is True
+    assert any("internal tool-dispatch fault" in r.message for r in caplog.records)

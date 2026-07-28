@@ -48,15 +48,85 @@ class TestRenderToolsBlock:
 
     def test_trim_keeps_first_sentence_only(self):
         text, _ = render_tools_block(["add_features"], resolver=self._resolver,
-                                     trim=True)
+                                     trim=True, expand=False)
         assert "Apply a list of document ops" in text
         assert "Second sentence" not in text
 
     def test_untrimmed_keeps_first_paragraph(self):
         text, _ = render_tools_block(["add_features"], resolver=self._resolver,
-                                     trim=False)
+                                     trim=False, expand=False)
         assert "Second sentence" in text
         assert "whole further paragraph" not in text
+
+    def test_expand_spends_leftover_budget_on_full_docstring(self):
+        # The floor discards everything past the first paragraph. When the tier's
+        # own budget has room, the authored guidance below it is what teaches the
+        # model the call shape — it must reach the prompt.
+        floor, _ = render_tools_block(["add_features"], resolver=self._resolver,
+                                      trim=False, expand=False)
+        full, meta = render_tools_block(["add_features"], resolver=self._resolver,
+                                        trim=False)
+        assert "whole further paragraph" not in floor
+        assert "whole further paragraph" in full
+        assert meta["expanded"] == ["add_features"]
+
+    def test_expansion_never_exceeds_budget(self):
+        for budget in (30, 60, 120, 2500):
+            text, meta = render_tools_block(
+                ["add_features", "no_doc"], resolver=self._resolver,
+                budget_tokens=budget, include_category_menu=False)
+            assert meta["tokens"] <= budget, (budget, meta)
+            assert _count_tokens(text) <= budget
+
+    def test_expansion_never_costs_a_tool_its_slot(self):
+        # A tool's prose must never push a DIFFERENT tool out of the block: the
+        # floor pass reserves every tool first, expansion only spends what is left.
+        _, floor = render_tools_block(
+            ["add_features", "no_doc"], resolver=self._resolver,
+            budget_tokens=80, include_category_menu=False, expand=False)
+        _, grown = render_tools_block(
+            ["add_features", "no_doc"], resolver=self._resolver,
+            budget_tokens=80, include_category_menu=False)
+        assert grown["rendered"] == floor["rendered"]
+        assert grown["omitted"] == floor["omitted"]
+
+    def test_expanded_block_keeps_the_slot_indent(self):
+        # Full docstrings keep their line breaks (worked examples depend on them),
+        # so every carried line must still sit inside the block frame.
+        text, meta = render_tools_block(["add_features"], resolver=self._resolver,
+                                        trim=False, include_category_menu=False)
+        assert meta["expanded"] == ["add_features"]
+        for ln in text.splitlines()[1:]:
+            assert ln.startswith("- ") or ln.startswith("    "), repr(ln)
+
+    def test_nothing_to_expand_is_not_reported_as_expanded(self):
+        text, meta = render_tools_block(["no_doc"], resolver=self._resolver,
+                                        include_category_menu=False)
+        assert meta["expanded"] == []
+
+    def test_tier_supplies_budget_and_trim(self):
+        # Every production call site omitted both, so every run silently used the
+        # local-24k fallback — frontier's own 10000-token allocation never applied.
+        _, front = render_tools_block(["add_features"], resolver=self._resolver,
+                                      tier="frontier")
+        _, local = render_tools_block(["add_features"], resolver=self._resolver,
+                                      tier="local-24k")
+        assert front["budget_tokens"] == 10000
+        assert front["trimmed"] is False
+        assert local["budget_tokens"] == DEFAULT_TOOLS_BUDGET_TOKENS
+        assert local["trimmed"] is True
+
+    def test_explicit_args_beat_the_tier(self):
+        _, meta = render_tools_block(["add_features"], resolver=self._resolver,
+                                     tier="frontier", budget_tokens=777, trim=True)
+        assert meta["budget_tokens"] == 777
+        assert meta["trimmed"] is True
+
+    def test_unknown_tier_falls_back_instead_of_raising(self):
+        for bogus in ("", "nope", None):
+            _, meta = render_tools_block(["add_features"], resolver=self._resolver,
+                                         tier=bogus)
+            assert meta["budget_tokens"] == DEFAULT_TOOLS_BUDGET_TOKENS, bogus
 
     def test_token_cost_is_measured_not_invented(self):
         text, meta = render_tools_block(["add_features"], resolver=self._resolver)

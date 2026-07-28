@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from mcp.server.fastmcp import Image
-from typing import Optional
+from pydantic import Field
+from typing import Annotated, Any, Optional
 import os
 
 from .cad_common import (
@@ -375,10 +376,28 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
 
 
+    # Canonical title-block field names — echoed in the docstring AND accepted
+    # flattened as top-level kwargs. Live 2026-07-27 (claude-opus, flyswatter
+    # run): the model was SHOWN these exact names in the docstring but wrote
+    # them as set_titleblock(title=..., drawn_by=..., date=..., rev=...)
+    # instead of nesting them in fields={...}, and got "unknown argument(s)"
+    # for all four. Not a synonym of `fields` (there is no single unambiguous
+    # target) — it's the same flattened-dict dialect query_geometry already
+    # accepts for its query keys, so set_titleblock gets the same treatment.
+    _TITLEBLOCK_FIELDS = ("title", "drawn_by", "date", "material", "finish",
+                          "scale", "rev", "sheet", "part_number", "company")
+
     @mcp.tool()
-    def set_titleblock(fields: dict, doc_id: Optional[str] = None) -> str:
+    def set_titleblock(fields: Optional[dict] = None, doc_id: Optional[str] = None,
+                       **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Fill the drawing's title block. doc_id = drawing_doc_id. fields is a dict of any of:
         title, drawn_by, date, material, finish, scale, rev, sheet, part_number, company.
+
+        Those field names are ALSO accepted flattened as top-level kwargs —
+        set_titleblock(title="Widget", rev="B") works the same as
+        set_titleblock(fields={"title": "Widget", "rev": "B"}), merged with any
+        fields= dict you also pass. Any other top-level kwarg is rejected (not a
+        recognized title-block field and not a synonym).
 
         Returns {ok, sheet_id, fields_set, title_block} where title_block is the sheet's FULL
         resulting field set (not just what you just passed) — confirms the write landed and
@@ -386,12 +405,33 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            nested = kwargs.pop("kwargs", None)
+            if isinstance(nested, dict):
+                for k, v in nested.items():
+                    kwargs.setdefault(k, v)
+            flat = {k: kwargs.pop(k) for k in list(kwargs)
+                    if k in _TITLEBLOCK_FIELDS and kwargs[k] is not None}
+            kwargs = {k: v for k, v in kwargs.items() if v is not None}
+            if kwargs:
+                raise ValueError(
+                    f"set_titleblock() got unknown argument(s) "
+                    f"{', '.join(repr(k) for k in kwargs)} — accepted title-block fields "
+                    f"are {', '.join(_TITLEBLOCK_FIELDS)} (pass as fields={{...}} or "
+                    f"flattened as kwargs), plus doc_id.")
+            notes: list = []
+            if flat:
+                notes.append(f"flattened kwarg(s) {', '.join(sorted(flat))} read as "
+                             f"fields={{...}}")
+                fields = {**(fields or {}), **flat}
             # LIVE-CRASH guard: `sorted(fields.keys())` blows up on a stringified fields dict
             # with a bare AttributeError (identical shape to run-97813015264134).
             fields = require_mapping(fields, "fields", "a title-block fields dict")
             r = cb.call("drawing_set_titleblock", {"doc_id": d, "sheet_id": "s1", "fields": fields})
             tb = r.get("title_block") or {}
-            return _dumps({"ok": True, "sheet_id": r.get("sheet_id", "s1"),
-                           "fields_set": sorted(fields.keys()), "title_block": tb})
+            out = {"ok": True, "sheet_id": r.get("sheet_id", "s1"),
+                  "fields_set": sorted(fields.keys()), "title_block": tb}
+            if notes:
+                out["interpreted"] = notes
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)

@@ -15,7 +15,7 @@ tool_allowlist:
   - tool: add_features
   - tool: compare_parts
   - tool: regen_diagnose
-  - tool: undo
+  - tool: plm_rollback
   - tool: render_part
 context_recipe:
   ledger_tokens: 800
@@ -74,8 +74,9 @@ system_prompt: |
   - Never invent a feature: if the source geometry doesn't support a clean
     prismatic, turned, or hole reconstruction, record it under unexplained — do
     not approximate with boxes or script features.
-  - regen_diagnose first on any rebuild failure; undo is honorable when diagnosis
-    says the approach was wrong.
+  - regen_diagnose first on any rebuild failure; plm_rollback(to="-1") is honorable
+    when diagnosis says the approach was wrong — undo/redo are daemon-denied for
+    agent connections.
   - Two failures on the same region with the same approach = stop and emit
     replan_request scope=approach with evidence.
   - Fillets and chamfers from the recognizer's candidates list are applied LAST,

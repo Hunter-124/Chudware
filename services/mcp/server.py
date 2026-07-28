@@ -633,15 +633,18 @@ import inspect as _inspect
 from pydantic import ValidationError as _ValidationError
 from mcp.server.fastmcp.exceptions import ToolError as _ToolError
 
+from services.agent.arg_reconciliation import (
+    annotation_admits as _annotation_admits,
+    norm_arg as _norm_arg,
+    resolve_unknown as _resolve_unknown,
+    synonyms_for as _synonyms_for,
+    unknown_arg_payload as _unknown_arg_payload,
+)
+
 _ARG_TEACHING = os.environ.get("CHUDWARE_MCP_ARG_TEACHING", "1").strip() != "0"
 # tool name -> (tool object identity, metadata dict). Re-derived if the registry
 # swaps the Tool out from under us; otherwise this is one dict hit per call.
 _ARG_META_CACHE: dict[str, tuple] = {}
-
-
-def _norm_arg(name: str) -> str:
-    """Fold an argument name for matching: case, underscores and dashes are noise."""
-    return name.replace("_", "").replace("-", "").replace(" ", "").lower()
 
 
 def _param_type(schema: dict, wire: str) -> str:
@@ -665,8 +668,7 @@ def _arg_meta(tool) -> dict:
     fields = tool.fn_metadata.arg_model.model_fields
     names: list[str] = []
     required: list[str] = []
-    norm_of: dict[str, str] = {}
-    by_norm: dict[str, str] = {}
+    ann: dict[str, str] = {}
     listing: list[str] = []
     for fname, finfo in fields.items():
         # func_metadata aliases params that shadow a BaseModel attribute
@@ -676,11 +678,9 @@ def _arg_meta(tool) -> dict:
         req = finfo.is_required()
         if req:
             required.append(wire)
-        nk = _norm_arg(wire)
-        norm_of[wire] = nk
-        by_norm[nk] = wire if nk not in by_norm else ""  # "" marks a collision
-        listing.append(f"{wire} ({'required' if req else 'optional'}, "
-                       f"{_param_type(tool.parameters, wire)})")
+        ptype = _param_type(tool.parameters, wire)
+        ann[wire] = ptype
+        listing.append(f"{wire} ({'required' if req else 'optional'}, {ptype})")
 
     # A tool taking **kwargs genuinely accepts anything — never second-guess it.
     varkw = False
@@ -696,42 +696,12 @@ def _arg_meta(tool) -> dict:
         "names": names,
         "accepted": frozenset(names),
         "required": required,
-        "norm_of": norm_of,
-        "by_norm": {k: v for k, v in by_norm.items() if v},
+        "ann": ann,
         "listing": listing,
         "varkw": varkw,
     }
     _ARG_META_CACHE[tool.name] = (tool, meta)
     return meta
-
-
-def _resolve_unknown(supplied: str, meta: dict, taken: set) -> str | None:
-    """Map an unknown argument onto a real parameter — ONLY when unambiguous.
-
-    1. exact match ignoring case/underscores  (docId -> doc_id)
-    2. the supplied name is an affix of exactly one free parameter, or vice versa
-       (shaft_diameter -> diameter).  Both sides need >=3 folded chars so a stray
-       `id` cannot capture `doc_id`.
-    """
-    nk = _norm_arg(supplied)
-    exact = meta["by_norm"].get(nk)
-    if exact is not None:
-        return exact if exact not in taken else None
-    if len(nk) < 3:
-        return None
-    hits = []
-    for wire in meta["names"]:
-        if wire in taken:
-            continue
-        pk = meta["norm_of"][wire]
-        if len(pk) < 3:
-            continue
-        if (nk.startswith(pk) or nk.endswith(pk)
-                or pk.startswith(nk) or pk.endswith(nk)):
-            hits.append(wire)
-            if len(hits) > 1:
-                return None  # ambiguous
-    return hits[0] if hits else None
 
 
 def _short_val(v) -> str:
@@ -751,21 +721,6 @@ def _corrected_call(tool_name: str, meta: dict, known: dict, dropped=()) -> str:
     if dropped:
         call += "   # drop " + ", ".join(repr(d) for d in dropped)
     return call
-
-
-def _unknown_arg_payload(tool_name, meta, known, unresolved) -> dict:
-    s = "s" if len(unresolved) > 1 else ""
-    bad = ", ".join(repr(u) for u in unresolved)
-    return {
-        "ok": False,
-        "error": (f"{tool_name}: unknown argument{s} {bad} — not a parameter of "
-                  f"{tool_name}(), and not close enough to exactly one to guess. "
-                  f"Rejected rather than silently dropped."),
-        "unknown_arguments": list(unresolved),
-        "parameters": meta["listing"],
-        "required": list(meta["required"]),
-        "hint": _corrected_call(tool_name, meta, known, unresolved),
-    }
 
 
 def _validation_payload(tool, meta, arguments, exc) -> dict | None:
@@ -849,7 +804,16 @@ def _annotate_interpreted(result, notes: list[str]):
 
 
 def _install_arg_teaching(server) -> None:
-    """Wrap ``ToolManager.call_tool`` — the one seam both dispatch paths cross."""
+    """Wrap ``ToolManager.call_tool`` — the external-MCP dispatch path's own seam.
+
+    NOT "the one seam both dispatch paths cross": the built-in agent
+    (``services/agent/agent_turn.py::_bind_tool``) calls tool functions
+    directly and never goes through ``ToolManager`` at all. What IS shared is
+    the reconciliation logic itself — the synonym tables, name-matching, and
+    teaching-payload shape live once in ``services.agent.arg_reconciliation``
+    and both this wrapper and ``agent_turn._reconcile_kwargs`` call into it,
+    so a fix here (or there) reaches both paths without being reapplied.
+    """
     # A stubbed FastMCP (test_mcp_freshness patches the module) has no manager —
     # teaching is a bonus layer, never a hard import dependency.
     manager = getattr(server, "_tool_manager", None)
@@ -872,9 +836,11 @@ def _install_arg_teaching(server) -> None:
                 else:
                     unresolved.append(k)
             taken = set(known)
+            synonyms = _synonyms_for(name)
             still_unknown = []
             for k in unresolved:
-                target = _resolve_unknown(k, meta, taken)
+                target = _resolve_unknown(k, arguments[k], meta["names"], meta["ann"],
+                                          taken, synonyms)
                 if target is None:
                     still_unknown.append(k)
                 else:
@@ -883,7 +849,8 @@ def _install_arg_teaching(server) -> None:
                     notes.append(f"interpreted {k!r} as {target!r}")
             if still_unknown:
                 return _emit_payload(
-                    tool, _unknown_arg_payload(name, meta, known, still_unknown),
+                    tool, _unknown_arg_payload(name, meta["names"], meta["required"],
+                                               arguments, still_unknown),
                     convert_result)
             arguments = known
 

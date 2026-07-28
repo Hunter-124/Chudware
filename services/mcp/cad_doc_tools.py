@@ -2911,6 +2911,55 @@ def _repair_datum_selector(v: Any) -> Optional[dict]:
             return out
     return None
 
+#: Direction-ish datum ref slots — the only members of _DATUM_REF_SLOTS where an arbitrary
+#: [x,y,z] vector unambiguously names a reserved axis (nearest cardinal). "plane"/"base"/
+#: "path" need a PLANE or a point/curve, not a direction, so a vector there stays untouched.
+_AXIS_DIRECTION_SLOTS = frozenset({"axis", "dir1", "dir2", "pull"})
+
+
+def _axis_vector_to_datum(v: Any) -> Optional[str]:
+    """A bare/mis-wrapped direction vector for an axis-ish ref slot -> the nearest cardinal
+    reserved axis ("axis.x"/"axis.y"/"axis.z").
+
+    An axis/dir ref slot only ever accepts a reserved datum token or a real selector object
+    — the engine has no "arbitrary 3D direction" selector kind, so [0,0,1] dies with
+    "selector must be an object" (it is a JSON array) and a pseudo-selector like
+    {"centroid":[0,0,1]} dies one rung later with "refs.axis.kind: not in […]" /
+    "refs.axis.centroid: must be [x,y,z]" (a real region/face selector, wrong shape). Every
+    observed case is a model naming X/Y/Z the way it would to a human — snap to the
+    dominant component. None when the value carries no recognizable vector at all.
+    """
+    vec: Optional[list] = None
+    if isinstance(v, (list, tuple)) and len(v) == 3 and all(_is_num(x) for x in v):
+        vec = [float(x) for x in v]
+    elif isinstance(v, dict):
+        if all(_is_num(v.get(k)) for k in ("x", "y", "z")):
+            vec = [float(v["x"]), float(v["y"]), float(v["z"])]
+        else:
+            c = v.get("centroid")
+            if isinstance(c, (list, tuple)) and len(c) == 3 and all(_is_num(x) for x in c):
+                vec = [float(x) for x in c]
+    if vec is None or not any(vec):
+        return None
+    dominant = max(range(3), key=lambda i: abs(vec[i]))
+    return ("axis.x", "axis.y", "axis.z")[dominant]
+
+
+#: A ref-slot synonym valid ONLY because the feature type has exactly one ref slot that
+#: could plausibly mean it — mirrors validate.cpp's REF_SLOT_ALIASES (single-slot types),
+#: but applied client-side so the "interpreted" note reaches the model the SAME turn
+#: instead of round-tripping to the engine and back. shell's only ref slot is `remove`
+#: (live 2026-07-28: refs.faces rejected with "unknown ref slot for shell"); extrude has
+#: SEVERAL ref slots (profile/up_to/up_to2/…), so the engine deliberately does not guess
+#: there — but "face" can only ever mean the sketch profile a model calls a face, so alias
+#: it too (live: refs.face rejected the same way).
+_TYPE_REF_ALIASES = {
+    "shell": {"faces": "remove", "open_faces": "remove", "open": "remove",
+              "remove_faces": "remove"},
+    "extrude": {"face": "profile"},
+    "surf_extrude": {"face": "profile"},
+}
+
 
 def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
     """Datum words + kind-less selectors in `refs`. Identity when everything is canonical."""
@@ -2920,6 +2969,15 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
     label = _feat_label(feat, ftype)
     out_refs = dict(refs)
     changed = False
+    alias_map = _TYPE_REF_ALIASES.get(ftype)
+    if alias_map:
+        for alias, target in alias_map.items():
+            if alias in out_refs and target not in out_refs:
+                out_refs[target] = out_refs.pop(alias)
+                changed = True
+                notes.append(f"{label}: interpreted refs.{alias} as refs.{target} — "
+                             f"{ftype} accepts refs.{target}")
+        refs = dict(out_refs)  # re-snapshot so the loop below reads the renamed keys
     for slot, v in refs.items():
         if (slot in _SINGLE_REF_SLOTS and isinstance(v, list) and len(v) == 1
                 and isinstance(v[0], (dict, str))):
@@ -2946,6 +3004,16 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
                 notes.append(f"{label}: completed the datum selector in refs.{slot} into "
                              f'{{"kind":"datum","feature":"{fixed["feature"]}"}} — a datum '
                              f"selector names its datum under `feature`")
+                continue
+            if slot in _AXIS_DIRECTION_SLOTS:
+                axis_datum = _axis_vector_to_datum(v)
+                if axis_datum is not None:
+                    out_refs[slot] = axis_datum
+                    changed = True
+                    notes.append(
+                        f"{label}: read refs.{slot} {_compact(v)} as the reserved datum "
+                        f'"{axis_datum}" — a direction slot takes a reserved axis token '
+                        f"(axis.x/axis.y/axis.z) or a real selector, never a bare vector")
             continue
         # Prose the model uses to NAME geometry ("the vertical edges", "the top face"),
         # and the {"query": …} wrapper it puts around it. Both are dialect for a geometry
@@ -3202,6 +3270,81 @@ _REFS_ONLY_SLOTS = frozenset({
 })
 
 
+#: Structural feature keys — the ONLY ones a feature dict is allowed at its top level per
+#: the engine's own schema (type/name/id/suppressed/params/refs/folder). Mirrors
+#: core/doc/session.cpp's own hoist set (960-991) exactly.
+_FEATURE_STRUCTURAL_KEYS = frozenset(
+    {"type", "name", "id", "suppressed", "params", "refs", "folder"})
+
+
+def _hoist_feature_sibling_keys(ops: Any, notes: Optional[list] = None) -> Any:
+    """Move every non-structural TOP-LEVEL feature key into ``params``, mirroring the
+    engine's own hoist (core/doc/session.cpp:960-991).
+
+    A model routinely writes a feature's real data BESIDE params/refs instead of inside
+    either — live 2026-07-28: ``{"type":"fillet","edges":[...],"params":{"radius":2}}``,
+    ``{"type":"linear_pattern","dir1":"x","count1":4,"spacing1":10,"features":["f2"]}``.
+    The C++ side already hoists any such sibling into ``params`` so nothing silently drops
+    (a stray top-level option used to vanish — a cut cylinder fused, a hole built once
+    instead of N times), but the Python normalizers that decide the FINAL shape run
+    entirely client-side, before that hoist ever sees the batch. Two of them —
+    ``_migrate_ref_slots`` (ref-only slot names -> refs) and ``_param_or_ref``/
+    ``_normalize_pattern_feature`` (pattern params/refs) — each independently look in
+    ``params``/``refs`` only, so a sibling key reached neither and the feature was rejected
+    for a slot the model DID supply, just in the wrong (nonexistent, from the engine's
+    normalizer's point of view) bag.
+
+    Doing the hoist ONCE, here, before either of those passes runs, is the root fix: by
+    the time they look, the value is already in ``params`` where they already know to look
+    — neither needs its own copy of this lookup, so a THIRD slot added later cannot regress
+    only one of them.
+
+    Silent, deliberately: session.cpp's own docstring example for this tool already shows
+    ``"at":[...],"axis":[...],"mode":"boss"`` living at a feature's top level as CANONICAL,
+    documented dialect (session.cpp: "params is merged into the feature ... so a model may
+    put a dimension at either level and mean the same thing") — the same reason
+    ``_split_two_levels`` never notes a top-level peek either. A downstream pass that finds
+    something to actually TEACH about a moved value (``_migrate_ref_slots``'s bag,
+    ``_normalize_pattern_feature``'s kind) still adds its own note; this pass only makes
+    the value visible to them.
+    """
+    if not isinstance(ops, list):
+        return ops
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        feat = op.get("feature")
+        if not isinstance(feat, dict):
+            continue
+        siblings = [k for k in feat if k not in _FEATURE_STRUCTURAL_KEYS]
+        if not siblings:
+            continue
+        params = feat.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        moved = []
+        for key in siblings:
+            if key in params:
+                continue  # an explicit params entry always wins, same as the C++ hoist
+            params[key] = feat[key]
+            moved.append(key)
+        if not moved:
+            continue
+        feat["params"] = params
+        for key in moved:
+            del feat[key]
+    return ops
+
+
+#: A ref-slot name that is ALSO a legitimate top-level dialect word for a DIFFERENT
+#: feature type, where the two meanings disagree about which bag the value belongs in.
+#: "tool" is a real ref slot for split/surf_trim (validate.cpp), but boolean's own flat
+#: dialect ("tool":"drain_boss") names an OPERAND -> params.b, never a selector —
+#: _normalize_boolean_feature (which runs later, off the top level itself via
+#: _split_two_levels) already owns that reading, so this migration must not preempt it.
+_REFS_ONLY_SLOTS_TYPE_EXCLUDE = {"tool": frozenset({"boolean"})}
+
+
 def _migrate_ref_slots(ops: Any, notes: Optional[list] = None) -> Any:
     """Move ref-only slots out of ``params`` into ``refs``.
 
@@ -3219,7 +3362,9 @@ def _migrate_ref_slots(ops: Any, notes: Optional[list] = None) -> Any:
         params = feat.get("params")
         if not isinstance(params, dict):
             continue
-        present = [k for k in list(params) if k in _REFS_ONLY_SLOTS]
+        ftype = feat.get("type")
+        present = [k for k in list(params) if k in _REFS_ONLY_SLOTS
+                  and ftype not in _REFS_ONLY_SLOTS_TYPE_EXCLUDE.get(k, ())]
         if not present:
             continue
         refs = dict(feat.get("refs") or {})
@@ -4570,6 +4715,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # FIRST — the sketch/primitive passes below branch on the canonical type, so a
             # sketch spelled "profile" used to slip past the sketch normalizer entirely.
             ops = _normalize_op_elements(ops, interpreted)
+            # A feature's real data may sit BESIDE params/refs at its own top level —
+            # mirror the engine's own hoist (session.cpp:960-991) so every pass after this
+            # one, including the pattern/ref-slot passes right below, sees it in params.
+            ops = _hoist_feature_sibling_keys(ops, interpreted)
             # A pattern decides its own type from params.mode, so it must run BEFORE the
             # alias table maps the generic word "pattern" onto linear_pattern regardless.
             ops = _normalize_pattern_ops(ops, interpreted)
@@ -4975,8 +5124,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     def undo(doc_id: Optional[str] = None) -> str:
         """Undo the last edit on the current part.
 
-        Multi-user note: from mcp/agent connections the daemon rejects this with
-        code ``undo_denied`` (agents use doc_checkpoint/doc_revert or PLM rollback).
+        Multi-user note: from mcp/agent connections the daemon UNCONDITIONALLY denies
+        this (code ``undo_denied``) — there is no agent-side way around it, and
+        retrying will fail identically. The refusal below is caught and expanded into
+        full recovery guidance; the callable tools are ``add_features(ops=[{"op":
+        "delete_feature"|"edit_feature", ...}])`` to remove/alter a feature you just
+        added, or ``plm_timeline()`` / ``plm_rollback(to="-1")`` to roll the whole
+        document back. ``doc_checkpoint``/``doc_revert`` are engine-internal RPCs with
+        no tool binding — do not try to call them.
         Set env ``CHUDWARE_UNDO_AGENTS=1`` only as a deliberate kill-switch.
 
         VERIFY LOOP: after undo, call render_part()/render_views() (and inspect_feature on the
@@ -4996,8 +5151,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     def redo(doc_id: Optional[str] = None) -> str:
         """Redo the last undone edit on the current part.
 
-        Multi-user note: from mcp/agent connections the daemon rejects this with
-        code ``undo_denied`` (agents use doc_checkpoint/doc_revert or PLM rollback).
+        Multi-user note: from mcp/agent connections the daemon UNCONDITIONALLY denies
+        this (code ``undo_denied``) — there is no agent-side way around it, and
+        retrying will fail identically. The refusal below is caught and expanded into
+        full recovery guidance; the callable tools are ``add_features(ops=[{"op":
+        "delete_feature"|"edit_feature", ...}])`` to remove/alter a feature you just
+        added, or ``plm_timeline()`` / ``plm_rollback(to="-1")`` to roll the whole
+        document back. ``doc_checkpoint``/``doc_revert`` are engine-internal RPCs with
+        no tool binding — do not try to call them.
         Set env ``CHUDWARE_UNDO_AGENTS=1`` only as a deliberate kill-switch.
 
         VERIFY LOOP: after redo, call render_part()/render_views() to SEE the restored state

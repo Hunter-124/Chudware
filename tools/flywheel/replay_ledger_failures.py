@@ -25,9 +25,24 @@ built by 40 earlier ops).  Those are reported separately as ``skipped`` with the
 reason, and are never counted as fixed.  A number this tool prints is a floor,
 never a flattering estimate.
 
+Two corpora
+-----------
+``--runs`` defaults to the gym ledger tree (``ledger.json``, full ``args``).  The
+*other* corpus is the one the user actually generates: live desktop runs under
+``~/.local/share/Chudware/cache/runs/<run_id>/events.jsonl``.  Pass ``--live`` to
+read those instead.  Live events store ``args_preview`` (capped at 2048 chars by
+``agent_events.tool_call_event``) rather than raw args, so a preview that does not
+parse as JSON is reported as ``skipped: truncated_args`` and never scored --
+measured at 1 of 60 on the current tree, so the corpus is ~98% usable.
+
+``--live`` also filters to genuine desktop runs (``run_id`` matching ``run-<digits>``),
+dropping synthetic bench/self-test runs that would otherwise dominate the count.
+
 Usage
 -----
-    python3 tools/flywheel/replay_ledger_failures.py              # summary
+    python3 tools/flywheel/replay_ledger_failures.py              # gym summary
+    python3 tools/flywheel/replay_ledger_failures.py --live       # live desktop runs
+    python3 tools/flywheel/replay_ledger_failures.py --live --since-days 7
     python3 tools/flywheel/replay_ledger_failures.py --detail     # per-call
     python3 tools/flywheel/replay_ledger_failures.py --tool fit_calc
     python3 tools/flywheel/replay_ledger_failures.py --json out.json
@@ -49,6 +64,12 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 DEFAULT_RUNS = REPO / "tools" / "flywheel" / "bench" / "gym" / "reports" / "runs"
+LIVE_RUNS = pathlib.Path.home() / ".local" / "share" / "Chudware" / "cache" / "runs"
+
+# A genuine desktop run.  Bench harnesses and self-tests write their own run ids
+# ("srctest_run", "mega8-e2e-run", ...) into the SAME tree, and they outnumber real
+# runs ~20:1, so counting them would drown the signal we care about.
+_LIVE_RUN_ID = re.compile(r"^run-\d+$")
 
 # Args naming state we cannot rebuild.  A call carrying one of these is replayed
 # only if the state happens to exist; otherwise it is skipped, not scored.
@@ -94,6 +115,60 @@ def load_failures(runs_dir: pathlib.Path) -> list[dict]:
                 "tool": tool,
                 "args": args if isinstance(args, dict) else {},
                 "was": _message(node.get("result")),
+            })
+    return out
+
+
+def load_live_failures(runs_dir: pathlib.Path, *, since_days: float = 0.0) -> list[dict]:
+    """Every failed tool call from the LIVE desktop run tree (``events.jsonl``).
+
+    This is the corpus that reflects what the user actually hits.  Args come from
+    ``args_preview`` (capped, so occasionally truncated); a preview that does not
+    parse as JSON is kept with ``truncated=True`` and skipped at replay rather than
+    silently scored.
+    """
+    import time  # noqa: PLC0415 — only this loader needs a clock
+
+    cutoff = time.time() - since_days * 86400 if since_days > 0 else 0.0
+    out: list[dict] = []
+    for run_dir in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
+        events = run_dir / "events.jsonl"
+        if not events.exists():
+            continue
+        try:
+            if cutoff and events.stat().st_mtime < cutoff:
+                continue
+            text = events.read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if '"agent.tool_call"' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("kind") != "agent.tool_call" or ev.get("ok") is not False:
+                continue
+            if not _LIVE_RUN_ID.match(str(ev.get("run_id", ""))):
+                continue
+            tool = ev.get("tool_name")
+            if not isinstance(tool, str) or not tool:
+                continue
+            try:
+                args = json.loads(ev.get("args_preview") or "{}")
+            except ValueError:
+                args, truncated = {}, True
+            else:
+                truncated = not isinstance(args, dict)
+                if truncated:
+                    args = {}
+            out.append({
+                "run": run_dir.name,
+                "tool": tool,
+                "args": args,
+                "was": ev.get("error_preview") or "",
+                "truncated": truncated,
             })
     return out
 
@@ -175,7 +250,11 @@ def _substitute_doc(fn: Any, args: dict, doc_id: str | None) -> dict:
     return out
 
 
-def _skip_reason(tool: str, args: dict) -> str | None:
+def _skip_reason(tool: str, args: dict, *, truncated: bool = False) -> str | None:
+    if truncated:
+        # A live args_preview capped mid-JSON is not the call the model made.
+        # Replaying a guess at it would invent a number.
+        return "truncated_args (live preview exceeded the 2048-char cap)"
     if tool in _STATEFUL_TOOLS:
         return f"needs live run state ({tool} is mission-scoped)"
     for key in _STATEFUL_ARGS:
@@ -192,7 +271,7 @@ def replay(failures: list[dict], *, doc_id: str | None) -> list[dict]:
         tool, args = rec["tool"], rec["args"]
         row = dict(rec, klass=classify(rec["was"]))
 
-        skip = _skip_reason(tool, args)
+        skip = _skip_reason(tool, args, truncated=bool(rec.get("truncated")))
         if skip is not None:
             results.append(dict(row, status="skipped", now=skip))
             results[-1]["fixed"] = None
@@ -316,19 +395,27 @@ def report(results: list[dict], *, detail: bool) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--runs", type=pathlib.Path, default=DEFAULT_RUNS,
-                    help="directory scanned recursively for ledger.json")
+    ap.add_argument("--runs", type=pathlib.Path, default=None,
+                    help="directory scanned recursively for ledger.json "
+                         f"(default: {DEFAULT_RUNS})")
+    ap.add_argument("--live", action="store_true",
+                    help="replay the LIVE desktop run tree (events.jsonl) instead of "
+                         f"the gym ledgers (default dir: {LIVE_RUNS})")
+    ap.add_argument("--since-days", type=float, default=0.0,
+                    help="with --live, only runs touched in the last N days")
     ap.add_argument("--tool", action="append", default=[],
                     help="only replay this tool (repeatable)")
     ap.add_argument("--detail", action="store_true", help="print every call")
     ap.add_argument("--json", type=pathlib.Path, help="also write raw results here")
     args = ap.parse_args(argv)
 
-    if not args.runs.is_dir():
-        print(f"no such runs dir: {args.runs}", file=sys.stderr)
+    runs = args.runs or (LIVE_RUNS if args.live else DEFAULT_RUNS)
+    if not runs.is_dir():
+        print(f"no such runs dir: {runs}", file=sys.stderr)
         return 2
 
-    failures = load_failures(args.runs)
+    failures = (load_live_failures(runs, since_days=args.since_days) if args.live
+                else load_failures(runs))
     if args.tool:
         wanted = set(args.tool)
         failures = [f for f in failures if f["tool"] in wanted]
@@ -337,12 +424,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     os.environ.setdefault("CHUDWARE_PREFLIGHT", "0")  # replay measures the tool, not preflight
-    doc_id = _mint_doc()
-    if doc_id is None:
-        print("warning: no engine available; doc-targeted calls will fail on lookup",
-              file=sys.stderr)
 
-    results = replay(failures, doc_id=doc_id)
+    # Replay MINTS documents. Against the daemon behind the user's open window that
+    # fans out doc.opened and buries their tab strip in scratch parts that outlive the
+    # run — the same way a bare `pytest services/mcp` did before conftest isolated it.
+    from services.mcp.private_hostd import private_daemon  # noqa: PLC0415
+
+    with private_daemon() as isolated:
+        if not isolated:
+            print("warning: no private daemon — replaying against the ambient engine",
+                  file=sys.stderr)
+        doc_id = _mint_doc()
+        if doc_id is None:
+            print("warning: no engine available; doc-targeted calls will fail on lookup",
+                  file=sys.stderr)
+        results = replay(failures, doc_id=doc_id)
     if args.json:
         args.json.write_text(json.dumps(results, indent=1, default=str))
     return report(results, detail=args.detail)

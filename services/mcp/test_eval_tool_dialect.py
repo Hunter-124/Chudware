@@ -230,6 +230,48 @@ def test_undo_denied_teaches_the_way_out():
     assert "plm_rollback" in alt["rollback_document"]
 
 
+def test_undo_denied_alternatives_actually_resolve():
+    """The refusal is exactly as broken as it was before if it names tools that
+    cannot be called. Every non-engine-internal tool it recommends must resolve
+    through the built-in agent's real dispatch path
+    (``services.agent.agent_turn._bind_tool`` — what ``agent_turn.py`` uses, NOT
+    FastMCP), and the two engine-internal RPCs it mentions for context must
+    genuinely NOT resolve there, proving the "engine-internal" framing is true
+    rather than aspirational."""
+    from services.mcp.cad_common import _err
+    from services.mcp.core_bridge import CoreError
+    out = json.loads(_err(CoreError(
+        "undo is disabled for mcp/agent connections; agents use "
+        "doc_checkpoint/doc_revert or PLM rollback", "undo_denied")))
+    hint = out["hint"]
+    for name in ("add_features", "plm_timeline", "plm_rollback"):
+        assert name in hint
+        assert at._bind_tool(name) is not None, (
+            f"{name!r} is recommended by the undo_denied hint but does not "
+            f"resolve via _bind_tool — the model cannot actually call it")
+    # doc_checkpoint/doc_revert are named only as context, explicitly marked
+    # engine-internal — they must NOT be presented as callable.
+    assert "engine-internal" in hint
+    for name in ("doc_checkpoint", "doc_revert"):
+        assert at._bind_tool(name) is None, (
+            f"{name!r} unexpectedly resolves via _bind_tool — the hint's "
+            f"'engine-internal' framing is now wrong, update it")
+
+
+def test_no_role_card_advertises_undo_or_redo():
+    """core/hostd/doc_registry.cpp::preCall UNCONDITIONALLY denies doc_undo/doc_redo
+    for kind mcp/agent (CHUDWARE_UNDO_AGENTS=1 kill-switch aside) — a role card that
+    advertises undo/redo as a concrete tool guarantees a call that fails identically
+    every time."""
+    from services.agent.roles import load_all_roles
+    for role_id, card in load_all_roles().items():
+        named = {t.tool for t in card.tool_allowlist if t.tool}
+        denied = named & {"undo", "redo"}
+        assert not denied, (
+            f"role {role_id!r} advertises {sorted(denied)}, which the daemon "
+            f"unconditionally denies for mcp/agent connections")
+
+
 def test_other_core_errors_are_untouched():
     """Only undo_denied gets the envelope; every other engine error renders
     exactly as before."""

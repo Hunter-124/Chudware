@@ -2570,3 +2570,220 @@ def test_the_live_run_120283478269835_pattern_builds(mode):
     # Every instance really was cut: N holes of d6 through 8mm of plate.
     n = 6 if mode == "circular" else 5
     assert r["volume_mm3"] == pytest.approx(120 * 80 * 8 - n * math.pi * 9 * 8, rel=1e-3)
+
+# --------------------------------------------------------------------- flat top-level keys
+#
+# core/doc/session.cpp:960-991 permissively hoists every non-structural top-level feature
+# key into params — so a flat model payload like {"type":"fillet","edges":[...],
+# "params":{"radius":2}} is legal from the ENGINE's point of view. The Python normalizers
+# that decide the final params/refs split (_migrate_ref_slots, _param_or_ref via
+# _normalize_pattern_feature) used to look only in params/refs, never at the feature's own
+# sibling top-level keys, so the flat shape was rejected before it ever reached the engine.
+# _hoist_feature_sibling_keys mirrors the C++ hoist client-side so both downstream passes
+# see the value without either needing its own copy of this lookup.
+
+def _pipeline(feature: dict, notes: list | None = None) -> dict:
+    """Run the real ops-normalization pipeline slice these tests care about, in the SAME
+    order add_features runs it: hoist -> pattern -> feature types -> ref-slot migration ->
+    refs repair. Returns the resulting feature dict."""
+    notes = notes if notes is not None else []
+    ops = [{"op": "add_feature", "feature": dict(feature)}]
+    ops = M._hoist_feature_sibling_keys(ops, notes)
+    ops = M._normalize_pattern_ops(ops, notes)
+    ops = M._normalize_feature_types(ops, notes)
+    ops = M._migrate_ref_slots(ops, notes)
+    feat = ops[0]["feature"]
+    return M._normalize_feature_refs(feat, feat.get("type"), notes)
+
+
+def test_flat_fillet_edges_reach_refs_not_params():
+    """Live: {"type":"fillet","edges":[...],"params":{"radius":2}} rejected 3x in a row
+    with «refs.edges: required for fillet» — the model had the right selectors, wrong bag,
+    and "edges" was never even IN a bag, it sat beside params."""
+    notes: list = []
+    feat = _pipeline({"type": "fillet", "name": "Corner_Fillets",
+                      "edges": [{"sid": "Ed7ec5d"}], "params": {"radius": 2}}, notes)
+    assert feat["refs"]["edges"] == [{"sid": "Ed7ec5d"}]
+    assert "edges" not in feat["params"]
+    assert "edges" not in feat
+    assert any("edges" in n for n in notes)
+
+
+def test_flat_loft_sections_reach_refs():
+    """Live: «refs.sections: required for loft» — same bug, loft's slot."""
+    feat = _pipeline({"type": "loft", "name": "Body",
+                      "sections": [{"kind": "region", "sketch": "S1"},
+                                   {"kind": "region", "sketch": "S2"}],
+                      "params": {}})
+    assert feat["refs"]["sections"] == [{"kind": "region", "sketch": "S1"},
+                                        {"kind": "region", "sketch": "S2"}]
+    assert "sections" not in feat.get("params", {})
+
+
+def test_flat_linear_pattern_reaches_canonical_schema():
+    """Live: «params.count1/spacing1 required for linear_pattern» and
+    «refs.dir1/refs.features required for linear_pattern» — a canonically-typed
+    linear_pattern with its numbers and refs sitting at the feature's own top level."""
+    feat = _pipeline({"type": "linear_pattern", "name": "Row",
+                      "dir1": "x", "count1": 4, "spacing1": 10, "features": ["f2"]})
+    assert feat["params"]["count1"] == 4
+    assert feat["params"]["spacing1"] == 10
+    assert feat["refs"]["dir1"] == "axis.x"  # "x" is a datum word: dir1 is in _DATUM_REF_SLOTS
+    assert feat["refs"]["features"] == ["f2"]
+    for k in ("dir1", "count1", "spacing1", "features"):
+        assert k not in feat
+
+
+def test_flat_generic_pattern_kind_is_detected_from_a_sibling_mode():
+    """A generic {"type":"pattern","mode":"circular",...} names its KIND in a sibling key,
+    not params — without the hoist, _pattern_kind never sees "mode" and a circular request
+    silently became linear (params.get(k) for every _PATTERN_KIND_KEYS candidate is None)."""
+    feat = _pipeline({"type": "pattern", "name": "Pat", "source": "f2",
+                      "mode": "circular", "axis": "z", "count": 6})
+    assert feat["type"] == "circular_pattern"
+    assert feat["params"]["count"] == 6
+    assert feat["refs"]["axis"] == "axis.z"
+    assert feat["refs"]["features"] == ["f2"]
+
+
+class TestHoistIsLoadBearing:
+    """Neuter the hoist and confirm the exact rejections above come back — proves the
+    upstream pass, not some other normalizer, is what fixes them."""
+
+    def _pipeline_without_hoist(self, feature: dict) -> dict:
+        notes: list = []
+        ops = [{"op": "add_feature", "feature": dict(feature)}]
+        # Skip M._hoist_feature_sibling_keys — this is the ONLY line different from
+        # _pipeline() above.
+        ops = M._normalize_pattern_ops(ops, notes)
+        ops = M._normalize_feature_types(ops, notes)
+        ops = M._migrate_ref_slots(ops, notes)
+        feat = ops[0]["feature"]
+        return M._normalize_feature_refs(feat, feat.get("type"), notes)
+
+    def test_fillet_edges_stay_stranded_without_the_hoist(self):
+        feat = self._pipeline_without_hoist(
+            {"type": "fillet", "name": "Corner_Fillets",
+             "edges": [{"sid": "Ed7ec5d"}], "params": {"radius": 2}})
+        assert "edges" not in feat.get("refs", {})
+        assert feat.get("edges") == [{"sid": "Ed7ec5d"}]  # still stranded at top level
+
+    def test_linear_pattern_numbers_stay_stranded_without_the_hoist(self):
+        feat = self._pipeline_without_hoist(
+            {"type": "linear_pattern", "name": "Row",
+             "dir1": "x", "count1": 4, "spacing1": 10, "features": ["f2"]})
+        assert "count1" not in feat.get("params", {})
+        assert "dir1" not in feat.get("refs", {})
+
+    def test_generic_pattern_mode_is_lost_without_the_hoist(self):
+        feat = self._pipeline_without_hoist(
+            {"type": "pattern", "name": "Pat", "source": "f2",
+             "mode": "circular", "axis": "z", "count": 6})
+        # No sibling visibility -> _pattern_kind falls back to its linear default, the
+        # exact silent-misdetection bug the hoist fixes.
+        assert feat["type"] == "linear_pattern"
+
+
+# --------------------------------------------------------------------- P1: per-type slots
+
+def test_shell_faces_alias_to_remove():
+    """Live: «refs.faces: unknown ref slot for shell» — shell's only ref slot is `remove`."""
+    notes: list = []
+    feat = M._normalize_feature_refs(
+        {"type": "shell", "name": "Hollow", "refs": {"faces": [{"sid": "F1"}]},
+         "params": {"thickness": 2}}, "shell", notes)
+    assert feat["refs"]["remove"] == [{"sid": "F1"}]
+    assert "faces" not in feat["refs"]
+    assert any("refs.faces" in n and "refs.remove" in n for n in notes)
+
+
+@pytest.mark.parametrize("alias", ["faces", "open_faces", "open", "remove_faces"])
+def test_every_shell_faces_synonym_aliases_to_remove(alias):
+    feat = M._normalize_feature_refs(
+        {"type": "shell", "name": "Hollow", "refs": {alias: [{"sid": "F1"}]},
+         "params": {"thickness": 2}}, "shell", [])
+    assert feat["refs"]["remove"] == [{"sid": "F1"}]
+
+
+def test_shell_alias_never_shadows_an_explicit_remove():
+    """An explicit refs.remove wins; the faces copy is just dropped, never guessed between."""
+    feat = {"type": "shell", "refs": {"faces": [{"sid": "WRONG"}],
+                                       "remove": [{"sid": "RIGHT"}]},
+           "params": {"thickness": 2}}
+    out = M._normalize_feature_refs(feat, "shell", [])
+    assert out is feat  # untouched: nothing unambiguous to fix
+    assert out["refs"]["remove"] == [{"sid": "RIGHT"}]
+
+
+def test_extrude_face_aliases_to_profile():
+    """Live: «refs.face: unknown ref slot for extrude» — extrude has SEVERAL ref slots
+    (profile/up_to/up_to2/…) so the engine's own single-slot aliasing deliberately refuses
+    to guess there, but "face" naming the sketch profile is unambiguous."""
+    notes: list = []
+    feat = M._normalize_feature_refs(
+        {"type": "extrude", "name": "Boss",
+         "refs": {"face": {"kind": "region", "sketch": "S1"}},
+         "params": {"depth": 5}}, "extrude", notes)
+    assert feat["refs"]["profile"] == [{"kind": "region", "sketch": "S1"}]
+    assert "face" not in feat["refs"]
+    assert any("refs.face" in n and "refs.profile" in n for n in notes)
+
+
+@pytest.mark.parametrize("ftype", ["extrude", "surf_extrude"])
+def test_extrude_family_face_alias(ftype):
+    feat = M._normalize_feature_refs(
+        {"type": ftype, "refs": {"face": {"kind": "region", "sketch": "S1"}},
+         "params": {"depth": 5}}, ftype, [])
+    assert feat["refs"]["profile"] == [{"kind": "region", "sketch": "S1"}]
+
+
+@pytest.mark.parametrize("axis_value,expected", [
+    ([0, 0, 1], "axis.z"),
+    ([0, 0, -1], "axis.z"),
+    ([1, 0, 0], "axis.x"),
+    ([0, 1, 0], "axis.y"),
+    ([0.02, 0.01, 5.0], "axis.z"),  # dominant component wins over near-zero noise
+])
+def test_bare_axis_vector_snaps_to_the_nearest_cardinal_datum(axis_value, expected):
+    """Live ladder: «refs.axis: selector must be an object» (a bare [x,y,z] list) — the
+    engine has no arbitrary-direction selector kind, only a reserved datum or a real
+    selector object."""
+    notes: list = []
+    feat = M._normalize_feature_refs(
+        {"type": "circular_pattern", "name": "P",
+         "refs": {"axis": axis_value, "features": ["f1"]},
+         "params": {"count": 6, "angle": 360}}, "circular_pattern", notes)
+    assert feat["refs"]["axis"] == expected
+    assert notes
+
+
+def test_malformed_vector_selector_for_axis_also_snaps():
+    """Live ladder rung 2: «refs.axis.kind: not in […]» / «refs.axis.centroid: must be
+    [x,y,z]» — a pseudo-selector wrapping the same direction, one shape further along."""
+    feat = M._normalize_feature_refs(
+        {"type": "circular_pattern", "name": "P",
+         "refs": {"axis": {"kind": "region", "centroid": [0, 0, -5]}, "features": ["f1"]},
+         "params": {"count": 6, "angle": 360}}, "circular_pattern", [])
+    assert feat["refs"]["axis"] == "axis.z"
+
+
+def test_zero_vector_axis_is_left_for_the_engine():
+    """No dominant component -> nothing unambiguous to snap to; leave the engine's error."""
+    feat = {"type": "circular_pattern", "name": "P",
+           "refs": {"axis": [0, 0, 0], "features": ["f1"]},
+           "params": {"count": 6, "angle": 360}}
+    assert M._normalize_feature_refs(feat, "circular_pattern", []) is feat
+
+
+def test_circular_pattern_origin_is_a_teaching_rejection_not_an_alias():
+    """Live: «refs.origin: unknown ref slot for circular_pattern». circular_pattern's only
+    ref slots are axis/features — there is no point/center slot to alias origin onto, and
+    an axis LINE is not interchangeable with a POINT (aliasing it would silently change
+    which geometry the rotation is built around, the same guess the shell/extrude aliases
+    deliberately avoid making for an ambiguous multi-slot type). Left untouched so the
+    engine's own "unknown ref slot" error — which lists the real slots — reaches the model."""
+    feat = {"type": "circular_pattern", "name": "P",
+           "refs": {"origin": [0, 0, 0], "axis": "axis.z", "features": ["f1"]},
+           "params": {"count": 6, "angle": 360}}
+    assert M._normalize_feature_refs(feat, "circular_pattern", []) is feat
+    assert "circular_pattern" not in M._TYPE_REF_ALIASES

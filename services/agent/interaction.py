@@ -638,6 +638,200 @@ def _emit(on_event, ledger, kind: str, data: dict) -> None:
         pass
 
 
+#: Per-question keys a model writes instead of ``prompt``. ``question`` is the
+#: one live claude-sonnet-5 picked (2026-07-28, run-73073258489640): every item
+#: carried a real question under that key, the batch normalized to zero prompts
+#: and ``ask_user`` answered "got no question text" — a self-inflicted dead end.
+PROMPT_ALIASES: tuple[str, ...] = (
+    "question", "text", "ask", "label", "title", "message", "body",
+    "content", "description", "q",
+)
+
+#: Keys that mark a dict as ONE question rather than an ``{id: prompt}`` map.
+QUESTION_FIELDS: frozenset[str] = frozenset({
+    "prompt", "id", "kind", "type", "suggested", "default", "options",
+    "choices", "required", "multi", "multiple", "targets", "target",
+    "unit", "family", "why", "media", "multiline", "proposal", "approve",
+    "geometry", *PROMPT_ALIASES,
+})
+
+#: Call-level kwargs a model uses instead of ``questions``/``question``.
+TOP_LEVEL_QUESTION_ALIASES: tuple[str, ...] = (
+    *PROMPT_ALIASES, "prompt", "query", "input", "request", "qs", "items",
+)
+
+
+def normalize_questions(raw: Any) -> list[dict]:
+    """Coerce model-authored question payloads into contract-§2 question dicts.
+
+    Accepts a plain string, a dict, or a list of strings/dicts. Fills the
+    required fields a small model tends to omit (id, kind, suggested) with honest
+    defaults — a text question whose default answer is empty string.
+
+    Also accepts common aliases:
+      type→kind, question/ask/text/label/… →prompt (see ``PROMPT_ALIASES``),
+      default→suggested, choices→options, multiple→multi, target→targets. A
+      bare ``{id: prompt}`` mapping is expanded into one question per entry.
+      Maps design-decision style payloads onto ``choice`` and geometry-pick
+      payloads onto ``geometry_select``.
+
+    Every entry is guaranteed an ``id`` (synthesised ``q1``, ``q2``, … when
+    omitted) and a ``kind`` from :data:`KINDS`, so the only thing a caller
+    still has to check is whether ``prompt`` ended up non-empty.
+
+    This is the ONE normalizer shared by every ``ask_user`` entry point
+    (``services.mcp.interaction_tools.ask_user``, ``MissionDispatch.ask_user``,
+    ``services.agent.agent_turn._ask_user_sync``) — extend it here, not per call
+    site, or the dialects drift again.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict) and raw and not (QUESTION_FIELDS & set(raw)):
+        # {"purpose": "…?", "dims": "…?"} — an id→prompt map, not one question.
+        items: list[Any] = [{"id": k, "prompt": v} for k, v in raw.items()
+                            if isinstance(v, str) and v.strip()]
+    else:
+        items = raw if isinstance(raw, list) else [raw]
+    out: list[dict] = []
+    for i, item in enumerate(items[:MAX_QUESTIONS], 1):
+        if isinstance(item, str):
+            q: dict[str, Any] = {"prompt": item}
+        elif isinstance(item, dict):
+            q = dict(item)
+        else:
+            continue
+        # Field aliases
+        if not str(q.get("prompt") or "").strip():
+            for _alias in PROMPT_ALIASES:
+                value = q.get(_alias)
+                if isinstance(value, str) and value.strip():
+                    q["prompt"] = value
+                    break
+            else:
+                q["prompt"] = ""
+        if "kind" not in q and q.get("type"):
+            q["kind"] = q["type"]
+        if q.get("suggested") is None and "default" in q:
+            q["suggested"] = q.get("default")
+        if "options" not in q and q.get("choices") is not None:
+            choices = q.get("choices") or []
+            opts = []
+            for c in choices:
+                if isinstance(c, dict) and "value" in c:
+                    opts.append(c)
+                elif isinstance(c, str):
+                    opts.append({"value": c, "label": c})
+            q["options"] = opts
+        if "multi" not in q and q.get("multiple") is not None:
+            q["multi"] = bool(q.get("multiple"))
+        if "targets" not in q and q.get("target") is not None:
+            t = q.get("target")
+            q["targets"] = t if isinstance(t, list) else [t]
+
+        # Infer kind from payload shape when omitted.
+        kind = (q.get("kind") or "").strip().lower()
+        if not kind:
+            if q.get("options") or q.get("choices"):
+                kind = "choice"
+            elif q.get("targets") or q.get("target") or q.get("geometry"):
+                kind = "geometry_select"
+            elif q.get("family") in ("length", "angle", "count") or q.get("unit"):
+                kind = "dimension"
+            elif "proposal" in q or q.get("approve") is not None:
+                kind = "approval"
+            else:
+                kind = "text"
+        # Map common free-form kind aliases.
+        kind_aliases = {
+            "select": "choice", "single_choice": "choice", "multiple_choice": "choice",
+            "mc": "choice", "design": "choice", "design_choice": "choice",
+            "decision": "choice", "option": "choice", "options": "choice",
+            "number": "dimension", "dim": "dimension", "length": "dimension",
+            "string": "text", "free_text": "text", "open": "text", "open_ended": "text",
+            "file": "file_request", "image": "file_request", "upload": "file_request",
+            "confirm": "approval", "approve": "approval", "yes_no": "approval",
+            "geometry": "geometry_select", "pick": "geometry_select",
+            "select_geometry": "geometry_select", "point": "geometry_select",
+            "feature": "geometry_select", "face": "geometry_select",
+        }
+        kind = kind_aliases.get(kind, kind)
+        q["kind"] = kind
+
+        q.setdefault("id", f"q{i}")
+        q.setdefault("required", False)
+
+        # Kind-specific suggested defaults when omitted.
+        if q.get("suggested") is None:
+            if kind == "choice":
+                opts = q.get("options") or []
+                if opts:
+                    first_opt = opts[0]
+                    first = (first_opt.get("value", "") if isinstance(first_opt, dict)
+                             else first_opt if isinstance(first_opt, str) else "")
+                    q["suggested"] = [first] if q.get("multi") else first
+                else:
+                    q["suggested"] = [] if q.get("multi") else ""
+            elif kind == "dimension":
+                unit = q.get("unit") or "mm"
+                # No invented engineering number — 0.0 is a placeholder; force required
+                # so unattended auto does not ship a degenerate dim unless the model
+                # supplied a real suggested value (or required:false explicitly).
+                q["suggested"] = {"value": 0.0, "unit": unit}
+                q.setdefault("family", "length")
+                if isinstance(item, dict) and "required" not in item:
+                    q["required"] = True
+            elif kind == "approval":
+                # Safe deny — never auto-approve a gate the model forgot to default.
+                q["suggested"] = False
+            elif kind == "file_request":
+                q["suggested"] = {"paths": []}
+            elif kind == "geometry_select":
+                # Honest empty pick — do not fabricate sids (contract §12).
+                q["suggested"] = [] if q.get("multi") else {}
+                if not q.get("targets"):
+                    q["targets"] = ["face", "edge", "feature"]
+            else:
+                q["suggested"] = ""
+
+        if kind == "choice" and q.get("multi") and not isinstance(q.get("suggested"), list):
+            s = q.get("suggested")
+            q["suggested"] = [] if s in (None, "") else [s]
+
+        if not q["prompt"]:
+            continue
+        out.append(q)
+    return out
+
+
+def ask_user_bad_arguments_error() -> dict:
+    """Teaching payload for an ``ask_user`` batch with no usable question text.
+
+    ONE shared rejection for every ``ask_user`` entry point (MCP ``ask_user``,
+    ``MissionDispatch.ask_user``, ``agent_turn._ask_user_sync``) so the
+    corrected-call example never drifts between call sites again (it did:
+    2026-07-27, ``ask_user {}`` retried 4x until the loop guard killed the
+    run — a schema recital did not stop the retry, a copy-pasteable example
+    and an explicit way OUT of needing the tool did).
+    """
+    return {
+        "ok": False,
+        "status": "bad_arguments",
+        "error": (
+            "ask_user got no question text. Call it exactly like this: "
+            'ask_user(questions=[{"id": "q1", "prompt": "Which material?", '
+            '"suggested": "AL_6061_T6"}]). A plain string also works: '
+            'ask_user(questions="Which material?"). Batch every unknown into '
+            "ONE call, at most 4 questions, each with a suggested default. If "
+            "you cannot phrase a concrete question, do NOT retry this tool — "
+            "state your assumption, continue the work, and mention the open "
+            "question in your final message instead."
+        ),
+        "example": [{"id": "material", "kind": "choice",
+                     "prompt": "What material?", "suggested": "PLA",
+                     "options": ["PLA", "PETG", "aluminium 6061"]}],
+    }
+
+
 def make_batch(questions: Iterable, **kw) -> QuestionBatch:
     qs = [q if isinstance(q, Question) else Question.from_dict(q) for q in questions]
     return QuestionBatch(questions=qs, **kw)

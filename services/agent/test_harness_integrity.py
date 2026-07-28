@@ -76,6 +76,7 @@ def test_every_role_card_tool_actually_resolves():
     "mission_start",       # general_agent's own escalation path
     "channel_send",        # department_manager, aicad.org/1 §18
     "request_resolve",
+    "request_raise",       # org_tools registers all four together; workers raise this
     "council_convene",
     "bom_price",           # sourcing_specialist
     "dag_run",             # orchestrator

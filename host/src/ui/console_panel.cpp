@@ -4,6 +4,7 @@
 #include "console_panel.h"
 
 #include "../core/app_state.h"
+#include "../ui_theme.h"
 
 namespace ui {
 
@@ -13,7 +14,8 @@ void drawConsoleBody(AppState& st) {
         ImGui::PushFont(st.fonts.mono);
         ImGui::PushStyleColor(ImGuiCol_ChildBg,
             ImVec4(pal.codeBg[0], pal.codeBg[1], pal.codeBg[2], pal.codeBg[3]));
-        ImGui::BeginChild("##log", ImVec2(0, 0), ImGuiChildFlags_None);
+        ImGui::BeginChild("##log", ImVec2(0, 0), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar);
         // Snapshot under the lock — addLog() mutates st.log from background threads (worker
         // errorSink); iterating it live raced push_back/erase and crashed. Copy is ≤500 lines.
         std::vector<std::string> lines;
@@ -35,6 +37,16 @@ void drawConsoleBody(AppState& st) {
             ImGui::TextColored(col, "%s", line.c_str());
         }
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4) ImGui::SetScrollHereY(1.0f);
+        // App-wide accent pill bar replaces the default grey one (child carries NoScrollbar);
+        // "host_agent_glass" is the AI panel's ONE shared surface — adaptivePanel is idempotent
+        // per frame, so this is a cached lookup.
+        {
+            ImVec2 mn = ImGui::GetWindowPos();
+            ImVec2 mx(mn.x + ImGui::GetWindowSize().x, mn.y + ImGui::GetWindowSize().y);
+            const ui::AdaptiveSurface& surf = ui::adaptivePanel(
+                ui::panelId("host_agent_glass"), ImRect(mn, mx), ui::GlassGroup::Copilot);
+            ui::drawWindowPillScrollbarV(surf);
+        }
         ImGui::EndChild();
         ImGui::PopStyleColor();
         ImGui::PopFont();

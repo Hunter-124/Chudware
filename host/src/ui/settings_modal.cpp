@@ -178,24 +178,36 @@ static void settingsGlassSectionEnd() {
     ui::popGlassChildStyle();
 }
 
+// Window-local accent pill scrollbar for a scrolling child inside the Settings modal. Call
+// immediately before EndChild(); it is a no-op when the content fits. One adaptivePanel id for
+// the whole modal — adaptivePanel is idempotent per frame, so repeated fetches are free.
+static void settingsPillScrollbar() {
+    ImVec2 mn = ImGui::GetWindowPos();
+    ImVec2 mx(mn.x + ImGui::GetWindowSize().x, mn.y + ImGui::GetWindowSize().y);
+    ui::drawWindowPillScrollbarV(ui::adaptivePanel(ui::panelId("settings_modal_glass"),
+                                                  ImRect(mn, mx), ui::GlassGroup::Global));
+}
+
 // Sticky Settings tabs: tab bar stays put; only the body child scrolls.
 // ImGuiChildFlags_AlwaysUseWindowPadding is REQUIRED: a child created with _None ignores
 // WindowPadding entirely, so the padding pushed here used to be a no-op and every tab drew
 // flush against the modal edge — which is exactly why each section grew its own ad-hoc indent.
-// One gutter lives here now. ScrollbarSize is pinned to the app value so the reserved
-// right-hand gutter is identical on every tab; ImGui subtracts it from GetContentRegionAvail()
-// once the bar exists, so -1 / 0-width controls stop sliding underneath it.
+// One gutter lives here now. Every body carries ImGuiWindowFlags_NoScrollbar and paints the
+// app-wide accent pill in settingsTabBodyEnd instead of ImGui's grey bar (a default bar
+// anywhere is a bug), so there is no reserved right-hand gutter to pin a ScrollbarSize to.
+// NoScrollWithMouse stays reserved for scroll=false bodies — adding it to a scrolling body
+// would silently eat the wheel.
 static void settingsTabBodyBegin(const char* id, bool scroll = true) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::px(14.0f), ui::metrics::px(10.0f)));
-    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, ui::metrics::px(12.0f));
-    ImGuiWindowFlags flags = scroll ? ImGuiWindowFlags_None
-                                    : (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar;
+    if (!scroll) flags |= ImGuiWindowFlags_NoScrollWithMouse;
     ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding, flags);
 }
 static void settingsTabBodyEnd() {
+    settingsPillScrollbar();
     ImGui::EndChild();
-    ImGui::PopStyleVar(2);  // ScrollbarSize, WindowPadding
+    ImGui::PopStyleVar();  // WindowPadding
 }
 
 // AI sub-tabs whose bodies own their own scrolling (Skills / Context) must zero the PARENT
@@ -4736,8 +4748,8 @@ void drawSettingsModal(AppState& st, bool busy) {
     const float margin = 28.0f * sc;
     const float maxW = std::max(360.0f * sc, vp->WorkSize.x - margin * 2.0f);
     const float maxH = std::max(420.0f * sc, vp->WorkSize.y - margin * 2.0f);
-    const float winW = std::min(760.0f * sc, maxW);
-    const float winH = std::min(760.0f * sc, maxH);
+    const float winW = std::min(920.0f * sc, maxW);
+    const float winH = std::min(820.0f * sc, maxH);
     if (s_settingsOpen) {
         ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Appearing);
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -4774,6 +4786,8 @@ void drawSettingsModal(AppState& st, bool busy) {
         // Which AI sub-tab a jump should land on (-1 = leave the last one selected). Declared
         // out here because the legacy-index remap below runs BEFORE the tab bar is built.
         static int s_aiSubJump = -1;
+        // Which AI sub-section the left nav rail has selected (persists across opens).
+        static int s_aiSubSel = 0;
         // openSettingsTab: jump to a specific tab requested by the command search widget.
         int jumpToTab = -1;
         if (st.openSettingsTab >= 0) {
@@ -4795,6 +4809,8 @@ void drawSettingsModal(AppState& st, bool busy) {
             s_aiSubJump = 2;
             jumpToTab = 2;
         }
+        // A resolved jump drives the rail selection directly, so it lands the same frame.
+        if (s_aiSubJump >= 0) s_aiSubSel = s_aiSubJump;
         // wantSettings (screenshot/automation shot) opens the AI tab.
         static bool s_wantSettingsTabDone = false;
         if (st.wantSettings && !s_wantSettingsTabDone) {
@@ -5216,17 +5232,68 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("AI", nullptr,
                                     (jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
-                settingsTabBodyBegin("##tab_ai");
+                settingsTabBodyBegin("##tab_ai", /*scroll=*/false);
 
-                if (ImGui::BeginTabBar("##ai_sub", ImGuiTabBarFlags_FittingPolicyScroll)) {
-                    auto subFlags = [](int idx) {
-                        return (s_aiSubJump == idx) ? ImGuiTabItemFlags_SetSelected
-                                                    : ImGuiTabItemFlags_None;
-                    };
+                // AI sub-navigation: left vertical rail + content pane, mirroring
+                // drawOmpProviderManager's split. Under 640*sc the rail collapses to a combo
+                // (design §3.1). Only the SELECTED section's body runs each frame —
+                // Benchmarks' status polling relies on that.
+                static const char* kAiSubLabels[8] = {
+                    "Harness", "Roles", "Prompts", "Skills",
+                    "Context", "Benchmarks", "Tools", "Dev Preview"};
+                const bool aiNarrow = ImGui::GetContentRegionAvail().x < 640.0f * sc;
+                if (aiNarrow) {
+                    ImGui::SetNextItemWidth(-1);
+                    if (ImGui::BeginCombo("##ai_sub_pick", kAiSubLabels[s_aiSubSel])) {
+                        for (int i = 0; i < 8; ++i)
+                            if (ImGui::Selectable(kAiSubLabels[i], i == s_aiSubSel))
+                                s_aiSubSel = i;
+                        ImGui::EndCombo();
+                    }
+                } else {
+                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                        ImVec2(8.0f * sc, 8.0f * sc));
+                    ImGui::BeginChild("##ai_rail", ImVec2(172.0f * sc, 0),
+                                      ImGuiChildFlags_Borders |
+                                          ImGuiChildFlags_AlwaysUseWindowPadding);
+                    const float railRowH = ImGui::GetTextLineHeight() + 10.0f * sc;
+                    for (int i = 0; i < 8; ++i) {
+                        ImGui::PushID(i);
+                        const bool selRow = (i == s_aiSubSel);
+                        if (ImGui::Selectable("##ai_rail_row", selRow, 0, ImVec2(0, railRowH)))
+                            s_aiSubSel = i;
+                        ImDrawList* rdl = ImGui::GetWindowDrawList();
+                        const ImVec2 rmn = ImGui::GetItemRectMin();
+                        const ImVec2 rmx = ImGui::GetItemRectMax();
+                        // Bare dp radius — glassRowBackground scales it internally.
+                        if (selRow)
+                            ui::glassRowBackground(rdl, rmn, rmx, 6.0f, /*stripe=*/false,
+                                                   /*selected=*/true);
+                        rdl->AddText(
+                            ImVec2(rmn.x + 8.0f * sc,
+                                   rmn.y + (rmx.y - rmn.y - ImGui::GetFontSize()) * 0.5f),
+                            ui::Palette::toU32(selRow ? ui::palette.accent : ui::palette.text),
+                            kAiSubLabels[i]);
+                        ImGui::PopID();
+                    }
+                    ImGui::EndChild();
+                    ImGui::PopStyleVar();
+                    ImGui::SameLine(0, 10.0f * sc);
+                }
+                ImGui::BeginChild("##ai_sub_body", ImVec2(0, 0),
+                                  ImGuiChildFlags_AlwaysUseWindowPadding,
+                                  ImGuiWindowFlags_NoScrollbar);
+                {
+                    // Selection changed: start the new section at the top.
+                    static int s_aiSubDrawnPrev = -1;
+                    if (s_aiSubDrawnPrev != s_aiSubSel) {
+                        ImGui::SetScrollY(0.0f);
+                        s_aiSubDrawnPrev = s_aiSubSel;
+                    }
 
                     // Harness is first: full quick-settings mirror + mode grid.
                     // (Behavior was absorbed here so knobs aren't duplicated.)
-                    if (ImGui::BeginTabItem("Harness", nullptr, subFlags(0))) {
+                    if (s_aiSubSel == 0) {
                         settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                         drawHarnessOrganizationSection(st, sc);
                         settingsGlassSectionEnd();
@@ -5242,12 +5309,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                         settingsGlassSectionBegin("##ai_memory", "Memory & Learning");
                         drawMemoryLearningSection(st, sc);
                         settingsGlassSectionEnd();
-                        ImGui::EndTabItem();
                     }
 
 
 
-                    if (ImGui::BeginTabItem("Roles", nullptr, subFlags(1))) {
+                    if (s_aiSubSel == 1) {
                         // Model pickers first (compact table).
                         settingsGlassSectionBegin("##ai_model_roles", "Model roles");
                         drawModelRolesSection(st, sc);
@@ -5270,10 +5336,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 s_efOpen = false;
                             }
                         }
-                        ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Prompts", nullptr, subFlags(2))) {
+                    if (s_aiSubSel == 2) {
                         // Full-height role prompt editor for power users / dev refinement.
                         bool canFetch = st.workerStarted && !busy;
                         if (!s_promptsLoaded && canFetch) loadPrompts(st);
@@ -5440,25 +5505,22 @@ void drawSettingsModal(AppState& st, bool busy) {
                         }
                         ImGui::EndChild();
                         ImGui::PopStyleVar();  // WindowPadding shared by both panes
-                        ImGui::EndTabItem();
                     }
 
 
-                    if (ImGui::BeginTabItem("Skills", nullptr, subFlags(3))) {
+                    if (s_aiSubSel == 3) {
                         // Fill-height editors own their scrolling: zero the parent ONCE on
                         // entry, never every frame (that ate the wheel on this tab).
                         if (aiSubTabJustEntered(3)) ImGui::SetScrollY(0.0f);
                         drawSettingsSkillsTab(st, sc);
-                        ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Context", nullptr, subFlags(4))) {
+                    if (s_aiSubSel == 4) {
                         if (aiSubTabJustEntered(4)) ImGui::SetScrollY(0.0f);
                         drawSettingsContextTab(st, sc);
-                        ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Benchmarks", nullptr, subFlags(5))) {
+                    if (s_aiSubSel == 5) {
                 // Shared leaderboard board (refreshed by runner / refresh button).
                 static ui::leaderboard::Board s_lb;
                 static bool s_lbLoaded = false;
@@ -5490,10 +5552,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                 drawBenchRunner(st, sc, s_lb, s_lbLast);
                 settingsGlassSectionEnd();
 
-                                        ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Tools", nullptr, subFlags(6))) {
+                    if (s_aiSubSel == 6) {
 
                         settingsGlassSectionBegin("##ai_tools_global", "Global tool limits");
                         dimText("Defaults applied to every tool call. A per-tool Options override "
@@ -6464,11 +6525,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                         }
                         settingsGlassSectionEnd();
-                        ImGui::EndTabItem();
                     }
 
                     // ---- Dev Preview: assembled general_agent system prompt ----
-                    if (ImGui::BeginTabItem("Dev Preview", nullptr, subFlags(7))) {
+                    if (s_aiSubSel == 7) {
                         if (aiSubTabJustEntered(7)) ImGui::SetScrollY(0.0f);
                         settingsGlassSectionBegin("##ai_dev_preview", "Prompt assembly preview");
                         dimText("Shows the system prompt a typical main-chat / general_agent "
@@ -6564,7 +6624,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::PushStyleColor(ImGuiCol_ChildBg,
                             ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
                                    ui::palette.panelBg[2], 1));
-                        ImGui::BeginChild("##dev_prompt_body", ImVec2(-1, prevH), true);
+                        ImGui::BeginChild("##dev_prompt_body", ImVec2(-1, prevH),
+                                          ImGuiChildFlags_Borders,
+                                          ImGuiWindowFlags_NoScrollbar);
                         ImGui::PushFont(st.fonts.mono);
                         const float wrapX = ImGui::GetCursorPosX() +
                             ImGui::GetContentRegionAvail().x - 4.0f * sc;
@@ -6585,14 +6647,15 @@ void drawSettingsModal(AppState& st, bool busy) {
                         }
                         ImGui::PopTextWrapPos();
                         ImGui::PopFont();
+                        settingsPillScrollbar();
                         ImGui::EndChild();
                         ImGui::PopStyleColor();
                         settingsGlassSectionEnd();
-                        ImGui::EndTabItem();
                     }
 
-                    ImGui::EndTabBar();
                 }
+                settingsPillScrollbar();
+                ImGui::EndChild();  // ##ai_sub_body
                 s_aiSubJump = -1;
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
@@ -6653,6 +6716,13 @@ void drawSettingsModal(AppState& st, bool busy) {
         }
         ImGui::EndChild();
         popGlassChildStyle();
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        // Right-align the Save/Cancel pair against the modal's right gutter.
+        const float footBtnsW = 120.0f * sc + 100.0f * sc + ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             ImGui::GetContentRegionAvail().x - footBtnsW);
         if (primaryButton("Save", ImVec2(120.0f * sc, 34.0f * sc))) {
             settings.systemPrompt = st.spBuf.data();
             saveSettings(settings);

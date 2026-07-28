@@ -152,12 +152,12 @@ static void helpMarker(const char* desc) {
 // Prefer this over raw ImGui::SeparatorText so Appearance/General/AI/… share one look.
 static void settingsSectionHeader(const char* title, bool first = false) {
     const float sc = ui::uiScale;
-    ImGui::Dummy(ImVec2(0, first ? 2.0f * sc : 10.0f * sc));
+    ImGui::Dummy(ImVec2(0, first ? 0.0f : 6.0f * sc));
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 1.0f));
     ImGui::TextUnformatted(title);
     ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+    ImGui::Dummy(ImVec2(0, 1.0f * sc));
 }
 
 // Frosted glass card around a group of related fields. Auto-height; id must be unique per tab.
@@ -166,8 +166,8 @@ static void settingsGlassSectionBegin(const char* id, const char* title) {
     const float sc = ui::uiScale;
     settingsSectionHeader(title);
     ui::pushGlassChildStyle(10.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f * sc, 10.0f * sc));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * sc, 6.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 7.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * sc, 5.0f * sc));
     ImGui::BeginChild(id, ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
 }
@@ -199,7 +199,7 @@ static void settingsPillScrollbar() {
 // would silently eat the wheel.
 static void settingsTabBodyBegin(const char* id, bool scroll = true) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::px(14.0f), ui::metrics::px(10.0f)));
+                        ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar;
     if (!scroll) flags |= ImGuiWindowFlags_NoScrollWithMouse;
     ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding, flags);
@@ -5251,24 +5251,42 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::EndCombo();
                     }
                 } else {
+                    // Borderless nav rail: selection is a soft accent wash (not the design
+                    // system's glow-border, which reads as a boxed outline at this size) —
+                    // the Selectable's own Header colors are suppressed so only the wash and
+                    // the label paint. A hairline divider separates rail from content.
+                    const ImVec2 railMn = ImGui::GetCursorScreenPos();
+                    const float railAvailH = ImGui::GetContentRegionAvail().y;
+                    const float railW = 148.0f * sc;
                     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                                        ImVec2(8.0f * sc, 8.0f * sc));
-                    ImGui::BeginChild("##ai_rail", ImVec2(172.0f * sc, 0),
-                                      ImGuiChildFlags_Borders |
-                                          ImGuiChildFlags_AlwaysUseWindowPadding);
-                    const float railRowH = ImGui::GetTextLineHeight() + 10.0f * sc;
+                                        ImVec2(6.0f * sc, 6.0f * sc));
+                    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                        ImVec2(6.0f * sc, 2.0f * sc));
+                    ImGui::BeginChild("##ai_rail", ImVec2(railW, 0),
+                                      ImGuiChildFlags_AlwaysUseWindowPadding,
+                                      ImGuiWindowFlags_NoScrollbar |
+                                          ImGuiWindowFlags_NoScrollWithMouse);
+                    const ImVec4 kTransparent(0, 0, 0, 0);
+                    ImGui::PushStyleColor(ImGuiCol_Header, kTransparent);
+                    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, kTransparent);
+                    ImGui::PushStyleColor(ImGuiCol_HeaderActive, kTransparent);
+                    const float railRowH = ImGui::GetTextLineHeight() + 6.0f * sc;
                     for (int i = 0; i < 8; ++i) {
                         ImGui::PushID(i);
                         const bool selRow = (i == s_aiSubSel);
                         if (ImGui::Selectable("##ai_rail_row", selRow, 0, ImVec2(0, railRowH)))
                             s_aiSubSel = i;
+                        const bool hovRow = ImGui::IsItemHovered();
                         ImDrawList* rdl = ImGui::GetWindowDrawList();
                         const ImVec2 rmn = ImGui::GetItemRectMin();
                         const ImVec2 rmx = ImGui::GetItemRectMax();
-                        // Bare dp radius — glassRowBackground scales it internally.
+                        // Bare dp radius — coloredRowWash scales it internally.
                         if (selRow)
-                            ui::glassRowBackground(rdl, rmn, rmx, 6.0f, /*stripe=*/false,
-                                                   /*selected=*/true);
+                            ui::coloredRowWash(rdl, rmn, rmx, 6.0f, ui::palette.accent,
+                                               0.30f, /*selected=*/false);
+                        else if (hovRow)
+                            ui::coloredRowWash(rdl, rmn, rmx, 6.0f, ui::palette.accent,
+                                               0.10f, /*selected=*/false);
                         rdl->AddText(
                             ImVec2(rmn.x + 8.0f * sc,
                                    rmn.y + (rmx.y - rmn.y - ImGui::GetFontSize()) * 0.5f),
@@ -5276,10 +5294,21 @@ void drawSettingsModal(AppState& st, bool busy) {
                             kAiSubLabels[i]);
                         ImGui::PopID();
                     }
+                    ImGui::PopStyleColor(3);
                     ImGui::EndChild();
-                    ImGui::PopStyleVar();
-                    ImGui::SameLine(0, 10.0f * sc);
+                    ImGui::PopStyleVar(2);  // ItemSpacing, WindowPadding
+                    {
+                        float edge[4];
+                        ui::Palette::withAlpha(ui::palette.glassBorder, edge, 0.6f);
+                        const float dx = railMn.x + railW + 3.5f * sc;
+                        ImGui::GetWindowDrawList()->AddLine(
+                            ImVec2(dx, railMn.y), ImVec2(dx, railMn.y + railAvailH),
+                            ui::Palette::toU32(edge));
+                    }
+                    ImGui::SameLine(0, 8.0f * sc);
                 }
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                    ImVec2(4.0f * sc, 2.0f * sc));
                 ImGui::BeginChild("##ai_sub_body", ImVec2(0, 0),
                                   ImGuiChildFlags_AlwaysUseWindowPadding,
                                   ImGuiWindowFlags_NoScrollbar);
@@ -6656,6 +6685,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
                 settingsPillScrollbar();
                 ImGui::EndChild();  // ##ai_sub_body
+                ImGui::PopStyleVar();  // WindowPadding (content pane)
                 s_aiSubJump = -1;
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
@@ -6716,9 +6746,7 @@ void drawSettingsModal(AppState& st, bool busy) {
         }
         ImGui::EndChild();
         popGlassChildStyle();
-        ImGui::Spacing();
         ImGui::Separator();
-        ImGui::Spacing();
         // Right-align the Save/Cancel pair against the modal's right gutter.
         const float footBtnsW = 120.0f * sc + 100.0f * sc + ImGui::GetStyle().ItemSpacing.x;
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() +

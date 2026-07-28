@@ -64,6 +64,26 @@ class TestAppServe:
         assert "text/html" in (r.headers.get("content-type") or "")
         assert "chudware" in r.text
 
+    def test_app_csp_permits_wasm_and_blob_workers(self, client, app_tree):
+        """The site-wide CSP in app.py is fatal for the Emscripten client.
+
+        `script-src 'self'` alone makes Chrome refuse WebAssembly.instantiate,
+        and Chudware.js spawns a worker from a createObjectURL blob which
+        worker-src (falling back to default-src) would block. Both broke the
+        whole /app client in production on 2026-07-28 with no server error —
+        every asset returned 200 and the page simply never started.
+        """
+        for path in ("/app/", "/app/chudware.js"):
+            r = client.get(path, headers=DEV_HEADERS)
+            assert r.status_code == 200, f"{path} -> {r.status_code}"
+            csp = r.headers.get("content-security-policy", "")
+            assert "'wasm-unsafe-eval'" in csp, f"{path} would break wasm: {csp!r}"
+            assert "worker-src 'self' blob:" in csp, f"{path} blocks blob worker: {csp!r}"
+            # Still tight where it matters — wasm-unsafe-eval must not have been
+            # waved through as a blanket 'unsafe-eval'.
+            assert "object-src 'none'" in csp
+            assert "'unsafe-eval'" not in csp.replace("'wasm-unsafe-eval'", "")
+
     def test_app_bare_path_same_as_slash(self, client, app_tree):
         r = client.get("/app", headers=DEV_HEADERS)
         assert r.status_code == 200

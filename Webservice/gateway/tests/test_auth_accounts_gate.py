@@ -43,16 +43,25 @@ def env(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("CHUDWARE_WEB_USERS_FILE", str(users))
 
+    # These modules hold process-global state (settings singleton, sqlite
+    # connection), so reloading them under a tmp data root leaks into every
+    # later test in the session unless we reload them back afterwards.
     import config
-    importlib.reload(config)
     import accounts
-    importlib.reload(accounts)
     import auth
-    importlib.reload(auth)
+
+    for mod in (config, accounts, auth):
+        importlib.reload(mod)
 
     directory = auth.UserDirectory(config.settings.users_file)
     middleware_app = _bare_app(auth, directory)
-    return accounts, TestClient(middleware_app)
+    try:
+        yield accounts, TestClient(middleware_app)
+    finally:
+        # monkeypatch has already restored the environment; reload once more so
+        # the shared modules point back at the real settings/database.
+        for mod in (config, accounts, auth):
+            importlib.reload(mod)
 
 
 def _bare_app(auth, directory):

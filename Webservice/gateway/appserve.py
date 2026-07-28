@@ -74,10 +74,34 @@ def _cache_control(path: Path) -> str:
     return "max-age=3600"
 
 
+# The /app bundle is Emscripten WASM, so the site-wide CSP set in app.py is
+# wrong for it in two ways and silently kills the whole client:
+#   * Chrome refuses WebAssembly.instantiate under a bare `script-src 'self'`
+#     — compiling wasm needs 'wasm-unsafe-eval'.
+#   * Chudware.js starts a worker from a createObjectURL blob, and worker-src
+#     falls back to default-src, so 'self' alone blocks it.
+# app.py's security middleware uses setdefault, so this value wins for /app.
+_APP_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'wasm-unsafe-eval'; "
+    "worker-src 'self' blob:; "
+    "child-src 'self' blob:; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self' ws: wss: blob: data:; "
+    "font-src 'self' data:; "
+    "frame-ancestors 'self'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "object-src 'none'"
+)
+
+
 def _coop_headers(path: Path) -> dict[str, str]:
     return {
         "Cross-Origin-Opener-Policy": "same-origin",
         "Cross-Origin-Embedder-Policy": "require-corp",
+        "Content-Security-Policy": _APP_CSP,
         "Cache-Control": _cache_control(path),
     }
 

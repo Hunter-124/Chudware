@@ -195,3 +195,76 @@ they never un-approve the human.
    taking money.
 6. Add token metering (§3.2), then enable Stripe.
 7. Only then set `CHUDWARE_WEB_AUTO_APPROVE_DOMAINS=` and open registration.
+
+---
+
+## 8. Where this left off (2026-07-28)
+
+### Deployed and working
+
+Prod (`livingroom-pc`) runs the gateway at whatever `master` was last pulled;
+check with `livingroom 'cd /home/liveuser/Repositories/CAD && sudo -u liveuser git log --oneline -1'`.
+All 217 tests pass. Verified live: admin + standard-user authorization, the
+account queue, per-account workspace isolation, the admin terminal (REST +
+WebSocket + reattach), and the `/app` WASM client booting with a strict CSP.
+
+The marketing site is live at **https://chudware-site.pages.dev** (Cloudflare
+Pages project `chudware-site`). No DNS was changed — `chudware.com` still goes
+to the gateway behind Access. The apex cutover is §5.
+
+### Three regressions this pass caused, and what they teach
+
+All three were invisible to the test suite and to `curl`, and all three only
+showed up by driving the real thing. Worth remembering when hardening further:
+
+1. **CSP killed the WASM client.** Every asset returned 200; the page just
+   never started. `script-src 'self'` blocks `WebAssembly.instantiate` without
+   `'wasm-unsafe-eval'`, blob workers need `worker-src`, and the inline
+   bootstrap script needed a hash. Fixed in `appserve.py`, which now derives
+   inline-script hashes from the file on disk so a rebuild refreshes them.
+2. **Requiring a container seat on `/engine` took the web client offline.**
+   `/app` is browser-native and never has a podman seat. Isolation belongs to
+   `_inject_identity` + `path_violation()`, not to seat ownership.
+3. **The terminal declared dead sessions on every deploy.** `shell_died` only
+   meant the `tmux attach` client died, which happens on every gateway restart
+   while the tmux server survives.
+
+### Resume here
+
+**1. Refresh the stale `/app` bundle.** This is the "web UI is behind the
+desktop build" complaint. `/app` is a *build artifact*, not source — `git pull`
+never updates it. The staged bundle is from 2026-07-24. emsdk IS installed at
+`/home/liveuser/.emsdk`, so on the box:
+
+```
+cd /home/liveuser/Repositories/CAD && EMSDK=$HOME/.emsdk ./build.sh wasm
+```
+
+That restages `~/chudware-web/app`. It is a long emscripten build — run it when
+you can watch it. Log lands in `/tmp/chudware-webd-sync-wasm.log`. Note
+`chudware-webd-sync.path` only fires on a rebuilt `chudware-hostd` binary, so a
+source-only pull will never trigger it.
+
+**2. Two switches are ON for convenience and must be flipped before public
+registration** (both commented in `~/chudware-web-data/gateway.env`):
+`CHUDWARE_WEB_TERMINAL_ENABLED=1` and `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=1`.
+
+**3. The blockers in §3 are unchanged** — plan entitlements still are not
+enforced (`sessions.py` never reads a plan), there is no token metering, the
+CAD daemon is still one shared process, `liveuser` still has NOPASSWD sudo plus
+LAN SSH keys, and the Cloudflare API token in git history is still live.
+
+### Operating notes
+
+- Deploy = pull + `systemctl --user restart chudware-gateway`. As root the user
+  bus needs: `setpriv --reuid=1000 --regid=1000 --init-groups env
+  XDG_RUNTIME_DIR=/run/user/1000
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemctl --user ...`
+- **Warn before restarting** — it drops every live terminal and engine socket.
+- To exercise authenticated endpoints without a browser, use the SSO shared
+  secret over loopback: `curl -u "you@crimson.ua.edu:$CHUDWARE_WEB_SSO_SHARED_SECRET"`.
+  Browsers will NOT attach that header to a WebSocket handshake, so a WS 403 in
+  a headless-browser test is usually the harness, not the server — confirm with
+  a real WS client before chasing it.
+- Rollback commit from before this pass: `~/chudware-web-data/ROLLBACK_COMMIT`.
+  Backups: `~/chudware-web-backups/` (local + unencrypted; see §4).

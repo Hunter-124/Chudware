@@ -601,65 +601,82 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     if ((overItem || overRect) && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
         ImGui::OpenPopup(popupId);
 
-    // Theme the menu like the app's other popups (widgets/interwebz.cpp beginComboImpl):
-    // opaque popupBg, glass border, accent hover/active highlight, and — the part that
-    // actually matters for the highlight filling the row — that SAME small WindowPadding +
-    // ItemSpacing. The stock ImGui popup padding this menu used before (default ~8dp) left a
-    // gap between the Selectable highlight and the rounded card edge wide enough to read as
-    // "the highlight doesn't fill the box"; the combo's tighter padding is the established
-    // convention elsewhere in the app for this exact look, so match it instead of reinventing it.
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     ImGui::PushStyleColor(ImGuiCol_PopupBg,
         ImVec4(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]));
     ImGui::PushStyleColor(ImGuiCol_Border,
         ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
-    ImGui::PushStyleColor(ImGuiCol_Header,
-        ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2], pal.accentSoft[3]));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
-        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.30f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive,
-        ImVec4(pal.accentMid[0], pal.accentMid[1], pal.accentMid[2], pal.accentMid[3]));
     ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 6.0f * sc);
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
-    // Horizontal padding MUST be 0: any nonzero value is dead space the row highlight can
-    // never paint over, which reads as "the highlight doesn't fill the box". Text stays
-    // inset via the default FramePadding (Selectable renders its label at bb.Min +
-    // FramePadding), so the look keeps breathing room while the hover fill bleeds
-    // edge-to-edge. Vertical padding stays so the first/last rows don't kiss the card's
-    // rounded corners.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 6.0f * sc));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * sc, 2.0f * sc));
+    // Zero padding both axes: any nonzero value is dead space the highlight can never paint
+    // over, which is the white strip reported. Text keeps its inset via FramePadding
+    // (Selectable renders the label at bb.Min + FramePadding). Corner safety comes from the
+    // per-row highlight rounding below, not from padding.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
     if (!ImGui::BeginPopup(popupId)) {
         ImGui::PopStyleVar(4);
-        ImGui::PopStyleColor(5);
+        ImGui::PopStyleColor(2);
         return;
     }
     const std::string& all = copyAll.empty() ? copyText : copyAll;
-    // size_arg.x must be the full content width: with size_arg.x == 0 Selectable sizes the
-    // item (and therefore the highlight rect) to the LABEL width only, leaving a blank gap to
-    // the right of the text — exactly the look reported. GetContentRegionAvail() is identical
-    // on every row (cursor x returns to the padding edge after each NewLine), so each row's
-    // highlight spans the whole popup interior.
-    auto copyRow = [&](const char* label, bool enabled, const std::string& text) {
+    // The highlight is drawn MANUALLY (draw list), not via Selectable's own RenderFrame:
+    //  - Selectable can only paint inside its own bounding box, and sizing that box off
+    //    GetContentRegionAvail()/GetWindowContentRegionMax() collapses on the popup's
+    //    auto-size frame (those report ~0 while ImGui is still measuring), which shrank the
+    //    whole menu to a sliver.
+    //  - Instead the row is sized off the LABEL width (never zero, stable across frames),
+    //    Selectable's own highlight is made transparent, and the hover fill is drawn from
+    //    the window's inner left edge to its inner right edge — a true edge-to-edge bleed.
+    //  - First/last rows get top/bottom corner rounding matching PopupRounding so the fill
+    //    follows the card's rounded corners instead of poking square corners past them.
+    auto copyRow = [&](const char* label, bool enabled, const std::string& text,
+                       ImDrawFlags cornerRound = ImDrawFlags_RoundCornersNone) {
         ImGui::BeginDisabled(!enabled);
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const float border = st.WindowBorderSize;
+        const float winW = ImGui::GetWindowWidth();
+        const float textW = ImGui::CalcTextSize(label).x + 2.0f * st.FramePadding.x;
+        // On the auto-size frame winW is tiny — fall back to the label width so the popup
+        // measures itself from the widest row; from the next frame on, winW - 2*border is
+        // the full interior and the fill bleeds edge to edge.
+        const float rowW = ImMax(winW - 2.0f * border, textW);
+        const ImVec2 pos = ImGui::GetCursorScreenPos();
         const bool clicked = ImGui::Selectable(label, false, ImGuiSelectableFlags_None,
-                                               ImVec2(ImGui::GetWindowContentRegionMax().x, 0.0f));
+                                               ImVec2(rowW, 0.0f));
+        const bool hovered = ImGui::IsItemHovered();
+        ImGui::PopStyleColor(3);
         ImGui::EndDisabled();
+        if (hovered && enabled) {
+            const ImVec2 winPos = ImGui::GetWindowPos();
+            const float rowH = ImGui::GetItemRectSize().y;
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                ImVec2(winPos.x + border, pos.y),
+                ImVec2(winPos.x + winW - border, pos.y + rowH),
+                ImGui::GetColorU32(ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.30f)),
+                6.0f * sc, cornerRound);
+        }
         if (clicked) {  // BeginDisabled already keeps a disabled row from ever registering one
             chatCopyToClipboard(text);
             ImGui::CloseCurrentPopup();
         }
     };
     if (!selText.empty()) {
-        copyRow("Copy", true, selText);
+        copyRow("Copy", true, selText, ImDrawFlags_RoundCornersTop);
         ImGui::Separator();
+        copyRow("Copy text", !copyText.empty(), copyText);
+        copyRow("Copy all", !all.empty(), all, ImDrawFlags_RoundCornersBottom);
+    } else {
+        copyRow("Copy text", !copyText.empty(), copyText, ImDrawFlags_RoundCornersTop);
+        copyRow("Copy all", !all.empty(), all, ImDrawFlags_RoundCornersBottom);
     }
-    copyRow("Copy text", !copyText.empty(), copyText);
-    copyRow("Copy all", !all.empty(), all);
     ImGui::EndPopup();
     ImGui::PopStyleVar(4);
-    ImGui::PopStyleColor(5);
+    ImGui::PopStyleColor(2);
 }
 
 

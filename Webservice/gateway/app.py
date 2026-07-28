@@ -58,6 +58,9 @@ try:
     from .terminal import router as terminal_router
     from .deploy_ops import router as deploy_router
     from .releases import router as releases_router
+    from . import accounts
+    from .accounts import router as accounts_router
+    from .billing import router as billing_router
 except ImportError:
     from engine_bridge import router as engine_router, active_bridge_count
     from workspace import router as workspace_router
@@ -67,6 +70,9 @@ except ImportError:
     from terminal import router as terminal_router
     from deploy_ops import router as deploy_router
     from releases import router as releases_router
+    import accounts
+    from accounts import router as accounts_router
+    from billing import router as billing_router
 
 settings.ensure_data_dirs()  # users_file must exist before the directory loads
 user_directory = UserDirectory(settings.users_file)
@@ -493,6 +499,21 @@ async def admin_page(request: Request) -> HTMLResponse:
 @app.on_event("startup")
 async def _startup() -> None:
     settings.ensure_data_dirs()
+    # Adopt the legacy YAML allowlist into the account store so existing
+    # teammates (and their admin role) survive the switch to the approval
+    # queue. Idempotent — later admin decisions are never clobbered.
+    try:
+        migrated = accounts.import_users_yaml(settings.users_file)
+        if migrated.get("imported"):
+            log.info("accounts: imported %d user(s) from %s",
+                     migrated["imported"], settings.users_file)
+    except Exception:  # noqa: BLE001 — never block boot on a migration hiccup
+        log.exception("accounts: users.yaml import failed")
+    if not accounts.auto_approve_domains():
+        log.warning(
+            "accounts: CHUDWARE_WEB_AUTO_APPROVE_DOMAINS is unset — every new "
+            "identity lands in the pending queue and must be approved in /admin"
+        )
     await manager.adopt_running()
     await manager.start_reaper()
     log.info(
@@ -820,6 +841,9 @@ app.include_router(terminal_router)
 app.include_router(deploy_router)
 app.include_router(releases_router)
 app.include_router(bucket_router)
+app.include_router(accounts_router)
+app.include_router(billing_router)
+
 
 class _AdminGatedStatic(StaticFiles):
     """admin.* portal assets are the privileged UI — never serve them to

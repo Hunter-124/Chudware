@@ -17,13 +17,18 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 try:
+    from . import accounts
     from .config import Settings, settings
 except ImportError:
+    import accounts
     from config import Settings, settings
 
 log = logging.getLogger("chudware-web.auth")
 
-PUBLIC_PATHS = frozenset({"/healthz"})
+# /healthz is liveness. /api/billing/webhook is Stripe calling in — it cannot
+# present a Cloudflare Access JWT, so it is authenticated by HMAC signature
+# inside billing.py instead. Nothing else belongs here.
+PUBLIC_PATHS = frozenset({"/healthz", "/api/billing/webhook"})
 
 
 def _is_public_path(path: str) -> bool:
@@ -401,6 +406,42 @@ class AuthMiddleware:
             except Exception:
                 scope["state"] = {"user": user, "user_email": user.email}
 
+    def _resolve_user(self, email: str) -> User:
+        """Map a verified email to an authorized User, or raise 403.
+
+        Authorization lives in the account store (``accounts.py``): an unknown
+        identity is REGISTERED as ``pending`` rather than rejected outright, so
+        a stranger who signs in through Cloudflare Access lands in the approval
+        queue instead of a dead end. Only ``status == "active"`` yields a
+        session. The legacy ``users.yaml`` allowlist is still the source of the
+        project/doc assignment, and is imported into the store at startup so
+        existing teammates keep their role.
+        """
+        email = email.strip().lower()
+        listed = self.directory.get(email)
+        account = accounts.ensure_account(email, display=email.split("@")[0])
+        if not accounts.is_authorized(account) and listed is not None:
+            # Adoption path: this identity predates the account store and is
+            # still on the YAML allowlist, so it is already an approved human.
+            # Activate it in place (carrying its role) rather than stranding a
+            # current teammate in the queue. Startup does the same migration in
+            # bulk; this covers a users.yaml edited while the gateway is up.
+            account = accounts.adopt_listed(
+                email, role=listed.role, heavy=listed.heavy, display=listed.display
+            )
+        if not accounts.is_authorized(account):
+            raise AuthError("account not approved", status=403, email=email)
+        return User(
+            email=account.email,
+            display=account.display or (listed.display if listed else email.split("@")[0]),
+            # Role and heavy come from the store, never from a self-asserted
+            # claim — a self-registered account can never be admin.
+            role=accounts.effective_role(account),
+            heavy=account.heavy,
+            project=listed.project if listed else "",
+            doc=listed.doc if listed else "",
+        )
+
     def _authenticate(
         self,
         headers: dict[str, str],
@@ -429,9 +470,7 @@ class AuthMiddleware:
                     email=None,
                 )
             email = email.strip().lower()
-            user = self.directory.get(email) or _domain_auto_user(email, self.directory)
-            if user is None:
-                raise AuthError("not on the list", status=403, email=email)
+            user = self._resolve_user(email)
             return user, (email if from_query else None)
 
         # Multi-tenant Microsoft Entra front door (sso.chudware.com): oauth2-proxy
@@ -451,9 +490,7 @@ class AuthMiddleware:
                     email = sso_email.strip().lower()
                     if not email or "@" not in email:
                         raise AuthError("sso token missing email", status=401)
-                    user = self.directory.get(email) or _domain_auto_user(email, self.directory)
-                    if user is None:
-                        raise AuthError("not on the list", status=403, email=email)
+                    user = self._resolve_user(email)
                     return user, None
 
         token = headers.get("cf-access-jwt-assertion")
@@ -488,9 +525,7 @@ class AuthMiddleware:
         if not email or "@" not in email:
             raise AuthError("token missing email claim", status=401)
 
-        user = self.directory.get(email) or _domain_auto_user(email, self.directory)
-        if user is None:
-            raise AuthError("not on the list", status=403, email=email)
+        user = self._resolve_user(email)
         return user, None
 
     def _deny_http(self, path: str, headers: dict[str, str], exc: AuthError):

@@ -173,14 +173,25 @@ def _normalize_email(email: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Legacy parity: auth.py hard-coded AUTO_APPROVE_DOMAINS = ("ua.edu",) before
+# this store existed, and the Cloudflare Access policy gates the same domains
+# at the edge. Defaulting to it keeps the existing user base working across the
+# change; set the env var to an EMPTY string to close it and route every new
+# identity through the approval queue instead.
+_LEGACY_AUTO_APPROVE = "ua.edu"
+
+
 def auto_approve_domains() -> tuple[str, ...]:
     """Domains whose identities self-activate as standard users.
 
     Read from the environment (CHUDWARE_WEB_AUTO_APPROVE_DOMAINS, comma-
-    separated, default empty) rather than config.py so this module ships
-    without touching the settings dataclass — wire it into Settings later.
+    separated) rather than config.py so this module ships without touching the
+    settings dataclass — wire it into Settings later. An explicitly empty value
+    disables auto-approval; an UNSET value keeps the legacy behaviour.
     """
-    raw = os.environ.get("CHUDWARE_WEB_AUTO_APPROVE_DOMAINS", "") or ""
+    raw = os.environ.get("CHUDWARE_WEB_AUTO_APPROVE_DOMAINS")
+    if raw is None:
+        raw = _LEGACY_AUTO_APPROVE
     return tuple(d.strip().lower() for d in raw.split(",") if d.strip())
 
 
@@ -257,6 +268,46 @@ def get_account_by_stripe_customer(customer_id: str) -> Account | None:
 # ---------------------------------------------------------------------------
 # Mutations (admin / billing)
 # ---------------------------------------------------------------------------
+
+
+def adopt_listed(
+    email: str,
+    *,
+    role: str = "user",
+    heavy: bool = False,
+    display: str = "",
+) -> Account | None:
+    """Activate a legacy ``users.yaml`` identity that predates this store.
+
+    Used by the auth middleware when an allowlisted teammate shows up before
+    (or after) the bulk startup migration ran — they are already an approved
+    human, so stranding them in the pending queue would be a regression.
+
+    Deliberately narrow: it only ever moves a ``pending`` row to ``active``. A
+    ``denied`` or ``suspended`` account is NOT resurrected, so an admin
+    decision always outranks the YAML file.
+    """
+    email = _normalize_email(email)
+    role = role if role in ROLES else "user"
+    with _DB_LOCK:
+        conn = _db()
+        cur = conn.execute(
+            """
+            UPDATE accounts
+               SET status = 'active', role = ?, heavy = ?,
+                   display = COALESCE(NULLIF(?, ''), display),
+                   decided_at = ?, decided_by = 'users.yaml'
+             WHERE email = ? AND status = 'pending'
+            """,
+            (role, 1 if heavy else 0, display.strip(), time.time(), email),
+        )
+        conn.commit()
+        if cur.rowcount:
+            log.info("accounts: adopted %s from users.yaml as %s", email, role)
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE email = ?", (email,)
+        ).fetchone()
+    return _row_to_account(row) if row else None
 
 
 def set_status(

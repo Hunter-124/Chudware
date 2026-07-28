@@ -2200,6 +2200,10 @@ void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
 //                                                 kind?, msg_idx?, call?:{turn,i}}]}
 //   plm_rollback {doc_id?, to: id|"turn:N"|"-N"|"msg:<idx>"|"call:<turn>:<i>"} ->
 //     {ok, ..., chat_truncate_to?}
+//   plm_rollback_check {doc_id?, to, file_path?, chat_size?} -> non-destructive
+//     preflight for the confirm dialog: {ok, discarded_checkpoints, discarded_turns,
+//     discarded_messages, geometry_rollback, chat_truncate_to,
+//     file:{path, provenance_known, externally_modified, recorded_mtime, current_mtime}}
 // Degrade: when the worker reports unknown_method the affordances hide permanently this session.
 // When v2 fields (kind/msg_idx/call) are absent, UI stays at turn-level Before/After only.
 
@@ -2252,6 +2256,16 @@ static bool aiVcIsAbsent(const core::RpcResult& r) {
             return true;
     }
     return false;
+}
+
+// True when a msg:<idx> rollback failed only because no checkpoint exists for that
+// message (backend raises "no checkpoint for msg N" -> reason "not_found"), or because
+// no document is open at all ("invalid_item") — in both cases a CHAT-only rewind is
+// still meaningful and must proceed locally. Never true for method-absent envelopes.
+static bool aiVcIsNoCheckpoint(const core::RpcResult& r) {
+    if (!r.ok || !r.result.is_object()) return false;
+    const std::string reason = r.result.value("reason", std::string());
+    return reason == "not_found" || reason == "invalid_item";
 }
 
 static bool aiVcOk(const core::RpcResult& r, std::string& hint) {
@@ -2317,12 +2331,31 @@ static void aiVcApplyChatTruncate(AppState& st, const nlohmann::json& res) {
     if (truncateTo < 0) return;
     if (truncateTo > (int)st.chat.size()) truncateTo = (int)st.chat.size();
     if (truncateTo < (int)st.chat.size()) {
+        // ARCHIVE, never destroy. The discarded tail moves into a branch on this session
+        // so a revert aimed at the wrong message can be undone — reverting must not be the
+        // operation that loses work. Textures are GPU handles owned by the live view, so
+        // they are released here; the branch keeps the message data only.
+        if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) {
+            ChatBranch br;
+            br.id = "b" + std::to_string(
+                st.conversations[st.activeConv].branches.size() + 1);
+            br.when = (double)std::time(nullptr);
+            br.fromMsgIdx = truncateTo;
+            br.label = "reverted to message " + std::to_string(truncateTo) + " — " +
+                       std::to_string((int)st.chat.size() - truncateTo) + " message(s) parked";
+            br.msgs.assign(st.chat.begin() + truncateTo, st.chat.end());
+            for (auto& m : br.msgs) {
+                m.uiCachedH = -1.0f;   // heights are view state, not content
+            }
+            st.conversations[st.activeConv].branches.push_back(std::move(br));
+        }
         // Free textures on the tail before erase (GL-safe via freeChatTextures).
         std::vector<ChatMsg> tail(st.chat.begin() + truncateTo, st.chat.end());
         freeChatTextures(tail);
         st.chat.erase(st.chat.begin() + truncateTo, st.chat.end());
         // Invalidate height caches for remaining messages (layout may shift).
         for (auto& m : st.chat) m.uiCachedH = -1.0f;
+        markChatHistoryDirty();  // the branch must reach disk, not just RAM
     }
 }
 
@@ -2346,6 +2379,19 @@ void aiVcRollback(AppState& st, const std::string& to, const std::string& okToas
         s_aiVc.busy = false;
         std::string hint;
         if (!aiVcOk(r, hint)) {
+            // Chat-only rewind: the backend has no geometry checkpoint for this message
+            // (or no document is open), so plm_rollback refuses — but the user asked to
+            // rewind the CHAT to this point, which is meaningful on its own. Truncate
+            // locally and say plainly that no geometry was rolled back.
+            if (s_aiVc.available && msgTruncateTo >= 0 && aiVcIsNoCheckpoint(r)) {
+                nlohmann::json synth = {{"chat_truncate_to", msgTruncateTo}};
+                aiVcApplyChatTruncate(st, synth);
+                st.toast(ui::ToastLevel::Info,
+                         "No geometry checkpoint at that point — rewound the chat only; "
+                         "the part was left unchanged.");
+                s_aiVc.lastFetch = 0.0;
+                return;
+            }
             if (s_aiVc.available) st.toast(ui::ToastLevel::Error, hint);
             return;
         }
@@ -2365,6 +2411,232 @@ void aiVcRollback(AppState& st, const std::string& to, const std::string& okToas
                  okToast.empty() ? std::string("Restored checkpoint") : okToast);
         s_aiVc.lastFetch = 0.0;  // force timeline refresh next open
     });
+}
+
+// ---- pre-rollback confirmation (the warning ladder, ONE dialog) ------------
+
+static std::string aiVcActiveDocFilePath(AppState& st) {
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+        return st.docTabs[st.activeTab].path;
+    return {};
+}
+
+static std::string aiVcFmtMtime(double epoch) {
+    if (epoch <= 0.0) return {};
+    std::time_t t = (std::time_t)epoch;
+    std::tm tmv;
+    if (!localtime_r(&t, &tmv)) return {};
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d",
+                  tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                  tmv.tm_hour, tmv.tm_min);
+    return buf;
+}
+
+void aiVcRequestRollback(AppState& st, const std::string& to, const std::string& okToast) {
+    if (!s_aiVc.available || s_aiVc.busy || s_aiVc.confirm.busy || to.empty()) return;
+    s_aiVc.confirm = AiVcUi::Confirm{};
+    s_aiVc.confirm.busy = true;
+    s_aiVc.confirm.to = to;
+    s_aiVc.confirm.toast = okToast;
+    nlohmann::json p = nlohmann::json::object();
+    const std::string docId = aiVcActiveDocId(st);
+    if (!docId.empty()) p["doc_id"] = docId;
+    p["to"] = to;
+    const std::string fp = aiVcActiveDocFilePath(st);
+    if (!fp.empty()) p["file_path"] = fp;
+    p["chat_size"] = (int)st.chat.size();
+    st.rpc.call("plm_rollback_check", p, [&st, to](const core::RpcResult& r) {
+        auto& c = s_aiVc.confirm;
+        c.busy = false;
+        if (c.to != to) return;   // user armed a different target meanwhile
+        // Chat-only rewind: no geometry checkpoint at that point. Still confirm,
+        // with wording that never claims geometry was restored.
+        if (aiVcIsNoCheckpoint(r) && to.rfind("msg:", 0) == 0) {
+            c.ok = true;
+            c.notFound = true;
+            // Chat-only rewind discards the tail after the target message.
+            try { c.discardedMessages =
+                    std::max(0, (int)st.chat.size() - std::stoi(to.substr(4))); }
+            catch (...) { c.discardedMessages = -1; }
+            c.geometryRollback = false;
+            c.open = true;
+            return;
+        }
+        std::string hint;
+        if (!aiVcOk(r, hint)) {
+            if (!s_aiVc.available) return;  // RPC absent — chrome hidden this session
+            c.ok = false;
+            c.err = hint;
+            c.open = true;
+            return;
+        }
+        const nlohmann::json& j = r.result;
+        c.ok = true;
+        c.cpLabel = j.value("checkpoint_label", std::string());
+        c.cpWhen = j.value("checkpoint_when", std::string());
+        if (j.contains("discarded_checkpoints") && j["discarded_checkpoints"].is_number())
+            c.discardedCheckpoints = j["discarded_checkpoints"].get<int>();
+        if (j.contains("discarded_turns") && j["discarded_turns"].is_number())
+            c.discardedTurns = j["discarded_turns"].get<int>();
+        if (j.contains("discarded_messages") && j["discarded_messages"].is_number())
+            c.discardedMessages = j["discarded_messages"].get<int>();
+        c.geometryRollback = j.value("geometry_rollback", false);
+        if (j.contains("file") && j["file"].is_object()) {
+            const auto& f = j["file"];
+            c.filePath = f.value("path", std::string());
+            c.provenanceKnown = f.value("provenance_known", false);
+            if (f.contains("externally_modified") && f["externally_modified"].is_boolean())
+                c.externallyModified = f["externally_modified"].get<bool>() ? 1 : 0;
+            if (f.contains("recorded_mtime") && f["recorded_mtime"].is_number())
+                c.recordedMtime = f["recorded_mtime"].get<double>();
+            if (f.contains("current_mtime") && f["current_mtime"].is_number())
+                c.currentMtime = f["current_mtime"].get<double>();
+        }
+        c.open = true;
+    });
+}
+
+void drawAiVcRollbackConfirm(AppState& st) {
+    auto& c = s_aiVc.confirm;
+    if (c.open) {
+        ImGui::OpenPopup("Restore to an earlier point?###ai_vc_confirm");
+        c.open = false;
+    }
+    if (c.busy) {
+        // Lightweight in-flight note; the dialog itself appears when data lands.
+        return;
+    }
+    ImGui::SetNextWindowSizeConstraints(ImVec2(ui::metrics::px(360.0f), 0.0f),
+                                        ImVec2(ui::metrics::px(520.0f), FLT_MAX));
+    if (!ImGui::BeginPopupModal("Restore to an earlier point?###ai_vc_confirm",
+                                nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    const ui::AdaptiveSurface& surf = chatSurf();
+
+    if (!c.ok) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("That could not be checked: %s",
+                           c.err.empty() ? "the service did not respond" : c.err.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Close", ImVec2(ui::metrics::px(120.0f), 0))) {
+            c = AiVcUi::Confirm{};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+        return;
+    }
+
+    // ---- target line -------------------------------------------------------
+    if (!c.notFound && (!c.cpLabel.empty() || !c.cpWhen.empty())) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        std::string tgt = c.cpLabel;
+        if (!c.cpWhen.empty()) {
+            if (!tgt.empty()) tgt += "  \xc2\xb7  ";
+            tgt += c.cpWhen;
+        }
+        ImGui::TextWrapped("Restore to: %s", tgt.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+
+    // ---- rung 1 (always): what is discarded --------------------------------
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        std::string line;
+        if (c.discardedMessages > 0)
+            line += std::to_string(c.discardedMessages) + " chat message" +
+                    (c.discardedMessages == 1 ? "" : "s");
+        if (c.discardedTurns > 0) {
+            if (!line.empty()) line += " and ";
+            line += std::to_string(c.discardedTurns) + " turn" +
+                    (c.discardedTurns == 1 ? "" : "s");
+        }
+        if (line.empty()) line = "Nothing after this point";
+        // Not "permanently discard": the tail is parked on this session as a revert
+        // branch and persists across restarts, so the wording must not overstate the loss.
+        ImGui::TextWrapped("This will rewind past %s. They are kept on this session as a "
+                           "revert branch, not deleted.", line.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // ---- chat-only case (no geometry checkpoint at that point) -------------
+    if (c.notFound) {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("No geometry checkpoint exists at that point \xe2\x80\x94 only the "
+                           "chat will be rewound; the part stays unchanged.");
+        ImGui::PopStyleColor();
+    }
+
+    // ---- rung 2: geometry rolls back ---------------------------------------
+    if (c.geometryRollback) {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::TextWrapped("The part's geometry will be rolled back to that point; every "
+                           "geometry change made since will be lost.");
+        ImGui::PopStyleColor();
+    }
+
+    // ---- rung 3: backing file modified OUTSIDE this session (headline) ------
+    if (c.externallyModified == 1 && !c.filePath.empty()) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.errSystem[0], ui::palette.errSystem[1], ui::palette.errSystem[2], 1.0f));
+        std::string when = aiVcFmtMtime(c.currentMtime);
+        std::string msg = "Warning: " + c.filePath +
+                          " was modified outside this session";
+        if (!when.empty()) msg += " (last change " + when + ")";
+        msg += ". Restoring will overwrite those external changes.";
+        ImGui::TextWrapped("%s", msg.c_str());
+        ImGui::PopStyleColor();
+    } else if (!c.provenanceKnown && !c.filePath.empty()) {
+        // Older checkpoint: no recorded hash — never claim the file is unmodified.
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("This checkpoint predates file tracking: the provenance of %s "
+                           "is unknown \xe2\x80\x94 it may have been modified outside this "
+                           "session.", c.filePath.c_str());
+        ImGui::PopStyleColor();
+    } else if (c.externallyModified == -1 && c.provenanceKnown) {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s could not be re-checked (missing or unreadable) \xe2\x80\x94 "
+                           "it may have changed outside this session.",
+                           c.filePath.empty() ? "The file" : c.filePath.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // ---- buttons ------------------------------------------------------------
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    const char* confirmLabel = c.notFound ? "Rewind chat only" : "Restore";
+    const float bw = ui::metrics::px(140.0f);
+    if (s_aiVc.busy) ImGui::BeginDisabled();
+    if (c.externallyModified == 1) {
+        // Destructive + external changes: the confirm button wears the danger color.
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(ui::palette.errSystem[0], ui::palette.errSystem[1], ui::palette.errSystem[2], 0.85f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImVec4(ui::palette.errSystem[0], ui::palette.errSystem[1], ui::palette.errSystem[2], 1.0f));
+    }
+    if (ImGui::Button(confirmLabel, ImVec2(bw, 0))) {
+        const std::string to = c.to, toast = c.toast;
+        c = AiVcUi::Confirm{};
+        ImGui::CloseCurrentPopup();
+        aiVcRollback(st, to, toast);
+    }
+    if (c.externallyModified == 1) ImGui::PopStyleColor(2);
+    if (s_aiVc.busy) ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(bw, 0))) {
+        c = AiVcUi::Confirm{};
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 static void aiVcFetchTimeline(AppState& st, bool force = false) {
@@ -2550,7 +2822,7 @@ static void drawAiVcTimelinePopover(AppState& st) {
                        rowMin.y + (rowH - ImGui::GetFrameHeight()) * 0.5f));
             if (s_aiVc.busy) ImGui::BeginDisabled();
             if (ImGui::SmallButton("Restore")) {
-                aiVcRollback(st, cp.id, std::string("Restored: ") + title);
+                aiVcRequestRollback(st, cp.id, std::string("Restored: ") + title);
                 ImGui::CloseCurrentPopup();
             }
             if (s_aiVc.busy) ImGui::EndDisabled();
@@ -2758,12 +3030,97 @@ void commitEditStageOnSend(AppState& st) {
         aiVcRollback(st, "msg:" + std::to_string(msgIdx), "Rewound to edit");
 }
 
+// 0 = no checkpoint resolves msg:<idx> (backend would refuse -> chat-only rewind),
+// 1 = a checkpoint exists at exactly this message (geometry rolls back too),
+// 2 = timeline not loaded yet — kick a throttled fetch and use neutral wording.
+// Mirrors AiVcStore::resolve_target: msg targets match on EXACT msg_idx, and without
+// msg granularity (v1 timelines carry no msg_idx) a msg target never resolves.
+int aiVcMsgCheckpointState(AppState& st, int msgIdx) {
+    if (s_aiVc.checkpoints.empty()) {
+        const double now = ImGui::GetTime();
+        if (!s_aiVc.loading && (now - s_aiVc.lastFetch) > 3.0)
+            aiVcFetchTimeline(st);   // sets loading + lastFetch; result lands async
+        return (s_aiVc.lastFetch <= 0.0 || s_aiVc.loading) ? 2 : 0;
+    }
+    if (!s_aiVc.hasMsgGranularity) return 0;
+    for (const auto& cp : s_aiVc.checkpoints)
+        if (cp.msgIdx == msgIdx) return 1;
+    return 0;
+}
+
+const char* aiVcRewindTip(int cpState) {
+    switch (cpState) {
+        case 1:  return "Rewind to before this message — rolls the part back to the "
+                        "checkpoint here and truncates the chat.";
+        case 2:  return "Rewind the chat to this point.";
+        default: return "Rewind the chat to this point — no geometry checkpoint exists "
+                        "here, so the part stays unchanged.";
+    }
+}
+
+std::string aiVcRewindToast(int cpState) {
+    switch (cpState) {
+        case 1:  return "Rewound to before this message";
+        case 2:  return "Rewound the chat";
+        default: return "Chat rewound — no geometry checkpoint at this point, "
+                        "so the part was left unchanged";
+    }
+}
+
+// Chat-only rewind affordance for finished turns that did NOT mutate geometry (no
+// turn-level Before/After target exists). Same rewind glyph + click-again inline confirm
+// as the user-message meta bar; always visible (there is no label row to hover-latch on).
+static void drawAiVcChatRewind(AppState& st, int msgIdx) {
+    const double now = ImGui::GetTime();
+    if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
+        s_aiVc.confirmMsgIdx = -1;
+        s_aiVc.confirmKind = 0;
+        s_aiVc.confirmCallI = -1;
+    }
+    const bool pending = (s_aiVc.confirmMsgIdx == msgIdx && s_aiVc.confirmKind == 3);
+    const int cpState = aiVcMsgCheckpointState(st, msgIdx);
+    const float btnSz = ImGui::GetFrameHeight() * 0.78f;
+    if (pending) {
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 0.55f));
+    }
+    const bool clicked = ImGui::InvisibleButton("##chat_rw", ImVec2(btnSz, btnSz));
+    const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ui::AdaptiveSurface& surf = chatSurf();
+    if (pending || ImGui::IsItemHovered())
+        dl->AddRectFilled(bmn, bmx,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                  surf.textPrimary.z, pending ? 0.18f : 0.10f)),
+            ui::metrics::rounding(4.0f));
+    const float rp = btnSz * 0.18f;   // inset to match the user-bubble rewind glyph
+    drawDoubleRewindGlyph(dl, ImVec2(bmn.x + rp, bmn.y + rp), ImVec2(bmx.x - rp, bmx.y - rp),
+        ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
+    if (pending) ImGui::PopStyleColor();
+    if (clicked) {
+        if (!pending) {
+            s_aiVc.confirmMsgIdx = msgIdx;
+            s_aiVc.confirmKind = 3;
+            s_aiVc.confirmUntil = now + 4.0;
+        } else {
+            aiVcRequestRollback(st, "msg:" + std::to_string(msgIdx), aiVcRewindToast(cpState));
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", pending ? "Click again to confirm rewind."
+                                        : aiVcRewindTip(cpState));
+}
+
 // Hover actions on a mutating assistant turn: restore before / after this step.
+// Non-mutating finished turns (turnNum <= 0) instead get the always-visible chat-only
+// rewind above — revert is offered at ANY point in the chat, and the wording never
+// implies geometry was restored when no checkpoint exists for that point.
 // Glyph language (◁◁) for Before; text "After" kept. Inline confirm = click again.
 // When call granularity is present, Before uses call:<turn>:<i> for the first tool of the turn
 // if known; otherwise degrades to turn-level "turn:N-1" / "turn:N".
 void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
-    if (!s_aiVc.available || turnNum <= 0 || s_aiVc.busy) return;
+    if (!s_aiVc.available || s_aiVc.busy) return;
+    if (turnNum <= 0) { drawAiVcChatRewind(st, msgIdx); return; }
     const float sc = ui::uiScale;
     const double now = ImGui::GetTime();
     if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
@@ -2824,9 +3181,9 @@ void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
                 } else {
                     to = "turn:" + std::to_string(turnNum);
                 }
-                aiVcRollback(st, to,
-                             kind == 1 ? "Restored to before this step"
-                                       : "Restored to after this step");
+                aiVcRequestRollback(st, to,
+                                    kind == 1 ? "Restored to before this step"
+                                              : "Restored to after this step");
             }
         }
         if (ImGui::IsItemHovered()) {
@@ -2852,8 +3209,8 @@ void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
                 s_aiVc.confirmKind = kind;
                 s_aiVc.confirmUntil = now + 4.0;
             } else {
-                aiVcRollback(st, "turn:" + std::to_string(turnNum),
-                             "Restored to after this step");
+                aiVcRequestRollback(st, "turn:" + std::to_string(turnNum),
+                                    "Restored to after this step");
             }
         }
         ImGui::PopStyleVar();

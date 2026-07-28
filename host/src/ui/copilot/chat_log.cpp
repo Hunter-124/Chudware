@@ -138,6 +138,10 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     }
     const bool pending = (s_aiVc.confirmMsgIdx == msgIdx && s_aiVc.confirmKind == 3);
     const bool showBtns = s_aiVc.available && msgIdx >= 0 && !s_aiVc.busy;
+    // Checkpoint coverage decides whether this rewind rolls geometry back too — the
+    // tooltip (before) and the toast (after) must never imply a geometry restore when
+    // no checkpoint exists for this message.
+    const int cpState = showBtns ? aiVcMsgCheckpointState(st, msgIdx) : 2;
     const float btnSz = ImGui::GetFrameHeight() * 0.78f;
     const float gap = 4.0f * sc;
     const float lineH = ImGui::GetTextLineHeight();
@@ -183,13 +187,13 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                     s_aiVc.confirmKind = 3;
                     s_aiVc.confirmUntil = now + 4.0;
                 } else {
-                    aiVcRollback(st, "msg:" + std::to_string(msgIdx),
-                                 "Rewound to before this message");
+                    aiVcRequestRollback(st, "msg:" + std::to_string(msgIdx),
+                                        aiVcRewindToast(cpState));
                 }
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(pending ? "Click again to confirm rewind."
-                                          : "Rewind — restore the part to before this message.");
+                ImGui::SetTooltip("%s", pending ? "Click again to confirm rewind."
+                                                : aiVcRewindTip(cpState));
         }
 
         // Pencil edit — atlas icon (msg_edit) with filled-glyph fallback.
@@ -396,8 +400,13 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // live picker for an in-flight turn that somehow has no stamp. No model →
     // omit label (never bare "Assistant").
     const bool proseCard = !m.text.empty() && m.errKind == ERR_NONE;
-    const bool vcRestore = msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m);
-    const bool metaInCard = !vcRestore &&
+    // Geometry-mutating turns keep the checkpoint-backed Before/After restore; EVERY
+    // other finished turn still offers a chat-only rewind (msg:<idx>) so a revert is
+    // reachable at any point in the chat. turnNum > 0 already implies chatMsgMutatedDoc
+    // (turn numbers are only assigned to mutating turns in drawChatLogWindowed).
+    const bool vcMutated = msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m);
+    const bool vcRestore = msgIdx >= 0 && !m.running && s_aiVc.available && !s_aiVc.busy;
+    const bool metaInCard = !vcMutated &&
         (proseCard || m.errKind != ERR_NONE || m.resultPartial);
     bool metaDrawn = false;
     const char* mid = nullptr;
@@ -425,7 +434,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 }
             }
         }
-        // Subtle restore affordance on mutating turns (hover / inline confirm — no modal).
+        // Restore affordance: hover Before/After on mutating turns, an always-visible
+        // chat-only rewind glyph on every other finished turn.
         if (vcRestore) {
             if (haveModel && !metaInCard) ImGui::SameLine(0, 8 * sc);
             drawAiVcTurnRestore(st, msgIdx, turnNum);
@@ -799,6 +809,7 @@ static void drawEmptyChatHero(const ui::Fonts& fonts, float logW) {
 
 void drawChatLogWindowed(AppState& st) {
     ui::Fonts& fonts = st.fonts;
+    drawAiVcRollbackConfirm(st);   // pre-rollback confirmation modal (warning ladder)
     const float logW    = ImGui::GetContentRegionAvail().x;
     if (st.chat.empty()) { drawEmptyChatHero(fonts, logW); return; }
     const float viewTop = ImGui::GetScrollY();

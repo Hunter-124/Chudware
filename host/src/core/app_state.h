@@ -707,6 +707,19 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
 // conversation by id, never by scanning whichever conversation happens to be on screen.
 std::vector<ChatMsg>* conversationMsgs(AppState& st, const std::string& convId);
 
+// A conversation tail that a REVERT moved out of the way. Reverting is destructive by
+// nature — it rewinds the chat to an earlier point — so the discarded messages are not
+// deleted, they are parked here and persisted with the session. A mis-aimed revert is
+// therefore always recoverable, which is the whole point of being able to revert "to any
+// point": the operation must not itself be the thing that loses work.
+struct ChatBranch {
+    std::string id;                 // stable id ("b1", "b2", …) for the session file
+    std::string label;              // human line, e.g. "reverted to message 12"
+    double when = 0.0;              // epoch seconds the revert happened
+    int fromMsgIdx = -1;            // index the chat was rewound to
+    std::vector<ChatMsg> msgs;      // the discarded tail, in original order
+};
+
 // One copilot conversation = its own tab. RESIDENT: every conversation loaded this process stays
 // in AppState::conversations for the app's lifetime — sessions are FIRST-CLASS, independent of
 // documents; each optionally carries a docLink reference to the document it relates to.
@@ -732,6 +745,9 @@ struct Conversation {
     // Archived sessions are hidden from the default Sessions list (Show archived toggle
     // reveals them) but keep their transcript/history — a soft "trash" before real deletion.
     bool archived = false;
+    // Tails moved aside by reverts, newest last. Persisted with the session so a revert
+    // stays undoable across restarts; never written to by anything except the revert path.
+    std::vector<ChatBranch> branches;
 };
 
 // Rail/tab color-code for a Conversation::scopeClass (RGBA 0..1). Unassessed (-1) returns a

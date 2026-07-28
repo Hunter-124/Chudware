@@ -280,3 +280,35 @@ def test_strategy_config_defaults() -> None:
     assert agent_config.handoff_save_to_disk(
         {"agent": {"handoff_save_to_disk": True}}
     ) is True
+
+
+# ---------------------------------------------------------------------------
+# revert-safety: compaction must never mutate persisted history
+# ---------------------------------------------------------------------------
+
+def test_rpc_wrappers_never_mutate_caller_messages() -> None:
+    """Revert depends on the chat transcript surviving compaction untouched.
+    compact_session / shake_session deep-copy before handing messages to the
+    engines (shake elides in place), so the caller's list AND nested dicts must
+    be byte-identical afterwards, and the rebuilt transcript must be new objects."""
+    import copy as _copy
+
+    from services.agent import session_cmds as sc
+
+    fat = "Z" * 6000
+    msgs = [
+        _user("build a bracket " + fat),
+        _assistant_call("c1", "add_features", {"ops": [{"op": "box"}]},
+                        intent="make box"),
+        _tool("c1", "W" * 5000, name="add_features"),
+        _assistant_text("done " + fat),
+    ] * 4
+    before = _copy.deepcopy(msgs)
+
+    out = sc.compact_session(msgs, "snapcompact", keep_recent_tokens=200)
+    assert msgs == before  # caller's history untouched
+    assert out["kept_messages"] is not msgs
+
+    out2 = sc.shake_session(msgs, mode="elide", aggressive=True)
+    assert msgs == before  # in-place elision hit the copy, never the caller
+    assert out2["messages"] is not msgs

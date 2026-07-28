@@ -432,7 +432,10 @@ void persistChatHistory(AppState& st) {
         if (conversationIsFresh(st, i) && !sessionHasDraft(st.conversations[i].id)) continue;
         if (!writtenIds.insert(st.conversations[i].id).second) continue;
         if (i == st.activeConv) activeId = st.conversations[i].id;
-        const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
+        // One serializer, used for the live transcript AND for any revert branches parked
+        // on this session — a branch is real conversation history and must round-trip
+        // through exactly the same shape, not a lossy summary of it.
+        auto serializeMsgs = [&](const std::vector<ChatMsg>& msgs) {
         nlohmann::json jm = nlohmann::json::array();
         for (const auto& m : msgs) {
             std::string body = m.text;
@@ -454,8 +457,15 @@ void persistChatHistory(AppState& st) {
             // Also ALWAYS keep a still-running turn even when it has nothing yet: dropping it
             // left a user prompt with no reply bubble after a mid-run crash, and the restore
             // path below needs the row to stamp the "interrupted" marker on.
-            if (body.empty() && !m.planState.present && !m.running) continue;
+            // NEVER skip a message here: AI-VC checkpoints anchor on the chat message ORDINAL
+            // (msg_idx), so dropping any row shifts every later checkpoint's anchor one
+            // position up after a reload — a revert would silently rewind to the wrong
+            // message. Persist an explicit placeholder instead (marked "empty" so the load
+            // path can render a subdued note), keeping save/load a position-preserving
+            // bijection across restarts.
+            const bool emptyTurn = body.empty() && !m.planState.present && !m.running;
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
+            if (emptyTurn) entry["empty"] = true;
             // In-flight marker: this turn was still streaming when the snapshot was taken. On
             // reload it means the app died (or was killed) mid-run — see parseChatSessionJson.
             if (!m.fromUser && m.running) entry["run"] = true;
@@ -540,9 +550,22 @@ void persistChatHistory(AppState& st) {
             }
             jm.push_back(std::move(entry));
         }
+        return jm;
+        };
+        const std::vector<ChatMsg>& liveMsgs =
+            (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
         nlohmann::json convObj = {{"id", st.conversations[i].id},
                                  {"title", st.conversations[i].title},
-                                 {"msgs", jm}};
+                                 {"msgs", serializeMsgs(liveMsgs)}};
+        // Revert branches: tails a rollback moved aside. Persisted so a revert stays
+        // undoable after a restart.
+        if (!st.conversations[i].branches.empty()) {
+            nlohmann::json jb = nlohmann::json::array();
+            for (const auto& b : st.conversations[i].branches)
+                jb.push_back({{"id", b.id}, {"label", b.label}, {"when", b.when},
+                              {"from", b.fromMsgIdx}, {"msgs", serializeMsgs(b.msgs)}});
+            convObj["branches"] = std::move(jb);
+        }
         // Optional document LINK (reference only — never an ownership key).
         if (!st.conversations[i].docLink.empty())
             convObj["doc"] = st.conversations[i].docLink;
@@ -721,7 +744,11 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         // This session's own saved execution trace, straight into its conversation-keyed store
         // (no active/parked special case — switching sessions just reads the other tree).
         if (jc.contains("agent_dag")) ui::agentDagFromJson(c.id, jc["agent_dag"]);
-        for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
+        // One parser, used for the live transcript AND for revert branches — a branch is
+        // real history and must come back in exactly the same shape it went out in.
+        auto parseMsgs = [&](const nlohmann::json& arr) {
+        std::vector<ChatMsg> out;
+        for (const auto& m : arr) {
             ChatMsg cm;
             cm.fromUser = m.value("u", false);
             cm.text = m.value("t", std::string());
@@ -789,7 +816,29 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
                     cm.text += std::string("\n\n") + note;
             }
             cm.running = false;
-            c.msgs.push_back(std::move(cm));
+            // Placeholder for a turn that produced no visible output (persisted as
+            // "empty" so message ORDINALS survive the round trip — AI-VC msg_idx
+            // anchors depend on positions never shifting across a restart).
+            if (cm.text.empty() && m.value("empty", false))
+                cm.text = "(Turn produced no visible output \xe2\x80\x94 kept to preserve chat positions.)";
+            out.push_back(std::move(cm));
+        }
+        return out;
+        };
+        c.msgs = parseMsgs(jc.value("msgs", nlohmann::json::array()));
+        // Revert branches: tails a rollback moved aside, so a revert stays undoable after
+        // a restart. Absent on sessions written before branches existed.
+        if (jc.contains("branches") && jc["branches"].is_array()) {
+            for (const auto& jb : jc["branches"]) {
+                if (!jb.is_object()) continue;
+                ChatBranch b;
+                b.id = jb.value("id", std::string());
+                b.label = jb.value("label", std::string());
+                b.when = jb.value("when", 0.0);
+                b.fromMsgIdx = jb.value("from", -1);
+                b.msgs = parseMsgs(jb.value("msgs", nlohmann::json::array()));
+                if (!b.msgs.empty()) c.branches.push_back(std::move(b));
+            }
         }
         c.lastContextTokens = jc.value("last_context_tokens", 0);
         if (jc.contains("queued_prompts") && jc["queued_prompts"].is_array()) {
@@ -798,7 +847,9 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         }
         // Fresh sessions are never kept (same rule as persist) — drop legacy empty entries
         // left on disk by older builds instead of resurrecting them.
-        if (c.msgs.empty() && c.queuedPrompts.empty()) return false;
+        // A session reverted all the way back still holds its branches — that is user
+        // history, and dropping it here would make the revert unrecoverable.
+        if (c.msgs.empty() && c.queuedPrompts.empty() && c.branches.empty()) return false;
         st.conversations.push_back(std::move(c));
     }
     return true;

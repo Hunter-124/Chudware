@@ -222,6 +222,31 @@ struct AiVcUi {
     int    confirmKind   = 0;   // 1 = before, 2 = after, 3 = user-msg rewind
     int    confirmCallI  = -1;  // tool-call index within turn when confirmKind is call-scoped
     double confirmUntil  = 0.0; // auto-clear after a few seconds
+
+    // Pre-rollback confirmation dialog (the warning ladder). Filled by the
+    // plm_rollback_check preflight RPC, shown in ONE modal before aiVcRollback runs.
+    struct Confirm {
+        bool open = false;          // request the modal next frame
+        bool busy = false;          // preflight RPC in flight
+        std::string to;             // rollback target awaiting confirmation
+        std::string toast;          // success toast after restore
+        // Preflight result (ok==false -> err/notFound describe why).
+        bool ok = false;
+        bool notFound = false;      // no checkpoint at that point (chat-only rewind)
+        std::string err;
+        std::string cpLabel;
+        std::string cpWhen;
+        int discardedCheckpoints = -1;  // -1 = unknown
+        int discardedTurns = -1;
+        int discardedMessages = -1;
+        bool geometryRollback = false;
+        // Backing-file provenance (externallyModified: -1 unknown, 0 no, 1 yes).
+        std::string filePath;
+        bool provenanceKnown = false;
+        int  externallyModified = -1;
+        double recordedMtime = 0.0;
+        double currentMtime = 0.0;
+    } confirm;
 };
 extern AiVcUi s_aiVc;
 
@@ -237,6 +262,19 @@ extern EditStage s_edit;
 
 bool chatMsgMutatedDoc(const ChatMsg& m);
 void aiVcRollback(AppState& st, const std::string& to, const std::string& okToast);
+// Request a rollback: runs the plm_rollback_check preflight, then shows the
+// single confirmation dialog (warning ladder) before anything destructive runs.
+void aiVcRequestRollback(AppState& st, const std::string& to, const std::string& okToast);
+// Draw the confirmation modal; call once per frame inside the chat window.
+void drawAiVcRollbackConfirm(AppState& st);
+// Checkpoint coverage for a msg:<idx> rewind target: 0 = no geometry checkpoint exists
+// for that message (chat-only rewind), 1 = a checkpoint exists (geometry rolls back too),
+// 2 = unknown (timeline not loaded yet — kicks a throttled fetch).
+int aiVcMsgCheckpointState(AppState& st, int msgIdx);
+// Shared wording so the user-message rewind and the assistant chat-only rewind never
+// diverge: the tip is shown BEFORE the click, the toast AFTER the rewind.
+const char* aiVcRewindTip(int cpState);
+std::string aiVcRewindToast(int cpState);
 void drawDoubleRewindGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx,
                            ImU32 col);
 void drawPencilGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, ImU32 col);

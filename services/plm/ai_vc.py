@@ -19,7 +19,12 @@ Contract (AI-VC) v1 + v2 (prompt/tool granularity):
     for tool checkpoints. Storage encoding is ``storage_kind: full|delta``.
   * Rollback: ``to`` accepts checkpoint id | ``turn:N`` | ``-N`` | ``msg:<idx>``
     | ``call:<turn>:<i>``. Response includes ``chat_truncate_to`` (msg_idx).
-  * Rollback surface: ``plm_rollback`` / ``plm_timeline`` (MCP + worker RPC).
+  * Backing-file provenance: when the doc is saved to a file, each checkpoint
+    also records ``file:{path, sha256, mtime, size}`` (additive — older records
+    lack it). ``plm_rollback_check`` previews a rollback non-destructively and
+    re-hashes the file to detect modifications made outside the session.
+  * Rollback surface: ``plm_rollback`` / ``plm_timeline`` / ``plm_rollback_check``
+    (MCP + worker RPC).
 
 Config (``config.json`` key ``plm.ai_vc``)::
 
@@ -177,6 +182,65 @@ def checkpoint_id(doc_id: str, turn_id: Any, op_batch: Any) -> str:
 
 def content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def file_fingerprint(path: str | os.PathLike | None) -> dict[str, Any] | None:
+    """Content hash + mtime + size of a backing file on disk.
+
+    Hash is primary (mtime alone gives false positives from touch/sync and
+    false negatives from same-second writes); mtime/size ride along as
+    secondary signals for display. Returns ``None`` when the path is empty,
+    missing, not a regular file, or unreadable — callers treat that as
+    \"provenance unknown\", never as \"unmodified\".
+    """
+    if not path:
+        return None
+    try:
+        p = Path(path)
+        if not p.is_file():
+            return None
+        st = p.stat()
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return {"path": str(p), "sha256": h.hexdigest(),
+                "mtime": st.st_mtime, "size": st.st_size}
+    except OSError:
+        return None
+
+
+def _doc_backing_path(doc_id: str,
+                      bridge_call: Callable[..., Any] | None = None) -> str | None:
+    """Best-effort: the doc's current backing file (.step+ path) via ``doc_list``.
+
+    The engine session tracks the save path per doc; ``None`` when the doc was
+    never saved or the bridge is unavailable. Never raises.
+    """
+    if not doc_id:
+        return None
+    call = bridge_call
+    if call is None:
+        try:
+            from services.mcp import core_bridge as cb  # noqa: PLC0415
+            call = cb.call
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        docs = call("doc_list", {})
+        if isinstance(docs, dict):
+            docs = docs.get("docs") or docs.get("items") or []
+        if not isinstance(docs, list):
+            return None
+        for d in docs:
+            if not isinstance(d, dict):
+                continue
+            if str(d.get("doc_id") or d.get("id") or "") == str(doc_id):
+                p = d.get("path")
+                return str(p) if p else None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def _canonical_bytes(doc: Any) -> bytes:
@@ -521,11 +585,16 @@ class AiVcStore:
         msg_idx: int | None = None,
         call: dict[str, Any] | None = None,
         project_dir: str | None = None,
+        doc_file: Any = None,
     ) -> dict[str, Any]:
         """Cut a deterministic checkpoint. Idempotent on (doc_id, turn_id, op_batch).
 
         *kind* is the event kind (``prompt`` | ``tool``). Storage encoding is
         recorded separately as ``storage_kind`` (``full`` | ``delta``).
+        *doc_file* (optional) is the document's backing file — a path (hashed
+        here) or a precomputed :func:`file_fingerprint` dict — recorded as
+        ``rec[\"file\"]`` so a later rollback can detect modifications made
+        outside this session. Additive: older records simply lack the key.
 
         Memory: holds at most one full snapshot in RAM for the delta base.
         """
@@ -613,6 +682,17 @@ class AiVcStore:
             }
         feat_n = _features_count(
             content if not isinstance(content, (bytes, bytearray)) else raw)
+        # Backing-file provenance (additive/optional): hash the file the doc
+        # is saved to so rollback can warn when it changed outside the session.
+        file_rec: dict[str, Any] | None = None
+        if doc_file:
+            if isinstance(doc_file, dict):
+                file_rec = {k: doc_file[k] for k in ("path", "sha256", "mtime", "size")
+                            if doc_file.get(k) is not None}
+            else:
+                file_rec = file_fingerprint(doc_file)
+            if file_rec and not file_rec.get("sha256"):
+                file_rec = None
         rec = {
             "id": cid,
             "doc_id": doc_id,
@@ -635,6 +715,8 @@ class AiVcStore:
             "call": call_rec,
             "content_unchanged": content_unchanged,
         }
+        if file_rec is not None:
+            rec["file"] = file_rec
         self._append_chain(doc_id, rec)
         meta = self._read_meta(doc_id)
         meta.update({
@@ -712,6 +794,7 @@ class AiVcStore:
             "msg_idx": r.get("msg_idx"),
             "call": r.get("call"),
             "storage_kind": AiVcStore._storage_kind_of(r),
+            "file": r.get("file"),
         }
         return out
 
@@ -847,6 +930,83 @@ class AiVcStore:
             "chat_truncate_to": chat_truncate_to,
             "msg_idx": rec.get("msg_idx"),
             "kind": rec.get("kind"),
+        }
+
+    def rollback_preflight(
+        self,
+        doc_id: str,
+        to: str,
+        *,
+        file_path: str | None = None,
+        chat_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Non-destructive preview of :meth:`rollback` — the warning ladder data.
+
+        Returns what reverting to *to* would discard (checkpoints / turns /
+        chat messages), whether geometry rolls back, and whether the document's
+        backing file was modified outside this session (hash comparison against
+        the checkpoint's recorded ``file`` block; *file_path* is the caller's
+        fallback when the record predates file provenance). Raises the same
+        ``KeyError``/``ValueError`` as :meth:`resolve_target`.
+        """
+        rec = self.resolve_target(doc_id, to)
+        chain = self.read_chain(doc_id)
+        idx = next(i for i, r in enumerate(chain) if r["id"] == rec["id"])
+        after = chain[idx + 1:]
+        turns = {str(r.get("turn")) for r in after if r.get("turn") is not None}
+        chat_truncate_to = rec.get("msg_idx")
+        if chat_truncate_to is None and isinstance(rec.get("call"), dict):
+            chat_truncate_to = rec["call"].get("turn")
+        discarded_messages: int | None = None
+        if chat_size is not None and chat_truncate_to is not None:
+            try:
+                discarded_messages = max(0, int(chat_size) - int(chat_truncate_to))
+            except (TypeError, ValueError):
+                discarded_messages = None
+        head = chain[-1] if chain else None
+        geometry_rollback = bool(
+            head and head.get("content_hash") and rec.get("content_hash")
+            and head.get("content_hash") != rec.get("content_hash"))
+
+        frec = rec.get("file")
+        if not isinstance(frec, dict):
+            frec = None
+        recorded_sha = (frec or {}).get("sha256")
+        recorded_mtime = (frec or {}).get("mtime")
+        path = (frec or {}).get("path") or file_path or None
+        cur = file_fingerprint(path) if path else None
+        if recorded_sha and cur and cur.get("sha256"):
+            externally_modified: bool | None = cur["sha256"] != recorded_sha
+            provenance_known = True
+        elif recorded_sha:
+            # File unreadable/absent now — cannot verify, say so honestly.
+            externally_modified = None
+            provenance_known = True
+        else:
+            externally_modified = None
+            provenance_known = False
+        return {
+            "ok": True,
+            "doc_id": doc_id,
+            "to": to,
+            "checkpoint_id": rec["id"],
+            "checkpoint_label": rec.get("label") or "",
+            "checkpoint_when": rec.get("when") or rec.get("time") or "",
+            "restored_turn": rec.get("turn"),
+            "chat_truncate_to": chat_truncate_to,
+            "discarded_checkpoints": len(after),
+            "discarded_turns": len(turns),
+            "discarded_messages": discarded_messages,
+            "geometry_rollback": geometry_rollback,
+            "file": {
+                "path": path,
+                "recorded_sha256": recorded_sha,
+                "recorded_mtime": recorded_mtime,
+                "current_sha256": (cur or {}).get("sha256"),
+                "current_mtime": (cur or {}).get("mtime"),
+                "provenance_known": provenance_known,
+                "externally_modified": externally_modified,
+            },
         }
 
     # -- storage stats -----------------------------------------------------
@@ -1047,6 +1207,7 @@ def on_prompt_start(
     ledger: Any = None,
     actor: str = "ai_vc",
     project_dir: str | None = None,
+    doc_file: Any = None,
 ) -> dict[str, Any] | None:
     """v2: checkpoint BEFORE a user prompt turn starts (kind=prompt).
 
@@ -1103,6 +1264,8 @@ def on_prompt_start(
                 pass
         return {"ok": False, "reason": "capture_failed", "hint": str(exc)}
 
+    if doc_file is None:
+        doc_file = _doc_backing_path(doc_id)
     out = st.checkpoint(
         doc_id, raw,
         turn_id=turn_id,
@@ -1112,6 +1275,7 @@ def on_prompt_start(
         kind="prompt",
         msg_idx=msg_idx,
         project_dir=project_dir,
+        doc_file=doc_file,
     )
     if ledger is not None:
         try:
@@ -1146,6 +1310,7 @@ def on_before_tool(
     actor: str = "ai_vc",
     project_dir: str | None = None,
     result: Any = None,
+    doc_file: Any = None,
 ) -> dict[str, Any] | None:
     """v2: checkpoint BEFORE a mutating tool call (kind=tool, label=tool name).
 
@@ -1206,6 +1371,8 @@ def on_before_tool(
                 pass
         return {"ok": False, "reason": "capture_failed", "hint": str(exc)}
 
+    if doc_file is None:
+        doc_file = _doc_backing_path(doc_id)
     out = st.checkpoint(
         doc_id, raw,
         turn_id=turn_id,
@@ -1216,6 +1383,7 @@ def on_before_tool(
         msg_idx=msg_idx,
         call=call,
         project_dir=project_dir,
+        doc_file=doc_file,
     )
     if ledger is not None:
         try:
@@ -1253,6 +1421,7 @@ def on_ai_tool_success(
     call_i: int | None = None,
     project_dir: str | None = None,
     before: bool = False,
+    doc_file: Any = None,
 ) -> dict[str, Any] | None:
     """Silent auto-VC for a mutating AI tool call.
 
@@ -1266,7 +1435,7 @@ def on_ai_tool_success(
             turn_id=turn_id, call_i=call_i, msg_idx=msg_idx,
             session_id=session_id, content=content, store=store,
             capture_fn=capture_fn, cfg=cfg, ledger=ledger, actor=actor,
-            project_dir=project_dir, result=result,
+            project_dir=project_dir, result=result, doc_file=doc_file,
         )
 
     cfg_r = load_ai_vc_config(cfg)
@@ -1316,6 +1485,8 @@ def on_ai_tool_success(
         return {"ok": False, "reason": "capture_failed", "hint": str(exc)}
 
     label = tool
+    if doc_file is None:
+        doc_file = _doc_backing_path(doc_id)
     out = st.checkpoint(
         doc_id, raw,
         turn_id=turn_id,
@@ -1326,6 +1497,7 @@ def on_ai_tool_success(
         msg_idx=msg_idx,
         call=call,
         project_dir=project_dir,
+        doc_file=doc_file,
     )
     if ledger is not None:
         try:
@@ -1360,6 +1532,44 @@ def plm_timeline(doc_id: str | None = None, *,
                  store: AiVcStore | None = None) -> dict[str, Any]:
     st = store or get_store()
     return st.timeline(doc_id or None)
+
+
+def plm_rollback_check(doc_id: str | None = None, to: str = "",
+                       *, store: AiVcStore | None = None,
+                       file_path: str | None = None,
+                       chat_size: int | None = None) -> dict[str, Any]:
+    """Non-destructive preview of :func:`plm_rollback` for the confirm dialog.
+
+    Same target resolution; returns the warning-ladder payload (discard counts,
+    geometry rollback, external file modification) WITHOUT touching anything.
+    """
+    if not to:
+        return {"ok": False, "reason": "invalid_mode",
+                "hint": ("give a checkpoint id, turn:N, -N, msg:<idx>, "
+                         "or call:<turn>:<i> to preview a roll back to")}
+    st = store or get_store()
+    if not doc_id:
+        tl = st.timeline(None)
+        match = next((c for c in tl.get("checkpoints", [])
+                      if c.get("id") == to
+                      or to.startswith("turn:")
+                      or to.startswith("msg:")
+                      or to.startswith("call:")), None)
+        if match and match.get("doc_id"):
+            doc_id = match["doc_id"]
+        elif tl.get("checkpoints"):
+            doc_id = tl["checkpoints"][0].get("doc_id")
+    if not doc_id:
+        return {"ok": False, "reason": "invalid_item",
+                "hint": "no document to roll back"}
+    try:
+        return st.rollback_preflight(doc_id, to, file_path=file_path,
+                                     chat_size=chat_size)
+    except KeyError as e:
+        return {"ok": False, "reason": "not_found", "hint": str(e)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(e).__name__}: {e}"}
 
 
 def plm_rollback(doc_id: str | None = None, to: str = "",

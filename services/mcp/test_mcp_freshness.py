@@ -300,7 +300,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "plm_init", "plm_open", "plm_save", "plm_checkpoint", "plm_release",
         "plm_history", "plm_restore", "plm_status", "plm_compare",
         "plm_set_ai_mode", "plm_item_set", "plm_where_used", "plm_timeline",
-        "plm_rollback",
+        "plm_rollback", "plm_rollback_check",
     },
     "reveng": {
         "reverse_engineer", "compare_parts", "convert_face_to_sketch",

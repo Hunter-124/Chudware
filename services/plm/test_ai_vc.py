@@ -646,3 +646,224 @@ def test_msg_and_call_rollback_with_chat_truncate(store):
         "rb2", "-1", store=store, restore_fn=_restore,
     )
     assert out4["ok"]
+
+
+# ---------------------------------------------------------------------------
+# restart durability — checkpoint records + msg anchors survive a store reopen
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_records_survive_store_reopen(store, tmp_path):
+    """Simulate an app restart: a brand-new AiVcStore over the same on-disk root
+    must return identical timeline rows (msg_idx / call / kind intact) and resolve
+    msg:<idx> to the SAME checkpoint. The store keeps no in-RAM chain cache —
+    read_chain hits disk — so this is exactly what happens after the process exits
+    and a new worker boots."""
+    ai_vc.stamp_authored("persist1", "agent")
+    d0 = _part(4, wall=1.0)
+    d1 = _part(4, wall=2.0)
+    r_prompt = store.checkpoint(
+        "persist1", d0, turn_id=7, op_batch={"kind": "prompt", "msg_idx": 7},
+        kind="prompt", msg_idx=7, label="add a rib",
+    )
+    store.checkpoint(
+        "persist1", d1, turn_id=7, op_batch={"kind": "tool", "call": {"turn": 7, "i": 0}},
+        kind="tool", msg_idx=7, call={"turn": 7, "i": 0}, label="add_features",
+    )
+
+    before = ai_vc.plm_timeline("persist1", store=store)
+    assert before["ok"] and len(before["checkpoints"]) == 2
+
+    # "Restart": fresh store instance over the SAME root (tmp_path/"ai_vc").
+    reopened = ai_vc.AiVcStore(tmp_path / "ai_vc", cfg={"full_every": 4, "keep_last": 0})
+    after = ai_vc.plm_timeline("persist1", store=reopened)
+    assert after["ok"]
+    assert [c["id"] for c in after["checkpoints"]] == \
+        [c["id"] for c in before["checkpoints"]]
+    for c in after["checkpoints"]:
+        assert c["msg_idx"] == 7
+        assert c["kind"] in ("prompt", "tool")
+    tool_row = next(c for c in after["checkpoints"] if c["kind"] == "tool")
+    assert tool_row["call"] == {"turn": 7, "i": 0}
+
+    restored = {}
+
+    def _restore(doc_id, data):
+        restored["doc"] = json.loads(data.decode("utf-8"))
+        return {"ok": True}
+
+    out = ai_vc.plm_rollback("persist1", "msg:7", store=reopened, restore_fn=_restore)
+    assert out["ok"]
+    assert out["checkpoint_id"] == r_prompt["id"]
+    assert out["chat_truncate_to"] == 7
+    assert restored["doc"]["features"][0]["params"]["wall"] == 1.0
+
+
+def test_retention_thinning_only_drops_oldest_records(store, tmp_path):
+    """keep_last>0 prunes the chain on checkpoint. Prove the records it keeps are
+    the NEWEST ones (a revert target the user just saw never vanishes) and that
+    survivors keep their msg_idx anchors after a reopen."""
+    thin = ai_vc.AiVcStore(tmp_path / "ai_vc_thin",
+                           cfg={"full_every": 2, "keep_last": 2})
+    ai_vc.stamp_authored("thin1", "agent")
+    for i in range(4):
+        thin.checkpoint(
+            "thin1", _part(4, wall=float(i + 1)), turn_id=i,
+            op_batch={"n": i}, kind="prompt", msg_idx=i, label=f"step {i}",
+        )
+    chain = thin.read_chain("thin1")
+    assert [r["msg_idx"] for r in chain] == [2, 3]  # oldest dropped, newest kept
+
+    reopened = ai_vc.AiVcStore(tmp_path / "ai_vc_thin",
+                               cfg={"full_every": 2, "keep_last": 2})
+    chain2 = reopened.read_chain("thin1")
+    assert [r["msg_idx"] for r in chain2] == [2, 3]
+    tl = ai_vc.plm_timeline("thin1", store=reopened)
+    assert {c["msg_idx"] for c in tl["checkpoints"]} == {2, 3}
+
+
+# ---------------------------------------------------------------------------
+# backing-file provenance + rollback preflight (warning ladder)
+# ---------------------------------------------------------------------------
+
+def test_file_fingerprint(store, tmp_path):
+    f = tmp_path / "Bracket.step+"
+    f.write_bytes(b"doc-bytes-v1")
+    fp = ai_vc.file_fingerprint(f)
+    assert fp is not None
+    assert fp["path"] == str(f)
+    assert fp["sha256"] == ai_vc.content_hash(b"doc-bytes-v1")
+    assert fp["size"] == len(b"doc-bytes-v1")
+    assert fp["mtime"] > 0
+    # Missing / directory / empty paths read as unknown, never as unmodified.
+    assert ai_vc.file_fingerprint(tmp_path / "nope.step+") is None
+    assert ai_vc.file_fingerprint(tmp_path) is None
+    assert ai_vc.file_fingerprint("") is None
+    assert ai_vc.file_fingerprint(None) is None
+
+
+def test_checkpoint_records_file_provenance(store, tmp_path):
+    f = tmp_path / "Bracket.step+"
+    f.write_bytes(b"on-disk-at-checkpoint")
+    ai_vc.stamp_authored("fp1", "agent")
+    r = store.checkpoint(
+        "fp1", _part(4), turn_id=1, op_batch={"n": 1}, kind="prompt",
+        msg_idx=1, label="make a boss", doc_file=str(f),
+    )
+    rec = r["record"]
+    assert rec["file"]["path"] == str(f)
+    assert rec["file"]["sha256"] == ai_vc.content_hash(b"on-disk-at-checkpoint")
+    assert rec["file"]["mtime"] > 0
+    # On-disk record (chain.jsonl) carries it too; timeline surfaces it.
+    chain = store.read_chain("fp1")
+    assert chain[0]["file"]["sha256"] == rec["file"]["sha256"]
+    tl = ai_vc.plm_timeline("fp1", store=store)
+    assert tl["checkpoints"][0]["file"]["sha256"] == rec["file"]["sha256"]
+
+
+def test_checkpoint_without_doc_file_omits_field(store):
+    """Additive field: records made without a path simply lack `file`."""
+    ai_vc.stamp_authored("fp2", "agent")
+    r = store.checkpoint("fp2", _part(4), turn_id=1, op_batch={"n": 1},
+                         kind="prompt", msg_idx=1, label="x")
+    assert "file" not in r["record"]
+
+
+def test_rollback_preflight_detects_external_modification(store, tmp_path):
+    f = tmp_path / "Bracket.step+"
+    f.write_bytes(b"v1")
+    ai_vc.stamp_authored("fp3", "agent")
+    r0 = store.checkpoint("fp3", _part(4, wall=1.0), turn_id=1,
+                          op_batch={"n": 1}, kind="prompt", msg_idx=1,
+                          label="step one", doc_file=str(f))
+    store.checkpoint("fp3", _part(4, wall=2.0), turn_id=2,
+                     op_batch={"n": 2}, kind="tool", msg_idx=2,
+                     call={"turn": 2, "i": 0}, label="add_features",
+                     doc_file=str(f))
+    store.checkpoint("fp3", _part(4, wall=3.0), turn_id=3,
+                     op_batch={"n": 3}, kind="prompt", msg_idx=3,
+                     label="step three", doc_file=str(f))
+
+    # Unmodified file -> externally_modified is explicitly False.
+    pf = ai_vc.plm_rollback_check("fp3", r0["id"], store=store, chat_size=6)
+    assert pf["ok"]
+    assert pf["checkpoint_id"] == r0["id"]
+    assert pf["discarded_checkpoints"] == 2
+    assert pf["discarded_turns"] == 2
+    assert pf["discarded_messages"] == 6 - 1
+    assert pf["geometry_rollback"] is True
+    assert pf["file"]["provenance_known"] is True
+    assert pf["file"]["externally_modified"] is False
+
+    # External write -> hash mismatch -> True, and the path names the file.
+    f.write_bytes(b"v2-tampered-elsewhere")
+    pf2 = ai_vc.plm_rollback_check("fp3", r0["id"], store=store, chat_size=6)
+    assert pf2["ok"]
+    assert pf2["file"]["externally_modified"] is True
+    assert pf2["file"]["path"] == str(f)
+    assert pf2["file"]["recorded_sha256"] != pf2["file"]["current_sha256"]
+    assert pf2["file"]["current_mtime"] >= pf2["file"]["recorded_mtime"]
+
+    # File deleted -> cannot verify: None, NOT a claim of unmodified.
+    f.unlink()
+    pf3 = ai_vc.plm_rollback_check("fp3", r0["id"], store=store)
+    assert pf3["ok"]
+    assert pf3["file"]["externally_modified"] is None
+    assert pf3["file"]["provenance_known"] is True  # hash was recorded
+
+
+def test_rollback_preflight_unknown_provenance_for_old_records(store, tmp_path):
+    """Old checkpoints (no recorded file hash): say provenance is unknown,
+    never claim the file is unmodified — even when a path is supplied."""
+    f = tmp_path / "Old.step+"
+    f.write_bytes(b"anything")
+    ai_vc.stamp_authored("fp4", "agent")
+    r0 = store.checkpoint("fp4", _part(4), turn_id=1, op_batch={"n": 1},
+                          kind="prompt", msg_idx=1, label="legacy")
+    assert "file" not in r0["record"]
+    pf = ai_vc.plm_rollback_check("fp4", r0["id"], store=store,
+                                  file_path=str(f), chat_size=3)
+    assert pf["ok"]
+    assert pf["file"]["provenance_known"] is False
+    assert pf["file"]["externally_modified"] is None
+    assert pf["file"]["path"] == str(f)  # surfaced for the warning text
+
+
+def test_rollback_preflight_error_envelopes(store):
+    ai_vc.stamp_authored("fp5", "agent")
+    r0 = store.checkpoint("fp5", _part(4), turn_id=1, op_batch={"n": 1},
+                          kind="prompt", msg_idx=1, label="x")
+    bad = ai_vc.plm_rollback_check("fp5", "", store=store)
+    assert bad["ok"] is False and bad["reason"] == "invalid_mode"
+    nf = ai_vc.plm_rollback_check("fp5", "msg:99", store=store)
+    assert nf["ok"] is False and nf["reason"] == "not_found"
+    # Preflight NEVER mutates: head unchanged, chain untouched.
+    assert store.read_chain("fp5")[0]["id"] == r0["id"]
+
+
+def test_old_records_without_file_field_still_roll_back(store, tmp_path):
+    """A chain written by the pre-provenance build (no `file` key anywhere)
+    loads, previews, and rolls back unchanged."""
+    ai_vc.stamp_authored("fp6", "agent")
+    r0 = store.checkpoint("fp6", _part(4, wall=1.0), turn_id=1,
+                          op_batch={"n": 1}, kind="prompt", msg_idx=1,
+                          label="one")
+    store.checkpoint("fp6", _part(4, wall=2.0), turn_id=2,
+                     op_batch={"n": 2}, kind="tool", msg_idx=2,
+                     call={"turn": 2, "i": 0}, label="two")
+    # Simulate an old build's chain: strip the key if present (it is not).
+    for rec in store.read_chain("fp6"):
+        assert "file" not in rec
+
+    reopened = ai_vc.AiVcStore(store.root, cfg={"full_every": 4, "keep_last": 0})
+    pf = ai_vc.plm_rollback_check("fp6", r0["id"], store=reopened)
+    assert pf["ok"] and pf["file"]["provenance_known"] is False
+
+    restored = {}
+
+    def _restore(doc_id, data):
+        restored["doc"] = json.loads(data.decode("utf-8"))
+        return {"ok": True}
+
+    out = ai_vc.plm_rollback("fp6", r0["id"], store=reopened, restore_fn=_restore)
+    assert out["ok"] and out["checkpoint_id"] == r0["id"]
+    assert restored["doc"]["features"][0]["params"]["wall"] == 1.0

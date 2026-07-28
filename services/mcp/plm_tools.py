@@ -14,7 +14,7 @@ users as-is.
 Registration: ``register_plm_tools(mcp)`` → adds plm_init, plm_open, plm_save,
 plm_checkpoint, plm_release, plm_history, plm_restore, plm_status, plm_compare,
 plm_set_ai_mode (T-R3), plm_item_set + plm_where_used (T-R4),
-plm_timeline + plm_rollback (AI-VC), and T-R7 remotes/locks:
+plm_timeline + plm_rollback + plm_rollback_check (AI-VC), and T-R7 remotes/locks:
 plm_add_remote, plm_sync, plm_lock, plm_unlock.
 
 plm_where_used note: §7 reserves this name for T-R6's Hub; the T-R4 task card
@@ -425,6 +425,38 @@ def register_plm_tools(mcp: FastMCP) -> None:
             return _err("no_vault", "AI version history is not available on this machine")
         try:
             out = ai_vc.plm_rollback(doc_id or None, to)
+        except Exception as e:  # noqa: BLE001
+            return _err("internal", f"{type(e).__name__}: {e}")
+        if not out.get("ok"):
+            return _err(str(out.get("reason") or "internal"),
+                        str(out.get("hint") or ""))
+        return _ok(**{k: v for k, v in out.items() if k != "ok"})
+
+    @mcp.tool()
+    def plm_rollback_check(to: str, doc_id: str = "", file_path: str = "",
+                           chat_size: int = -1) -> str:
+        """Preview a rollback WITHOUT applying it — the confirmation data.
+
+        Same ``to`` forms as ``plm_rollback``. Returns ``{ok,
+        discarded_checkpoints, discarded_turns, discarded_messages,
+        geometry_rollback, chat_truncate_to, checkpoint_label,
+        checkpoint_when, file:{path, provenance_known,
+        externally_modified, current_mtime, recorded_mtime}}``.
+        ``externally_modified`` is true only when the backing file's
+        current hash differs from the checkpoint's recorded hash; null
+        when provenance is unknown or unverifiable. ``file_path`` is the
+        caller-supplied fallback for checkpoints recorded before file
+        provenance existed; ``chat_size`` (<0 = unknown) drives the
+        discarded-messages count."""
+        try:
+            from services.plm import ai_vc
+        except ImportError:
+            return _err("no_vault", "AI version history is not available on this machine")
+        try:
+            out = ai_vc.plm_rollback_check(
+                doc_id or None, to,
+                file_path=file_path or None,
+                chat_size=chat_size if chat_size >= 0 else None)
         except Exception as e:  # noqa: BLE001
             return _err("internal", f"{type(e).__name__}: {e}")
         if not out.get("ok"):

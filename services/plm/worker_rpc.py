@@ -421,6 +421,37 @@ def _plm_rollback(params: dict, _emit: Callable) -> dict:
                 "hint": f"{type(e).__name__}: {e}"}
 
 
+def _plm_rollback_check(params: dict, _emit: Callable) -> dict:
+    """AI-VC rollback preview: the confirm-dialog warning ladder, non-destructive.
+
+    Params: ``doc_id?``, ``to``, ``file_path?`` (doc's backing file, fallback
+    when the checkpoint predates file provenance), ``chat_size?`` (for the
+    discarded-messages count). Shape: ``{ok, discarded_checkpoints,
+    discarded_turns, discarded_messages, geometry_rollback, chat_truncate_to,
+    file:{path, provenance_known, externally_modified, ...}}``.
+    """
+    try:
+        from services.plm import ai_vc
+    except ImportError:
+        return dict(_NO_VAULT)
+    doc_id = (params or {}).get("doc_id") or None
+    if doc_id is not None:
+        doc_id = str(doc_id) or None
+    to = str((params or {}).get("to", "") or "")
+    file_path = str((params or {}).get("file_path") or "") or None
+    chat_size = (params or {}).get("chat_size")
+    try:
+        chat_size = int(chat_size) if chat_size is not None else None
+    except (TypeError, ValueError):
+        chat_size = None
+    try:
+        return ai_vc.plm_rollback_check(doc_id, to, file_path=file_path,
+                                        chat_size=chat_size)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(e).__name__}: {e}"}
+
+
 def _plm_compare(params: dict, _emit: Callable) -> dict:
     """Semantic (+ optional visual) compare of one item between two entries.
 
@@ -770,6 +801,7 @@ WORKER_METHODS = {
     "plm_draft": _plm_draft,
     "plm_timeline": _plm_timeline,
     "plm_rollback": _plm_rollback,
+    "plm_rollback_check": _plm_rollback_check,
     "plm_add_remote": _plm_add_remote,
     "plm_sync": _plm_sync,
     "plm_lock": _plm_lock,
@@ -854,6 +886,7 @@ def _cad_graph_get(params: dict, _emit: Callable) -> dict:
             max_nodes=max_nodes, max_edges=max_edges,
             if_mtimes_max=if_mtimes_max,
             if_sources_count=if_sources_count,
+            linked=bool(p.get("linked", False)),
         )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"cad_graph_get failed: {exc}", "hint": ""}
@@ -986,6 +1019,295 @@ def _cad_graph_assembly_tree(params: dict, _emit: Callable) -> dict:
                 "hint": "", "trees": []}
 
 
+# ──── keyword / watch / search / config (contracts/cad_graph.md 2026-07) ────
+
+
+def _require_project_dir(p: dict) -> str:
+    return str(p.get("project_dir") or p.get("path") or "")
+
+
+def _cad_graph_keyword_add(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_keyword_add {project_dir, target, keyword, origin?}``."""
+    try:
+        from services.plm import keywords as kw
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"keywords unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = _require_project_dir(p)
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        return kw.add_keyword(
+            project_dir, str(p.get("target") or ""),
+            str(p.get("keyword") or ""),
+            origin=str(p.get("origin") or "manual"),
+            author=p.get("author") if isinstance(p.get("author"), dict) else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_keyword_add failed: {exc}",
+                "hint": ""}
+
+
+def _cad_graph_keyword_remove(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_keyword_remove {project_dir, entry_id?|target+keyword}``."""
+    try:
+        from services.plm import keywords as kw
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"keywords unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = _require_project_dir(p)
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        entry_id = str(p.get("entry_id") or "").strip()
+        if entry_id:
+            return kw.remove_keyword(project_dir, entry_id)
+        target = str(p.get("target") or "").strip()
+        keyword = str(p.get("keyword") or "").strip()
+        if not target or not keyword:
+            return {"ok": False, "reason": "entry_id or target+keyword required",
+                    "hint": "pass entry_id, or both target and keyword"}
+        return kw.remove_pair(project_dir, target, keyword)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_keyword_remove failed: {exc}",
+                "hint": ""}
+
+
+def _cad_graph_keyword_list(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_keyword_list {project_dir, target?} -> {ok, entries}``."""
+    try:
+        from services.plm import keywords as kw
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"keywords unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = _require_project_dir(p)
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required",
+                    "hint": "", "entries": []}
+        entries = kw.list_entries(project_dir)
+        target = str(p.get("target") or "").strip()
+        if target:
+            entries = [e for e in entries if e.get("target") == target]
+        return {"ok": True, "entries": entries}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_keyword_list failed: {exc}",
+                "hint": "", "entries": []}
+
+
+def _graph_for_query(p: dict):
+    """Shared loader: graph dict honoring the optional ``linked`` flag.
+
+    Returns ``(project_dir, None)`` when no project_dir was given — callers
+    must turn that into the flat ``project_dir required`` envelope.
+    """
+    from services.plm import cad_graph as cg
+    project_dir = _require_project_dir(p)
+    if not project_dir:
+        return "", None
+    force = bool(p.get("force", False))
+    include_archive = bool(p.get("include_archive", False))
+    g = cg.get_graph(project_dir, force=force,
+                     include_archive=include_archive,
+                     max_nodes=0, max_edges=0,
+                     linked=bool(p.get("linked", False)))
+    return project_dir, g
+
+
+def _cad_graph_search(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_search {project_dir, q?, kinds?, keyword?, linked?}``."""
+    try:
+        from services.plm import cad_graph as cg
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        _project_dir, g = _graph_for_query(p)
+        if g is None:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        kinds = p.get("kinds")
+        if isinstance(kinds, str):
+            kinds = [k.strip() for k in kinds.split(",") if k.strip()]
+        elif not isinstance(kinds, list):
+            kinds = None
+        out = cg.search_graph(g, q=str(p.get("q") or ""), kinds=kinds,
+                              keyword=str(p.get("keyword") or ""))
+        out["nodes"] = out["nodes"][:400]
+        keep = {n["id"] for n in out["nodes"]}
+        out["edges"] = [e for e in out["edges"]
+                        if e.get("src") in keep and e.get("dst") in keep][:400]
+        return out
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_search failed: {exc}",
+                "hint": ""}
+
+
+def _cad_graph_neighbors(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_neighbors {project_dir, node_id, depth?, linked?}``."""
+    try:
+        from services.plm import cad_graph as cg
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        node_id = str(p.get("node_id") or "").strip()
+        if not node_id:
+            return {"ok": False, "reason": "node_id required", "hint": ""}
+        _project_dir, g = _graph_for_query(p)
+        if g is None:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        try:
+            depth = int(p.get("depth", 1))
+        except (TypeError, ValueError):
+            depth = 1
+        return cg.neighbors(g, node_id, depth)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_neighbors failed: {exc}",
+                "hint": ""}
+
+
+def _cad_graph_watch_add(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_watch_add {project_dir, keyword?|node_id?, note?, origin?}``."""
+    try:
+        from services.plm import watch as w
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"watch unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = _require_project_dir(p)
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        return w.watch_add(
+            project_dir, keyword=str(p.get("keyword") or ""),
+            node_id=str(p.get("node_id") or ""),
+            note=str(p.get("note") or ""),
+            origin=str(p.get("origin") or "manual"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_watch_add failed: {exc}",
+                "hint": ""}
+
+
+def _cad_graph_watch_remove(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_watch_remove {project_dir, entry_id}``."""
+    try:
+        from services.plm import watch as w
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"watch unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = _require_project_dir(p)
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        return w.watch_remove(project_dir, str(p.get("entry_id") or ""))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_watch_remove failed: {exc}",
+                "hint": ""}
+
+
+def _cad_graph_watch_list(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_watch_list {project_dir} -> {ok, watch}``."""
+    try:
+        from services.plm import watch as w
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"watch unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = _require_project_dir(p)
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required",
+                    "hint": "", "watch": []}
+        return {"ok": True, "watch": w.list_watch(project_dir)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_watch_list failed: {exc}",
+                "hint": "", "watch": []}
+
+
+def _cad_graph_changes(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_changes {project_dir, linked?} -> diff vs cached graph``.
+
+    Diffs the on-disk cached graph (pre-rebuild) against a fresh build and
+    annotates added/removed nodes with ``watched: true`` when they match a
+    watch-overlay entry (keyword or node id).
+    """
+    try:
+        from services.plm import cad_graph as cg
+        from services.plm import watch as w
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = _require_project_dir(p)
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        old = cg.load_cached_graph(project_dir) or {"nodes": [], "edges": []}
+        linked = bool(p.get("linked", False))
+        new = cg.get_graph(project_dir, force=True, max_nodes=0, max_edges=0,
+                           linked=linked)
+        diff = cg.graph_diff(old, new)
+        watch_entries = w.list_watch(project_dir)
+        matched = w.watched_matches(new, watch_entries) if watch_entries else set()
+        matched_old = w.watched_matches(old, watch_entries) if watch_entries else set()
+        for n in diff["nodes_added"]:
+            if n.get("id") in matched:
+                n["watched"] = True
+        for n in diff["nodes_removed"]:
+            if n.get("id") in matched_old:
+                n["watched"] = True
+        watched_changed = sorted({
+            n["id"] for n in diff["nodes_added"] + diff["nodes_removed"]
+            if n.get("watched")})
+        diff["watched"] = watched_changed
+        diff["generated_at"] = new.get("generated_at")
+        return diff
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_changes failed: {exc}",
+                "hint": ""}
+
+
+def _cad_graph_config_get(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_config_get {project_dir} -> {ok, config, project_key}``."""
+    try:
+        from services.plm import graph_config as gcfg
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"graph_config unavailable: {exc}",
+                "hint": ""}
+    try:
+        p = params or {}
+        project_dir = _require_project_dir(p)
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        return {"ok": True, "config": gcfg.get_config(project_dir),
+                "project_key": gcfg.project_key(project_dir)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_config_get failed: {exc}",
+                "hint": ""}
+
+
+def _cad_graph_config_set(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_config_set {project_dir, fields...}`` — validates via module."""
+    try:
+        from services.plm import graph_config as gcfg
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"graph_config unavailable: {exc}",
+                "hint": ""}
+    try:
+        p = params or {}
+        project_dir = _require_project_dir(p)
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        fields = {k: v for k, v in p.items()
+                  if k in ("office_content", "office_max_chars", "office_kinds",
+                           "linked_projects", "project_key")}
+        if not fields:
+            return {"ok": False, "reason": "no config fields given",
+                    "hint": "office_content|office_max_chars|office_kinds|"
+                            "linked_projects|project_key"}
+        return gcfg.set_config(project_dir, **fields)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_config_set failed: {exc}",
+                "hint": ""}
+
+
 CAD_GRAPH_METHODS: dict[str, Callable[..., Any]] = {
     "cad_graph_get": _cad_graph_get,
     "cad_graph_blast": _cad_graph_blast,
@@ -994,6 +1316,17 @@ CAD_GRAPH_METHODS: dict[str, Callable[..., Any]] = {
     "cad_graph_link_remove": _cad_graph_link_remove,
     "cad_graph_link_list": _cad_graph_link_list,
     "cad_graph_assembly_tree": _cad_graph_assembly_tree,
+    "cad_graph_keyword_add": _cad_graph_keyword_add,
+    "cad_graph_keyword_remove": _cad_graph_keyword_remove,
+    "cad_graph_keyword_list": _cad_graph_keyword_list,
+    "cad_graph_search": _cad_graph_search,
+    "cad_graph_neighbors": _cad_graph_neighbors,
+    "cad_graph_watch_add": _cad_graph_watch_add,
+    "cad_graph_watch_remove": _cad_graph_watch_remove,
+    "cad_graph_watch_list": _cad_graph_watch_list,
+    "cad_graph_changes": _cad_graph_changes,
+    "cad_graph_config_get": _cad_graph_config_get,
+    "cad_graph_config_set": _cad_graph_config_set,
 }
 
 

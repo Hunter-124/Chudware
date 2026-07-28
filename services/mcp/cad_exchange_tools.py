@@ -93,6 +93,12 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         (for assembly); omit it to open the file as a NEW part (made current). `as_solid` sews a
         mesh (STL/OBJ/…) into a solid on import; B-rep formats already import as solids.
 
+        A file that is ALREADY OPEN is RESUMED, not opened twice: the reply carries
+        `reused: true` with the existing doc_id, so re-importing the part you are already
+        working in can never leave a second "<name>2" document in the user's tab strip. Pass
+        `into=<doc_id>` when you genuinely want this file added as another BODY inside an
+        open part.
+
         DXF/DWG are 2D vector drawings: they import as planar wires + faces (closed loops become
         faces) — reference/profile geometry to extrude or dimension, not a solid. DWG needs a
         DWG→DXF converter (LibreDWG `dwg2dxf`) on PATH; without one it errors with a hint.
@@ -125,6 +131,40 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                        "necessarily your project folder. Run fs_list on the "
                                        "containing directory for the exact name, or pass an "
                                        "absolute path."})
+            # A file that is ALREADY OPEN is reused, not opened a second time. doc_open /
+            # import_file mint a fresh document per call and doc_new uniquifies the colliding
+            # name, so an agent that re-imports the part it is already working in ends up with
+            # "mudbucket" and "mudbucket2" side by side in the user's tab strip (observed live,
+            # run-138660919763973). Matching is on the RESOLVED file path only: a GUI-created
+            # doc lists its autosave path, so this can only ever match a document that really
+            # was opened from this file.
+            if not into:
+                try:
+                    open_docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                                 if isinstance(e, dict) and e.get("doc_id")]
+                except Exception:  # noqa: BLE001 — listing is an optimisation, never fatal
+                    open_docs = []
+                want = os.path.realpath(path_abs)
+                for e in open_docs:
+                    p = e.get("path")
+                    if not isinstance(p, str) or not p:
+                        continue
+                    if os.path.realpath(p) != want:
+                        continue
+                    did = e["doc_id"]
+                    _CUR["doc_id"] = did
+                    vol = e.get("volume")
+                    if isinstance(vol, (int, float)):
+                        _LAST_VOLUME.setdefault(did, vol)
+                    _publish_current(did)
+                    return _dumps({
+                        "ok": True, "doc_id": did, "imported_from": path, "reused": True,
+                        "name": e.get("name"), "revision": e.get("revision", 0),
+                        "feature_count": e.get("feature_count"),
+                        "note": f'"{os.path.basename(path_abs)}" is already open as doc_id='
+                                f'{did} — resumed it instead of opening a second copy. Pass '
+                                f'into="{did}" to add this file as a BODY inside an existing '
+                                "part instead."})
             # SolidWorks feature-tree resolution (opening as a NEW editable part/assembly).
             if resolve_features and not into and path_abs.lower().endswith((".sldprt", ".sldasm")):
                 from services.sw_import.sw_feature_import import SolidWorksUnavailable

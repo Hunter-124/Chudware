@@ -162,3 +162,99 @@ def test_import_part_missing_relative_path_keeps_teaching_envelope(exchange, tmp
     assert out["error"] == "file not found: nope/ghost.step"
     assert str(tmp_path) in out["hint"]  # teaches the resolved location it checked
     assert calls == []  # isfile gate fired before any cb.call
+
+# ---------------------------------------------------------------------------------------
+# Re-importing an already-open file must RESUME it, never mint a second document.
+#
+# Live-run root cause (run-138660919763973): the agent imported
+# Projects/Testing/mudbucket.step+ and then kept working through tools that mint documents,
+# and the user was left with mudbucket.step+ AND mudbucket2.step+ on disk plus three tabs.
+# doc_open/import_file mint a fresh doc per call and doc_new uniquifies the colliding name,
+# so every re-import compounds. Matching is on the RESOLVED path only — a GUI-created doc
+# lists its autosave path, so this can never adopt a document that is not this file.
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def exchange_with_open_file(monkeypatch, tmp_path):
+    """Exchange tools where `part.step+` is ALREADY open as doc-already."""
+    part = tmp_path / "mudbucket.step+"
+    part.write_bytes(b"PK\x03\x04 fake native container")
+    calls: list = []
+
+    def _fake_call(method, params):
+        calls.append((method, dict(params)))
+        if method == "doc_list":
+            return {"docs": [
+                # A GUI doc parked on its autosave path — must never be adopted.
+                {"doc_id": "doc-gui", "name": "Part1", "revision": 1,
+                 "path": str(tmp_path / "autosave" / "doc-gui.step+")},
+                {"doc_id": "doc-already", "name": "mudbucket", "revision": 7,
+                 "feature_count": 4, "path": str(part)},
+            ]}
+        if method == "doc_open":
+            return {"doc_id": "doc-opened"}
+        if method == "import_file":
+            return {"doc_id": "doc-imported"}
+        return {}
+
+    monkeypatch.setattr(M.cb, "call", _fake_call)
+    monkeypatch.setattr(M, "_publish_current", lambda *a, **k: None)
+    mcp = _StubMCP()
+    M.register_cad_exchange_tools(mcp)
+    return mcp.tools, calls, part
+
+
+def test_import_part_resumes_an_already_open_file(exchange_with_open_file):
+    """The whole duplicate-part class: no second document, and the caller is told why."""
+    tools_fn, calls, part = exchange_with_open_file
+
+    out = json.loads(tools_fn["import_part"](path=str(part)))
+
+    assert out["ok"] is True, out
+    assert out["reused"] is True, out
+    assert out["doc_id"] == "doc-already"
+    assert out["feature_count"] == 4
+    assert [m for m, _ in calls if m in ("doc_open", "import_file")] == []
+    # The note must teach: name the file, the doc it resumed, and the corrected call.
+    assert "mudbucket.step+" in out["note"]
+    assert "doc-already" in out["note"]
+    assert 'into="doc-already"' in out["note"]
+
+
+def test_import_part_resume_survives_a_non_canonical_path(exchange_with_open_file,
+                                                          monkeypatch):
+    """`./mudbucket.step+` and `dir/../mudbucket.step+` are the same file as the open doc."""
+    tools_fn, calls, part = exchange_with_open_file
+    monkeypatch.chdir(part.parent)
+
+    out = json.loads(tools_fn["import_part"](path="./sub/../mudbucket.step+"))
+
+    assert out.get("reused") is True, out
+    assert out["doc_id"] == "doc-already"
+    assert [m for m, _ in calls if m in ("doc_open", "import_file")] == []
+
+
+def test_import_part_into_an_existing_part_still_imports(exchange_with_open_file):
+    """`into=` means "add this file as a BODY here" — reuse must not hijack that."""
+    tools_fn, calls, part = exchange_with_open_file
+
+    out = json.loads(tools_fn["import_part"](path=str(part), into="doc-target"))
+
+    assert out["ok"] is True, out
+    assert "reused" not in out
+    assert [m for m, _ in calls if m == "import_file"], calls
+
+
+def test_import_part_does_not_adopt_an_unrelated_open_doc(exchange_with_open_file,
+                                                          tmp_path):
+    """A DIFFERENT file still opens normally — the guard is path equality, not a name guess."""
+    tools_fn, calls, _part = exchange_with_open_file
+    other = tmp_path / "bracket.step+"
+    other.write_bytes(b"PK\x03\x04 fake native container")
+
+    out = json.loads(tools_fn["import_part"](path=str(other)))
+
+    assert out["ok"] is True, out
+    assert "reused" not in out
+    assert out["doc_id"] == "doc-opened"

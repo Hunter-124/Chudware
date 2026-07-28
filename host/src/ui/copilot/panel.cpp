@@ -22,6 +22,8 @@
 #include "copilot_internal.h"
 #include "ui/tesseract.h"  // ui::drawTesseract — the animated 4-cube brand mark in the header
 #include "core/engine_events.h"  // core::mirrorRecoveredDocs — Reopen a dismissed live agent doc
+#include "ui/ai/ai_prefs.h"      // ui::chatShowRenders — Artifacts render-thumbnail display pref
+#include "gl_compat.h"           // glDeleteTextures — LRU eviction of render thumbnails
 
 namespace ui {
 
@@ -781,12 +783,43 @@ static void artiRow(AppState& st, const std::string& label, const std::string& t
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
 }
 
-// Session Artifacts panel — subagents, the plan, and session documents for this session.
+// Render-thumbnail cache for the Artifacts tab's "Renders" grid. The panel is redrawn every
+// frame, so each PNG the agent produced is decoded and uploaded ONCE and then keyed by path —
+// the same lazy-upload shape the inline chat tool rows use (activity_timeline.cpp s_artTex),
+// but BOUNDED: a long session emits hundreds of render_part files and an unbounded map would
+// hold a GL texture per file forever. 32 resident entries, least-recently-used evicted and its
+// texture released. A FAILED decode is cached as id == 0 so a missing/corrupt file is not
+// re-read every frame; callers fall back to a dim text row for it.
+static Tex artiRenderThumb(const std::string& path) {
+    struct Slot { Tex tex; double lastUse = 0.0; };
+    static std::unordered_map<std::string, Slot> s_cache;
+    static constexpr size_t kMaxResident = 32;
+    const double now = ImGui::GetTime();
+    auto it = s_cache.find(path);
+    if (it == s_cache.end()) {
+        if (s_cache.size() >= kMaxResident) {
+            auto oldest = s_cache.begin();
+            for (auto i = s_cache.begin(); i != s_cache.end(); ++i)
+                if (i->second.lastUse < oldest->second.lastUse) oldest = i;
+            if (oldest->second.tex.id) {
+                GLuint dead = (GLuint)oldest->second.tex.id;
+                glDeleteTextures(1, &dead);
+            }
+            s_cache.erase(oldest);
+        }
+        it = s_cache.emplace(path, Slot{loadTexture(path), now}).first;
+    }
+    it->second.lastUse = now;
+    return it->second.tex;   // by value: the next call may evict/rehash this slot
+}
+
+// Session Artifacts panel — subagents, the plan, the documents the AGENT touched (not every
+// open tab) and the renders the agent itself looked at, as images.
 static void drawArtifactsPanel(AppState& st, bool busy) {
     (void)busy;
     const ui::AdaptiveSurface& surf = chatSurf();
     ui::cpMenuHeader(st.fonts, "Session Artifacts",
-                     "Subagents, plan and documents for this session.");
+                     "Subagents, the plan, the documents the agent touched and its renders.");
 
     // ---- Subagents (from plan_state subagent rows + agent.spawn activity) ----
     // Collected first so the section header can carry a count; the data selection is unchanged.
@@ -843,14 +876,20 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
         artiEmptyState(surf, "No plan yet \xe2\x80\x94 the agent's task list shows up here once a build starts.");
     }
 
-    // ---- Open documents (deduplicated doc tabs) + files produced this session ----
+    // ---- Documents the AGENT touched + files/renders it produced this session ----
     // Rows are gathered before drawing so each header can show a count; same sources as before.
     struct ArtiDocRow {
         std::string label, tooltip, path;
         std::function<void()> open;
+        bool image = false;   // produced-file rows only: an "image" artifact (a render PNG)
     };
-    std::vector<ArtiDocRow> docRows;   // open documents (one row per underlying doc)
-    std::vector<ArtiDocRow> fileRows;  // files the agent wrote this session
+    // The question this panel answers is "what did the AGENT touch", not "what is open" — the old
+    // single list showed every doc tab, so a session that built one part looked like it built
+    // four. A tab counts as agent-touched when it was handed off by an agent OR carries an agent
+    // edit stamp; everything else is the user's own document and goes behind a collapsed line.
+    std::vector<ArtiDocRow> agentRows;   // documents this session's agent opened / built / edited
+    std::vector<ArtiDocRow> otherRows;   // the user's own open documents (collapsed by default)
+    std::vector<ArtiDocRow> fileRows;    // files the agent wrote this session (renders included)
     {
         // Dedup doc-tab rows: an AI read-only mirror tab and the user's own tab can be
         // two docTabs entries for the SAME underlying document. Two things independently
@@ -876,12 +915,15 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
             r.path  = !t.path.empty() ? t.path : st.plmProjectPath();
             r.tooltip = r.path.empty() ? r.label : (r.label + "\n" + r.path);
             r.open  = [&st, ti]() { st.switchToTab(ti); };
-            docRows.push_back(std::move(r));
+            const bool agentTouched =
+                t.aiHandoff || t.lastAgentEditAt != std::chrono::steady_clock::time_point{};
+            (agentTouched ? agentRows : otherRows).push_back(std::move(r));
         }
         // Docs the user closed from the viewport while an agent kept building them.
         // hostd degraded that close to a detach (the work is independent of the
         // user's tabs), so the part is still live — list it with a Reopen action
         // instead of letting it vanish from the session's artifacts entirely.
+        // These are agent documents by construction, so they belong in the agent bucket.
         for (const auto& [docId, label] : st.dismissedMirrorDocs) {
             if (docId.empty() || !seenId.insert(docId).second) continue;
             ArtiDocRow r;
@@ -892,7 +934,7 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                 st.dismissedMirrorDocs.erase(docId);
                 core::mirrorRecoveredDocs(st, {docId});
             };
-            docRows.push_back(std::move(r));
+            agentRows.push_back(std::move(r));
         }
         // Cross-source dedup: seed `seen` with the doc tabs' real file paths so a file
         // already listed as an open document is not repeated as a produced-file row.
@@ -922,35 +964,142 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                     r.label   = base + "  (" + kindA + ")";
                     r.path    = path;
                     r.tooltip = path;
+                    r.image   = (kindA == "image");
                     r.open    = [&st, path]() { chatArtifactOpenSmart(st, path); };
                     fileRows.push_back(std::move(r));
                 }
             }
         }
     }
-    // Section-scoped ImGui ids: both loops index from 0, so without a per-section scope
-    // the first produced-file row would collide with the first open-document row and one
-    // of the two rows' buttons would go dead.
-    artiSectionHeader(surf, "Open Documents", (int)docRows.size());
-    if (docRows.empty()) {
-        artiEmptyState(surf, "No open documents \xe2\x80\x94 parts you open are listed here.");
+    // Section-scoped ImGui ids: every loop below indexes from 0, so without a per-section scope
+    // the first produced-file row would collide with the first agent-document row and one of the
+    // two rows' buttons would go dead.
+    artiSectionHeader(surf, "Agent Documents", (int)agentRows.size());
+    if (agentRows.empty()) {
+        artiEmptyState(surf, "Nothing yet \xe2\x80\x94 parts the agent opens, imports or edits are listed here.");
     } else {
         ImGui::PushID("arti_docs");
-        for (size_t i = 0; i < docRows.size(); ++i) {
+        for (size_t i = 0; i < agentRows.size(); ++i) {
             ImGui::PushID((int)i);
-            artiRow(st, docRows[i].label, docRows[i].tooltip, docRows[i].path, docRows[i].open);
+            artiRow(st, agentRows[i].label, agentRows[i].tooltip, agentRows[i].path,
+                    agentRows[i].open);
             ImGui::PopID();
         }
         ImGui::PopID();
     }
-    artiSectionHeader(surf, "Produced This Session", (int)fileRows.size());
-    if (fileRows.empty()) {
+
+    // The user's own tabs must not dominate this panel, but dropping them outright would lose the
+    // only way to reach a part the agent worked on BEFORE the handoff / edit-stamp flags were set
+    // — so they stay, collapsed behind a dim click-to-expand line.
+    artiSectionHeader(surf, "Other Open Documents", (int)otherRows.size());
+    {
+        static bool s_showOtherDocs = false;
+        const float ind = ui::metrics::cpMenuRowPadX();
+        ImGui::Indent(ind);
+        if (otherRows.empty()) {
+            ui::cpMenuHint("No other documents open.");
+        } else {
+            char line[96];
+            snprintf(line, sizeof(line), "%d other open document%s (%s)",
+                     (int)otherRows.size(), otherRows.size() == 1 ? "" : "s",
+                     s_showOtherDocs ? "hide" : "show");
+            ui::cpMenuHint(line);
+            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsItemClicked()) s_showOtherDocs = !s_showOtherDocs;
+        }
+        ImGui::Unindent(ind);
+        if (s_showOtherDocs && !otherRows.empty()) {
+            ImGui::PushID("arti_other_docs");
+            for (size_t i = 0; i < otherRows.size(); ++i) {
+                ImGui::PushID((int)i);
+                artiRow(st, otherRows[i].label, otherRows[i].tooltip, otherRows[i].path,
+                        otherRows[i].open);
+                ImGui::PopID();
+            }
+            ImGui::PopID();
+        }
+    }
+
+    // Renders vs everything else. Image artifacts are what the VISION model actually looked at, so
+    // they are shown as images instead of a path string. With the display pref off they stay in
+    // "Produced This Session" as plain rows, in their original chronological order.
+    const bool showRenders = ui::chatShowRenders();
+    std::vector<const ArtiDocRow*> renderRows, plainRows;
+    for (const auto& r : fileRows) {
+        if (showRenders && r.image) renderRows.push_back(&r);
+        else                        plainRows.push_back(&r);
+    }
+    if (!renderRows.empty()) {
+        artiSectionHeader(surf, "Renders", (int)renderRows.size());
+        // NEWEST FIRST: chat activity is chronological, so the last artifact collected is the
+        // render the model just looked at — that is the one the user wants at the top.
+        const float availW = ImGui::GetContentRegionAvail().x;
+        const float maxTw  = ui::metrics::copilotThumbW();
+        const float thumbW = availW < maxTw ? availW : maxTw;
+        const float gap    = ui::metrics::px(6.0f);
+        const float lineX1 = ImGui::GetCursorPosX() + availW;
+        const int   kCap   = 24;                  // hard cap on thumbnails drawn per frame
+        int drawn = 0, more = 0;
+        bool firstInRow = true;
+        // Wrap on the MEASURED cell width, not the thumbnail width: each cell is a group of the
+        // image plus its actions row, and that button row can be wider than the image itself.
+        float cellW = thumbW;
+        ImGui::PushID("arti_renders");
+        for (size_t k = renderRows.size(); k-- > 0;) {
+            const ArtiDocRow& r = *renderRows[k];
+            if (drawn >= kCap) { ++more; continue; }
+            const Tex tex = artiRenderThumb(r.path);
+            ImGui::PushID((int)k);
+            if (!tex.id || tex.w <= 0 || tex.h <= 0) {
+                // Undecodable (missing or half-written file): fall back to the dim path row this
+                // artifact used to get, rather than leaving a hole in the grid. Own line.
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+                ImGui::TextWrapped("image: %s", r.path.c_str());
+                ImGui::PopStyleColor();
+                chatArtifactActions(st, r.path);
+                firstInRow = true;
+            } else {
+                if (!firstInRow) {
+                    ImGui::SameLine(0, gap);
+                    if (ImGui::GetCursorPosX() + cellW > lineX1) ImGui::NewLine();
+                }
+                firstInRow = false;
+                std::string base = r.path;
+                const size_t slash = base.find_last_of("/\\");
+                if (slash != std::string::npos) base = base.substr(slash + 1);
+                const float th = thumbW * (float)tex.h / (float)std::max(1, tex.w);
+                ImGui::BeginGroup();
+                ImGui::Image((ImTextureID)(intptr_t)tex.id, ImVec2(thumbW, th));
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("%s", base.c_str());
+                }
+                if (ImGui::IsItemClicked()) chatArtifactOpenSmart(st, r.path);
+                // The same actions the inline chat image rows carry, under the thumbnail.
+                chatArtifactActions(st, r.path);
+                ImGui::EndGroup();
+                cellW = std::max(thumbW, ImGui::GetItemRectSize().x);
+            }
+            ImGui::PopID();
+            ++drawn;
+        }
+        ImGui::PopID();
+        if (more > 0) {
+            char mline[64];
+            snprintf(mline, sizeof(mline), "+%d more render%s", more, more == 1 ? "" : "s");
+            artiEmptyState(surf, mline);
+        }
+    }
+
+    artiSectionHeader(surf, "Produced This Session", (int)plainRows.size());
+    if (plainRows.empty()) {
         artiEmptyState(surf, "No files yet \xe2\x80\x94 files the agent writes show up here.");
     } else {
         ImGui::PushID("arti_files");
-        for (size_t i = 0; i < fileRows.size(); ++i) {
+        for (size_t i = 0; i < plainRows.size(); ++i) {
             ImGui::PushID((int)i);
-            artiRow(st, fileRows[i].label, fileRows[i].tooltip, fileRows[i].path, fileRows[i].open);
+            artiRow(st, plainRows[i]->label, plainRows[i]->tooltip, plainRows[i]->path,
+                    plainRows[i]->open);
             ImGui::PopID();
         }
         ImGui::PopID();

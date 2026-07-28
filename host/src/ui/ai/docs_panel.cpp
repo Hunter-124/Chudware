@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +27,8 @@
 #include "ui/file_dialog.h"   // ui::openFileDialog (native open dialog)
 #include "ui_theme.h"         // ui::palette / uiScale / adaptivePanel / glassPanel / glassRowBackground
 #include "ui/metrics.h"       // cpMenu* rhythm tokens (gutter / row pad / corner)
+#include "gl_compat.h"        // glDeleteTextures for the bounded preview-texture cache
+#include "ui/ai/ai_prefs.h"   // ui::chatShowRenders (chat display prefs)
 
 namespace ui {
 namespace {
@@ -48,11 +51,32 @@ const char kDocsFilter[] =
 enum class DocKind { Text, Csv, Image, Office, Other };
 
 struct DocEntry {
-    std::string path;
-    std::string kind;      // artifact kind ("file"/"image"/...) or "attached"
+    std::string name;      // display label (basename, or a doc tab's displayTitle())
+    std::string path;      // file on disk; empty for an agent part not written out yet
+    std::string key;       // selection identity (path, or the unsaved-doc sentinel)
+    std::string kind;      // artifact kind ("file"/"image"/"part") or "attached"
     std::string tool;      // producing tool/stage for artifacts (tooltip only)
     bool        attached = false;
+    // True for anything the agent produced or touched (activity artifacts + agent doc tabs);
+    // false only for the user's own attachments. Drives the two list sections.
+    bool        agentTouched = false;
 };
+
+// Selection key for an agent part that has no file yet — never a real path, so the preview
+// pane can tell it apart from a missing file instead of crying "no longer exists on disk".
+const std::string kUnsavedKeyPrefix = "\x1f" "unsaved\x1f";
+
+// One decoded preview/thumbnail image. `tried` remembers a failed decode so a broken path is
+// not re-decoded every frame.
+struct TexSlot {
+    Tex    t;
+    double lastUse = 0.0;
+    bool   tried = false;
+};
+
+// Hard ceiling on resident preview textures. A long session that scrolls through many renders
+// used to keep one GL texture per path forever; past this the least-recently-drawn is deleted.
+constexpr size_t kMaxTexCache = 24;
 
 struct DocsState {
     // Per-session user attachments, keyed by conversation id ("" -> "default").
@@ -72,8 +96,12 @@ struct DocsState {
     std::string    officeErr;
     nlohmann::json officeResult;
 
-    // Image texture cache keyed by path (session-scale; same precedent as copilot's s_artTex).
-    std::unordered_map<std::string, Tex> tex;
+    // Image texture cache keyed by path, bounded by kMaxTexCache with LRU eviction.
+    std::unordered_map<std::string, TexSlot> tex;
+
+    // Artifact kind of the entry `selected` addresses, refreshed by the list each frame. Lets
+    // the preview honour an artifact the agent tagged "image" whatever its extension is.
+    std::string selectedKind;
 
     char pathBuf[512] = {};
 };
@@ -105,7 +133,7 @@ bool extIn(const std::string& ext, const char* const* list, size_t n) {
 }
 
 DocKind kindForExt(const std::string& ext) {
-    static const char* const kImage[]  = {".png", ".jpg", ".jpeg"};
+    static const char* const kImage[]  = {".png", ".jpg", ".jpeg", ".bmp"};
     static const char* const kOffice[] = {".pptx", ".xlsx", ".xlsm", ".pdf", ".doc", ".docx",
                                           ".ppt", ".xls"};
     static const char* const kCsv[]    = {".csv", ".tsv"};
@@ -162,6 +190,48 @@ std::string ellipsize(const std::string& s, float maxW) {
     return out + "...";
 }
 
+// A render, either because the agent tagged the artifact "image" or because the path says so.
+bool isImageEntry(const DocEntry& e) {
+    if (e.kind == "image") return true;
+    return kindForExt(lowerExt(e.path)) == DocKind::Image;
+}
+
+// `seen` holds raw paths for file identity plus this prefixed form for display identity, so a
+// doc tab whose file already arrived as an activity artifact is not listed twice.
+std::string nameKey(const std::string& n) { return "\x1f" "name\x1f" + n; }
+
+void releaseTex(Tex& t) {
+    if (!t.id) return;
+    GLuint id = (GLuint)t.id;
+    glDeleteTextures(1, &id);
+    t.id = 0;
+    t.w = t.h = 0;
+}
+
+// Lazy GL upload (same loadTexture path the copilot timeline uses for artifact images) behind
+// the bounded LRU. Returns the slot for `path`; its texture may be 0 when the decode failed.
+const TexSlot& texFor(DocsState& D, const std::string& path) {
+    auto it = D.tex.find(path);
+    if (it == D.tex.end()) {
+        TexSlot s;
+        s.t = loadTexture(path);
+        s.tried = true;
+        it = D.tex.emplace(path, s).first;
+    }
+    it->second.lastUse = ImGui::GetTime();
+    while (D.tex.size() > kMaxTexCache) {
+        auto oldest = D.tex.end();
+        for (auto i = D.tex.begin(); i != D.tex.end(); ++i) {
+            if (i->first == path) continue;   // never evict the entry we just handed out
+            if (oldest == D.tex.end() || i->second.lastUse < oldest->second.lastUse) oldest = i;
+        }
+        if (oldest == D.tex.end()) break;
+        releaseTex(oldest->second.t);
+        D.tex.erase(oldest);   // erase never invalidates `it` (only the erased iterator)
+    }
+    return it->second;
+}
+
 // ---------------------------------------------------------------- artifact collection
 
 // Agent-created files packed into activity detail after "\x1eART\x1e" (live + restored) —
@@ -187,9 +257,34 @@ void collectArtifacts(const AppState& st, std::vector<DocEntry>& out,
                 e.path = tab == std::string::npos ? line : line.substr(tab + 1);
                 e.tool = a.title.empty() ? a.stage : a.title;
                 if (e.path.empty() || !seen.insert(e.path).second) continue;
+                e.name = baseName(e.path);
+                e.key  = e.path;
+                e.agentTouched = true;   // an activity blob IS agent output by construction
+                seen.insert(nameKey(e.name));
                 out.push_back(std::move(e));
             }
         }
+    }
+}
+
+// The agent's DOCUMENTS, not just its files: a part it opened or edited belongs in this list
+// even when no file was ever written for it. "Agent-touched" is the shared contract —
+// aiHandoff, or a non-zero lastAgentEditAt.
+void collectAgentDocs(const AppState& st, std::vector<DocEntry>& out,
+                      std::unordered_set<std::string>& seen) {
+    for (const auto& t : st.docTabs) {
+        if (!t.aiHandoff && t.lastAgentEditAt == std::chrono::steady_clock::time_point{})
+            continue;
+        DocEntry e;
+        e.name = t.displayTitle();   // never the raw doc id
+        if (e.name.empty()) continue;
+        e.path = t.path;
+        e.kind = "part";
+        e.agentTouched = true;
+        if (!e.path.empty() && !seen.insert(e.path).second) continue;
+        if (!seen.insert(nameKey(e.name)).second) continue;
+        e.key = e.path.empty() ? kUnsavedKeyPrefix + e.name : e.path;
+        out.push_back(std::move(e));
     }
 }
 
@@ -505,22 +600,32 @@ void drawTextPreview(AppState& st, DocsState& D, const std::string& path, bool i
     }
 }
 
-void drawImagePreview(DocsState& D, const std::string& path,
+void drawImagePreview(AppState& st, DocsState& D, const std::string& path,
                       const AdaptiveSurface& surf, float S) {
-    auto it = D.tex.find(path);
-    if (it == D.tex.end()) it = D.tex.emplace(path, loadTexture(path)).first;
-    const Tex& t = it->second;
+    const TexSlot& slot = texFor(D, path);
+    const Tex& t = slot.t;
     if (!t.id || t.w <= 0 || t.h <= 0) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 1.0f));
-        ImGui::TextWrapped("Could not decode this image.");
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted("could not load image");
         ImGui::PopStyleColor();
+        // Never a blank pane: show whatever text presentation the file itself supports.
+        const DocKind fk = kindForExt(lowerExt(path));
+        if (fk == DocKind::Text || fk == DocKind::Csv) {
+            drawTextPreview(st, D, path, fk == DocKind::Csv, surf, S);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 1.0f));
+            ImGui::TextWrapped("Nothing decodable at this path yet - a render still being "
+                               "written, or not an image file:\n%s", path.c_str());
+            ImGui::PopStyleColor();
+        }
         return;
     }
     const float capH = ImGui::GetTextLineHeightWithSpacing() + 6.0f * S;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float sc = std::min(avail.x / (float)t.w,
-                              std::max(1.0f, avail.y - capH) / (float)t.h);
+    // Fit the pane on both axes, aspect ratio preserved (never upscale past 1:1).
+    const float sc = std::min(1.0f, std::min(avail.x / (float)t.w,
+                                             std::max(1.0f, avail.y - capH) / (float)t.h));
     const float tw = (float)t.w * sc, th = (float)t.h * sc;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail.x - tw) * 0.5f));
     ImGui::Image((ImTextureID)(intptr_t)t.id, ImVec2(tw, th));
@@ -571,6 +676,19 @@ void drawPreview(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
                    "Pick a file on the left, or attach one with the button or path entry.");
         return;
     }
+    // An agent part with no file yet: not a missing file, so say what it actually is.
+    if (D.selected.rfind(kUnsavedKeyPrefix, 0) == 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::TextUnformatted(D.selected.substr(kUnsavedKeyPrefix.size()).c_str());
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextWrapped("The agent is working on this part in the session - nothing has been "
+                           "written to disk for it yet. Save it from its document tab to read "
+                           "it here.");
+        ImGui::PopStyleColor();
+        return;
+    }
     const std::string& path = D.selected;
     std::error_code ec;
     if (!std::filesystem::exists(path, ec)) {
@@ -585,17 +703,29 @@ void drawPreview(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
         return;
     }
     const std::string ext = lowerExt(path);
-    const DocKind kind = kindForExt(ext);
+    DocKind kind = kindForExt(ext);
+    // An artifact the agent tagged "image" is a render whatever its extension looks like.
+    if (D.selectedKind == "image") kind = DocKind::Image;
     const char* kindLabel =
         kind == DocKind::Text ? "text" :
         kind == DocKind::Csv  ? "csv"  :
         kind == DocKind::Image ? "image" :
         kind == DocKind::Office ? "office/pdf" : ext.c_str();
     drawPreviewHeader(path, kindLabel, surf, S);
+    if (kind == DocKind::Image) {
+        if (chatShowRenders()) {
+            drawImagePreview(st, D, path, surf, S);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextWrapped("Render previews are off (Settings > AI > show renders in chat).");
+            ImGui::PopStyleColor();
+        }
+        return;
+    }
     switch (kind) {
         case DocKind::Text:  drawTextPreview(st, D, path, false, surf, S); break;
         case DocKind::Csv:   drawTextPreview(st, D, path, true,  surf, S); break;
-        case DocKind::Image: drawImagePreview(D, path, surf, S); break;
+        case DocKind::Image: break;   // handled above
         case DocKind::Office: {
             drawOfficePreview(st, D, path, surf, S);
             ImGui::Spacing();
@@ -617,13 +747,16 @@ void drawPreview(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
 
 // One clickable glass row: basename + right-aligned kind tag. Returns true on click;
 // `removeClicked` is set when the trailing (x) of an attached row is hit.
-bool docRow(const DocEntry& e, bool selected, const AdaptiveSurface& surf, float S,
-            bool& removeClicked) {
+bool docRow(DocsState& D, const DocEntry& e, bool selected, const AdaptiveSurface& surf,
+            float S, bool& removeClicked) {
     removeClicked = false;
+    // Renders get a two-line-tall thumbnail chip so the list is scannable at a glance.
+    const bool wantThumb = !e.path.empty() && isImageEntry(e) && chatShowRenders();
+    const float lineH  = ImGui::GetTextLineHeightWithSpacing();
     const float avail  = ImGui::GetContentRegionAvail().x;
-    const float rowH   = ImGui::GetTextLineHeightWithSpacing() + ui::metrics::cpMenuRowPadY();
+    const float rowH   = (wantThumb ? lineH * 2.0f : lineH) + ui::metrics::cpMenuRowPadY();
     const float rowW   = avail - (e.attached ? 40.0f * S : 0.0f);
-    ImGui::PushID(e.path.c_str());
+    ImGui::PushID(e.key.c_str());
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##hit", ImVec2(rowW, rowH));
     const bool clicked = ImGui::IsItemClicked();
@@ -633,29 +766,46 @@ bool docRow(const DocEntry& e, bool selected, const AdaptiveSurface& surf, float
     ui::glassRowBackground(dl, p0, ImVec2(p0.x + rowW, p0.y + rowH), rowRoundDp(), false,
                            selected, selected ? 0.5f : 0.30f);
     std::error_code ec;
-    const bool missing = !std::filesystem::exists(e.path, ec);
+    const bool missing = !e.path.empty() && !std::filesystem::exists(e.path, ec);
     const ImVec4 txt = missing    ? surf.textTertiary
                      : selected   ? surf.textPrimary
                                   : surf.textSecondary;
     const ImVec2 tagSz = ImGui::CalcTextSize(e.kind.c_str());
     const float padX = ui::metrics::cpMenuRowPadX();
-    const float padY = ui::metrics::cpMenuRowPadY() * 0.5f;
-    const float nameMaxW = rowW - tagSz.x - padX * 2.0f - ui::metrics::cpMenuRowGap();
-    const std::string name = ellipsize(baseName(e.path), std::max(24.0f, nameMaxW));
-    dl->AddText(ImVec2(p0.x + padX, p0.y + padY),
-                ImGui::ColorConvertFloat4ToU32(txt), name.c_str());
-    dl->AddText(ImVec2(p0.x + rowW - tagSz.x - padX, p0.y + padY),
+    const float textY = p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
+    float nameX = p0.x + padX;
+    if (wantThumb) {
+        const TexSlot& slot = texFor(D, e.path);
+        if (slot.t.id && slot.t.w > 0 && slot.t.h > 0) {
+            const float chipH = lineH * 2.0f - 4.0f * S;
+            const float chipW = std::min(chipH * (float)slot.t.w / (float)slot.t.h, chipH * 2.0f);
+            const ImVec2 a(nameX, p0.y + (rowH - chipH) * 0.5f);
+            dl->AddImageRounded((ImTextureID)(intptr_t)slot.t.id, a,
+                                ImVec2(a.x + chipW, a.y + chipH), ImVec2(0, 0), ImVec2(1, 1),
+                                IM_COL32_WHITE, ui::metrics::cpMenuRowRound() * 0.5f);
+            nameX = a.x + chipW + padX;
+        }
+    }
+    const float nameMaxW = (p0.x + rowW - tagSz.x - padX) - nameX - ui::metrics::cpMenuRowGap();
+    const std::string label = ellipsize(e.name.empty() ? baseName(e.path) : e.name,
+                                        std::max(24.0f, nameMaxW));
+    dl->AddText(ImVec2(nameX, textY), ImGui::ColorConvertFloat4ToU32(txt), label.c_str());
+    dl->AddText(ImVec2(p0.x + rowW - tagSz.x - padX, textY),
                 ImGui::ColorConvertFloat4ToU32(surf.textTertiary), e.kind.c_str());
     if (hovered) {
         ImGui::BeginTooltip();
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
-        ImGui::TextUnformatted(e.path.c_str());
+        ImGui::TextUnformatted(e.path.empty() ? e.name.c_str() : e.path.c_str());
         if (!e.tool.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
             ImGui::Text("from: %s", e.tool.c_str());
             ImGui::PopStyleColor();
         }
-        if (missing) {
+        if (e.path.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextUnformatted("not written to disk yet");
+            ImGui::PopStyleColor();
+        } else if (missing) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 1.0f));
             ImGui::TextUnformatted("not found on disk");
@@ -702,19 +852,27 @@ void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
     }
     ImGui::Spacing();
 
-    // ---- entries: session artifacts first, then user attachments ----
+    // ---- entries: everything the agent touched first, then the user's own attachments ----
     std::vector<DocEntry> entries;
     std::unordered_set<std::string> seen;
     collectArtifacts(st, entries, seen);
-    size_t attachedFrom = entries.size();
+    collectAgentDocs(st, entries, seen);
     for (const auto& p : attached) {
         if (!seen.insert(p).second) continue;
         DocEntry e;
         e.path = p;
+        e.name = baseName(p);
+        e.key  = p;
         e.kind = "attached";
         e.attached = true;
         entries.push_back(std::move(e));
     }
+    // ONE flat vector — selection still addresses entries[i] directly; the two labelled
+    // sections are only a header drawn before each run.
+    const size_t attachedFrom = (size_t)(
+        std::stable_partition(entries.begin(), entries.end(),
+                              [](const DocEntry& e) { return e.agentTouched; }) -
+        entries.begin());
     if (entries.empty()) {
         emptyState("No documents yet",
                    "Files agents create in this session show up here. Attach a file to "
@@ -727,10 +885,11 @@ void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
     ImGui::Spacing();
 
     int removeIdx = -1;
+    D.selectedKind.clear();
     for (int i = 0; i < (int)entries.size(); ++i) {
         if (i == 0 && attachedFrom > 0) {
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-            ImGui::TextUnformatted("Session artifacts");
+            ImGui::TextUnformatted("Agent output");
             ImGui::PopStyleColor();
         }
         if (i == (int)attachedFrom && attachedFrom < entries.size()) {
@@ -738,12 +897,16 @@ void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
             ImGui::TextUnformatted("Attached");
             ImGui::PopStyleColor();
         }
+        const DocEntry& e = entries[(size_t)i];
+        if (D.selected == e.key) D.selectedKind = e.kind;
         bool removeClicked = false;
-        if (docRow(entries[i], D.selected == entries[i].path, surf, S, removeClicked))
-            D.selected = entries[i].path;
+        if (docRow(D, e, D.selected == e.key, surf, S, removeClicked)) {
+            D.selected     = e.key;
+            D.selectedKind = e.kind;
+        }
         if (removeClicked) removeIdx = i;
     }
-    if (removeIdx >= (int)attachedFrom && removeIdx >= 0) {
+    if (removeIdx >= 0 && entries[(size_t)removeIdx].attached) {
         const std::string p = entries[(size_t)removeIdx].path;
         attached.erase(std::remove(attached.begin(), attached.end(), p), attached.end());
         if (D.selected == p) D.selected.clear();

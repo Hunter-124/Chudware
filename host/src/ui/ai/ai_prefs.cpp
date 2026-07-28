@@ -52,4 +52,51 @@ void setAiFollowActiveSession(bool on) { saveAgentInt("ui_follow_session", on ? 
 bool aiActiveWorkPreviews()          { return loadAgentInt("ui_active_work_previews", 1, 0, 1) != 0; }
 void setAiActiveWorkPreviews(bool on){ saveAgentInt("ui_active_work_previews", on ? 1 : 0); }
 
+// ---- chat transcript display -----------------------------------------------------------
+// Unlike the knobs above (read a handful of times per frame from ONE view), these are read
+// once per activity row per frame — a transcript with 60 rows would do 60 config.json opens
+// every frame through loadAgentInt. Cache the value on first read and let the setter be the
+// single invalidation point; nothing else writes these keys.
+namespace {
+struct CachedInt {
+    const char* key;
+    int def, lo, hi;
+    int  value = 0;
+    bool loaded = false;
+
+    int get() {
+        if (!loaded) { value = loadAgentInt(key, def, lo, hi); loaded = true; }
+        return value;
+    }
+    void set(int v) {
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        value = v;
+        loaded = true;
+        saveAgentInt(key, v);
+    }
+};
+
+CachedInt g_toolDetail   {"ui_chat_tool_detail",   1, 0, 2};
+CachedInt g_collapseAnim {"ui_chat_collapse_anim", 1, 0, 1};
+CachedInt g_groupCalls   {"ui_chat_group_calls",   1, 0, 1};
+CachedInt g_showRenders  {"ui_chat_show_renders",  1, 0, 1};
+CachedInt g_humanizeIds  {"ui_chat_humanize_ids",  1, 0, 1};
+}  // namespace
+
+int  chatToolDetail()                { return g_toolDetail.get(); }
+void setChatToolDetail(int v)        { g_toolDetail.set(v); }
+
+bool chatCollapseAnim()              { return g_collapseAnim.get() != 0; }
+void setChatCollapseAnim(bool on)    { g_collapseAnim.set(on ? 1 : 0); }
+
+bool chatGroupToolCalls()            { return g_groupCalls.get() != 0; }
+void setChatGroupToolCalls(bool on)  { g_groupCalls.set(on ? 1 : 0); }
+
+bool chatShowRenders()               { return g_showRenders.get() != 0; }
+void setChatShowRenders(bool on)     { g_showRenders.set(on ? 1 : 0); }
+
+bool chatHumanizeDocIds()            { return g_humanizeIds.get() != 0; }
+void setChatHumanizeDocIds(bool on)  { g_humanizeIds.set(on ? 1 : 0); }
+
 }  // namespace ui

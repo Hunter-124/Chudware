@@ -6,6 +6,9 @@
 
 #include "copilot_internal.h"
 #include "agent_text.h"
+#include "ui/copilot/tool_phrase.h"   // human phrasing + grouping for raw MCP tool symbols
+#include "ui/ai/ai_prefs.h"           // cached chat-display prefs (Settings -> AI -> Harness)
+#include "gl_compat.h"                // glDeleteTextures — bounded artifact texture cache
 
 namespace ui {
 
@@ -19,13 +22,44 @@ namespace ui {
 //
 // docLabel() is deliberately NOT used: it returns the literal "a document" for an unknown id,
 // which must never be spliced into a JSON blob. An id with no open tab stays a raw id.
-static std::string sanitizeAgentText(AppState& st, const std::string& s) {
+//
+// `Name (doc-cpp0017)` reads well in prose, but nested inside a JSON string value on the args
+// drawer it produced exactly the {"doc_id": "AI: mudbucket2 (doc-cpp00000023)"} the user called
+// out. substituteDocIds composes that parenthetical itself (agent_text.cpp — owned elsewhere),
+// so the JSON path drops it here: the NAME is what was missing, and diagnostic mode
+// (chatHumanizeDocIds off) still shows the untouched id.
+// Idempotent: with the parenthetical gone there is no id left for a later pass to match.
+static std::string stripResolvedDocIdParens(const std::string& s) {
+    if (s.find(" (doc") == std::string::npos) return s;
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        if (s[i] == ' ' && i + 9 < s.size() && s[i + 1] == '(' &&
+            s.compare(i + 2, 3, "doc") == 0 && (s[i + 5] == '-' || s[i + 5] == '_') &&
+            s.compare(i + 6, 3, "cpp") == 0) {
+            size_t j = i + 9;
+            while (j < s.size() && std::isxdigit((unsigned char)s[j])) ++j;
+            if (j > i + 9 && j < s.size() && s[j] == ')') { i = j + 1; continue; }
+        }
+        out.push_back(s[i++]);
+    }
+    return out;
+}
+
+// `jsonBody` marks the tool-row args blob, where the id parenthetical is stripped (above).
+// The whole substitution is user-gated: chatHumanizeDocIds() off (diagnostic mode) leaves engine
+// ids exactly as the harness wrote them, which is the entire point of that mode. The glyph fold
+// always runs — an unrenderable codepoint is a defect at every detail level.
+static std::string sanitizeAgentText(AppState& st, const std::string& s, bool jsonBody = false) {
     if (s.empty()) return s;
-    return foldToAtlasGlyphs(substituteDocIds(s, [&st](const std::string& id) -> std::string {
+    if (!ui::chatHumanizeDocIds()) return foldToAtlasGlyphs(s);
+    std::string out = substituteDocIds(s, [&st](const std::string& id) -> std::string {
         for (const auto& t : st.docTabs)
             if (t.docId == id) return t.displayTitle();
         return std::string();
-    }));
+    });
+    if (jsonBody) out = stripResolvedDocIdParens(out);
+    return foldToAtlasGlyphs(out);
 }
 
 // Both halves are idempotent and have no-allocation fast paths, so running this over the same
@@ -33,12 +67,110 @@ static std::string sanitizeAgentText(AppState& st, const std::string& s) {
 // right-click "Copy text" path (ui_common chatActivityCopyText) then see the same clean strings.
 // Restricted to the prose row kinds (0 thinking/action, 1 context chip, 2 thought box, 3 tool
 // call) — rowKind >= 4 are corporate/swarm cards whose detail is a JSON payload cards.cpp
-// re-parses, and those carry no doc ids.
+// re-parses, and those carry no doc ids. Only a tool row's detail is an args JSON body.
 static void sanitizeActivityItem(AppState& st, ActivityItem& a) {
     if (a.rowKind > 3) return;
     a.reason = sanitizeAgentText(st, a.reason);
-    a.detail = sanitizeAgentText(st, a.detail);
+    a.detail = sanitizeAgentText(st, a.detail, /*jsonBody=*/a.rowKind == 3);
     a.title  = sanitizeAgentText(st, a.title);
+}
+
+// ---- collapse animation (ui::chatCollapseAnim) ----------------------------------------------
+// Thinking boxes, thought boxes and tool drawers used to SNAP shut the frame a later row landed.
+// Each animated box keeps an eased 0..1 factor plus the natural height measured on its last
+// fully-open frame; while the factor is strictly between the ends the EXPANDED body is drawn
+// inside a fixed-height clipping child, so the content slides shut instead of vanishing.
+// Keyed by the caller's ImGui id, which drawAgentTimeline's per-row PushID makes unique.
+struct CollapseAnim {
+    float t = -1.0f;   // < 0 = never seen: seeded to the target so history never animates in
+    float h = 0.0f;    // natural expanded height, logical px, from the last fully-open frame
+};
+static std::unordered_map<ImGuiID, CollapseAnim> s_collapseT;
+static constexpr float kCollapseSecs = 0.18f;
+
+// Advance *key*'s factor toward *open* and return the smoothstep-eased value in [0,1].
+static float collapseEase(ImGuiID key, bool open) {
+    // A long session scrolls through thousands of row ids; dropping the table wholesale is
+    // cheaper than per-entry liveness tracking and only costs a reseed (no visible animation).
+    if (s_collapseT.size() > 4096) s_collapseT.clear();
+    CollapseAnim& c = s_collapseT[key];
+    const float target = open ? 1.0f : 0.0f;
+    if (c.t < 0.0f) {
+        c.t = target;
+    } else if (c.t != target) {
+        const float step = ImGui::GetIO().DeltaTime / kCollapseSecs;
+        c.t = (c.t < target) ? ImMin(target, c.t + step) : ImMax(target, c.t - step);
+    }
+    return c.t * c.t * (3.0f - 2.0f * c.t);
+}
+
+struct CollapseBody {
+    ImGuiID key = 0;
+    bool    child = false;     // body is clipped inside a fixed-height child
+    bool    measure = false;   // body is inline this frame: record its natural height
+    float   y0 = 0.0f;
+};
+
+// Opens the animated body for *key*; the caller only reaches this when e > 0. Fully open — or
+// not yet measured, i.e. the box's very first open frame — draws inline and measures. Anything
+// in between clips into a child of the measured height scaled by e.
+static CollapseBody beginCollapseBody(ImGuiID key, float e, const char* id) {
+    CollapseBody b;
+    b.key = key;
+    const float h = s_collapseT[key].h;
+    if (e >= 1.0f || h <= 0.0f) {
+        b.measure = true;
+        b.y0 = ImGui::GetCursorPosY();
+        return b;
+    }
+    b.child = true;
+    const float ah = h * e;
+    ImGui::BeginChild(id, ImVec2(0.0f, ah < 1.0f ? 1.0f : ah), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    return b;
+}
+
+static void endCollapseBody(CollapseBody& b) {
+    if (b.child) { ImGui::EndChild(); return; }
+    if (b.measure) {
+        const float h = ImGui::GetCursorPosY() - b.y0;
+        if (h > 0.0f) s_collapseT[b.key].h = h;
+    }
+}
+
+// ---- inline artifact thumbnails: bounded texture cache --------------------------------------
+// Renders are now written once per render_part call, so the old unbounded path-keyed map leaked
+// one GL texture per call for the life of the process. LRU-bounded; eviction deletes on the GL
+// thread, the only thread that ever draws these rows. There is no shared Tex release helper in
+// the host (app_state.cpp:1176 deletes inline exactly the same way), so the delete lives here.
+struct ArtTexEntry {
+    Tex                tex;
+    unsigned long long use = 0;
+};
+static std::unordered_map<std::string, ArtTexEntry> s_artTex;
+static unsigned long long s_artTexClock = 0;
+static constexpr size_t kArtTexCap = 48;
+
+static const Tex& artTexFor(const std::string& path) {
+    auto it = s_artTex.find(path);
+    if (it != s_artTex.end()) {
+        it->second.use = ++s_artTexClock;
+        return it->second.tex;
+    }
+    while (s_artTex.size() >= kArtTexCap) {
+        auto oldest = s_artTex.begin();
+        for (auto i = s_artTex.begin(); i != s_artTex.end(); ++i)
+            if (i->second.use < oldest->second.use) oldest = i;
+        if (oldest->second.tex.id) {
+            unsigned int id = oldest->second.tex.id;
+            glDeleteTextures(1, &id);
+        }
+        s_artTex.erase(oldest);
+    }
+    ArtTexEntry e;
+    e.tex = loadTexture(path);
+    e.use = ++s_artTexClock;
+    return s_artTex.emplace(path, e).first->second.tex;
 }
 
 void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
@@ -294,6 +426,11 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         }
     }
     const bool hasDetail = !replyBody.empty() || !sentBody.empty();
+    // Collapse animation: the body eases shut over kCollapseSecs instead of vanishing.
+    const ImGuiID animKey = ImGui::GetID("##thinkblk_anim");
+    const bool    wantOpen = open && hasDetail;
+    const float   openE = ui::chatCollapseAnim() ? collapseEase(animKey, wantOpen)
+                                                 : (wantOpen ? 1.0f : 0.0f);
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
@@ -301,7 +438,7 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
     const ui::AdaptiveSurface& surf = chatSurf();
-    if (!open && hasDetail) {
+    if (openE <= 0.0f && hasDetail) {
         // Collapsed presentation: dim stage icon before the title, same Image+SameLine pattern
         // as drawActionCard's header.
         ui::IconUV iv = ui::getIcon(stageIconName(a.stage, a.missionHeader), 20);
@@ -325,7 +462,8 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
     }
-    if (open && hasDetail) {
+    if (openE > 0.0f) {
+        CollapseBody cb = beginCollapseBody(animKey, openE, "##thinkanim");
         if (!sentBody.empty()) {
             if (ImGui::TreeNodeEx("Sent to model##thinksent", ImGuiTreeNodeFlags_SpanAvailWidth)) {
                 drawProseBox("##thinksentbox", sentBody, ui::metrics::copilotProseMaxH());
@@ -343,6 +481,7 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
                 ImGui::TreePop();
             }
         }
+        endCollapseBody(cb);
     } else if (hasDetail && !replyBody.empty()) {
         // Collapsed: dim one-line preview of the first reply line, ellipsized to the card's
         // content width (same pattern as drawThoughtBox).
@@ -608,6 +747,10 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
                                 : (a.userToggled ? a.expanded
                                                  : (a.expanded || a.streaming ||
                                                     (!isOutput && liveFrontier)));
+    // Collapse animation: the body eases shut over kCollapseSecs instead of vanishing.
+    const ImGuiID animKey = ImGui::GetID("##thoughtbox_anim");
+    const float   openE = ui::chatCollapseAnim() ? collapseEase(animKey, open)
+                                                 : (open ? 1.0f : 0.0f);
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
@@ -634,7 +777,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     }
 
     // Ops JSON collapsed (default): one-line summary from reason (op count / byte count).
-    if (isOpsJson && !open) {
+    if (isOpsJson && openE <= 0.0f) {
         std::string sum = a.reason;
         if (sum.empty()) {
             char buf[64];
@@ -647,8 +790,9 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         ImGui::PopStyleColor();
     }
 
-    if (open) {
+    if (openE > 0.0f) {
         if (!a.detail.empty()) {
+            CollapseBody cb = beginCollapseBody(animKey, openE, "##thoughtanim");
             if (isOpsJson) {
                 // Raw JSON only inside the expander.
                 drawProseBox("##opsraw", a.detail, ui::metrics::copilotProseMaxH());
@@ -668,6 +812,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
                              grow ? ui::metrics::copilotProseStreamCapH()
                                   : ui::metrics::copilotProseMaxH(), grow);
             }
+            endCollapseBody(cb);
         }
     } else if (!isOpsJson && !a.detail.empty()) {
         // Collapsed thinking/prose: dim one-line preview (first line), ellipsized to the card's
@@ -857,18 +1002,28 @@ static bool toolRowIsGuardRefusal(const ActivityItem& a) {
     return a.status == "fail" && isLoopGuardRefusal(splitToolRowDetail(a.detail).err);
 }
 
-// M14 — one inline row per tool call ("Doing"): ok/fail glyph + tool icon + tool name + latency,
-// with the human-readable target as a dim wrapped line. Args preview + failure text + image
-// artifacts expand on click.
+// M14 — one inline row per tool call: ok/fail glyph + tool icon + a HUMAN title (tool_phrase.h
+// turns `add_features` into "Building geometry"; the raw MCP symbol survives as the title's
+// tooltip, and as a dim suffix at chatToolDetail() >= 2) + latency, with the cleaned target as a
+// dim wrapped line. Args preview + failure text + image artifacts expand on click, and the
+// drawer eases shut (chatCollapseAnim) instead of snapping when the next call starts.
 // Mid-loop CAD tool failures use statusWarn (amber), matching drawAgentStep build issues — the
 // error is fed back for repair, not a catastrophic turn failure. A loop-guard refusal is not a
 // failure at all (the tool never ran), so it drops the amber chrome entirely for the neutral
 // "skipped" glyph + iterBuilt blue chip. `failCount` > 1 collapses consecutive identical
-// tool+target fails into one row (drawAgentTimeline computes the run).
+// tool+target fails into one row; a non-null `group` of >1 is a fold of consecutive SIMILAR
+// successful calls into one card (drawAgentTimeline computes both runs).
 static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& fonts,
-                                int failCount, bool liveFrontier, int callI = -1) {
+                                int failCount, bool liveFrontier, int callI = -1,
+                                const std::vector<ActivityItem*>* group = nullptr) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
+    // Chat-display prefs (cached in ai_prefs — safe to read per row per frame).
+    const int  detailLvl = ui::chatToolDetail();
+    const bool simple    = detailLvl <= 0;   // human sentence only: no drawer, no meta, no ids
+    const bool diag      = detailLvl >= 2;   // + the raw MCP symbol dim after the human title
+    const bool showRenders = ui::chatShowRenders();
+    const int  groupN    = (group && group->size() > 1) ? (int)group->size() : 1;
     // Split the packed detail FIRST: whether this row is a genuine failure or the harness's own
     // loop-guard refusal decides the glyph, chip, tone and border drawn below.
     const ToolRowDetail parts = splitToolRowDetail(a.detail);
@@ -883,6 +1038,26 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     // Refusals get the palette's informational role instead (iterBuilt — the "in progress,
     // nothing broke" blue of the "built" step badge and the AI-VC tool chip), never amber.
     const ImVec4 guardTone = semanticOnGlass(pal.iterBuilt, chatSurf());
+
+    // Drawer state is settled BEFORE anything is drawn: the header's click targets and the
+    // animated body both need it, and a grouped card's drawer is its members' drawers stacked.
+    const bool open = a.userToggled ? a.expanded : (a.expanded || liveFrontier);
+    bool hasDrawer = !argsBody.empty() || !errBody.empty() || !artsBlob.empty();
+    if (groupN > 1) {
+        hasDrawer = false;
+        for (const ActivityItem* mi : *group) {
+            const ToolRowDetail mp = splitToolRowDetail(mi->detail);
+            if (!mp.args.empty() || !mp.err.empty() || !mp.arts.empty()) { hasDrawer = true; break; }
+        }
+    }
+    // Simplified mode has no (details) affordance, no args drawer and no engine ids at all —
+    // artifacts still reach the user, drawn inline below instead of behind an expander.
+    if (simple) hasDrawer = false;
+    const ImGuiID animKey = ImGui::GetID("##toolrow_anim");
+    const bool    wantOpen = open && hasDrawer;
+    const float   openE = ui::chatCollapseAnim() ? collapseEase(animKey, wantOpen)
+                                                 : (wantOpen ? 1.0f : 0.0f);
+
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -890,6 +1065,48 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     ImGui::BeginChild("##toolrow", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     const ui::AdaptiveSurface& surf = chatSurf();
+
+    // One artifact blob -> inline images (or, with renders off, dim path lines) + file actions.
+    // Shared by the single-row drawer, every member of a grouped drawer, and simplified mode.
+    auto drawArtifacts = [&](const std::string& blob) {
+        if (blob.empty()) return;
+        const float logW = ImGui::GetContentRegionAvail().x;
+        std::istringstream iss(blob);
+        std::string line;
+        int imgI = 0;
+        while (std::getline(iss, line)) {
+            if (line.empty()) continue;
+            size_t tab = line.find('\t');
+            std::string kindA = (tab == std::string::npos) ? "file" : line.substr(0, tab);
+            std::string path  = (tab == std::string::npos) ? line : line.substr(tab + 1);
+            if (path.empty()) continue;
+            ++imgI;
+            if (kindA == "image" && showRenders) {
+                const Tex& tx = artTexFor(path);
+                if (tx.id) {
+                    float maxTw = ui::metrics::copilotThumbW();
+                    float tw = logW < maxTw ? logW : maxTw;
+                    float th = tw * (float)tx.h / (float)std::max(1, tx.w);
+                    ImGui::PushID(imgI);
+                    ImGui::Image((ImTextureID)(intptr_t)tx.id, ImVec2(tw, th));
+                    ImGui::PopID();
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+                    ImGui::TextWrapped("image: %s", path.c_str());
+                    ImGui::PopStyleColor();
+                }
+            } else {
+                // mesh / file — and, with renders off, images too: a dim path line, no upload.
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+                ImGui::TextWrapped("%s: %s", kindA.c_str(), path.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::PushID(imgI + 1000);
+            chatArtifactActions(st, path);
+            ImGui::PopID();
+        }
+    };
+
     drawStatusGlyph(hardFail ? "retry" : guard ? "skipped" : a.status,
                     ImGui::GetTextLineHeight());
     ImGui::SameLine(0, 6 * sc);
@@ -900,57 +1117,108 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
         ImGui::SameLine(0, 6 * sc);
     }
+    // ---- the human title. `add_features` is an MCP symbol, not a sentence: the card says what
+    // the call DOES, and the raw symbol stays reachable as the title's tooltip (always) and as a
+    // dim suffix in diagnostic mode.
+    const std::string humanTitle = groupN > 1
+        ? ui::toolGroupTitle(a.title, groupN)
+        : ui::toolPhrase(a.title, a.reason, !fail).title;
     ImGui::PushFont(fonts.medium);
-    {
-        std::string doingTitle = "Doing \xc2\xb7 " + a.title;
-        ImGui::TextColored(hardFail ? failTone : surf.textPrimary, "%s", doingTitle.c_str());
-    }
+    ImGui::TextColored(hardFail ? failTone : surf.textPrimary, "%s", humanTitle.c_str());
     ImGui::PopFont();
-
-    // Auto-open while this row is the live frontier of the turn; collapses as soon as a later
-    // row lands or the turn ends. A user's explicit toggle always wins, both directions.
-    const bool open = a.userToggled ? a.expanded : (a.expanded || liveFrontier);
-    const bool hasDrawer = !argsBody.empty() || !errBody.empty() || !artsBlob.empty();
+    // Click state is sampled BEFORE SetTooltip: that opens a window of its own and the
+    // IsItem* queries afterwards would no longer refer to the title.
+    const bool titleHovered = ImGui::IsItemHovered();
+    bool toggleHit = hasDrawer && ImGui::IsItemClicked();
+    if (titleHovered) {
+        if (hasDrawer) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("%s", a.title.c_str());
+    }
+    if (diag) {
+        ImGui::SameLine(0, 6 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::Text("\xc2\xb7 %s", a.title.c_str());
+        ImGui::PopStyleColor();
+    }
     if (hasDrawer) {
-        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
         ImGui::SameLine(0, 6 * sc);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         ImGui::TextUnformatted(open ? "(hide)" : "(details)");
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
+        if (ImGui::IsItemClicked()) toggleHit = true;
     }
-    if (fail || a.durationMs > 0 || failCount > 1) {
-        ImGui::SameLine(0, 8 * sc);
-        char meta[80];
+    if (toggleHit) { a.expanded = !open; a.userToggled = true; }
+
+    // ---- meta chip: latency / failure count / refusal note. Simplified mode shows none of it.
+    double groupMs = a.durationMs;
+    if (groupN > 1) {
+        groupMs = 0;
+        for (const ActivityItem* mi : *group) groupMs += mi->durationMs;
+    }
+    std::string metaS;
+    if (!simple) {
+        char meta[96];
         // A refusal has no latency worth showing (nothing was dispatched) and is not a failure:
         // it is the harness skipping a call the model already made.
-        if (guard && failCount > 1)
+        if (groupN > 1) {
+            if (groupMs > 0) {
+                std::snprintf(meta, sizeof(meta), "%.1fs", groupMs / 1000.0);
+                metaS = meta;
+            }
+        } else if (guard && failCount > 1) {
             std::snprintf(meta, sizeof(meta), "skipped \xc2\xb7 repeated call \xc3\x97%d", failCount);
-        else if (guard)
-            std::snprintf(meta, sizeof(meta), "skipped \xc2\xb7 repeated call");
-        else if (hardFail && failCount > 1 && a.durationMs > 0)
+            metaS = meta;
+        } else if (guard) {
+            metaS = "skipped \xc2\xb7 repeated call";
+        } else if (hardFail && failCount > 1 && a.durationMs > 0) {
             std::snprintf(meta, sizeof(meta), "failed \xc3\x97%d \xc2\xb7 %.1fs",
                           failCount, a.durationMs / 1000.0);
-        else if (hardFail && failCount > 1)
+            metaS = meta;
+        } else if (hardFail && failCount > 1) {
             std::snprintf(meta, sizeof(meta), "failed \xc3\x97%d", failCount);
-        else if (hardFail && a.durationMs > 0)
+            metaS = meta;
+        } else if (hardFail && a.durationMs > 0) {
             std::snprintf(meta, sizeof(meta), "failed \xc2\xb7 %.1fs", a.durationMs / 1000.0);
-        else if (hardFail)
-            std::snprintf(meta, sizeof(meta), "failed");
-        else
+            metaS = meta;
+        } else if (hardFail) {
+            metaS = "failed";
+        } else if (a.durationMs > 0) {
             std::snprintf(meta, sizeof(meta), "%.1fs", a.durationMs / 1000.0);
+            metaS = meta;
+        }
+    }
+    if (!metaS.empty()) {
+        ImGui::SameLine(0, 8 * sc);
         ImGui::PushStyleColor(ImGuiCol_Text, guard ? guardTone
                                            : hardFail ? failTone : surf.textSecondary);
-        ImGui::TextUnformatted(meta);
+        ImGui::TextUnformatted(metaS.c_str());
         ImGui::PopStyleColor();
     }
     // Per-call rewind: restore the part to the state BEFORE this individual tool call.
     // Self-gating — it draws nothing unless exactly one checkpoint matches this call
     // ordinal AND tool name, so read-only calls and pre-checkpoint history get no glyph.
-    drawAiVcCallRewind(st, callI, a.title);
-    if (!a.reason.empty()) dimText(a.reason.c_str());   // the human target — "what it acts on"
+    // A grouped card covers several calls, so it never offers one (callI arrives as -1).
+    if (groupN == 1) drawAiVcCallRewind(st, callI, a.title);
+
+    // ---- the human target(s) — "what it acts on".
+    if (groupN > 1) {
+        // Each folded member's own target, so a run of three never hides which three.
+        std::vector<std::string> tgts;
+        tgts.reserve(group->size());
+        for (const ActivityItem* mi : *group) {
+            std::string t = ui::humanTarget(mi->reason);
+            if (!t.empty()) tgts.push_back(std::move(t));
+        }
+        constexpr size_t kMaxTargetLines = 6;
+        for (size_t k = 0; k < tgts.size() && k < kMaxTargetLines; ++k) dimText(tgts[k].c_str());
+        if (tgts.size() > kMaxTargetLines)
+            dimText(("+" + std::to_string(tgts.size() - kMaxTargetLines) + " more").c_str());
+    } else {
+        const std::string tgt = ui::humanTarget(a.reason);
+        if (!tgt.empty()) dimText(tgt.c_str());
+    }
+
     if (guard) {
         // What happened, in the user's terms — collapsed AND expanded, because it is the row's
         // label, not its payload. The model-facing guidance text appears only in the drawer, so
@@ -959,88 +1227,70 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         ImGui::TextWrapped("Identical call repeated — the harness skipped it and asked the model "
                            "to try another approach. The tool never ran.");
         ImGui::PopStyleColor();
-    } else if (hardFail && !errBody.empty() && !open) {
+    } else if (hardFail && !errBody.empty() && (simple || openE <= 0.0f)) {
         // Keep a one-line cause visible even when collapsed (same calm tone as drawAgentStep).
+        // In simplified mode this IS the failure presentation — there is no drawer behind it.
         ImGui::PushStyleColor(ImGuiCol_Text, failTone);
         ImGui::TextWrapped("%s", errSummary(errBody).c_str());
         ImGui::PopStyleColor();
     }
-    if (open && hasDrawer) {
-        if (guard) {
-            // The guidance sent back to the model, in full, wrapped in place. NOT drawCodeBox:
-            // that is an InputTextMultiline, which does not wrap — it clipped this single long
-            // line mid-word — and its content would only repeat the summary above it.
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-            ImGui::TextWrapped("%s", errBody.c_str());
-            ImGui::PopStyleColor();
-        } else if (hardFail && !errBody.empty()) {
-            // Why it failed, first: amber summary + full text in a warn-outlined code box.
-            ImGui::PushStyleColor(ImGuiCol_Text, failTone);
-            ImGui::TextWrapped("%s", errSummary(errBody).c_str());
-            ImGui::PopStyleColor();
-            const ImVec2 errMin = ImGui::GetCursorScreenPos();
-            const float errW = ImGui::GetContentRegionAvail().x;
-            drawCodeBox("##toolerr", errBody, fonts.mono, ui::metrics::px(200.0f));
-            const ImVec2 errMax(errMin.x + errW,
-                                ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y);
-            ImGui::GetWindowDrawList()->AddRect(errMin, errMax,
-                                                ui::Palette::toU32(pal.statusWarn),
-                                                4.0f * sc, 0, ui::metrics::stroke(1.0f));
-        }
-        // The guard's own text quotes the repeated arguments verbatim ("…with the same arguments
-        // ({})"), so a second box holding that same "{}" is noise — drop it in that case only.
-        // Longer args, which the guard summarizes and truncates, still get their box; either way
-        // right-click Copy on the row yields the whole raw detail.
-        if (!argsBody.empty() &&
-            !(guard && errBody.find(argsBody) != std::string::npos))
-            drawProseBox("##tooldetail", stripMdMarks(argsBody), ui::metrics::copilotProseMaxH());
-        // Inline image artifacts (lazy GL upload; same path as drawAgentStep contact sheets).
-        if (!artsBlob.empty()) {
-            const float logW = ImGui::GetContentRegionAvail().x;
-            // Session-local texture cache keyed by path (tool rows are redrawn every frame).
-            static std::unordered_map<std::string, Tex> s_artTex;
-            std::istringstream iss(artsBlob);
-            std::string line;
-            int imgI = 0;
-            while (std::getline(iss, line)) {
-                if (line.empty()) continue;
-                size_t tab = line.find('\t');
-                std::string kindA = (tab == std::string::npos) ? "file" : line.substr(0, tab);
-                std::string path  = (tab == std::string::npos) ? line : line.substr(tab + 1);
-                if (path.empty()) continue;
-                if (kindA == "image") {
-                    auto it = s_artTex.find(path);
-                    if (it == s_artTex.end()) {
-                        Tex t = loadTexture(path);
-                        it = s_artTex.emplace(path, t).first;
-                    }
-                    if (it->second.id) {
-                        float maxTw = ui::metrics::copilotThumbW();
-                        float tw = logW < maxTw ? logW : maxTw;
-                        float th = tw * (float)it->second.h / (float)std::max(1, it->second.w);
-                        ImGui::PushID(imgI++);
-                        ImGui::Image((ImTextureID)(intptr_t)it->second.id, ImVec2(tw, th));
-                        ImGui::PopID();
-                    } else {
-                        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-                        ImGui::TextWrapped("image: %s", path.c_str());
-                        ImGui::PopStyleColor();
-                    }
-                    ImGui::PushID(imgI + 1000);
-                    chatArtifactActions(st, path);
-                    ImGui::PopID();
-                } else {
-                    // mesh / file — show path as a dim line (no inline preview) + file actions.
-                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-                    ImGui::TextWrapped("%s: %s", kindA.c_str(), path.c_str());
-                    ImGui::PopStyleColor();
-                    ImGui::PushID(imgI + 2000);
-                    chatArtifactActions(st, path);
-                    ImGui::PopID();
-                    ++imgI;
-                }
+    if (simple) {
+        // No drawer, but a render the agent looked at must still reach the user.
+        if (groupN > 1)
+            for (const ActivityItem* mi : *group) drawArtifacts(splitToolRowDetail(mi->detail).arts);
+        else
+            drawArtifacts(artsBlob);
+    }
+    if (openE > 0.0f && hasDrawer) {
+        CollapseBody cb = beginCollapseBody(animKey, openE, "##toolanim");
+        if (groupN > 1) {
+            // Grouped: every member's drawer stacked, each under its own dim target line.
+            // Only successes ever group (toolPhrase hands failures an empty groupKey), so
+            // there is no per-member failure chrome to reproduce here.
+            int memberI = 0;
+            for (const ActivityItem* mi : *group) {
+                ImGui::PushID(memberI++);
+                const ToolRowDetail mp = splitToolRowDetail(mi->detail);
+                const std::string t = ui::humanTarget(mi->reason);
+                if (!t.empty()) dimText(t.c_str());
+                if (!mp.args.empty())
+                    drawProseBox("##tooldetail", stripMdMarks(mp.args),
+                                 ui::metrics::copilotProseMaxH());
+                drawArtifacts(mp.arts);
+                ImGui::PopID();
             }
+        } else {
+            if (guard) {
+                // The guidance sent back to the model, in full, wrapped in place. NOT drawCodeBox:
+                // that is an InputTextMultiline, which does not wrap — it clipped this single long
+                // line mid-word — and its content would only repeat the summary above it.
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                ImGui::TextWrapped("%s", errBody.c_str());
+                ImGui::PopStyleColor();
+            } else if (hardFail && !errBody.empty()) {
+                // Why it failed, first: amber summary + full text in a warn-outlined code box.
+                ImGui::PushStyleColor(ImGuiCol_Text, failTone);
+                ImGui::TextWrapped("%s", errSummary(errBody).c_str());
+                ImGui::PopStyleColor();
+                const ImVec2 errMin = ImGui::GetCursorScreenPos();
+                const float errW = ImGui::GetContentRegionAvail().x;
+                drawCodeBox("##toolerr", errBody, fonts.mono, ui::metrics::px(200.0f));
+                const ImVec2 errMax(errMin.x + errW,
+                                    ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y);
+                ImGui::GetWindowDrawList()->AddRect(errMin, errMax,
+                                                    ui::Palette::toU32(pal.statusWarn),
+                                                    4.0f * sc, 0, ui::metrics::stroke(1.0f));
+            }
+            // The guard's own text quotes the repeated arguments verbatim ("…with the same
+            // arguments ({})"), so a second box holding that same "{}" is noise — drop it in that
+            // case only. Longer args, which the guard summarizes and truncates, still get their
+            // box; either way right-click Copy on the row yields the whole raw detail.
+            if (!argsBody.empty() &&
+                !(guard && errBody.find(argsBody) != std::string::npos))
+                drawProseBox("##tooldetail", stripMdMarks(argsBody), ui::metrics::copilotProseMaxH());
+            drawArtifacts(artsBlob);
         }
+        endCollapseBody(cb);
     }
     ImGui::EndChild();
     ImGui::PopStyleVar();   // ##toolrow WindowPadding
@@ -1117,11 +1367,17 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         } else if (a.rowKind == 2) {
             drawThoughtBox(a, fonts, showThinking, liveFrontier);
         } else if (a.rowKind == 3) {
+            // TWO independent folds, and they can never collide: tool_phrase.h invariant 1 gives
+            // a FAILED call an empty groupKey, so the similarity fold below only ever sees
+            // successes while the identical-failure fold below only ever sees failures.
+            //
             // Collapse consecutive identical tool+target failures into one row with a count
             // (stops five identical amber cards stacking during a repair loop). Show the
             // last item in the run so the visible error_preview is the most recent.
             int failCount = 1;
             size_t drawIdx = i;
+            size_t frontIdx = i;     // the run's LAST row decides live-frontier auto-expansion
+            std::vector<ActivityItem*> group;
             if (a.status == "fail") {
                 const bool aGuard = toolRowIsGuardRefusal(a);
                 size_t j = i + 1;
@@ -1136,20 +1392,46 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
                     ++j;
                 }
                 drawIdx = j - 1;
+                frontIdx = j - 1;
                 i = j - 1;  // loop ++i advances past the coalesced run
+            } else if (ui::chatGroupToolCalls() && a.status != "running" &&
+                       a.stage != "artifacts") {
+                // Fold a run of consecutive successful calls that phrase to the same groupKey
+                // into ONE card ("Rendering the part x 3") instead of N near-identical cards.
+                const std::string key = ui::toolPhrase(a.title, a.reason, true).groupKey;
+                if (!key.empty()) {
+                    size_t j = i + 1;
+                    while (j < m.activity.size()) {
+                        const ActivityItem& n = m.activity[j];
+                        if (n.rowKind != 3 || n.status == "fail" || n.status == "running") break;
+                        if (n.stage == "artifacts") break;
+                        if (ui::toolPhrase(n.title, n.reason, true).groupKey != key) break;
+                        ++j;
+                    }
+                    if (j > i + 1) {
+                        group.reserve(j - i);
+                        for (size_t k = i; k < j; ++k) group.push_back(&m.activity[k]);
+                        frontIdx = j - 1;
+                        i = j - 1;   // loop ++i advances past the folded run
+                    }
+                }
             }
             // This row's call ordinal. The synthesized "Session files" row is presentation,
             // not a checkpointed call, so it never consumes an index. A coalesced run of
-            // identical failures draws ONE row but consumed failCount calls, so the ordinal
-            // advances by all of them — the row itself rewinds to before the FIRST attempt.
+            // identical failures — or a folded group of similar successes — draws ONE row but
+            // consumed that many calls, so the ordinal advances by all of them.
             int callIdx = -1;
             if (a.stage != "artifacts") {
                 callIdx = ++toolOrdinal;
                 if (failCount > 1) toolOrdinal += failCount - 1;
+                if (group.size() > 1) toolOrdinal += (int)group.size() - 1;
             }
-            // Frontier for the coalesced row is judged by the row actually drawn (drawIdx).
+            // A grouped card must never offer a rewind glyph pointing at an arbitrary member;
+            // the identical-failure fold still rewinds to before the FIRST attempt.
+            const int rewindIdx = group.size() > 1 ? -1 : callIdx;
             drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount,
-                                turnRunning && (drawIdx == lastVisible), callIdx);
+                                turnRunning && (frontIdx == lastVisible), rewindIdx,
+                                group.size() > 1 ? &group : nullptr);
         } else if (a.rowKind == 10) {
             drawClassificationCard(a, fonts, turnRunning);
         } else if (a.rowKind == 19) {

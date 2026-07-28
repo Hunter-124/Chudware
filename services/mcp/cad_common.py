@@ -563,6 +563,89 @@ def _tmp(suffix: str) -> str:
     return path
 
 
+_RENDER_PRUNE_DONE = False
+
+
+def render_output_path(stem: str = "render", suffix: str = ".png") -> str:
+    """Durable path for a render the MODEL receives — and therefore the USER must see.
+
+    Deliberately NOT :func:`_tmp`. ``services/agent/agent_events.py::_is_internal_scratch``
+    drops any artifact whose basename starts with ``chudware_mcp_`` (the ``_tmp`` prefix),
+    so ``derive_artifacts`` returned nothing for every render tool and the
+    ``agent.tool_call`` event carried no ``artifacts`` field at all — verified on the live
+    run ``run-138660919763973``, where ``render_part`` reported ``artifacts: None``. The
+    GUI's inline-image path and the Artifacts panel read that field, so the user never saw
+    the images the vision model was looking at. Renders therefore live under
+    ``<CACHE>/renders/YYYY-MM-DD/<stem>-<token><suffix>``: outside the scratch filter,
+    self-describing on disk, and pruned (see :func:`prune_render_cache`). Do NOT "tidy"
+    this back onto a tempfile — that silently re-breaks render visibility.
+
+    `stem` should say what the render is OF (part name + view, e.g. ``mudbucket-iso``); it
+    is sanitised to ``[A-Za-z0-9._-]``, collapsed, trimmed to 60 chars, and falls back to
+    ``render`` when nothing usable survives.
+    """
+    from services import paths as _paths  # noqa: PLC0415 — alias-aware root, read late
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(stem or ""))
+    safe = re.sub(r"-{2,}", "-", safe).strip("-.")[:60].strip("-.") or "render"
+    day = Path(_paths.CACHE) / "renders" / time.strftime("%Y-%m-%d")
+    day.mkdir(parents=True, exist_ok=True)
+    global _RENDER_PRUNE_DONE
+    if not _RENDER_PRUNE_DONE:
+        # Opportunistic, once per process: keeps the cache bounded without a cron/daemon.
+        _RENDER_PRUNE_DONE = True
+        prune_render_cache()
+    return os.path.abspath(str(day / f"{safe}-{os.urandom(4).hex()}{suffix}"))
+
+
+def prune_render_cache(max_age_days: int = 7, max_files: int = 2000) -> int:
+    """Bound ``<CACHE>/renders`` and return how many files were deleted.
+
+    Files older than `max_age_days` go first; if the cache is still over `max_files` the
+    oldest survivors go until it fits. Empty day directories are removed afterwards. This
+    NEVER raises: a permission error or a racing unlink must not be able to break a render.
+    """
+    removed = 0
+    try:
+        from services import paths as _paths  # noqa: PLC0415
+        root = Path(_paths.CACHE) / "renders"
+        if not root.is_dir():
+            return 0
+        keep: list = []
+        cutoff = time.time() - max(0.0, float(max_age_days)) * 86400.0
+        for p in root.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff:
+                try:
+                    p.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+            else:
+                keep.append((mtime, p))
+        if len(keep) > max_files:
+            keep.sort(key=lambda e: e[0])
+            for _mtime, p in keep[:len(keep) - max_files]:
+                try:
+                    p.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        for d in sorted(root.iterdir(), reverse=True):
+            try:
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001 — a broken cache must never break a render
+        pass
+    return removed
+
+
 def _captioned_render(png: str, doc_id: str, views: list,
                       annotations: Optional[dict] = None,
                       extra: str = "") -> Union[Image, list]:

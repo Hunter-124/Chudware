@@ -4419,19 +4419,60 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
     # ---------------------------------------------------------------- modeling
 
+    def _doc_path_stem(entry: dict) -> str:
+        """Case-folded file stem of a doc's backing path, or "".
+
+        The app's native suffixes are two-part tokens (".step+", ".stl+"), so the
+        stem is everything before the LAST '.' of the basename — "mudbucket.step+"
+        stems to "mudbucket", and a dotted name like "v1.2_bracket" keeps its dot
+        only if it also carries a real extension."""
+        raw = entry.get("path") or entry.get("file_path") or ""
+        if not isinstance(raw, str) or not raw.strip():
+            return ""
+        base = raw.strip().replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        if "." in base:
+            base = base.rsplit(".", 1)[0]
+        return base.strip().casefold()
+
+    def _best_open_doc(matches: list) -> dict:
+        """The one of several same-named docs an agent MEANT: the most built
+        (highest feature_count), then the most revised, then the most recently
+        opened (last in doc_list order). Deterministic — never a coin flip."""
+        def _key(pair):
+            i, e = pair
+            built = e.get("feature_count")
+            rev = e.get("revision")
+            return (built if isinstance(built, (int, float)) else 0,
+                    rev if isinstance(rev, (int, float)) else 0,
+                    i)
+        return max(enumerate(matches), key=_key)[1]
+
     @mcp.tool()
     def new_part(name: str = "part", *, fresh: bool = False) -> str:
         """Create an editable part document named `name` and make it current.
 
-        A part of that name that is ALREADY OPEN is resumed, not duplicated. A general agent
-        that retries a brief, or a `model3d` worker that respawns per turn, calls
-        new_part(name="Widget") again with no memory of the doc_id it got back; the engine's
-        doc_new UNIQUIFIES the collision into "Widget2" and mints a second document, and
-        every mint fans out doc.opened to the GUI, so copies of "the same part" pile up in
-        the user's tab strip (observed live: one requested part produced
-        CD-1400_TwistedLatticeSphere and five more numbered ...2 through ...6).
+        A part of that name that is ALREADY OPEN is RESUMED, never duplicated — and that
+        holds however many open documents answer to the name. A general agent that retries
+        a brief, or a `model3d` worker that respawns per turn, calls new_part(name="Widget")
+        again with no memory of the doc_id it got back; the engine's doc_new UNIQUIFIES the
+        collision into "Widget2" and mints a second document, and every mint fans out
+        doc.opened to the GUI, so copies of "the same part" pile up in the user's tab strip
+        (observed live: one requested part produced CD-1400_TwistedLatticeSphere and five
+        more numbered ...2 through ...6; and an import followed by two new_part("mudbucket")
+        calls left mudbucket, mudbucket and mudbucket2 open at once).
         The name IS the identity an agent addresses a part by, so asking for one that exists
-        means "resume it". Pass `fresh=True` for a deliberately separate document.
+        means "resume it". The rules, exactly:
+
+          * ONE OR MORE open parts named `name` -> resume the best of them (most features,
+            then highest revision, then most recently opened). The reply reports
+            `duplicates` and every colliding doc_id when there was more than one; pass
+            `doc_id=` to a modeling tool to work in a specific one.
+          * NO name match, but exactly ONE open part whose FILE STEM is `name`
+            (import_part("Projects/Testing/mudbucket.step+") often leaves the doc named
+            after the file) -> resume that one; the reply carries `resumed_by="path_stem"`.
+            Several parts stemming to the same name are ambiguous and are NOT guessed — a
+            new document is minted instead, because editing the wrong part is worse.
+          * `fresh=True` is the ONLY way to force a second document with a taken name.
 
         A resumed part that already carries geometry says so in `feature_count` and `note`:
         build ON what is there. Ignoring that and placing the next body at the origin is what
@@ -4445,8 +4486,16 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                         if isinstance(e, dict) and e.get("doc_id")]
                 existing = _docs_named(docs, name)
-                if len(existing) == 1:
-                    taken = existing[0]
+                by_stem = ""
+                if not existing:
+                    folded = (name or "").strip().casefold()
+                    stemmed = [e for e in docs if folded and _doc_path_stem(e) == folded]
+                    # Exactly one is an identification; several is a guess, and the wrong
+                    # part edited is worse than one extra document.
+                    if len(stemmed) == 1:
+                        existing, by_stem = stemmed, "path_stem"
+                if existing:
+                    taken = _best_open_doc(existing)
                     did = taken["doc_id"]
                     _CUR["doc_id"] = did
                     # Never reset a real baseline to 0.0: the part may already carry
@@ -4458,13 +4507,30 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                f"(get_part first), or call new_part(fresh=True) for a "
                                f"separate empty document"
                                if isinstance(built, int) and built > 0 else "")
-                    return _dumps({
+                    out = {
                         "ok": True, "doc_id": did,
                         "name": taken.get("name") or name,
-                        "revision": taken.get("revision", 0), "reused": True,
+                        "revision": taken.get("revision", 0),
+                        "reused": True, "resumed": True,
                         "feature_count": built,
                         "note": f'resumed the open part "{name}" (doc_id={did}) instead of '
-                                f"minting a duplicate document" + carries})
+                                f"minting a duplicate document" + carries}
+                    if by_stem:
+                        out["resumed_by"] = by_stem
+                        src = taken.get("path") or taken.get("file_path") or ""
+                        out["note"] = (
+                            f'resumed the open part imported from "{src}" (doc_id={did}), '
+                            f'whose file stem is "{name}", instead of minting a duplicate '
+                            f"document" + carries)
+                    elif len(existing) > 1:
+                        others = ", ".join(str(e.get("doc_id")) for e in existing)
+                        out["duplicates"] = len(existing)
+                        out["note"] += (
+                            f'; {len(existing)} open documents answer to "{name}" '
+                            f"({others}) — pass doc_id= explicitly to work in a specific "
+                            f"one, or new_part(fresh=True) for a deliberately separate "
+                            f"document")
+                    return _dumps(out)
             r = cb.call("doc_new", {"kind": "part", "name": name})
             did = r.get("doc_id")
             _CUR["doc_id"] = did

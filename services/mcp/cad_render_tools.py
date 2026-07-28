@@ -21,6 +21,7 @@ from .cad_common import (
     _crop_rect_for_target,
     _describe_part_excerpt,
     _doc,
+    _handoff_doc_name,
     _inspect_caption,
     _normalize_view_list,
     _orbit_view_dirs,
@@ -34,7 +35,18 @@ from .cad_common import (
     _tmp,
     _vnorm,
     cb,
+    render_output_path,
 )
+
+
+def _render_stem(doc_id: str, label: str = "") -> str:
+    """Filename stem naming what a render is OF: the resolved document name (else the doc
+    id) joined with the view / target label, so a file lands as
+    ``renders/2026-07-28/mudbucket-iso-3f2a9c11.png`` and is self-describing both on disk
+    and in the GUI's Artifacts panel."""
+    base = (_handoff_doc_name(doc_id) or "").strip() or str(doc_id or "part")
+    label = str(label or "").strip()
+    return f"{base}-{label}" if label else base
 
 
 def _annotated_view_tiles(d: str, view_list: list, highlight=None, annotate: bool = True,
@@ -55,6 +67,9 @@ def _annotated_view_tiles(d: str, view_list: list, highlight=None, annotate: boo
             vd = _camera_dir_for_target(matches or [], v if v != "auto" else "auto")
         except Exception:  # noqa: BLE001
             vd = _vnorm((1.0, 1.0, 0.8))
+        # Internal plumbing: every tile is composed into ONE sheet by the caller
+        # (_tile_pngs_grid) and is never handed to the model, so tiles stay on the scratch
+        # prefix — only the finished sheet gets a durable render_output_path.
         png_full = _tmp(".png")
         r = cb.call("doc_render_view", {"doc_id": d, "out_path": png_full,
                                         "view": {"dir": list(vd)}, "annotate": bool(annotate)})
@@ -168,8 +183,10 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         plus the tool to call for it. A model that reads only the caption still knows the scene.
         """
         d = _doc(doc_id)
-        png = _tmp(".png")
         view_name = view if isinstance(view, str) else ("iso" if view is None else "custom")
+        # Durable, not scratch: this exact path is returned when annotate=False with nothing
+        # emphasized, and by the drawing-render fallback below.
+        png = render_output_path(_render_stem(d, view_name), ".png")
 
         # Resolve emphasis target (accept either `target` or `emphasize`).
         emp_spec = emphasize if emphasize is not None else target
@@ -255,7 +272,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 highlight=highlight,
                 edges=bool(annotate),
                 callouts=bool(annotate) and not cropping,
-                scale=bool(annotate) and not cropping)
+                scale=bool(annotate) and not cropping,
+                out_png=render_output_path(_render_stem(d, view_name), ".png"))
 
         caption_extra = ""
         if emp_matches and view_dir is not None:
@@ -268,11 +286,14 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 # Frame camera to feature AABB via crop (engine has no eye/bbox override).
                 rect = _crop_rect_for_target(part_bb, target_bb, view_dir,
                                             margin=0.18, zoom_factor=1.35)
+                # Internal: the crop is immediately repainted by the emphasis overlay below
+                # and never returned, so it stays on the scratch prefix.
                 png_crop = _tmp(".png")
                 _crop_png_to_rect(png, rect, png_crop)
                 png_emp, palette = _apply_emphasis_overlay(
                     png_crop, d, emp_matches, part_bb, view_dir,
-                    mode=emphasis_mode or "emphasis")
+                    mode=emphasis_mode or "emphasis",
+                    out_png=render_output_path(_render_stem(d, view_name), ".png"))
                 png = png_emp
                 # Auto-section when the target is internal.
                 if _target_is_internal(emp_matches, part_bb):
@@ -329,7 +350,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         d = _doc(doc_id)
         view_list = views or ["front", "right", "top", "iso"]
         if not annotate and highlight is None:
-            png = _tmp(".png")
+            png = render_output_path(_render_stem(d, "contact-sheet"), ".png")
             r = cb.call("doc_render_contact_sheet",
                         {"doc_id": d, "out_path": png, "views": views or []})
             if not r.get("ok") or not os.path.exists(png):
@@ -342,7 +363,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                                                      annotate=annotate)
         if not tiles:
             raise ValueError("Contact sheet failed: no bodies to render")
-        out = _tmp(".png")
+        out = render_output_path(_render_stem(d, "contact-sheet"), ".png")
         _tile_pngs_grid(tiles, out, labels=labels,
                         cols=max(1, int(math.ceil(math.sqrt(len(tiles))))))
         return _captioned_render(out, d, labels,
@@ -391,7 +412,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             # Native engine sheet only when there is nothing to overlay (it tiles internally,
             # so there is no per-tile image to draw edges or a highlight onto).
             if not annotate and highlight is None:
-                png = _tmp(".png")
+                png = render_output_path(_render_stem(d, "views"), ".png")
                 r = cb.call("doc_render_contact_sheet",
                             {"doc_id": d, "out_path": png, "views": view_list})
                 if not r.get("ok") or not os.path.exists(png):
@@ -407,7 +428,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                                                          annotate=annotate)
             if not tiles:
                 raise ValueError("render_views failed: no bodies to render")
-            out = _tmp(".png")
+            out = render_output_path(_render_stem(d, "views"), ".png")
             _tile_pngs_grid(tiles, out, labels=labels, cols=3)
             return _captioned_render(out, d, labels,
                                      annotations=_merge_annotation_infos(infos),
@@ -427,7 +448,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             part_bb=part_bb, target_bb=target_bb, matches=matches)
         if not tile_paths:
             raise ValueError("render_views: every tile render failed")
-        out = _tmp(".png")
+        out = render_output_path(
+            _render_stem(d, f"{resolved.get('label') or 'target'}-views"), ".png")
         # 3-column grid reads better for 6–7 views than the 2-col look_around default.
         _tile_pngs_grid(tile_paths, out, labels=labels, cols=3)
         caption = (
@@ -494,6 +516,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             raise ValueError("no part bounding box — build geometry first")
 
         view_dir = _camera_dir_for_target(matches, view)
+        # Internal: unconditionally cropped into png_out below, never returned.
         png_full = _tmp(".png")
         r = cb.call("doc_render_view", {
             "doc_id": d, "out_path": png_full,
@@ -510,14 +533,17 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
 
         rect = _crop_rect_for_target(part_bb, target_bb, view_dir,
                                     margin=float(margin), zoom_factor=float(zoom_factor))
-        png_out = _tmp(".png")
+        png_out = render_output_path(
+            _render_stem(d, f"{resolved.get('label') or 'target'}"), ".png")
         _crop_png_to_rect(png_full, rect, png_out)
 
         palette = None
         if emphasize:
             png_out, palette = _apply_emphasis_overlay(
                 png_out, d, matches, part_bb, view_dir,
-                mode=emphasis_mode or "emphasis")
+                mode=emphasis_mode or "emphasis",
+                out_png=render_output_path(
+                    _render_stem(d, f"{resolved.get('label') or 'target'}-emphasis"), ".png"))
 
         caption = _inspect_caption(d, resolved, target_bb, view_dir,
                                    method="crop", n_matches=len(matches))
@@ -561,6 +587,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         tile_paths = []
         labels = []
         for i, vd in enumerate(dirs):
+            # Internal: each orbit frame is cropped, then tiled into the returned sheet.
             png_full = _tmp(".png")
             r = cb.call("doc_render_view", {
                 "doc_id": d, "out_path": png_full,
@@ -570,13 +597,14 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 continue
             rect = _crop_rect_for_target(part_bb, target_bb, vd,
                                         margin=float(margin), zoom_factor=float(zoom_factor))
-            png_tile = _tmp(".png")
+            png_tile = _tmp(".png")  # internal tile — composed into `out` below
             _crop_png_to_rect(png_full, rect, png_tile)
             tile_paths.append(png_tile)
             labels.append(f"orbit {i * (360 // max(len(dirs), 1))}°")
         if not tile_paths:
             raise ValueError("look_around: every orbit render failed")
-        out = _tmp(".png")
+        out = render_output_path(
+            _render_stem(d, f"{resolved.get('label') or 'target'}-look-around"), ".png")
         _tile_pngs(tile_paths, out, labels=labels)
         caption = (
             f"Look-around of {resolved.get('label')!r}: {len(tile_paths)} orbit close-ups. "
@@ -620,6 +648,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             raise ValueError("no part bounding box — build geometry first")
 
         view_dir = _camera_dir_for_target(matches, view)
+        # Internal: unconditionally cropped, then emphasis-painted into png_out.
         png_full = _tmp(".png")
         r = cb.call("doc_render_view", {
             "doc_id": d, "out_path": png_full,
@@ -635,11 +664,13 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
 
         rect = _crop_rect_for_target(part_bb, target_bb, view_dir,
                                     margin=0.18, zoom_factor=1.45)
-        png_crop = _tmp(".png")
+        png_crop = _tmp(".png")  # internal: repainted by the emphasis overlay below
         _crop_png_to_rect(png_full, rect, png_crop)
         png_out, palette = _apply_emphasis_overlay(
             png_crop, d, matches, part_bb, view_dir,
-            mode=emphasis_mode or "emphasis")
+            mode=emphasis_mode or "emphasis",
+            out_png=render_output_path(
+                _render_stem(d, f"{resolved.get('label') or 'target'}-emphasis"), ".png"))
 
         caption = _inspect_caption(d, resolved, target_bb, view_dir,
                                    method="crop", n_matches=len(matches))

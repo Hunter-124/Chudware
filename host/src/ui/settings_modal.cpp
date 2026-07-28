@@ -3194,6 +3194,75 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
 
     ImGui::Dummy(ImVec2(0, 6.0f * sc));
 
+    // ---- Chat display: how the transcript renders the agent's work. These knobs live in
+    // config.json (agent.ui_chat_*) and persist themselves inside the ui/ai/ai_prefs.h setters,
+    // so they deliberately do NOT flip `changed` — a saveSettings from here would write back
+    // unrelated AppState::Settings state the caller never touched.
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                                 ui::palette.textDim[2], 1));
+    ImGui::TextUnformatted("Chat display");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+
+    if (ImGui::BeginTable("##harness_chat_display", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Tool call detail");
+            helpMarker("Simplified: plain sentences only. Normal: sentences with an "
+                       "expandable raw drawer. Diagnostic: raw arguments, engine document "
+                       "ids and timings, drawers open by default.");
+            ImGui::SetNextItemWidth(-1.0f);
+            static const char* kChatDetail[] = {"Simplified", "Normal", "Diagnostic"};
+            int detail = ui::chatToolDetail();
+            if (detail < 0 || detail > 2) detail = 1;
+            if (ImGui::Combo("##h_chat_detail", &detail, kChatDetail, 3))
+                ui::setChatToolDetail(detail);
+        }
+
+        ImGui::TableNextColumn();
+        {
+            bool anim = ui::chatCollapseAnim();
+            if (ImGui::Checkbox("Animate collapsing boxes", &anim))
+                ui::setChatCollapseAnim(anim);
+            helpMarker("Thinking boxes and tool drawers slide shut when the next step "
+                       "starts instead of snapping.");
+        }
+
+        ImGui::TableNextColumn();
+        {
+            bool group = ui::chatGroupToolCalls();
+            if (ImGui::Checkbox("Group repeated tool calls", &group))
+                ui::setChatGroupToolCalls(group);
+            helpMarker("Fold consecutive calls of the same tool into one card with a "
+                       "count. Failures are never folded.");
+        }
+
+        ImGui::TableNextColumn();
+        {
+            bool renders = ui::chatShowRenders();
+            if (ImGui::Checkbox("Show renders inline", &renders))
+                ui::setChatShowRenders(renders);
+            helpMarker("Display the images the vision model is looking at in the "
+                       "transcript and the Artifacts panel. Off shows file paths instead.");
+        }
+
+        ImGui::TableNextColumn();
+        {
+            bool human = ui::chatHumanizeDocIds();
+            if (ImGui::Checkbox("Humanize document ids", &human))
+                ui::setChatHumanizeDocIds(human);
+            helpMarker("Replace engine ids like doc-cpp0000001f with the part's name in "
+                       "agent text. Turn off to see exactly what the model sent.");
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+
     // ---- Sliders / budgets in 2 columns ----
     if (ImGui::BeginTable("##harness_sliders", 2,
                           ImGuiTableFlags_SizingStretchSame |

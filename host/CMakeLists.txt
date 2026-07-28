@@ -100,6 +100,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/conv_ids.cpp           # session-id allocation (GL-free; unit-tested)
   src/ui/copilot/agent_text.cpp         # doc-id + atlas-glyph text sanitizers (GL-free; unit-tested)
   src/ui/copilot/text_wrap.cpp          # composer hard-break tracking (GL-free; unit-tested)
+  src/ui/copilot/tool_phrase.cpp        # tool-call human phrasing + grouping keys (GL-free; unit-tested)
   src/ui/copilot/settings.cpp           # AI settings sections + model dropdown
   src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
@@ -556,6 +557,24 @@ add_test(NAME test_text_wrap
   COMMAND test_text_wrap
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end composer hard-break tracking ---
+
+# --- tool-call human phrasing + grouping (GL-free) ---
+# The chat transcript used to print the raw MCP symbol ("Doing . add_features") and stack one
+# card per call, so a repair loop read as a wall of identical rows. tool_phrase.cpp turns a
+# (tool, target, ok) triple into the sentence the card shows and the key consecutive calls are
+# grouped by; both are pure string logic, so they are pinned here rather than eyeballed in the
+# running GUI.
+add_executable(test_tool_phrase
+  src/ui/copilot/tool_phrase.cpp
+  tests/test_tool_phrase.cpp)
+target_include_directories(test_tool_phrase PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_tool_phrase PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_tool_phrase
+  COMMAND test_tool_phrase
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end tool-call human phrasing ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD

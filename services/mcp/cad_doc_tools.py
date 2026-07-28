@@ -220,6 +220,39 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
             return True
     return False
 
+#: Side words a model uses when it names a face in prose, mapped to the engine's side token.
+_FACE_SIDE_WORDS = {
+    "top": "top", "upper": "top", "above": "top",
+    "bottom": "bottom", "lower": "bottom", "under": "bottom", "underside": "bottom",
+    "front": "front", "back": "back", "rear": "back",
+    "left": "left", "right": "right",
+}
+_FACE_NOUNS = ("face", "surface", "facet")
+
+
+def _face_phrase_query(v: Any) -> Optional[dict]:
+    """'the top face' -> {"of": "face", "side": "top"}; anything else -> None.
+
+    A prose FACE reference is not a datum. _norm_datum returns an unrecognized string
+    UNCHANGED, so refs.plane="the top face" sailed through to the kernel and died on
+    "'the top face' is neither a reserved datum nor a feature id" — which also stranded the
+    extrude that referenced the sketch by name (live copilot run, 2026-07-28).
+
+    Mapping it to the like-named ORIGIN DATUM would be wrong geometry, not a near miss:
+    plane.top is z=0, while the top face of a 20mm boss is z=20. The geometry query resolves
+    the actual face, so that is what a face phrase becomes. A phrase must name a face noun
+    AND exactly one side, or it stays untouched for the datum path.
+    """
+    if not isinstance(v, str):
+        return None
+    words = re.findall(r"[a-z]+", v.lower())
+    if not any(w in _FACE_NOUNS for w in words):
+        return None
+    sides = {_FACE_SIDE_WORDS[w] for w in words if w in _FACE_SIDE_WORDS}
+    if len(sides) != 1:
+        return None
+    return {"of": "face", "side": sides.pop()}
+
 
 def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     """Rewrite a natural/flat sketch add_feature into the engine's canonical shape."""
@@ -323,7 +356,19 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     refs_out = dict(feat.get("refs") or {})
     plane = None
     for src in (refs_out.get("plane"), params.get("plane"), feat.get("plane")):
-        p = _norm_datum(src) if src is not None else None
+        if src is None:
+            continue
+        query = _face_phrase_query(src)
+        if query is not None:
+            plane = query
+            if notes is not None:
+                notes.append(
+                    f'{_feat_label(feat, "sketch")}: read plane="{src}" as '
+                    f'{{"of":"face","side":"{query["side"]}"}} — a prose FACE reference '
+                    f"resolves the real face of the body; the like-named origin datum "
+                    f'("plane.{query["side"]}") is a different plane entirely')
+            break
+        p = _norm_datum(src)
         if p:
             plane = p
             break
@@ -1886,6 +1931,28 @@ def _normalize_extrude_params(feat: dict, ftype: str, notes: list) -> dict:
         changed = True
         notes.append(f'{label}: interpreted end "{end_v}" as "{canon}" — an {ftype} ends '
                      f'"blind" (depth), "through_all" or "mid_plane"')
+
+    # A negative depth is how a model says "the other way" — overwhelmingly a pocket cut
+    # DOWN from the sketch plane (params {"distance": -8, "mode": "cut"}, live copilot run
+    # 2026-07-28). The kernel refuses it outright with "extrude depth must be > 0" and never
+    # says how to reverse, so the whole batch died. The sign is direction, not magnitude:
+    # take the magnitude and flip the run.
+    depth_v = peek("depth")
+    given = depth_v.get("value") if _is_dim_object(depth_v) else depth_v
+    if _is_num(given) and float(given) < 0:
+        magnitude = _clean_num(abs(float(given)))
+        if _is_dim_object(depth_v):
+            params["depth"] = {**depth_v, "value": magnitude}
+        else:
+            params["depth"] = magnitude
+        flipped = not bool(peek("flip") not in (_MISSING, None, False))
+        params["flip"] = flipped
+        out.pop("depth", None)
+        out.pop("flip", None)
+        changed = True
+        notes.append(f"{label}: read depth={given} as depth={magnitude} with flip="
+                     f"{str(flipped).lower()} — the sign of an {ftype} is its DIRECTION; "
+                     f"depth is a magnitude and must be > 0")
 
     if not changed:
         return feat

@@ -1260,3 +1260,95 @@ class TestMaterialDesignations:
         from services.mcp.cad_common import _resolve_appearance
         with _pytest.raises(ValueError):
             _resolve_appearance("mystery unobtainium")
+
+
+class TestProseFaceAsSketchPlane:
+    """refs.plane="the top face" (live copilot run, 2026-07-28).
+
+    _norm_datum returns an unrecognized string UNCHANGED, so the phrase reached the kernel
+    and died on "'the top face' is neither a reserved datum nor a feature id" — which also
+    stranded the extrude that referenced the sketch by name, making one root cause look
+    like two failures.
+    """
+
+    @pytest.mark.parametrize("phrase,side", [
+        ("the top face", "top"),
+        ("top face", "top"),
+        ("the upper surface", "top"),
+        ("bottom face", "bottom"),
+        ("the underside face", "bottom"),
+        ("front face", "front"),
+        ("the rear surface", "back"),
+        ("left face", "left"),
+    ])
+    def test_a_face_phrase_becomes_a_geometry_query(self, phrase, side):
+        assert M._face_phrase_query(phrase) == {"of": "face", "side": side}
+
+    @pytest.mark.parametrize("phrase", [
+        "plane.top",        # already canonical
+        "top plane",        # a DATUM, not a face — must stay on the datum path
+        "the xy plane",
+        "top",              # bare side word: datum
+        "the angled face",  # a face, but no side we can resolve — do not guess
+        "the top and bottom faces",  # two sides — ambiguous, do not guess
+        "PocketSk",         # a feature name
+        42,
+        None,
+    ])
+    def test_everything_else_is_left_alone(self, phrase):
+        assert M._face_phrase_query(phrase) is None
+
+    def test_a_face_phrase_is_not_silently_swapped_for_the_origin_datum(self):
+        """plane.top is z=0; the top face of a 20mm boss is z=20. Mapping a face phrase to
+        the like-named datum would be wrong geometry, not a near miss."""
+        notes: list = []
+        out = M._normalize_sketch_feature({
+            "type": "sketch", "name": "PocketSk", "refs": {"plane": "the top face"},
+            "params": {"entities": [{"type": "rectangle", "cx": 0, "cy": 0,
+                                     "width": 58.6, "height": 29.5}]}}, notes)
+        assert out["refs"]["plane"] == {"of": "face", "side": "top"}
+        assert any("prose FACE reference" in n for n in notes)
+
+    def test_a_datum_plane_still_normalizes_to_the_datum(self):
+        out = M._normalize_sketch_feature({
+            "type": "sketch", "name": "S", "refs": {"plane": "top"},
+            "params": {"entities": [{"type": "circle", "cx": 0, "cy": 0, "r": 5}]}}, [])
+        assert out["refs"]["plane"] == "plane.top"
+
+
+class TestNegativeExtrudeDepth:
+    """params {"distance": -8, "mode": "cut"} (same live run).
+
+    The kernel refuses a negative depth with "extrude depth must be > 0" and never says how
+    to reverse the run, so the batch died. The sign is DIRECTION, not magnitude.
+    """
+
+    def _norm(self, params):
+        notes: list = []
+        out = M._normalize_extrude_params(
+            {"type": "extrude", "name": "DevicePocket", "params": dict(params)},
+            "extrude", notes)
+        return out.get("params", {}), notes
+
+    def test_a_negative_distance_becomes_depth_plus_flip(self):
+        params, notes = self._norm({"distance": -8, "mode": "cut"})
+        assert params["depth"] == 8
+        assert params["flip"] is True
+        assert any("DIRECTION" in n for n in notes)
+
+    def test_a_negative_depth_on_top_of_an_explicit_flip_flips_back(self):
+        """Two reversals are not a reversal — otherwise we silently double-negate."""
+        params, _ = self._norm({"depth": -5, "flip": True})
+        assert params["depth"] == 5
+        assert params["flip"] is False
+
+    def test_a_negative_dimension_object_keeps_its_wrapper(self):
+        params, _ = self._norm({"depth": {"value": -12, "expr": None}})
+        assert params["depth"] == {"value": 12, "expr": None}
+        assert params["flip"] is True
+
+    def test_a_positive_depth_is_untouched(self):
+        params, notes = self._norm({"depth": 8, "mode": "cut"})
+        assert params["depth"] == 8
+        assert "flip" not in params
+        assert not any("DIRECTION" in n for n in notes)

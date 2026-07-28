@@ -98,10 +98,25 @@ class ToolCallLoopGuard:
 
     @staticmethod
     def message(detection: RepeatedToolCallDetection) -> str:
+        # The escape hatches must never include the tool being refused. Live
+        # 2026-07-27: haiku called ask_user with {} four times and the guard
+        # answered "change approach (replan/ask_user)" — telling it to call the
+        # very tool just blocked, so the only advice on offer was the loop.
+        alternatives = [t for t in ("replan", "ask_user") if t != detection.tool]
+        escape = (f" or change approach ({'/'.join(alternatives)})"
+                  if alternatives else "")
+        # An empty-argument repeat is almost always a schema failure, not a
+        # genuine retry: the model does not know how to fill the call in, so
+        # "try different arguments" alone leaves it stuck.
+        empty_args = detection.arguments_summary.strip() in ("{}", "")
+        hint = (" The arguments were EMPTY — you are missing the tool's required "
+                "fields, so re-read its schema and supply them, or drop this tool "
+                "and continue with what you already know."
+                if empty_args else "")
         return (
             f"LOOP GUARD: '{detection.tool}' was just called {detection.count}× in a "
             f"row with the same arguments ({detection.arguments_summary}) — this call "
             "was refused rather than repeated. The result did not change last time and "
             "will not change now; read the prior result again, try different "
-            "arguments, or change approach (replan/ask_user) instead of repeating."
+            f"arguments{escape} instead of repeating.{hint}"
         )

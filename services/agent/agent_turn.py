@@ -1475,6 +1475,54 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     _trig_prev_calls_idx = 0
     # One trim-and-retry per turn on context overflow, then fail honestly.
     _ctx_overflow_retried = False
+    # Auto-enable-on-reach budget. Bounded so a model that keeps reaching for
+    # unrelated packs still converges on a refusal instead of silently widening
+    # its own permissions for the whole turn.
+    _autoenable_budget = [4]
+
+    def _apply_categories(cats: list[str]) -> list[str]:
+        """Enable tool *cats* for the rest of this turn; return newly-added names.
+
+        Shared by the explicit ``enable_tools`` call and by auto-enable-on-reach
+        below, so both widen the allow-set, mirror the live registry policy and
+        re-render the §9.1 tools block identically — the model must see real
+        schemas for anything it can now call, however the pack got enabled.
+        """
+        nonlocal system, tools_text
+        from services.agent.tool_categories import resolve_categories  # noqa: PLC0415
+        expanded = resolve_categories(cats)
+        newly = sorted(expanded - allow)
+        # In-place: `allow |= expanded` would rebind the name and make `allow`
+        # a local of this closure (UnboundLocalError on the read above).
+        allow.update(expanded)
+        allow.add("enable_tools")
+        allow.add("list_tool_categories")
+        try:
+            from services.mcp import tool_registry as _tr  # noqa: PLC0415
+            cur = _tr._current_allow()
+            if cur is not None:
+                _tr.set_policy(allow=sorted(set(cur) | allow),
+                               deny_risk=_tr._current_deny_risk())
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
+            new_text, _meta = render_tools_block(
+                sorted(allow), resolver=resolver_for(mission_dispatch))
+            if new_text:
+                if tools_text and tools_text in system:
+                    system = system.replace(tools_text, new_text, 1)
+                elif "\nAllowed tools: " in system and not tools_text:
+                    import re as _re  # noqa: PLC0415
+                    system = _re.sub(r"\nAllowed tools: [^\n]*",
+                                     "\n\n" + new_text, system, count=1)
+                else:
+                    system = system.rstrip() + "\n\n" + new_text
+                tools_text = new_text
+        except Exception:  # noqa: BLE001
+            pass
+        return newly
+
     for _ in range(budget + 1):
         # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  When this turn IS a
         # sub-agent session (subagent_id set), drain the cross-process steering queue
@@ -2096,48 +2144,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                             "note": "already full access (unrestricted mode)",
                         }
                     else:
-                        expanded = resolve_categories(cats)
-                        newly = sorted(expanded - allow)
-                        allow |= expanded
-                        allow.add("enable_tools")
-                        allow.add("list_tool_categories")
-                        # Mirror into live tool_registry policy when active.
-                        try:
-                            from services.mcp import tool_registry as _tr  # noqa: PLC0415
-                            cur = _tr._current_allow()
-                            if cur is not None:
-                                _tr.set_policy(
-                                    allow=sorted(set(cur) | allow),
-                                    deny_risk=_tr._current_deny_risk(),
-                                )
-                        except Exception:  # noqa: BLE001
-                            pass
-                        # Re-render tools block so subsequent steps see new schemas.
-                        try:
-                            from services.agent.tool_schemas import (  # noqa: PLC0415
-                                render_tools_block,
-                            )
-                            _resolver = resolver_for(mission_dispatch)
-                            new_text, _meta = render_tools_block(
-                                sorted(allow), resolver=_resolver,
-                            )
-                            if new_text:
-                                if tools_text and tools_text in system:
-                                    system = system.replace(tools_text, new_text, 1)
-                                elif "\nAllowed tools: " in system and not tools_text:
-                                    # Replace bare name list with full block.
-                                    import re as _re  # noqa: PLC0415
-                                    system = _re.sub(
-                                        r"\nAllowed tools: [^\n]*",
-                                        "\n\n" + new_text,
-                                        system,
-                                        count=1,
-                                    )
-                                else:
-                                    system = system.rstrip() + "\n\n" + new_text
-                                tools_text = new_text
-                        except Exception:  # noqa: BLE001
-                            pass
+                        newly = _apply_categories(cats)
                         meta_result = {
                             "ok": True,
                             "enabled": newly,
@@ -2177,14 +2184,18 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             continue
 
         if allow and tool not in allow:
-            note = {"tool": tool, "error": f"tool {tool!r} not in allowed list"}
-            calls.append(note)
-            _log(ledger, actor, {"event": "tool_denied", **note})
-            # Name the pack that owns the tool when we can — "not permitted"
-            # alone leaves the model guessing dialects for a tool it cannot
-            # see (2026-07-27: k3 wrote add_features blind twice).
-            _deny_msg = (
-                f"Tool {tool!r} is not permitted. Choose an allowed tool.")
+            # Auto-enable-on-reach. A tool the model asked for by its REAL name,
+            # that lives in a pack this turn is allowed to enable, is not a
+            # policy violation — it is a pack that has not been pulled in yet.
+            # Denying it costs a full billed completion to be told to call
+            # enable_tools, plus another to retry: live 2026-07-27 (haiku, one
+            # build) describe_part, measure_part and verify_battery each burned
+            # that pair, 6 of 19 calls spent on paperwork. Enable it and run the
+            # call, saying so, instead of bouncing the model.
+            # The kill-switches still win: a tool disabled in Settings, denied
+            # by risk class, or belonging to no known pack falls through to the
+            # refusal below exactly as before.
+            _packs: list[str] = []
             try:
                 from services.agent.tool_categories import (  # noqa: PLC0415
                     CATEGORY_PACKS,
@@ -2194,27 +2205,53 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     name for name in sorted(CATEGORY_PACKS)
                     if tool in resolve_categories([name])
                 ]
+            except Exception:  # noqa: BLE001 — pack lookup is best-effort
+                _packs = []
+            _auto_pack = None
+            if _packs and _autoenable_budget[0] > 0:
+                try:
+                    _apply_categories([_packs[0]])
+                    if tool in allow:
+                        _auto_pack = _packs[0]
+                        _autoenable_budget[0] -= 1
+                except Exception:  # noqa: BLE001 — never break the turn
+                    _auto_pack = None
+            if _auto_pack is not None:
+                _log(ledger, actor, {"event": "tool_pack_autoenabled",
+                                     "tool": tool, "pack": _auto_pack})
+                messages.append({"role": "user", "content": _parts(
+                    f"[auto-enabled] {tool!r} needed the {_auto_pack!r} pack, so it "
+                    f"was enabled for you and the call was run — its schema is now "
+                    f"in your tools list. Enable packs up front next time.")})
+                # fall through and dispatch the call for real
+            else:
+                note = {"tool": tool, "ok": False,
+                        "error": f"tool {tool!r} not in allowed list"}
+                note["result"] = {"ok": False, "error": note["error"]}
+                calls.append(note)
+                _log(ledger, actor, {"event": "tool_denied",
+                                     "tool": tool, "error": note["error"]})
+                _deny_msg = (
+                    f"Tool {tool!r} is not permitted. Choose an allowed tool.")
                 if _packs:
                     _deny_msg = (
                         f"Tool {tool!r} is not enabled in this turn. It is in "
                         f"the {_packs!r} pack(s) - call enable_tools("
                         f"categories=[{_packs[0]!r}]) to pull it in with its "
                         f"schema, then retry.")
-            except Exception:  # noqa: BLE001 — pack lookup is best-effort
-                pass
-            messages.append({"role": "user", "content": _parts(_deny_msg)})
-            # Skill auto-invocation on reach: a denied tool with a skill
-            # trigger still injects its SKILL.md body so the model learns the
-            # right workflow at the moment of need (once per session).
-            try:
-                from services.agent import skills as _skills_den  # noqa: PLC0415
-                for _sk_body in _skills_den.activate_for_prompt(
-                        "", session_id=_sid, tools_about_to_run=[tool],
-                        role=actor):
-                    messages.append({"role": "user", "content": _parts(_sk_body)})
-            except Exception:  # noqa: BLE001 — skill nudge never breaks turn
-                pass
-            continue
+                messages.append({"role": "user", "content": _parts(_deny_msg)})
+                # Skill auto-invocation on reach: a denied tool with a skill
+                # trigger still injects its SKILL.md body so the model learns the
+                # right workflow at the moment of need (once per session).
+                try:
+                    from services.agent import skills as _skills_den  # noqa: PLC0415
+                    for _sk_body in _skills_den.activate_for_prompt(
+                            "", session_id=_sid, tools_about_to_run=[tool],
+                            role=actor):
+                        messages.append({"role": "user", "content": _parts(_sk_body)})
+                except Exception:  # noqa: BLE001 — skill nudge never breaks turn
+                    pass
+                continue
 
         # mega-13/14: HARD block thrash tools that skip the ECAD product chain.
         # Soft [ECAD enablement] nudges were ignored live (place×6 → max_iters,
@@ -3270,6 +3307,74 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
 # Parsing + dispatch
 # ---------------------------------------------------------------------------
 
+#: Keys that are directive CONTROL fields, never tool arguments. Anything else
+#: sitting beside "tool" in a flat directive is an argument.
+_DIRECTIVE_CONTROL_KEYS = frozenset({
+    "tool", "tool_name", "toolname", "name", "function", "function_name",
+    "args", "arguments", "parameters", "params", "input", "inputs",
+    "tool_input", "kwargs", "done", "handoff", "status", "thought",
+    "thoughts", "thinking", "reasoning", "reasoning_summary", "plan",
+    "rationale", "explanation", "commentary", "step", "next", "id", "type",
+})
+#: Where models nest their arguments when they DO nest them.
+_DIRECTIVE_ARG_KEYS = (
+    "args", "arguments", "parameters", "params", "tool_input", "input",
+    "inputs", "kwargs",
+)
+
+
+def _normalize_directive(obj: dict) -> dict:
+    """Fold known tool-call dialects onto the canonical ``{tool, args}`` shape.
+
+    Live 2026-07-27 (claude-haiku-4-5): the model emitted
+    ``{"tool": "fs_list", "path": "/…/CDR"}`` — arguments FLAT beside the tool
+    name rather than nested under ``args``. The caller read
+    ``parsed.get("args") or {}``, so every argument was silently dropped and the
+    tool was invoked with nothing; the model then retried the identical empty
+    call until the loop guard killed the run. Small models write this shape
+    constantly, so accept it (and the ``arguments``/``parameters``/``input``
+    spellings, including an ``arguments`` JSON *string*) instead of losing work.
+
+    A finish envelope (``done``/``handoff``) is never touched: its top-level
+    keys are the payload, not arguments.
+    """
+    if not isinstance(obj, dict) or obj.get("done") or "handoff" in obj:
+        return obj
+    tool = None
+    for key in ("tool", "tool_name", "toolname", "name", "function"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            tool = value.strip()
+            break
+        # OpenAI-ish {"function": {"name": ..., "arguments": ...}}
+        if isinstance(value, dict) and isinstance(value.get("name"), str):
+            inner = dict(value)
+            inner.setdefault("tool", inner.pop("name"))
+            return _normalize_directive(inner)
+    if tool is None:
+        return obj
+
+    args: Any = None
+    for key in _DIRECTIVE_ARG_KEYS:
+        if key in obj:
+            args = obj[key]
+            break
+    if isinstance(args, str):
+        try:  # `"arguments": "{\"path\": \".\"}"` — the tool-calling wire form.
+            args = json.loads(args)
+        except (json.JSONDecodeError, ValueError):
+            args = None
+    if not isinstance(args, dict):
+        args = None
+    if args is None:
+        # Flat dialect: everything that is not a control field is an argument.
+        args = {k: v for k, v in obj.items() if k not in _DIRECTIVE_CONTROL_KEYS}
+    out = dict(obj)
+    out["tool"] = tool
+    out["args"] = args
+    return out
+
+
 def _parse_directive(reply: str) -> dict | None:
     """Extract the first tool/done directive from a model reply.
 
@@ -3294,7 +3399,7 @@ def _parse_directive(reply: str) -> dict | None:
     for cand in candidates:
         obj = _loads_first_object(cand)
         if obj is not None:
-            return obj
+            return _normalize_directive(obj)
     return _parse_text_tool_call(reply)
 
 
@@ -3457,7 +3562,7 @@ def _known_tool_names() -> frozenset[str]:
 def _ask_user_sync(questions: Any = None, question: Any = None,
                    scope: str = "run", run_id: str | None = None,
                    doc_id: str | None = None, revision: int | None = None,
-                   **_ignored: Any) -> dict:
+                   **extra: Any) -> dict:
     """Ask the human a typed batch of questions and return machine-readable answers.
 
     Batch every unknown into ONE call (at most 4 questions), each with a
@@ -3482,13 +3587,26 @@ def _ask_user_sync(questions: Any = None, question: Any = None,
     from services.agent.interaction import MemoryLedger, ask_user  # noqa: PLC0415
     from services.agent.mission_dispatch import _normalize_questions  # noqa: PLC0415
 
-    norm = _normalize_questions(questions if questions is not None else question)
+    raw = questions if questions is not None else question
+    if raw is None:
+        # Same dialect widening as MissionDispatch.ask_user: models put the
+        # question under whatever key they like and those used to vanish into
+        # **_ignored, making the call look argument-less.
+        for _alias in ("prompt", "text", "ask", "message", "query", "q",
+                       "content", "body", "input", "request"):
+            if extra.get(_alias):
+                raw = extra[_alias]
+                break
+    norm = _normalize_questions(raw)
+    norm = [q for q in norm if str(q.get("prompt") or "").strip()]
     if not norm:
         return {"ok": False, "status": "bad_arguments",
-                "error": ("ask_user needs questions=[{id, prompt, suggested, kind?}] "
-                          "(a single dict or a plain string also works). Batch every "
-                          "unknown into ONE call, at most 4, each with a suggested "
-                          "default — see cad_guide('interaction')."),
+                "error": ("ask_user got no question text. Batch every unknown into "
+                          "ONE call, at most 4, each with a suggested default — see "
+                          "cad_guide('interaction'). If you cannot phrase a concrete "
+                          "question, do NOT retry this tool: state your assumption, "
+                          "continue, and raise the open question in your final "
+                          "message instead."),
                 "example": [{"id": "material", "kind": "choice",
                              "prompt": "What material?", "suggested": "PLA",
                              "options": ["PLA", "PETG", "aluminium 6061"]}]}
@@ -3834,6 +3952,51 @@ def _bad_kwargs_error(tool: str, spec: dict, supplied: dict,
     return payload
 
 
+def _missing_kwargs_error(tool: str, spec: dict, missing: list[str]) -> dict:
+    """Teaching error for REQUIRED parameters the model left out.
+
+    Live 2026-07-27 (claude-haiku-4-5, general lane): the model issued fs_read,
+    fs_glob and run_shell with ``{}`` and got back raw Python —
+    "register_fs_tools.<locals>.fs_read() missing 1 required positional
+    argument: 'path'". A small model cannot act on ``<locals>``: it retried the
+    same empty call until the loop guard killed the run. Name the tool, the
+    missing parameters and a concrete call instead.
+    """
+    ann = spec.get("ann") or {}
+
+    def _placeholder(name: str) -> Any:
+        a = ann.get(name) or ""
+        if "int" in a:
+            return 1
+        if "float" in a:
+            return 1.0
+        if "bool" in a:
+            return True
+        if "list" in a:
+            return []
+        if "dict" in a:
+            return {}
+        return f"<{name}>"
+
+    example = {n: _placeholder(n) for n in spec.get("required") or ()}
+    optional = [p for p in (spec.get("params") or ()) if p not in (spec.get("required") or ())]
+    return {
+        "ok": False,
+        "status": "missing_argument",
+        "reason": "missing_argument",
+        "error": (
+            f"{tool} is missing required argument(s): {', '.join(missing)}. "
+            f"Call it with every required field, e.g. "
+            f"{tool}({', '.join(f'{k}={v!r}' for k, v in example.items())}). "
+            "Repeating the same empty call will not help — supply the argument, "
+            "or use a different tool."
+        ),
+        "required": sorted(spec.get("required") or ()),
+        "optional": optional,
+        "example": example,
+    }
+
+
 def _reconcile_kwargs(tool: str, fn: Any, supplied: dict,
                       config_keys: set[str] | None = None) -> tuple[dict, list[str], dict | None]:
     """Reconcile *supplied* against *fn*'s real signature.
@@ -3841,14 +4004,14 @@ def _reconcile_kwargs(tool: str, fn: Any, supplied: dict,
     Returns ``(kwargs, notes, error)``. ``error`` non-None means DO NOT CALL —
     it is the teaching payload to hand back to the model."""
     spec = _signature_spec(fn)
-    if spec["var_kw"] or not supplied:
+    if spec["var_kw"]:
         return supplied, [], None
     params = spec["params"]
     kwargs: dict[str, Any] = {}
     notes: list[str] = []
     unmapped: list[str] = []
     used = {k for k in supplied if k in params}
-    for name, value in supplied.items():
+    for name, value in (supplied or {}).items():
         if name in params:
             kwargs[name] = value
             continue
@@ -3862,6 +4025,12 @@ def _reconcile_kwargs(tool: str, fn: Any, supplied: dict,
     if unmapped:
         return {}, [], _bad_kwargs_error(tool, spec, supplied, unmapped,
                                          config_keys or set())
+    # Required parameters the model omitted. This check MUST run for an empty
+    # payload too: `not supplied` used to return early, so a bare {} call went
+    # straight to fn() and surfaced a raw TypeError instead of a teaching error.
+    missing = [n for n in (spec.get("required") or ()) if n not in kwargs]
+    if missing:
+        return {}, [], _missing_kwargs_error(tool, spec, missing)
     return kwargs, notes, None
 
 

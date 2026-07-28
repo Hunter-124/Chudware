@@ -429,7 +429,7 @@ class MissionDispatch:
 
     # ------------------------------------------------------------------ ask_user
     def ask_user(self, questions: Any = None, question: Any = None,
-                 scope: str = "run", **_ignored: Any) -> dict:
+                 scope: str = "run", **extra: Any) -> dict:
         """Ask the human a typed question batch (contract §4).
 
         In an autonomous run there is no blocking transport: every question is
@@ -437,11 +437,31 @@ class MissionDispatch:
         its suggested default (source: "default") — never a fabricated human reply.
         """
         raw = questions if questions is not None else question
+        if raw is None:
+            # Models put the question under whatever key they feel like; those
+            # used to land in **_ignored and the call looked argument-less.
+            for alias in ("prompt", "text", "ask", "message", "query", "q",
+                          "content", "body", "input", "request"):
+                value = extra.get(alias)
+                if value:
+                    raw = value
+                    break
         norm = _normalize_questions(raw)
+        norm = [q for q in norm if str(q.get("prompt") or "").strip()]
         if not norm:
-            return {"ok": False,
-                    "error": ("ask_user needs questions=[{id, prompt, suggested, "
-                              "kind?}] (or a plain string)")}
+            # An empty/unparseable call repeated verbatim is the live haiku loop
+            # (2026-07-27: ask_user {} ×4 until the loop guard killed the run).
+            # A schema recital did not help it; a copy-pasteable example and an
+            # explicit way OUT of needing the tool at all does.
+            return {"ok": False, "status": "bad_arguments",
+                    "error": ("ask_user got no question text. Call it exactly like "
+                              'this: ask_user(questions=[{"id": "q1", "prompt": '
+                              '"Which material?", "suggested": "AL_6061_T6"}]). '
+                              "A plain string also works: ask_user(questions=\"Which "
+                              "material?\"). If you cannot phrase a concrete "
+                              "question, do NOT retry this tool — state your "
+                              "assumption, continue the work, and mention the open "
+                              "question in your final message instead.")}
         try:
             from services.agent import interaction
             answers = interaction.ask_user(

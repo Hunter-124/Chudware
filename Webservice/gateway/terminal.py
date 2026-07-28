@@ -167,6 +167,17 @@ def _tmux_cmd(*args: str) -> list[str]:
     return [_TMUX, "-L", _SOCKET, *args]
 
 
+def _target(tmux_name: str) -> str:
+    """Session target for tmux commands. Plain name, NOT the ``=name``
+    exact-match form: tmux 3.6b rejects ``=`` targets for set-option and
+    send-keys (rc=1, "no such session") even while has-session/kill-session
+    accept them — which silently dropped session options AND the omp launch
+    keys. Our names are unique and glob-free (``[a-z0-9-]`` slugs and
+    ``token_urlsafe`` ids), and tmux tries an exact name match first, so the
+    plain form is exactly equivalent here."""
+    return tmux_name
+
+
 def _run_tmux(*args: str, timeout: float = 10.0) -> subprocess.CompletedProcess:
     """Run a tmux control command (client-side, returns quickly)."""
     return subprocess.run(  # noqa: S603
@@ -211,7 +222,7 @@ def _server_running() -> bool:
 def _session_exists(tmux_name: str) -> bool:
     if not _TMUX:
         return False
-    return _run_tmux("has-session", "-t", f"={tmux_name}").returncode == 0
+    return _run_tmux("has-session", "-t", _target(tmux_name)).returncode == 0
 
 
 def _list_sessions() -> list[dict[str, Any]]:
@@ -378,7 +389,7 @@ def _create_session(
         if not _session_exists(tmux_name):
             detail = (cp.stderr or cp.stdout or "").strip()[-300:] or f"rc={cp.returncode}"
             raise RuntimeError(f"tmux session create failed: {detail}")
-    target = f"={tmux_name}"
+    target = _target(tmux_name)
     # Ownership metadata lives in tmux itself, so it survives gateway restarts
     # exactly as long as the session it describes.
     if owner:
@@ -411,12 +422,12 @@ def _create_session(
 def _kill_session(tmux_name: str) -> bool:
     if not _TMUX:
         return False
-    return _run_tmux("kill-session", "-t", f"={tmux_name}").returncode == 0
+    return _run_tmux("kill-session", "-t", _target(tmux_name)).returncode == 0
 
 
 def _spawn_attach(tmux_name: str, cols: int, rows: int) -> tuple[int, int]:
     """Fork a PTY and exec ``tmux attach`` (plain attach → multi-client)."""
-    argv = _tmux_cmd("attach", "-t", f"={tmux_name}")
+    argv = _tmux_cmd("attach", "-t", _target(tmux_name))
     child_env = _child_env(_repo_dir())
     pid, master_fd = pty.fork()
     if pid == 0:

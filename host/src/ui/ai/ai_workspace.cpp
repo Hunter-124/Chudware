@@ -1550,6 +1550,7 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
     // The chat column's slab is drawn by the host child; resolve the same surface id here so
     // the pill scrollbar picks up matching tones.
     const ImVec2 lw0 = ImGui::GetWindowPos();
+    const ImVec2 lwSize = ImGui::GetWindowSize();
     const AdaptiveSurface& logSurf = adaptivePanel(
         panelId("ai_ws_conv_glass"),
         ImRect(lw0, ImVec2(lw0.x + ImGui::GetWindowSize().x,
@@ -1567,6 +1568,10 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
     drawWindowPillScrollbarV(logSurf);
     ImGui::EndChild();
     ImGui::PopStyleColor();
+    // Floating jump-to-latest arrow over the chat viewport's bottom-right corner; hidden while
+    // pinned to the tail. Region id matches the stick call above.
+    chatDrawJumpToLatest("aiws.chatlog", lw0,
+                         ImVec2(lw0.x + lwSize.x, lw0.y + lwSize.y));
 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     ImGui::BeginGroup();

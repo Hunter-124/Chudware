@@ -838,26 +838,43 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
         artiEmptyState(surf, "No plan yet \xe2\x80\x94 the agent's task list shows up here once a build starts.");
     }
 
-    // ---- Documents (open doc tabs) + agent-created files from tool_call artifacts ----
-    // Rows are gathered before drawing so the header can show a count; same sources as before.
+    // ---- Open documents (deduplicated doc tabs) + files produced this session ----
+    // Rows are gathered before drawing so each header can show a count; same sources as before.
     struct ArtiDocRow {
         std::string label, tooltip, path;
         std::function<void()> open;
     };
-    std::vector<ArtiDocRow> rows;
-    for (int ti = 0; ti < (int)st.docTabs.size(); ++ti) {
-        const auto& t = st.docTabs[ti];
-        ArtiDocRow r;
-        r.label = t.title.empty() ? (t.path.empty() ? t.docId : t.path) : t.title;
-        // Unsaved in-memory docs have no file to reveal — fall back to their save
-        // destination (the project/workspace folder) so the location action always exists.
-        r.path  = !t.path.empty() ? t.path : st.plmProjectPath();
-        r.tooltip = r.path.empty() ? r.label : (r.label + "\n" + r.path);
-        r.open  = [&st, ti]() { st.switchToTab(ti); };
-        rows.push_back(std::move(r));
-    }
+    std::vector<ArtiDocRow> docRows;   // open documents (one row per underlying doc)
+    std::vector<ArtiDocRow> fileRows;  // files the agent wrote this session
     {
+        // Dedup doc-tab rows: an AI read-only mirror tab and the user's own tab can be
+        // two docTabs entries for the SAME underlying document. Two things independently
+        // identify one document, so BOTH are checked — the mirror shares the agent's
+        // docId, while a part reopened from disk under a fresh docId shares only its
+        // path. Claiming either key is enough to make a later tab a duplicate.
+        std::set<std::string> seenId, seenPath;
+        for (int ti = 0; ti < (int)st.docTabs.size(); ++ti) {
+            const auto& t = st.docTabs[ti];
+            const bool dupId   = !t.docId.empty() && !seenId.insert(t.docId).second;
+            const bool dupPath = !t.path.empty()  && !seenPath.insert(t.path).second;
+            if (dupId || dupPath) continue;
+            if (t.docId.empty() && t.path.empty() && !t.title.empty() &&
+                !seenId.insert("title:" + t.title).second)
+                continue;  // last resort for a tab with neither identifier
+            ArtiDocRow r;
+            r.label = t.title.empty() ? (t.path.empty() ? t.docId : t.path) : t.title;
+            // Unsaved in-memory docs have no file to reveal — fall back to their save
+            // destination (the project/workspace folder) so the location action always exists.
+            r.path  = !t.path.empty() ? t.path : st.plmProjectPath();
+            r.tooltip = r.path.empty() ? r.label : (r.label + "\n" + r.path);
+            r.open  = [&st, ti]() { st.switchToTab(ti); };
+            docRows.push_back(std::move(r));
+        }
+        // Cross-source dedup: seed `seen` with the doc tabs' real file paths so a file
+        // already listed as an open document is not repeated as a produced-file row.
         std::set<std::string> seen;
+        for (const auto& t : st.docTabs)
+            if (!t.path.empty()) seen.insert(t.path);
         for (const auto& m : st.chat) {
             if (m.fromUser) continue;
             for (const auto& a : m.activity) {
@@ -882,20 +899,37 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                     r.path    = path;
                     r.tooltip = path;
                     r.open    = [&st, path]() { chatArtifactOpenSmart(st, path); };
-                    rows.push_back(std::move(r));
+                    fileRows.push_back(std::move(r));
                 }
             }
         }
     }
-    artiSectionHeader(surf, "Documents", (int)rows.size());
-    if (rows.empty()) {
-        artiEmptyState(surf, "No documents yet \xe2\x80\x94 parts you open and files the agent writes are listed here.");
+    // Section-scoped ImGui ids: both loops index from 0, so without a per-section scope
+    // the first produced-file row would collide with the first open-document row and one
+    // of the two rows' buttons would go dead.
+    artiSectionHeader(surf, "Open Documents", (int)docRows.size());
+    if (docRows.empty()) {
+        artiEmptyState(surf, "No open documents \xe2\x80\x94 parts you open are listed here.");
     } else {
-        for (size_t i = 0; i < rows.size(); ++i) {
+        ImGui::PushID("arti_docs");
+        for (size_t i = 0; i < docRows.size(); ++i) {
             ImGui::PushID((int)i);
-            artiRow(st, rows[i].label, rows[i].tooltip, rows[i].path, rows[i].open);
+            artiRow(st, docRows[i].label, docRows[i].tooltip, docRows[i].path, docRows[i].open);
             ImGui::PopID();
         }
+        ImGui::PopID();
+    }
+    artiSectionHeader(surf, "Produced This Session", (int)fileRows.size());
+    if (fileRows.empty()) {
+        artiEmptyState(surf, "No files yet \xe2\x80\x94 files the agent writes show up here.");
+    } else {
+        ImGui::PushID("arti_files");
+        for (size_t i = 0; i < fileRows.size(); ++i) {
+            ImGui::PushID((int)i);
+            artiRow(st, fileRows[i].label, fileRows[i].tooltip, fileRows[i].path, fileRows[i].open);
+            ImGui::PopID();
+        }
+        ImGui::PopID();
     }
     ImGui::Dummy(ImVec2(0, ui::metrics::px(6.0f)));
 }
@@ -1162,6 +1196,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         const bool  logScrolled = ImGui::GetScrollY() > 0.5f;
         const ImVec2 logP0 = ImGui::GetWindowPos();
         const float  logVisW = ImGui::GetWindowSize().x;
+        const float  logVisH = ImGui::GetWindowSize().y;
         // Chat scrollbar: 9px, sitting ON the right edge of the lane reserved by padR above.
         ui::drawWindowPillScrollbarV(chatSurf(), ui::kChatScrollbar);
         ImGui::EndChild();
@@ -1184,6 +1219,11 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             ImGui::EndChild();
             ImGui::SetCursorPos(keep);
         }
+        // Floating jump-to-latest arrow over the chat viewport's bottom-right corner (chat
+        // view only); hidden while pinned to the tail.
+        if (!overlayOpen)
+            chatDrawJumpToLatest("copilot.panel", logP0,
+                                 ImVec2(logP0.x + logVisW, logP0.y + logVisH));
         ImGui::PopStyleVar();   // per-view WindowPadding
         ImGui::PopStyleColor();
 

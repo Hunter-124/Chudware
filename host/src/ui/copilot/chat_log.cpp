@@ -110,12 +110,12 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
     const float bw = ImGui::GetContentRegionAvail().x;
     GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 10.0f);
-    // Every chat bubble in the log shares ONE inset (cpMenuRowPadX/Y). Before this the user
+    // Every chat bubble in the log shares ONE inset (cpChatCardPadX/Y). Before this the user
     // bubble ran 10/5, the prose card 10/7 and every other card inherited the pane's tight
     // 3/2 — three different insets stacked down one column, which is what made the log read
     // as unrelated widgets rather than one surface.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     // Zero the default 9px inter-item spacing for this bubble's body -> meta bar
@@ -267,7 +267,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     const std::string sel = chatInputSelection(textId);
     chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::px(10.0f)));   // gap to the next TURN
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatTurnGap()));   // gap to the next TURN
 }
 
 
@@ -294,7 +294,7 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const auto& pal = ui::palette;
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     {
         char hdr[64];
         std::snprintf(hdr, sizeof(hdr), "Provider log (%d)", (int)calls.size());
@@ -343,7 +343,7 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
 
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##provlog", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     if (fonts.mono) ImGui::PushFont(fonts.mono);
@@ -434,13 +434,11 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 }
             }
         }
-        // Restore affordance: hover Before/After on mutating turns, an always-visible
-        // chat-only rewind glyph on every other finished turn.
-        if (vcRestore) {
-            if (haveModel && !metaInCard) ImGui::SameLine(0, 8 * sc);
-            drawAiVcTurnRestore(st, msgIdx, turnNum);
-        }
-        if ((haveModel && !metaInCard) || vcRestore)
+        // The restore affordance used to live HERE, inline with the model name, where it
+        // read as part of the author label. It now draws as a bottom action row at the end
+        // of the turn (see the end of this function) so agent and user messages both offer
+        // revert in the same place.
+        if (haveModel && !metaInCard)
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         ImGui::PopStyleVar();
     }
@@ -469,7 +467,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextUnformatted((std::string("Plan \xc2\xb7 ") + prog).c_str());
             ImGui::PopStyleColor();
-            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
         }
     }
 
@@ -484,7 +482,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           10.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                            ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                            ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
         ImGui::BeginChild("##prose", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         // Author meta row INSIDE the card top (model left, age right) when it
@@ -511,7 +509,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImRect proseRect = endGlassBubble(gb);
         const std::string sel = chatInputSelection(textId);
         chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);
-        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     }
 
 
@@ -539,7 +537,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         }
         if (!hasLiveContent && !m.text.empty()) hasLiveContent = true;
         if (!hasLiveContent) {
-            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
             const ui::AdaptiveSurface& surf = chatSurf();
             std::string say = m.liveStatus;
             if (say == "Working" || say == "working...")
@@ -581,11 +579,11 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (m.errKind == ERR_PARTIAL || m.resultPartial) {
         std::string body = stripMdMarks(m.text);
         if (body.empty()) body = "Partially complete";
-        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           10.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                            ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                            ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
         ImGui::BeginChild("##partialcard", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         const ImVec4 warnCol = semanticOnGlass(pal.statusWarn, chatSurf());
@@ -695,11 +693,11 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         const bool haveFull = !fullErr.empty() && (clipped || fullErr != shown);
 
         if (!shown.empty() || !m.errorHuman.empty()) {
-            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
             GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                               10.0f);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                                ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                                ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
             ImGui::BeginChild("##errcard", ImVec2(0, 0),
                               ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
             // Error tone retuned for the frost so the reason stays readable over any model.
@@ -775,6 +773,15 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (!m.running)
         drawProviderLog(m, fonts);
 
+    // (10) Restore/rewind action row — the LAST thing in the turn, mirroring the user
+    // bubble's bottom meta bar so revert sits in the same place on both sides of the chat.
+    // Mutating turns get Before/After (checkpoint-backed); every other finished turn gets
+    // the chat-only rewind, so a revert point is reachable anywhere in the transcript.
+    if (vcRestore) {
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
+        drawAiVcTurnRestore(st, msgIdx, turnNum);
+    }
+
 }
 
 
@@ -842,7 +849,7 @@ void drawChatLogWindowed(AppState& st) {
             drawUserBlock(st, m, fonts, logW, (int)mi);
         } else {
             drawAssistantTurn(st, m, fonts, logW, (int)mi, thisTurn);
-            ImGui::Dummy(ImVec2(0, ui::metrics::px(10.0f)));   // gap to the next TURN
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpChatTurnGap()));   // gap to the next TURN
         }
         ImGui::EndGroup();
         // (Mode-colored left accent bar removed — it read as a stray vertical line next
@@ -866,6 +873,7 @@ void drawChatLogWindowed(AppState& st) {
 namespace {
 struct StickState {
     bool  stick = true;
+    bool  atBottom = true;   // mirrors stick after the snap check; drives the jump button
     float prevScrollY = -1.0f;
 };
 std::unordered_map<std::string, StickState> s_stickByRegion;
@@ -882,7 +890,61 @@ void chatLogStickToBottom(const char* regionId) {
         s.stick = true;                        // at/near the bottom — re-engage
     if (s.stick && smax > sy)
         ImGui::SetScrollY(smax);
+    s.atBottom = s.stick;                      // the near-bottom check above folded into stick
     s.prevScrollY = ImGui::GetScrollY();
+}
+
+bool chatLogAtBottom(const char* regionId) {
+    const auto it = s_stickByRegion.find(regionId ? regionId : "");
+    return it == s_stickByRegion.end() || it->second.atBottom;
+}
+
+void chatLogJumpToBottom(const char* regionId) {
+    StickState& s = s_stickByRegion[regionId ? regionId : ""];
+    s.stick = true;
+    s.prevScrollY = -1.0f;   // the deferred snap must not read as a user scroll-up
+}
+
+void chatDrawJumpToLatest(const char* regionId, const ImVec2& viewMin, const ImVec2& viewMax) {
+    (void)viewMin;
+    if (chatLogAtBottom(regionId)) return;
+    const float sc = ui::uiScale;
+    const float r  = 13.0f * sc;
+    // 18dp x-inset keeps the disc clear of the pill-scrollbar lane on the child's right edge.
+    const ImVec2 c(viewMax.x - 18.0f * sc - r, viewMax.y - 10.0f * sc - r);
+
+    // The hit widget must live in the PARENT window (we are after EndChild) without disturbing
+    // its cursor layout — save/restore around the InvisibleButton.
+    const ImVec2 keep = ImGui::GetCursorPos();
+    ImGui::SetCursorScreenPos(ImVec2(c.x - r, c.y - r));
+    ImGui::PushID(regionId ? regionId : "chat");
+    ImGui::InvisibleButton("##jump_latest", ImVec2(r * 2.0f, r * 2.0f));
+    ImGui::PopID();
+    const bool hov     = ImGui::IsItemHovered();
+    const bool clicked = ImGui::IsItemClicked();
+    if (hov) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("Jump to the latest reply");
+    }
+    ImGui::SetCursorPos(keep);
+
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec4 fill = surf.tint;
+    fill.w = hov ? 0.98f : 0.85f;
+    dl->AddCircleFilled(c, r, ImGui::ColorConvertFloat4ToU32(fill));
+    dl->AddCircle(c, r,
+                  ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                        surf.textPrimary.z, hov ? 0.55f : 0.28f)),
+                  0, ui::metrics::stroke(1.0f));
+    // Down chevron.
+    const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+    const float hw = r * 0.42f, hh = r * 0.24f, th = ui::metrics::stroke(2.0f);
+    const ImVec2 mid(c.x, c.y + hh * 0.6f);
+    dl->AddLine(ImVec2(c.x - hw, c.y - hh), mid, ink, th);
+    dl->AddLine(ImVec2(c.x + hw, c.y - hh), mid, ink, th);
+
+    if (clicked) chatLogJumpToBottom(regionId);
 }
 
 // Re-engage stick-to-bottom on every chat surface (conversation switch). Dropping the entries

@@ -154,6 +154,16 @@ void chatDrawLog(AppState& st);                               // the active conv
 // conversation in the same frame, and they must not share (and fight over) one flag.
 void chatLogStickToBottom(const char* regionId);
 void chatLogResetStick();  // re-engage autoscroll everywhere (conversation switch)
+// True while the region is at (or pinned to) the tail — false once the user scrolls up.
+bool chatLogAtBottom(const char* regionId);
+// Re-engage stick and snap to the tail on the region's next chatLogStickToBottom call (the
+// scroll offset can only be set from INSIDE the scrolling child, so the jump is deferred).
+void chatLogJumpToBottom(const char* regionId);
+// Floating circular down-arrow "jump to latest" button, drawn OVER a chat viewport's
+// bottom-right corner. Call AFTER the scrolling child's EndChild() with the child's screen
+// rect (parent-window drawlist, so it never scrolls with the content). Hidden while
+// chatLogAtBottom(regionId); clicking re-engages stick-to-bottom.
+void chatDrawJumpToLatest(const char* regionId, const ImVec2& viewMin, const ImVec2& viewMax);
 void chatDrawComposer(AppState& st, bool busy, bool canRun);  // prelude + input + toolbar (real send path)
 void chatDrawSessionsList(AppState& st, bool busy);           // session rows + "+ New session"
 

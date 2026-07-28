@@ -86,6 +86,16 @@ inline float cpMenuHeadGap()  { return px(6.0f); }    // below a section header 
 inline float cpMenuLabelGap() { return px(3.0f); }    // label -> its control
 inline float cpMenuCtlGap()   { return px(7.0f); }    // control -> next label (vertical rhythm)
 
+// ---- Copilot CHAT timeline density (ui/copilot/activity_timeline.cpp + chat_log.cpp) -------
+// The per-turn activity timeline (thinking blocks, thought boxes, tool rows, action cards) is
+// a conversation, not a menu: cards land in dense runs while a turn streams, so it sizes
+// TIGHTER than the cpMenu* rhythm or a single run overflows the viewport. The four menu views
+// above keep cpMenu*; activity cards and turn spacing MUST size from here.
+inline float cpChatRowGap()   { return px(2.0f); }  // between sibling activity rows/cards
+inline float cpChatCardPadX() { return px(9.0f); }  // inside an activity card, horizontal
+inline float cpChatCardPadY() { return px(4.0f); }  // inside an activity card, vertical
+inline float cpChatTurnGap()  { return px(6.0f); }  // between chat TURNS (user/assistant)
+
 // ---- Reverse Engineering workspace (ui/reveng/, RE-40 overhaul) -------------------------------
 // The RE tab is a wizard: a session rail, a stage stepper, one stage body, a properties column.
 // Before these tokens each of the four stage TUs invented its own paddings and card corners, so

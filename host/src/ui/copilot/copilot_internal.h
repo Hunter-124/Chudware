@@ -159,7 +159,7 @@ std::string stripMdMarks(const std::string& in);
 // stripMdMarks + chatDrawSelectableText. Returns the last prose segment's InputText id.
 ImGuiID     drawMdProse(const char* id, const std::string& in, const ImVec4& col, ImFont* mono);
 void        drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW,
-                           bool turnRunning = false);
+                           bool liveFrontier = false);
 void        chatArtifactReveal(AppState& st, const std::string& path);
 void        chatArtifactOpenSmart(AppState& st, const std::string& path);
 void        chatArtifactActions(AppState& st, const std::string& path);
@@ -283,7 +283,10 @@ bool drawHeaderTextButton(const char* id, const char* label, bool active,
 void cancelEditStage(AppState& st);
 void beginEditStage(AppState& st, int msgIdx);
 void commitEditStageOnSend(AppState& st);
-void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum);
+// Restore/rewind actions for an assistant turn. alwaysShow=true draws them as a bottom
+// action row (the chat-log default, matching the user bubble's own meta bar); false keeps
+// the hover-latched variant that anchors on a preceding label item.
+void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum, bool alwaysShow = true);
 
 // ---- chat log (chat_log) ----
 void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,

@@ -1375,6 +1375,9 @@ void submitTurn(AppState& st, const std::string& text) {
         st.chat.push_back(a);
     }
     st.designStarted = true;   // conversation is now active (kept for shot scenarios)
+    // Sending a message is intent to follow the reply: re-engage stick-to-bottom on every
+    // chat surface even if the user had scrolled up into the history.
+    chatLogResetStick();
 
     // Name the conversation tab after its first prompt; persist so the turn survives a restart.
     if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) {

@@ -2243,6 +2243,12 @@ def run_linear_role_turn(
         run_id=run_id,
         capability=capability,
         options=options,
+        # The interactive lane's allow-set is an on-ramp, not a scope: the model
+        # is expected to pull packs in with enable_tools as it works. Let the
+        # harness do it on first reach instead of spending two billed
+        # completions per pack. Curated roles (sourcing, DAG nodes, subagents)
+        # leave this off, so their allow-list stays a hard boundary.
+        auto_enable_packs=(role == "general_agent"),
     )
     # OMP Auto-Learn capture-at-stop (agent.autolearn_*). Main-chat / linear
     # entry only — never raises into the turn path.

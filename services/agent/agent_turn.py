@@ -482,6 +482,48 @@ def _announces_next_step(text: str) -> bool:
     return False
 
 
+#: Fields worth naming when a finish envelope carries data but no prose, in the
+#: order a person would read them out.
+_SUMMARY_FIELDS = (
+    ("part_name", "part"), ("name", "name"), ("doc_id", "doc"),
+    ("dimensions_mm", "dimensions (mm)"), ("volume_mm3", "volume (mm^3)"),
+    ("mass_g", "mass (g)"), ("material", "material"),
+    ("density_g_cm3", "density (g/cm^3)"), ("saved_path", "saved to"),
+    ("path", "path"), ("count", "count"), ("files", "files"),
+)
+
+
+def _summarize_outputs(handoff: Any) -> str:
+    """A one-line report built from a finish envelope's own structured fields.
+
+    Live 2026-07-27 (claude-haiku-4-5): a completed build returned
+    ``{"part_name": "SummaryCheck", "mass_g": 172.8, "volume_mm3": 64000,
+    "saved_path": …}`` and NO prose key at all, so the chat bubble rendered
+    empty even though the work succeeded and every number was right there.
+    This states what the payload already says — it never invents a value, and
+    returns "" when there is nothing concrete to report.
+    """
+    if not isinstance(handoff, dict):
+        return ""
+    src: dict = {}
+    for bag in (handoff.get("outputs"), handoff):
+        if isinstance(bag, dict):
+            for k, v in bag.items():
+                src.setdefault(k, v)
+    parts: list[str] = []
+    for key, label in _SUMMARY_FIELDS:
+        val = src.get(key)
+        if val is None or isinstance(val, (dict,)) or val == "" or val == []:
+            continue
+        if isinstance(val, list):
+            if not all(isinstance(x, (int, float, str)) for x in val):
+                continue
+            val = " x ".join(str(x) for x in val)
+        parts.append(f"{label}: {val}")
+        if len(parts) >= 6:
+            break
+    return "; ".join(parts)
+
 # Fabricated-success detector: a finish (bare prose, junk JSON, or a formal
 # done envelope) that CLAIMS completed work while the turn ran zero voluntary
 # tool calls. Live (2026-07-27, kimi k3-256k general lane): "make me a
@@ -948,7 +990,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              context_refs=None,
              mode: str | None = None,
              plan_only: bool | None = None,
-             options: dict | None = None) -> TurnResult:
+             options: dict | None = None,
+             auto_enable_packs: bool = False) -> TurnResult:
     """Streaming wrapper around :func:`_run_turn_impl`.
 
     When *on_event* is supplied (GUI turns), installs a thread-local provider
@@ -969,7 +1012,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             capability=capability, tier=tier, model_id=model_id, phase=phase,
             task_class=task_class, msg_idx=msg_idx, doc_id=doc_id,
             context_refs=context_refs, mode=mode, plan_only=plan_only,
-            options=options)
+            options=options, auto_enable_packs=auto_enable_packs)
 
     from services.agent import agent_events as _ae  # noqa: PLC0415
     from services.agent.providers import base as _pbase  # noqa: PLC0415
@@ -989,7 +1032,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             capability=capability, tier=tier, model_id=model_id, phase=phase,
             task_class=task_class, msg_idx=msg_idx, doc_id=doc_id,
             context_refs=context_refs, mode=mode, plan_only=plan_only,
-            options=options)
+            options=options, auto_enable_packs=auto_enable_packs)
 
 
 def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
@@ -1017,7 +1060,8 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
              context_refs=None,
              mode: str | None = None,
              plan_only: bool | None = None,
-             options: dict | None = None) -> TurnResult:
+             options: dict | None = None,
+             auto_enable_packs: bool = False) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
@@ -2033,6 +2077,15 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _log(ledger, actor, {"event": "done_blocked",
                                      "guardrail": block[:300]})
                 continue
+            # Never hand the GUI an empty bubble: a finish envelope that carries
+            # only structured outputs (no summary/response key) rendered as a
+            # blank assistant message even though the work succeeded. Report the
+            # payload's own fields rather than inventing prose.
+            if isinstance(handoff, dict) and not _handoff_text(handoff):
+                _synth = _summarize_outputs(handoff)
+                if _synth:
+                    handoff = dict(handoff)
+                    handoff["summary"] = _synth
             handoff = _attach_typed_refusal_if_needed(handoff, calls)
             _log(ledger, actor, {"event": "turn", "kind": "done", "handoff": handoff})
             return TurnResult(True, _DONE,
@@ -2208,7 +2261,13 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             except Exception:  # noqa: BLE001 — pack lookup is best-effort
                 _packs = []
             _auto_pack = None
-            if _packs and _autoenable_budget[0] > 0:
+            # ONLY on a lane that opted in (auto_enable_packs). That is the line
+            # between "the allow-set is an on-ramp the model widens as it works"
+            # — the interactive general lane, where auto-enabling merely saves
+            # two billed completions per pack — and "the allow-set is a SCOPE",
+            # which is what it means for a curated role like the sourcing
+            # subagent or a DAG node. Those keep a hard boundary.
+            if _packs and _autoenable_budget[0] > 0 and auto_enable_packs:
                 try:
                     _apply_categories([_packs[0]])
                     if tool in allow:

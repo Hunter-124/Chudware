@@ -1961,6 +1961,45 @@ def _migrate_ref_slots(ops: Any, notes: Optional[list] = None) -> Any:
     return ops
 
 
+def _unwrap_enum_dims(ops: Any, notes: Optional[list] = None) -> Any:
+    """Unwrap text/enum params a model dressed up as a dimension.
+
+    validate.cpp treats ANY params entry shaped ``{value|expr: …}`` as a
+    dimension and demands a numeric ``value``. Models habitually wrap an enum
+    the same way they wrap a length — live 2026-07-27 an extrude arrived as
+    ``params.mode = {"value": "blind"}`` and was rejected with
+    "params.mode.value: missing or non-numeric", which reads as a units problem
+    for something that was never a number. ``_NON_DIM_KEYS`` already names every
+    param whose value is text, so unwrap those back to the bare value.
+    """
+    if not isinstance(ops, list):
+        return ops
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        feat = op.get("feature")
+        if not isinstance(feat, dict):
+            continue
+        params = feat.get("params")
+        if not isinstance(params, dict):
+            continue
+        for key in list(params):
+            if key not in _NON_DIM_KEYS:
+                continue
+            val = params[key]
+            if not isinstance(val, dict) or "value" not in val:
+                continue
+            inner = val.get("value")
+            if isinstance(inner, bool) or not isinstance(inner, (int, float)):
+                params[key] = inner
+                if notes is not None:
+                    notes.append(
+                        f"{feat.get('name') or feat.get('type') or 'feature'}: "
+                        f"unwrapped params.{key} from a dimension object to "
+                        f"{inner!r} ({key} is an enum/text param, not a number)")
+    return ops
+
+
 def _bare_sid(v: Any) -> Optional[str]:
     """The stable sid this ref value IS, or None (a datum / f<N> id / selector is not one)."""
     if not isinstance(v, str):
@@ -2947,6 +2986,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # model had the right edges, just the wrong bag. Runs before the
             # sketch/primitive passes so they see the canonical layout.
             ops = _migrate_ref_slots(ops, interpreted)
+            # An enum wrapped as a dimension ({"mode":{"value":"blind"}}) is
+            # rejected as non-numeric — unwrap before the dim passes run.
+            ops = _unwrap_enum_dims(ops, interpreted)
             # Model-robustness: accept the natural/flat sketch shape LLMs emit
             # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
             # to the engine's canonical schema before validation.

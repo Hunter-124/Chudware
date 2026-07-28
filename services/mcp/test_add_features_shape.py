@@ -1181,3 +1181,82 @@ def test_other_failures_are_never_reworded():
           {"id": "f2", "ok": False, "error": "extrude produced a zero-volume solid — …"}]
     M._enrich_zero_volume_errors(fs, [], {})
     assert fs[0]["error"].endswith("— …") and fs[1]["error"].endswith("— …")
+
+
+# --------------------------------------------------------------------------- shakeout dialects
+# Found by running claude-haiku-4-5 across modeling scenarios (2026-07-27) and
+# bucketing failures by shape. Both are cases where the model had the RIGHT
+# content in the WRONG container.
+
+class TestRefSlotMigration:
+    def test_fillet_edges_under_params_move_to_refs(self):
+        """The live failure: correct edge sids, wrong bag, rejected 3x with
+        '.refs.edges: required for fillet'."""
+        from services.mcp.cad_doc_tools import _migrate_ref_slots
+        ops = [{"op": "add_feature", "feature": {
+            "type": "fillet", "name": "Corner_Fillets",
+            "params": {"radius": {"value": 10}, "edges": [{"sid": "Ed7ec5d"}]}}}]
+        feat = _migrate_ref_slots(ops, [])[0]["feature"]
+        assert feat["refs"]["edges"] == [{"sid": "Ed7ec5d"}]
+        assert "edges" not in feat["params"]
+        assert feat["params"]["radius"] == {"value": 10}
+
+    def test_explicit_refs_win_and_stale_params_copy_is_dropped(self):
+        """A duplicate left in params would trip the unknown-param check."""
+        from services.mcp.cad_doc_tools import _migrate_ref_slots
+        ops = [{"op": "add_feature", "feature": {
+            "type": "fillet", "refs": {"edges": [{"sid": "KEEP"}]},
+            "params": {"edges": [{"sid": "DROP"}], "radius": 2}}}]
+        feat = _migrate_ref_slots(ops, [])[0]["feature"]
+        assert feat["refs"]["edges"] == [{"sid": "KEEP"}]
+        assert "edges" not in feat["params"]
+
+    def test_non_ref_params_are_untouched(self):
+        from services.mcp.cad_doc_tools import _migrate_ref_slots
+        ops = [{"op": "add_feature", "feature": {
+            "type": "box", "params": {"length": 10, "width": 5, "height": 2}}}]
+        feat = _migrate_ref_slots(ops, [])[0]["feature"]
+        assert feat["params"] == {"length": 10, "width": 5, "height": 2}
+        assert not feat.get("refs")
+
+
+class TestEnumDimUnwrap:
+    def test_mode_wrapped_as_a_dimension_is_unwrapped(self):
+        """validate.cpp dim-validates any {value|expr} params entry, so an enum
+        wrapped like a length fails as 'non-numeric' — a units error for
+        something that was never a number."""
+        from services.mcp.cad_doc_tools import _unwrap_enum_dims
+        ops = [{"op": "add_feature", "feature": {
+            "type": "extrude",
+            "params": {"mode": {"value": "blind", "expr": None},
+                       "distance": {"value": 5, "expr": None}}}}]
+        feat = _unwrap_enum_dims(ops, [])[0]["feature"]
+        assert feat["params"]["mode"] == "blind"
+        assert feat["params"]["distance"] == {"value": 5, "expr": None}, "real dims must survive"
+
+    def test_numeric_valued_text_key_is_left_as_a_dim(self):
+        """'size' is in _NON_DIM_KEYS but a numeric one is a genuine dimension."""
+        from services.mcp.cad_doc_tools import _unwrap_enum_dims
+        ops = [{"op": "add_feature", "feature": {
+            "type": "box", "params": {"size": {"value": 10, "expr": None}}}}]
+        feat = _unwrap_enum_dims(ops, [])[0]["feature"]
+        assert feat["params"]["size"] == {"value": 10, "expr": None}
+
+
+class TestMaterialDesignations:
+    def test_engineering_designations_resolve_to_an_appearance(self):
+        from services.mcp.cad_common import _resolve_appearance
+        for name in ("A36 steel", "6061-T6 Al", "304 stainless", "PLA filament"):
+            assert _resolve_appearance(name).get("color"), name
+
+    def test_stainless_steel_does_not_degrade_to_steel(self):
+        """Longest-first matching, or the more specific preset is lost."""
+        from services.mcp.cad_common import _resolve_appearance
+        assert _resolve_appearance("stainless steel") == _resolve_appearance("stainless")
+        assert _resolve_appearance("A36 steel") == _resolve_appearance("steel")
+
+    def test_genuine_nonsense_is_still_rejected(self):
+        import pytest as _pytest
+        from services.mcp.cad_common import _resolve_appearance
+        with _pytest.raises(ValueError):
+            _resolve_appearance("mystery unobtainium")

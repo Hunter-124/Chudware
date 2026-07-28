@@ -92,3 +92,33 @@ class TestMissingArgumentErrors:
     def test_valid_call_is_unaffected(self):
         r = _dispatch_tool("fs_list", {"path": "."})
         assert (r if isinstance(r, dict) else {}).get("ok") is True
+
+
+class TestEmptyFinishMessage:
+    """A finish envelope carrying only structured outputs rendered as a BLANK
+    chat bubble even though the work succeeded (live 2026-07-27, haiku: a built
+    cube came back as {part_name, mass_g, volume_mm3, saved_path} with no prose
+    key at all)."""
+
+    def test_outputs_are_reported_when_there_is_no_prose(self):
+        from services.agent.agent_turn import _summarize_outputs
+        s = _summarize_outputs({"part_name": "Cube", "mass_g": 172.8,
+                                "volume_mm3": 64000, "saved_path": "/tmp/c.step+"})
+        assert "Cube" in s and "172.8" in s and "64000" in s
+
+    def test_outputs_nested_under_outputs_are_found(self):
+        from services.agent.agent_turn import _summarize_outputs
+        assert "P" in _summarize_outputs({"outputs": {"part_name": "P", "mass_g": 1.5}})
+
+    def test_nothing_concrete_yields_nothing(self):
+        """Never invent prose — an envelope with no reportable field stays empty
+        so the honesty gates still see it as content-free."""
+        from services.agent.agent_turn import _summarize_outputs
+        assert _summarize_outputs({}) == ""
+        assert _summarize_outputs({"typed_refusal": {"reason": "x"}}) == ""
+        assert _summarize_outputs("not a dict") == ""
+
+    def test_real_prose_is_left_alone(self):
+        """_handoff_text still wins; synthesis only fills a genuine gap."""
+        from services.agent.agent_turn import _handoff_text
+        assert _handoff_text({"summary": "I built the cube."}) == "I built the cube."

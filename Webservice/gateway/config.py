@@ -138,6 +138,14 @@ class Settings:
         # forwarding anything near that OOM-kills a 1 GiB gateway.
         default_factory=lambda: _env_int("CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES", 4 * 1024 * 1024)
     )
+    max_engine_bridges_per_user: int = field(
+        # Concurrent /engine websockets per account. The browser client opens
+        # one and reconnects on drop, so a small number is plenty; this only
+        # exists to stop one account fanning out across the shared daemon.
+        # Not 1: a reconnect can briefly overlap the socket it replaces, and a
+        # user may legitimately have two tabs open.
+        default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_ENGINE_BRIDGES_PER_USER", 4)
+    )
     rate_writes_per_min: int = field(
         default_factory=lambda: _env_int("CHUDWARE_WEB_RATE_WRITES_PER_MIN", 120)
     )

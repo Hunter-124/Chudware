@@ -58,8 +58,11 @@ def env(tmp_path, monkeypatch):
     try:
         yield accounts, TestClient(middleware_app)
     finally:
-        # monkeypatch has already restored the environment; reload once more so
-        # the shared modules point back at the real settings/database.
+        # monkeypatch's own teardown runs AFTER this finalizer, so the tmp env
+        # is still active here. Undo it first — otherwise the reload below
+        # re-caches settings against the tmp data root and every later test in
+        # the session ends up talking to a throwaway accounts database.
+        monkeypatch.undo()
         for mod in (config, accounts, auth):
             importlib.reload(mod)
 

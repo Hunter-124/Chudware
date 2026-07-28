@@ -36,6 +36,9 @@ router = APIRouter()
 # deploy path (install_webd.sh --restart) can hold off restarting the SHARED daemon
 # while users are mid-session — a restart tears every bridge down at once.
 _active_bridges = 0
+# email -> concurrent open bridges, so one account cannot fan out across the
+# shared daemon. Decremented in the same finally that clears _active_bridges.
+_bridge_owners: dict[str, int] = {}
 
 
 def active_bridge_count() -> int:
@@ -292,13 +295,20 @@ def _sanitize_agent_provider(line: str) -> str:
 @router.websocket("/engine")
 async def engine_ws(ws: WebSocket) -> None:
     user = ws.state.user  # AuthMiddleware closed 4401/4403 already if unauthenticated
-    # AUDIT (CRITICAL, multi-tenant): this bridge attaches the caller to the ONE
-    # shared webd daemon. Without a live seat of their own the user has no
-    # business on the engine — refuse before accept so the close code survives.
-    sess = manager.get_for_user(user.email)
-    if sess is None or sess.status not in {"starting", "ready"}:
-        log.warning("engine bridge refused for %s: no live session", user.email)
-        await ws.close(code=4403, reason="no live session")
+    # AUDIT (multi-tenant): this bridge attaches the caller to the ONE shared
+    # webd daemon. It deliberately does NOT require a podman seat — /app is the
+    # browser-native WASM client and is a separate delivery mode from the
+    # streamed desktop, so demanding a container session here takes the whole
+    # web client offline (regression 2026-07-28: "Engine daemon unreachable").
+    # Isolation is enforced where it actually belongs: _inject_identity
+    # overwrites the client-supplied identity server-side, path_violation()
+    # jails every filesystem path to the caller's own roots, and frames are
+    # size-capped. What is left to bound here is fan-out, so cap concurrent
+    # bridges per account.
+    mine = _bridge_owners.get(user.email, 0)
+    if mine >= settings.max_engine_bridges_per_user:
+        log.warning("engine bridge refused for %s: %d already open", user.email, mine)
+        await ws.close(code=4429, reason="too many engine connections")
         return
     await ws.accept()
     sock = str(settings.webd_socket)
@@ -311,6 +321,7 @@ async def engine_ws(ws: WebSocket) -> None:
     log.info("engine bridge open: %s -> %s", user.email, sock)
     global _active_bridges
     _active_bridges += 1
+    _bridge_owners[user.email] = _bridge_owners.get(user.email, 0) + 1
     # The absolute paths this caller may name in a daemon RPC: their own
     # workspace + bucket trees, plus the shared scratch dirs the client uses for
     # mesh/tess payloads (those carry no other account's data).
@@ -405,4 +416,10 @@ async def engine_ws(ws: WebSocket) -> None:
             except Exception:
                 pass  # peer vanished mid-close
         _active_bridges -= 1
+        remaining = _bridge_owners.get(user.email, 1) - 1
+        if remaining > 0:
+            _bridge_owners[user.email] = remaining
+        else:
+            # Drop the key so the table cannot grow unbounded across accounts.
+            _bridge_owners.pop(user.email, None)
         log.info("engine bridge closed: %s (%d active)", user.email, _active_bridges)

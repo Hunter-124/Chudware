@@ -298,17 +298,32 @@ class TestPortalPayload:
 
 
 class TestEngineBridgeHardening:
-    def test_engine_requires_live_session(self, daemon, client):
-        """A caller with no seat of their own is refused before the bridge opens.
+    def test_engine_opens_without_a_container_seat(self, daemon, client):
+        """/app is the browser-native client and never has a podman seat.
 
-        alice@ua.edu is auto-approved by auth, so a 4403 here can only come
-        from the session-ownership check, not from authentication.
+        An earlier hardening pass required the caller to own a live session
+        here, which took the whole WASM client offline in production
+        ("Engine daemon unreachable — retrying", 2026-07-28). Isolation is
+        enforced by _inject_identity and path_violation instead, so an
+        authorized caller with NO seat must still be able to open the bridge.
         """
-        headers = {"X-Dev-User": "alice@ua.edu"}
-        with pytest.raises(WebSocketDisconnect) as exc:
-            with client.websocket_connect("/engine", headers=headers):
-                pass
-        assert exc.value.code == 4403
+        assert manager.get_for_user("demo@example.com") is None
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            ws.send_text(json.dumps({"id": 1, "method": "ping"}))
+            assert json.loads(ws.receive_text())["result"]["pong"] is True
+
+    def test_engine_bridges_capped_per_account(self, daemon, client, monkeypatch):
+        """One account must not fan out across the shared daemon."""
+        monkeypatch.setattr(settings, "max_engine_bridges_per_user", 1)
+        with client.websocket_connect("/engine", headers=DEV_HEADERS):
+            with pytest.raises(WebSocketDisconnect) as exc:
+                with client.websocket_connect("/engine", headers=DEV_HEADERS):
+                    pass
+            assert exc.value.code == 4429
+        # Closing the first bridge frees the slot again.
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            ws.send_text(json.dumps({"id": 1, "method": "ping"}))
+            assert json.loads(ws.receive_text())["result"]["pong"] is True
 
     def test_oversized_frame_rejected_not_forwarded(
         self, daemon, client, live_session, monkeypatch

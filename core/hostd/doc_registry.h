@@ -104,6 +104,12 @@ public:
     // from their viewport while the agent is still building it.
     bool isAgentOrigin(const std::string& docId);
 
+    // The last doc.changed payload pushed for `docId` (see DocState::lastPush), or a
+    // null json when nothing has been pushed yet. Reads only the registry mutex —
+    // NEVER the engine or the doc's per-doc mutex — so a GUI can populate a mirror
+    // tab for a doc another client is mid-write on without queueing behind it.
+    nlohmann::json lastPushFor(const std::string& docId);
+
     // Client disconnected: drop its attachments/holds/subscriptions and notify
     // remaining subscribers (doc.lease_change). Docs left with NO attached
     // client start the doc-GC grace countdown (CHUDWARE_DOC_GC_GRACE_S, default
@@ -183,6 +189,15 @@ private:
         // Doc-GC: when > 0, no client is attached and the doc closes once this
         // deadline passes without a new attach (zombie-doc prevention).
         long long orphanDeadlineMs = 0;
+        // The last doc.changed payload fanned out for this doc (tree + aicm_path +
+        // owner_map + datums + feature_status). Served verbatim by doc_snapshot.
+        // WHY it is kept: a GUI mirror tab that has not yet received a push had no way
+        // to populate itself except doc_activate, which takes the doc's per-doc engine
+        // mutex (T-PERF5 DocLock) and therefore QUEUES BEHIND THE AGENT'S WRITE BURST.
+        // Measured on a live run: 142.9 s for one tab switch onto the part the agent was
+        // building. This copy costs one tree per doc and is served without touching the
+        // engine at all, so spectating a doc can never wait on the client writing it.
+        nlohmann::json lastPush;
     };
     struct PendingEvent {
         int target;

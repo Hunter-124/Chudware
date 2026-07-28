@@ -1449,6 +1449,11 @@ struct AppState {
     int pendingActivateTab = -1;          // -1 = no coalesced switch waiting; else docTabs index
     std::string pendingActivateDocId;     // pendingActivateTab's doc id (staleness check on drain)
     uint64_t pendingActivateGeneration = 0;
+    // doc_ids with a lock-free doc_snapshot prime in flight (switchToTabCore). Dedup only:
+    // a spectator can click the same wedged mirror tab a dozen times while the agent writes,
+    // and each click re-enters switchToTabCore — without this every click would queue another
+    // identical registry read.
+    std::set<std::string> snapshotPrimeInFlight;
     // T-PERF3: mesh loader generation — bumped on every loadDocMeshAsync; drain drops
     // completions whose gen != meshGen_ (latest-wins; keep-last-good on screen meanwhile).
     std::atomic<uint64_t> meshGen_{0};

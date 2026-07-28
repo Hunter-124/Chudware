@@ -518,6 +518,29 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         return json{{"ok", true}};
     }
 
+    // Lock-free doc read for spectators. Returns the last revision payload the registry
+    // fanned out for this doc (tree + aicm_path + owner_map + datums + feature_status),
+    // straight out of DocState::lastPush — this NEVER reaches the engine, so it cannot
+    // queue behind the per-doc mutex a writing client holds.
+    // WHY: a GUI mirror tab used doc_activate to populate itself. doc_activate is
+    // read-only in intent but still takes the doc's DocLock, so clicking the tab for the
+    // part an agent was actively building blocked for 142.9 s on a live run (measured:
+    // "[perf] tab_switch_rebuild ... total=142902ms") while every further click coalesced
+    // behind it. Spectating must never wait on the writer.
+    if (method == "doc_snapshot") {
+        const std::string id = params.value("doc_id", std::string());
+        if (id.empty()) {
+            isError = true;
+            return json{{"code", "invalid_params"}, {"message", "pass {\"doc_id\": ...}"}};
+        }
+        json push = registry_.lastPushFor(id);
+        if (!push.is_object())
+            return json{{"doc_id", id}, {"has_snapshot", false}};
+        push["doc_id"] = id;
+        push["has_snapshot"] = true;
+        return push;
+    }
+
     // Orphan-tier recovery (docs retired by clean shutdown / doc-GC — never
     // auto-opened; the user or agent decides).
     if (method == "recovery_list") {

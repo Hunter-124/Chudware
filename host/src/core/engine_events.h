@@ -16,6 +16,7 @@
 //                       checked before the undo — see engine_events.cpp).
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -52,5 +53,21 @@ void watchRevEngReconstruct(const std::string& runId);
 // focuses, the rest open in the background with the aiPulse glow. No-op off
 // daemon mode.
 void mirrorRecoveredDocs(AppState& st, const std::vector<std::string>& docIds);
+
+// Populate a mirror tab's parked snapshot + mesh cache from the daemon's LOCK-FREE
+// doc_snapshot (hostd serves DocState::lastPush straight out of its registry — no engine
+// call, so it cannot queue behind the client that is writing the doc).
+//
+// WHY this exists: a mirror tab used to populate itself with doc_activate, which despite
+// being read-only still takes the doc's per-doc engine mutex. Clicking the tab for the part
+// an agent was actively building therefore blocked behind the agent's whole write burst —
+// 142.9 s on a live run — and every further click coalesced behind that one in-flight call,
+// so the tab only ever opened during a lull in the agent's tool calls.
+//
+// Async and best-effort: `then` runs after the snapshot has been applied (or immediately on
+// the next drain if the daemon has nothing yet), with `true` when a snapshot was applied.
+// No-op off daemon mode (then is still invoked, with false).
+void primeMirrorFromSnapshot(AppState& st, const std::string& docId,
+                             std::function<void(bool)> then = {});
 
 }  // namespace core

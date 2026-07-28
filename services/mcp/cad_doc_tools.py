@@ -4050,48 +4050,48 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def new_part(name: str = "part", *, fresh: bool = False) -> str:
-        """Create (or resume) an editable part document named `name` and make it current.
+        """Create an editable part document named `name` and make it current.
 
-        Default (`fresh=False`) RESUMES an already-open part of the same name instead of
-        minting a new one: a general agent that retries a brief, or a `model3d` worker that
-        respawns per turn, calls new_part(name="Widget") more than once with no memory of the
-        first doc_id it got back. Without this, the engine's doc_new would UNIQUIFY the
-        colliding name and mint a brand-new document each time — each mint fans out doc.opened
-        to the GUI, which opens a duplicate mirror tab, so the user ends up with several copies
-        of "the same part" in the viewport. The name IS the identity an agent addresses a part
-        by, so asking for a name that already exists means "resume it", not "fork it".
-        Pass `fresh=True` to force a genuinely separate document (e.g. a deliberate variant).
+        An UNBUILT part of the same name is resumed rather than duplicated. A general agent
+        that retries a brief, or a `model3d` worker that respawns per turn, calls
+        new_part(name="Widget") again with no memory of the doc_id it got back; the engine's
+        doc_new would UNIQUIFY the collision into "Widget2" and mint a second document, and
+        every mint fans out doc.opened to the GUI, so the user watches duplicate copies of
+        "the same part" pile up in the viewport (observed live: one request produced
+        CD-XXX_TwistedLatticeOrb, ...Orb2, ...Orb3 and ...Orb4).
+
+        A part that ALREADY HAS GEOMETRY is never resumed silently — inheriting a stranger's
+        half-built body is worse than a duplicate, because the next feature lands on geometry
+        the caller does not know is there ("boss added no material — it is buried inside the
+        body"). That case still mints a separate document, but the response says so:
+        `name_taken`, the existing part's doc_id and feature count, and how to continue it
+        instead. `fresh=True` skips the lookup entirely.
 
         Follow with add_features(...) to build geometry. Each part is a real parametric feature
         tree (undo/redo, editable parameters), not a one-shot mesh.
         """
         try:
+            taken = None
             if not fresh:
                 docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                         if isinstance(e, dict) and e.get("doc_id")]
                 existing = _docs_named(docs, name)
                 if len(existing) == 1:
-                    did = existing[0]["doc_id"]
-                    _CUR["doc_id"] = did
-                    # Never reset a real volume baseline to 0.0 here: the part may already
-                    # carry built geometry, and clobbering _LAST_VOLUME would corrupt the
-                    # next add_features' write-diff ("0.0 -> X" instead of the true delta).
-                    # Only seed it if this process has never tracked this doc before.
-                    _LAST_VOLUME.setdefault(did, existing[0].get("volume", 0.0))
-                    # Say what was RESUMED, not just that it was. An agent that believes
-                    # it started an empty part builds its next body at the origin and gets
-                    # "boss added no material (it is buried inside the body)" — an error
-                    # about geometry for what is really a document mix-up.
-                    built = existing[0].get("feature_count")
-                    carries = (f"; it already carries {built} feature(s) — build ON them, "
-                               f"or call new_part(fresh=True) for an empty document"
-                               if isinstance(built, int) and built > 0 else "")
-                    out = {"ok": True, "doc_id": did, "name": existing[0].get("name") or name,
-                           "revision": existing[0].get("revision", 0), "reused": True,
-                           "feature_count": built,
-                           "note": f'resumed the existing part "{name}" (doc_id={did}) instead '
-                                   "of minting a duplicate" + carries}
-                    return _dumps(out)
+                    taken = existing[0]
+                    built = taken.get("feature_count")
+                    unbuilt = (taken.get("revision", 0) or 0) == 0 or built == 0
+                    if unbuilt:
+                        # Minted but never built: this IS the respawned-worker case, and
+                        # resuming it cannot surprise anyone — there is no geometry to inherit.
+                        did = taken["doc_id"]
+                        _CUR["doc_id"] = did
+                        _LAST_VOLUME.setdefault(did, 0.0)
+                        return _dumps({
+                            "ok": True, "doc_id": did,
+                            "name": taken.get("name") or name,
+                            "revision": taken.get("revision", 0), "reused": True,
+                            "note": f'resumed the empty part "{name}" (doc_id={did}) instead '
+                                    "of minting a duplicate document"})
             r = cb.call("doc_new", {"kind": "part", "name": name})
             did = r.get("doc_id")
             _CUR["doc_id"] = did
@@ -4099,11 +4099,25 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # add_features reports a real volume delta ("0.0 -> X (+X)") instead of degrading
             # to the volume-only "volume now X" branch of _write_diff.
             _LAST_VOLUME[did] = 0.0
-            out = {"ok": True, "doc_id": did, "name": name,
+            # doc_new UNIQUIFIES a colliding name. Returning the requested name would be a
+            # lie the caller then repeats in every later name-based lookup, so report what
+            # the document is actually called.
+            actual = r.get("name") or name
+            out = {"ok": True, "doc_id": did, "name": actual,
                    "revision": r.get("revision", 0)}
+            if taken is not None:
+                out["name_taken"] = True
+                out["existing"] = {"doc_id": taken["doc_id"],
+                                   "name": taken.get("name") or name,
+                                   "feature_count": taken.get("feature_count")}
+                out["note"] = (
+                    f'a part named "{name}" was already open with geometry in it '
+                    f'(doc_id={taken["doc_id"]}); this call made a SEPARATE document '
+                    f'"{actual}". If you meant to keep building the first one, pass its '
+                    f'doc_id to add_features instead of calling new_part again.')
             # Land the (still empty) part in the user's project folder immediately so it
             # exists as a real, openable file; add_features refreshes it as geometry grows.
-            saved = _project_save(did, name)
+            saved = _project_save(did, actual)
             if saved:
                 out["saved_path"] = saved
             return _dumps(out)

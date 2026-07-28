@@ -18,6 +18,7 @@
 #include "../renderer.h"
 #include "../render/aicm_loader.h"    // complete DocMesh for per-session parsed tess cache
 #include "engine_backend.h"           // Phase 4: daemon mirror tabs detach, not doc_close
+#include "engine_events.h"            // primeMirrorFromSnapshot — lock-free spectator read
 #include "ipc_client.h"               // services/ipc EngineClient (daemon detach_doc)
 #include "../ui/sketch_mode.h"        // per-document SketchMode owned by each DocSession
 #include "../ui/property_manager.h"   // per-document PropertyManager owned by each DocSession
@@ -439,6 +440,21 @@ void AppState::switchToTabCore(int idx) {
         // to the full forced rebuild inside the engine only when that cache is cold.
         const std::string rebuildDocId = dst.docId;
         const int rebuildTabIdx = idx;
+        // A mirror of a doc ANOTHER client owns must never reach doc_activate while it has
+        // an alternative: doc_activate takes that doc's per-doc engine mutex, so clicking the
+        // tab for the part an agent is mid-burst on blocked for 142.9 s on a live run. Ask the
+        // daemon for its last pushed revision instead — registry-only, no engine call. If it
+        // has one, the retry below lands on the pushed/cached fast path and never activates.
+        const bool spectating = dst.aiHandoff && !dst.userAdopted;
+        if (spectating && !snapshotPrimeInFlight.count(rebuildDocId)) {
+            snapshotPrimeInFlight.insert(rebuildDocId);
+            core::primeMirrorFromSnapshot(*this, rebuildDocId, [this, rebuildDocId](bool got) {
+                snapshotPrimeInFlight.erase(rebuildDocId);
+                if (!got) return;   // nothing parked — the doc_activate below still runs
+                const int i = reresolveTabIndex(*this, -1, rebuildDocId);
+                if (i >= 0 && i == activeTab) switchToTabCore(i);
+            });
+        }
         if (loadingToastInFlight.insert(rebuildDocId).second)   // dedup: one toast per rebuild
             toast(ui::ToastLevel::Info, "Loading " + dst.title + "…");
         // Select the shell immediately but never show another document's stale geometry under it.
@@ -624,8 +640,19 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                      toast(ui::ToastLevel::Error, "Couldn't switch document: " + r.err);
                      return;
                  }
-                 // Only adopt into the live mirror if this tab is still active.
-                 if (activeTab == idx) {
+                 // Only adopt into the live mirror if this tab is still active AND this is
+                 // still the newest activation for it. `generation` was previously logged but
+                 // never compared: a doc_activate that queued 142.9 s behind an agent's write
+                 // burst came back holding a two-minute-old tree + AICM, and adopting that
+                 // would have replaced the live pushed revision the mirror had caught up to
+                 // in the meantime. Superseded results still park below (the `else` branch),
+                 // where a stale revision is harmless.
+                 const bool current = generation == activationGeneration;
+                 if (!current)
+                     addLog("[tabs] async activation for " + docId + " superseded (gen " +
+                            std::to_string(generation) + " < " +
+                            std::to_string(activationGeneration) + ") — not adopted");
+                 if (activeTab == idx && current) {
                      suppressTabDirty = true;
                      if (!docMirror.adoptActivateResponse(docId, r.result, aicm, e2)) {
                          suppressTabDirty = false;
@@ -668,17 +695,22 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                      else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB)
                          ribbonTab = RT_Features;
                  } else {
-                     // Park mesh path on the session so the next switch can use the fast path.
-                     std::string aicmPark;
-                     if (r.result.contains("tess") && r.result["tess"].is_object())
-                         aicmPark = r.result["tess"].value("aicm_path", std::string());
-                     if (!aicmPark.empty() && docTabs[idx].session) {
-                         docTabs[idx].session->cachedAicmPath = aicmPark;
-                         if (r.result.contains("revision") &&
-                             r.result["revision"].is_number_integer())
-                             docTabs[idx].session->cachedRevision =
-                                 r.result["revision"].get<int>();
-                     }
+                    // Park mesh path on the session so the next switch can use the fast path.
+                    // Never let an OLDER revision overwrite what the tab already has: this
+                    // branch also catches the superseded case above, and a doc_activate that
+                    // spent two minutes queued behind a writer comes back older than the
+                    // pushed revisions the tab prewarmed while it waited.
+                    std::string aicmPark;
+                    if (r.result.contains("tess") && r.result["tess"].is_object())
+                        aicmPark = r.result["tess"].value("aicm_path", std::string());
+                    int parkRev = -1;
+                    if (r.result.contains("revision") && r.result["revision"].is_number_integer())
+                        parkRev = r.result["revision"].get<int>();
+                    if (!aicmPark.empty() && docTabs[idx].session &&
+                        parkRev >= docTabs[idx].session->cachedRevision) {
+                        docTabs[idx].session->cachedAicmPath = aicmPark;
+                        docTabs[idx].session->cachedRevision = parkRev;
+                    }
                  }
              }, 120000);
 }

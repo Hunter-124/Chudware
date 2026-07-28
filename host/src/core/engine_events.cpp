@@ -229,13 +229,25 @@ void openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     // all once the prewarm committed), so spectating and selecting never wait on the writer.
     st.ensureTabSession(st.docTabs[idx]);
     st.addLog("[daemon] mirror tab opened for " + docId);
+    // Prime the tab from the daemon's last pushed revision BEFORE anything can switch to
+    // it. This is the lock-free read (primeMirrorFromSnapshot); it lands within a frame or
+    // two and leaves a parked snapshot + prewarmed mesh, so the auto-focus below and any
+    // later user click both take switchToTabCore's pushed/cached path instead of issuing a
+    // doc_activate that queues on the doc's engine mutex behind the agent writing it.
     if (takeFocus && !crashLoopBraked) {
-        st.switchToTab(idx);  // activates: doc_activate (ro-allowed) -> tree + mesh
+        core::primeMirrorFromSnapshot(st, docId, [&st, docId](bool) {
+            // Focus once the snapshot is parked (or once we know there is none — a doc
+            // nobody has written yet activates instantly, so the fallback is cheap).
+            // Re-resolve: tabs may have opened or closed while the call was in flight.
+            const int i = tabIndexForDoc(st, docId);
+            if (i >= 0 && i != st.activeTab) st.switchToTab(i);
+        });
         st.toast(ui::ToastLevel::Info,
                  "Live view of the AI's part — it updates as it builds");
     } else {
         st.docTabs[idx].aiPulse = true;  // background reveal; switch-in activates
         st.docTabs[idx].lastAgentEditAt = std::chrono::steady_clock::now();
+        core::primeMirrorFromSnapshot(st, docId);
         if (takeFocus) {
             // Crash-loop brake: would have taken focus and auto-activated, but repeated
             // engine reconnects mean this doc's activation keeps crashing hostd. Leave the
@@ -1032,6 +1044,53 @@ void mirrorRecoveredDocs(AppState& st, const std::vector<std::string>& docIds) {
     // path: placeholder title now, async doc_tree backfill on a later frame.
     for (const auto& id : docIds)
         if (!id.empty()) openMirrorTab(st, id);
+}
+
+void primeMirrorFromSnapshot(AppState& st, const std::string& docId,
+                             std::function<void(bool)> then) {
+    if (docId.empty() || !engine::daemonMode() || !engine::client()) {
+        if (then) then(false);
+        return;
+    }
+    st.rpc.call("doc_snapshot", json{{"doc_id", docId}},
+                [&st, docId, then = std::move(then)](const core::RpcResult& r) {
+                    const bool have = r.ok && r.result.is_object() &&
+                                      r.result.value("has_snapshot", false);
+                    if (!have) {
+                        // An old daemon (unknown method) or a doc that has not been written
+                        // since the daemon started. The caller falls back to doc_activate.
+                        if (then) then(false);
+                        return;
+                    }
+                    const int idx = tabIndexForDoc(st, docId);
+                    if (idx < 0) {
+                        if (then) then(false);
+                        return;
+                    }
+                    // doc_snapshot returns the VERBATIM doc.changed payload, so both the
+                    // active and the background branch below are the same code the live
+                    // event path already runs — this is a replay of the push we missed,
+                    // not a second way of loading a document.
+                    if (idx == st.activeTab) {
+                        applyChangedActive(st, docId, r.result);
+                        if (then) then(true);
+                        return;
+                    }
+                    AppState::DocTab& tab = st.docTabs[idx];
+                    DocMirrorSnapshot snapshot;
+                    const std::string aicm = r.result.value("aicm_path", std::string());
+                    if (!tab.session || !pushedSnapshot(docId, r.result, snapshot) ||
+                        aicm.empty()) {
+                        if (then) then(false);
+                        return;
+                    }
+                    tab.session->cachedAicmPath = aicm;
+                    tab.session->cachedRevision = snapshot.revision;
+                    tab.session->cachedMirror = std::move(snapshot);
+                    tab.session->cachedDocMesh.reset();
+                    st.cacheBackgroundDocMeshAsync(docId, tab.session->cachedRevision, aicm);
+                    if (then) then(true);
+                }, 15000);
 }
 
 }  // namespace core

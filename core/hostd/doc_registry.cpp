@@ -614,6 +614,9 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                     if (result.contains("rebuild") && result["rebuild"].is_object() &&
                         result["rebuild"].contains("feature_status"))
                         data["feature_status"] = result["rebuild"]["feature_status"];
+                    // Keep the payload so a mirror tab that appears AFTER this push can
+                    // still be populated without a doc_activate (see DocState::lastPush).
+                    d.lastPush = data;
                     fanoutLocked(docId, json{{"event", "doc.changed"}, {"data", data}},
                                  clientId, pending);
                 }
@@ -724,6 +727,13 @@ bool DocRegistry::isAgentOrigin(const std::string& docId) {
     if (it == docs_.end()) return false;
     const std::string& k = it->second.originKind;
     return k == "agent" || k == "mcp";
+}
+
+json DocRegistry::lastPushFor(const std::string& docId) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = docs_.find(docId);
+    if (it == docs_.end()) return json();
+    return it->second.lastPush;
 }
 
 }  // namespace hostd

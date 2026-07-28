@@ -5276,3 +5276,36 @@ built inside the first and the engine rightly said "boss added no material". Ver
 at d2d88005 (before this session) in a pinned worktree. The test now uses distinct names, and
 new_part's resume note reports the feature count it resumed onto, so an agent that believes it
 started an empty part is told otherwise before it builds a second body at the origin.
+
+Spectating an agent's part must never wait on the agent (2026-07-28). Report: "I can only
+switch to the AI part if there's a gap where the agent stops sending tool calls, and when I do
+get in, duplicate parts open in the viewport." The GUI's own perf log named the first cause
+exactly: `[perf] tab_switch doc=doc-cpp00000002 path=async-rebuild gen=1` at 07:21:19, six
+`path=async-rebuild-coalesced` lines over the next six seconds (the user clicking again), and
+`[perf] tab_switch_rebuild doc=doc-cpp00000002 gen=1 total=142902ms` at 07:23:42. A mirror tab
+with no parked revision populated itself with `doc_activate`, which is read-only in INTENT but
+still takes the doc's per-doc engine mutex (T-PERF5 DocLock), so it queued behind the agent's
+write burst for 142.9 s — and `activationInFlight` parked every later click in
+`pendingActivateTab` behind that one call, which is why only a lull let the switch through.
+Fix: hostd now caches the last `doc.changed` payload it fanned out (`DocState::lastPush`, built
+at the existing fanout site so it costs one tree per doc) and serves it from a new daemon-only
+`doc_snapshot` that never reaches the engine. `primeMirrorFromSnapshot` (engine_events) replays
+it through the SAME code the live event path runs, so a mirror tab is populated the moment it
+appears and both the auto-focus and any user click take switchToTabCore's pushed/cached branch.
+Measured on an isolated hostd (scratch/snapshot_lockfree_probe.py, a private copy of the binary
+— CHUDWARE_HOSTD_SOCKET does not isolate): one 900-feature batch held the doc 3237 ms;
+`doc_activate` issued during it took 2826 ms, while 141 `doc_snapshot` calls spanning the whole
+write had a worst case of 1.7 ms and a median of 0.1 ms. Two related hazards closed with it:
+`generation` was logged but never COMPARED, so that 142.9 s-stale tree would have been adopted
+into a mirror that had since caught up — a superseded activation is now dropped; and the
+off-screen park no longer lets an older revision overwrite a newer parked one.
+The duplicates were four real documents: `doc_list` on the live daemon showed
+CD-XXX_TwistedLatticeOrb (rev 5), ...Orb2, ...Orb3 and ...Orb4 for ONE requested part, because
+each respawned `model3d` worker re-called `new_part` with the same name, `doc_new` UNIQUIFIED
+the collision, and every mint fans out doc.opened → another mirror tab. `new_part` now resumes
+an UNBUILT same-named part (exactly the respawn case, nothing to inherit) and, for a BUILT one,
+still mints a separate document but reports `name_taken` + the existing doc_id/feature count +
+how to continue it, and returns the name the document ACTUALLY got instead of the requested one.
+The first attempt at this resumed ANY same-named part and broke twelve sibling tests with
+"boss added no material (it is buried inside the body)" — inheriting a stranger's half-built
+body is worse than a duplicate tab, and that failure is what the built/unbuilt split encodes.

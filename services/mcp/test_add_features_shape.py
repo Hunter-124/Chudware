@@ -15,6 +15,7 @@ import asyncio
 import json
 import math
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -2164,61 +2165,60 @@ def test_the_live_run_96954661041418_batches_build(case):
 
 
 @enginetest
-def test_live_new_part_default_resumes_same_named_doc_instead_of_forking():
-    """Live bug (doc_list on the running daemon showed 4 docs named
-    CD-XXX_TwistedLatticeOrb[1-4]): a general agent that retries a brief, or a model3d
-    worker that respawns per turn, calls new_part(name=...) more than once with no memory
-    of the first doc_id. The engine's doc_new uniquifies the colliding name and mints a
-    fresh document each time, fanning out doc.opened and opening a duplicate GUI tab per
-    call. The default MUST resume the existing document by name, not fork another one."""
+def test_live_new_part_resumes_an_unbuilt_same_named_doc_instead_of_forking():
+    """Live bug (doc_list on the running daemon showed four docs named
+    CD-XXX_TwistedLatticeOrb, ...Orb2, ...Orb3, ...Orb4 for ONE requested part): a general
+    agent that retries a brief, or a model3d worker that respawns per turn, calls
+    new_part(name=...) again with no memory of the first doc_id. doc_new uniquifies the
+    collision and mints a fresh document each time, and every mint fans out doc.opened, so
+    the GUI opens another mirror tab. An UNBUILT part of that name has no geometry to
+    inherit, so resuming it is unambiguous — and it is exactly the respawn case."""
     from services.agent.agent_turn import _bind_tool
     from services.mcp import cad_common as cc
     new_part = _bind_tool("new_part")
-    add_features = _bind_tool("add_features")
+    name = f"WidgetUnbuilt_{uuid.uuid4().hex[:8]}"
 
-    first = json.loads(new_part(name="Widget"))
+    first = json.loads(new_part(name=name))
     assert first["ok"] and "reused" not in first
     doc = first["doc_id"]
 
-    second = json.loads(new_part(name="Widget"))
+    second = json.loads(new_part(name=name))
     assert second["ok"] is True
-    assert second["doc_id"] == doc, "same name must resolve to the SAME document"
+    assert second["doc_id"] == doc, "an unbuilt part of the same name must be RESUMED"
     assert second.get("reused") is True
-    assert "note" in second and "Widget" in second["note"]
 
     docs = cc.cb.call("doc_list", {}).get("docs", [])
-    named_widget = [d for d in docs if d.get("name") == "Widget"]
-    assert len(named_widget) == 1, (
-        f"expected exactly one open document named Widget, got {named_widget}")
+    assert len([d for d in docs if d.get("name") == name]) == 1
 
 
 @enginetest
-def test_live_new_part_default_does_not_reset_volume_baseline_on_reuse():
-    """The reused-doc path must seed _LAST_VOLUME only if this process never tracked the
-    doc — clobbering it to 0.0 on every reuse would corrupt the NEXT add_features write-diff
-    ("0.0 -> X" instead of the true delta) for a part that already carries built geometry."""
+def test_live_new_part_never_silently_inherits_a_built_part():
+    """The dangerous half of name-reuse. Handing a caller someone else's half-built body is
+    WORSE than a duplicate tab: the next feature lands on geometry the caller does not know
+    is there and fails as «boss added no material (it is buried inside the body)» — an error
+    about geometry for what is really a document mix-up. So a BUILT same-named part is never
+    resumed; a separate document is minted and the collision is reported instead of hidden."""
     from services.agent.agent_turn import _bind_tool
     new_part = _bind_tool("new_part")
     add_features = _bind_tool("add_features")
+    name = f"WidgetBuilt_{uuid.uuid4().hex[:8]}"
 
-    doc = json.loads(new_part(name="VolumeKeepWidget"))["doc_id"]
+    doc = json.loads(new_part(name=name))["doc_id"]
     built = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
         "type": "box", "name": "Block",
         "params": {"length": 40, "width": 30, "height": 20}}}]))
     assert built["ok"], built
-    assert built["changes"]["volume_delta_mm3"] > 0
 
-    resumed = json.loads(new_part(name="VolumeKeepWidget"))
-    assert resumed["ok"] and resumed["reused"] is True
-    assert resumed["doc_id"] == doc
-
-    again = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
-        "type": "cylinder", "name": "Post",
-        "params": {"radius": 3, "height": 10}, "at": [0, 0, 20]}}]))
-    assert again["ok"], again
-    # A clobbered baseline would report the FULL new volume as if starting from 0 — assert
-    # the reported delta is the small cylinder addition, not the whole part's volume.
-    assert again["changes"]["volume_delta_mm3"] < built["changes"]["volume_delta_mm3"]
+    second = json.loads(new_part(name=name))
+    assert second["ok"] is True
+    assert second.get("reused") is not True
+    assert second["doc_id"] != doc, "a BUILT part must never be silently resumed"
+    # The caller is told, and told enough to act: the other part's id and how to continue it.
+    assert second.get("name_taken") is True
+    assert second["existing"]["doc_id"] == doc
+    assert doc in second["note"]
+    # And it is not lied to about which document it now holds: doc_new uniquified the name.
+    assert second["name"] != name
 
 
 @enginetest

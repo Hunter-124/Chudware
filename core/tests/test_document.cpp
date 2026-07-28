@@ -4020,3 +4020,90 @@ TEST_CASE("validate: unknown ref slot names every accepted slot") {
               std::string::npos);
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The "four-rung ladder": a live copilot run tried to fillet "the vertical edges" of a
+// keychain body four times, and each rejection revealed exactly ONE more constraint --
+//   1. {"query":"..."}              -> refs.edges: must be a non-empty list
+//   2. ["the vertical edges"]       -> [0]: neither a reserved datum, a feature id, nor "$N"
+//   3. [{"query":"..."}]            -> [0].kind: not in [body,datum,edge,...]
+//   4. [{"kind":"edge","query":..}] -> [0].centroid: must be [x,y,z]
+// -- so the model learned one rung per turn, never reached a writable form, and the turn
+// died. The engine has accepted {"of":"edge","parallel":"z"} in this exact slot the whole
+// time (picks.cpp resolve_geom_query, and parse_axis_vec even reads parallel:"vertical"),
+// but NO rejection mentioned that queries exist. Every rung must now name the full grammar,
+// including the query form and its keys, so one rejection is enough.
+TEST_CASE("validate: a rejected selector slot teaches the whole grammar, incl. queries") {
+    auto fillet_doc = [](json edges) {
+        json canon;
+        canon["schema"] = "aicad.part/1";
+        canon["id"] = "doc1";
+        canon["name"] = "Keychain";
+        canon["units"] = json{{"system", "MMGS"}};
+        canon["features"] = json::array({
+            json{{"id", "f1"}, {"type", "box"}, {"name", "Body"}, {"suppressed", false},
+                 {"params", {{"length", 40}, {"width", 20}, {"height", 4}}},
+                 {"refs", json::object()}},
+            json{{"id", "f2"}, {"type", "fillet"}, {"name", "Round"}, {"suppressed", false},
+                 {"params", {{"radius", 2}}},
+                 {"refs", {{"edges", edges}}}},
+        });
+        return canon;
+    };
+    auto edge_err = [&](json edges) {
+        for (const auto& e : chudware::doc::validate_document(fillet_doc(edges)))
+            if (e.find("refs.edges") != std::string::npos) return e;
+        return std::string();
+    };
+    // Every rejection must carry the query form AND its key vocabulary -- the two things
+    // that were missing from all four live messages.
+    auto teaches_query = [](const std::string& e) {
+        CHECK(e.find("\"of\":\"edge\",\"parallel\":\"z\"") != std::string::npos);
+        CHECK(e.find("query keys: of(face|edge, default face)") != std::string::npos);
+        CHECK(e.find("perpendicular, pick, near, count, index") != std::string::npos);
+        CHECK(e.find("describe_part") != std::string::npos);
+    };
+
+    SUBCASE("rung 1: a bare object in a list slot") {
+        const std::string e = edge_err(json{{"query", "the vertical edges"}});
+        REQUIRE_MESSAGE(!e.empty(), "an object in refs.edges must be rejected");
+        MESSAGE(e);
+        CHECK(e.find("must be a non-empty list") != std::string::npos);
+        teaches_query(e);
+    }
+    SUBCASE("rung 2: a prose string element") {
+        const std::string e = edge_err(json::array({"the vertical edges"}));
+        REQUIRE_MESSAGE(!e.empty(), "a prose string element must be rejected");
+        MESSAGE(e);
+        CHECK(e.find("is neither a reserved datum, a feature id, nor a same-batch") !=
+              std::string::npos);
+        teaches_query(e);
+    }
+    SUBCASE("rung 3: an object element that is not a query") {
+        const std::string e = edge_err(json::array({json{{"query", "the vertical edges"}}}));
+        REQUIRE_MESSAGE(!e.empty(), "a non-query object element must be rejected");
+        MESSAGE(e);
+        CHECK(e.find(".kind: not in") != std::string::npos);
+        teaches_query(e);
+    }
+    SUBCASE("rung 4: a half-built topology selector the model cannot finish") {
+        const std::string e = edge_err(
+            json::array({json{{"kind", "edge"}, {"query", "the vertical edges"}}}));
+        REQUIRE_MESSAGE(!e.empty(), "a centroid-less edge selector must be rejected");
+        MESSAGE(e);
+        // No longer "give me a centroid" -- a model cannot measure one.
+        CHECK(e.find("incomplete engine topology selector") != std::string::npos);
+        CHECK(e.find("only the engine can measure") != std::string::npos);
+        CHECK(e.find("query_geometry") != std::string::npos);
+        teaches_query(e);
+    }
+    // Accept behaviour is UNCHANGED: the form the messages now teach was always valid and
+    // must stay valid. (Guards the whole change against becoming a strictness regression.)
+    SUBCASE("the taught form validates clean") {
+        const json canon =
+            fillet_doc(json::array({json{{"of", "edge"}, {"parallel", "z"}}}));
+        const std::vector<std::string> errs = chudware::doc::validate_document(canon);
+        for (const auto& x : errs) MESSAGE("  " << x);
+        CHECK(errs.empty());
+    }
+}

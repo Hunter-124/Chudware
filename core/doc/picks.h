@@ -139,4 +139,15 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
 // Feature compilers use this to branch a query payload vs an explicit pick selector.
 bool is_geom_query(const nlohmann::json& v);
 
+// Canonical geometry-query grammar tail, appended to EVERY error that rejects a value in a
+// query / selector slot. A model that guessed one key wrong has no other way to discover the
+// vocabulary, so the message must carry the whole shape rather than the one offending field.
+// Single definition on purpose: doc/picks.cpp (query resolution) and doc/validate.cpp
+// (document validation) both emit it, and two copies would silently drift apart.
+constexpr const char* kQueryGrammar =
+    " | query keys: of(face|edge, default face), side(top|bottom|left|right|front|back|"
+    "+x|-x|+y|-y|+z|-z), surf, parallel, perpendicular, pick, near, count, index. Example: "
+    "{\"of\":\"face\",\"side\":\"top\"}. For a free-text description call describe_part / "
+    "hover(sid) instead.";
+
 }  // namespace chudware::doc

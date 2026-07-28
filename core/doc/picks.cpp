@@ -587,19 +587,8 @@ std::optional<Eigen::Vector3d> parse_axis_vec(const nlohmann::json& j) {
     return std::nullopt;
 }
 
-// Shared tail for EVERY geom-query error: the FULL query grammar, not just the one field
-// that was rejected. A model that guessed one key wrong has no other way to discover the
-// vocabulary — the old errors named only the offending field, so the model retried with a
-// different wrong guess instead of learning the shape. Also names the escape hatch — the
-// REAL agent-facing exploration tools (describe_part -> a named face/edge roster with stable
-// sids, hover(sid) -> one element's card) — for when the "query" was really a prose
-// description. describe_faces is a C++ symbol, NOT a tool: naming it would cost the model
-// another failed call, which is the exact failure class this grammar exists to end.
-constexpr const char* kQueryGrammar =
-    " | query keys: of(face|edge, default face), side(top|bottom|left|right|front|back|"
-    "+x|-x|+y|-y|+z|-z), surf, parallel, perpendicular, pick, near, count, index. Example: "
-    "{\"of\":\"face\",\"side\":\"top\"}. For a free-text description call describe_part / "
-    "hover(sid) instead.";
+// The shared query-grammar tail for every geom-query error now lives in doc/picks.h
+// (chudware::doc::kQueryGrammar) so doc/validate.cpp emits the identical text.
 
 // Echo a REJECTED string value back inside an error message: capped so a pasted sentence
 // can't bloat the error, and cut on a UTF-8 code-point boundary because the message is

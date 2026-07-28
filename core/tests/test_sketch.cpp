@@ -473,3 +473,55 @@ TEST_CASE("malformed entity + constraint on it: skipped, no crash (hostd SIGSEGV
     CHECK(sol.dof == 1);
     CHECK(double(sol.entities["e1"]["p2"][0]) == doctest::Approx(80.0));
 }
+
+TEST_CASE("shorthand id-less circles do not crash the solver") {
+    // Regression: the live agent turn of 2026-07-28 wrote a `PatternSk` sketch as a
+    // lattice of bare circles in the shorthand dialect — {"type":"circle","cx":…,
+    // "cy":…,"r":…} with no "id", no "center", no "radius". allocate_entity read
+    // e["center"] / e["id"] through nlohmann's CONST operator[], which is UNDEFINED
+    // BEHAVIOUR on a missing key: it dereferenced end() and handed num() a garbage
+    // json, SIGSEGV'ing inside get_arithmetic_value(). That killed the python admin
+    // worker mid-turn (coredump PID 3454839), which the host reported only as
+    // "admin worker closed stdout" / stop_reason non_modeling_request, losing the
+    // whole session's modeling work. Missing keys must degrade to a skipped entity.
+    json s;
+    json ents = json::array();
+    // Enough entities to force the underlying vector to reallocate several times.
+    for (int i = 0; i < 64; ++i)
+        ents.push_back(json{{"type", "circle"},
+                            {"cx", -23.0 + 1.5 * i},
+                            {"cy", (i % 2) ? 4.0 : 0.0},
+                            {"r", 2.25}});
+    // One well-formed entity alongside them: the healthy geometry must still solve.
+    ents.push_back(line("e1", 0, 0, 80, 0));
+    s["entities"] = ents;
+    s["constraints"] = json::array({
+        rel("c1", "fix", {"e1.p1"}),
+        dim("c2", "distance", {"e1.p1", "e1.p2"}, 80.0),
+    });
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+    CHECK(double(sol.entities["e1"]["p2"][0]) == doctest::Approx(80.0));
+}
+
+TEST_CASE("entities missing their coordinate keys are skipped, not dereferenced") {
+    // Same UB class, one entity per affected type: every branch of allocate_entity
+    // used const operator[] on keys the schema does not guarantee.
+    json s;
+    s["entities"] = json::array({
+        line("e1", 0, 0, 80, 0),
+        json{{"id", "a"}, {"type", "circle"}},                       // no center/radius
+        json{{"id", "b"}, {"type", "arc"}, {"center", json::array({1})}},  // short array
+        json{{"id", "c"}, {"type", "line"}},                         // no p1/p2
+        json{{"id", "d"}, {"type", "spline"}},                       // no points
+        json{{"id", "e"}, {"type", "ellipse"}, {"center", json::array({0, 0})}},
+        json{{"id", "f"}},                                           // no type at all
+    });
+    s["constraints"] = json::array({
+        rel("c1", "fix", {"e1.p1"}),
+        dim("c2", "distance", {"e1.p1", "e1.p2"}, 80.0),
+    });
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+    CHECK(double(sol.entities["e1"]["p2"][0]) == doctest::Approx(80.0));
+}

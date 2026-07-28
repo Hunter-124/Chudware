@@ -585,10 +585,20 @@ std::string admin_worker_repo_root() {
 // worker-reported ok:false (offline mode, no provider, turn exception, ...) —
 // the caller's contract is to treat every false return identically: fall back
 // to the blocked response.
+//
+// `crashed` is set when the worker DIED rather than answered (killed by a signal,
+// or exited without a response). 2026-07-28: a shorthand sketch entity
+// ({"type":"circle","cx":…} with no "center") drove nlohmann's UB const
+// operator[] inside chudware::sketch::allocate_entity and SIGSEGV'd the worker
+// mid-turn; the operator saw only "admin worker closed stdout" and a
+// `non_modeling_request` stop reason, because the child's stderr went to the
+// host's own stderr and the wait status was never inspected. Both are now
+// captured: `err` carries the signal name and the worker's last stderr, and the
+// caller reports stop_reason "worker_crash".
 bool call_admin_worker_turn(const std::string& request, const std::string& run_id,
                             const json& provider_cfg, const std::string& workspace_dir,
                             const json& history, RunEvents& events, json& turn_out,
-                            std::string& err) {
+                            std::string& err, bool& crashed) {
     const std::string python = admin_worker_python_bin();
     if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
         err = "python runtime not found at " + python;
@@ -596,8 +606,8 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     }
     const std::string repo = admin_worker_repo_root();
 
-    int out_pipe[2], in_pipe[2];
-    if (::pipe(out_pipe) != 0 || ::pipe(in_pipe) != 0) {
+    int out_pipe[2], in_pipe[2], err_pipe[2];
+    if (::pipe(out_pipe) != 0 || ::pipe(in_pipe) != 0 || ::pipe(err_pipe) != 0) {
         err = std::string("pipe() failed: ") + std::strerror(errno);
         return false;
     }
@@ -618,7 +628,9 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
 #endif
         ::dup2(in_pipe[0], STDIN_FILENO);
         ::dup2(out_pipe[1], STDOUT_FILENO);
+        ::dup2(err_pipe[1], STDERR_FILENO);
         ::close(in_pipe[0]); ::close(in_pipe[1]); ::close(out_pipe[0]); ::close(out_pipe[1]);
+        ::close(err_pipe[0]); ::close(err_pipe[1]);
 #if defined(__linux__)
         ::close_range(3, ~0U, 0);  // never leak the host process's own fds into the worker
 #endif
@@ -629,9 +641,67 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     ::setpgid(pid, pid);
     ::close(in_pipe[0]);
     ::close(out_pipe[1]);
+    ::close(err_pipe[1]);
     ::fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
+    ::fcntl(err_pipe[0], F_SETFL, O_NONBLOCK);
     const int rd = out_pipe[0];
+    const int ed = err_pipe[0];
     const int wr = in_pipe[1];
+
+    // Rolling tail of the worker's stderr. It MUST be drained even when nothing
+    // goes wrong: an unread 64 KiB pipe would block a chatty worker forever.
+    // Only the tail is kept — a python traceback's last lines are the diagnosis.
+    constexpr size_t kStderrTailMax = 8192;
+    std::string stderr_tail;
+    auto drain_stderr = [&]() {
+        char buf[4096];
+        for (;;) {
+            ssize_t n = ::read(ed, buf, sizeof(buf));
+            if (n <= 0) break;
+            stderr_tail.append(buf, static_cast<size_t>(n));
+            if (stderr_tail.size() > kStderrTailMax)
+                stderr_tail.erase(0, stderr_tail.size() - kStderrTailMax);
+        }
+    };
+    // Why the worker stopped answering: the wait status (signal name for a native
+    // crash, exit code otherwise) plus the tail of what it printed on the way out.
+    auto death_detail = [&](const char* prefix) {
+        drain_stderr();
+        int status = 0;
+        std::string what = prefix;
+        for (int i = 0; i < 100; ++i) {
+            pid_t r = ::waitpid(pid, &status, WNOHANG);
+            if (r == pid) {
+                if (WIFSIGNALED(status)) {
+                    const int sig = WTERMSIG(status);
+                    what = std::string("admin worker crashed: ") + ::strsignal(sig) +
+                           " (signal " + std::to_string(sig) + ")";
+                } else if (WIFEXITED(status)) {
+                    what = "admin worker exited with code " +
+                           std::to_string(WEXITSTATUS(status)) + " without answering";
+                }
+                break;
+            }
+            if (r < 0 && errno == ECHILD) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::string tail = stderr_tail;
+        while (!tail.empty() && (tail.back() == '\n' || tail.back() == '\r')) tail.pop_back();
+        if (!tail.empty()) {
+            // Last few lines only: the chat card has to stay readable.
+            size_t cut = tail.size();
+            for (int lines = 0; lines < 6 && cut > 0; ++lines) {
+                size_t nl = tail.rfind('\n', cut - 1);
+                if (nl == std::string::npos) { cut = 0; break; }
+                cut = nl;
+            }
+            if (cut > 0) tail = "…" + tail.substr(cut + 1);
+            events.emit("run_note", json{{"note", "admin worker stderr"},
+                                         {"reason", stderr_tail}});
+            what += " — worker stderr: " + tail;
+        }
+        return what;
+    };
 
     auto reap = [&](bool graceful) {
         if (graceful) {
@@ -724,19 +794,47 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
                 err = "timeout waiting for admin worker response";
                 break;
             }
-            struct pollfd pfd { rd, POLLIN, 0 };
-            int pr = ::poll(&pfd, 1, 200);
+            struct pollfd pfds[2] = {{rd, POLLIN, 0}, {ed, POLLIN, 0}};
+            int pr = ::poll(pfds, 2, 200);
             if (pr < 0) { if (errno == EINTR) continue; err = "poll() failed"; break; }
-            if (pr == 0) {
+            if (pfds[1].revents) drain_stderr();
+            if (pr == 0 || !(pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
                 int status = 0;
                 pid_t r = ::waitpid(pid, &status, WNOHANG);
-                if (r == pid || (r < 0 && errno == ECHILD)) { err = "admin worker exited early"; break; }
+                if (r == pid || (r < 0 && errno == ECHILD)) {
+                    // Reap already consumed the status when r == pid; re-derive from it
+                    // directly rather than waiting again on a gone child.
+                    drain_stderr();
+                    if (r == pid && WIFSIGNALED(status)) {
+                        const int sig = WTERMSIG(status);
+                        err = std::string("admin worker crashed: ") + ::strsignal(sig) +
+                              " (signal " + std::to_string(sig) + ")";
+                    } else if (r == pid && WIFEXITED(status)) {
+                        err = "admin worker exited with code " +
+                              std::to_string(WEXITSTATUS(status)) + " without answering";
+                    } else {
+                        err = "admin worker exited early";
+                    }
+                    if (!stderr_tail.empty()) {
+                        events.emit("run_note", json{{"note", "admin worker stderr"},
+                                                     {"reason", stderr_tail}});
+                        err += " — worker stderr: " + stderr_tail.substr(
+                                   stderr_tail.size() > 600 ? stderr_tail.size() - 600 : 0);
+                    }
+                    crashed = true;
+                    break;
+                }
                 continue;
             }
             char chunk[4096];
             ssize_t got = ::read(rd, chunk, sizeof(chunk));
             if (got > 0) { read_buf.append(chunk, static_cast<size_t>(got)); continue; }
-            if (got == 0) { err = "admin worker closed stdout"; break; }
+            if (got == 0) {
+                // EOF on the worker's stdout: it is gone, not idle. Report WHY.
+                err = death_detail("admin worker closed stdout without answering");
+                crashed = true;
+                break;
+            }
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
             err = std::string("read() failed: ") + std::strerror(errno);
             break;
@@ -782,13 +880,14 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         break;
     }
     ::close(rd);
+    ::close(ed);
     reap(got_final && !cancelled);
     return ok_final;
 }
 #else   // _WIN32
 bool call_admin_worker_turn(const std::string&, const std::string&, const json&,
                             const std::string&, const json&, RunEvents&,
-                            json&, std::string& err) {
+                            json&, std::string& err, bool&) {
     err = "admin worker bridge unavailable on this platform";
     return false;
 }
@@ -968,22 +1067,35 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // the worker was unreachable, which was wrong for every case except the offline
         // pre-flight below (the ONE path that never calls the worker, and therefore the
         // one where an empty reason is the honest answer).
-        auto blocked_response = [&](const std::string& worker_err) -> json {
+        // `stop_reason` is "non_modeling_request" only for the refusal this branch is
+        // actually about (nothing could run the request). A worker that DIED is not a
+        // non-modeling request — reporting a SIGSEGV under that label sent the operator
+        // looking for a routing bug while a kernel crash went unlogged. `crashed` runs
+        // routes to "worker_crash" with status "failed", so the GUI shows a crash.
+        auto blocked_response = [&](const std::string& worker_err, bool worker_crashed = false)
+            -> json {
             const std::string detail = worker_err.empty() ? why : worker_err;
+            const std::string stop = worker_crashed ? "worker_crash" : "non_modeling_request";
+            const std::string status = worker_crashed ? "failed" : "blocked";
             const std::string human =
-                worker_err.empty()
+                worker_crashed
+                    ? "The agent worker process died part-way through this turn, so the "
+                      "turn was abandoned. This is a crash in Chudware, not something you "
+                      "did. Details: " +
+                          worker_err
+                : worker_err.empty()
                     ? std::string("I handed this to the general agent, but couldn't reach it "
                                   "(offline mode is on), so nothing was changed. Turn offline "
                                   "mode off, or use the PLM tab / file explorer directly.")
                     : "I handed this to the general agent, but the turn didn't complete, so "
                       "nothing was changed. Reason: " +
                           worker_err;
-            events.emit("run_finished", json{{"status", "blocked"},
-                                             {"stop_reason", "non_modeling_request"},
+            events.emit("run_finished", json{{"status", status},
+                                             {"stop_reason", stop},
                                              {"error_detail", detail}});
             return json{{"run_id", run_id},
-                        {"status", "blocked"},
-                        {"stop_reason", "non_modeling_request"},
+                        {"status", status},
+                        {"stop_reason", stop},
                         {"error_detail", detail},
                         {"error_human", human},
                         {"doc_id", doc_id}};
@@ -1002,10 +1114,11 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // response carrying that reason — never a crash, never a silent hang.
         json turn;
         std::string worker_err;
+        bool worker_crashed = false;
         const std::string ws_dir = agent_workspace_dir(options);
         const json history = options.value("history", json::array());
         if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, history, events,
-                                    turn, worker_err)) {
+                                    turn, worker_err, worker_crashed)) {
             if (worker_err == "cancelled" || run_ctl.cancelled()) {
                 events.emit("run_finished", json{{"status", "cancelled"},
                                                  {"stop_reason", "cancelled"}});
@@ -1014,9 +1127,11 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                             {"stop_reason", "cancelled"},
                             {"doc_id", doc_id}};
             }
-            events.emit("run_note", json{{"note", "general-work worker turn unavailable"},
-                                         {"reason", worker_err}});
-            return blocked_response(worker_err);
+            events.emit("run_note",
+                        json{{"note", worker_crashed ? "agent worker process died mid-turn"
+                                                     : "general-work worker turn unavailable"},
+                             {"reason", worker_err}});
+            return blocked_response(worker_err, worker_crashed);
         }
 
         const bool turn_ok = turn.value("success", false);

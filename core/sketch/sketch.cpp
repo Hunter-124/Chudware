@@ -48,6 +48,40 @@ using VarMap = std::map<std::string, std::vector<int>>;
 
 double num(const json& j) { return j.get<double>(); }
 
+// nlohmann's CONST operator[] is UNDEFINED BEHAVIOUR on a missing object key or an
+// out-of-range array index: it dereferences end() and hands back a garbage json&,
+// which num() then reads as a double — a wild pointer inside
+// get_arithmetic_value(). A model that writes an entity in the shorthand dialect
+// ({"type":"circle","cx":-23,"cy":0,"r":2.5} — no "center"/"radius"/"id") therefore
+// SIGSEGV'd the whole process from inside allocate_entity, killing the python admin
+// worker mid-turn and losing every modeling result in the session. The surrounding
+// try/catch could not help: UB does not throw.
+//
+// jat() turns every miss into a reference to a shared null json, so num() raises
+// nlohmann::type_error and the forward-tolerant catch skips exactly one entity or
+// constraint — the same degradation an unresolved handle already gets.
+const json& jnull() {
+    static const json kNull;
+    return kNull;
+}
+const json& jat(const json& j, const char* key) {
+    if (!j.is_object()) return jnull();
+    const auto it = j.find(key);
+    return it == j.end() ? jnull() : *it;
+}
+const json& jat(const json& j, int i) {
+    if (!j.is_array() || i < 0 || static_cast<std::size_t>(i) >= j.size()) return jnull();
+    return j[static_cast<std::size_t>(i)];
+}
+// Entity/constraint id with the same missing-key tolerance (mirrors sketch3d.cpp,
+// which already reads ids via value()). An id-less entity cannot be referenced by
+// any constraint, so collapsing them onto "" is harmless — unlike reading end().
+std::string jid(const json& j) {
+    if (!j.is_object()) return std::string();
+    const auto it = j.find("id");
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+}
+
 std::vector<int> concat(const std::vector<int>& a, const std::vector<int>& b) {
     std::vector<int> r = a;
     r.insert(r.end(), b.begin(), b.end());
@@ -98,24 +132,28 @@ VectorXd r1Vec2(const Vector2d& v) {
 // conic-family branch). Mirrors _entity_init_slice; only the generically-fixed
 // types need it.
 std::vector<double> entity_init_slice(const json& ent) {
-    const std::string et = ent.at("type");
+    const std::string et = ent.value("type", std::string());
     if (et == "ellipse_arc") {
-        double rot = ent.contains("rot") ? num(ent["rot"]) : 0.0;
-        return {num(ent["center"][0]), num(ent["center"][1]), num(ent["rx"]),
-                num(ent["ry"]), rot, num(ent["a0"]), num(ent["a1"])};
+        double rot = ent.contains("rot") ? num(jat(ent, "rot")) : 0.0;
+        return {num(jat(jat(ent, "center"), 0)), num(jat(jat(ent, "center"), 1)),
+                num(jat(ent, "rx")), num(jat(ent, "ry")), rot,
+                num(jat(ent, "a0")), num(jat(ent, "a1"))};
     }
     if (et == "parabola") {
-        return {num(ent["vertex"][0]), num(ent["vertex"][1]), num(ent["focus"][0]),
-                num(ent["focus"][1]), num(ent["t0"]), num(ent["t1"])};
+        return {num(jat(jat(ent, "vertex"), 0)), num(jat(jat(ent, "vertex"), 1)),
+                num(jat(jat(ent, "focus"), 0)), num(jat(jat(ent, "focus"), 1)),
+                num(jat(ent, "t0")), num(jat(ent, "t1"))};
     }
     if (et == "conic") {
-        double rho = ent.contains("rho") ? num(ent["rho"]) : 0.5;
-        return {num(ent["p0"][0]), num(ent["p0"][1]), num(ent["p1"][0]),
-                num(ent["p1"][1]), num(ent["apex"][0]), num(ent["apex"][1]), rho};
+        double rho = ent.contains("rho") ? num(jat(ent, "rho")) : 0.5;
+        return {num(jat(jat(ent, "p0"), 0)), num(jat(jat(ent, "p0"), 1)),
+                num(jat(jat(ent, "p1"), 0)), num(jat(jat(ent, "p1"), 1)),
+                num(jat(jat(ent, "apex"), 0)), num(jat(jat(ent, "apex"), 1)), rho};
     }
     if (et == "arc_slot") {
-        return {num(ent["center"][0]), num(ent["center"][1]), num(ent["radius"]),
-                num(ent["a0"]), num(ent["a1"]), num(ent["width"])};
+        return {num(jat(jat(ent, "center"), 0)), num(jat(jat(ent, "center"), 1)),
+                num(jat(ent, "radius")), num(jat(ent, "a0")), num(jat(ent, "a1")),
+                num(jat(ent, "width"))};
     }
     return {};
 }
@@ -123,63 +161,68 @@ std::vector<double> entity_init_slice(const json& ent) {
 // ---- entity parameterization ------------------------------------------------
 
 std::vector<int> allocate_entity(System& sys, const json& e) {
-    const std::string t = e["type"];
+    const std::string t = e.value("type", std::string());
     if (t == "point") {
-        Vector2d p(num(e["p"][0]), num(e["p"][1]));
+        Vector2d p(num(jat(jat(e, "p"), 0)), num(jat(jat(e, "p"), 1)));
         return sys.add_vars(2, {p(0), p(1)});
     }
     if (t == "line") {
-        return sys.add_vars(4, {num(e["p1"][0]), num(e["p1"][1]),
-                                num(e["p2"][0]), num(e["p2"][1])});
+        return sys.add_vars(4, {num(jat(jat(e, "p1"), 0)), num(jat(jat(e, "p1"), 1)),
+                                num(jat(jat(e, "p2"), 0)), num(jat(jat(e, "p2"), 1))});
     }
     if (t == "circle") {
-        return sys.add_vars(3, {num(e["center"][0]), num(e["center"][1]),
-                                num(e["radius"])});
+        return sys.add_vars(3, {num(jat(jat(e, "center"), 0)), num(jat(jat(e, "center"), 1)),
+                                num(jat(e, "radius"))});
     }
     if (t == "arc") {
-        return sys.add_vars(5, {num(e["center"][0]), num(e["center"][1]),
-                                num(e["radius"]), num(e["start"]), num(e["end"])});
+        return sys.add_vars(5, {num(jat(jat(e, "center"), 0)), num(jat(jat(e, "center"), 1)),
+                                num(jat(e, "radius")), num(jat(e, "start")),
+                                num(jat(e, "end"))});
     }
     if (t == "ellipse") {
-        return sys.add_vars(5, {num(e["center"][0]), num(e["center"][1]),
-                                num(e["rx"]), num(e["ry"]), num(e["rot"])});
+        return sys.add_vars(5, {num(jat(jat(e, "center"), 0)), num(jat(jat(e, "center"), 1)),
+                                num(jat(e, "rx")), num(jat(e, "ry")), num(jat(e, "rot"))});
     }
     if (t == "ellipse_arc") {
-        double rot = e.contains("rot") ? num(e["rot"]) : 0.0;
-        return sys.add_vars(7, {num(e["center"][0]), num(e["center"][1]),
-                                num(e["rx"]), num(e["ry"]), rot,
-                                num(e["a0"]), num(e["a1"])});
+        double rot = e.contains("rot") ? num(jat(e, "rot")) : 0.0;
+        return sys.add_vars(7, {num(jat(jat(e, "center"), 0)), num(jat(jat(e, "center"), 1)),
+                                num(jat(e, "rx")), num(jat(e, "ry")), rot,
+                                num(jat(e, "a0")), num(jat(e, "a1"))});
     }
     if (t == "parabola") {
-        return sys.add_vars(6, {num(e["vertex"][0]), num(e["vertex"][1]),
-                                num(e["focus"][0]), num(e["focus"][1]),
-                                num(e["t0"]), num(e["t1"])});
+        return sys.add_vars(6, {num(jat(jat(e, "vertex"), 0)), num(jat(jat(e, "vertex"), 1)),
+                                num(jat(jat(e, "focus"), 0)), num(jat(jat(e, "focus"), 1)),
+                                num(jat(e, "t0")), num(jat(e, "t1"))});
     }
     if (t == "conic") {
-        double rho = e.contains("rho") ? num(e["rho"]) : 0.5;
-        return sys.add_vars(7, {num(e["p0"][0]), num(e["p0"][1]),
-                                num(e["p1"][0]), num(e["p1"][1]),
-                                num(e["apex"][0]), num(e["apex"][1]), rho});
+        double rho = e.contains("rho") ? num(jat(e, "rho")) : 0.5;
+        return sys.add_vars(7, {num(jat(jat(e, "p0"), 0)), num(jat(jat(e, "p0"), 1)),
+                                num(jat(jat(e, "p1"), 0)), num(jat(jat(e, "p1"), 1)),
+                                num(jat(jat(e, "apex"), 0)), num(jat(jat(e, "apex"), 1)),
+                                rho});
     }
     if (t == "slot") {
-        return sys.add_vars(5, {num(e["p1"][0]), num(e["p1"][1]),
-                                num(e["p2"][0]), num(e["p2"][1]), num(e["width"])});
+        return sys.add_vars(5, {num(jat(jat(e, "p1"), 0)), num(jat(jat(e, "p1"), 1)),
+                                num(jat(jat(e, "p2"), 0)), num(jat(jat(e, "p2"), 1)),
+                                num(jat(e, "width"))});
     }
     if (t == "arc_slot") {
-        return sys.add_vars(6, {num(e["center"][0]), num(e["center"][1]),
-                                num(e["radius"]), num(e["a0"]), num(e["a1"]),
-                                num(e["width"])});
+        return sys.add_vars(6, {num(jat(jat(e, "center"), 0)), num(jat(jat(e, "center"), 1)),
+                                num(jat(e, "radius")), num(jat(e, "a0")),
+                                num(jat(e, "a1")), num(jat(e, "width"))});
     }
     if (t == "spline" || t == "style_spline") {
+        const json& pts = jat(e, "points");
+        if (!pts.is_array()) throw std::runtime_error("spline: missing points array");
         std::vector<double> init;
-        for (const auto& p : e["points"]) {
-            init.push_back(num(p[0]));
-            init.push_back(num(p[1]));
+        for (const auto& p : pts) {
+            init.push_back(num(jat(p, 0)));
+            init.push_back(num(jat(p, 1)));
         }
         return sys.add_vars(static_cast<int>(init.size()), init);
     }
     if (t == "text") {
-        return sys.add_vars(2, {num(e["p"][0]), num(e["p"][1])});
+        return sys.add_vars(2, {num(jat(jat(e, "p"), 0)), num(jat(jat(e, "p"), 1))});
     }
     if (t == "eq_curve") {
         return sys.add_vars(0, {});
@@ -2287,7 +2330,7 @@ std::map<std::string, std::string> compute_statuses(
     const std::map<std::string, std::vector<int>>& tag_vars) {
     std::map<std::string, std::string> statuses;
     if (J.rows() == 0 || n_vars == 0) {
-        for (const auto& e : entities_list) statuses[e["id"]] = "under";
+        for (const auto& e : entities_list) statuses[jid(e)] = "under";
         return statuses;
     }
     Eigen::JacobiSVD<MatrixXd> svd(J, Eigen::ComputeFullV);
@@ -2314,7 +2357,7 @@ std::map<std::string, std::string> compute_statuses(
     }
 
     for (const auto& e : entities_list) {
-        std::string id = e["id"];
+        std::string id = jid(e);
         const std::vector<int>& v = var_map.at(id);
         bool over = false;
         for (int vi : v)
@@ -2531,16 +2574,16 @@ SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
     json constraints_list = sketch.value("constraints", json::array());
 
     EntMap entities;
-    for (const auto& e : entities_list) entities[e["id"]] = e;
+    for (const auto& e : entities_list) entities[jid(e)] = e;
 
     System sys;
     sys.set_interactive(interactive);
     VarMap var_map;
     for (const auto& e : entities_list) {
         try {
-            var_map[e["id"]] = allocate_entity(sys, e);
+            var_map[jid(e)] = allocate_entity(sys, e);
         } catch (...) {
-            var_map[e["id"]] = sys.add_vars(0, {});
+            var_map[jid(e)] = sys.add_vars(0, {});
         }
     }
 
@@ -2559,7 +2602,7 @@ SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
     // equal strings and a rewritten entity produces a different one, which is all the
     // warm/cold gate needs (byte-identity with Python is NOT required).
     std::map<std::string, std::string> cur_sig;
-    for (const auto& e : entities_list) cur_sig[e["id"]] = e.dump();
+    for (const auto& e : entities_list) cur_sig[jid(e)] = e.dump();
 
     // Determine the warm-start vector. Warm values are applied PER ENTITY and only
     // while that entity's doc geometry is unchanged since the warm state was built
@@ -2754,18 +2797,18 @@ std::map<std::string, std::string> warm_gate_decision(const json& sketch,
     VarMap var_map;
     for (const auto& e : entities_list) {
         try {
-            var_map[e["id"]] = allocate_entity(sys, e);
+            var_map[jid(e)] = allocate_entity(sys, e);
         } catch (...) {
-            var_map[e["id"]] = sys.add_vars(0, {});
+            var_map[jid(e)] = sys.add_vars(0, {});
         }
     }
     std::map<std::string, std::string> cur_sig;
-    for (const auto& e : entities_list) cur_sig[e["id"]] = e.dump();
+    for (const auto& e : entities_list) cur_sig[jid(e)] = e.dump();
 
     std::map<std::string, std::string> decision;
     bool legacy = warm.ent_sig.empty();
     for (const auto& e : entities_list) {
-        std::string eid = e["id"];
+        std::string eid = jid(e);
         if (legacy) {
             // Legacy whole-vector behavior: warm iff total var counts match.
             decision[eid] = (warm.n_vars == sys.n_vars()) ? "warm" : "cold";
@@ -2838,11 +2881,11 @@ std::vector<FreeVar> free_variables_at(const json& sketch, const json& env,
     VarMap var_map;
     EntMap entities;
     for (const auto& e : entities_list) {
-        entities[e["id"]] = e;
+        entities[jid(e)] = e;
         try {
-            var_map[e["id"]] = allocate_entity(sys, e);
+            var_map[jid(e)] = allocate_entity(sys, e);
         } catch (...) {
-            var_map[e["id"]] = sys.add_vars(0, {});
+            var_map[jid(e)] = sys.add_vars(0, {});
         }
     }
     for (const auto& c : constraints_list) {
@@ -2886,7 +2929,7 @@ std::vector<FreeVar> free_variables_at(const json& sketch, const json& env,
     // Walk entities in declaration order; for each, map its loose local variables to
     // their plain-word names. A global->local lookup via the entity's var_map slot.
     for (const auto& e : entities_list) {
-        std::string id = e["id"];
+        std::string id = jid(e);
         const std::string t = e.value("type", std::string());
         const std::vector<int>& v = var_map.at(id);
         std::vector<std::string> names = entity_var_names(t, static_cast<int>(v.size()));
@@ -3242,9 +3285,9 @@ json drag(const SolveState& state, const std::string& handle,
             ctx->sys.set_interactive(true);
             for (const auto& e : ctx->entities_list) {
                 try {
-                    ctx->var_map[e["id"]] = allocate_entity(ctx->sys, e);
+                    ctx->var_map[jid(e)] = allocate_entity(ctx->sys, e);
                 } catch (...) {
-                    ctx->var_map[e["id"]] = ctx->sys.add_vars(0, {});
+                    ctx->var_map[jid(e)] = ctx->sys.add_vars(0, {});
                 }
             }
             for (const auto& c : ctx->constraints_list) {

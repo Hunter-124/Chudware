@@ -8,6 +8,7 @@
 // operator outside {+,-,*,/,**, unary +/-}, a non-numeric constant, a call to a
 // function not in _FUNCS, keyword arguments, or any other construct. '^' -> '**'.
 #include "doc/validate.h"
+#include "doc/picks.h"  // kQueryGrammar — one canonical query-grammar string, never a copy
 #include <algorithm>
 
 #include <cctype>
@@ -742,6 +743,34 @@ bool is_query_obj(const json& v) {
     return v.is_object() && (get(v, "kind") == json("query") || v.contains("of"));
 }
 
+// Shared tail for EVERY rejection of a value in a selector slot. The four-rung ladder a live
+// run hit (list-shape -> string -> kind -> centroid) happened because each message named only
+// the ONE constraint that failed, so the model learned one rung per turn and never reached a
+// form it could actually write. Naming the whole grammar once makes a single rejection enough
+// — and, decisively, it names the geometry QUERY form: the engine has always accepted
+// {"of":"edge","parallel":"z"} in these slots, but no error mentioned queries existed, so a
+// model with no way to synthesize a centroid kept guessing at raw topology selectors.
+const string& selector_forms() {
+    static const string s =
+        string(" — a selector slot accepts: a geometry QUERY object (e.g. "
+               "{\"of\":\"edge\",\"parallel\":\"z\"} = the vertical edges), a reserved datum "
+               "name, an f<N> feature id, a same-batch \"$<N>\" reference, or an "
+               "engine-produced topology selector (kind+sid+centroid, as returned by "
+               "describe_part / query_geometry — a model cannot invent one). List slots take "
+               "a non-empty LIST of those") +
+        kQueryGrammar;
+    return s;
+}
+
+// Does a rejected object look like a HALF-BUILT engine topology selector? kind / sid /
+// centroid / surf are fields the engine emits from real B-rep topology; a model that wrote
+// one of them by hand is on a path it cannot finish, so the error must redirect it to the
+// query form or to describe_part / query_geometry rather than name the next missing field.
+bool looks_like_topology_sel(const json& v) {
+    return v.is_object() && (v.contains("kind") || v.contains("sid") ||
+                             v.contains("centroid") || v.contains("surf"));
+}
+
 // An EXPLICIT axis/direction spec: an object carrying a 3-vector `axis` direction.
 // Small local models hand us a revolve/pattern axis as raw geometry under an invented
 // wrapper (kind:"axis", or an edge selector with a bogus surf) rather than the datum
@@ -776,12 +805,18 @@ vector<string> validate_geom_query(const json& q, const string& where) {
 vector<string> validate_selector(const json& sel, const string& where) {
     vector<string> errs;
     if (!sel.is_object()) {
-        return {where + ": selector must be an object"};
+        return {where + ": selector must be an object" + selector_forms()};
     }
     const json& kindj = get(sel, "kind");
     string kind = kindj.is_string() ? kindj.get<string>() : "";
     if (!kindj.is_string() || SELECTOR_KINDS.find(kind) == SELECTOR_KINDS.end()) {
-        return {where + ".kind: not in " + sorted_set_str(SELECTOR_KINDS)};
+        if (looks_like_topology_sel(sel)) {
+            return {where + ": incomplete engine topology selector (kind must be one of " +
+                    sorted_set_str(SELECTOR_KINDS) + ") — kind/sid/centroid describe real "
+                    "B-rep topology and can only come from describe_part / query_geometry, "
+                    "not from a hand-written guess" + selector_forms()};
+        }
+        return {where + ".kind: not in " + sorted_set_str(SELECTOR_KINDS) + selector_forms()};
     }
     if (kind == "datum") {
         const json& feat = get(sel, "feature");
@@ -819,8 +854,15 @@ vector<string> validate_selector(const json& sel, const string& where) {
         return errs;
     }
     // face / edge / vertex
+    // A missing centroid is the LAST rung of the ladder, and the one a model can never
+    // climb: a centroid is measured off real B-rep topology. Say that, instead of asking
+    // for a number it would have to fabricate.
     if (!is_vec(get(sel, "centroid"), 3)) {
-        errs.push_back(where + ".centroid: must be [x,y,z]");
+        errs.push_back(where + ": incomplete engine topology selector — a '" + kind +
+                       "' selector needs centroid [x,y,z] (with its sid), which only the "
+                       "engine can measure: call describe_part / query_geometry for a real "
+                       "selector, or name the geometry with a query instead" +
+                       selector_forms());
     }
     const json& surf = get(sel, "surf");
     if (kind == "face" && !surf.is_null()) {
@@ -851,7 +893,8 @@ vector<string> validate_sel_or_datum(const json& v, const string& where) {
             std::regex_match(s, FEATURE_ID_RE)) {
             return {};
         }
-        return {where + ": '" + s + "' is neither a reserved datum nor a feature id"};
+        return {where + ": '" + s + "' is neither a reserved datum nor a feature id" +
+                selector_forms()};
     }
     return validate_selector(v, where);
 }
@@ -1476,7 +1519,7 @@ vector<string> validate_feature(const json& f, const string& where,
             }
             case RefForm::SelList: {
                 if (!v.is_array() || v.empty()) {
-                    errs.push_back(loc + ": must be a non-empty list");
+                    errs.push_back(loc + ": must be a non-empty list" + selector_forms());
                 } else {
                     for (size_t i = 0; i < v.size(); ++i) {
                         const string eloc = loc + "[" + std::to_string(i) + "]";
@@ -1498,7 +1541,8 @@ vector<string> validate_feature(const json& f, const string& where,
                                 !std::regex_match(s, BATCH_PLACEHOLDER_RE)) {
                                 errs.push_back(eloc + ": '" + s + "' is neither a "
                                                "reserved datum, a feature id, nor a "
-                                               "same-batch \"$<index>\" reference");
+                                               "same-batch \"$<index>\" reference" +
+                                               selector_forms());
                             }
                             continue;
                         }

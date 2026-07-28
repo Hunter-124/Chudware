@@ -5368,3 +5368,32 @@ the agent_turn path only, so a real MCP client calling FastMCP directly gets non
 `cam_set_stock(setup=…)` raises a raw pydantic ToolError with no synonym mapping and no
 teaching text. Reproduction is in the CrashSweep report. The layer belongs at registration
 or in FastMCP middleware. Also unswept: the ~35 smaller *_tools.py modules in the long tail.
+
+The duplicate "AI: SwingArm4/5/6/7" tabs were the TEST SUITE, not the agent (2026-07-28).
+`doc_list` on the live daemon settled it: SwingArm, SwingArm2 ... SwingArm7, plate7/9/10,
+atom/atom2, sk/sk2, buried_boss/buried_boss2, mp_asm, aa_asm, free_free, mat_scale, bg, sph
+— every one `origin_kind: gui`, `revision: 0`, and every one a fixture name from
+`services/mcp`. `core_bridge` defaults to daemon mode and connects to whatever hostd is
+already listening, which on a developer box is the daemon behind the user's open window, so
+each `pytest services/mcp` run minted parts in the user's session, fanned out `doc.opened`,
+and the GUI faithfully opened a mirror tab per part. The documents outlive the run, so the
+NEXT run's `new_part("SwingArm")` collided with a stale one and the engine handed back a
+uniquified "SwingArm8" — the duplication compounding itself. Worse, a run started right
+after `./build.sh daemon` saw a daemon older than the binary on disk and, per the bridge's
+version drain-replace, told it to DRAIN: the user's daemon exited out from under the window
+they were working in (that is why the socket went to "daemon.draining" mid-session).
+The invariant is that a test process must never attach to a daemon it did not start, and it
+is enforced entirely in a new `services/mcp/conftest.py`: a session fixture spawns a private
+hostd from a COPY of the binary (`CHUDWARE_HOSTD_SOCKET` alone does not isolate — main.cpp
+derives lock AND socket from `instanceKey(selfPath())`, so a same-path daemon loses the
+SingleInstance race and exits 0 without listening) and exports its socket, deferring to an
+explicit `CHUDWARE_HOSTD_SOCKET` or `CHUDWARE_ENGINE_DAEMON=0` when the caller has already
+chosen. Nothing in hostd or the bridge changed, deliberately: the first attempt made hostd
+treat a `client: "test"` connection's docs as internal, which broke the nine
+`test_hostd_registry` / `test_hostd_edgecases` / `test_live_preview` cases that legitimately
+connect as kind "test" and assert real origin_kind, fanout and drain-replace behaviour.
+Isolation belongs to the harness, not to the daemon's wire semantics. Verified: those suites
+plus test_add_features_shape now run 333 passed against the private daemon, and a GUI client
+connecting to a shared daemon after a full run sees ZERO documents. Pre-existing and NOT
+caused by this: 13 baseline `services/mcp` failures plus 6 in `test_interface_check.py`,
+which reproduce identically under `CHUDWARE_ENGINE_DAEMON=0` (no daemon in the picture).

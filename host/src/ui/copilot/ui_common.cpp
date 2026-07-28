@@ -601,10 +601,13 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     if ((overItem || overRect) && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
         ImGui::OpenPopup(popupId);
 
-    // Theme the menu like the app's other popups (interwebz combo): opaque popupBg, glass
-    // border, and an accent hover/active highlight. MenuItem hover reads ImGuiCol_HeaderHovered
-    // and the stock theme's highlight is near-invisible over the chat glass — push the accent
-    // ramp so "Copy text" / "Copy all" get a proper, visible highlight.
+    // Theme the menu like the app's other popups (widgets/interwebz.cpp beginComboImpl):
+    // opaque popupBg, glass border, accent hover/active highlight, and — the part that
+    // actually matters for the highlight filling the row — that SAME small WindowPadding +
+    // ItemSpacing. The stock ImGui popup padding this menu used before (default ~8dp) left a
+    // gap between the Selectable highlight and the rounded card edge wide enough to read as
+    // "the highlight doesn't fill the box"; the combo's tighter padding is the established
+    // convention elsewhere in the app for this exact look, so match it instead of reinventing it.
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     ImGui::PushStyleColor(ImGuiCol_PopupBg,
@@ -619,26 +622,20 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
         ImVec4(pal.accentMid[0], pal.accentMid[1], pal.accentMid[2], pal.accentMid[3]));
     ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 6.0f * sc);
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * sc, 6.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * sc, 2.0f * sc));
     if (!ImGui::BeginPopup(popupId)) {
-        ImGui::PopStyleVar(2);
+        ImGui::PopStyleVar(4);
         ImGui::PopStyleColor(5);
         return;
     }
     const std::string& all = copyAll.empty() ? copyText : copyAll;
-    // Plain full-width Selectable rows instead of ImGui::MenuItem: MenuItem derives its
-    // highlight width from window->DC.MenuColumns, which springs toward the widest item over
-    // several frames rather than snapping instantly. A context menu like this one is opened
-    // fresh on every right-click, so the FIRST frame (the one the user actually sees, since
-    // the popup rarely stays open long) renders the top row's highlight using last-opening's
-    // (or zero) cached column width — it visibly falls short of the popup's right edge.
-    // ImGuiSelectableFlags_SpanAvailWidth reads GetContentRegionAvail() every frame instead,
-    // so the highlight always fills the row from the very first frame.
-    const float rowW = ImGui::GetContentRegionAvail().x;
+    // Plain Selectable (no explicit size, no MenuItem): with size_arg.x == 0 it already fills
+    // the popup's content width every frame — no MenuColumns cache to lag on a freshly opened
+    // popup, and no gap beyond the WindowPadding pushed above.
     auto copyRow = [&](const char* label, bool enabled, const std::string& text) {
         ImGui::BeginDisabled(!enabled);
-        const bool clicked = ImGui::Selectable(label, false,
-                                               ImGuiSelectableFlags_SpanAvailWidth,
-                                               ImVec2(rowW, 0));
+        const bool clicked = ImGui::Selectable(label, false);
         ImGui::EndDisabled();
         if (clicked) {  // BeginDisabled already keeps a disabled row from ever registering one
             chatCopyToClipboard(text);
@@ -652,7 +649,7 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     copyRow("Copy text", !copyText.empty(), copyText);
     copyRow("Copy all", !all.empty(), all);
     ImGui::EndPopup();
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleVar(4);
     ImGui::PopStyleColor(5);
 }
 

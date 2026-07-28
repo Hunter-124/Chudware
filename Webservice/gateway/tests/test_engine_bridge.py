@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from gateway import app as app_mod  # noqa: E402
 from gateway.config import settings  # noqa: E402
+from gateway.limits import user_slug  # noqa: E402
 
 DEV_HEADERS = {"X-Dev-User": "demo@example.com"}
 ADMIN_HEADERS = {"X-Dev-User": "haedmonds69@gmail.com"}
@@ -124,13 +125,17 @@ def daemon(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def workspace(tmp_path, monkeypatch):
+    # /workspace/* is per-account (tenant isolation): the API operates on the
+    # caller's own tree under <workspace_root>/users/<slug>, never the shared
+    # root itself, so seed the caller's tree and hand it to the tests.
     root = tmp_path / "CAD_Build"
     root.mkdir()
-    (root / "parts").mkdir()
-    (root / "parts" / "bracket.step+").write_bytes(b"fake step plus")
     monkeypatch.setattr(settings, "workspace_root", root)
     monkeypatch.setattr(settings, "dev_mode", True)
-    return root
+    user_root = settings.user_workspace_root(user_slug("demo@example.com"))
+    (user_root / "parts").mkdir(parents=True)
+    (user_root / "parts" / "bracket.step+").write_bytes(b"fake step plus")
+    return user_root
 
 
 @pytest.fixture()
@@ -147,6 +152,47 @@ def _rpc(ws, id_, method, params=None) -> dict:
 
 
 class TestEngineBridge:
+    @pytest.fixture(autouse=True)
+    def _live_seats(self):
+        """/engine now requires a live seat of the caller's own (ownership audit fix).
+
+        The tracked users.yaml template grants nobody access, so the admin test
+        identity is injected into the live directory for the test's duration.
+        """
+        from gateway.auth import User
+        from gateway.sessions import Session, manager
+
+        admin = User(email="haedmonds69@gmail.com", display="Admin", role="admin",
+                     heavy=False, project="", doc="")
+        prev_entry = app_mod.user_directory._by_email.get(admin.email)
+        app_mod.user_directory._by_email[admin.email] = admin
+
+        seeded = []
+        for i, email in enumerate(("demo@example.com", "haedmonds69@gmail.com")):
+            sess = Session(
+                sid=f"ebseat{i}" + "s" * 24,
+                email=email,
+                display=email.split("@")[0],
+                slug=email.split("@")[0],
+                container=f"chudware-sess-eb{i}",
+                host_port=8490 + i,
+                heavy=False,
+                status="ready",
+            )
+            manager._sessions[sess.sid] = sess
+            manager._by_email[email] = sess.sid
+            manager._ports_in_use.add(sess.host_port)
+            seeded.append(sess)
+        yield
+        for sess in seeded:
+            manager._sessions.pop(sess.sid, None)
+            manager._by_email.pop(sess.email, None)
+            manager._ports_in_use.discard(sess.host_port)
+        if prev_entry is None:
+            app_mod.user_directory._by_email.pop(admin.email, None)
+        else:
+            app_mod.user_directory._by_email[admin.email] = prev_entry
+
     def test_hello_identity_injected(self, daemon, client):
         with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
             resp = _rpc(ws, 1, "hello", {"client": "agent", "pid": 42, "proto": 1})
@@ -194,11 +240,11 @@ class TestEngineBridge:
         from gateway import engine_bridge
 
         assert engine_bridge.active_bridge_count() == 0
-        assert client.get("/healthz").json()["engine_bridges"] == 0
+        assert client.get("/healthz", headers=DEV_HEADERS).json()["engine_bridges"] == 0
         with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
             _rpc(ws, 1, "hello")
             assert engine_bridge.active_bridge_count() == 1
-            assert client.get("/healthz").json()["engine_bridges"] == 1
+            assert client.get("/healthz", headers=DEV_HEADERS).json()["engine_bridges"] == 1
         # Closing the socket must decrement — the deploy idle-wait relies on this
         # returning to 0, else it would defer restarts forever.
         assert engine_bridge.active_bridge_count() == 0
@@ -290,8 +336,8 @@ class TestWorkspaceApi:
         body = resp.json()
         assert body["path"] == "parts/imported.stl" and body["bytes"] == 7
         assert (workspace / "parts" / "imported.stl").read_bytes() == b"solid x"
-        # abs_path is what the browser hands to the daemon's import_file RPC.
-        assert body["abs_path"] == str(workspace / "parts" / "imported.stl")
+        # Absolute host paths never leave the server (tenant isolation).
+        assert "abs_path" not in body
 
     def test_traversal_rejected(self, workspace, client):
         for bad in ("../secrets", "..", "a/../../b"):

@@ -86,7 +86,9 @@ def effective_plan(account: Account | None) -> str:
 # SQLite store (single connection, module-level lock)
 # ---------------------------------------------------------------------------
 
-_DB_LOCK = threading.Lock()
+# RLock: public functions hold it across read-modify-write while _db() also
+# acquires it internally; a plain Lock would self-deadlock.
+_DB_LOCK = threading.RLock()
 _CONN: sqlite3.Connection | None = None
 _CONN_PATH: Path | None = None
 

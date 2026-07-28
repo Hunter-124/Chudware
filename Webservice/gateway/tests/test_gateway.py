@@ -367,6 +367,9 @@ def test_ai_provider_vars_parse_and_forward(client, _isolate, monkeypatch, tmp_p
     monkeypatch.setattr(mgr, "run_podman", fake_podman)
     monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
     monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
+    # Provider keys are withheld from seats by default; this tests the explicit
+    # operator opt-in forward path.
+    monkeypatch.setattr("gateway.sessions._SHARE_PROVIDER_KEYS", True)
 
     r = client.post("/api/sessions", headers=_auth("demo@example.com"))
     assert r.status_code == 200, r.text
@@ -541,6 +544,8 @@ def test_default_project_inherited(client, _admin_env, _isolate, monkeypatch):
 
 def test_admin_browse_and_path_default(client, _admin_env, _isolate, monkeypatch, tmp_path):
     directory, synced, users = _admin_env
+    # Browse/default-project are confined to the allowlisted project roots.
+    monkeypatch.setattr(settings, "project_roots_raw", str(tmp_path))
     proj = tmp_path / "TeamParts"
     (proj / "sub").mkdir(parents=True)
     (proj / "Frame.step+").write_bytes(b"x")
@@ -693,6 +698,9 @@ def _tmux_env(monkeypatch):
 
     if term._TMUX is None:
         pytest.skip("tmux not installed on host")
+    # The terminal is opt-in (default off); this lifecycle test exercises the
+    # enabled deployment.
+    monkeypatch.setattr(settings, "terminal_enabled", True)
     monkeypatch.setattr(term, "_SOCKET", "chudware-pytest")
     monkeypatch.setenv("CHUDWARE_OMP_CMD", "true")
     # Start the tmux server directly (no systemd user scope) so the test is
@@ -722,7 +730,7 @@ def test_terminal_sessions_shared_lifecycle(client, _admin_env, _tmux_env):
     assert r.status_code == 200, r.text
     assert r.json()["name"] == "work-1"  # slugged
 
-    # it now shows up for every admin (shared/saved with zero clients attached)
+    # it now shows up in the owner's list (saved with zero clients attached)
     sessions = client.get("/api/admin/terminal/sessions",
                           headers=_auth("boss@example.com")).json()["sessions"]
     names = {s["name"]: s for s in sessions}

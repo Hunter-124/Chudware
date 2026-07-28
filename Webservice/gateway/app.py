@@ -826,7 +826,9 @@ class _AdminGatedStatic(StaticFiles):
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":
             name = (scope.get("path") or "").rsplit("/", 1)[-1]
-            if name.startswith("admin."):
+            # admin.html/admin.js plus the admin_-prefixed terminal/ops/wm
+            # assets (all referenced only by admin.html).
+            if name.startswith("admin"):
                 state = scope.get("state") or {}
                 user = (
                     state.get("user")

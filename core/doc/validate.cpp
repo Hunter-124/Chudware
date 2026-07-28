@@ -2195,7 +2195,28 @@ std::vector<std::string> normalize_feature_shape(nlohmann::json& feature) {
                     continue;  // single-value slot: nothing to wrap
             }
             auto it = refs.find(slot.name);
-            if (it == refs.end() || it->is_null() || it->is_array()) continue;
+            if (it == refs.end() || it->is_null()) continue;
+            if (it->is_array()) {
+                // The INVERSE dialect miss of the string wrap below: a geometry
+                // QUERY wrapped in a one-element list ([{"of":"face",...}]). The
+                // compiler's query resolver only ever sees the BARE object; the
+                // list-selector resolver cannot resolve a query element (shell
+                // remove: "no candidates of matching kind" — the failure the live
+                // run hit right after the slot-name rejection). Where the list
+                // form already works (fillet/chamfer edges resolve query elements
+                // one by one), the bare form resolves the SAME query against the
+                // SAME body, so unwrapping can never change which geometry is
+                // selected — it only rescues a batch that would otherwise dangle.
+                // Multi-element lists are left alone: they may be intentional.
+                if (slot.form == RefForm::SelList && it->size() == 1 &&
+                    is_query_obj((*it)[0])) {
+                    notes.push_back("interpreted refs." + slot.name + " [" +
+                                    (*it)[0].dump() + "] as the bare query (" + type +
+                                    "." + slot.name + " resolves queries unwrapped)");
+                    *it = (*it)[0];
+                }
+                continue;
+            }
             // STRINGS ONLY, and this restriction is load-bearing. A bare id or
             // datum ("$0", "f1", "plane.top") in a list slot has exactly one
             // meaning, so wrapping it cannot change the build. A bare OBJECT does

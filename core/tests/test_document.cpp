@@ -3889,22 +3889,32 @@ TEST_CASE("shape: shell refs.faces is aliased to remove and builds (the live-run
     for (const json& st : r.at("rebuild").at("feature_status"))
         REQUIRE_MESSAGE(st.value("ok", false), "shell alias batch: " << status_err(st));
     CHECK(doc_volume(id) > 1.0);
-    // The stored feature was rewritten: refs.remove exists, refs.faces is gone.
+    // The stored feature was rewritten: refs.remove exists, refs.faces is gone,
+    // and the one-element query list was unwrapped to the bare query object the
+    // compiler's query resolver consumes.
     const json& feats = r.at("tree").at("features");
     REQUIRE(feats.size() == 2);
-    CHECK(feats[1].at("refs").contains("remove"));
+    CHECK(feats[1].at("refs").at("remove") == json({{"of", "face"}, {"side", "top"}}));
     CHECK(!feats[1].at("refs").contains("faces"));
 
-    // ...and the rewrite REPORTS itself, exactly like the other normalizations.
+    // ...and BOTH rewrites REPORT themselves, exactly like the other
+    // normalizations: one note for the slot rename, one for the query unwrap.
     json feat = json{{"type", "shell"},
-                     {"refs", {{"faces", json::array({"$0"})}}}};
+                     {"refs", {{"faces", json::array({{{"of", "face"}, {"side", "top"}}})}}}};
     const std::vector<std::string> notes = chudware::doc::normalize_feature_shape(feat);
-    REQUIRE(notes.size() == 1);
+    REQUIRE(notes.size() == 2);
     CHECK(notes[0].find("refs.faces") != std::string::npos);
     CHECK(notes[0].find("refs.remove") != std::string::npos);
+    CHECK(notes[1].find("bare query") != std::string::npos);
+    CHECK(feat.at("refs").at("remove") == json({{"of", "face"}, {"side", "top"}}));
+
     // A string value still gets the list wrap AFTER the rename (remove is a
-    // SelList slot): the two rewrites compose.
-    CHECK(feat.at("refs").at("remove") == json::array({"$0"}));
+    // SelList slot): the rename and the wrap compose too.
+    json feat_str = json{{"type", "shell"},
+                         {"refs", {{"faces", "$0"}}}};
+    const std::vector<std::string> sn = chudware::doc::normalize_feature_shape(feat_str);
+    REQUIRE(sn.size() == 2);
+    CHECK(feat_str.at("refs").at("remove") == json::array({"$0"}));
 }
 
 TEST_CASE("shape: ref-slot aliases never shadow or clobber") {

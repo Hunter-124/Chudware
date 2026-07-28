@@ -534,14 +534,19 @@ figure.shot figcaption {
   color: var(--muted);
 }
 
+/* Hanging em-dash marker. Deliberately NOT a grid: these list items contain
+   inline markup, and every inline child of a grid container would become its
+   own grid item and land in the marker column. */
 .tier-list li {
-  display: grid;
-  grid-template-columns: 1.125rem 1fr;
-  gap: var(--s2);
+  position: relative;
+  padding-left: 1.25rem;
 }
 
 .tier-list li::before {
   content: "\2014";
+  position: absolute;
+  left: 0;
+  top: 0;
   color: var(--teal);
   font-family: var(--mono);
   font-size: 0.75rem;
@@ -635,15 +640,17 @@ figure.shot figcaption {
 .facts ul { list-style: none; margin-top: var(--s4); display: grid; gap: var(--s3); }
 
 .facts li {
-  display: grid;
-  grid-template-columns: 1.125rem 1fr;
-  gap: var(--s2);
+  position: relative;
+  padding-left: 1.25rem;
   font-size: 0.9375rem;
   color: var(--muted);
 }
 
 .facts li::before {
   content: "\2014";
+  position: absolute;
+  left: 0;
+  top: 0;
   color: var(--teal);
   font-family: var(--mono);
   font-size: 0.75rem;
@@ -739,6 +746,8 @@ figure.shot figcaption {
 }
 
 @media (max-width: 719px) {
+  .notice { grid-template-columns: 1fr; gap: var(--s2); padding: var(--s4); }
+  .notice > :not(b) { grid-column: 1; }
   .site-head .wrap { flex-wrap: wrap; gap: var(--s3) var(--s4); }
   .brand { margin-right: 0; width: 100%; }
   .site-nav { gap: var(--s4); flex-wrap: wrap; }

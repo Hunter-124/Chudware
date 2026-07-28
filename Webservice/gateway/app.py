@@ -526,6 +526,11 @@ async def sessions_start(request: Request) -> dict[str, Any]:
                        doc=user.doc or user_directory.default_doc)
     try:
         sess = await manager.start(user)
+    except HTTPException:
+        # Rate-limit (429) and other deliberate HTTP errors raised inside the
+        # manager must keep their status and Retry-After headers, not be
+        # flattened into a 500 by the broad handler below.
+        raise
     except SessionBusy as exc:
         raise HTTPException(status_code=503, detail=exc.message) from exc
     except PodmanError as exc:

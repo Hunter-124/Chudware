@@ -621,11 +621,15 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,
         ImVec4(pal.accentMid[0], pal.accentMid[1], pal.accentMid[2], pal.accentMid[3]));
     ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 6.0f * sc);
+    // Selectable draws its highlight with FrameRounding (default 0 = square). Match the
+    // popup's rounding so the hover box doesn't read as a hard-edged rectangle inside a
+    // rounded card.
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f * sc);
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * sc, 6.0f * sc));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * sc, 2.0f * sc));
     if (!ImGui::BeginPopup(popupId)) {
-        ImGui::PopStyleVar(4);
+        ImGui::PopStyleVar(5);
         ImGui::PopStyleColor(5);
         return;
     }
@@ -652,7 +656,7 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     copyRow("Copy text", !copyText.empty(), copyText);
     copyRow("Copy all", !all.empty(), all);
     ImGui::EndPopup();
-    ImGui::PopStyleVar(4);
+    ImGui::PopStyleVar(5);
     ImGui::PopStyleColor(5);
 }
 

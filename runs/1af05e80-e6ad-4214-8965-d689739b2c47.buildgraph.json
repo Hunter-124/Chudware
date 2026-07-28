@@ -1,0 +1,42 @@
+{
+  "run_id": "1af05e80-e6ad-4214-8965-d689739b2c47",
+  "graph": {
+    "schema": "aicad.buildgraph/1",
+    "mission": " design_toolchain",
+    "nodes": [
+      {
+        "id": "bg_ceaae05e",
+        "kind": "part",
+        "label": "flanged_bushing",
+        "doc_id": "",
+        "refs": {
+          "features": [],
+          "parts": []
+        },
+        "requires": [],
+        "why": "part root for 'flanged_bushing'",
+        "status": "pending",
+        "assigned": null
+      },
+      {
+        "id": "bg_93ba67e0",
+        "kind": "checkpoint",
+        "label": "flanged_bushing_done",
+        "doc_id": "",
+        "refs": {
+          "features": [],
+          "parts": [
+            "flanged_bushing"
+          ]
+        },
+        "requires": [
+          "bg_ceaae05e"
+        ],
+        "why": "PLM checkpoint: all features of 'flanged_bushing' complete",
+        "status": "pending",
+        "assigned": null
+      }
+    ]
+  },
+  "advisories": []
+}

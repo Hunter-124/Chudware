@@ -165,9 +165,13 @@ async def workspace_list(request: Request, dir: str = "", scope: str = "") -> di
         else:
             files.append({"name": p.name, "path": rel, "size": st.st_size,
                           "mtime": int(st.st_mtime)})
-    # "root" stays a key for client compatibility but is always the RELATIVE
-    # path of the jail root ("") — absolute host paths never leave the server.
-    return {"root": "", "dir": str(base.relative_to(root)) if base != root else "",
+    # "root" is the caller's OWN absolute jail root. The WASM client contract
+    # (host/src/core/fs_backend.h) builds daemon doc_open/doc_save paths as
+    # `root + entry path`, so blanking it silently breaks opening any file on
+    # the web client. Telling a user their own directory is not the security
+    # boundary — engine_bridge.py is, and it rejects any daemon RPC whose path
+    # falls outside this same root.
+    return {"root": str(root), "dir": str(base.relative_to(root)) if base != root else "",
             "dirs": dirs[:2000], "files": files[:2000]}
 
 

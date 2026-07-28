@@ -2192,12 +2192,12 @@ def test_live_new_part_resumes_an_unbuilt_same_named_doc_instead_of_forking():
 
 
 @enginetest
-def test_live_new_part_never_silently_inherits_a_built_part():
-    """The dangerous half of name-reuse. Handing a caller someone else's half-built body is
-    WORSE than a duplicate tab: the next feature lands on geometry the caller does not know
-    is there and fails as «boss added no material (it is buried inside the body)» — an error
-    about geometry for what is really a document mix-up. So a BUILT same-named part is never
-    resumed; a separate document is minted and the collision is reported instead of hidden."""
+def test_live_new_part_resumes_a_built_part_and_says_what_it_inherited():
+    """The other half. Forking was the reported bug — the user's tab strip filled with
+    "AI: SwingArm4/5/6/7" for ONE part — so a same-named part is resumed even when it
+    already has geometry. The hazard that buys is a caller building blind on top of a body
+    it does not know is there ("boss added no material — it is buried inside the body"), so
+    the response must state the feature count, not just that something was reused."""
     from services.agent.agent_turn import _bind_tool
     new_part = _bind_tool("new_part")
     add_features = _bind_tool("add_features")
@@ -2211,14 +2211,17 @@ def test_live_new_part_never_silently_inherits_a_built_part():
 
     second = json.loads(new_part(name=name))
     assert second["ok"] is True
-    assert second.get("reused") is not True
-    assert second["doc_id"] != doc, "a BUILT part must never be silently resumed"
-    # The caller is told, and told enough to act: the other part's id and how to continue it.
-    assert second.get("name_taken") is True
-    assert second["existing"]["doc_id"] == doc
-    assert doc in second["note"]
-    # And it is not lied to about which document it now holds: doc_new uniquified the name.
-    assert second["name"] != name
+    assert second["doc_id"] == doc, "a same-named part must be RESUMED, never forked"
+    assert second.get("reused") is True
+    assert second.get("feature_count", 0) >= 1
+    assert "ALREADY CARRIES" in second["note"]
+
+    # And the resume must not have zeroed the write-diff baseline.
+    again = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "cylinder", "name": "Post",
+        "params": {"radius": 3, "height": 10}, "at": {"of": "face", "side": "top"}}}]))
+    assert again["ok"], again
+    assert again["changes"]["volume_delta_mm3"] < built["changes"]["volume_delta_mm3"]
 
 
 @enginetest
@@ -2457,3 +2460,113 @@ def test_a_bare_string_op_element_is_a_teaching_valueerror():
         M._normalize_op_elements(["oops, not an op"], [])
     assert not isinstance(exc.value, AttributeError)
     assert "oops, not an op" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Live run run-120283478269835 (2026-07-28): a twisted lattice orb. Six failed calls,
+# the model looping on two sentences it could not act on.
+
+@pytest.mark.parametrize("mode,kind", [
+    ("circular", "circular_pattern"), ("polar", "circular_pattern"),
+    ("radial", "circular_pattern"), ("linear", "linear_pattern"),
+    ("rectangular", "linear_pattern"), ("grid", "linear_pattern")])
+def test_a_generic_pattern_reads_its_kind_from_mode(mode, kind):
+    """`_FEATURE_TYPE_ALIASES` mapped the bare word "pattern" to linear_pattern REGARDLESS
+    of mode, so a circular pattern was rejected for the four linear fields it never had."""
+    feat = M._normalize_pattern_feature({
+        "type": "pattern", "name": "P",
+        "params": {"source": "$0", "mode": mode, "axis": "z", "count": 12,
+                   "angle": 360, "spacing": 10, "direction": "x"}}, [])
+    assert feat["type"] == kind
+
+
+def test_a_circular_pattern_lands_on_the_circular_schema():
+    notes = []
+    feat = M._normalize_pattern_feature({
+        "type": "pattern", "name": "CutPatternZ",
+        "params": {"source": "$0", "mode": "circular", "axis": "z",
+                   "count": 12, "angle": 360}}, notes)
+    assert feat["params"] == {"count": 12, "angle": 360}
+    assert feat["refs"] == {"axis": "z", "features": ["$0"]}
+    assert any("circular_pattern" in n for n in notes)
+
+
+def test_a_linear_pattern_lands_on_the_numbered_schema():
+    feat = M._normalize_pattern_feature({
+        "type": "array", "name": "Row",
+        "params": {"source": "f2", "mode": "linear", "direction": "x",
+                   "count": 5, "spacing": 20}}, [])
+    assert feat["type"] == "linear_pattern"
+    assert feat["params"] == {"count1": 5, "spacing1": 20}
+    assert feat["refs"] == {"dir1": "x", "features": ["f2"]}
+
+
+def test_the_destination_key_is_not_erased_by_its_own_alias_cleanup():
+    """`axis` is both an accepted alias AND the canonical ref name, so stripping aliases
+    AFTER writing the answer deleted it and the batch died on «refs.axis: required»."""
+    feat = M._normalize_pattern_feature({
+        "type": "circular_pattern", "name": "P",
+        "params": {"count": 6, "angle": 360}, "refs": {"axis": "axis.z",
+                                                       "features": ["f1"]}}, [])
+    assert feat["refs"]["axis"] == "axis.z"
+    assert feat["refs"]["features"] == ["f1"]
+
+
+def test_a_circular_pattern_with_no_angle_defaults_to_a_full_revolution():
+    feat = M._normalize_pattern_feature({
+        "type": "polar_pattern", "name": "P",
+        "params": {"count": 8}, "refs": {"axis": "axis.z", "features": ["f1"]}}, [])
+    assert feat["params"]["angle"] == 360
+
+
+def test_a_non_pattern_feature_is_untouched():
+    feat = {"type": "extrude", "name": "E", "params": {"depth": 5, "count": 3}}
+    assert M._normalize_pattern_feature(feat, []) is feat
+
+
+@enginetest
+def test_a_boolean_on_operands_merged_by_an_earlier_batch_is_repaired():
+    """«operand 'f1' was already merged into another body — build that body with
+    "merge":false» is not actionable: f1 is already built. Four consecutive live batches
+    died on that one sentence. edit_feature CAN apply it, so the harness does."""
+    from services.agent.agent_turn import _bind_tool
+    np, add = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(np(name="merged_operand", fresh=True))["doc_id"]
+    add(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "Base",
+        "params": {"length": 60, "width": 60, "height": 40}}}])
+    # A default primitive FUSES, so after this call f1 and f2 are one solid.
+    add(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "CutTool",
+        "params": {"length": 3, "width": 10, "height": 60}}}])
+    r = json.loads(add(doc_id=doc, ops=[{"op": "boolean", "feature": {
+        "type": "boolean", "name": "LatticeCut1",
+        "params": {"operation": "cut", "a": "f1", "b": "f2"}}}]))
+    assert r["ok"] is True, r.get("error")
+    assert any("merge:false" in n for n in r.get("interpreted") or [])
+    # The slot really was cut: 60*60*40 minus the 3x10x40 the tool overlaps.
+    assert r["volume_mm3"] == pytest.approx(60 * 60 * 40 - 3 * 10 * 40, rel=1e-4)
+
+
+@enginetest
+@pytest.mark.parametrize("mode", ["circular", "linear"])
+def test_the_live_run_120283478269835_pattern_builds(mode):
+    from services.agent.agent_turn import _bind_tool
+    np, add = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(np(name=f"pat_{mode}", fresh=True))["doc_id"]
+    add(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "Plate",
+        "params": {"length": 120, "width": 80, "height": 8}}}])
+    extra = ({"mode": "circular", "axis": "z", "count": 6, "angle": 360} if mode == "circular"
+             else {"mode": "linear", "direction": "x", "count": 5, "spacing": 20})
+    r = json.loads(add(doc_id=doc, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "hole", "name": "Seed",
+            "params": {"diameter": 6, "style": "simple", "end": "through_all"},
+            "refs": {"face": {"of": "face", "side": "top"}}, "at": [-40, 0, 0]}},
+        {"op": "pattern", "feature": {"type": "pattern", "name": "Pat",
+                                      "params": {"source": "$0", **extra}}}]))
+    assert r["ok"] is True, r.get("error")
+    # Every instance really was cut: N holes of d6 through 8mm of plate.
+    n = 6 if mode == "circular" else 5
+    assert r["volume_mm3"] == pytest.approx(120 * 80 * 8 - n * math.pi * 9 * 8, rel=1e-3)

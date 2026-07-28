@@ -5309,3 +5309,34 @@ how to continue it, and returns the name the document ACTUALLY got instead of th
 The first attempt at this resumed ANY same-named part and broke twelve sibling tests with
 "boss added no material (it is buried inside the body)" — inheriting a stranger's half-built
 body is worse than a duplicate tab, and that failure is what the built/unbuilt split encodes.
+
+Fourth live batch, run-120283478269835 (2026-07-28) — a twisted lattice orb, six failed
+calls, the model looping on two sentences it could not act on.
+(1) `{"type":"pattern","params":{"mode":"circular","axis":"z","count":12,"angle":360}}` was
+mapped to linear_pattern by `_FEATURE_TYPE_ALIASES` REGARDLESS of mode, then rejected for
+the four linear fields it never had (count1/spacing1/dir1/features) — none of which the
+model had any reason to send, and none of which appear anywhere in what it wrote.
+`_normalize_pattern_ops` now decides the type from mode/kind/pattern_type (or from the
+qualifier inside "polar_pattern"/"rectangular_array"), then lays the size onto the real
+schema: count+angle with refs.axis for circular, count1+spacing1 with refs.dir1 for linear,
+and the patterned feature into refs.features wherever the model put it
+(source/seed/features/of/target/…). A circular pattern with no angle defaults to a full
+revolution rather than being rejected. It runs BEFORE the alias table, which is the whole
+point. Subtle trap worth remembering: the destination key is itself an alias — `axis` is
+both an accepted spelling and the canonical ref name — so stripping aliases AFTER writing
+the answer deleted it and the batch died on «refs.axis: required». Compute, then strip,
+then lay the canonical values on top.
+(2) «boolean: operand 'f1' was already merged into another body — build that body with
+"merge":false» is not an instruction a model can follow: f1 is already built, and
+rebuilding an existing feature is not something it knows how to express. It retried four
+times. `_repair_merged_boolean_operands` reads the live doc_tree owner_map (there is no
+doc_get/doc_owner_map method), finds the operands sharing one body, keeps the EARLIEST as
+the base and prepends `{"op":"edit_feature","id":…,"params":{"merge":false}}` for the later
+ones — the tools. Verified: 60x60x40 block minus a 3x10x40 slot = 142800.0 mm3 exactly.
+Only mergeable primitives (box/cylinder/cone/sphere/torus) are separated; anything else
+keeps the engine's error rather than being guessed at.
+Test-environment note for whoever runs these next: services/mcp engine tests share the
+live hostd, and concurrent sessions make it idle-exit between new_part and add_features —
+every doc then reports "ZERO documents are open in this engine session". That is
+contention, not a regression. Run with CHUDWARE_ENGINE_DAEMON=0 to pin the in-process
+engine and get a deterministic result.

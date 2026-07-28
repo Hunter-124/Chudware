@@ -1281,6 +1281,232 @@ def _interpreted_notes(notes: list) -> list:
 # "cut_cylinder"). All three are unambiguous, so they are rewritten here instead of
 # rejected; each rewrite is echoed ONCE per batch in `interpreted` (the notes are
 # de-duplicated, so a 20-element batch adds one line, not twenty).
+#: A pattern names its own KIND in a param, and `_FEATURE_TYPE_ALIASES` blindly mapped the
+#: generic word to linear_pattern. Live run 2026-07-28:
+#: {"type":"pattern","params":{"mode":"circular","axis":"z","count":12,"angle":360}}
+#: became a LINEAR pattern and was rejected for the four linear fields it never had
+#: (count1/spacing1/dir1/features) — none of which the model had any reason to send.
+_PATTERN_KIND_WORDS = {
+    "circular": "circular_pattern", "polar": "circular_pattern",
+    "radial": "circular_pattern", "angular": "circular_pattern",
+    "revolved": "circular_pattern", "rotational": "circular_pattern",
+    "axial": "circular_pattern",
+    "linear": "linear_pattern", "rectangular": "linear_pattern",
+    "rect": "linear_pattern", "grid": "linear_pattern", "row": "linear_pattern",
+    "directional": "linear_pattern",
+}
+_GENERIC_PATTERN_WORDS = frozenset({"pattern", "array", "repeat", "duplicate"})
+_PATTERN_KIND_KEYS = ("mode", "kind", "pattern_type", "pattern", "arrangement", "style",
+                      "direction_type")
+#: What a model calls the thing being patterned. The engine wants refs.features, a LIST.
+_PATTERN_SOURCE_KEYS = ("source", "seed", "feature", "features", "of", "target",
+                        "targets", "entities", "items")
+#: linear_pattern's params are count1/spacing1; circular_pattern's are count/angle.
+_LINEAR_COUNT_KEYS = ("count1", "count", "instances", "n", "copies", "quantity", "num")
+_LINEAR_SPACING_KEYS = ("spacing1", "spacing", "distance", "pitch", "step", "gap")
+_LINEAR_DIR_KEYS = ("dir1", "dir", "direction", "axis", "along", "vector")
+_CIRCULAR_COUNT_KEYS = ("count", "count1", "instances", "n", "copies", "quantity", "num")
+_CIRCULAR_ANGLE_KEYS = ("angle", "total_angle", "span", "sweep", "arc", "extent")
+_CIRCULAR_AXIS_KEYS = ("axis", "about", "around", "axis1", "dir1", "direction")
+_PATTERN_CONSUMED_KEYS = frozenset(
+    _PATTERN_KIND_KEYS + _PATTERN_SOURCE_KEYS + _LINEAR_COUNT_KEYS + _LINEAR_SPACING_KEYS
+    + _LINEAR_DIR_KEYS + _CIRCULAR_COUNT_KEYS + _CIRCULAR_ANGLE_KEYS + _CIRCULAR_AXIS_KEYS)
+
+
+def _param_or_ref(feat: dict, params: dict, key: str) -> Any:
+    """A value from params or refs, whichever bag the model used."""
+    v = params.get(key)
+    if v is not None:
+        return v
+    refs = feat.get("refs")
+    return refs.get(key) if isinstance(refs, dict) else None
+
+
+def _pattern_kind(feat: dict, params: dict) -> Optional[str]:
+    """The pattern feature type this feature MEANS, or None when it is not a pattern."""
+    tword = _slug(feat.get("type"))
+    if tword in ("linear_pattern", "circular_pattern"):
+        return tword
+    if tword in _PATTERN_KIND_WORDS:
+        return _PATTERN_KIND_WORDS[tword]
+    # A QUALIFIED spelling — "polar_pattern", "pattern_circular", "rectangular_array".
+    # Strip the generic noun and read the qualifier that is left.
+    words = [w for w in tword.split("_") if w]
+    if any(w in _GENERIC_PATTERN_WORDS for w in words):
+        for w in words:
+            if w in _PATTERN_KIND_WORDS:
+                return _PATTERN_KIND_WORDS[w]
+    elif tword not in _GENERIC_PATTERN_WORDS:
+        return None
+    for k in _PATTERN_KIND_KEYS:
+        kind = _PATTERN_KIND_WORDS.get(_slug(params.get(k)))
+        if kind:
+            return kind
+    # A generic pattern naming an ANGLE is polar; otherwise linear, which is also what the
+    # bare word aliased to before this existed — so nothing that worked before changes.
+    if any(params.get(k) is not None for k in ("angle", "total_angle", "sweep")):
+        return "circular_pattern"
+    return "linear_pattern"
+
+
+def _pattern_source_refs(feat: dict, params: dict) -> Optional[list]:
+    """The feature list being patterned, from wherever the model put it."""
+    refs = feat.get("refs") if isinstance(feat.get("refs"), dict) else {}
+    for holder in (refs, params):
+        for k in _PATTERN_SOURCE_KEYS:
+            v = holder.get(k)
+            if isinstance(v, str) and v.strip():
+                return [v.strip()]
+            if isinstance(v, list) and v:
+                return list(v)
+    return None
+
+
+def _normalize_pattern_feature(feat: dict, notes: list) -> dict:
+    """A pattern in any dialect -> linear_pattern/circular_pattern with its real schema."""
+    params = dict(feat.get("params")) if isinstance(feat.get("params"), dict) else {}
+    kind = _pattern_kind(feat, params)
+    if kind is None:
+        return feat
+    label = _feat_label(feat, kind)
+    refs_in = dict(feat.get("refs")) if isinstance(feat.get("refs"), dict) else {}
+    src = _pattern_source_refs(feat, params)
+    out_params: dict = {}
+    out_refs: dict = {}
+    if kind == "circular_pattern":
+        for dest, keys in (("count", _CIRCULAR_COUNT_KEYS), ("angle", _CIRCULAR_ANGLE_KEYS)):
+            val = next((v for k in keys if (v := _param_or_ref(feat, params, k)) is not None),
+                       None)
+            if val is not None:
+                out_params[dest] = val
+        # "pattern this 12 times around Z" means a full revolution, and `angle` is REQUIRED
+        # — defaulting it beats rejecting a request that is otherwise complete.
+        out_params.setdefault("angle", 360)
+        axis = next((v for k in _CIRCULAR_AXIS_KEYS
+                     if (v := _param_or_ref(feat, params, k)) is not None), None)
+        if axis is not None:
+            out_refs["axis"] = axis
+    else:
+        for dest, keys in (("count1", _LINEAR_COUNT_KEYS),
+                           ("spacing1", _LINEAR_SPACING_KEYS)):
+            val = next((v for k in keys if (v := _param_or_ref(feat, params, k)) is not None),
+                       None)
+            if val is not None:
+                out_params[dest] = val
+        d1 = next((v for k in _LINEAR_DIR_KEYS
+                   if (v := _param_or_ref(feat, params, k)) is not None), None)
+        if d1 is not None:
+            out_refs["dir1"] = d1
+        for k in ("count2", "spacing2"):
+            if params.get(k) is not None:
+                out_params[k] = params[k]
+        d2 = _param_or_ref(feat, params, "dir2")
+        if d2 is not None:
+            out_refs["dir2"] = d2
+    # Strip every alias FIRST, then lay the canonical values on top — the destination key
+    # is itself an alias (refs.axis, params.count), so cleaning last erased the answer.
+    for k in _PATTERN_CONSUMED_KEYS:
+        params.pop(k, None)
+        refs_in.pop(k, None)
+    refs = {**refs_in, **out_refs}
+    if src is not None:
+        refs["features"] = src
+    out = {**feat, "type": kind, "params": {**params, **out_params}}
+    if refs:
+        out["refs"] = refs
+    else:
+        out.pop("refs", None)
+    if out == feat:
+        return feat
+    shape = ("count+angle with refs.axis" if kind == "circular_pattern"
+             else "count1+spacing1 with refs.dir1")
+    notes.append(
+        f"{label}: read this as a {kind} — moved its size onto that schema ({shape}) and "
+        f"the patterned feature(s) into refs.features. A pattern names its kind in the "
+        f'TYPE; the generic word "pattern" used to default to LINEAR regardless of mode')
+    return out
+
+
+#: Feature types whose body is a standalone primitive and therefore carries `merge`.
+#: Only these can be separated after the fact; anything else keeps the engine's error.
+_MERGEABLE_PRIMITIVES = frozenset({"box", "cylinder", "cone", "sphere", "torus"})
+_FEAT_ID_RE = re.compile(r"^f\d+$")
+
+
+def _repair_merged_boolean_operands(ops: Any, doc_id: str, notes: list) -> Any:
+    """Separate the bodies an EXISTING-feature boolean needs, before the engine refuses.
+
+    A default primitive fuses into the running body, so a boolean naming it dies on
+    «operand 'f3' was already merged into another body — build that body with
+    "merge":false». A model cannot act on that: f3 is already built, and rebuilding it is
+    not something it knows how to express. The engine's own instruction IS the fix, and
+    edit_feature can apply it, so do that — keeping the EARLIEST operand as the base body
+    and separating the later ones, which are the tools. Live run 2026-07-28: four
+    consecutive batches died on this one sentence.
+    """
+    if not isinstance(ops, list):
+        return ops
+    wanted: set = set()
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if not isinstance(feat, dict) or _slug(feat.get("type")) != "boolean":
+            continue
+        params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+        ids = [v.strip() for v in (params.get("a"), params.get("b"))
+               if isinstance(v, str) and _FEAT_ID_RE.match(v.strip())]
+        if len(ids) == 2:
+            wanted.update(ids)
+    if not wanted:
+        return ops
+
+    try:
+        # doc_tree hands back BOTH the feature list and the live owner map in one call —
+        # there is no doc_get/doc_owner_map method.
+        snap = cb.call("doc_tree", {"doc_id": doc_id}) or {}
+        tree = snap.get("tree") or {}
+        owner = snap.get("owner_map") or {}
+    except Exception:  # noqa: BLE001 — a probe failure must never break a valid batch
+        return ops
+    bodies_of = {fid: set(v.get("bodies") or ())
+                 for fid, v in owner.items() if isinstance(v, dict)}
+    order = {f.get("id"): i for i, f in enumerate(tree.get("features") or [])
+             if isinstance(f, dict)}
+    types = {f.get("id"): _slug(f.get("type")) for f in (tree.get("features") or [])
+             if isinstance(f, dict)}
+    # Operands sharing a body are ONE solid; the earliest is the base, the rest are tools.
+    shared = [fid for fid in wanted
+              if any(fid != other and bodies_of.get(fid)
+                     and bodies_of.get(fid) == bodies_of.get(other) for other in wanted)]
+    if len(shared) < 2:
+        return ops
+    tools = sorted(shared, key=lambda f: order.get(f, 0))[1:]
+    fixes = [{"op": "edit_feature", "id": fid, "params": {"merge": False}}
+             for fid in tools if types.get(fid) in _MERGEABLE_PRIMITIVES]
+    if not fixes:
+        return ops
+    notes.append(
+        "separated " + ", ".join(f["id"] for f in fixes) + " into its own body with "
+        'merge:false before the boolean — a primitive built with the default mode:"boss" '
+        "fuses into the running solid, so a boolean naming it has no second operand left")
+    return fixes + list(ops)
+
+
+def _normalize_pattern_ops(ops: Any, notes: list) -> Any:
+    """Run the pattern normalizer over the batch, before the type alias table sees it."""
+    if not isinstance(ops, list):
+        return ops
+    out, changed = [], False
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if not isinstance(feat, dict):
+            out.append(op)
+            continue
+        new = _normalize_pattern_feature(feat, notes)
+        changed = changed or new is not feat
+        out.append(op if new is feat else {**op, "feature": new})
+    return out if changed else ops
+
+
 _FEATURE_TYPE_ALIASES = {
     "cube": "box", "cuboid": "box", "rect_prism": "box", "rectangular_prism": "box",
     "block": "box", "rectangle": "box", "prism": "box", "plate": "box", "slab": "box",
@@ -4052,46 +4278,48 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     def new_part(name: str = "part", *, fresh: bool = False) -> str:
         """Create an editable part document named `name` and make it current.
 
-        An UNBUILT part of the same name is resumed rather than duplicated. A general agent
+        A part of that name that is ALREADY OPEN is resumed, not duplicated. A general agent
         that retries a brief, or a `model3d` worker that respawns per turn, calls
         new_part(name="Widget") again with no memory of the doc_id it got back; the engine's
-        doc_new would UNIQUIFY the collision into "Widget2" and mint a second document, and
-        every mint fans out doc.opened to the GUI, so the user watches duplicate copies of
-        "the same part" pile up in the viewport (observed live: one request produced
-        CD-XXX_TwistedLatticeOrb, ...Orb2, ...Orb3 and ...Orb4).
+        doc_new UNIQUIFIES the collision into "Widget2" and mints a second document, and
+        every mint fans out doc.opened to the GUI, so copies of "the same part" pile up in
+        the user's tab strip (observed live: one requested part produced
+        CD-1400_TwistedLatticeSphere and five more numbered ...2 through ...6).
+        The name IS the identity an agent addresses a part by, so asking for one that exists
+        means "resume it". Pass `fresh=True` for a deliberately separate document.
 
-        A part that ALREADY HAS GEOMETRY is never resumed silently — inheriting a stranger's
-        half-built body is worse than a duplicate, because the next feature lands on geometry
-        the caller does not know is there ("boss added no material — it is buried inside the
-        body"). That case still mints a separate document, but the response says so:
-        `name_taken`, the existing part's doc_id and feature count, and how to continue it
-        instead. `fresh=True` skips the lookup entirely.
+        A resumed part that already carries geometry says so in `feature_count` and `note`:
+        build ON what is there. Ignoring that and placing the next body at the origin is what
+        produces "boss added no material (it is buried inside the body)".
 
         Follow with add_features(...) to build geometry. Each part is a real parametric feature
         tree (undo/redo, editable parameters), not a one-shot mesh.
         """
         try:
-            taken = None
             if not fresh:
                 docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                         if isinstance(e, dict) and e.get("doc_id")]
                 existing = _docs_named(docs, name)
                 if len(existing) == 1:
                     taken = existing[0]
+                    did = taken["doc_id"]
+                    _CUR["doc_id"] = did
+                    # Never reset a real baseline to 0.0: the part may already carry
+                    # geometry, and clobbering _LAST_VOLUME would make the next
+                    # add_features report "0.0 -> X" instead of the true delta.
+                    _LAST_VOLUME.setdefault(did, taken.get("volume", 0.0) or 0.0)
                     built = taken.get("feature_count")
-                    unbuilt = (taken.get("revision", 0) or 0) == 0 or built == 0
-                    if unbuilt:
-                        # Minted but never built: this IS the respawned-worker case, and
-                        # resuming it cannot surprise anyone — there is no geometry to inherit.
-                        did = taken["doc_id"]
-                        _CUR["doc_id"] = did
-                        _LAST_VOLUME.setdefault(did, 0.0)
-                        return _dumps({
-                            "ok": True, "doc_id": did,
-                            "name": taken.get("name") or name,
-                            "revision": taken.get("revision", 0), "reused": True,
-                            "note": f'resumed the empty part "{name}" (doc_id={did}) instead '
-                                    "of minting a duplicate document"})
+                    carries = (f"; it ALREADY CARRIES {built} feature(s) — build on them "
+                               f"(get_part first), or call new_part(fresh=True) for a "
+                               f"separate empty document"
+                               if isinstance(built, int) and built > 0 else "")
+                    return _dumps({
+                        "ok": True, "doc_id": did,
+                        "name": taken.get("name") or name,
+                        "revision": taken.get("revision", 0), "reused": True,
+                        "feature_count": built,
+                        "note": f'resumed the open part "{name}" (doc_id={did}) instead of '
+                                f"minting a duplicate document" + carries})
             r = cb.call("doc_new", {"kind": "part", "name": name})
             did = r.get("doc_id")
             _CUR["doc_id"] = did
@@ -4105,16 +4333,6 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             actual = r.get("name") or name
             out = {"ok": True, "doc_id": did, "name": actual,
                    "revision": r.get("revision", 0)}
-            if taken is not None:
-                out["name_taken"] = True
-                out["existing"] = {"doc_id": taken["doc_id"],
-                                   "name": taken.get("name") or name,
-                                   "feature_count": taken.get("feature_count")}
-                out["note"] = (
-                    f'a part named "{name}" was already open with geometry in it '
-                    f'(doc_id={taken["doc_id"]}); this call made a SEPARATE document '
-                    f'"{actual}". If you meant to keep building the first one, pass its '
-                    f'doc_id to add_features instead of calling new_part again.')
             # Land the (still empty) part in the user's project folder immediately so it
             # exists as a real, openable file; add_features refreshes it as geometry grows.
             saved = _project_save(did, actual)
@@ -4352,6 +4570,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # FIRST — the sketch/primitive passes below branch on the canonical type, so a
             # sketch spelled "profile" used to slip past the sketch normalizer entirely.
             ops = _normalize_op_elements(ops, interpreted)
+            # A pattern decides its own type from params.mode, so it must run BEFORE the
+            # alias table maps the generic word "pattern" onto linear_pattern regardless.
+            ops = _normalize_pattern_ops(ops, interpreted)
             ops = _normalize_feature_types(ops, interpreted)
             # Geometry selectors written into `params` belong in `refs` — the
             # model had the right edges, just the wrong bag. Runs before the
@@ -4385,6 +4606,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             ops = _resolve_relative_profile_refs(ops, interpreted)
             # LAST: operands are canonical only now, and this reads them.
             ops = _unmerge_boolean_operands(ops, interpreted)
+            # …and the same problem for operands built by an EARLIER batch, which
+            # merge:false on a new feature cannot reach — that needs an edit_feature.
+            ops = _repair_merged_boolean_operands(ops, d, interpreted)
             interpreted = _interpreted_notes(interpreted)
 
             def _apply() -> dict:

@@ -504,9 +504,11 @@ async def _startup() -> None:
     # queue. Idempotent — later admin decisions are never clobbered.
     try:
         migrated = accounts.import_users_yaml(settings.users_file)
-        if migrated.get("imported"):
+        # import_users_yaml returns the email LISTS, not counts.
+        imported = migrated.get("imported") or []
+        if imported:
             log.info("accounts: imported %d user(s) from %s",
-                     migrated["imported"], settings.users_file)
+                     len(imported), settings.users_file)
     except Exception:  # noqa: BLE001 — never block boot on a migration hiccup
         log.exception("accounts: users.yaml import failed")
     if not accounts.auto_approve_domains():

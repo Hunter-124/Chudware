@@ -101,6 +101,12 @@ def _db_path() -> Path:
 
 def _connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
+    # Account rows carry every user's email, role and Stripe customer id, so
+    # the file must not be world-readable. sqlite creates it 0644 by default.
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        log.warning("accounts: could not restrict permissions on %s", path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(

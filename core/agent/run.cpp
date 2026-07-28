@@ -587,7 +587,7 @@ std::string admin_worker_repo_root() {
 // to the blocked response.
 bool call_admin_worker_turn(const std::string& request, const std::string& run_id,
                             const json& provider_cfg, const std::string& workspace_dir,
-                            RunEvents& events, json& turn_out,
+                            const json& history, RunEvents& events, json& turn_out,
                             std::string& err) {
     const std::string python = admin_worker_python_bin();
     if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
@@ -660,6 +660,10 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     // worker jails fs_* on CHUDWARE_FS_ROOT and chdirs here so file work lands in
     // the user's folder instead of the CAD source repo checkout.
     if (!workspace_dir.empty()) params["workspace_dir"] = workspace_dir;
+    // Prior conversation turns from the GUI's session store (options.history), oldest
+    // first — the worker forks fresh per turn, so without this every follow-up was a
+    // cold start. Absent/empty array == previous behaviour (no key sent at all).
+    if (history.is_array() && !history.empty()) params["history"] = history;
     if (provider_cfg.is_object()) {
         auto put = [&](const char* cfg_key, const char* param_key) {
             const auto it = provider_cfg.find(cfg_key);
@@ -783,7 +787,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
 }
 #else   // _WIN32
 bool call_admin_worker_turn(const std::string&, const std::string&, const json&,
-                            const std::string&, RunEvents&,
+                            const std::string&, const json&, RunEvents&,
                             json&, std::string& err) {
     err = "admin worker bridge unavailable on this platform";
     return false;
@@ -999,8 +1003,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         json turn;
         std::string worker_err;
         const std::string ws_dir = agent_workspace_dir(options);
-        if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, events, turn,
-                                    worker_err)) {
+        const json history = options.value("history", json::array());
+        if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, history, events,
+                                    turn, worker_err)) {
             if (worker_err == "cancelled" || run_ctl.cancelled()) {
                 events.emit("run_finished", json{{"status", "cancelled"},
                                                  {"stop_reason", "cancelled"}});

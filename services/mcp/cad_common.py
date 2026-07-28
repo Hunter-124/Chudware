@@ -878,6 +878,17 @@ def _autosave_dir() -> Path:
     return d
 
 
+#: Autosave COUNT cap. The age-based prune below was the only bound, and it never
+#: fires in practice: the worker is forked PER TURN (core/agent/run.cpp), so every
+#: turn gets a fresh _SESSION_ID and writes a brand-new session-prefixed snapshot for
+#: every doc it touches — all of them younger than the age cutoff. One day of use
+#: left 39,162 files / 3.6 GB under mcp_autosave, 19,581 distinct stems in seven
+#: hours. These are crash-recovery snapshots, not user deliverables (those go to the
+#: project folder via _project_save), so the directory is also bounded by count.
+_AUTOSAVE_MAX_FILES = int(os.environ.get("CHUDWARE_AUTOSAVE_MAX_FILES") or 2000)
+_autosave_pruned = False
+
+
 def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
     """Persist a doc to a recoverable .step+ (plus a sidecar tagging the session) so a
     server restart — e.g. after a client timeout killed it — can reload THIS session's
@@ -906,6 +917,7 @@ def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
         meta = {"session": _SESSION_ID, "doc_id": doc_id, "name": name or "",
                 "saved_at": time.time()}
         (_autosave_dir() / f"{stem}.json").write_text(json.dumps(meta))
+        _prune_autosaves()  # once per process, after our own snapshot is safely down
     except Exception:  # noqa: BLE001
         pass
 
@@ -1112,19 +1124,60 @@ def autosave_p95_ms() -> float | None:
     return s[int(len(s) * 0.95)] * 1000.0
 
 
-def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS) -> int:
-    """Delete autosave .step+ / sidecars older than max_age_days (by mtime). Returns count."""
+def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS,
+                     max_files: int = 0) -> int:
+    """Delete autosave .step+ / sidecars older than max_age_days (by mtime).
+
+    *max_files* (0 = use _AUTOSAVE_MAX_FILES) additionally caps how many snapshots
+    may remain, deleting OLDEST FIRST. The age rule alone never bounded anything in
+    practice — the worker forks per turn, so every snapshot on disk is young — which
+    is how the directory reached 39k files in one day. Two things are never removed
+    by the count cap: this process's own snapshots (live crash recovery) and the
+    newest surviving snapshot of any doc_id, so the most recent recoverable copy of
+    a document always stays on disk. Returns the number of snapshots deleted.
+    """
     n = 0
     cutoff = time.time() - max_age_days * 86400.0
     try:
+        entries: list[tuple[float, Path]] = []
         for p in _autosave_dir().glob("*.step+"):
             try:
-                if p.stat().st_mtime < cutoff:
+                mt = p.stat().st_mtime
+            except OSError:
+                continue
+            if mt < cutoff:
+                try:
                     p.unlink(missing_ok=True)
                     p.with_suffix(".json").unlink(missing_ok=True)
                     n += 1
-            except OSError:
+                except OSError:
+                    pass
                 continue
+            entries.append((mt, p))
+        cap = max_files or _AUTOSAVE_MAX_FILES
+        if cap > 0 and len(entries) > cap:
+            entries.sort(key=lambda e: e[0], reverse=True)  # newest first
+            keep_doc: set[str] = set()
+            protected: set[Path] = set()
+            for _mt, p in entries:
+                stem = p.name[:-6]
+                doc = stem.split("-", 1)[1] if "-" in stem else stem
+                if doc not in keep_doc:
+                    keep_doc.add(doc)
+                    protected.add(p)          # newest snapshot of this document
+                if stem.startswith(f"{_SESSION_ID}-"):
+                    protected.add(p)          # our own live recovery data
+            for _mt, p in reversed(entries):  # oldest first
+                if len(entries) - n <= cap:
+                    break
+                if p in protected:
+                    continue
+                try:
+                    p.unlink(missing_ok=True)
+                    p.with_suffix(".json").unlink(missing_ok=True)
+                    n += 1
+                except OSError:
+                    continue
     except Exception:  # noqa: BLE001
         pass
     return n

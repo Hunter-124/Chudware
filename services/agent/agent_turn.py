@@ -991,6 +991,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              mode: str | None = None,
              plan_only: bool | None = None,
              options: dict | None = None,
+             history: list[dict] | None = None,
              auto_enable_packs: bool = False) -> TurnResult:
     """Streaming wrapper around :func:`_run_turn_impl`.
 
@@ -1012,7 +1013,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             capability=capability, tier=tier, model_id=model_id, phase=phase,
             task_class=task_class, msg_idx=msg_idx, doc_id=doc_id,
             context_refs=context_refs, mode=mode, plan_only=plan_only,
-            options=options, auto_enable_packs=auto_enable_packs)
+            options=options, history=history, auto_enable_packs=auto_enable_packs)
 
     from services.agent import agent_events as _ae  # noqa: PLC0415
     from services.agent.providers import base as _pbase  # noqa: PLC0415
@@ -1032,7 +1033,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             capability=capability, tier=tier, model_id=model_id, phase=phase,
             task_class=task_class, msg_idx=msg_idx, doc_id=doc_id,
             context_refs=context_refs, mode=mode, plan_only=plan_only,
-            options=options, auto_enable_packs=auto_enable_packs)
+            options=options, history=history, auto_enable_packs=auto_enable_packs)
 
 
 def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
@@ -1061,6 +1062,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
              mode: str | None = None,
              plan_only: bool | None = None,
              options: dict | None = None,
+             history: list[dict] | None = None,
              auto_enable_packs: bool = False) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
@@ -1087,7 +1089,15 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     *capability* / *tier* / *model_id* resolve a CapabilityProfile for A/B
     scaffolds (WI-2/4/6/7). Letter C is always a no-op for scaffolds.
     *phase* applies HARD phase_caps (WI-4) when set.
-    *task_class* feeds WI-8 reference-build novelty (when injected upstream)."""
+    *task_class* feeds WI-8 reference-build novelty (when injected upstream).
+
+    *history* is the prior conversation transcript (GUI session), oldest first,
+    as ``{"role": "user"|"assistant", "text": str}`` entries. Validated and
+    capped defensively here (<=12 entries, <=8000 chars total, dropped from the
+    FRONT, each entry clipped to 1500 chars with a trailing " …"), then seeded
+    as normal role messages BEFORE the current *request*. Absent/invalid ==
+    exactly today's behaviour. *request* is never merged into history — the
+    work-intent classifier reads only *request*."""
     # Capability profile: prefer explicit, else mission_dispatch, else C.
     try:
         from services.agent import scaffolds as _sc  # noqa: PLC0415
@@ -1433,7 +1443,15 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     elif allow:
         system += "\nAllowed tools: " + ", ".join(sorted(allow))
 
-    messages: list[dict] = [{"role": "user", "content": _parts(_req)}]
+    # Conversation history (GUI session transcript): sanitize + cap, then seed
+    # BEFORE the current user request. Validated here too — worker_rpc applies
+    # the same contract, but run_turn is a public entry other callers reach.
+    _hist_msgs: list[dict] = [
+        {"role": role, "content": _parts(text)}
+        for role, text in _sanitize_history(history)
+    ]
+
+    messages: list[dict] = [*_hist_msgs, {"role": "user", "content": _parts(_req)}]
 
     # Skills catalog + activation (contracts/skills.md). Best-effort.
     try:
@@ -1447,7 +1465,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _req = _reapply(_clean, context_refs)
             except Exception:  # noqa: BLE001
                 _req = _clean
-            messages = [{"role": "user", "content": _parts(_req)}]
+            messages = [*_hist_msgs, {"role": "user", "content": _parts(_req)}]
         _sk_parts: list[str] = []
         if _first_catalog_turn:
             _cat = _skills.catalog_block()
@@ -4279,6 +4297,50 @@ def _dispatch_tool(
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
+
+# Conversation-history contract (options.history / run_turn history=): the GUI
+# session transcript travels as {"role": "user"|"assistant", "text": str}
+# entries, oldest first. These caps are applied at every Python layer that
+# accepts history (worker_rpc._agent_admin_turn AND agent_turn.run_turn) so a
+# direct caller cannot blow the context budget either.
+_HISTORY_MAX_ENTRIES = 12
+_HISTORY_MAX_CHARS = 8000
+_HISTORY_CLIP_CHARS = 1500
+
+
+def _sanitize_history(history: Any) -> list[tuple[str, str]]:
+    """Validate + cap a history list → [(role, text), ...] oldest first.
+
+    Drops anything that is not a dict with role in {user, assistant} and a
+    non-empty string text; clips long entries; enforces the entry/char caps by
+    dropping from the FRONT (recent turns matter most). Never raises.
+    """
+    if not isinstance(history, list):
+        return []
+    cand: list[tuple[str, str]] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        text = entry.get("text")
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        cand.append((role, text.strip()))
+    cand = cand[-_HISTORY_MAX_ENTRIES:]
+    kept: list[tuple[str, str]] = []
+    total = 0
+    for role, text in reversed(cand):
+        clip = (text[:_HISTORY_CLIP_CHARS].rstrip() + " …"
+                if len(text) > _HISTORY_CLIP_CHARS else text)
+        if total + len(clip) > _HISTORY_MAX_CHARS:
+            continue  # older entries only — recent turns kept, front dropped
+        total += len(clip)
+        kept.append((role, clip))
+    kept.reverse()
+    return kept
+
 
 def _parts(text: str) -> list[dict]:
     return [{"type": "text", "text": str(text)}]

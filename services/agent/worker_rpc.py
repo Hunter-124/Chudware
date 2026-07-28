@@ -1402,7 +1402,7 @@ OFFICE_METHODS: dict[str, Callable] = {
 
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     """``agent_admin_turn {request, run_id?, role?, provider?, model?, api_key?,
-    base_url?, reasoning_effort?, workspace_dir?} -> {ok, turn:{success, stop_reason,
+    base_url?, reasoning_effort?, workspace_dir?, history?} -> {ok, turn:{success, stop_reason,
     result, role, allowed_tools}} | {ok:false, reason}``.
 
     Streams turn events through ``_emit`` — worker_main.py's serve loop tags each
@@ -1509,6 +1509,18 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         data["kind"] = kind
         _emit(data)
 
+    def _history() -> list[dict] | None:
+        """params["history"] — the GUI session transcript, oldest first, as
+        {"role": "user"|"assistant", "text": str}. Validated and capped here
+        (agent_turn.run_turn re-applies the same contract defensively).
+        Absent/invalid == today's behaviour exactly (None, not [])."""
+        try:
+            from services.agent.agent_turn import _sanitize_history  # noqa: PLC0415
+            kept = _sanitize_history((params or {}).get("history"))
+            return [{"role": r, "text": t} for r, t in kept] or None
+        except Exception:  # noqa: BLE001 — history must never break a turn
+            return None
+
     try:
         turn = run_linear_role_turn(
             request, role, provider,
@@ -1517,6 +1529,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             # reads options project_dir/project_path/workspace_dir for its
             # project-memory lookup).
             options={"project_dir": project_root} if project_root else None,
+            history=_history(),
         )
         return {"ok": True, "turn": turn}
     except Exception as exc:  # noqa: BLE001 — never raise across the worker seam

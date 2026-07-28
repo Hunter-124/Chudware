@@ -149,6 +149,13 @@ static std::string chatSessionFilePath(const std::string& id) {
     return chatSessionsDir() + "/" + chatSessionFileStem(id) + ".json";
 }
 
+// File STEMS of sessions this process has verifiably held LIVE (loaded successfully, or
+// written by us this run). The prune step in persistChatHistory may ONLY remove transcripts
+// for these stems — anything else on disk (a crash-orphaned transcript whose index write
+// never landed, a file that failed to parse, another instance's session) is user data we
+// cannot vouch for and MUST keep. Recovery beats pruning: when in doubt, keep the file.
+static std::set<std::string> s_pruneableSessionStems;
+
 static std::string promptDraftKey(AppState& st) {
     std::string key = st.chatDocKey.empty() ? convDocKey(st) : st.chatDocKey;
     key += "/";
@@ -400,10 +407,29 @@ void persistChatHistory(AppState& st) {
     nlohmann::json order = nlohmann::json::array();
     std::set<std::string> writtenIds;  // defensive: never write an id twice in one snapshot
     std::string activeId;
+    // A PARKED session whose only content is an unsent composer draft (saved under its
+    // docKey/id key in prompt_drafts.json) is not "fresh" — the session is the draft's only
+    // anchor; dropping it strands the user's typed text in an unreachable drafts entry.
+    nlohmann::json drafts = nlohmann::json::object();
+    {
+        std::ifstream in(promptDraftsPath());
+        if (in) { try { in >> drafts; } catch (...) { drafts = nlohmann::json::object(); } }
+    }
+    auto sessionHasDraft = [&](const std::string& id) {
+        if (!drafts.is_object() || id.empty()) return false;
+        const std::string suffix = "/" + id;  // "/" anchor: c1 must not match c12
+        for (auto it = drafts.begin(); it != drafts.end(); ++it) {
+            if (it.key().size() < suffix.size()) continue;
+            if (it.key().compare(it.key().size() - suffix.size(), suffix.size(), suffix) != 0)
+                continue;
+            if (!promptDraftIsEmpty(it.value())) return true;
+        }
+        return false;
+    };
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
-        // Fresh sessions (no messages, no queue, no run) are never written — same rule as
-        // empty parts never autosaving.
-        if (conversationIsFresh(st, i)) continue;
+        // Fresh sessions (no messages, no queue, no run, no draft) are never written — same
+        // rule as empty parts never autosaving.
+        if (conversationIsFresh(st, i) && !sessionHasDraft(st.conversations[i].id)) continue;
         if (!writtenIds.insert(st.conversations[i].id).second) continue;
         if (i == st.activeConv) activeId = st.conversations[i].id;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
@@ -536,15 +562,20 @@ void persistChatHistory(AppState& st) {
         sessions.push_back(convObj);
         order.push_back(st.conversations[i].id);
         // One transcript file per session — durable atomic write per file.
-        atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id), convObj.dump(1));
+        if (atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id), convObj.dump(1)))
+            s_pruneableSessionStems.insert(chatSessionFileStem(st.conversations[i].id));
     }
     nlohmann::json index = {{"version", 2}, {"active", activeId}, {"order", order}};
     try {
         // Durable atomic write (tmp + fsync + rename + dir fsync) — a hard crash mid-run must
         // never be able to leave a truncated/empty transcript behind.
         if (!atomicWriteFileDurable(chatSessionsIndexPath(), index.dump(1))) return;
-        // Prune transcripts of sessions that no longer exist (deleted this process or a
-        // previous one) — the dir is the store, never an accumulating graveyard.
+        // Prune transcripts of sessions that no longer exist — but ONLY stems this process
+        // has verifiably held live (loaded successfully or written by us: see
+        // s_pruneableSessionStems). A file we cannot vouch for — crash-orphaned, corrupt at
+        // load time, or written by a second app instance with a different resident set — is
+        // user data: KEEP it. The dir is the store, but never at the cost of silent
+        // destruction of unverifiable history.
         std::set<std::string> keep;
         for (const auto& id : order) keep.insert(chatSessionFileStem(id.get<std::string>()));
         std::error_code ec;
@@ -555,7 +586,9 @@ void persistChatHistory(AppState& st) {
                 name.compare(name.size() - 5, 5, ".json") != 0)
                 continue;
             std::string stem = name.substr(0, name.size() - 5);
-            if (!keep.count(stem)) fs::remove(de.path(), ec);
+            if (keep.count(stem) || !s_pruneableSessionStems.count(stem)) continue;
+            fs::remove(de.path(), ec);
+            if (!ec) s_pruneableSessionStems.erase(stem);
         }
         appstatePersistSync();  // WASM: flush IDBFS; no-op on desktop
 #ifdef __EMSCRIPTEN__
@@ -796,7 +829,14 @@ void loadChatHistory(AppState& st) {
     st.activeConv = -1;
 
     bool migratedLegacy = false;
+    bool recoveredOrphan = false;
     std::string activeId;
+    std::set<std::string> seen;  // ids loaded this run — dup guard + orphan-sweep skip set
+    auto noteLoaded = [&] {  // record a successfully parsed session as prunable + seen
+        const std::string& id = st.conversations.back().id;
+        seen.insert(id);
+        s_pruneableSessionStems.insert(chatSessionFileStem(id));
+    };
     // Per-session transcript store: index.json (order + active id) + <id>.json transcripts.
     {
         nlohmann::json index = nlohmann::json::object();
@@ -806,7 +846,6 @@ void loadChatHistory(AppState& st) {
         }
         if (index.is_object() && index.contains("order") && index["order"].is_array()) {
             activeId = index.value("active", std::string());
-            std::set<std::string> seen;  // a damaged index may list an id twice — load it once
             bool droppedDup = false;
             for (const auto& jid : index["order"]) {
                 if (!jid.is_string()) continue;
@@ -816,10 +855,44 @@ void loadChatHistory(AppState& st) {
                     std::ifstream sf(chatSessionFilePath(jid.get<std::string>()));
                     if (sf) { try { sf >> js; } catch (...) { continue; } }
                 }
-                if (js.is_object())
-                    parseChatSessionJson(st, js, js.value("doc", std::string()));
+                // A corrupt transcript is skipped here (this one file only — later sessions
+                // still load) and, crucially, NOT recorded in s_pruneableSessionStems, so
+                // the prune step can never destroy it: it stays on disk for recovery.
+                if (js.is_object() &&
+                    parseChatSessionJson(st, js, js.value("doc", std::string())))
+                    s_pruneableSessionStems.insert(
+                        chatSessionFileStem(st.conversations.back().id));
             }
             if (droppedDup) markChatHistoryDirty();  // rewrite a clean order on next persist
+        }
+    }
+    // Recovery sweep: a transcript file on disk that the index does NOT list is still user
+    // data — a crash between the per-session write and the index write (or a failed index
+    // write, which early-returns persistChatHistory) used to orphan it forever, and the old
+    // prune step would then have DELETED it. Adopt any parseable orphan into the resident
+    // set and mark dirty so the next persist rewrites an index that lists it. Unparseable
+    // files are left untouched on disk (never prunable — see above).
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (const auto& de : fs::directory_iterator(chatSessionsDir(), ec)) {
+            if (!de.is_regular_file(ec)) continue;
+            const std::string name = de.path().filename().string();
+            if (name == "index.json" || name.size() < 6 ||
+                name.compare(name.size() - 5, 5, ".json") != 0)
+                continue;
+            nlohmann::json js;
+            {
+                std::ifstream sf(de.path());
+                if (sf) { try { sf >> js; } catch (...) { continue; } }
+            }
+            if (!js.is_object()) continue;
+            const std::string id = js.value("id", std::string());
+            if (id.empty() || seen.count(id)) continue;
+            if (parseChatSessionJson(st, js, js.value("doc", std::string()))) {
+                noteLoaded();
+                recoveredOrphan = true;
+            }
         }
     }
     if (st.conversations.empty()) {
@@ -833,7 +906,7 @@ void loadChatHistory(AppState& st) {
             if (activeId.empty()) activeId = root.value("active", std::string());
             for (const auto& jc : root["sessions"]) {
                 if (!jc.is_object()) continue;
-                parseChatSessionJson(st, jc, jc.value("doc", std::string()));
+                if (parseChatSessionJson(st, jc, jc.value("doc", std::string()))) noteLoaded();
                 migratedLegacy = true;
             }
         } else if (root.is_object()) {
@@ -842,7 +915,7 @@ void loadChatHistory(AppState& st) {
                 if (!it.value().is_object()) continue;
                 for (const auto& jc : it.value().value("conversations", nlohmann::json::array())) {
                     if (!jc.is_object()) continue;
-                    parseChatSessionJson(st, jc, it.key());
+                    if (parseChatSessionJson(st, jc, it.key())) noteLoaded();
                     migratedLegacy = true;
                 }
             }
@@ -859,8 +932,9 @@ void loadChatHistory(AppState& st) {
     }
     restorePromptDraft(st);
     // An imported legacy store is written through to the per-session transcripts on the
-    // next debounced persist.
-    if (migratedLegacy) markChatHistoryDirty();
+    // next debounced persist. A recovered orphan likewise needs the index rewritten so it
+    // is listed (and therefore reachable on every future load) again.
+    if (migratedLegacy || recoveredOrphan) markChatHistoryDirty();
 }
 
 #ifdef __EMSCRIPTEN__

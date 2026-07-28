@@ -2159,6 +2159,7 @@ def run_linear_role_turn(
     max_tool_calls: int | None = None,
     tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
     options: dict | None = None,
+    history: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Run ONE bounded ``agent_turn.run_turn`` against *role*'s card.
 
@@ -2243,6 +2244,7 @@ def run_linear_role_turn(
         run_id=run_id,
         capability=capability,
         options=options,
+        history=history,
         # The interactive lane's allow-set is an on-ramp, not a scope: the model
         # is expected to pull packs in with enable_tools as it works. Let the
         # harness do it on first reach instead of spending two billed

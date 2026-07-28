@@ -23,6 +23,7 @@ from .cad_common import (
     _SID_RE,
     _autosave,
     _doc,
+    _docs_named,
     _doc_revision,
     _dumps,
     _err,
@@ -1483,6 +1484,58 @@ _OP_TARGET_OPS = frozenset({
 })
 
 
+#: Keys whose value is a STRUCTURE. A string here is a nested encoding, never data —
+#: unlike name/mode/plane, where a string is exactly what belongs.
+_STRUCTURE_KEYS = frozenset({
+    "feature", "features", "params", "refs", "ops", "entities", "constraints",
+    "dimensions", "equations", "profile", "profiles", "sections", "targets", "bodies"})
+
+
+def _decode_one_structure(v: Any) -> Any:
+    """A string encoding a dict/list -> that dict/list. Anything else, unchanged.
+
+    JSON first, then `ast.literal_eval` — the live payload was a PYTHON repr (single
+    quotes, bare `None`), which json.loads cannot read. Never raises: an unparseable
+    string is data as far as this is concerned, and the caller's own validation owns it.
+    """
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    if not (s[:1] in "{[" and s[-1:] in "}]"):
+        return v
+    try:
+        return json.loads(s)
+    except ValueError:
+        pass
+    try:
+        import ast  # noqa: PLC0415 — only reached on the repr dialect
+        parsed = ast.literal_eval(s)
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        return v
+    return parsed if isinstance(parsed, (dict, list)) else v
+
+
+def _decode_embedded_structures(v: Any, notes: list, _depth: int = 0) -> Any:
+    """Decode every stringified structure in the batch, at any depth."""
+    if _depth > 8:
+        return v
+    if isinstance(v, list):
+        return [_decode_embedded_structures(x, notes, _depth + 1) for x in v]
+    if not isinstance(v, dict):
+        return v
+    out = {}
+    for k, val in v.items():
+        if k in _STRUCTURE_KEYS:
+            decoded = _decode_one_structure(val)
+            if decoded is not val:
+                notes.append(
+                    f'decoded "{k}" from a string into the object it encodes — a '
+                    f"structure slot takes real JSON, not a quoted dict")
+                val = decoded
+        out[k] = _decode_embedded_structures(val, notes, _depth + 1)
+    return out
+
+
 def _normalize_op_elements(ops: list, notes: list) -> list:
     """Give every batch element a valid `op`. Raises ValueError with a teaching message
     for an element that names neither an op nor a feature type."""
@@ -1514,6 +1567,22 @@ def _normalize_op_elements(ops: list, notes: list) -> list:
                              '"feature" object — an add_feature op is '
                              '{"op":"add_feature","feature":{"type":…,"params":{…}}}')
                 continue
+            # A string feature that survived _decode_embedded_structures unparsed (not
+            # JSON, not a Python literal, or a literal that isn't a dict — e.g. a bare
+            # number or a list) must never reach a downstream `.get()` and crash with a
+            # bare AttributeError the way the live 2026-07-28 run did. Every other pass
+            # below only ever normalizes a DICT feature (isinstance-guarded), so a feature
+            # that is still not a dict here would otherwise ride silently to the engine.
+            if kind == "add_feature" and el.get("feature") is not None and not isinstance(
+                    el.get("feature"), dict):
+                bad = el["feature"]
+                text = bad if isinstance(bad, str) else repr(bad)
+                if len(text) > 80:
+                    text = text[:80] + "…"
+                raise ValueError(
+                    f'ops[{i}]["feature"] is a {type(bad).__name__} ({text!r}), not a JSON '
+                    f"object — it did not decode into one either. feature must be a JSON "
+                    f'object, e.g. {{"type":"cylinder","name":"PoleBore","params":{{...}}}}')
             if kind in docops or kind == "new_part":
                 out.append(_normalize_op_target(el, kind, notes))
                 continue
@@ -2114,6 +2183,196 @@ def _one_operand(v: Any) -> Optional[str]:
     return _operand_name(v)
 
 
+#: A selector slot the model explicitly EMPTIED. Live run 2026-07-28: a shell with
+#: refs.faces:"none" and, on the retry, refs.remove:[] — both hard-rejected («'none' is
+#: neither a reserved datum…», «must be a non-empty list»). The model was saying "remove
+#: no faces", which is a legal closed shell; the slot should simply not be there.
+_EMPTY_SLOT_WORDS = frozenset({"none", "null", "nil", "nothing", "no", "n/a", "n_a", "na",
+                               "", "empty", "undefined", "no_faces", "not_applicable"})
+
+
+def _is_empty_slot(v: Any) -> bool:
+    if isinstance(v, str):
+        return _slug(v) in _EMPTY_SLOT_WORDS
+    if isinstance(v, list):
+        return len(v) == 0 or all(_is_empty_slot(x) for x in v)
+    return v is None
+
+
+def _drop_empty_ref_slots(ops: Any, notes: list) -> Any:
+    """Delete every ref slot the model emptied. An absent slot is a legal "no selection";
+    an empty one is a rejection, and the two mean the same thing."""
+    if not isinstance(ops, list):
+        return ops
+    out, hits = [], []
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        refs = feat.get("refs") if isinstance(feat, dict) else None
+        if not isinstance(refs, dict):
+            out.append(op)
+            continue
+        kept = {k: v for k, v in refs.items() if not _is_empty_slot(v)}
+        if len(kept) == len(refs):
+            out.append(op)
+            continue
+        dropped = sorted(set(refs) - set(kept))
+        hits.extend(dropped)
+        nf = {k: v for k, v in feat.items() if k != "refs"}
+        if kept:
+            nf["refs"] = kept
+        out.append({**op, "feature": nf})
+    if not hits:
+        return ops
+    notes.append(
+        "dropped the empty ref slot(s) " + ", ".join(sorted(set(hits)))
+        + " — an emptied selector slot means no selection, which is an ABSENT slot; "
+          "a shell with no removed faces is a closed hollow, not an error")
+    return out
+
+
+#: A primitive carrying its own boolean intent. Live run 2026-07-28:
+#: {"type":"cylinder",…,"refs":{"boolean":"subtract","target":"f2"}} — the model wants the
+#: cylinder subtracted, and the engine already does exactly that with params.mode:"cut".
+#: No extra boolean feature is needed, and inventing one would add a body the part
+#: does not want.
+_INLINE_BOOLEAN_KEYS = ("boolean", "boolean_op", "operation", "bool_op", "combine")
+_INLINE_BOOLEAN_MODE = {"subtract": "cut", "cut": "cut", "difference": "cut",
+                        "remove": "cut", "minus": "cut", "union": "boss", "add": "boss",
+                        "fuse": "boss", "join": "boss", "boss": "boss", "merge": "boss"}
+_MODE_TYPES = frozenset({"box", "cylinder", "cone", "sphere", "torus", "extrude",
+                         "revolve", "sweep", "loft", "rib"})
+
+
+def _normalize_inline_boolean(ops: Any, notes: list) -> Any:
+    """A boolean word attached to a PRIMITIVE -> params.mode, which is the same thing."""
+    if not isinstance(ops, list):
+        return ops
+    out, hits = [], []
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if not isinstance(feat, dict) or _slug(feat.get("type")) not in _MODE_TYPES:
+            out.append(op)
+            continue
+        nf = dict(feat)
+        params = dict(nf.get("params")) if isinstance(nf.get("params"), dict) else {}
+        refs = dict(nf.get("refs")) if isinstance(nf.get("refs"), dict) else {}
+        mode = None
+        for holder in (refs, params):
+            for k in _INLINE_BOOLEAN_KEYS:
+                word = _INLINE_BOOLEAN_MODE.get(_slug(holder.get(k)))
+                if word:
+                    mode = mode or word
+                    holder.pop(k, None)
+        if mode is None:
+            out.append(op)
+            continue
+        # The companion `target` names the body being cut. A mode:"cut" primitive already
+        # cuts every body it intersects and these types have no target slot, so keeping it
+        # would only re-raise "unknown ref slot".
+        target = next((refs.pop(k) for k in ("target", "into", "target_body")
+                       if k in refs), None)
+        params.setdefault("mode", mode)
+        nf["params"] = params
+        if refs:
+            nf["refs"] = refs
+        else:
+            nf.pop("refs", None)
+        hits.append((_feat_label(feat, "feature"), mode, target))
+        out.append({**op, "feature": nf})
+    for label, mode, target in hits:
+        notes.append(
+            f'{label}: read the boolean word as params.mode="{mode}" — a primitive '
+            f"removes material itself, so this is one feature, not a primitive plus a "
+            f"boolean" + (f'; dropped target "{target}" (a cut applies to every body it '
+                          f"intersects)" if target else ""))
+    return ops if not hits else out
+
+
+def _unmerge_boolean_operands(ops: Any, notes: list) -> Any:
+    """A body this batch feeds to a boolean must stay a SEPARATE solid.
+
+    Live run 2026-07-28: a sphere built inside a box to be subtracted was merged into it
+    on creation, so it "added no material" and the boolean's operand did not exist —
+    «ref 'b' -> 'f2' not found». The model cannot know this; the batch says it.
+    """
+    if not isinstance(ops, list):
+        return ops
+    wanted: set = set()
+    by_name: dict = {}
+    for i, op in enumerate(ops):
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if isinstance(feat, dict) and isinstance(feat.get("name"), str):
+            by_name.setdefault(feat["name"].strip(), i)
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if not isinstance(feat, dict) or _slug(feat.get("type")) != "boolean":
+            continue
+        params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+        for slot in ("a", "b"):
+            v = params.get(slot)
+            if not isinstance(v, str):
+                continue
+            v = v.strip()
+            if _BATCH_REF_RE.match(v):
+                wanted.add(int(v[1:]))
+            elif v in by_name:
+                wanted.add(by_name[v])
+    hits = []
+    out = list(ops)
+    for i in sorted(wanted):
+        feat = out[i].get("feature") if isinstance(out[i], dict) else None
+        if not isinstance(feat, dict) or _slug(feat.get("type")) == "boolean":
+            continue
+        params = dict(feat.get("params")) if isinstance(feat.get("params"), dict) else {}
+        if params.get("merge") is False:
+            continue
+        params["merge"] = False
+        out[i] = {**out[i], "feature": {**feat, "params": params}}
+        hits.append(_feat_label(feat, f"op {i}"))
+    if not hits:
+        return ops
+    notes.append(
+        "set merge:false on " + ", ".join(hits) + " — a body this batch hands to a "
+        "boolean has to stay a separate solid, or it is absorbed on creation and the "
+        "boolean's operand no longer exists")
+    return out
+
+
+#: `{"op":"boolean_subtract","target":"f1","tool":"f2"}` (live run 2026-07-28). The op
+#: name is invented, but it carries its operation AND both operands — a complete boolean.
+_COMPOUND_BOOLEAN_RE = re.compile(
+    r"^(?:boolean[_-]?)?(subtract|difference|minus|cut|union|add|fuse|join|"
+    r"intersect|intersection|common)(?:[_-]?boolean)?$")
+
+
+def _expand_compound_boolean_ops(ops: Any, notes: list) -> Any:
+    """An invented `boolean_<word>` op -> the canonical boolean add_feature."""
+    if not isinstance(ops, list):
+        return ops
+    out, hits = [], []
+    for el in ops:
+        m = _COMPOUND_BOOLEAN_RE.match(_slug(el.get("op"))) if isinstance(el, dict) else None
+        if not m or isinstance(el.get("feature"), dict):
+            out.append(el)
+            continue
+        word = m.group(1)
+        rest = {k: v for k, v in el.items() if k != "op"}
+        name = rest.pop("name", None)
+        feat = {"type": "boolean", "params": {"op": word, **rest}}
+        if name is not None:
+            feat["name"] = name
+        out.append({"op": "add_feature", "feature": feat})
+        hits.append(_slug(el.get("op")))
+    if not hits:
+        return ops
+    notes.append(
+        'read op "' + '", "'.join(sorted(set(hits))) + '" as '
+        '{"op":"add_feature","feature":{"type":"boolean","params":{"op":"cut|fuse|common",'
+        '"a":…,"b":…}}} — a boolean is a FEATURE; the only ops are add_feature, '
+        "edit_feature and delete_feature")
+    return out
+
+
 def _normalize_boolean_feature(feat: dict, notes: list) -> dict:
     """params.operation:"union" + targets:[a,b] -> params.op:"fuse" + params.a/b."""
     out, params, peek, consume = _split_two_levels(feat)
@@ -2158,12 +2417,29 @@ def _normalize_boolean_feature(feat: dict, notes: list) -> dict:
                 operands = [_operand_name(x) for x in tv[:2]]
         pair_note = None
         if not operands:
+            # The pair may sit in `refs` instead of `params`: a live 2026-07-28 batch sent
+            # refs.base=[{"kind":"feature","id":"f1"}] + refs.tool=[…], which reads as
+            # exactly the two operands and died anyway because only params was consulted.
+            refs_in = out.get("refs") if isinstance(out.get("refs"), dict) else {}
+
+            def _peek_either(k: str) -> Any:
+                v = peek(k)
+                return refs_in.get(k, _MISSING) if v is _MISSING else v
+
             tgt = next((k for k in _BOOLEAN_TARGET_KEYS
-                        if _one_operand(peek(k)) is not None), None)
+                        if _one_operand(_peek_either(k)) is not None), None)
             tol = next((k for k in _BOOLEAN_TOOL_KEYS
-                        if _one_operand(peek(k)) is not None), None)
+                        if _one_operand(_peek_either(k)) is not None), None)
             if tgt and tol:
-                operands = [_one_operand(consume(tgt)), _one_operand(consume(tol))]
+                def _take(k: str) -> Any:
+                    if peek(k) is not _MISSING:
+                        return consume(k)
+                    return refs_in.pop(k)
+
+                operands = [_one_operand(_take(tgt)), _one_operand(_take(tol))]
+                out["refs"] = refs_in or None
+                if out["refs"] is None:
+                    out.pop("refs")
                 pair_note = (f'{label}: read {tgt}="{operands[0]}" as params.a (the body '
                              f'kept) and {tol}="{operands[1]}" as params.b (the body '
                              f"applied to it) — a boolean's operands are params.a/params.b")
@@ -3773,13 +4049,41 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- modeling
 
     @mcp.tool()
-    def new_part(name: str = "part") -> str:
-        """Create a new, empty editable part document and make it current. Returns its doc_id.
+    def new_part(name: str = "part", *, fresh: bool = False) -> str:
+        """Create (or resume) an editable part document named `name` and make it current.
+
+        Default (`fresh=False`) RESUMES an already-open part of the same name instead of
+        minting a new one: a general agent that retries a brief, or a `model3d` worker that
+        respawns per turn, calls new_part(name="Widget") more than once with no memory of the
+        first doc_id it got back. Without this, the engine's doc_new would UNIQUIFY the
+        colliding name and mint a brand-new document each time — each mint fans out doc.opened
+        to the GUI, which opens a duplicate mirror tab, so the user ends up with several copies
+        of "the same part" in the viewport. The name IS the identity an agent addresses a part
+        by, so asking for a name that already exists means "resume it", not "fork it".
+        Pass `fresh=True` to force a genuinely separate document (e.g. a deliberate variant).
 
         Follow with add_features(...) to build geometry. Each part is a real parametric feature
         tree (undo/redo, editable parameters), not a one-shot mesh.
         """
         try:
+            if not fresh:
+                docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                        if isinstance(e, dict) and e.get("doc_id")]
+                existing = _docs_named(docs, name)
+                if len(existing) == 1:
+                    did = existing[0]["doc_id"]
+                    _CUR["doc_id"] = did
+                    # Never reset a real volume baseline to 0.0 here: the part may already
+                    # carry built geometry, and clobbering _LAST_VOLUME would corrupt the
+                    # next add_features' write-diff ("0.0 -> X" instead of the true delta).
+                    # Only seed it if this process has never tracked this doc before.
+                    _LAST_VOLUME.setdefault(did, existing[0].get("volume", 0.0))
+                    out = {"ok": True, "doc_id": did, "name": existing[0].get("name") or name,
+                           "revision": existing[0].get("revision", 0), "reused": True,
+                           "note": f'resumed the existing part "{name}" (doc_id={did}) instead '
+                                   "of minting a duplicate; call new_part(fresh=True) to force "
+                                   "a separate document"}
+                    return _dumps(out)
             r = cb.call("doc_new", {"kind": "part", "name": name})
             did = r.get("doc_id")
             _CUR["doc_id"] = did
@@ -3975,6 +4279,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             if bg is not None:
                 background = bg
             ops = list(ops)
+            # A model that nests a structure inside a STRING. Live run 2026-07-28 sent
+            # {"op":"add_feature","feature":"{'type': 'cylinder', …, 'expr': None}"} —
+            # a Python repr, not JSON — and every downstream pass called .get() on a str,
+            # so the turn died on «'str' object has no attribute 'get'»: our crash, and a
+            # message that taught the model nothing. Decode once, here, before any pass
+            # touches the batch; anything that does not parse is left exactly as it came.
+            ops = _decode_embedded_structures(ops, interpreted)
             # Model-robustness: `new_part` is a top-level TOOL, not a batch op — but models
             # reliably open a build batch with {"op":"new_part","name":…} (or the bare
             # {"type":"new_part",…} — a real rejected batch from the field) because that
@@ -4012,6 +4323,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             ops = _expand_face_pockets(ops, interpreted)
             # …and an extruded-polygon compound, before the vocabulary check rejects it.
             ops = _expand_prisms(ops, interpreted)
+            # …and an invented `boolean_<word>` op, which is a whole boolean feature.
+            ops = _expand_compound_boolean_ops(ops, interpreted)
             # Give every element an `op` (a bare feature dict is the single most common
             # rejection in the field) and map every feature TYPE onto the engine vocabulary
             # FIRST — the sketch/primitive passes below branch on the canonical type, so a
@@ -4022,6 +4335,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # model had the right edges, just the wrong bag. Runs before the
             # sketch/primitive passes so they see the canonical layout.
             ops = _migrate_ref_slots(ops, interpreted)
+            # An emptied selector slot ("none", []) means NO selection, which is an absent
+            # slot — and a boolean word on a primitive is params.mode, not a second feature.
+            ops = _drop_empty_ref_slots(ops, interpreted)
+            ops = _normalize_inline_boolean(ops, interpreted)
             # An enum wrapped as a dimension ({"mode":{"value":"blind"}}) is
             # rejected as non-numeric — unwrap before the dim passes run.
             ops = _unwrap_enum_dims(ops, interpreted)
@@ -4044,6 +4361,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             ops = _resolve_batch_name_refs(ops, interpreted)
             # …and "the sketch I just made", which no name table can carry.
             ops = _resolve_relative_profile_refs(ops, interpreted)
+            # LAST: operands are canonical only now, and this reads them.
+            ops = _unmerge_boolean_operands(ops, interpreted)
             interpreted = _interpreted_notes(interpreted)
 
             def _apply() -> dict:

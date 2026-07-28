@@ -1951,7 +1951,9 @@ def test_live_kimi_keychain_hex_batch_builds(profile_ref):
     """The VERBATIM live batch, in both ref dialects the model tried. Both used to fail."""
     from services.agent.agent_turn import _bind_tool
     new_part, add_features = _bind_tool("new_part"), _bind_tool("add_features")
-    doc = json.loads(new_part(name="kimi_keychain"))["doc_id"]
+    # fresh=True per parametrization: new_part otherwise hands back the CURRENT document,
+    # and the second dialect would re-cut hexes the first already removed.
+    doc = json.loads(new_part(name="kimi_keychain", fresh=True))["doc_id"]
     add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
         "type": "box", "name": "Plate",
         "params": {"length": 60, "width": 30, "height": 4}}}])
@@ -2159,3 +2161,299 @@ def test_the_live_run_96954661041418_batches_build(case):
     assert size[2] == pytest.approx(20, abs=1e-3)
     expect_x = 60.0 if case == "prism" else 50.22
     assert size[0] == pytest.approx(expect_x, abs=1e-2)
+
+
+@enginetest
+def test_live_new_part_default_resumes_same_named_doc_instead_of_forking():
+    """Live bug (doc_list on the running daemon showed 4 docs named
+    CD-XXX_TwistedLatticeOrb[1-4]): a general agent that retries a brief, or a model3d
+    worker that respawns per turn, calls new_part(name=...) more than once with no memory
+    of the first doc_id. The engine's doc_new uniquifies the colliding name and mints a
+    fresh document each time, fanning out doc.opened and opening a duplicate GUI tab per
+    call. The default MUST resume the existing document by name, not fork another one."""
+    from services.agent.agent_turn import _bind_tool
+    from services.mcp import cad_common as cc
+    new_part = _bind_tool("new_part")
+    add_features = _bind_tool("add_features")
+
+    first = json.loads(new_part(name="Widget"))
+    assert first["ok"] and "reused" not in first
+    doc = first["doc_id"]
+
+    second = json.loads(new_part(name="Widget"))
+    assert second["ok"] is True
+    assert second["doc_id"] == doc, "same name must resolve to the SAME document"
+    assert second.get("reused") is True
+    assert "note" in second and "Widget" in second["note"]
+
+    docs = cc.cb.call("doc_list", {}).get("docs", [])
+    named_widget = [d for d in docs if d.get("name") == "Widget"]
+    assert len(named_widget) == 1, (
+        f"expected exactly one open document named Widget, got {named_widget}")
+
+
+@enginetest
+def test_live_new_part_default_does_not_reset_volume_baseline_on_reuse():
+    """The reused-doc path must seed _LAST_VOLUME only if this process never tracked the
+    doc — clobbering it to 0.0 on every reuse would corrupt the NEXT add_features write-diff
+    ("0.0 -> X" instead of the true delta) for a part that already carries built geometry."""
+    from services.agent.agent_turn import _bind_tool
+    new_part = _bind_tool("new_part")
+    add_features = _bind_tool("add_features")
+
+    doc = json.loads(new_part(name="VolumeKeepWidget"))["doc_id"]
+    built = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "Block",
+        "params": {"length": 40, "width": 30, "height": 20}}}]))
+    assert built["ok"], built
+    assert built["changes"]["volume_delta_mm3"] > 0
+
+    resumed = json.loads(new_part(name="VolumeKeepWidget"))
+    assert resumed["ok"] and resumed["reused"] is True
+    assert resumed["doc_id"] == doc
+
+    again = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "cylinder", "name": "Post",
+        "params": {"radius": 3, "height": 10}, "at": [0, 0, 20]}}]))
+    assert again["ok"], again
+    # A clobbered baseline would report the FULL new volume as if starting from 0 — assert
+    # the reported delta is the small cylinder addition, not the whole part's volume.
+    assert again["changes"]["volume_delta_mm3"] < built["changes"]["volume_delta_mm3"]
+
+
+@enginetest
+def test_live_new_part_fresh_true_mints_a_separate_document():
+    from services.agent.agent_turn import _bind_tool
+    new_part = _bind_tool("new_part")
+
+    first = json.loads(new_part(name="ForkOnPurpose"))
+    second = json.loads(new_part(name="ForkOnPurpose", fresh=True))
+    assert first["ok"] and second["ok"]
+    assert second.get("reused") is not True
+    assert second["doc_id"] != first["doc_id"], (
+        "fresh=True must mint a genuinely separate document")
+
+
+# ---------------------------------------------------------------------------
+# Live run run-97813015264134 (2026-07-28): a hollow orb, ten failed calls, no geometry.
+# Six distinct classes, one of them a HARNESS CRASH.
+
+def test_a_stringified_feature_is_decoded_not_crashed_on():
+    """The model sent a PYTHON REPR where an object belonged and the turn died on
+    «'str' object has no attribute 'get'» — our crash, and a message that taught
+    nothing. json.loads cannot read it: single quotes and a bare None."""
+    notes = []
+    ops = M._decode_embedded_structures([{"op": "add_feature", "feature":
+        "{'type': 'cylinder', 'name': 'PoleBore', 'params': "
+        "{'height': {'value': 90, 'expr': None}}}"}], notes)
+    feat = ops[0]["feature"]
+    assert isinstance(feat, dict)
+    assert feat["type"] == "cylinder" and feat["params"]["height"]["expr"] is None
+    assert any("decoded" in n for n in notes)
+
+
+def test_real_json_in_a_structure_slot_is_decoded_too():
+    ops = M._decode_embedded_structures(
+        [{"op": "add_feature", "feature": '{"type": "box", "name": "B"}'}], [])
+    assert ops[0]["feature"] == {"type": "box", "name": "B"}
+
+
+@pytest.mark.parametrize("val", ["HexPattern", "top", "cut", "", "not a dict", "{oops"])
+def test_a_plain_string_is_never_mangled_by_the_decoder(val):
+    """`profile` is a structure slot AND a legitimate sketch-name slot — a name must
+    survive untouched, and an unparseable brace-string is data, not our business."""
+    ops = [{"op": "add_feature", "feature": {"type": "extrude",
+                                             "params": {"profile": val}}}]
+    assert M._decode_embedded_structures(ops, [])[0]["feature"]["params"]["profile"] == val
+
+
+@pytest.mark.parametrize("empty", ["none", "None", "n/a", "", [], [None], "null"])
+def test_an_emptied_ref_slot_is_dropped_not_rejected(empty):
+    """A shell saying "remove no faces" is a closed hollow. Both spellings of that were
+    hard rejections: «'none' is neither a reserved datum…» and «must be a non-empty list»."""
+    notes = []
+    out = M._drop_empty_ref_slots([{"op": "add_feature", "feature": {
+        "type": "shell", "name": "S", "params": {"thickness": 2.5},
+        "refs": {"remove": empty}}}], notes)
+    assert "refs" not in out[0]["feature"]
+    assert any("no selection" in n for n in notes)
+
+
+def test_a_real_selector_is_never_dropped_as_empty():
+    ops = [{"op": "add_feature", "feature": {
+        "type": "shell", "name": "S",
+        "refs": {"remove": [{"of": "face", "side": "top"}], "faces": "none"}}}]
+    out = M._drop_empty_ref_slots(ops, [])
+    assert out[0]["feature"]["refs"] == {"remove": [{"of": "face", "side": "top"}]}
+
+
+def test_boolean_subtract_op_becomes_a_boolean_feature():
+    """«unknown op 'boolean_subtract'» — the name was invented but it carried the
+    operation AND both operands, which is a complete boolean."""
+    notes = []
+    out = M._expand_compound_boolean_ops(
+        [{"op": "boolean_subtract", "target": "f1", "tool": "f2", "name": "Hollow"}], notes)
+    feat = out[0]["feature"]
+    assert out[0]["op"] == "add_feature" and feat["type"] == "boolean"
+    assert feat["name"] == "Hollow"
+    assert feat["params"]["op"] == "subtract"   # canonicalized to "cut" downstream
+    assert feat["params"]["target"] == "f1" and feat["params"]["tool"] == "f2"
+    assert any("boolean is a FEATURE" in n for n in notes)
+
+
+def test_a_real_add_feature_is_not_touched_by_the_compound_op_pass():
+    ops = [{"op": "add_feature", "feature": {"type": "boolean",
+                                             "params": {"op": "cut", "a": "f1", "b": "f2"}}}]
+    assert M._expand_compound_boolean_ops(ops, []) is ops
+
+
+def test_boolean_operands_are_read_from_refs_base_and_tool():
+    """refs.base/refs.tool is exactly the two operands; only params was consulted, so
+    the batch died on «needs its two operands» with both of them right there."""
+    notes = []
+    feat = M._normalize_boolean_feature({
+        "type": "boolean", "name": "HollowShell", "params": {"operation": "subtract"},
+        "refs": {"base": [{"kind": "feature", "id": "f1"}],
+                 "tool": [{"kind": "feature", "id": "f2"}]}}, notes)
+    assert feat["params"]["op"] == "cut"
+    assert feat["params"]["a"] == "f1" and feat["params"]["b"] == "f2"
+    assert not feat.get("refs")
+
+
+def test_a_same_batch_boolean_operand_is_built_unmerged():
+    """The sphere meant as a cutting tool was merged into the box on creation, so it
+    "added no material" and the boolean's operand no longer existed."""
+    notes = []
+    out = M._unmerge_boolean_operands([
+        {"op": "add_feature", "feature": {"type": "box", "name": "Base", "params": {}}},
+        {"op": "add_feature", "feature": {"type": "sphere", "name": "Inner", "params": {}}},
+        {"op": "add_feature", "feature": {"type": "boolean", "name": "H",
+                                          "params": {"op": "cut", "a": "f1", "b": "$1"}}}],
+        notes)
+    assert out[1]["feature"]["params"]["merge"] is False
+    assert "merge" not in out[0]["feature"]["params"]   # f1 is the KEPT body
+    assert any("separate solid" in n for n in notes)
+
+
+def test_an_operand_named_by_display_name_is_also_unmerged():
+    out = M._unmerge_boolean_operands([
+        {"op": "add_feature", "feature": {"type": "sphere", "name": "Inner", "params": {}}},
+        {"op": "add_feature", "feature": {"type": "boolean", "name": "H",
+                                          "params": {"op": "cut", "a": "f1", "b": "Inner"}}}],
+        [])
+    assert out[0]["feature"]["params"]["merge"] is False
+
+
+def test_a_batch_with_no_boolean_is_left_alone():
+    ops = [{"op": "add_feature", "feature": {"type": "box", "name": "B", "params": {}}}]
+    assert M._unmerge_boolean_operands(ops, []) is ops
+
+
+@pytest.mark.parametrize("word,mode", [("subtract", "cut"), ("cut", "cut"),
+                                       ("union", "boss"), ("add", "boss")])
+def test_a_boolean_word_on_a_primitive_becomes_its_mode(word, mode):
+    """{"type":"cylinder",…,"refs":{"boolean":"subtract","target":"f2"}} — the engine
+    already removes material with params.mode; a second feature would add a body the
+    part never asked for."""
+    notes = []
+    out = M._normalize_inline_boolean([{"op": "add_feature", "feature": {
+        "type": "cylinder", "name": "Bore", "params": {"radius": 5, "height": 90},
+        "refs": {"boolean": word, "target": "f2"}}}], notes)
+    feat = out[0]["feature"]
+    assert feat["params"]["mode"] == mode
+    assert "refs" not in feat
+    assert any("params.mode" in n for n in notes)
+
+
+def test_an_explicit_mode_is_not_overridden_by_a_boolean_word():
+    out = M._normalize_inline_boolean([{"op": "add_feature", "feature": {
+        "type": "cylinder", "name": "C", "params": {"mode": "boss"},
+        "refs": {"boolean": "subtract"}}}], [])
+    assert out[0]["feature"]["params"]["mode"] == "boss"
+
+
+@enginetest
+@pytest.mark.parametrize("case", ["faces_none", "remove_empty", "boolean_subtract_op",
+                                  "refs_base_tool", "stringified_feature"])
+def test_the_live_run_97813015264134_batches_build(case):
+    from services.agent.agent_turn import _bind_tool
+    box = {"op": "add_feature", "feature": {"type": "box", "name": "Base", "params": {
+        "length": {"value": 65, "expr": None}, "width": {"value": 65, "expr": None},
+        "height": {"value": 65, "expr": None}}}}
+    sphere = {"op": "add_feature", "feature": {"type": "sphere", "name": "InnerSphere",
+                                               "params": {"radius": {"value": 25,
+                                                                     "expr": None}}}}
+    ops = {
+        "faces_none": [box, {"op": "add_feature", "feature": {
+            "type": "shell", "name": "ShellWall", "refs": {"faces": "none"},
+            "params": {"thickness": {"value": 2.5, "expr": None}, "shell_all": True}}}],
+        "remove_empty": [box, {"op": "add_feature", "feature": {
+            "type": "shell", "name": "ShellWall", "refs": {"remove": []},
+            "params": {"thickness": {"value": 2.5, "expr": None}}}}],
+        "boolean_subtract_op": [box, sphere, {"op": "boolean_subtract", "target": "f1",
+                                              "tool": "$1", "name": "HollowShell"}],
+        "refs_base_tool": [box, sphere, {"op": "add_feature", "feature": {
+            "type": "boolean", "name": "HollowShell", "params": {"operation": "subtract"},
+            "refs": {"base": [{"kind": "feature", "id": "f1"}],
+                     "tool": [{"kind": "feature", "id": "$1"}]}}}],
+        "stringified_feature": [box, {"op": "add_feature", "feature":
+            "{'type': 'cylinder', 'name': 'PoleBore', 'params': {'diameter': "
+            "{'value': 10, 'expr': None}, 'height': {'value': 90, 'expr': None}}, "
+            "'refs': {'boolean': 'subtract', 'target': 'f1'}}"}],
+    }[case]
+    doc = json.loads(_bind_tool("new_part")(name=f"live97_{case}"))["doc_id"]
+    r = json.loads(_bind_tool("add_features")(doc_id=doc, ops=ops))
+    assert r["ok"] is True, r.get("error")
+    # Every case must leave ONE solid that is materially smaller than the raw 65mm block
+    # (274625 mm3) — proof the shell/cut actually happened rather than being dropped.
+    assert r["body_count"] == 1
+    assert r["volume_mm3"] < 274625.0 * 0.995, r["volume_mm3"]
+
+# --------------------------------------------------------------- stringified feature dicts
+
+def test_the_verbatim_run_97813015264134_stringified_feature_decodes():
+    """The op that killed run-97813015264134: feature is a Python-repr STRING (single
+    quotes, bare None), not JSON. Must decode to a real dict, never crash with
+    "'str' object has no attribute 'get'"."""
+    ops = [{"op": "add_feature", "feature":
+            "{'type': 'cylinder', 'name': 'PoleBore', 'params': {'diameter': "
+            "{'value': 10, 'expr': None}, 'height': {'value': 90, 'expr': None}}, "
+            "'refs': {'boolean': 'subtract', 'target': 'f2'}}"}]
+    notes: list = []
+    decoded = M._decode_embedded_structures(ops, notes)
+    normalized = M._normalize_op_elements(decoded, notes)
+    feat = normalized[0]["feature"]
+    assert isinstance(feat, dict)
+    assert feat["type"] == "cylinder"
+    assert feat["params"]["diameter"]["value"] == 10
+    assert notes  # the coercion is reported so the model learns the canonical spelling
+
+
+def test_a_real_json_string_feature_also_decodes():
+    ops = [{"op": "add_feature", "feature":
+            '{"type":"box","name":"B","params":{"length":10,"width":10,"height":10}}'}]
+    notes: list = []
+    decoded = M._decode_embedded_structures(ops, notes)
+    normalized = M._normalize_op_elements(decoded, notes)
+    feat = normalized[0]["feature"]
+    assert isinstance(feat, dict)
+    assert feat["type"] == "box"
+
+
+def test_an_unparseable_string_feature_is_a_teaching_valueerror_not_an_attributeerror():
+    ops = [{"op": "add_feature", "feature": "not json and not a python literal either"}]
+    notes: list = []
+    decoded = M._decode_embedded_structures(ops, notes)
+    with pytest.raises(ValueError) as exc:
+        M._normalize_op_elements(decoded, notes)
+    assert not isinstance(exc.value, AttributeError)
+    msg = str(exc.value)
+    assert "not json and not a python literal either" in msg
+    assert "JSON" in msg
+
+
+def test_a_bare_string_op_element_is_a_teaching_valueerror():
+    with pytest.raises(ValueError) as exc:
+        M._normalize_op_elements(["oops, not an op"], [])
+    assert not isinstance(exc.value, AttributeError)
+    assert "oops, not an op" in str(exc.value)

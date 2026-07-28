@@ -5197,3 +5197,36 @@ the old bare string told a model nothing, which is why it got six identical cont
 errors and gave up. And the flat-shorthand note compared points by IDENTITY, so `_xy`
 returning a fresh list made every polygon claim a `{"x":…} -> [x,y]` rewrite that never
 happened — a note that teaches the model a lie. Compared by value now.
+
+Third live batch, run-97813015264134 (2026-07-28) — a hollow orb, ten failed calls, no
+geometry at all. Six classes, one of them OUR CRASH:
+(1) `{"op":"add_feature","feature":"{'type': 'cylinder', …, 'expr': None}"}` — a structure
+nested inside a STRING, and a Python repr at that (single quotes, bare None), so every
+downstream pass called .get() on a str and the turn died on «'str' object has no attribute
+'get'». Wrong twice: it crashed, and the message taught nothing.
+`_decode_embedded_structures` now decodes every structure-typed slot ONCE at the entrance,
+json.loads then ast.literal_eval, leaving anything that does not parse exactly as it came
+(`profile` is both a structure slot and a legitimate sketch-NAME slot, so a bare name must
+survive — the decoder only engages on a string that opens and closes with a brace).
+(2) `refs.faces:"none"` and `refs.remove:[]` were both hard rejections («'none' is neither a
+reserved datum…», «must be a non-empty list»). The model was saying "remove no faces",
+which is a legal closed shell. An emptied slot now means an ABSENT slot.
+(3) `{"op":"boolean_subtract","target":"f1","tool":"f2"}` → «unknown op». The name was
+invented but it carried the operation AND both operands, which is a complete boolean:
+`_expand_compound_boolean_ops` builds the canonical feature.
+(4) `refs.base=[{"kind":"feature","id":"f1"}]` + `refs.tool=[…]` died on «needs its two
+operands» with both of them right there — `_normalize_boolean_feature` consulted only
+params. It reads refs too now.
+(5) `{"type":"cylinder",…,"refs":{"boolean":"subtract","target":"f2"}}` — a primitive
+carrying its own boolean intent. The engine already removes material via params.mode, so
+this is ONE feature; inventing a second would add a body the part never asked for. The
+companion `target` is dropped with a note, since a cut applies to every body it intersects
+and these types have no target slot.
+(6) The sphere meant as a cutting tool was merged into the box on creation, so it "added no
+material" and the boolean's operand did not exist («ref 'b' -> 'f2' not found»). The model
+cannot know that; the BATCH says it. `_unmerge_boolean_operands` sets merge:false on any
+feature this batch names as a boolean operand, and runs last, once operands are canonical.
+Verified end to end: box 65mm minus sphere r25 → 209432.7 mm3 against an exact
+209175.2 mm3, the 0.12% being sphere tessellation. Also fixed a test-isolation bug: the
+kimi-keychain replay reused new_part's CURRENT document, so the second dialect re-cut hexes
+the first had already removed; it passes fresh=True now.

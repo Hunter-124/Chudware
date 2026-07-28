@@ -67,10 +67,13 @@ static float s_scrollX = 0.0f;   // px of content hidden past the LEFT edge (0 =
 // drawDocTabs runs each frame, so it reports the previous frame's overflow. One frame of lag on
 // transitions; the published band bottom (publishDocTabBandBottom) covers the real edge either way.
 static bool  s_lastOverflow = false;
-// Height the band grows by while overflowing (logical dp, pre-scale): a scrollbar lane BELOW the
-// tab pills. The bar itself is the app-wide hairline pill (ui::drawScrollPill) centred in the lane,
-// so tab titles keep their full height and never share space with the bar.
-static constexpr float kScrollLaneDp = 8.0f;
+// Height the band grows by while overflowing (logical dp, pre-scale): a scrollbar lane ABOVE the
+// tab pills, so tab titles keep their full height and never share space with the bar.
+static constexpr float kScrollLaneDp = 10.0f;
+// Drawn thickness of the scrollbar track + thumb (logical dp, pre-scale). Chunkier than the
+// app-wide 2px list-pane hairline — this strip's bar must stay legible over the busy viewport
+// backdrop behind the glass band.
+static constexpr float kScrollBarThickDp = 6.0f;
 
 // Forward decls (definitions below drawDocTabs, which calls them).
 void createNewDoc(AppState& st, int kindOrd);
@@ -605,7 +608,7 @@ float drawDocTabs(AppState& st, float availW) {
         // stops overflowing — no transition frame where the bar hangs outside the band.
         const bool willOverflow = fullContentW > std::max(40.0f * s, winW - btn - gap * 2.0f) + 0.5f;
         // Height hugs the band + a hair of slack so the rounded pills are not clipped: barH for the
-        // pill row, plus the scrollbar lane while overflowing (bottom of the band, below the pills).
+        // pill row, plus the scrollbar lane while overflowing (top of the band, above the pills).
         const float winH = barH + (willOverflow ? kScrollLaneDp * s : 0.0f) + 2.0f * s;
         availW = winW;   // the strip lays out relative to this window's content width
         ImGui::SetNextWindowPos(ImVec2(docX, docY), ImGuiCond_Always);
@@ -644,7 +647,7 @@ float drawDocTabs(AppState& st, float availW) {
     const bool overflow = fullContentW > outerW + 0.5f;
     s_lastOverflow = overflow;   // next frame's docTabStripHeight reports the grown strip
     const float scrollLane = overflow ? kScrollLaneDp * s : 0.0f;
-    // Band spans the pill row plus the scrollbar lane (bottom, below the pills) while overflowing.
+    // Band spans the scrollbar lane (top) plus the pill row while overflowing.
     const float bandB = origin.y + barH + scrollLane;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     // The band hugs its CONTENT (contentW measured above the Begin) instead of spanning the full
@@ -668,8 +671,8 @@ float drawDocTabs(AppState& st, float availW) {
     // its left. When they overflow, each side that hides files gets a dedicated "+N" glass chip in
     // its OWN slot (the tab clip region shrinks so chips never paint over a filename). Boundary tab
     // titles fade out with a clean alpha ramp. When everything fits this collapses to the plain
-    // flush-left, no-chip layout.
-    const float y0 = origin.y;
+    // flush-left, no-chip layout. The tab row sits BELOW the scrollbar lane while overflowing.
+    const float y0 = origin.y + scrollLane;
 
     // Two-pass layout: chip widths depend on hidden counts, and hidden counts depend on the
     // (shrunk) tab clip width after chips are reserved. One refine pass is enough for digit-width
@@ -793,14 +796,14 @@ float drawDocTabs(AppState& st, float availW) {
             s_scrollX = std::min(maxScroll, s_scrollX + tabsW * 0.8f);
     }
 
-    // Horizontal scrollbar in its own lane at the BOTTOM of the band (the band grew by
+    // Horizontal scrollbar in its own lane at the TOP of the band (the band grew by
     // kScrollLaneDp while overflowing — see the window sizing above), so the bar never overlaps a
-    // tab title. The app-wide hairline pill: a thin track line spanning the band interior with a
-    // brighter rounded thumb riding it (ui::drawScrollPill, same look as every list pane). The drag
+    // tab title. ui::drawScrollPill with a 6dp track + thumb (kScrollBarThickDp): same pill idiom
+    // as every list pane, but thick enough to stay legible over the viewport backdrop. The drag
     // strip covers the whole lane; while active the thumb centre follows the mouse x. Drawn on the
     // window draw list like everything else in the strip, so modals still paint over it.
     if (overflow && maxScroll > 0.5f) {
-        const float laneT = bandT + barH;
+        const float laneT = bandT;
         const float laneB = laneT + scrollLane;
         const float inset = 8.0f * s;   // keep the track clear of the band's rounded corners
         const float trackL = bandL + inset;
@@ -818,7 +821,7 @@ float drawDocTabs(AppState& st, float availW) {
         }
         ui::drawScrollPill(dl, ImVec2(trackL, laneT), ImVec2(trackR, laneB),
                            thumbX, thumbX + thumbW,
-                           /*vertical=*/false, sbHov, surf);
+                           /*vertical=*/false, sbHov, surf, kScrollBarThickDp);
     }
 
     // "+" New-Document button, pinned at the far right of the strip — opens the chooser popup (Wave 2).

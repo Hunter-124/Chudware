@@ -341,6 +341,13 @@ static bool tabModelLoading(const AppState& st) {
         tab.kind != AppState::DocTab::TabKind::Assembly)
         return false;
     if (tab.docId.empty()) return false;
+    // A live pushed revision can commit this tab's mesh while its doc_activate is still queued
+    // behind an agent that holds the doc's engine lock (engine_events applyChangedActive adopts
+    // the snapshot the daemon pushed with doc.changed, then loads the mesh itself — it does not
+    // wait for the activation). The geometry is on screen; claiming "Loading" over it is a lie,
+    // and it is exactly the case the user hits while spectating an AI build. Whatever is still
+    // in flight reports through the status-bar rebuild chip instead.
+    if (st.hasDocMesh && st.docMirror.docId() == tab.docId) return false;
     // This tab's doc_activate is coalesced behind another in-flight activation
     // (switchToTabCore's async-rebuild-coalesced branch).
     if (st.pendingActivateTab == st.activeTab) return true;
@@ -2823,6 +2830,29 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         ImGui::SetCursorScreenPos(cr0);
         ImGui::InvisibleButton("##viewport3d",
             ImVec2(avail.x > 1.0f ? avail.x : 1.0f, avail.y > 1.0f ? avail.y : 1.0f));
+        // Hover MUST be sampled here, immediately after the input surface and BEFORE any
+        // overlay below draws. Overlays that submit their own ImGui items (drawTabLoadingOverlay
+        // ends in ui::busyLabel — a Dummy + TextUnformatted) would otherwise become "the last
+        // item", so a later IsItemHovered() reported the hover state of a centered "Loading…"
+        // label instead of the viewport. That silently killed EVERY navigation and picking path
+        // gated on imgHovered (orbit, pan, zoom, selection) for as long as the scrim was up —
+        // the user could watch the AI build the part but could not move the camera.
+        const bool imgHovered = ImGui::IsItemHovered();
+        // Drop TARGET (Wave 3A item 5): dropping an in-app Explorer file row onto the viewport opens
+        // it. The payload is the dragged file's absolute path (NUL-terminated); we hand it to the
+        // GL-thread request pump via st.requestOpenPath, which routes CAD vs ECAD by extension — the
+        // same safe deferred-open path the Explorer double-click and File menu use. (OS-level file
+        // drops from Windows Explorer are handled separately by the GLFW drop callback in app.cpp.)
+        // Bound to the viewport button for the same reason imgHovered is sampled above:
+        // BeginDragDropTarget() targets the LAST submitted item, so it has to run before the
+        // overlays below submit theirs.
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload(ui::kFileDragPayload)) {
+                if (pl->Data && pl->DataSize > 0)
+                    st.requestOpenPath = std::string(static_cast<const char*>(pl->Data));
+            }
+            ImGui::EndDragDropTarget();
+        }
         // Tab-switch loading state: while the ACTIVE part/asm tab's async activation + mesh load
         // are still on the way, frost the wiped scene and center a brand mark + "Loading <tab>…"
         // so the click reads as registered. Painted before the HUD chrome so status pills (busy,
@@ -2848,19 +2878,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // framed sim is loaded in the Manufacture workspace.
         if (st.activeWorkspace == AppState::Workspace::Manufacture && ui::camSimHudActive())
             ui::camDrawSimHud(st, vr0, ImVec2(vr1.x - vr0.x, vr1.y - vr0.y));
-        // Drop TARGET (Wave 3A item 5): dropping an in-app Explorer file row onto the viewport opens
-        // it. The payload is the dragged file's absolute path (NUL-terminated); we hand it to the
-        // GL-thread request pump via st.requestOpenPath, which routes CAD vs ECAD by extension — the
-        // same safe deferred-open path the Explorer double-click and File menu use. (OS-level file
-        // drops from Windows Explorer are handled separately by the GLFW drop callback in app.cpp.)
-        if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload(ui::kFileDragPayload)) {
-                if (pl->Data && pl->DataSize > 0)
-                    st.requestOpenPath = std::string(static_cast<const char*>(pl->Data));
-            }
-            ImGui::EndDragDropTarget();
-        }
-        const bool imgHovered = ImGui::IsItemHovered();
         // C25 W2-D: camera navigation. All of it is suppressed while sketching (camera is
         // plane-locked) except the wheel zoom, which stays usable. Any drag-navigation cancels an
         // in-flight tween so the user takes over instantly.

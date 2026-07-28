@@ -20,14 +20,14 @@ from __future__ import annotations
 import json
 import math
 from collections import defaultdict
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Optional, Union
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from mcp_server import core_bridge as cb
 from mcp_server.cad_common import (_NON_BODY_FEATURE_TYPES, _face_attribution,
-                                   _solid_feature_order)
+                                   _solid_feature_order, coerce_json_or_repr, require_list)
 from mcp_server.cad_tools import _doc, _dumps, _err
 from mcp_server.fit_narration import _format_fit  # single home (T-F8); loop.py shares it
 
@@ -1590,8 +1590,10 @@ def _unwrap_var_kw(kwargs: dict) -> None:
     arguments. FastMCP instead validates against a generated pydantic model: it hands the tool
     {"kwargs": None} for a canonical call, and DROPS any argument the model has no field for.
     So a FastMCP client reaches the dialect through the one field the schema does carry —
-    kwargs={"part": "bracket"} — and that nested mapping is merged here."""
-    nested = kwargs.pop("kwargs", None)
+    kwargs={"part": "bracket"} — and that nested mapping is merged here. A model that JSON- or
+    repr-encodes that nested value as a STRING (kwargs='{"part": "bracket"}') used to fail the
+    bare isinstance check and vanish silently — coerce first so the intended aliases still land."""
+    nested = coerce_json_or_repr(kwargs.pop("kwargs", None))
     if isinstance(nested, dict):
         kwargs.update(nested)
 
@@ -1706,8 +1708,15 @@ def _describe_project_args(run, kwargs: dict) -> tuple:
       * a project NAME (project=, project_name=, mission=);
       * a free-form description in semantic fields (mission_request=, deliverables=,
         constraints=, ...) — collected under run["brief"] and narrated straight back, because
-        this tool narrates a run, it does not plan one."""
+        this tool narrates a run, it does not plan one.
+
+    `run` (and the run_id/run/id aliases below) is coerced through coerce_json_or_repr first:
+    a model that JSON/repr-encodes the run dict as a STRING (run='{"id": "r7", "nodes": []}')
+    used to fall through to the run_id branch and get treated as a literal id — a SILENT
+    WRONG READ (the real run dict was discarded and the tool answered "no such run" instead
+    of narrating the run it was actually given)."""
     notes: list = []
+    run = coerce_json_or_repr(run)
     if isinstance(run, dict):
         for k in list(kwargs):
             if kwargs[k] is None:
@@ -1721,7 +1730,7 @@ def _describe_project_args(run, kwargs: dict) -> tuple:
     if run_id:
         notes.append(f'read run={run_id!r} as a DAG run id (run also takes the full run dict)')
     for key in _RUN_ID_ALIASES:
-        v = kwargs.pop(key, None)
+        v = coerce_json_or_repr(kwargs.pop(key, None))
         if isinstance(v, dict) and not run_id:
             return v, notes + [f'read {key}= as the run dict']
         if isinstance(v, str) and v.strip() and not run_id:
@@ -2001,7 +2010,8 @@ def register_gsl_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def describe_scene(views: Optional[list] = None, doc_id: Optional[str] = None) -> str:
+    def describe_scene(views: Optional[Union[list, str]] = None,
+                       doc_id: Optional[str] = None) -> str:
         """Deterministic "what the render would show" per view, from B-rep face normals — the
         non-vision fallback for render_part / render_views / contact_sheet.
 
@@ -2017,6 +2027,13 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            # A stringified views list ('["front","top"]' or a bare CSV word) used to be
+            # handed straight to `for name in view_names`, iterating it CHARACTER BY
+            # CHARACTER into garbage view names that all silently fell back to the iso
+            # direction (ok:true, wrong views) — the SILENT WRONG BEHAVIOR class.
+            if views is not None:
+                views = require_list(views, "views",
+                                      'a list of view names, e.g. ["front","top","iso"]')
             view_names = views or ["front", "right", "top", "iso"]
             faces = cb.call("doc_query", {"doc_id": d, "query": {"of": "face"}}).get(
                 "matches", [])
@@ -2114,7 +2131,7 @@ def register_gsl_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def describe_project(run: Optional[dict] = None,
+    def describe_project(run: Optional[Union[dict, str]] = None,
                          **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Compact narrative of a DAG project run — nodes done/blocked, budgets, open questions.
         Feeds WS-A dag_status and the T-F17 mission-control UI.

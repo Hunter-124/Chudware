@@ -49,6 +49,7 @@ from mcp.server.fastmcp import FastMCP, Image
 from . import core_bridge as cb
 from .core_bridge import CoreError
 from .cad_tools import _doc, _dumps, _err
+from .cad_common import coerce_json_or_repr, require_list, require_mapping
 
 
 # ───────────────────────────────────────── doc helpers ───────────────────────────────────────────
@@ -125,15 +126,35 @@ def _dim(v: Any) -> dict:
 
 # ─────────────────────────────────── curve-spec → entity mapping ──────────────────────────────────
 
-def _validate_pts(pts: Any, min_n: int = 1) -> list:
+def _coerce_point3(v: Any, ctx: str) -> list:
+    """Coerce ONE world point to [x, y, z].
+
+    Accepts a 3-element list/tuple OR an {"x":..,"y":..,"z":..} object — the exact shape a
+    model sends when it treats a point as a named-field record instead of an array (proven
+    live on the 2D sketch path, where an un-coerced point silently built at the origin
+    instead of failing loud). A 2-key {"x","y"} object (no z) is genuinely ambiguous for a
+    3D sketch, so it is rejected with a teaching error rather than guessing z=0.
+    """
+    v = coerce_json_or_repr(v)
+    if isinstance(v, dict):
+        if {"x", "y", "z"} <= v.keys():
+            return [float(v["x"]), float(v["y"]), float(v["z"])]
+        raise ValueError(f"{ctx} must be [x,y,z] or {{'x':..,'y':..,'z':..}} — got {v!r} "
+                          f"(missing key(s) {sorted({'x', 'y', 'z'} - v.keys())})")
+    if isinstance(v, (list, tuple)) and len(v) == 3:
+        return [float(v[0]), float(v[1]), float(v[2])]
+    raise ValueError(f"{ctx} must be [x,y,z] — got {v!r}")
+
+
+def _validate_pts(pts: Any, min_n: int = 1, name: str = "pts") -> list:
+    # A stringified points list ('[[1,2,3],[4,5,6]]' or its Python-repr twin) is the same
+    # dialect a stringified curves/entities list arrives in — coerce before the shape check.
+    pts = coerce_json_or_repr(pts)
     if not isinstance(pts, list) or len(pts) < min_n:
-        raise ValueError(f"pts must be a list of at least {min_n} [x,y,z] points.")
-    out = []
-    for i, p in enumerate(pts):
-        if not isinstance(p, (list, tuple)) or len(p) != 3:
-            raise ValueError(f"pts[{i}] must be [x, y, z] — got {p!r}")
-        out.append([float(p[0]), float(p[1]), float(p[2])])
-    return out
+        got = f"a list of {len(pts)}" if isinstance(pts, list) else type(pts).__name__
+        raise ValueError(f"{name} must be a list of at least {min_n} [x,y,z] points — got "
+                          f"{got}.")
+    return [_coerce_point3(p, f"{name}[{i}]") for i, p in enumerate(pts)]
 
 
 def _curves_to_entities(curves: list, start_n: int = 0) -> list:
@@ -153,12 +174,35 @@ def _curves_to_entities(curves: list, start_n: int = 0) -> list:
         n += 1
         return f"e{n}"
 
+    # Raw-entity point fields keyed by type — used both to detect the raw-entity form
+    # without a "type" key (see kind/type fallback below) and to coerce each point.
+    _RAW_PT_FIELDS = {"line": ("p1", "p2"), "arc": ("p1", "pm", "p2"), "point": ("p",)}
+
     for i, spec in enumerate(curves):
         if not isinstance(spec, dict):
             raise ValueError(f"curves[{i}] must be a dict, got {type(spec).__name__}")
+        raw_pt_hit = {"p1", "p2", "pm", "p", "points"} & spec.keys()
+        if "type" not in spec and raw_pt_hit and "pts" not in spec and \
+                spec.get("kind") in ("line", "arc", "spline", "point", "eq_curve3d"):
+            # A raw engine entity that named its shape "kind" instead of "type" — the exact
+            # kind/type confusion already seen live on the 2D sketch path. Unambiguous here
+            # because raw point fields (p1/p2/pm/p/points), not "pts", are present.
+            spec = dict(spec)
+            spec["type"] = spec.pop("kind")
         if "type" in spec:  # raw engine entity
             ent = dict(spec)
             ent.setdefault("construction", False)
+            etype = ent.get("type")
+            for field in _RAW_PT_FIELDS.get(etype, ()):
+                if field in ent:
+                    ent[field] = _coerce_point3(ent[field], f"curves[{i}].{field}")
+            if etype == "spline" and "points" in ent:
+                raw_points = coerce_json_or_repr(ent["points"])
+                if not isinstance(raw_points, list):
+                    raise ValueError(f"curves[{i}].points must be a list of [x,y,z] points "
+                                      f"— got {type(raw_points).__name__}.")
+                ent["points"] = [_coerce_point3(p, f"curves[{i}].points[{j}]")
+                                 for j, p in enumerate(raw_points)]
             if not ent.get("id"):
                 ent["id"] = _eid()
             else:
@@ -562,7 +606,14 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
             feat = _find_sketch3d(d, sketch3d_id)
             params = feat.get("params") or {}
             entities = list(params.get("entities") or [])
-            if not isinstance(curves, list) or not curves:
+            # A model-stringified curves list (JSON or Python-repr) is the same dialect
+            # cad_common.require_list already teaches elsewhere — coerce before the shape
+            # check so this fails on genuine garbage, not on a well-formed batch that just
+            # arrived as text (a bare isinstance(list) check would silently reject it).
+            curves = require_list(curves, "curves",
+                                   'a list of curve specs, e.g. '
+                                   '[{"kind":"line","pts":[[x,y,z],[x,y,z]]}]')
+            if not curves:
                 return _dumps({"ok": False, "error": "curves must be a non-empty list"})
             new_ents = _curves_to_entities(curves, start_n=_next_id(entities, "e"))
             entities.extend(new_ents)
@@ -607,7 +658,12 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
             feat = _find_sketch3d(d, sketch3d_id)
             params = feat.get("params") or {}
             cons = list(params.get("constraints") or [])
-            if not isinstance(constraints, list) or not constraints:
+            # Same stringified-list dialect as curves — coerce before the shape check
+            # rather than bare-isinstance-rejecting a well-formed but stringified batch.
+            constraints = require_list(constraints, "constraints",
+                                        'a list of constraint records, e.g. '
+                                        '[{"type":"fix","refs":["e1"]}]')
+            if not constraints:
                 return _dumps({"ok": False, "error": "constraints must be a non-empty list"})
             n = _next_id(cons, "c")
             added = []
@@ -657,6 +713,13 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         try:
             d = _doc(doc_id)
             feat = _find_sketch3d(d, sketch3d_id)
+            if selector is not None:
+                # A stringified selector dict is the same dialect require_mapping already
+                # teaches on cad_asm_tools' `a`/`b` — coerce before it gets embedded verbatim
+                # into external_refs and fails deep inside the engine with no context.
+                selector = require_mapping(selector, "selector",
+                                            "a raw vertex selector dict (e.g. from a prior "
+                                            "sketch3d_ref_vertex call or doc_resolve_pick)")
             if selector is None:
                 if topo_id is None:
                     return _dumps({"ok": False,
@@ -857,7 +920,7 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            pts = _validate_pts(points, 2)
+            pts = _validate_pts(points, 2, name="points")
             if fit not in ("polyline", "spline"):
                 return _dumps({"ok": False,
                                "error": f"fit must be 'polyline' or 'spline', got {fit!r}"})
@@ -958,7 +1021,10 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                 sweep_index = 0
             sweep_refs: dict = {"profile": profile_ref, "path": path_ref}
             if guide is not None:
-                sweep_refs["guides"] = [guide]
+                # A model-stringified guide ref ({"feature":...} or a bare fid string that
+                # happens to be Python-repr'd) — coerce_json_or_repr never raises, so a real
+                # bare-string fid passes through untouched while a stringified dict resolves.
+                sweep_refs["guides"] = [coerce_json_or_repr(guide)]
             ops.append({"op": "add_feature", "feature": {
                 "type": "sweep", "name": "Pipe",
                 "params": {"mode": mode, "merge": bool(merge)},
@@ -1236,7 +1302,8 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            view_list = views or ["top", "iso"]
+            view_list = require_list(views, "views", 'a list of view names, e.g. '
+                                      '["front","top"]') if views else ["top", "iso"]
             view_list = ["top" if v == "flat" else v for v in view_list]
             png = _tmp(".png")
 

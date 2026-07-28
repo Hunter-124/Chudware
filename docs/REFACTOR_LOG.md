@@ -5340,3 +5340,31 @@ live hostd, and concurrent sessions make it idle-exit between new_part and add_f
 every doc then reports "ZERO documents are open in this engine session". That is
 contention, not a regression. Run with CHUDWARE_ENGINE_DAEMON=0 to pin the in-process
 engine and get a deterministic result.
+
+Coercion sweep completed across the tool modules the first wave could not reach (2026-07-28):
+gsl, plm, cad_sim, parts, reveng, ecad (pcb/thermal/reliability/sim), sketch3d, office,
+preflight. All import the shared `coerce_json_or_repr` / `require_mapping` / `require_list`
+from cad_common — none redefined. 52 new regression tests across three files.
+The headline is not the crashes; it is the SILENT WRONG ANSWERS, every one of which
+reported success:
+- `run_fea_buckling` fell back to a hard-coded P=1000 N when the caller's `load` lacked a
+  `force` key, and returned fabricated critical loads without ever saying the load was
+  ignored. There is no safe default for a buckling load; it is a loud error now.
+- `run_fea_frequency_response` float()'d `excitation_dir`/`sweep_hz` CHARACTER BY CHARACTER
+  when they arrived as strings, so "123" became [1.0, 2.0, 3.0].
+- `describe_scene(views='["front","top"]')` iterated the string's characters and rendered
+  'f','r','o','n','t' as five iso views, ok:true.
+- `ecad_thermal_handoff(transient=…)` and `ecad_airflow_handoff(enclosure=…)` silently
+  discarded a stringified spec and solved the DEFAULT case, reporting solved:true.
+- `board_from_schematic(board_size=…)` dropped a stringified size and auto-outlined instead.
+sketch3d turned out to carry ALL THREE of the confirmed 2D sketch defects, which is why the
+read-across was worth doing rather than guessing: a stringified curve list was rejected
+contentlessly; an entity naming its shape in `kind` produced a phantom "pts must be a list
+of at least 2 [x,y,z] points" that mentions neither key; and `{x,y,z}` object points sailed
+through to a deep engine rejection. A 2-key {x,y} point is REJECTED with a teaching error
+rather than being guessed as z=0.
+Still open, reported and NOT fixed: `_reconcile_kwargs` (the argument-synonym layer) sits on
+the agent_turn path only, so a real MCP client calling FastMCP directly gets none of it —
+`cam_set_stock(setup=…)` raises a raw pydantic ToolError with no synonym mapping and no
+teaching text. Reproduction is in the CrashSweep report. The layer belongs at registration
+or in FastMCP middleware. Also unswept: the ~35 smaller *_tools.py modules in the long tail.

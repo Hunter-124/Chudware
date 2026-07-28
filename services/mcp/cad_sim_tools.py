@@ -8,6 +8,9 @@ import math
 
 from .cad_common import (
     CoreError,
+    coerce_json_or_repr,
+    require_list,
+    require_mapping,
     _autosave_all_open,
     _default_conductivity,
     _default_specific_heat,
@@ -32,7 +35,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- simulation
 
     @mcp.tool()
-    def run_fea_static(fixtures: list, loads: list, material: Union[str, dict] = "steel",
+    def run_fea_static(fixtures: Union[list, str], loads: Union[list, str],
+                       material: Union[str, dict] = "steel",
                        mesh_fineness: float = 0.5, doc_id: Optional[str] = None,
                        background: bool = False) -> str:
         """Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.
@@ -53,7 +57,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            mat = _resolve_material(material)
+            fixtures = require_list(fixtures, "fixtures",
+                                     'a list of face queries, e.g. ["bottom"] or '
+                                     '[{"of":"face","side":"bottom","pick":"largest"}]')
+            loads = require_list(loads, "loads",
+                                  'a list of {face query + force/pressure}, e.g. '
+                                  '[{"face":"top","force":[0,0,-500]}]')
+            mat = _resolve_material(coerce_json_or_repr(material))
             step = _tmp(".step")
             cb.call("doc_export_step", {"doc_id": d, "path": step})
 
@@ -126,7 +136,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def run_fea_modal(fixtures: list, material: Union[str, dict] = "steel", n_modes: int = 6,
+    def run_fea_modal(fixtures: Union[list, str], material: Union[str, dict] = "steel",
+                      n_modes: int = 6,
                       mesh_fineness: float = 0.5, doc_id: Optional[str] = None,
                       background: bool = False) -> str:
         """Modal FEA — the natural frequencies (Hz) of the held part. Returns the first n_modes.
@@ -138,7 +149,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            mat = _resolve_material(material)
+            fixtures = require_list(fixtures, "fixtures",
+                                     'a list of face queries held fixed, e.g. ["bottom"]')
+            mat = _resolve_material(coerce_json_or_repr(material))
             step = _tmp(".step")
             cb.call("doc_export_step", {"doc_id": d, "path": step})
             fixture_sets: list = []
@@ -222,11 +235,12 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def run_fea_frequency_response(fixtures: list, excitation_dir: Optional[list] = None,
-                                   sweep_hz: Optional[list] = None, zeta: float = 0.02,
+    def run_fea_frequency_response(fixtures: Union[list, str],
+                                   excitation_dir: Optional[Union[list, str]] = None,
+                                   sweep_hz: Optional[Union[list, str]] = None, zeta: float = 0.02,
                                    base_accel_g: float = 1.0,
-                                   psd_breakpoints: Optional[list] = None,
-                                   vibration_spec: Optional[dict] = None,
+                                   psd_breakpoints: Optional[Union[list, str]] = None,
+                                   vibration_spec: Optional[Union[dict, str]] = None,
                                    n_modes: int = 6,
                                    material: Union[str, dict] = "steel",
                                    mesh_fineness: float = 0.5,
@@ -257,7 +271,21 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            mat = _resolve_material(material)
+            fixtures = require_list(fixtures, "fixtures",
+                                     'face queries held fixed, e.g. ["bottom"]')
+            if excitation_dir is not None:
+                excitation_dir = require_list(excitation_dir, "excitation_dir",
+                                               "a 3-vector [dx,dy,dz]")
+            if sweep_hz is not None:
+                sweep_hz = require_list(sweep_hz, "sweep_hz", "a list of frequencies in Hz")
+            if psd_breakpoints is not None:
+                psd_breakpoints = require_list(psd_breakpoints, "psd_breakpoints",
+                                                "a list of [f_hz, psd_g2_per_hz] pairs")
+            if vibration_spec is not None:
+                vibration_spec = require_mapping(
+                    vibration_spec, "vibration_spec",
+                    'a dict like {"max_peak_accel_g": g} and/or {"max_grms": g}')
+            mat = _resolve_material(coerce_json_or_repr(material))
             ex_dir = [float(x) for x in (excitation_dir or [0.0, 0.0, 1.0])]
             if sweep_hz is not None:
                 sweep = [float(f) for f in sweep_hz]
@@ -540,7 +568,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def run_fea_fatigue(fixtures: list, loads: list, material: Union[str, dict] = "steel",
+    def run_fea_fatigue(fixtures: Union[list, str], loads: Union[list, str],
+                        material: Union[str, dict] = "steel",
                         load_type: str = "reversed", load_ratio: float = -1.0,
                         surface: str = "machined", reliability_pct: float = 50.0,
                         temperature_c: float = 20.0, theory: str = "goodman",
@@ -572,7 +601,11 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         try:
             from . import fea_advanced as fa
             d = _doc(doc_id)
-            mat = _resolve_material(material)
+            fixtures = require_list(fixtures, "fixtures",
+                                     'SAME plain-English face queries as run_fea_static')
+            loads = require_list(loads, "loads",
+                                  'SAME {face + force/pressure} shape as run_fea_static')
+            mat = _resolve_material(coerce_json_or_repr(material))
             Sut = float(mat.get("ultimate_mpa") or 0.0)
             Se_base = float(mat.get("endurance_mpa") or 0.0)
             if Sut <= 0:
@@ -668,11 +701,11 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def run_fea_thermal(hot_faces: list, cold_faces: list,
+    def run_fea_thermal(hot_faces: Union[list, str], cold_faces: Union[list, str],
                         material: Union[str, dict] = "steel",
                         conductivity_w_mk: Optional[float] = None,
-                        transient: Optional[dict] = None,
-                        loads: Optional[list] = None,
+                        transient: Optional[Union[dict, str]] = None,
+                        loads: Optional[Union[list, str]] = None,
                         specific_heat_j_kgk: Optional[float] = None,
                         mesh_fineness: float = 0.5,
                         doc_id: Optional[str] = None) -> str:
@@ -713,13 +746,25 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                             (falls back to a typical value for the named material).
         """
         try:
+            hot_faces = require_list(hot_faces, "hot_faces",
+                                      'a list of {"face": <query>, "temperature": <°C>}')
+            cold_faces = require_list(cold_faces, "cold_faces",
+                                       'a list of {"face": <query>, "temperature": <°C>}')
+            if loads is not None:
+                loads = require_list(loads, "loads",
+                                      'a list of {"face": <query>, "flux_w_m2": <q>} or '
+                                      '{"face": <query>, "h_w_m2k": <h>} entries')
+            if transient is not None:
+                transient = require_mapping(transient, "transient",
+                                             'a dict like {"t_end_s": 60, "dt_s": 0.5}')
+            material = coerce_json_or_repr(material)
             if transient is not None:
                 d = _doc(doc_id)
                 mat = _resolve_material(material)
                 k_cond = (float(conductivity_w_mk) if conductivity_w_mk is not None
                           else float(mat.get("conductivity_w_mk")
                                      or _default_conductivity(mat, material)))
-                if not isinstance(transient, dict) or not transient.get("t_end_s"):
+                if not transient.get("t_end_s"):
                     return _dumps({"ok": False, "error":
                                    "transient needs a dict with t_end_s (seconds), e.g. "
                                    "{\"t_end_s\": 60, \"dt_s\": 0.5}"})
@@ -846,7 +891,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def run_fea_buckling(fixtures: list, load: list, material: Union[str, dict] = "steel",
+    def run_fea_buckling(fixtures: list, load: Union[list, str], material: Union[str, dict] = "steel",
                          n_modes: int = 4, doc_id: Optional[str] = None) -> str:
         """Linear (eigenvalue) buckling via CalculiX (ccx subprocess) — critical load
         factor for slender members / thin panels.
@@ -869,12 +914,21 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             if fa.ccx_path() is None:
                 return _dumps(fa._ccx_absent_result("linear buckling"))
             d = _doc(doc_id)
-            mat = _resolve_material(material)
+            load = require_list(load, "load",
+                                 'a single-item list [{"face": <query>, "force": [x,y,z]}]')
+            mat = _resolve_material(coerce_json_or_repr(material))
             E = float(mat["E_mpa"]); nu = float(mat.get("nu", 0.3))
-            P = 1000.0
-            if load and isinstance(load[0], dict) and "force" in load[0]:
-                vec = load[0]["force"]
-                P = max(1.0, math.sqrt(sum(float(x) ** 2 for x in vec)))
+            # A malformed load used to fall back to a hard-coded 1000 N SILENTLY (ok:true,
+            # a critical_loads_n the caller never asked for) — worse than a crash, because
+            # the response looked like a real answer to a different question. Teach the
+            # shape instead of guessing a magnitude the caller never supplied.
+            if not (load and isinstance(load[0], dict) and "force" in load[0]):
+                raise ValueError(
+                    "load must be a single-item list [{'face': <query>, 'force': [x,y,z]}] "
+                    f"— got {load!r}. The force magnitude is what the buckling load factor "
+                    "scales; there is no safe default to assume.")
+            vec = load[0]["force"]
+            P = max(1.0, math.sqrt(sum(float(x) ** 2 for x in vec)))
             L, b, h = _part_bbox_dims(d)
             gen = fa.build_buckling_column_inp(L, b, h, E, nu, P, nz=4)
             run = fa.run_ccx(gen["inp"], job="buckle")
@@ -925,7 +979,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             if fa.ccx_path() is None:
                 return _dumps(fa._ccx_absent_result("nonlinear contact"))
             d = _doc(doc_id)
-            mat = _resolve_material(material)
+            mat = _resolve_material(coerce_json_or_repr(material))
             E = float(mat["E_mpa"]); nu = float(mat.get("nu", 0.3))
             L, b, h = _part_bbox_dims(d)
             gen = fa.build_contact_block_inp(L, b, h, E, nu, float(pressure_mpa))

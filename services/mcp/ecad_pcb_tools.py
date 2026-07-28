@@ -7,6 +7,7 @@ from typing import Union
 import json
 import os
 
+from .cad_common import coerce_json_or_repr, require_list, require_mapping
 from .ecad_common import (
     OpError,
     _ECAD,
@@ -473,7 +474,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def ecad_add_zone(net: str, layer: str = "F.Cu",
-                      rect_or_polygon: Optional[list] = None, doc_id: str = "") -> str:
+                      rect_or_polygon: Optional[Union[list, str]] = None, doc_id: str = "") -> str:
         """Add a copper pour (zone) bound to ``net`` on ``layer`` — usually a ground/power plane.
 
         ``rect_or_polygon`` is either a rectangle ``[x0, y0, x1, y1]`` (auto-expanded to 4 corners)
@@ -490,6 +491,15 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="Zones live on a board.",
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
+        # SILENT-DISCARD guard: _zone_polygon only recognises a real list, so a
+        # stringified "[x0,y0,x1,y1]"/python-repr polygon used to fall straight
+        # through to the generic "could not derive a zone polygon" error instead
+        # of being read as the shape it plainly is.
+        if isinstance(rect_or_polygon, str) and rect_or_polygon.strip():
+            rect_or_polygon = coerce_json_or_repr(rect_or_polygon)
+            if isinstance(rect_or_polygon, str):
+                return _err(f"rect_or_polygon is not valid JSON/list: {rect_or_polygon!r}",
+                            hint="Pass [x0,y0,x1,y1] or [[x,y],...] (>=3 pts).")
         polygon = _zone_polygon(doc, rect_or_polygon)
         if polygon is None:
             return _err("could not derive a zone polygon",
@@ -860,16 +870,26 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="Open a board first.",
                         next_actions=["ecad_new_pcb('myboard')"])
         if isinstance(params, str):
-            try:
-                params = json.loads(params)
-            except Exception:
-                return _err(f"params is not valid JSON: {params!r}")
+            # LIVE CRASH class: a python-repr params string ("{'match_tolerance_mm': 0.5}")
+            # would json.loads-fail even though it IS the dict it looks like.
+            coerced = coerce_json_or_repr(params)
+            if isinstance(coerced, dict):
+                params = coerced
+            else:
+                try:
+                    params = json.loads(params)
+                except Exception:
+                    return _err(f"params is not valid JSON: {params!r}")
         if isinstance(nets, str):
-            try:
-                nets = json.loads(nets) if nets.strip().startswith("[") else \
-                    [n.strip() for n in nets.split(",") if n.strip()]
-            except Exception:
-                return _err(f"nets is not a valid list: {nets!r}")
+            coerced = coerce_json_or_repr(nets)
+            if isinstance(coerced, list):
+                nets = coerced
+            else:
+                try:
+                    nets = json.loads(nets) if nets.strip().startswith("[") else \
+                        [n.strip() for n in nets.split(",") if n.strip()]
+                except Exception:
+                    return _err(f"nets is not a valid list: {nets!r}")
         try:
             import copy as _copy
             from services.ecad import si_rules as si_mod  # STAYS (T-RF20): no C++ counterpart
@@ -1318,10 +1338,10 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def board_from_schematic(sch_doc_id: str = "", optimize: bool = True,
                              doc_id: str = "",
-                             board_size: Optional[list] = None,
+                             board_size: Optional[Union[list, str]] = None,
                              outline_margin: float = 0.0,
                              outline_area_scale: float = 0.0,
-                             outline: Optional[list] = None,
+                             outline: Optional[Union[list, str]] = None,
                              force_outline: bool = False) -> str:
         """ONE-CALL schematic -> preliminary PCB: sync footprints, place (connectivity-aware),
         autoroute, then (by default) optimize traces (arc corners / teardrops / impedance).
@@ -1379,14 +1399,34 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             "seed": 0,
             "pcb_name": "Board1",
         }
+        # SILENT-DISCARD guard: board_size/outline used to be checked with a bare
+        # `isinstance(x, list)` — a stringified "[100, 80]"/python-repr value quietly
+        # fell through BOTH `if` branches below with no error, so the caller's explicit
+        # room knob was dropped and AUTO-OUTLINE ran instead while reporting ok=True.
+        if isinstance(board_size, str) and board_size.strip():
+            board_size = coerce_json_or_repr(board_size)
+            if isinstance(board_size, str):
+                return _err(f"board_size is not a valid [w, h] list: {board_size!r}",
+                            hint="Pass board_size=[100, 80] (mm).")
         if board_size is not None and isinstance(board_size, (list, tuple)) and len(board_size) >= 2:
             flow_opts["board_size"] = [float(board_size[0]), float(board_size[1])]
+        elif board_size is not None:
+            return _err(f"board_size must be a [w, h] list, got {board_size!r}",
+                        hint="Pass board_size=[100, 80] (mm).")
         if outline_margin and float(outline_margin) > 0:
             flow_opts["outline_margin"] = float(outline_margin)
         if outline_area_scale and float(outline_area_scale) > 0:
             flow_opts["outline_area_scale"] = float(outline_area_scale)
+        if isinstance(outline, str) and outline.strip():
+            outline = coerce_json_or_repr(outline)
+            if isinstance(outline, str):
+                return _err(f"outline is not a valid polygon list: {outline!r}",
+                            hint="Pass outline=[[x,y], ...] (>=3 points).")
         if outline is not None and isinstance(outline, list) and len(outline) >= 3:
             flow_opts["outline"] = outline
+        elif outline is not None:
+            return _err(f"outline must be a [[x,y],...] list (>=3 points), got {outline!r}",
+                        hint="Pass outline=[[x,y], ...] (>=3 points).")
         if force_outline:
             flow_opts["force_outline"] = True
 
@@ -1603,14 +1643,18 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         if targets is not None:
             if isinstance(targets, str):
                 if targets.strip():
-                    try:
-                        parsed = json.loads(targets)
-                    except (TypeError, ValueError) as e:
-                        return _err(
-                            f"targets is not valid JSON: {e}",
-                            hint='Pass a dict or JSON object, e.g. \'{"CLK": 50}\'.',
-                            next_actions=["ecad_optimize_traces(targets={'CLK': 50})"],
-                        )
+                    # LIVE CRASH class: a python-repr targets string ("{'CLK': 50}")
+                    # would json.loads-fail even though it IS the map it looks like.
+                    parsed = coerce_json_or_repr(targets)
+                    if isinstance(parsed, str):
+                        try:
+                            parsed = json.loads(parsed)
+                        except (TypeError, ValueError) as e:
+                            return _err(
+                                f"targets is not valid JSON: {e}",
+                                hint='Pass a dict or JSON object, e.g. \'{"CLK": 50}\'.',
+                                next_actions=["ecad_optimize_traces(targets={'CLK': 50})"],
+                            )
                     if not isinstance(parsed, dict):
                         return _err("targets must be a JSON object {net: z0_ohm}",
                                     hint='e.g. \'{"CLK": 50, "USB_DP": 90}\'.')

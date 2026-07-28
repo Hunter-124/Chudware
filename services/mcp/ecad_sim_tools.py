@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
-from typing import Optional
+from typing import Optional, Union
 import json
 import os
 
+from .cad_common import coerce_json_or_repr, require_list, require_mapping
 from .ecad_common import (
     OpError,
     _ECAD,
@@ -132,8 +133,8 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- simulate
 
     @mcp.tool()
-    def ecad_simulate(analysis: str = "op", params: Optional[dict] = None,
-                      probes: Optional[list] = None, doc_id: str = "",
+    def ecad_simulate(analysis: str = "op", params: Optional[Union[dict, str]] = None,
+                      probes: Optional[Union[list, str]] = None, doc_id: str = "",
                       backend: str = "mna") -> str:
         """Build the netlist -> SPICE circuit -> run the simulator, and return the KEY
         results with a plain-English reading.
@@ -174,6 +175,17 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         except OpError as e:
             return _err(e.message, hint="Open a schematic first.",
                         next_actions=["ecad_new_schematic('mydesign')"])
+        # LIVE CRASH / SILENT-DISCARD classes: `params` used to reach `_build_analysis`
+        # (which does `.get()` on it) as a bare string — 'str' object has no attribute
+        # 'get' — and a stringified `probes` list used to be handed to `list(probes)`,
+        # which iterates a STRING CHARACTER BY CHARACTER, silently building a garbage
+        # probe list with no error at all.
+        if params is not None:
+            params = require_mapping(params, "params",
+                                      "an analysis-params dict, e.g. {'tstep':1e-6,'tstop':1e-3}")
+        if probes is not None:
+            probes = require_list(probes, "probes",
+                                  'a list of probe names, e.g. ["V(OUT)", "I(V1)"]')
         doc = session.doc
         nl = netlist_mod.build_netlist(doc)
         circuit, warns = _netlist_to_circuit(nl)  # C++ sim_netlist_to_circuit RPC
@@ -492,7 +504,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- parameter sweep
 
     @mcp.tool()
-    def ecad_sweep(param: str, values: Optional[list] = None,
+    def ecad_sweep(param: str, values: Optional[Union[list, str]] = None,
                    analysis: str = "op", probe: str = "", doc_id: str = "") -> str:
         """Parameter sweep: re-simulate the active schematic once per value of ``param`` and report
         how the output moves (a SPICE ``.step``).
@@ -508,8 +520,16 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         except OpError as e:
             return _err(e.message, hint="Sweeps run on a schematic.",
                         next_actions=["ecad_new_schematic('mydesign')"])
+        if isinstance(values, str) and values.strip():
+            # A stringified/python-repr values list ("[1000, 2000]") used to fail the
+            # bare isinstance(values, list) check below and get the SAME contentless
+            # "needs a non-empty list" error as an omitted argument — never naming
+            # what was actually received.
+            values = require_list(values, "values",
+                                  "a list of sweep values, e.g. [1000, 2000, 5000]")
         if not values or not isinstance(values, list):
-            return _err("ecad_sweep needs a non-empty 'values' list",
+            return _err(f"ecad_sweep needs a non-empty 'values' list, got "
+                        f"{type(values).__name__}: {values!r}",
                         hint="Pass the values to sweep, e.g. ecad_sweep('R1', [1000, 2000, 5000]).",
                         next_actions=["ecad_sweep('R1', [1000, 2000, 5000])"])
         doc = session.doc
@@ -557,7 +577,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- FPGA (T-FIN11)
 
     @mcp.tool()
-    def ecad_fpga_check(ref: str = "", io: Optional[dict] = None, doc_id: str = "") -> str:
+    def ecad_fpga_check(ref: str = "", io: Optional[Union[dict, str]] = None, doc_id: str = "") -> str:
         """Bank-aware FPGA design checks on the active schematic (T-FIN11).
 
         Finds every placed FPGA (a symbol whose value/libid matches an
@@ -582,6 +602,9 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         except OpError as e:
             return _err(e.message, hint="FPGA checks run on a schematic.",
                         next_actions=["ecad_new_schematic('myfpga')"])
+        if io is not None:
+            io = require_mapping(io, "io",
+                                 'a {net_name: {"iostandard": "LVCMOS18"}} map')
         try:
             from services.ecad import fpga  # STAYS (T-RF20): no C++ counterpart
         except Exception as e:  # noqa: BLE001

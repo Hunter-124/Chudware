@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
-from typing import Optional
+from typing import Optional, Union
 from pathlib import Path as _Path
 import json as _json
 import math as _math
@@ -11,6 +11,7 @@ import re as _re
 import secrets as _secrets
 import shutil as _shutil
 
+from .cad_common import coerce_json_or_repr, require_list, require_mapping
 from .reveng_common import (
     _dumps,
     _err,
@@ -1131,7 +1132,7 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def reveng_add_images(
         session_id: str,
-        paths: Optional[list] = None,
+        paths: Optional[Union[list, str]] = None,
         dir: Optional[str] = None,  # noqa: A002
     ) -> str:
         """Add still images to *session_id* for photogrammetry / multi-view reconstruction.
@@ -1152,6 +1153,13 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
                     return _dumps({"ok": False, "reason": f"directory not found: {dir}"})
                 for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"):
                     sources.extend(src.glob(ext))
+            if isinstance(paths, str) and paths.strip():
+                # SILENT WRONG BEHAVIOR: `for p in paths` over a stringified/python-repr
+                # list ("['a.jpg','b.jpg']") iterates CHARACTER BY CHARACTER, building
+                # single-letter "paths" that all fail `.is_file()` — added stays 0 with
+                # no error at all, silently reporting an empty ingest as success.
+                paths = require_list(paths, "paths",
+                                     'a list of image file paths, e.g. ["a.jpg", "b.jpg"]')
             if paths:
                 sources.extend(_Path(p).expanduser() for p in paths)
             added = 0
@@ -1311,7 +1319,7 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
     def reveng_set_scale(
         session_id: str,
         method: str,
-        params: Optional[dict] = None,
+        params: Optional[Union[dict, str]] = None,
     ) -> str:
         """Solve and record scale calibration for *session_id* (contracts/reveng.md §8.2).
 
@@ -1348,7 +1356,12 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
                     "reason": f"invalid method {method!r}",
                     "hint": f"must be one of {VALID_METHODS}",
                 })
-            params = params or {}
+            # LIVE CRASH class (cad_common.coerce_json_or_repr docstring): `params`
+            # used to reach `params.get("value_mm")` below as a bare string — 'str'
+            # object has no attribute 'get' — whenever a model sent it as JSON or a
+            # python-repr dict instead of a real dict.
+            params = require_mapping(params, "params",
+                "a JSON object, e.g. {'value_mm': 25.4, 'source': 'caliper'}") if params else {}
             warnings: list = []
 
             if method == "known_dim":

@@ -35,6 +35,7 @@ import os
 from typing import Any, Optional, Union
 
 from services.mcp import simhandoff as sh
+from services.mcp.cad_common import coerce_json_or_repr, require_mapping
 
 # Environment presets: film coefficient (W/m^2-K) + default ambient (C).
 # still_air ~ natural convection off a horizontal board; forced_air ~ moderate fan flow
@@ -412,6 +413,19 @@ def thermal_handoff_impl(board_doc: dict, *,
                       hint="thermal handoff needs a routed board's document JSON.",
                       next_actions=["ecad_new_pcb('myboard')", "ecad_make_board(...)"])
 
+    # SILENT-DISCARD guard: every `isinstance(transient, dict)` check below used to
+    # just fall through when `transient` arrived as a stringified/python-repr dict —
+    # the caller's explicit duty-cycle spec (t_end_s/dt_s/schedules) was silently
+    # dropped in favour of the quasi-steady default, while the result still reported
+    # solved=True with no hint anything was ignored.
+    if isinstance(transient, str) and transient.strip():
+        coerced = coerce_json_or_repr(transient)
+        if not isinstance(coerced, dict):
+            return _err_d(f"transient is not a valid JSON object: {transient!r}",
+                          hint='Pass transient={"t_end_s": 3600, "dt_s": 30, '
+                               '"schedules": {...}} or a JSON object string.')
+        transient = coerced
+
     try:
         env = resolve_environment(environment, h_w_m2k, t_amb_c)
     except ValueError as e:
@@ -754,10 +768,17 @@ def register_ecad_thermal_tools(mcp) -> None:
         """
         hr = handoff_result
         if isinstance(hr, str) and hr.strip():
-            try:
-                hr = json.loads(hr)
-            except ValueError as e:
-                return _err(f"handoff_result is not valid JSON: {e}")
+            # LIVE CRASH class: a python-repr handoff_result string (single-quoted,
+            # bare None) would json.loads-fail even though it IS the dict it looks
+            # like — try the shared repr/JSON coercer before giving up.
+            coerced = coerce_json_or_repr(hr)
+            if isinstance(coerced, dict):
+                hr = coerced
+            else:
+                try:
+                    hr = json.loads(hr)
+                except ValueError as e:
+                    return _err(f"handoff_result is not valid JSON: {e}")
         if hr is None:
             hr = _THERMAL.get("last_handoff")
         if not isinstance(hr, dict):
@@ -1078,7 +1099,7 @@ def register_ecad_airflow_tools(mcp) -> None:
                              inlet_mps: float = 2.0,
                              inlet_temp_c: float = 25.0,
                              preset: str = "coarse",
-                             enclosure: Optional[dict] = None,
+                             enclosure: Optional[Union[dict, str]] = None,
                              component_kappa_w_mk: float = _COMPONENT_KAPPA_W_MK,
                              dry_run: bool = False,
                              path: str = "") -> str:
@@ -1108,6 +1129,17 @@ def register_ecad_airflow_tools(mcp) -> None:
         grow fast.
         """
         warnings: list = []
+        # SILENT-DISCARD guard: `isinstance(enclosure, dict)` below used to just skip
+        # a stringified/python-repr enclosure spec — the caller's explicit
+        # clearance_mm/wall_mm duct walls were silently dropped in favour of the
+        # open_ambient default while the result still reported ok=True.
+        if isinstance(enclosure, str) and enclosure.strip():
+            coerced = coerce_json_or_repr(enclosure)
+            if not isinstance(coerced, dict):
+                return _err(f"enclosure is not a valid JSON object: {enclosure!r}",
+                            hint='Pass enclosure={"clearance_mm": 10, "wall_mm": 2} '
+                                 'or a JSON object string.')
+            enclosure = coerced
         try:
             session = _get_pcb(doc_id or None)
         except OpError as e:
@@ -1287,6 +1319,11 @@ def register_ecad_airflow_tools(mcp) -> None:
         """
         def _load(v, fallback):
             if isinstance(v, str) and v.strip():
+                # LIVE CRASH class: a python-repr result string would json.loads-fail
+                # even though it IS the dict it looks like — coerce first.
+                coerced = coerce_json_or_repr(v)
+                if isinstance(coerced, dict):
+                    return coerced
                 try:
                     return json.loads(v)
                 except ValueError:

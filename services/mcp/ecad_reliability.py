@@ -48,9 +48,10 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from services.mcp import simhandoff as sh
+from services.mcp.cad_common import coerce_json_or_repr, require_list
 from services.mcp.ecad_thermal import _faceset  # shared faceset shape (tol/normal)
 
 # --------------------------------------------------------------------------- constants
@@ -393,8 +394,8 @@ def register_ecad_reliability_tools(mcp) -> None:
     def ecad_vibe_check(doc_id: str = "",
                         band_lo_hz: float = _DEFAULT_BAND_HZ[0],
                         band_hi_hz: float = _DEFAULT_BAND_HZ[1],
-                        psd_breakpoints: Optional[list] = None,
-                        mount_holes: Optional[list] = None,
+                        psd_breakpoints: Optional[Union[list, str]] = None,
+                        mount_holes: Optional[Union[list, str]] = None,
                         zeta: float = 0.05,
                         n_modes: int = 8,
                         mesh_fineness: float = 0.35,
@@ -435,6 +436,21 @@ def register_ecad_reliability_tools(mcp) -> None:
         deflection_screen (with citation), warnings, simhandoff}.
         """
         warnings: list = []
+        # LIVE CRASH class: a stringified/python-repr list ("[[3,3],[37,3]]") used to
+        # sail past `Optional[list]` untouched, then get iterated CHARACTER BY
+        # CHARACTER below (`for p in psd_breakpoints` / detect_mount_holes' `for h in
+        # user_holes`) — float('[') then crashed with a message naming neither this
+        # argument nor the shape it wanted. Coerce up front so a real string error
+        # names the argument, and a genuine list/repr-list is read correctly.
+        if isinstance(psd_breakpoints, str) and psd_breakpoints.strip():
+            psd_breakpoints = require_list(
+                psd_breakpoints, "psd_breakpoints",
+                "a list of [f_hz, g2_per_hz] pairs, e.g. [[20, 0.04], [350, 0.04]]")
+        if isinstance(mount_holes, str) and mount_holes.strip():
+            mount_holes = require_list(
+                mount_holes, "mount_holes",
+                "a list of [x_mm, y_mm] or [x_mm, y_mm, drill_d_mm] points, e.g. "
+                "[[3, 3], [37, 3], [37, 27], [3, 27]]")
         try:
             session = _get_pcb(doc_id or None)
         except OpError as e:

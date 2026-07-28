@@ -30,6 +30,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from .cad_common import require_mapping
+
 
 def _err(reason: str, hint: str = "") -> str:
     return json.dumps({"ok": False, "reason": reason, "hint": hint})
@@ -221,7 +223,7 @@ def register_plm_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def plm_plan(path: str, op: str = "list", entity: str = "task",
-                 data: dict | None = None, id: str = "") -> str:
+                 data: dict | str | None = None, id: str = "") -> str:
         """Plan the work: read or change the project's tasks, issues and
         milestones (stored with the project, so they version and restore with
         it). ``op`` ∈ ``list`` | ``create`` | ``update`` | ``delete``;
@@ -230,6 +232,18 @@ def register_plm_tools(mcp: FastMCP) -> None:
         Returns ``{ok, items, count, entity?, deleted_id?}`` — ``count`` is
         the number of remaining ``entity`` items, ``entity`` is the created/
         updated record, ``deleted_id`` confirms which id was removed."""
+        # A stringified `data` (JSON or Python-repr encoded) used to reach
+        # planning._build's bare `data.get("title", "")` unchanged and crash with
+        # "'str' object has no attribute 'get'" — the LIVE CRASH class. Coerce/validate
+        # here so the caller gets a named, fixable error instead of a transport failure.
+        if data is not None:
+            try:
+                data = require_mapping(
+                    data, "data",
+                    "a dict of fields (title, status/priority, assignee, links to "
+                    "items/revisions, …)")
+            except ValueError as e:
+                return _err("invalid_data", str(e))
         try:
             Vault, VaultError = _vault_module()
         except ImportError:

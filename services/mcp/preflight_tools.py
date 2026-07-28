@@ -38,6 +38,8 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from .cad_common import require_list
+
 _log = logging.getLogger(__name__)
 
 
@@ -262,6 +264,17 @@ def register_preflight_tools(mcp: FastMCP) -> None:
             if not cur:
                 raise ValueError("No current document — pass doc_id or call new_part() first")
             return cur
+
+        # A stringified ops batch (JSON or Python-repr) used to sail straight into
+        # run_preflight/_run, which never raises — it degraded into a "warn" item whose
+        # detail was a raw internal AttributeError instead of ever validating the batch.
+        # Coerce at THIS entry point so the model gets a teaching error, not a wasted
+        # dry-run that silently skipped every check.
+        try:
+            ops = require_list(ops, "ops",
+                                'a list of ops, e.g. [{"op":"add_feature","feature":{...}}]')
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
 
         try:
             d = _resolve(doc_id)

@@ -59,6 +59,7 @@ if str(_REPO) not in sys.path:
 
 
 from mcp_server import result_serving as _rs
+from .cad_common import coerce_json_or_repr
 
 def _ok(payload) -> str:
     return json.dumps({"ok": True, **payload} if isinstance(payload, dict) else {"ok": True, "result": payload},
@@ -78,10 +79,20 @@ def _err(reason: str, hint: str = "") -> str:
 # ({ok: false, reason, hint}) when a backing module is absent — CI-safe.
 # ---------------------------------------------------------------------------
 
+# LIVE CRASH class (cad_common.coerce_json_or_repr docstring): a model that sends a
+# PYTHON REPR string ("{'od_mm': 25.4}", single-quoted, bare None/True/False) for a
+# facets/params/doc argument used to fail json.loads with an opaque "not valid JSON"
+# error — a dead end, since the value WAS a perfectly good dict, just not JSON syntax.
+# Run every raw string through the shared repr/JSON coercer first so json.loads only
+# ever has to reject genuinely malformed input.
 def _parse_json_dict(raw, what: str) -> tuple[dict | None, str | None]:
-    """Parse an MCP JSON-string dict param. Returns (dict, None) or (None, error)."""
+    """Parse an MCP JSON-string (or Python-repr-string) dict param. Returns (dict, None)
+    or (None, error)."""
     if raw is None or raw == "" or raw == {}:
         return {}, None
+    if isinstance(raw, dict):
+        return raw, None
+    raw = coerce_json_or_repr(raw)
     if isinstance(raw, dict):
         return raw, None
     try:
@@ -1369,11 +1380,17 @@ def register_parts_tools(mcp: FastMCP) -> None:
         elif isinstance(doc, str) and doc.strip():
             text = doc.strip()
             if text[:1] in ("{", "["):
-                try:
-                    parsed = json.loads(text)
-                except Exception as exc:  # noqa: BLE001
-                    return _err(f"doc is not valid JSON ({exc}). Got: "
-                                f"{text[:80]!r}", _PLACE_DOC_HINT)
+                # LIVE CRASH class: a python-repr doc string ("{'op': ..., 'expr': None}")
+                # would json.loads-fail even though it IS the object it looks like.
+                # coerce_json_or_repr tries ast.literal_eval first; json.loads only has
+                # to reject genuinely malformed text.
+                parsed = coerce_json_or_repr(text)
+                if isinstance(parsed, str):
+                    try:
+                        parsed = json.loads(parsed)
+                    except Exception as exc:  # noqa: BLE001
+                        return _err(f"doc is not valid JSON ({exc}). Got: "
+                                    f"{text[:80]!r}", _PLACE_DOC_HINT)
                 if not isinstance(parsed, dict):
                     return _err(f"doc must be a JSON OBJECT, got "
                                 f"{type(parsed).__name__}.", _PLACE_DOC_HINT)

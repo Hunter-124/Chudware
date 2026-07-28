@@ -41,6 +41,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .cad_common import coerce_json_or_repr, require_list, require_mapping
+
 
 def _err(reason: str, hint: str = "") -> str:
     return json.dumps({"ok": False, "reason": reason, "hint": hint})
@@ -228,9 +230,26 @@ def _extract_docx(path: str) -> dict:
 def _apply_docx_ops(doc, ops: list) -> int | dict:
     """Apply office_edit_docx-style ops to an open python-docx Document in place.
     Returns the number of paragraphs changed, or an {ok:false,...} error dict."""
+    if ops:
+        try:
+            # A stringified ops batch (JSON or Python-repr) used to reach `op.get(...)`
+            # below as raw characters (iterating a string, not a list) and crash with a
+            # bare "'str' object has no attribute 'get'" — coerce it the same way the
+            # already-hardened mcp/*_tools.py modules do.
+            ops = require_list(ops, "ops",
+                                'a list of docx ops, e.g. '
+                                '[{"op":"append_paragraph","text":"..."}] or '
+                                '[{"paragraph_index":0,"text":"..."}]')
+        except ValueError as exc:
+            return {"ok": False, "reason": "invalid_op", "hint": str(exc)}
+    else:
+        ops = []
     changed = 0
-    for op in ops or []:
-        op = op or {}
+    for i, op in enumerate(ops):
+        op = coerce_json_or_repr(op) or {}
+        if not isinstance(op, dict):
+            return {"ok": False, "reason": "invalid_op",
+                     "hint": f"ops[{i}] must be a dict, got {type(op).__name__}: {op!r}"}
         if op.get("op") == "append_paragraph":
             doc.add_paragraph(op.get("text", ""))
             changed += 1
@@ -436,9 +455,20 @@ def register_office_tools(mcp) -> None:
             prs = Presentation(path)
         except Exception as exc:  # noqa: BLE001
             return _err("open_failed", str(exc))
+        # Stringified ops used to iterate as raw characters and crash on `op.get(...)`
+        # with a bare AttributeError — coerce first, same defect as _apply_docx_ops.
+        try:
+            ops = require_list(ops, "ops",
+                                'a list of pptx ops, e.g. '
+                                '[{"slide":0,"shape_index":1,"text":"..."}]') if ops else []
+        except ValueError as exc:
+            return _err("invalid_op", str(exc))
         changed = 0
-        for op in ops or []:
-            op = op or {}
+        for i, op in enumerate(ops):
+            op = coerce_json_or_repr(op) or {}
+            if not isinstance(op, dict):
+                return _err("invalid_op", f"ops[{i}] must be a dict, got "
+                            f"{type(op).__name__}: {op!r}")
             si, shi, text = op.get("slide"), op.get("shape_index"), op.get("text")
             if si is None or shi is None or text is None:
                 return _err("invalid_op", "each op needs slide, shape_index, text")
@@ -501,7 +531,16 @@ def register_office_tools(mcp) -> None:
         if sheet not in wb.sheetnames:
             return _err("invalid_sheet", f"no sheet named '{sheet}'")
         ws = wb[sheet]
-        for addr, value in (cells or {}).items():
+        # `(cells or {}).items()` used to crash with a bare AttributeError when cells
+        # arrived stringified — coerce so a well-formed dict that just arrived as text
+        # keeps working instead of dying on `'str' object has no attribute 'items'`.
+        try:
+            cells = require_mapping(cells, "cells",
+                                     'a dict of cell address -> value, e.g. '
+                                     '{"B2": 214.8, "C3": "=SUM(B2:B5)"}') if cells else {}
+        except ValueError as exc:
+            return _err("invalid_op", str(exc))
+        for addr, value in cells.items():
             try:
                 ws[addr] = value
             except Exception as exc:  # noqa: BLE001
@@ -536,12 +575,33 @@ def register_office_tools(mcp) -> None:
         """Full-file rewrite (csv has no partial-edit primitive). Returns
         ``{ok, path, row_count}``."""
         dest = out_path or path
+        # A stringified rows/header batch used to writerow() its own CHARACTERS as
+        # columns — worse than a crash, it wrote a syntactically valid but garbage CSV
+        # while reporting success. Coerce and require each row to be a real list.
+        try:
+            if header:
+                header = require_list(header, "header",
+                                       'a list of column names, e.g. ["id","name"]')
+            rows = require_list(rows, "rows",
+                                 'a list of rows, each a list of cell values, e.g. '
+                                 '[["a","b"],["c","d"]]') if rows else []
+        except ValueError as exc:
+            return _err("invalid_op", str(exc))
+        coerced_rows = []
+        for i, row in enumerate(rows):
+            row = coerce_json_or_repr(row)
+            if not isinstance(row, list):
+                return _err("invalid_op",
+                            f"rows[{i}] must be a list of cell values, got "
+                            f"{type(row).__name__}: {row!r}")
+            coerced_rows.append(row)
+        rows = coerced_rows
         try:
             with open(dest, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 if header:
                     writer.writerow(header)
-                for row in rows or []:
+                for row in rows:
                     writer.writerow(row)
         except Exception as exc:  # noqa: BLE001
             return _err("write_failed", str(exc))
@@ -584,8 +644,18 @@ def register_office_tools(mcp) -> None:
         writer = pypdf.PdfWriter()
         for page in reader.pages:
             writer.add_page(page)
-        for op in ops or []:
-            op = op or {}
+        # Same stringified-ops crash class fixed in office_edit_pptx/_apply_docx_ops.
+        try:
+            ops = require_list(ops, "ops",
+                                'a list of pdf ops, e.g. [{"op":"rotate","page":0,'
+                                '"degrees":90}]') if ops else []
+        except ValueError as exc:
+            return _err("invalid_op", str(exc))
+        for i, op in enumerate(ops):
+            op = coerce_json_or_repr(op) or {}
+            if not isinstance(op, dict):
+                return _err("invalid_op", f"ops[{i}] must be a dict, got "
+                            f"{type(op).__name__}: {op!r}")
             kind = op.get("op")
             if kind == "rotate":
                 idx = op.get("page")

@@ -1236,6 +1236,30 @@ void unwrap_value_scalars(json& j) {
         for (auto& el : j) unwrap_value_scalars(el);
     }
 }
+
+// A sketch point is [x, y]. Models also write it as an OBJECT — {"x":20,"y":8} or the
+// sketch-space {"u":20,"v":8} — and every reader here takes a point only from an array,
+// so an object point did not fail: it fell back to the default. A polygon whose center
+// arrived as {"x":20,"y":8} was silently built at the ORIGIN, which is how seven patterned
+// hexagons ended up stacked on one another (live 2026-07-28). Coerce the object forms into
+// arrays before any reader runs; anything else is left exactly as written so the reader's
+// own error still names it.
+void coerce_object_points(json& j) {
+    if (j.is_array()) {
+        for (auto& el : j) coerce_object_points(el);
+        return;
+    }
+    if (!j.is_object()) return;
+    for (const char* pair : {"xy", "uv"}) {
+        const std::string a(1, pair[0]), b(1, pair[1]);
+        if (j.size() == 2 && j.contains(a) && j.contains(b) &&
+            j[a].is_number() && j[b].is_number()) {
+            j = json::array({j[a].get<double>(), j[b].get<double>()});
+            return;
+        }
+    }
+    for (auto& el : j.items()) coerce_object_points(el.value());
+}
 // Normalize + expand ONE inline sketch entity into the concrete entities the geometry kernel
 // understands. Applied on BOTH ingestion paths — the sketch_add_entity op AND a sketch feature's
 // inline params.entities (op_add_feature) — so a hexagon / rectangle / airfoil / {value:N} scalar
@@ -1245,6 +1269,7 @@ void unwrap_value_scalars(json& j) {
 // else a fresh id) and a "construction" flag.
 std::vector<json> expand_sketch_entity(json ent, IdGen& gen) {
     unwrap_value_scalars(ent);  // accept {value:N} scalars in sketch entities
+    coerce_object_points(ent);  // accept {"x":X,"y":Y} / {"u":U,"v":V} points
 
     // Weak-model shape: a spline's points arrive DOUBLE-WRAPPED [[[x,y],...]] — unwrap one level.
     if (ent.value("type", std::string()) == "spline" && ent.contains("points") &&

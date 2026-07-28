@@ -1883,14 +1883,31 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            # Models pass the sketch's display NAME as often as its f<N> id, and an id from
+            # a batch that was rolled back is stale by definition. Resolve names, and when
+            # nothing matches say WHICH sketches exist instead of "call get_part" (live
+            # 2026-07-28: describe_sketch("f4") answered with nothing actionable and the
+            # model had to spend a turn guessing).
+            from services.mcp.cad_eval_tools import _sketch_features, _sketch_roster
+            rows = _sketch_features(d)
+            ids = {str(f.get("id")) for f in rows}
+            if sketch not in ids:
+                by_name = {str(f.get("name")): str(f.get("id")) for f in rows if f.get("name")}
+                if sketch in by_name:
+                    sketch = by_name[sketch]
+                else:
+                    return _dumps({"ok": False,
+                                   "error": f"no sketch {sketch!r} in {d}. "
+                                            + _sketch_roster(d),
+                                   "sketches": sorted(ids)})
             try:
                 overview = cb.call("doc_sketch_overview", {"doc_id": d, "sketch": sketch})
             except Exception as e:  # noqa: BLE001
                 detail = getattr(e, "detail", None)
                 if isinstance(detail, dict) and detail.get("reason") == "unknown sketch":
                     return _dumps({"ok": False,
-                                   "error": f"no sketch {sketch!r} "
-                                            "(call get_part for current ids)"})
+                                   "error": f"no sketch {sketch!r} in {d}. "
+                                            + _sketch_roster(d)})
                 raise
             try:
                 regions_resp = cb.call("doc_sketch_regions", {"doc_id": d, "sketch": sketch})

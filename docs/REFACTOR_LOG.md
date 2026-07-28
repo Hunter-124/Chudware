@@ -5115,3 +5115,36 @@ path so its instance key differs from the live daemon) driving three clients —
 then disconnects, a staller holds `agent_test_stall` (env-gated, `agent_`-prefixed so it
 registers in `agentWorkInFlight`), gui closes. Deferred: no hostd ctest harness exists, so
 that guard has no in-tree regression test yet.
+
+Sketch dialect + copilot UI, from a live kimi-keychain run (2026-07-28). Ledger:
+`~/.local/share/Chudware/cache/runs/run-93714991526393/events.jsonl`. THREE independent
+defects made one basic four-feature batch unbuildable twice, and each is a whole class:
+(1) `params.shapes=[…]` was never read as the entity list — `_normalize_sketch_feature` only
+picked `entities` — so the sketch was created EMPTY, reported ok, and every extrude
+referencing it then died on "profile sketch has no closed face". Now `shapes`/`profiles`/
+`geometry`/`curves`/`elements` alias the entity list, the consumed key is dropped from params,
+and `_stray_geometry_key` REJECTS a sketch whose geometry sits under a key nothing reads,
+naming the key and the five canonical entity shapes (a teachable `ValueError`, the same
+contract `_normalize_boolean_feature` already uses; `_normalize_sketch_ops` re-raises it
+instead of swallowing). (2) `refs.profile: "HexPattern"` — a bare same-batch NAME — survived
+because `profile` was missing from `_resolve_batch_name_refs`'s key allowlist. Inside `refs`
+every string slot is a reference by definition, so that substitution is now total (a geometry
+query `{"of":…}` is excluded: its enum words could collide with a display name). (3) Object
+points: `{"x":20,"y":8}` reached the engine, which reads a point only from an array, so seven
+patterned hexagons were silently built AT THE ORIGIN. Fixed on both sides — `_xy` coerces
+`{x,y}`/`{u,v}`, and `coerce_object_points()` runs at the top of `expand_sketch_entity` so
+every client gets it (`core/tests/test_document.cpp` asserts the hexagon's bbox sits at x=40,
+not 0). `describe_sketch` now resolves a sketch by NAME and, on a miss, prints the roster of
+sketches that exist instead of "call get_part". UI: stick-to-bottom used
+`SetScrollY(GetScrollMaxY())`, but ImGui only finalizes ContentSize at End(), so the target
+was always one frame behind a streaming message — `SetScrollHereY(1.0f)` tracks the true
+current-frame bottom; panel.cpp's per-tab-switch `SetNextWindowScroll` reset was deleted (each
+view has its own BeginChild id and ImGui already persists its offset). Live thinking cards now
+GROW to fit (`drawProseBox(..., growToFit)`, capped at `copilotProseStreamCapH`) instead of
+scrolling inside a fixed box, and every activity row is separated by the single
+`copilotActivityRowGapH` token. Tab switches onto a doc an agent is actively editing no longer
+revert: `activateTabDocAsync`'s completion lambda compared a raw captured `tabIdx` that any
+concurrent tab close shifted, so the activation was dropped as "stale" after the shell had
+already cleared the old mesh — it re-resolves the index by docId now. Pre-existing and NOT
+touched: 13 `services/mcp` failures (recon risk-deny env, verify_battery, ecad sim,
+parts dialect, `org` tool family) reproduce identically with these changes stashed.

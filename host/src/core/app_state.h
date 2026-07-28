@@ -781,8 +781,10 @@ void drawCodeBox(const char* id, const std::string& code, ImFont* mono, float ma
 // Colored unified-diff view (+ green / - red / @@ blue) in a scrolling box.
 void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float maxH);
 
-// Dim, wrapped prose (reasoning / notes) in a scrolling box.
-void drawProseBox(const char* id, const std::string& text, float maxH);
+// Dim, wrapped prose (reasoning / notes) in a scrolling box, fixed at maxH.
+// growToFit=true (a LIVE streaming card): grow to fit the content instead, capped at maxH —
+// pass ui::metrics::copilotProseStreamCapH() as maxH in that case, not the static scroll cap.
+void drawProseBox(const char* id, const std::string& text, float maxH, bool growToFit = false);
 
 // Fit/interference readout: a green ("fits") or red ("clash") status line; when detailed,
 // the per-pair overlap volumes (red) and clearance gaps (dim) below it.

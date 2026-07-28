@@ -590,6 +590,41 @@ TEST_CASE("polygon entity builds a closed hexagon -> hex standoff extrudes + bor
     CHECK(vol == doctest::Approx(expect).epsilon(0.01));
 }
 
+// A sketch point written as an OBJECT ({"x":…,"y":…} / {"u":…,"v":…}) must land where it
+// says. Every reader in expand_sketch_entity takes a point only from an ARRAY, so an object
+// center did not fail — it fell through to the (0,0) default, and a patterned lattice of
+// polygons was silently built stacked on the origin (live 2026-07-28 kimi-keychain run:
+// seven hexagons, one hole). Wrong geometry that reports success is the worst failure mode
+// there is, so the coercion belongs in the kernel, not only in a client normalizer.
+TEST_CASE("an object-form sketch point is honoured, not silently read as the origin") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    json nr = doc_new("part", "ObjectPoint");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "HexSk"},
+             {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+             {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "sketch_add_entity"}, {"sketch", "$0"},
+             {"entity", {{"type", "hexagon"},
+                         {"center", json{{"x", 40.0}, {"y", 0.0}}},
+                         {"across_flats", 10}}}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "extrude"}, {"name", "Body"},
+             {"params", {{"mode", "boss"}, {"end", "blind"},
+                         {"depth", json{{"value", 5}, {"expr", nullptr}}}}},
+             {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", "$0"},
+                        {"centroid", json::array({40, 0})}, {"hint_index", 0}}})}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    REQUIRE(resp.value("volume", 0.0) > 0.0);
+    // The hexagon must sit AT x=40 (circumradius 5/cos30 ≈ 5.7735), not at the origin.
+    const double R = 5.0 / std::cos(3.14159265358979 / 6.0);
+    json bb = chudware::doc::doc_bbox(id);
+    REQUIRE(bb.contains("min"));
+    CHECK(bb["min"][0].get<double>() == doctest::Approx(40.0 - R).epsilon(0.01));
+    CHECK(bb["max"][0].get<double>() == doctest::Approx(40.0 + R).epsilon(0.01));
+}
+
 // 1i. PRIMITIVE `axis`: the feature-level orientation param. Before this, primitives were
 //     hard-wired to their natural local +Z — `axis`/`direction`/`dir` were all silently
 //     ignored, so there was NO way to make a sideways cylinder without sketch+extrude, and

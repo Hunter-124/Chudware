@@ -174,12 +174,24 @@ void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float ma
 }
 
 
-// Dim, wrapped prose (reasoning / notes) in a scrolling box.
-void drawProseBox(const char* id, const std::string& text, float maxH) {
+// Dim, wrapped prose (reasoning / notes). growToFit=false (default): fixed-height scrolling box
+// at maxH, as always. growToFit=true: a LIVE streaming thinking/thought box — auto-sizes to the
+// wrapped text height as it arrives (SetNextWindowSizeConstraints + AutoResizeY) instead of
+// scrolling inside a small fixed box, so the card visibly fills out mid-stream; once content
+// would exceed maxH (the generous cap, e.g. copilotProseStreamCapH()) it clamps there and falls
+// back to the same scrolling presentation as the static case.
+void drawProseBox(const char* id, const std::string& text, float maxH, bool growToFit) {
     const auto& p = ui::palette;
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
         ImVec4(p.proseBg[0], p.proseBg[1], p.proseBg[2], p.proseBg[3]));
-    ImGui::BeginChild(id, ImVec2(0, maxH), ImGuiChildFlags_Border);
+    ImGuiChildFlags flags = ImGuiChildFlags_Border;
+    ImVec2 size(0, maxH);
+    if (growToFit) {
+        flags |= ImGuiChildFlags_AutoResizeY;
+        size.y = 0;   // ignored when AutoResizeY is set; height comes from the constraint below
+        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(FLT_MAX, maxH));
+    }
+    ImGui::BeginChild(id, size, flags);
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(p.proseText[0], p.proseText[1], p.proseText[2], 1));
     ImGui::TextWrapped("%s", text.c_str());

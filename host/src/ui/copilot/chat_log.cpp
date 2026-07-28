@@ -925,8 +925,17 @@ void chatLogStickToBottom(const char* regionId) {
         s.stick = false;                       // user scrolled up this frame
     if (sy >= smax - thresh)
         s.stick = true;                        // at/near the bottom — re-engage
-    if (s.stick && smax > sy)
-        ImGui::SetScrollY(smax);
+    // ROOT CAUSE of the "autoscroll stops keeping up during a live turn" report: ImGui only
+    // finalizes window->ContentSize (and thus ScrollMax) at End()/next Begin(), so GetScrollMaxY()
+    // here still reports LAST frame's height — one full frame behind whatever the streaming
+    // message just grew to. SetScrollY(smax) therefore chased a permanently-stale target and the
+    // view trailed the true bottom by one frame's growth on every single frame of a stream.
+    // SetScrollHereY(1.0f) instead reads window->DC.CursorPosPrevLine, i.e. the position the log
+    // loop's last item ACTUALLY finished at this frame (we run right after drawChatLogWindowed /
+    // chatDrawLog, still inside the scrolling child) — so the target always matches the current
+    // frame's real content height, card expand/collapse included, with no lag to chase.
+    if (s.stick)
+        ImGui::SetScrollHereY(1.0f);
     s.atBottom = s.stick;                      // the near-bottom check above folded into stick
     s.prevScrollY = ImGui::GetScrollY();
 }

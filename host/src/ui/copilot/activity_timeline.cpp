@@ -47,10 +47,11 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     const ImVec4 accentCol = semanticOnGlass(pal.accent, stepSurf);
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
-    // Shared card inset: without it the card inherits the pane's tight 3/2 window padding and
+    // Shared card inset (cpChatCardPadX/Y — same tokens every other activity card in this file
+    // and cards.cpp uses): without it the card inherits the pane's tight 3/2 window padding and
     // its text sits flush against the glass edge, unlike the prose/user bubbles above it.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##stepcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
@@ -333,8 +334,12 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         }
         if (!replyBody.empty()) {
             if (ImGui::TreeNodeEx("Model reply##thinkreply", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                // Same grow-to-fit treatment as drawThoughtBox: a still-live reasoning block
+                // fills out instead of scrolling inside the small static cap.
+                const bool grow = a.streaming || liveFrontier;
                 drawProseBox("##thinkreplybox", stripMdMarks(replyBody),
-                             ui::metrics::copilotProseMaxH());
+                             grow ? ui::metrics::copilotProseStreamCapH()
+                                  : ui::metrics::copilotProseMaxH(), grow);
                 ImGui::TreePop();
             }
         }
@@ -653,7 +658,15 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
                 ImGui::TextWrapped("%s", stripMdMarks(a.detail).c_str());
                 ImGui::PopStyleColor();
             } else {
-                drawProseBox("##thoughttxt", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+                // Grow to fit while the text is still arriving (or this box is the live
+                // frontier just after streaming stopped) instead of scrolling inside a small
+                // fixed box — the box fills out as the model reasons, only falling back to the
+                // scrolling presentation past the generous cap. Finished/historical boxes keep
+                // the tight static scroll cap.
+                const bool grow = a.streaming || liveFrontier;
+                drawProseBox("##thoughttxt", stripMdMarks(a.detail),
+                             grow ? ui::metrics::copilotProseStreamCapH()
+                                  : ui::metrics::copilotProseMaxH(), grow);
             }
         }
     } else if (!isOpsJson && !a.detail.empty()) {
@@ -1072,7 +1085,9 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
     // Resolve opaque doc ids to part names and fold uncovered glyphs before ANY row is measured
     // or drawn — one place, every row kind, and the widths computed below are the final ones.
     for (auto& a : m.activity) sanitizeActivityItem(st, a);
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+    // No blanket leading Dummy here: EVERY dispatched row (both the local draw* functions below
+    // and cards.cpp's corp/firm/swarm family) already opens with its own cpChatRowGap() Dummy —
+    // one used to sit here too, doubling the gap above the first card in every turn.
     // The live frontier: the most recent row this loop will actually draw (skip conditions
     // below). Only that row auto-expands mid-turn; earlier rows collapse to summary+icon.
     size_t lastVisible = (size_t)-1;

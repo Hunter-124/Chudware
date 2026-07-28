@@ -591,10 +591,14 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
     const bool sectionOpen = hdrStore->GetBool(hdrId, true);
     if (!sectionOpen) {
         // Collapsed: one-line card with title + live progress; click re-opens.
+        // Same leading gap + padding tokens as every other row drawAgentTimeline dispatches
+        // (cpChatRowGap/cpChatCardPadX/Y) — this used to run the heavier cpMenu* rhythm, which
+        // is why the plan card sat at a different inset than its neighbours in the stack.
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
         GlassBubble gb0 = beginGlassBubble(ImGui::GetContentRegionAvail().x,
                                            ui::GlassLevel::Thin, 10.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                            ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                            ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
         ImGui::BeginChild("##plansec_min", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         ImGui::PushFont(fonts.medium);
@@ -621,9 +625,12 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
         return;
     }
 
+    // See the collapsed branch above: same shared cpChatRowGap/cpChatCardPadX/Y tokens as
+    // every other drawAgentTimeline row, not the heavier cpMenu* menu rhythm.
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##plansec", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
@@ -1252,10 +1259,10 @@ void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##corporg", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1349,10 +1356,10 @@ void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const bool blocked = a.opsCount > 0 || a.status == "warn";
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##corpmeet", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1440,10 +1447,10 @@ void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##corpsteer", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1479,7 +1486,7 @@ void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts) {
 // Muted single-line activity (route rejection / wind-down summary).
 void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts) {
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     const std::string& line = !a.reason.empty() ? a.reason
                             : !a.title.empty()  ? a.title
                                                 : a.detail;
@@ -1507,10 +1514,10 @@ void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##classcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1663,10 +1670,10 @@ void drawDelegationCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##delegcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1733,10 +1740,10 @@ void drawSwarmWaveCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##swarmwave", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1789,10 +1796,10 @@ void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##firmbids", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1904,10 +1911,10 @@ void drawFirmAwardCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##firmaward", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -1939,10 +1946,10 @@ void drawFirmTeamCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##firmteam", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -2023,10 +2030,10 @@ void drawFirmCommCard(ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##firmcomm", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -2074,10 +2081,10 @@ void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const bool planApproval = (a.opsCount > 0);  // feed stamps opsCount=1 for plan-approval
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##advisor", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -2162,10 +2169,10 @@ void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##subrun", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 

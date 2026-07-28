@@ -1177,12 +1177,6 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                            : st.showArtifacts         ? "cp_artifacts"
                            : st.showSessionsPicker    ? "cp_sessions"
                                                       : "cp_chat";
-        // These are string literals — the SAME object every frame — so a pointer compare IS the
-        // "view changed this frame" test, with no per-frame strcmp.
-        static const char* s_lastViewId = nullptr;
-        const bool viewChanged = (s_lastViewId != viewId);
-        s_lastViewId = viewId;
-
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         // Horizontal gutter is ASYMMETRIC: the pill scrollbar is clipped to this child, so the
         // right side must reserve a full kChatScrollbarLane for it or bubbles run under the bar.
@@ -1196,9 +1190,14 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                             overlayOpen
                                 ? ImVec2(padR, ui::metrics::px(4.0f))
                                 : ImVec2(padR, 2.0f * ui::uiScale));
-        // Never open a menu mid-scroll. SetNextWindowScroll (not SetScrollY) so the reset lands on
-        // THIS frame instead of flashing one frame at the previous view's offset; -1 leaves X alone.
-        if (viewChanged) ImGui::SetNextWindowScroll(ImVec2(-1.0f, 0.0f));
+        // NOTE: this used to force SetNextWindowScroll(-1,0) on every view change ("never open a
+        // menu mid-scroll") from back when all five views shared ONE scroll id — closing over a
+        // stale offset left over from a completely different view's content. Now that each view
+        // gets its own BeginChild id (see above), ImGui already keeps a separate window->Scroll
+        // per id and restores it on its own; forcing it to 0 here instead threw away the user's
+        // own position in that view every time they left and came back (reported as "switching
+        // tabs is jarring") and, worse, snapped Chat back to the top whenever the user had
+        // scrolled up and stick-to-bottom was disengaged. Let each view remember itself.
         ImGui::BeginChild(viewId, ImVec2(0, chatH), ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoScrollbar);
         if (padR > padL) ImGui::Indent(padL - padR);   // negative: pull the LEFT edge back to padL

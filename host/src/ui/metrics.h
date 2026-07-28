@@ -67,6 +67,10 @@ inline float copilotBtnH()        { return px(32.0f); }   // primary send / buil
 inline int   copilotInputMaxLines(){ return 6; }          // prompt box grows to N lines, then scrolls
 inline float copilotThumbW()      { return px(220.0f); }  // iteration contact-sheet thumbnail width
 inline float copilotProseMaxH()   { return px(150.0f); }  // thoughts / prose scroll cap
+inline float copilotProseStreamCapH() { return px(420.0f); }  // generous grow cap for a LIVE
+// streaming thinking/thought box (T-RF6b "let it fill out"): while text is arriving it grows to
+// fit instead of scrolling inside copilotProseMaxH(), up to this height, THEN falls back to the
+// normal fixed-height scroll. Finished/historical drawers keep using copilotProseMaxH().
 inline float copilotDiffMaxH()    { return px(220.0f); }  // diff / code view scroll cap
 
 // ---- Copilot MENU views (Sessions / Tasks / Artifacts / Quick settings) ----------------------
@@ -86,11 +90,16 @@ inline float cpMenuHeadGap()  { return px(6.0f); }    // below a section header 
 inline float cpMenuLabelGap() { return px(3.0f); }    // label -> its control
 inline float cpMenuCtlGap()   { return px(7.0f); }    // control -> next label (vertical rhythm)
 
-// ---- Copilot CHAT timeline density (ui/copilot/activity_timeline.cpp + chat_log.cpp) -------
-// The per-turn activity timeline (thinking blocks, thought boxes, tool rows, action cards) is
-// a conversation, not a menu: cards land in dense runs while a turn streams, so it sizes
-// TIGHTER than the cpMenu* rhythm or a single run overflows the viewport. The four menu views
-// above keep cpMenu*; activity cards and turn spacing MUST size from here.
+// ---- Copilot CHAT timeline density (ui/copilot/activity_timeline.cpp + cards.cpp + chat_log.cpp)
+// The per-turn activity timeline (thinking blocks, thought boxes, tool rows, action cards, AND
+// every corp/firm/swarm/classification/delegation card cards.cpp draws for drawAgentTimeline) is
+// a conversation, not a menu: cards land in dense runs while a turn streams, so it sizes TIGHTER
+// than the cpMenu* rhythm or a single run overflows the viewport. The four menu views above keep
+// cpMenu*; EVERY row kind drawAgentTimeline dispatches — regardless of file, card kind, or
+// collapsed/expanded state — MUST size from cpChatRowGap/cpChatCardPadX/cpChatCardPadY, full
+// stop. Before this rule cards.cpp's corp/firm/swarm family still used the heavier cpMenuRowGap/
+// cpMenuRowPadX/Y, so the sibling stack alternated between a 2px/9px-pad rhythm and a 5px/10px-pad
+// rhythm row to row — the "trash", uneven spacing a live session flagged.
 inline float cpChatRowGap()   { return px(2.0f); }  // between sibling activity rows/cards
 inline float cpChatCardPadX() { return px(9.0f); }  // inside an activity card, horizontal
 inline float cpChatCardPadY() { return px(4.0f); }  // inside an activity card, vertical

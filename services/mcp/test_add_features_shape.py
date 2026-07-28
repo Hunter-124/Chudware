@@ -1874,3 +1874,129 @@ def test_live_the_29_circle_pattern_sketch_builds():
     assert all("center" in e and "radius" in e for e in sk_ents)
     print("LIVE 29-circle PatternSk interpreted:", r["interpreted"])
     print("LIVE 29-circle PatternSk changes:", r.get("changes"))
+
+# --------------------------------------------------------- the kimi-keychain batch (2026-07-28)
+# Ledger: ~/.local/share/Chudware/cache/runs/run-93714991526393/events.jsonl. TWO independent
+# defects made the same four-feature batch unbuildable, twice in a row, on a basic part:
+#   * params.shapes=[…] was never read as the entity list, so the sketch was created EMPTY and
+#     the extrudes referencing it died on "profile sketch has no closed face";
+#   * refs.profile="HexPattern" (a bare same-batch NAME, not a list) was left verbatim because
+#     `profile` was missing from the refs key allowlist -> "is neither a reserved datum…".
+# On top of both, every polygon center was an OBJECT ({"x":20,"y":8}), which the engine reads
+# only as an array — silently building all seven hexagons at the origin.
+
+_HEXES = [{"type": "polygon", "sides": 6, "center": {"x": 20, "y": 8}, "radius": 4},
+          {"type": "polygon", "sides": 6, "center": {"x": 27, "y": 15}, "radius": 4},
+          {"type": "polygon", "sides": 6, "center": {"x": 13, "y": 15}, "radius": 3}]
+_EMBLEM = [{"type": "polyline", "closed": True,
+            "points": [[46, 6], [56, 6], [56, 9], [50, 9], [50, 13], [55, 13],
+                       [55, 16], [50, 16], [50, 24], [46, 24]]}]
+
+
+def test_params_shapes_is_read_as_the_entity_list():
+    feat = M._normalize_sketch_feature(
+        {"type": "sketch", "name": "HexPattern",
+         "params": {"plane": "top", "shapes": list(_HEXES)}}, notes := [])
+    ents = feat["params"]["entities"]
+    assert len(ents) == len(_HEXES)
+    assert [e["type"] for e in ents] == ["polygon"] * 3
+    assert [e["center"] for e in ents] == [[20, 8], [27, 15], [13, 15]]
+    assert all(isinstance(e["id"], str) and e["construction"] is False for e in ents)
+    assert "shapes" not in feat["params"]          # consumed, never left to confuse the engine
+    assert any("read params.shapes" in n for n in notes), notes
+
+
+def test_object_form_points_become_arrays():
+    """{"x":…,"y":…} on a polygon center reached the engine as "no array" and silently
+    placed the shape at the ORIGIN — wrong geometry, not an error."""
+    assert M._xy({"x": 20, "y": 8}) == [20, 8]
+    assert M._xy({"u": 3, "v": 4}) == [3, 4]
+    assert M._xy([1, 2]) == [1, 2]
+    assert M._xy("plane.top") == "plane.top"       # untouched
+    feat = M._normalize_sketch_feature(
+        {"type": "sketch", "name": "Hex",
+         "params": {"plane": "top", "shapes": [dict(_HEXES[0])]}}, [])
+    assert feat["params"]["entities"][0]["center"] == [20, 8]
+
+
+def test_bare_name_in_refs_profile_resolves_to_its_placeholder():
+    notes: list = []
+    ops = M._resolve_batch_name_refs([
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "HexPattern",
+                                          "params": {"entities": []}}},
+        {"op": "add_feature", "feature": {"type": "extrude", "name": "HexCuts",
+                                          "params": {"mode": "cut"},
+                                          "refs": {"profile": "HexPattern"}}},
+    ], notes)
+    assert ops[1]["feature"]["refs"]["profile"] == "$0"
+    assert any("resolved same-batch feature name" in n for n in notes), notes
+
+
+def test_refs_geometry_query_is_not_mistaken_for_a_name():
+    """A query object's enum words ("top", "face") must survive even when a feature in the
+    batch happens to carry that display name."""
+    ops = M._resolve_batch_name_refs([
+        {"op": "add_feature", "feature": {"type": "box", "name": "top",
+                                          "params": {"length": 1, "width": 1, "height": 1}}},
+        {"op": "add_feature", "feature": {"type": "hole", "name": "H",
+                                          "refs": {"face": {"of": "face", "side": "top"}}}},
+    ], [])
+    assert ops[1]["feature"]["refs"]["face"] == {"of": "face", "side": "top"}
+
+
+@enginetest
+@pytest.mark.parametrize("profile_ref", ["HexPattern", ["$0"]])
+def test_live_kimi_keychain_hex_batch_builds(profile_ref):
+    """The VERBATIM live batch, in both ref dialects the model tried. Both used to fail."""
+    from services.agent.agent_turn import _bind_tool
+    new_part, add_features = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(new_part(name="kimi_keychain"))["doc_id"]
+    add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "Plate",
+        "params": {"length": 60, "width": 30, "height": 4}}}])
+    emblem_ref = "FEmblem" if isinstance(profile_ref, str) else ["$2"]
+    r = json.loads(add_features(doc_id=doc, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "sketch", "name": "HexPattern",
+            "params": {"plane": "top face", "shapes": list(_HEXES)}}},
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "HexCuts",
+            "params": {"depth": {"value": 4}, "mode": "cut"},
+            "refs": {"profile": profile_ref}}},
+        {"op": "add_feature", "feature": {
+            "type": "sketch", "name": "FEmblem",
+            "params": {"plane": "top face", "shapes": list(_EMBLEM)}}},
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "FBoss",
+            "params": {"depth": {"value": 2}, "mode": "boss"},
+            "refs": {"profile": emblem_ref}}},
+    ]))
+    assert r["ok"], r
+    tree = json.loads(_bind_tool("get_part")(doc_id=doc))
+    hexes = next(f for f in tree["tree"]["features"] if f.get("name") == "HexPattern")
+    ents = hexes["params"]["entities"]
+    assert len(ents) == 18, ents          # 3 hexagons x 6 line segments
+    xs = [p[0] for e in ents for p in (e["p1"], e["p2"])]
+    # Centers honoured: the lattice spans the plate, it is not collapsed on the origin.
+    assert min(xs) > 5 and max(xs) > 25, (min(xs), max(xs))
+
+
+def test_geometry_under_an_unreadable_key_is_rejected_not_silently_dropped():
+    """A sketch created EMPTY reports success and then poisons the extrude that
+    references it with "profile sketch has no closed face" — an error naming neither
+    the cause nor a fix. Reject at the sketch instead, naming the key."""
+    with pytest.raises(ValueError) as ei:
+        M._normalize_sketch_ops([{"op": "add_feature", "feature": {
+            "type": "sketch", "name": "Sk",
+            "params": {"plane": "top",
+                       "loops": [{"type": "circle", "center": [0, 0], "radius": 5}]}}}], [])
+    assert "params.loops" in str(ei.value)
+    assert "params.entities" in str(ei.value)
+
+
+def test_a_deliberately_empty_sketch_still_normalizes():
+    """Empty is legal — only geometry we could not READ is a rejection."""
+    feat = M._normalize_sketch_feature(
+        {"type": "sketch", "name": "Empty", "params": {"plane": "top", "entities": []}}, [])
+    assert feat["params"]["entities"] == []
+    assert feat["params"]["constraints"] == []

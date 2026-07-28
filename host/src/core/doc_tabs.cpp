@@ -71,6 +71,28 @@ static std::string jtab(const nlohmann::json& o, const char* k) {
     return (it != o.end() && it->is_string()) ? it->get<std::string>() : std::string();
 }
 
+// Re-resolve a tab index captured earlier THIS FRAME (or a prior frame, for a slow
+// doc_activate) against the CURRENT docTabs vector. The bug this guards: switchToTabCore's
+// async-activation branch closes over a raw index (rebuildTabIdx / pendingActivateTab) when
+// it dispatches doc_activate, but any closeDocTab() that runs before the RPC completes —
+// switchToTab's own auto-close of a finished, un-adopted AI mirror the user just left, OR an
+// unrelated doc.closed(last_writer_detached) auto-close for a DIFFERENT background mirror
+// (engine_events.cpp) — erases a tab and shifts every LATER index down by one. closeDocTab
+// keeps AppState::activeTab itself correct across that shift (its `if (idx < activeTab)
+// --activeTab` fixup), but a value already captured in an in-flight lambda has no way to see
+// the later erase and goes stale. Treating a stale index as "tab closed" silently drops the
+// activation response — the shell already shows the new tab (switchToTabCore set activeTab
+// and cleared the mesh before the RPC was even sent), so the user just watches the loading
+// toast do nothing and the view never populates, reading as "it kicked me back". Re-resolve
+// by docId (the stable identity) instead of trusting the index; only report "gone" when no
+// tab holds this docId at all.
+static int reresolveTabIndex(AppState& st, int idx, const std::string& docId) {
+    if (idx >= 0 && idx < (int)st.docTabs.size() && st.docTabs[idx].docId == docId) return idx;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+        if (st.docTabs[i].docId == docId) return i;
+    return -1;
+}
+
 // doc_ids with a "Loading <title>…" toast in flight (async switch-in rebuild pending). Re-entering
 // switchToTab for the same doc while its rebuild drains must not post the toast again — dedup here,
 // erased in the rebuild-completion callback.
@@ -557,13 +579,16 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                  // activations" guarantee. Runs unconditionally, before any early return below,
                  // so a closed/errored tab never strands a coalesced switch.
                  if (pendingActivateTab >= 0) {
-                     const int nextIdx = pendingActivateTab;
+                     const int nextIdxRaw = pendingActivateTab;
                      const std::string nextDocId = pendingActivateDocId;
                      const uint64_t nextGen = pendingActivateGeneration;
                      pendingActivateTab = -1;
                      pendingActivateDocId.clear();
-                     if (nextIdx < 0 || nextIdx >= (int)docTabs.size() ||
-                         docTabs[nextIdx].docId != nextDocId) {
+                     // nextIdxRaw was captured when THIS switch coalesced behind the in-flight
+                     // call; re-resolve by docId in case a tab close since then shifted indices
+                     // (see reresolveTabIndex above).
+                     const int nextIdx = reresolveTabIndex(*this, nextIdxRaw, nextDocId);
+                     if (nextIdx < 0) {
                          addLog("[tabs] coalesced async activation for " + nextDocId +
                                 " dropped — tab closed/changed");
                      } else {
@@ -579,13 +604,18 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                                   " gen=" + std::to_string(generation) +
                                   " total=" + std::to_string(rebuildMs) + "ms");
                  loadingToastInFlight.erase(docId);
-                 if (tabIdx < 0 || tabIdx >= (int)docTabs.size() ||
-                     docTabs[tabIdx].docId != docId) {
+                 // tabIdx was captured at dispatch time; re-resolve by docId (see
+                 // reresolveTabIndex above) instead of trusting it directly — a closeDocTab for
+                 // an EARLIER tab (switchToTab's own leaving-mirror auto-close, or an unrelated
+                 // doc.closed(last_writer_detached) for a different background mirror) can have
+                 // shifted this tab's real index down since the RPC was sent.
+                 const int idx = reresolveTabIndex(*this, tabIdx, docId);
+                 if (idx < 0) {
                      addLog("[tabs] async activation for " + docId +
                             " ignored — tab closed/changed");
                      return;
                  }
-                 if (activeTab != tabIdx) {
+                 if (activeTab != idx) {
                      // User switched away — still update that tab's session cache when possible.
                      addLog("[tabs] async activation for " + docId + " completed off-screen");
                  }
@@ -595,7 +625,7 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                      return;
                  }
                  // Only adopt into the live mirror if this tab is still active.
-                 if (activeTab == tabIdx) {
+                 if (activeTab == idx) {
                      suppressTabDirty = true;
                      if (!docMirror.adoptActivateResponse(docId, r.result, aicm, e2)) {
                          suppressTabDirty = false;
@@ -603,7 +633,7 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                          return;
                      }
                      suppressTabDirty = false;
-                     DocTab& d = docTabs[tabIdx];
+                     DocTab& d = docTabs[idx];
                      d.isAssembly = docMirror.tree().is_object() &&
                                     (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
                      d.title = docTitle(docMirror.tree(), d.isAssembly);
@@ -642,11 +672,11 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                      std::string aicmPark;
                      if (r.result.contains("tess") && r.result["tess"].is_object())
                          aicmPark = r.result["tess"].value("aicm_path", std::string());
-                     if (!aicmPark.empty() && docTabs[tabIdx].session) {
-                         docTabs[tabIdx].session->cachedAicmPath = aicmPark;
+                     if (!aicmPark.empty() && docTabs[idx].session) {
+                         docTabs[idx].session->cachedAicmPath = aicmPark;
                          if (r.result.contains("revision") &&
                              r.result["revision"].is_number_integer())
-                             docTabs[tabIdx].session->cachedRevision =
+                             docTabs[idx].session->cachedRevision =
                                  r.result["revision"].get<int>();
                      }
                  }

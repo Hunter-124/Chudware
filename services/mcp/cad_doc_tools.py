@@ -95,9 +95,23 @@ _DIM_CTYPES = frozenset({"distance", "length", "angle", "radius", "diameter"})
 
 
 def _xy(v: Any) -> Any:
-    """Coerce a coordinate to the engine's 2D [x, y]; pass anything else through."""
+    """Coerce a coordinate to the engine's 2D [x, y]; pass anything else through.
+
+    Models write a point three ways: the canonical ``[x, y]``, and the object forms
+    ``{"x":20,"y":8}`` / ``{"u":20,"v":8}``. The object forms USED to pass straight
+    through to the engine, which reads a center only from an array — so
+    ``{"type":"polygon","center":{"x":20,"y":8"},…}`` silently became a polygon at the
+    ORIGIN. Seven hexagons stacked on top of each other instead of a pattern (live
+    2026-07-28 kimi-keychain run). Silent wrong geometry is worse than a rejection, so
+    the object forms are coerced here, at the one place every entity normalizes points.
+    """
     if isinstance(v, list) and len(v) >= 2 and all(isinstance(x, (int, float)) for x in v[:2]):
         return [v[0], v[1]]
+    if isinstance(v, dict):
+        for xk, yk in (("x", "y"), ("u", "v")):
+            p = _flat_point(v, xk, yk)
+            if p is not None:
+                return p
     return v
 
 
@@ -245,6 +259,12 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
     for e in (ents or []):
         if not isinstance(e, dict):
             continue
+        # An object-form point ({"x":…,"y":…}) on an otherwise canonical entity: the
+        # engine reads points only as arrays and would silently place the shape at the
+        # origin, so this needs normalizing even though nothing else looks wrong.
+        if any(isinstance(e.get(k), dict)
+               for k in ("center", "p", "p1", "p2", "corner1", "corner2")):
+            return True
         if _slug(e.get("type")) in _POLYLINE_TYPES:
             return True
         if not (isinstance(e.get("id"), str) and _EID_RE.match(e["id"])):
@@ -378,6 +398,27 @@ def _geom_ref_member(v: Any, kind: str) -> Optional[dict]:
     return None
 
 
+#: Sketch params that legitimately hold a LIST and are not entity geometry.
+_SKETCH_NON_GEOM_LISTS = frozenset({"entities", "constraints", "dimensions", "refs"})
+
+
+def _stray_geometry_key(feat: dict, params: dict) -> Optional[str]:
+    """A key holding what is unmistakably sketch geometry, that is not the entity list.
+
+    "Unmistakably" = a non-empty list of dicts that each carry a geometry-shaped field.
+    A list of strings, ids or numbers is NOT claimed — only a shape the caller clearly
+    meant as entities, so this can reject without ever eating a legitimate param.
+    """
+    geom_fields = ("type", "points", "center", "p1", "p2", "start", "radius")
+    for src in (params, feat):
+        for key, val in src.items():
+            if key in _SKETCH_NON_GEOM_LISTS or not isinstance(val, list) or not val:
+                continue
+            if all(isinstance(x, dict) and any(g in x for g in geom_fields) for x in val):
+                return key
+    return None
+
+
 def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     """Rewrite a natural/flat sketch add_feature into the engine's canonical shape."""
     params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
@@ -393,7 +434,39 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     # A sketch with no `entities` at all is still a sketch: the engine REQUIRES
     # params.entities and params.constraints on every one, so an empty profile must be
     # normalized into the canonical empty lists rather than skipped.
-    ents_in = _pick("entities") or []
+    ents_in = _pick("entities")
+    ents_key = "entities"
+    if ents_in is None:
+        # Aliases for the entity list. `shapes` is the big one: a whole sketch written as
+        # params.shapes=[{polygon…},{polyline…}] used to survive normalization untouched,
+        # so the sketch was created with entities:[] — a SUCCESSFUL call that produced an
+        # empty sketch, and every extrude referencing it then died on the baffling
+        # "profile sketch has no closed face" (live 2026-07-28 kimi-keychain run).
+        for alias in ("shapes", "profiles", "geometry", "curves", "elements"):
+            alt = _pick(alias)
+            if alt is not None:
+                ents_in, ents_key = alt, alias
+                sink.append(
+                    f'{_feat_label(feat, "sketch")}: read params.{alias} as the sketch '
+                    f"entity list — a sketch carries params.entities (each one a "
+                    f"line/arc/circle/polygon/rectangle/polyline)")
+                break
+    ents_in = ents_in or []
+    if not ents_in:
+        # Geometry the model DID send, under a key nothing here reads. Creating the sketch
+        # anyway is the worst outcome: the call reports ok, the sketch is empty, and the
+        # extrude that references it dies later on "profile sketch has no closed face" —
+        # an error that names neither the real cause nor a fix. Reject here, naming the key.
+        stray = _stray_geometry_key(feat, params)
+        if stray:
+            raise ValueError(
+                f'sketch "{_feat_label(feat, "sketch")}": params.{stray} holds geometry but '
+                f"a sketch's entities live in params.entities — move them there. Each entity "
+                f'is one shape: {{"type":"line","p1":[x,y],"p2":[x,y]}}, '
+                f'{{"type":"circle","center":[x,y],"radius":r}}, '
+                f'{{"type":"polygon","sides":6,"center":[x,y],"radius":r}}, '
+                f'{{"type":"rectangle","center":[x,y],"width":w,"height":h}} or '
+                f'{{"type":"polyline","closed":true,"points":[[x,y],…]}}.')
     if not _sketch_needs_norm(feat, params):
         return feat  # already canonical — leave byte-identical
 
@@ -492,6 +565,24 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
                     for k in ("r",) + _DIAMETER_KEYS:
                         ne.pop(k, None)
                     used_shorthand.add("diameter" if was_diam else "radius")
+        else:
+            # Shape-primitive entities the ENGINE expands (polygon/ngon/hexagon/…,
+            # rectangle/rect, slot): it reads their center and corners ONLY as arrays, so
+            # an object point silently degrades to the origin instead of erroring. Coerce
+            # every point-shaped slot here; the size keys stay for the engine to read.
+            for k in ("center", "corner1", "corner2", "p1", "p2", "start", "end"):
+                if k in ne:
+                    coerced = _xy(ne[k])
+                    if coerced is not ne[k]:
+                        ne[k] = coerced
+                        used_shorthand.add("point_obj")
+            if "center" not in ne:
+                flat_c = _flat_point(ne, "cx", "cy")
+                if flat_c is not None:
+                    ne["center"] = flat_c
+                    ne.pop("cx", None)
+                    ne.pop("cy", None)
+                    used_shorthand.add("center")
         norm_ents.append(ne)
 
     if used_shorthand:
@@ -506,6 +597,8 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             rewrites.append('x1/y1/x2/y2 -> p1/p2')
         if "point_xy" in used_shorthand:
             rewrites.append('x/y -> p')
+        if "point_obj" in used_shorthand:
+            rewrites.append('{"x":…,"y":…} -> [x,y]')
         sink.append(
             f'{_feat_label(feat, "sketch")}: expanded flat entity shorthand '
             f'({"; ".join(rewrites)}) into the engine\'s canonical entity fields '
@@ -569,6 +662,7 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     new_feat = dict(feat)
     for k in ("entities", "constraints", "dimensions", "plane"):
         new_feat.pop(k, None)
+    new_feat.pop(ents_key, None)
     # Models label a sketch with "id":"profile" intending to reference it later as the
     # extrude/revolve profile — but refs resolve by feature NAME (or "$N"/f-id), so the
     # label was dead weight and the batch died on "profile 'profile' not found" (live
@@ -580,6 +674,7 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     new_params = dict(params)
     new_params.pop("plane", None)
     new_params.pop("dimensions", None)
+    new_params.pop(ents_key, None)   # consumed into `entities` above
     new_params["entities"] = norm_ents
     new_params["constraints"] = norm_cons
     new_feat["params"] = new_params
@@ -598,6 +693,12 @@ def _normalize_sketch_ops(ops: Any, notes: Optional[list] = None) -> Any:
                     and isinstance(op.get("feature"), dict)
                     and op["feature"].get("type") == "sketch"):
                 op = {**op, "feature": _normalize_sketch_feature(op["feature"], notes)}
+        except ValueError:
+            # A TEACHABLE rejection the normalizer proved (same contract as
+            # _normalize_boolean_feature): the call cannot build and the message says how
+            # to fix it. Swallowing it here would create the empty sketch anyway and hand
+            # the model an unrelated error two features later.
+            raise
         except Exception:  # noqa: BLE001 — never let normalization break a valid call
             pass
         out.append(op)
@@ -2913,11 +3014,17 @@ def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
     if not index:
         return ops
     hits: list = []
-    # Slots whose STRING value names a feature (everything else is left verbatim).
-    ref_keys = ("feature", "owner_feature", "sketch", "a", "b", "id")
+    # `params` holds plenty of strings that are NOT references (mode:"cut", side:"top"),
+    # so there the substitution is limited to the slots that name a feature. Inside `refs`
+    # the opposite is true: EVERY string slot is a reference by definition, so a key
+    # allowlist there can only ever miss one. It did: refs.profile held a bare
+    # "HexPattern" (live 2026-07-28 kimi-keychain run) — `profile` was absent from the
+    # allowlist and the value was a plain string, not a list, so the batch reached the
+    # engine with a display name in a selector slot and died on the dangling-ref
+    # guardrail. Only same-batch NAMES are in `table`, so a total sweep of refs is safe.
     param_keys = ("a", "b", "sketch", "profile", "targets", "bodies", "features")
 
-    def _sub(v: Any, table: dict) -> Any:
+    def _sub(v: Any, table: dict, all_strings: bool = False) -> Any:
         if isinstance(v, str):
             tgt = table.get(v.strip())
             if tgt and not _is_canon_datum(v.strip()):
@@ -2925,9 +3032,16 @@ def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
                 return tgt
             return v
         if isinstance(v, list):
-            return [_sub(x, table) for x in v]
+            return [_sub(x, table, all_strings) for x in v]
         if isinstance(v, dict):
-            return {k: (_sub(x, table) if k in ref_keys or isinstance(x, (list, dict)) else x)
+            # A geometry QUERY ({"of":"face","side":"top"}) is data, not a ref: its values
+            # are enum words that could collide with a feature named "top" or "face".
+            if "of" in v:
+                return v
+            ref_keys = ("feature", "owner_feature", "sketch", "a", "b", "id")
+            return {k: (_sub(x, table, all_strings)
+                        if all_strings or k in ref_keys or isinstance(x, (list, dict))
+                        else x)
                     for k, x in v.items()}
         return v
 
@@ -2941,7 +3055,8 @@ def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
         # A feature never references ITSELF, and its own `name` is not a ref.
         table = {k: v for k, v in index.items() if v != f"${i}"}
         refs, params = feat.get("refs"), feat.get("params")
-        new_refs = _sub(refs, table) if (table and isinstance(refs, dict)) else refs
+        new_refs = (_sub(refs, table, all_strings=True)
+                    if (table and isinstance(refs, dict)) else refs)
         new_params = params
         if table and isinstance(params, dict):
             new_params = {k: (_sub(v, table) if k in param_keys else v)

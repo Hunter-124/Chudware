@@ -3662,15 +3662,16 @@ def _ask_user_sync(questions: Any = None, question: Any = None,
     turn has no transport to prompt through — a blocking batch would raise.
     """
     from services.agent.interaction import MemoryLedger, ask_user  # noqa: PLC0415
-    from services.agent.mission_dispatch import _normalize_questions  # noqa: PLC0415
+    from services.agent.mission_dispatch import (  # noqa: PLC0415
+        _TOP_LEVEL_QUESTION_ALIASES, _normalize_questions,
+    )
 
     raw = questions if questions is not None else question
     if raw is None:
         # Same dialect widening as MissionDispatch.ask_user: models put the
         # question under whatever key they like and those used to vanish into
         # **_ignored, making the call look argument-less.
-        for _alias in ("prompt", "text", "ask", "message", "query", "q",
-                       "content", "body", "input", "request"):
+        for _alias in _TOP_LEVEL_QUESTION_ALIASES:
             if extra.get(_alias):
                 raw = extra[_alias]
                 break

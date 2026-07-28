@@ -440,8 +440,7 @@ class MissionDispatch:
         if raw is None:
             # Models put the question under whatever key they feel like; those
             # used to land in **_ignored and the call looked argument-less.
-            for alias in ("prompt", "text", "ask", "message", "query", "q",
-                          "content", "body", "input", "request"):
+            for alias in _TOP_LEVEL_QUESTION_ALIASES:
                 value = extra.get(alias)
                 if value:
                     raw = value
@@ -1995,6 +1994,29 @@ class MissionDispatch:
 
 # --------------------------------------------------------------------------- helpers
 
+#: Per-question keys a model writes instead of ``prompt``.  ``question`` is the
+#: one live claude-sonnet-5 picked (2026-07-28, run-73073258489640): every item
+#: carried a real question under that key, the batch normalized to zero prompts
+#: and ask_user answered "got no question text" — a self-inflicted dead end.
+_PROMPT_ALIASES: tuple[str, ...] = (
+    "question", "text", "ask", "label", "title", "message", "body",
+    "content", "description", "q",
+)
+
+#: Keys that mark a dict as ONE question rather than an ``{id: prompt}`` map.
+_QUESTION_FIELDS: frozenset[str] = frozenset({
+    "prompt", "id", "kind", "type", "suggested", "default", "options",
+    "choices", "required", "multi", "multiple", "targets", "target",
+    "unit", "family", "why", "media", "multiline", "proposal", "approve",
+    "geometry", *_PROMPT_ALIASES,
+})
+
+#: Call-level kwargs a model uses instead of ``questions``/``question``.
+_TOP_LEVEL_QUESTION_ALIASES: tuple[str, ...] = (
+    *_PROMPT_ALIASES, "prompt", "query", "input", "request", "qs", "items",
+)
+
+
 def _normalize_questions(raw: Any) -> list[dict]:
     """Coerce model-authored question payloads into contract-§2 question dicts.
 
@@ -2003,13 +2025,20 @@ def _normalize_questions(raw: Any) -> list[dict]:
     defaults — a text question whose default answer is empty string.
 
     Also accepts common aliases:
-      type→kind, ask/text→prompt, default→suggested, choices→options,
-      multiple→multi, target→targets. Maps design-decision style payloads onto
-      ``choice`` and geometry-pick payloads onto ``geometry_select``.
+      type→kind, question/ask/text/label/… →prompt (see ``_PROMPT_ALIASES``),
+      default→suggested, choices→options, multiple→multi, target→targets. A
+      bare ``{id: prompt}`` mapping is expanded into one question per entry.
+      Maps design-decision style payloads onto ``choice`` and geometry-pick
+      payloads onto ``geometry_select``.
     """
     if raw is None:
         return []
-    items = raw if isinstance(raw, list) else [raw]
+    if isinstance(raw, dict) and raw and not (_QUESTION_FIELDS & set(raw)):
+        # {"purpose": "…?", "dims": "…?"} — an id→prompt map, not one question.
+        items: list[Any] = [{"id": k, "prompt": v} for k, v in raw.items()
+                            if isinstance(v, str) and v.strip()]
+    else:
+        items = raw if isinstance(raw, list) else [raw]
     out: list[dict] = []
     for i, item in enumerate(items[:4], 1):  # contract cap: 4 questions per batch
         if isinstance(item, str):
@@ -2019,8 +2048,14 @@ def _normalize_questions(raw: Any) -> list[dict]:
         else:
             continue
         # Field aliases
-        if "prompt" not in q:
-            q["prompt"] = q.get("text") or q.get("ask") or ""
+        if not str(q.get("prompt") or "").strip():
+            for _alias in _PROMPT_ALIASES:
+                value = q.get(_alias)
+                if isinstance(value, str) and value.strip():
+                    q["prompt"] = value
+                    break
+            else:
+                q["prompt"] = ""
         if "kind" not in q and q.get("type"):
             q["kind"] = q["type"]
         if q.get("suggested") is None and "default" in q:

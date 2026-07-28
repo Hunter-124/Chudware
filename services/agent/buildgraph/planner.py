@@ -345,6 +345,33 @@ def _check_shell_ambiguity_in_features(
 # DAG plan mission → buildgraph
 # ---------------------------------------------------------------------------
 
+def _edge_pairs(raw_edges: Any) -> list[tuple[str, str]]:
+    """(from, to) pairs from whatever edge spelling arrived.
+
+    Accepts the canonical ``{"from": a, "to": b}`` dict (plus the usual
+    source/target, src/dst, parent/child aliases), a 2-element ``[a, b]``
+    list/tuple, and an ``"a->b"`` string.  A dag/1 graph written with pair
+    edges used to raise ``'list' object has no attribute 'get'`` here, and the
+    buildgraph adapter silently DROPPED them — both lost the model's ordering.
+    """
+    pairs: list[tuple[str, str]] = []
+    for edge in raw_edges or []:
+        source = target = ""
+        if isinstance(edge, dict):
+            for a, b in (("from", "to"), ("source", "target"), ("src", "dst"),
+                         ("parent", "child"), ("u", "v")):
+                if edge.get(a) and edge.get(b):
+                    source, target = str(edge[a]), str(edge[b])
+                    break
+        elif isinstance(edge, (list, tuple)) and len(edge) == 2:
+            source, target = str(edge[0] or ""), str(edge[1] or "")
+        elif isinstance(edge, str) and "->" in edge:
+            source, _, target = (p.strip() for p in edge.partition("->"))
+        if source and target:
+            pairs.append((source, target))
+    return pairs
+
+
 def _nodes_from_dag_plan(
     plan: dict,
     advisories: list[dict],
@@ -355,25 +382,21 @@ def _nodes_from_dag_plan(
     graph are converted to requires[] entries on the successor node.
     """
     dag_nodes: list[dict] = plan.get("nodes", [])
-    dag_edges: list[dict] = plan.get("edges", [])
 
     # Build successor map from edges
     requires_map: dict[str, list[str]] = {}
-    for edge in dag_edges:
-        to_id = edge.get("to", "")
-        from_id = edge.get("from", "")
-        if to_id and from_id:
-            requires_map.setdefault(to_id, []).append(from_id)
+    for from_id, to_id in _edge_pairs(plan.get("edges")):
+        requires_map.setdefault(to_id, []).append(from_id)
 
     nodes: list[dict] = []
     for dag_node in dag_nodes:
         dag_id = dag_node.get("id", _bgid("bg"))
-        node_type = dag_node.get("type", "design")
+        node_type = dag_node.get("type") or dag_node.get("kind") or "design"
         bg_kind = _dag_type_to_bg_kind(node_type)
         bg_node: dict = {
             "id": f"bg_{dag_id}",
             "kind": bg_kind,
-            "label": dag_node.get("name", dag_id),
+            "label": dag_node.get("name") or dag_node.get("label") or dag_id,
             "doc_id": dag_node.get("inputs", {}).get("doc_id", ""),
             "refs": {"features": [], "parts": []},
             "requires": [f"bg_{r}" for r in requires_map.get(dag_id, [])],
@@ -407,13 +430,8 @@ def _nodes_from_buildgraph_plan(plan: dict) -> list[dict]:
     dependency structure instead of routing it through BUILD PLAN inference.
     """
     edge_requires: dict[str, list[str]] = {}
-    for edge in plan.get("edges", []):
-        if not isinstance(edge, dict):
-            continue
-        source = str(edge.get("from") or "")
-        target = str(edge.get("to") or "")
-        if source and target:
-            edge_requires.setdefault(target, []).append(source)
+    for source, target in _edge_pairs(plan.get("edges")):
+        edge_requires.setdefault(target, []).append(source)
 
     nodes: list[dict] = []
     for raw in plan.get("nodes", []):

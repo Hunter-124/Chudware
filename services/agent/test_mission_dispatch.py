@@ -246,6 +246,41 @@ class TestAskUser:
         qs = _normalize_questions([{"prompt": "Ship it?", "kind": "approval"}])
         assert qs[0]["suggested"] is False
 
+    def test_normalize_question_key_alias(self):
+        """Live regression (run-73073258489640, claude-sonnet-5): every item put
+        its text under ``question``; the batch normalized to zero prompts and the
+        model was told it "got no question text"."""
+        qs = _normalize_questions([
+            {"id": "purpose", "question": "New standalone mud bucket part?",
+             "type": "choice", "options": ["Yes", "No"], "suggested": "Yes"},
+            {"id": "dims", "question": "What size?"},
+        ])
+        assert [q["id"] for q in qs] == ["purpose", "dims"]
+        assert qs[0]["prompt"].startswith("New standalone")
+        assert qs[0]["kind"] == "choice"
+
+    @pytest.mark.parametrize(
+        "key", ["question", "text", "ask", "label", "title", "message",
+                "body", "content", "description", "q"])
+    def test_normalize_accepts_every_prompt_alias(self, key):
+        qs = _normalize_questions([{key: "Which material?"}])
+        assert len(qs) == 1 and qs[0]["prompt"] == "Which material?"
+
+    def test_normalize_id_to_prompt_mapping(self):
+        qs = _normalize_questions({"purpose": "New part?", "dims": "How big?"})
+        assert [(q["id"], q["prompt"]) for q in qs] == [
+            ("purpose", "New part?"), ("dims", "How big?")]
+
+    def test_normalize_single_dict_question_is_not_a_mapping(self):
+        qs = _normalize_questions({"id": "q1", "prompt": "Material?"})
+        assert len(qs) == 1 and qs[0]["id"] == "q1"
+
+    def test_ask_user_accepts_question_key_end_to_end(self, md):
+        out = md.ask_user(questions=[{"id": "mat", "question": "Material?",
+                                      "suggested": "AL_6061_T6"}])
+        assert out["ok"] is True
+        assert out["answers"]["mat"]["value"] == "AL_6061_T6"
+
 
 # ---------------------------------------------------------------------------
 # delegate / dag_plan / part_search

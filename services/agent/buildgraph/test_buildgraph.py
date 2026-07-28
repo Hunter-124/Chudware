@@ -511,3 +511,61 @@ class TestDagPlanInput:
         # n2 should require bg_n1
         n2 = next(n for n in graph["nodes"] if n["id"] == "bg_n2")
         assert "bg_n1" in n2["requires"]
+
+    @pytest.mark.parametrize("edges", [
+        [{"from": "n1", "to": "n2"}],
+        [["n1", "n2"]],
+        [("n1", "n2")],
+        ["n1->n2"],
+        [{"source": "n1", "target": "n2"}],
+        [{"parent": "n1", "child": "n2"}],
+    ])
+    def test_dag_plan_accepts_every_edge_spelling(self, edges):
+        """Live regression: a dag/1 graph whose edges were ``[from, to]`` pairs
+        raised ``'list' object has no attribute 'get'`` inside the planner."""
+        dag_plan = {
+            "schema": "aicad.dag/1",
+            "nodes": [{"id": "n1", "kind": "part", "label": "Hub"},
+                      {"id": "n2", "kind": "checkpoint", "label": "Verify"}],
+            "edges": edges,
+        }
+        graph, _ = build_graph(dag_plan, mission="test")
+        n2 = next(n for n in graph["nodes"] if n["id"] == "bg_n2")
+        assert n2["requires"] == ["bg_n1"]
+
+    def test_dag_plan_reads_kind_and_label_aliases(self):
+        dag_plan = {
+            "schema": "aicad.dag/1",
+            "nodes": [{"id": "n1", "kind": "part", "label": "Hub cylinder"}],
+            "edges": [],
+        }
+        graph, _ = build_graph(dag_plan, mission="test")
+        assert graph["nodes"][0]["label"] == "Hub cylinder"
+
+
+class TestCoercePlanDialect:
+    """buildgraph_plan input shapes recorded from live runs (gym ledgers)."""
+
+    def _coerce(self, plan_json, **extras):
+        from services.agent.buildgraph.mcp_tools import coerce_plan
+        return coerce_plan(plan_json, dict(extras), extras.get("mission", ""), [])
+
+    def test_parts_as_name_to_contents_map(self):
+        plan, why = self._coerce(
+            '{"parts": {"flanged_bushing": ["hub", "flange", "bore"]}}')
+        assert why == ""
+        assert plan["parts"] == [
+            {"name": "flanged_bushing", "features": ["hub", "flange", "bore"]}]
+
+    def test_plan_json_python_literal_with_mixed_quotes(self):
+        plan, why = self._coerce(
+            "{\"part\": \"bushing\", 'inputs': [\"m4\"], 'outputs': [\"bore\"]}")
+        assert why == "" and plan is not None
+
+    @pytest.mark.parametrize("key", ["mission_request", "mission_spec",
+                                     "mission_brief", "user_request"])
+    def test_build_description_aliases(self, key):
+        """These carried the whole brief and were dropped as unknown kwargs."""
+        plan, why = self._coerce(None, **{key: "Design a flanged bushing"})
+        assert why == "" and plan is not None
+        assert plan["parts"]

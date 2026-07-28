@@ -22,6 +22,7 @@ Returns {ok, ...} following the project _dumps/_err convention from dag/mcp_tool
 """
 from __future__ import annotations
 
+import ast
 import difflib
 import json
 import os
@@ -103,7 +104,8 @@ _PLAN_ALIASES = ("plan", "plan_dict", "graph", "json", "build_plan", "buildplan"
 # tool synthesizes the plan and echoes exactly what it built.
 _DELIVERABLE_KEYS = ("deliverable", "goal", "objective", "brief", "description",
                      "task", "request", "summary", "title", "name", "product",
-                     "part", "assembly")
+                     "part", "assembly", "mission_request", "mission_spec",
+                     "mission_brief", "user_request", "prompt", "ask")
 _COMPONENT_KEYS = ("components", "parts", "items", "pieces", "subassemblies",
                    "assemblies", "bodies", "modules", "elements")
 _SEQUENCE_KEYS = ("sequence", "steps", "order", "operations", "ops", "features",
@@ -307,10 +309,19 @@ def coerce_plan(plan_json: Any, extras: dict, mission: str,
         if text[:1] in ("{", "["):
             try:
                 plan = json.loads(text)
+                interpreted.append("parsed plan_json from a JSON string")
             except ValueError as exc:
-                return None, (f"plan_json was a JSON string that failed to parse: "
-                              f"{exc}")
-            interpreted.append("parsed plan_json from a JSON string")
+                # Models mix quote styles ({"a": 1, 'b': 2}) and write Python
+                # tuples; that is still an unambiguous literal, so parse it as
+                # one rather than bouncing a recoverable call.
+                try:
+                    plan = ast.literal_eval(text)
+                except (ValueError, SyntaxError, TypeError, MemoryError,
+                        RecursionError):
+                    return None, (f"plan_json was a JSON string that failed to "
+                                  f"parse: {exc}")
+                interpreted.append(
+                    "parsed plan_json from a Python literal (it was not valid JSON)")
         elif text:
             interpreted.append(
                 f"plan_json was prose, read as the deliverable: {text[:80]!r}")
@@ -331,6 +342,24 @@ def coerce_plan(plan_json: Any, extras: dict, mission: str,
             if only_key in _PLAN_ALIASES:
                 interpreted.append(f"unwrapped the single {only_key!r} key")
                 return coerce_plan(plan[only_key], extras, mission, interpreted)
+        parts = plan.get("parts")
+        if isinstance(parts, dict) and parts:
+            # {"parts": {"flanged_bushing": ["hub", "flange", "bore"]}} — a
+            # name→contents map instead of the list of part objects.  The
+            # mapping is unambiguous, so read it rather than refusing.
+            promoted: list[dict] = []
+            for pname, body in parts.items():
+                if isinstance(body, dict):
+                    promoted.append({"name": pname, **body})
+                elif isinstance(body, list):
+                    promoted.append({"name": pname, "features": body})
+                elif body not in (None, ""):
+                    promoted.append({"name": pname, "features": [body]})
+                else:
+                    promoted.append({"name": pname})
+            plan = {**plan, "parts": promoted}
+            interpreted.append(
+                f"read 'parts' as a name→contents map of {len(promoted)} part(s)")
         if _is_plan_shaped(plan):
             if isinstance(plan.get("nodes"), list) and not plan.get("schema") \
                     and plan.get("format") != "aicad.buildgraph/1" \

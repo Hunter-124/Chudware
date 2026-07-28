@@ -100,13 +100,9 @@ def _auth(email: str = "demo@example.com") -> dict[str, str]:
 def test_healthz_no_auth(client):
     r = client.get("/healthz")
     assert r.status_code == 200
-    body = r.json()
-    assert body["ok"] is True
-    assert "sessions" in body
-    assert "mem_available_gib" in body
-    assert "image_present" in body
-    assert "dev_mode" in body
-    assert body["dev_mode"] is True
+    # Anonymous probes get a bare liveness result — host telemetry and
+    # dev_mode stay behind auth (detail path: tests/test_headers_csrf.py).
+    assert r.json() == {"ok": True}
 
 
 def test_auth_allow(client):
@@ -162,7 +158,9 @@ def test_dev_user_query_sets_cookie(client):
     assert "dev_user=demo@example.com" in set_cookie
     assert "Path=/" in set_cookie
     assert "HttpOnly" in set_cookie
-    assert "SameSite=Lax" in set_cookie or "SameSite=lax" in set_cookie
+    assert "SameSite=Strict" in set_cookie or "SameSite=strict" in set_cookie
+    # Plain-http localhost is the only Secure exemption; testserver is not.
+    assert "Secure" in set_cookie
 
 
 def test_dev_user_cookie_authenticates(client):

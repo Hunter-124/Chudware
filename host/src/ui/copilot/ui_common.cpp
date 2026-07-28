@@ -625,15 +625,32 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
         return;
     }
     const std::string& all = copyAll.empty() ? copyText : copyAll;
+    // Plain full-width Selectable rows instead of ImGui::MenuItem: MenuItem derives its
+    // highlight width from window->DC.MenuColumns, which springs toward the widest item over
+    // several frames rather than snapping instantly. A context menu like this one is opened
+    // fresh on every right-click, so the FIRST frame (the one the user actually sees, since
+    // the popup rarely stays open long) renders the top row's highlight using last-opening's
+    // (or zero) cached column width — it visibly falls short of the popup's right edge.
+    // ImGuiSelectableFlags_SpanAvailWidth reads GetContentRegionAvail() every frame instead,
+    // so the highlight always fills the row from the very first frame.
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    auto copyRow = [&](const char* label, bool enabled, const std::string& text) {
+        ImGui::BeginDisabled(!enabled);
+        const bool clicked = ImGui::Selectable(label, false,
+                                               ImGuiSelectableFlags_SpanAvailWidth,
+                                               ImVec2(rowW, 0));
+        ImGui::EndDisabled();
+        if (clicked) {  // BeginDisabled already keeps a disabled row from ever registering one
+            chatCopyToClipboard(text);
+            ImGui::CloseCurrentPopup();
+        }
+    };
     if (!selText.empty()) {
-        if (ImGui::MenuItem("Copy"))
-            chatCopyToClipboard(selText);
+        copyRow("Copy", true, selText);
         ImGui::Separator();
     }
-    if (ImGui::MenuItem("Copy text", nullptr, false, !copyText.empty()))
-        chatCopyToClipboard(copyText);
-    if (ImGui::MenuItem("Copy all", nullptr, false, !all.empty()))
-        chatCopyToClipboard(all);
+    copyRow("Copy text", !copyText.empty(), copyText);
+    copyRow("Copy all", !all.empty(), all);
     ImGui::EndPopup();
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(5);

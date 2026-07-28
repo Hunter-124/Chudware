@@ -3852,3 +3852,161 @@ TEST_CASE("shape: a bare QUERY object in a list slot is left alone") {
         REQUIRE_MESSAGE(st.value("ok", false), "shell: " << status_err(st));
     CHECK(doc_volume(id) > 1.0);
 }
+
+// ============================================================================
+// REF-SLOT ALIASES + TEACHING unknown-slot errors
+//
+// A live claude-sonnet-5 run burned 3 batch retries (and 8 of 13 tool calls
+// overall) on:
+//     features[1](f2).refs.faces: unknown ref slot for shell
+// shell's only slot is `remove`, but `faces` is the slot name nearly every
+// other feature uses — a predictable miss that the old error gave no way to
+// recover from. Two fixes, pinned below: normalize_feature_shape renames the
+// obvious synonym onto the single declared slot (with a note, like every other
+// rewrite), and the unknown-slot error names what the feature DOES accept.
+// ============================================================================
+
+TEST_CASE("shape: shell refs.faces is aliased to remove and builds (the live-run miss)") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const std::string id = doc_new("part", "shellalias").at("doc_id").get<std::string>();
+
+    // The exact op shape the model wrote: a face QUERY object under "faces"
+    // instead of "remove". Before the alias this batch was rejected at
+    // validation three times in a row; now it must build the hollowed box.
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "box"}, {"name", "B"},
+                 {"params", {{"length", dimv(40)}, {"width", dimv(40)},
+                             {"height", dimv(40)}}}}}},
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "shell"}, {"name", "Hollow"},
+                 {"params", {{"thickness", dimv(2)}, {"outward", false}}},
+                 {"refs", {{"faces", json::array({{{"of", "face"}, {"side", "top"}}})}}}}}},
+    });
+    json r = doc_apply_ops(id, -1, ops, false);
+    for (const json& st : r.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(st.value("ok", false), "shell alias batch: " << status_err(st));
+    CHECK(doc_volume(id) > 1.0);
+    // The stored feature was rewritten: refs.remove exists, refs.faces is gone.
+    const json& feats = r.at("tree").at("features");
+    REQUIRE(feats.size() == 2);
+    CHECK(feats[1].at("refs").contains("remove"));
+    CHECK(!feats[1].at("refs").contains("faces"));
+
+    // ...and the rewrite REPORTS itself, exactly like the other normalizations.
+    json feat = json{{"type", "shell"},
+                     {"refs", {{"faces", json::array({"$0"})}}}};
+    const std::vector<std::string> notes = chudware::doc::normalize_feature_shape(feat);
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("refs.faces") != std::string::npos);
+    CHECK(notes[0].find("refs.remove") != std::string::npos);
+    // A string value still gets the list wrap AFTER the rename (remove is a
+    // SelList slot): the two rewrites compose.
+    CHECK(feat.at("refs").at("remove") == json::array({"$0"}));
+}
+
+TEST_CASE("shape: ref-slot aliases never shadow or clobber") {
+    // (c) An existing CORRECT `remove` is untouched — no note, no new keys.
+    json good = json{{"type", "shell"},
+                     {"refs", {{"remove", json::array({"$0"})}}}};
+    const std::vector<std::string> n1 = chudware::doc::normalize_feature_shape(good);
+    CHECK(n1.empty());
+    CHECK(good.at("refs").at("remove") == json::array({"$0"}));
+    CHECK(!good.at("refs").contains("faces"));
+
+    // (d) BOTH `faces` and `remove` present: the alias must NOT fire. Keeping
+    // one of two values would be a semantic guess; `remove` wins by being
+    // declared, `faces` stays put (and the teaching validator error names it),
+    // and no data is dropped.
+    json both = json{{"type", "shell"},
+                     {"refs", {{"faces", json::array({"$1"})},
+                               {"remove", json::array({"$0"})}}}};
+    const std::vector<std::string> n2 = chudware::doc::normalize_feature_shape(both);
+    CHECK(n2.empty());
+    CHECK(both.at("refs").at("remove") == json::array({"$0"}));
+    CHECK(both.at("refs").at("faces") == json::array({"$1"}));
+
+    // The alias never shadows a name the feature already declares (guard, plus
+    // none of the table's alias strings is a declared slot of its feature).
+    // A multi-slot feature (extrude) is never aliased at all: `faces` is left
+    // for the teaching error because guessing between 6 slots is unsafe.
+    json multi = json{{"type", "extrude"},
+                      {"refs", {{"profile", json::array({"$0"})},
+                                {"faces", json::array({"$0"})}}}};
+    const std::vector<std::string> n3 = chudware::doc::normalize_feature_shape(multi);
+    CHECK(n3.empty());
+    CHECK(multi.at("refs").contains("faces"));
+}
+
+TEST_CASE("validate: unknown ref slot names every accepted slot") {
+    auto canon_doc = [](json feats) {
+        json canon;
+        canon["schema"] = "aicad.part/1";
+        canon["id"] = "doc1";
+        canon["name"] = "UnknownSlot";
+        canon["units"] = json{{"system", "MMGS"}};
+        canon["features"] = feats;
+        return canon;
+    };
+    auto find_err = [](const std::vector<std::string>& errs, const std::string& needle) {
+        for (const auto& e : errs)
+            if (e.find(needle) != std::string::npos) return e;
+        return std::string();
+    };
+
+    // (b) A genuinely unknown slot on a MULTI-slot feature: the error must name
+    // every accepted slot, comma-separated, in declaration order.
+    {
+        json canon = canon_doc(json::array({
+            json{{"id", "f1"}, {"type", "box"}, {"name", "Base"}, {"suppressed", false},
+                 {"params", {{"length", 40}, {"width", 30}, {"height", 10}}}},
+            json{{"id", "f2"}, {"type", "extrude"}, {"name", "Boss"}, {"suppressed", false},
+                 {"params", {{"mode", "new"}}},
+                 {"refs", {{"profile", json::array({"f1"})}, {"bogus", "f1"}}}},
+        }));
+        const std::vector<std::string> errs = chudware::doc::validate_document(canon);
+        const std::string e = find_err(errs, "unknown ref slot");
+        REQUIRE_MESSAGE(!e.empty(), "bogus slot must be rejected; errs:");
+        for (const auto& x : errs) MESSAGE("  " << x);
+        CHECK(e.find("features[1](f2).refs.bogus: unknown ref slot for extrude — "
+                     "extrude accepts refs: profile, up_to, up_to2, start_ref, "
+                     "end_ref, end2_ref") != std::string::npos);
+    }
+
+    // The live-run case verbatim (validate_document sees the doc BEFORE any
+    // session-side aliasing): shell.refs.faces must now say the slot is `remove`.
+    {
+        json canon = canon_doc(json::array({
+            json{{"id", "f1"}, {"type", "box"}, {"name", "Base"}, {"suppressed", false},
+                 {"params", {{"length", 40}, {"width", 30}, {"height", 10}}}},
+            json{{"id", "f2"}, {"type", "shell"}, {"name", "Hollow"}, {"suppressed", false},
+                 {"params", {{"thickness", 2}}},
+                 {"refs", {{"faces", json::array({"f1"})}}}},
+        }));
+        const std::vector<std::string> errs = chudware::doc::validate_document(canon);
+        const std::string e = find_err(errs, "unknown ref slot");
+        REQUIRE_MESSAGE(!e.empty(), "shell refs.faces must be rejected at raw validation");
+        for (const auto& x : errs) MESSAGE("  " << x);
+        CHECK(e.find("unknown ref slot for shell — shell accepts refs: remove") !=
+              std::string::npos);
+    }
+
+    // A feature with NO ref slots says so explicitly instead of listing nothing.
+    {
+        json canon = canon_doc(json::array({
+            json{{"id", "f1"}, {"type", "box"}, {"name", "Base"}, {"suppressed", false},
+                 {"params", {{"length", 40}, {"width", 30}, {"height", 10}}}},
+            json{{"id", "f2"}, {"type", "transform"}, {"name", "Move"}, {"suppressed", false},
+                 {"params", json::object()},
+                 {"refs", {{"bogus", "f1"}}}},
+        }));
+        const std::vector<std::string> errs = chudware::doc::validate_document(canon);
+        const std::string e = find_err(errs, "unknown ref slot");
+        REQUIRE_MESSAGE(!e.empty(), "transform refs must be rejected");
+        for (const auto& x : errs) MESSAGE("  " << x);
+        CHECK(e.find("unknown ref slot for transform — transform takes no refs") !=
+              std::string::npos);
+    }
+}

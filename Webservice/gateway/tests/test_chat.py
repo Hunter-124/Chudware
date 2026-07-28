@@ -104,19 +104,17 @@ def test_ws_broadcast_and_presence(chat_env):
     chat, config, data = chat_env
     from fastapi.testclient import TestClient
 
-    # Identity via query params when state.user is absent (chat.py fallback).
-    app = _make_app(chat, user=None)
-    with TestClient(app) as client:
-        with client.websocket_connect(
-            "/ws/chat?email=alice@example.com&display=Alice"
-        ) as ws_a:
+    # Identity comes from middleware-attached state.user only — chat.py has
+    # no unauthenticated query-param fallback (impersonation primitive).
+    app_a = _make_app(chat, user=_User("alice@example.com", "Alice"))
+    app_b = _make_app(chat, user=_User("bob@example.com", "Bob"))
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        with client_a.websocket_connect("/ws/chat") as ws_a:
             snap = ws_a.receive_json()
             assert snap["type"] == "presence"
             assert any(u["email"] == "alice@example.com" for u in snap["users"])
 
-            with client.websocket_connect(
-                "/ws/chat?email=bob@example.com&display=Bob"
-            ) as ws_b:
+            with client_b.websocket_connect("/ws/chat") as ws_b:
                 snap_b = ws_b.receive_json()
                 assert snap_b["type"] == "presence"
                 emails = {u["email"] for u in snap_b["users"]}
@@ -157,7 +155,7 @@ def test_ws_broadcast_and_presence(chat_env):
             assert leave["type"] == "leave"
             assert leave["user"] == "bob@example.com"
 
-        r = client.get("/api/chat/history")
+        r = client_a.get("/api/chat/history")
         assert r.status_code == 200
         texts = [m["text"] for m in r.json()["messages"]]
         assert "hello lab" in texts

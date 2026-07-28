@@ -1584,10 +1584,26 @@ vector<string> validate_feature(const json& f, const string& where,
             }
         }
     }
-    // Unknown ref slots.
+    // Unknown ref slots. TEACH, don't just reject: name the slots this feature
+    // type actually takes, read straight from the same FeatureSpec that rejected
+    // it (never a second hand-maintained table), so the model can rewrite the op
+    // instead of guessing. A live run burned 3 batch retries on shell.refs.faces
+    // — `faces` being the slot name nearly every other feature uses — because
+    // "unknown ref slot for shell" never said the slot is called `remove`.
+    string accepted;
+    if (spec.refs.empty()) {
+        accepted = ftype + " takes no refs";
+    } else {
+        accepted = ftype + " accepts refs: ";
+        for (size_t i = 0; i < spec.refs.size(); ++i) {
+            if (i) accepted += ", ";
+            accepted += spec.refs[i].name;  // declaration order
+        }
+    }
     for (auto it = refs.begin(); it != refs.end(); ++it) {
         if (known_slots.find(it.key()) == known_slots.end()) {
-            errs.push_back(where + ".refs." + it.key() + ": unknown ref slot for " + ftype);
+            errs.push_back(where + ".refs." + it.key() + ": unknown ref slot for " +
+                           ftype + " — " + accepted);
         }
     }
     return errs;
@@ -2106,6 +2122,30 @@ std::vector<std::string> feature_type_names() {
 // visible. What stays here is the rewrite that needs no echo because it has
 // exactly one possible meaning.
 //
+// Ref-slot SYNONYMS normalized onto a feature's declared slot, keyed by feature
+// type. shell is the load-bearing row: its only slot is `remove`, but `faces` is
+// the slot name almost every other feature uses (draft, weld_gusset, surf_*), so
+// it is the predictable miss — a live run burned 3 batch retries on
+// "unknown ref slot for shell".
+//
+// ELIGIBILITY, enforced at use, not by convention: the feature type MUST have
+// exactly ONE ref slot, so whatever the model meant by the alias can only be
+// that slot and the rename cannot change which geometry is selected. Multi-slot
+// features are left to the (now teaching) unknown-slot error above. The target
+// name is read from the FeatureSpec, not duplicated here, so adding a second
+// slot to one of these types automatically disables its aliases.
+const std::map<string, std::vector<string>> REF_SLOT_ALIASES = {
+    {"shell", {"faces", "open_faces", "open", "remove_faces"}},
+    {"thread", {"face"}},
+    {"text", {"face"}},
+    {"helix", {"at"}},
+    {"weld_end_cap", {"faces"}},
+    {"surf_thicken", {"face", "faces"}},
+    {"sm_edge_flange", {"edges"}},
+    {"sm_hem", {"edges"}},
+    {"sm_jog", {"edges"}},
+};
+
 // Returns a human-readable note per rewrite. Empty result == already canonical.
 std::vector<std::string> normalize_feature_shape(nlohmann::json& feature) {
     std::vector<std::string> notes;
@@ -2119,6 +2159,30 @@ std::vector<std::string> normalize_feature_shape(nlohmann::json& feature) {
 
     if (feature.contains("refs") && feature["refs"].is_object()) {
         json& refs = feature["refs"];
+
+        // Rename obvious slot synonyms onto the single declared slot BEFORE the
+        // shape wrapping below (so an aliased string still gets its list wrap)
+        // and before validation (so it never errors). Two hard no-guessing
+        // rules: never shadow a name the feature already declares, and never
+        // fire when the declared slot is already present — picking which of two
+        // values to keep would be a semantic decision, not a shape fix, so that
+        // case is left to the teaching unknown-slot error.
+        if (spec.refs.size() == 1) {
+            auto alias_it = REF_SLOT_ALIASES.find(type);
+            if (alias_it != REF_SLOT_ALIASES.end()) {
+                const string& target = spec.refs[0].name;
+                for (const string& alias : alias_it->second) {
+                    if (alias == target) continue;
+                    auto it = refs.find(alias);
+                    if (it == refs.end() || refs.contains(target)) continue;
+                    notes.push_back("interpreted refs." + alias + " as refs." + target +
+                                    " (" + type + " accepts refs: " + target + ")");
+                    refs[target] = *it;
+                    refs.erase(it);
+                }
+            }
+        }
+
         for (const RefSlot& slot : spec.refs) {
             switch (slot.form) {
                 case RefForm::SelList:

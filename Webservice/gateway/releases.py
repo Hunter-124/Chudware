@@ -10,6 +10,7 @@ built on a Windows box, since this Linux deploy host cannot produce one).
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,11 +40,15 @@ def _releases_dir() -> Path:
     return Path.home() / "chudware-releases"
 
 
+# Strict allowlist: the name flows into FileResponse(filename=...) and thus
+# into a Content-Disposition header, so anything outside [A-Za-z0-9._-] (quotes,
+# semicolons, newlines) is a header-injection vector, not just a path concern.
+_SAFE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
 def _safe_name(name: str) -> str:
-    """Basename only; reject path separators and dotfiles."""
-    if not name or name.startswith(".") or "/" in name or "\\" in name:
-        raise HTTPException(status_code=400, detail="invalid release name")
-    if os.path.basename(name) != name:
+    """Release basename: strict charset, no dotfiles, no separators."""
+    if not name or name.startswith(".") or not _SAFE_NAME_RE.fullmatch(name):
         raise HTTPException(status_code=400, detail="invalid release name")
     return name
 

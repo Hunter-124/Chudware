@@ -44,8 +44,10 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             fmt = fmt.lower().lstrip(".")
             # The native editable container is written by doc_save, not the interchange writer.
             if fmt in ("step+", "stepplus", "stp+", "native"):
-                # K3: canonicalise caller-supplied path before passing to the engine.
-                out = _sanitize_output_path(path) if path else _tmp(".step+")
+                # K3: canonicalise caller-supplied path before passing to the engine — expanduser
+                # first so "~/…" doesn't collapse to "<cwd>/~/…" under abspath, and abspath so a
+                # relative destination lands in THIS cwd, not the engine daemon's.
+                out = _sanitize_output_path(os.path.expanduser(path)) if path else _tmp(".step+")
                 if not out.lower().endswith(".step+"):
                     out += ".step+"
                 r = cb.call("doc_save", {"doc_id": d, "path": out})
@@ -57,8 +59,9 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": os.path.exists(written), "format": "step+",
                                "native": True, "doc_id": d, "path": written,
                                "exists": os.path.exists(written)})
-            # K3: canonicalise caller-supplied path before passing to the engine.
-            out = _sanitize_output_path(path) if path else _tmp("." + fmt)
+            # K3: canonicalise caller-supplied path before passing to the engine (expanduser +
+            # abspath — same reasoning as the step+ branch above).
+            out = _sanitize_output_path(os.path.expanduser(path)) if path else _tmp("." + fmt)
             # The engine round-trips B-rep formats (re-reads + BRepCheck) and THROWS if the file is
             # truncated/malformed, so a returned ok:True means it actually re-opens. It echoes real
             # metadata (solid_count, valid_solids, bytes, validated) — surface it so the caller can
@@ -106,17 +109,28 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         into a shared coordinate frame — translate:[x,y,z] and/or angle:<deg> with rotate:[ax,ay,az].
         """
         try:
+            # Resolve the caller-supplied path ONCE against THIS process's cwd: the worker
+            # chdir's to the project root, but the engine/daemon has a DIFFERENT working
+            # directory, so a raw relative path that resolves fine here is unfindable there.
+            # Every cb.call below gets the absolute form; `imported_from` keeps the caller's
+            # original string so run records stay readable.
+            path_abs = os.path.abspath(os.path.expanduser(path))
             # K2: validate the path exists BEFORE calling the engine so we never open a
             # zombie doc.  The engine's import_file does not distinguish "file missing" from
             # "format unsupported" and may silently create an empty document.
-            if not os.path.isfile(path):
-                return _dumps({"ok": False, "error": f"file not found: {path}"})
+            if not os.path.isfile(path_abs):
+                return _dumps({"ok": False, "error": f"file not found: {path}",
+                               "hint": f"looked for {path_abs} — relative paths resolve "
+                                       "against the MCP server's working directory, not "
+                                       "necessarily your project folder. Run fs_list on the "
+                                       "containing directory for the exact name, or pass an "
+                                       "absolute path."})
             # SolidWorks feature-tree resolution (opening as a NEW editable part/assembly).
-            if resolve_features and not into and path.lower().endswith((".sldprt", ".sldasm")):
+            if resolve_features and not into and path_abs.lower().endswith((".sldprt", ".sldasm")):
                 from services.sw_import.sw_feature_import import SolidWorksUnavailable
                 from services.sw_import.sw_translate import resolve as _sw_resolve
                 try:
-                    plan = _sw_resolve(path)
+                    plan = _sw_resolve(path_abs)
                 except SolidWorksUnavailable as e:
                     return _dumps({"ok": False, "error": str(e),
                                    "hint": "Open the part in SolidWorks and Save As STEP, then "
@@ -193,8 +207,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             # open it as a fresh part. WITH `into`, the engine's import_file now extracts the
             # container's solids and bakes them as an embedded-BREP import feature on the target
             # doc (Issue 2 — native parts are assemblable without re-exporting to plain STEP).
-            if path.lower().endswith(".step+") and not into:
-                r = cb.call("doc_open", {"path": path})
+            if path_abs.lower().endswith(".step+") and not into:
+                r = cb.call("doc_open", {"path": path_abs})
                 new_id = r.get("doc_id")
                 if new_id:
                     _CUR["doc_id"] = new_id
@@ -208,7 +222,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                "format": "step+", "native": True,
                                **{k: r[k] for k in ("revision", "name", "body_count")
                                   if k in r}})
-            params: dict = {"path": path, "as_solid": bool(as_solid)}
+            params: dict = {"path": path_abs, "as_solid": bool(as_solid)}
             if into:
                 params["into"] = into
             r = cb.call("import_file", params)

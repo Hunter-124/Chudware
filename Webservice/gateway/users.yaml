@@ -1,23 +1,26 @@
-# chudware-web allowlist — email must match Access/JWT (prod) or X-Dev-User (dev).
-# role: admin | user;  heavy: true = GPU seat when available (≤ max_heavy).
+# chudware-web allowlist — TEMPLATE ONLY. This tracked file must never contain
+# real accounts. The production allowlist lives OUTSIDE the repo: set
+# CHUDWARE_WEB_USERS_FILE to an untracked, chmod-600 file (see
+# Webservice/deploy/DEPLOYMENT.md, "Allowlist / users file").
 #
-# After editing, push the same list into the Cloudflare Access policy:
+# On startup, config.py seeds the runtime file from THIS template when the
+# configured path does not exist — so this template intentionally grants
+# NOBODY access (example.com entries are dev-only and never synced to
+# Cloudflare Access). A fresh boot therefore serves /healthz but logs nobody
+# in; to recover, edit the runtime users file or point
+# CHUDWARE_WEB_USERS_FILE at a real one, then restart the gateway.
+#
+# After editing the RUNTIME allowlist, push it into the Cloudflare Access
+# policy:
 #   python3 Webservice/deploy/cf_provision.py --sync-users
-# (example.com entries are dev-only and never synced to Access)
+#
+# role: admin | user;  heavy: true = GPU seat when available (≤ max_heavy).
 users:
-  - email: haedmonds@crimson.ua.edu
-    display: Hunter
-    role: admin
-    heavy: true
-  - email: haedmonds69@gmail.com
-    display: Hunter
-    role: admin
-    heavy: true
   - email: demo@example.com
     display: Demo User
     role: user
     heavy: false
-  # - email: friend@ua.edu
-  #   display: Friend
-  #   role: user
-  #   heavy: false
+  # - email: admin@example.com
+  #   display: Example Admin
+  #   role: admin
+  #   heavy: true

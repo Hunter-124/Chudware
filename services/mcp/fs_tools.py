@@ -11,7 +11,11 @@ Families (server.py wires each via _reg.view(mcp, family)):
   * ``shell`` — run_shell   (kept a SEPARATE family so it can be toggled off independently)
 
 Envelope: ``{ok:true, …}`` | ``{ok:false, reason, hint}`` — never a traceback (mirrors
-office_tools.py / plm_tools.py).
+office_tools.py / plm_tools.py). A ``not_found`` also carries ``did_you_mean`` (near-miss
+suggestions, incl. the ``X`` vs ``X+`` native-container trap) and folds the top suggestion
+into ``hint``. CAD/geometry files (.step+, .step, .stl, …) refuse with ``use_import_part``
+and point at import_part + describe_part/measure_part/inspect_part instead of a useless
+``binary_file``.
 
 CONTEXT-SAFE READING (the point of fs_read): a raw file dump overflows a small model's
 context. fs_read never returns unbounded text. It emits LINE-NUMBERED output, honours an
@@ -45,6 +49,7 @@ SCOPING (the "limited cases" the base tooling is deliberately narrowed for):
 """
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import subprocess
@@ -115,6 +120,103 @@ def _ok(**fields: Any) -> dict:
     return {"ok": True, **fields}
 
 
+# --------------------------------------------------------------------------- near-miss recovery
+# A misspelled path must never be a dead end: not_found carries did_you_mean suggestions
+# AND folds the top one into hint, so a model that only reads hint still recovers.
+NEAR_MISS_MAX_ENTRIES = 5000        # dir scan cap — a huge dir degrades to no suggestions
+NEAR_MISS_CUTOFF = 0.6              # difflib similarity floor
+NEAR_MISS_MAX_SUGGESTIONS = 5
+
+
+def _dir_entry_names(directory: Path) -> list[str]:
+    """Best-effort list of entry NAMES in *directory*. Never raises — an unreadable or
+    huge directory degrades to fewer/zero names instead of an exception."""
+    names: list[str] = []
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                names.append(entry.name)
+                if len(names) >= NEAR_MISS_MAX_ENTRIES:
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+    return names
+
+
+def _near_misses(raw_path: str) -> list[str]:
+    """Existing paths near a MISSING *raw_path*, most-likely-first.
+
+    Probes Chudware's own dual-format trap first — the exact ``+``-suffixed sibling
+    (``X`` → ``X+`` native part container) or the de-suffixed original (``X+`` → ``X``)
+    — then difflib close matches over the parent's entries. When the parent itself is
+    missing, walks up to the nearest existing ancestor and close-matches the first
+    missing component instead, so a mistyped folder name is diagnosed too. Never raises,
+    never lists entries from a _sensitive_block location, and caps work (NEAR_MISS_*)."""
+    suggestions: list[str] = []
+    try:
+        if _sensitive_block(raw_path) is not None:
+            return suggestions
+        target = Path(raw_path).expanduser()
+        seen: set[str] = set()
+
+        def _add(candidate: Path) -> None:
+            text = str(candidate)
+            if text not in seen and _sensitive_block(text) is None:
+                seen.add(text)
+                suggestions.append(text)
+
+        # 1) The native-container +/- trap, probed exactly (our own most likely typo).
+        probe = target.parent / (
+            target.name[:-1] if target.name.endswith("+") else target.name + "+")
+        try:
+            if probe.exists():
+                _add(probe)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 2) Close matches over the parent — or, when the parent chain is broken, over
+        #    the nearest existing ancestor for the first missing component.
+        probe_dir, probe_name = target.parent, target.name
+        try:
+            while not probe_dir.is_dir():
+                parent = probe_dir.parent
+                if parent == probe_dir:  # filesystem root reached, nothing exists
+                    return suggestions
+                probe_name = probe_dir.name
+                probe_dir = parent
+        except Exception:  # noqa: BLE001
+            return suggestions
+        if probe_dir != target.parent and _sensitive_block(str(probe_dir)) is not None:
+            return suggestions  # listing this ancestor would leak a credential location
+        entries = _dir_entry_names(probe_dir)
+        if entries:
+            by_lower: dict[str, str] = {}
+            for entry in entries:
+                by_lower.setdefault(entry.lower(), entry)
+            close = difflib.get_close_matches(
+                probe_name.lower(), list(by_lower),
+                n=NEAR_MISS_MAX_SUGGESTIONS, cutoff=NEAR_MISS_CUTOFF)
+            for key in close:
+                _add(probe_dir / by_lower[key])
+    except Exception:  # noqa: BLE001
+        pass
+    return suggestions[:NEAR_MISS_MAX_SUGGESTIONS]
+
+
+def _err_not_found(raw_path: str, what: str = "path") -> dict:
+    """not_found envelope with near-miss recovery: a did_you_mean list of existing
+    neighbours, with the top suggestion folded into hint so a model that only reads
+    hint still recovers."""
+    hint = f"no such {what}: {raw_path}"
+    near = _near_misses(raw_path)
+    if not near:
+        return _err("not_found", hint)
+    hint += f"; did you mean '{near[0]}'?"
+    if len(near) > 1:
+        hint += f" (also: {', '.join(repr(n) for n in near[1:])})"
+    return {"ok": False, "reason": "not_found", "hint": hint, "did_you_mean": near}
+
+
 # --------------------------------------------------------------------------- limits
 # Defaults chosen so a single read/search/shell call cannot flood a small-model context.
 DEFAULT_MAX_LINES = 400          # lines returned by fs_read when no explicit window
@@ -131,6 +233,41 @@ SHELL_MAX_TIMEOUT_S = 900
 SHELL_MAX_OUTPUT_BYTES = 96 * 1024
 
 DOC_EXTS = {"pptx", "xlsx", "xlsm", "csv", "pdf", "doc", "docx"}
+
+# CAD/geometry files fs_read must NOT try to dump as text — the right reader is
+# import_part(path=...) which returns a doc_id for describe_part / measure_part /
+# inspect_part. Binary containers ALWAYS redirect; plain-text exchange formats redirect
+# by default but honour an explicit raw=True escape (the text is genuinely readable).
+CAD_BINARY_EXTS = {
+    "step+",   # Chudware native part container (ZIP) — the exact file fs_read choked on
+    "cam+",    # Chudware native CAM container (ZIP)
+    "stl", "3mf", "glb", "3dm", "sldprt", "sldasm", "f3d", "ipt", "iam", "dwg",
+}
+CAD_TEXT_EXTS = {
+    "step", "stp", "iges", "igs", "brep", "obj", "ply", "gltf", "dxf",
+}
+CAD_EXTS = CAD_BINARY_EXTS | CAD_TEXT_EXTS
+
+
+def _cad_redirect(path: str, kind: str) -> dict:
+    """Teaching redirect: fs_read serves text/documents; CAD geometry goes through
+    import_part (returns a doc_id) and the describe/measure/inspect readers."""
+    name = Path(path).name
+    if kind == "dxf":
+        hint = (f"{name} is a 2D CAD drawing — open it with import_part(path=\"{path}\") "
+                "(imports as wires and returns a doc_id), then read it with describe_part / "
+                "measure_part / inspect_part; DXF is plain text, so if you truly need the "
+                "raw file text pass raw=True to fs_read")
+    elif kind in CAD_TEXT_EXTS:
+        hint = (f"{name} is a CAD/geometry exchange file — open it with "
+                f"import_part(path=\"{path}\") which returns a doc_id, then read the model "
+                "with describe_part / measure_part / inspect_part; this format is plain "
+                "text, so if you truly need the raw file text pass raw=True to fs_read")
+    else:
+        hint = (f"{name} is a binary CAD/geometry container — fs_read cannot show it as "
+                f"text; open it with import_part(path=\"{path}\") which returns a doc_id, "
+                "then read the model with describe_part / measure_part / inspect_part")
+    return _err("use_import_part", hint)
 
 # Destructive shell shapes refused outright (ported/trimmed from the oh-my-pi bash tool's
 # CRITICAL_BASH_PATTERNS). Intentionally tight — the cost of a false negative is a wiped host.
@@ -394,7 +531,11 @@ def register_fs_tools(mcp) -> None:
                  ':50-200' (inclusive), ':50+150' (150 lines from 50), ':5-16,960-973'
                  (multi-range), ':raw' (verbatim, no line numbers). A directory lists its
                  entries. A document (.pdf/.docx/.pptx/.xlsx/.xlsm/.csv/.doc) is extracted
-                 to text (via office_extract) and paginated the same way.
+                 to text (via office_extract) and paginated the same way. A CAD/geometry
+                 file (.step+/.step/.stp/.iges/.stl/.3mf/.obj/…) is NOT dumped — you get a
+                 use_import_part redirect: open it with import_part(path=...) and read the
+                 model via describe_part / measure_part / inspect_part (plain-text exchange
+                 formats honour raw=True as an explicit escape).
         offset : 1-indexed start line when no selector is given (default: from the top).
         limit  : max lines to return (default 400, hard cap 4000).
         raw    : omit line numbers / column clipping.
@@ -410,10 +551,15 @@ def register_fs_tools(mcp) -> None:
             raw = True
         p = Path(clean)
         if not p.exists():
-            return _err("not_found", f"no such path: {clean}")
+            return _err_not_found(clean)
         if p.is_dir():
             return _list_dir(clean, show_hidden=raw)
-        if _kind_for(clean) in DOC_EXTS:
+        kind = _kind_for(clean)
+        if kind in CAD_EXTS and (kind in CAD_BINARY_EXTS or not raw):
+            # CAD geometry is read through import_part + describe/measure/inspect, never
+            # dumped as text — redirect BEFORE the binary sniff so the answer teaches.
+            return _cad_redirect(clean, kind)
+        if kind in DOC_EXTS:
             return _read_document(clean, ranges, offset, limit, raw)
         return _read_text(clean, ranges, offset, limit, raw)
 
@@ -426,7 +572,7 @@ def register_fs_tools(mcp) -> None:
             return blocked
         p = Path(path)
         if not p.exists():
-            return _err("not_found", f"no such path: {path}")
+            return _err_not_found(path)
         if not p.is_dir():
             return _err("not_a_directory", f"{path} is not a directory")
         return _list_dir(path, show_hidden)
@@ -440,7 +586,7 @@ def register_fs_tools(mcp) -> None:
             return blocked
         base = Path(path)
         if not base.exists():
-            return _err("not_found", f"no such path: {path}")
+            return _err_not_found(path)
         cap = min(limit if limit > 0 else MAX_GLOB_RESULTS, MAX_GLOB_RESULTS)
         try:
             hits = [str(m) for m in base.glob(pattern)]
@@ -468,7 +614,7 @@ def register_fs_tools(mcp) -> None:
             return _err("bad_pattern", str(exc))
         base = Path(path)
         if not base.exists():
-            return _err("not_found", f"no such path: {path}")
+            return _err_not_found(path)
         cap = min(max_matches if max_matches > 0 else MAX_GREP_MATCHES, MAX_GREP_MATCHES)
         files: list[Path] = [base] if base.is_file() else \
             [p for p in base.rglob(glob or "*") if p.is_file()]
@@ -524,8 +670,12 @@ def register_fs_tools(mcp) -> None:
         if blocked:
             return blocked
         p = Path(path)
+        if p.is_dir():
+            return _err("not_found",
+                        f"{path} is a directory, not a file — fs_edit edits files; "
+                        "use fs_list to browse it")
         if not p.is_file():
-            return _err("not_found", f"no such file: {path}")
+            return _err_not_found(path, what="file")
         if old == "":
             return _err("empty_old", "`old` must be a non-empty string to locate the edit")
         try:

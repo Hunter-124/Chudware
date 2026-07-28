@@ -114,6 +114,10 @@ Webservice/Cloudflare-info.txt
 Webservice/secrets/
 Webservice/image/stage/
 Webservice/gateway/.venv/
+# per-deployment allowlist and env files hold live emails/secrets — never commit
+Webservice/gateway/users.yaml
+Webservice/**/*.env
+!Webservice/gateway/config.example.env
 
 # local artifacts — never commit
 reports/runs/

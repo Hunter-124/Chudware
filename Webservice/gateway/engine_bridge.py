@@ -18,8 +18,10 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 try:
     from .config import settings
+    from .sessions import manager
 except ImportError:  # uvicorn app:app from package dir
     from config import settings
+    from sessions import manager
 
 log = logging.getLogger("chudware-web.engine")
 
@@ -36,8 +38,11 @@ def active_bridge_count() -> int:
 
 
 # Engine responses can carry whole doc-JSON snapshots; the default 64 KiB
-# StreamReader limit would kill the bridge mid-session.
-_LINE_LIMIT = 256 * 1024 * 1024
+# StreamReader limit would kill the bridge mid-session. Cap at the configured
+# per-frame maximum — anything near the old 256 MiB limit OOM-kills a 1 GiB
+# gateway (MemoryMax=1G).
+def _line_limit() -> int:
+    return settings.ws_max_message_bytes
 
 
 def _inject_identity(line: str, email: str, display: str) -> str:
@@ -230,10 +235,18 @@ def _sanitize_agent_provider(line: str) -> str:
 @router.websocket("/engine")
 async def engine_ws(ws: WebSocket) -> None:
     user = ws.state.user  # AuthMiddleware closed 4401/4403 already if unauthenticated
+    # AUDIT (CRITICAL, multi-tenant): this bridge attaches the caller to the ONE
+    # shared webd daemon. Without a live seat of their own the user has no
+    # business on the engine — refuse before accept so the close code survives.
+    sess = manager.get_for_user(user.email)
+    if sess is None or sess.status not in {"starting", "ready"}:
+        log.warning("engine bridge refused for %s: no live session", user.email)
+        await ws.close(code=4403, reason="no live session")
+        return
     await ws.accept()
     sock = str(settings.webd_socket)
     try:
-        reader, writer = await asyncio.open_unix_connection(sock, limit=_LINE_LIMIT)
+        reader, writer = await asyncio.open_unix_connection(sock, limit=_line_limit())
     except OSError as exc:
         log.warning("engine bridge: webd connect failed for %s: %s", user.email, exc)
         await ws.close(code=1013, reason="engine unavailable")
@@ -243,8 +256,18 @@ async def engine_ws(ws: WebSocket) -> None:
     _active_bridges += 1
 
     async def ws_to_daemon() -> None:
+        max_frame = settings.ws_max_message_bytes
         while True:
             line = await ws.receive_text()
+            if len(line.encode("utf-8")) > max_frame:
+                # One oversized frame can OOM the gateway; never forward it.
+                log.warning(
+                    "engine bridge %s: frame exceeds %d bytes; closing",
+                    user.email,
+                    max_frame,
+                )
+                await ws.close(code=1009, reason="frame too large")
+                return
             # Cheap pre-filters (method sits near the front of the JSON-RPC line);
             # the helpers re-check the method properly before rewriting.
             head = line[:96]

@@ -511,10 +511,14 @@ def _sanitize_output_path(path: str) -> str:
     knows exactly where the file will land, and the engine can't be fooled by a crafted
     relative sequence that navigates outside an expected directory.
 
+    ``~`` is expanded first: without it a model-written ``~/parts/x.step+`` became a
+    LITERAL ``~`` directory under the daemon's cwd, so the file landed somewhere the
+    user could never find.
+
     Raises ValueError for obviously invalid inputs (empty string, non-string)."""
     if not isinstance(path, str) or not path.strip():
         raise ValueError("output path must be a non-empty string")
-    return os.path.abspath(path)
+    return os.path.abspath(os.path.expanduser(path))
 
 
 # --- live viewport handoff -------------------------------------------------------------

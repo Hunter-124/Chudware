@@ -22,6 +22,7 @@ from starlette.background import BackgroundTask
 try:
     from .auth import AuthMiddleware, User, get_current_user
     from .config import settings
+    from .limits import enforce_upload_size, uploads
     from .proxy import router as proxy_router
     from .sessions import SessionBusy, PodmanError, manager, mem_available_bytes, mem_available_gib
     from .chat import Presence, presence, router as chat_router  # noqa: F401
@@ -29,6 +30,7 @@ try:
 except ImportError:  # uvicorn app:app from package dir
     from auth import AuthMiddleware, User, get_current_user
     from config import settings
+    from limits import enforce_upload_size, uploads
     from proxy import router as proxy_router
     from sessions import SessionBusy, PodmanError, manager, mem_available_bytes, mem_available_gib
     from chat import Presence, presence, router as chat_router  # noqa: F401
@@ -73,6 +75,18 @@ app = FastAPI(title="chudware-web", version="1.0.0")
 app.add_middleware(AuthMiddleware, directory=user_directory)
 
 
+# Verified against static/*.html: every <script> is an external /static file
+# (no inline script blocks anywhere), so script-src needs no 'unsafe-inline';
+# inline <style> blocks and style= attributes DO exist, hence style-src keeps
+# it. The app is same-origin only; portals speak wss: to their own host.
+_CSP = (
+    "default-src 'self'; script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+    "connect-src 'self' ws: wss:; frame-src 'self'; frame-ancestors 'self'; "
+    "base-uri 'self'; form-action 'self'; object-src 'none'"
+)
+
+
 @app.middleware("http")
 async def _security_headers(request: Request, call_next):
     resp = await call_next(request)
@@ -81,6 +95,15 @@ async def _security_headers(request: Request, call_next):
     h.setdefault("Referrer-Policy", "same-origin")
     # Stream iframe and popout are same-origin; nothing embeds us cross-site.
     h.setdefault("X-Frame-Options", "SAMEORIGIN")
+    h.setdefault("Content-Security-Policy", _CSP)
+    h.setdefault(
+        "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
+    )
+    h.setdefault(
+        "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
+    )
+    # setdefault: appserve already sets COOP/COEP for /app — never fight it.
+    h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
     return resp
 
 
@@ -156,10 +179,36 @@ _PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
 _CAD_EXTS = {".step+", ".step", ".stp", ".stl", ".3mf", ".iges", ".igs", ".brep", ".aicm"}
 
 
+def _in_project_roots(path: Path) -> bool:
+    """Is ``path`` (resolved) inside one of the allowlisted project roots?
+
+    resolve() follows symlinks, so a symlink inside a root cannot point the
+    check at an outside directory.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for root in settings.project_roots:
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
 def _valid_project(p: str) -> bool:
-    """A PLM project name, or an absolute host directory (bind-mounted into sessions)."""
+    """A PLM project name, or an absolute host directory (bind-mounted into sessions).
+
+    Absolute paths must sit inside settings.project_roots — otherwise any admin
+    could bind-mount /etc or another user's home into every session.
+    """
     if p.startswith("/"):
-        return ".." not in p.split("/") and Path(p).is_dir()
+        if ".." in p.split("/"):
+            return False
+        try:
+            resolved = Path(p).resolve()
+        except OSError:
+            return False
+        return resolved.is_dir() and _in_project_roots(resolved)
     return bool(_PROJECT_RE.match(p))
 
 
@@ -169,13 +218,20 @@ def _valid_doc(d: str) -> bool:
 
 @admin_router.get("/browse")
 async def admin_browse(request: Request, path: str = "") -> dict[str, Any]:
-    """Host-machine folder listing for the admin project picker (admin-only)."""
+    """Host-machine folder listing for the admin project picker (admin-only).
+
+    Confined to settings.project_roots: an absolute path outside every
+    allowlisted root is rejected rather than listed.
+    """
     _require_admin(request)
-    base = Path(path).expanduser() if path else Path.home()
+    base = Path(path).expanduser() if path else settings.project_roots[0]
     try:
         base = base.resolve()
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not _in_project_roots(base):
+        raise HTTPException(status_code=400,
+                            detail="path is outside the allowed project roots")
     if not base.is_dir():
         raise HTTPException(status_code=400, detail="not a directory")
     dirs: list[str] = []
@@ -190,8 +246,11 @@ async def admin_browse(request: Request, path: str = "") -> dict[str, Any]:
                 parts.append(entry.name)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    # Don't offer an "up" link that steps outside the allowlisted roots — the
+    # follow-up browse would be rejected anyway.
+    parent = str(base.parent) if base.parent != base and _in_project_roots(base.parent) else None
     return {"path": str(base),
-            "parent": str(base.parent) if base.parent != base else None,
+            "parent": parent,
             "dirs": dirs[:500], "parts": parts[:500]}
 
 
@@ -388,6 +447,27 @@ async def admin_screenshot(sid: str, request: Request) -> Response:
                     headers={"Cache-Control": "no-store"})
 
 
+# Obvious secret shapes that may land in the gateway journal (auth headers,
+# CF Access tokens, env dumps). admin_logs redacts them before serving.
+_REDACT_JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\b")
+_REDACT_BEARER = re.compile(r"(Bearer\s+)\S+", re.IGNORECASE)
+_REDACT_CFAT = re.compile(r"\bcfat_[A-Za-z0-9_-]+\b")
+# ALL-CAPS env-style assignments ending in KEY/SECRET/TOKEN (uppercase-only so
+# ordinary words like "monkey=banana" never false-positive).
+_REDACT_ASSIGN = re.compile(
+    r"\b([A-Z_][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|KEY|SECRET|TOKEN))=([^\s]+)"
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip obvious credential shapes from journal output before serving it."""
+    text = _REDACT_JWT.sub("[REDACTED-JWT]", text)
+    text = _REDACT_BEARER.sub(r"\1[REDACTED]", text)
+    text = _REDACT_CFAT.sub("[REDACTED-CFAT]", text)
+    text = _REDACT_ASSIGN.sub(r"\1=[REDACTED]", text)
+    return text
+
+
 @admin_router.get("/logs")
 async def admin_logs(request: Request, lines: int = 200) -> PlainTextResponse:
     """Tail the gateway journal — remote debugging without SSH."""
@@ -401,7 +481,7 @@ async def admin_logs(request: Request, lines: int = 200) -> PlainTextResponse:
         ).stdout
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise HTTPException(status_code=503, detail=f"journalctl failed: {exc}") from exc
-    return PlainTextResponse(out or "(empty)")
+    return PlainTextResponse(_redact_secrets(out) if out else "(empty)")
 
 
 @app.get("/admin")
@@ -560,6 +640,14 @@ async def transfer_upload(
     file: UploadFile = File(...),
     path: str = Query(default="", description="relative path under the session home"),
 ) -> dict[str, Any]:
+    user = get_current_user(request)
+    uploads.enforce(user.email, "uploads")
+    # Chunked uploads carry no Content-Length, so enforce the byte cap BOTH
+    # up front (fast reject before a byte is buffered) and while streaming
+    # (unlinking the partial temp file on abort) — an unbounded stream to a
+    # host temp file lets any account fill the host disk.
+    cl = request.headers.get("content-length", "").strip()
+    cap = enforce_upload_size(int(cl) if cl.isdigit() else None)
     user, sess = _live_session_for(request)
     rel = _safe_rel(path or file.filename or "")
 
@@ -568,12 +656,21 @@ async def transfer_upload(
     size = 0
     with tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False) as tmp:
         tmp_path = Path(tmp.name)
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            tmp.write(chunk)
+        try:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > cap:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"upload too large — {cap // (1024 * 1024)} MiB max",
+                    )
+                tmp.write(chunk)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
     try:
         parent = str(Path("/home/user") / Path(rel).parent)
         if parent not in {"/home/user", "/home/user/."}:
@@ -666,7 +763,13 @@ def _nvidia_vram() -> dict[str, Any] | None:
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, Any]:
+async def healthz(request: Request) -> dict[str, Any]:
+    # /healthz is on the public allowlist for uptime probes — anonymous
+    # callers get a bare liveness result ONLY. Host memory/GPU/session
+    # telemetry and dev_mode stay behind auth (AuthMiddleware soft-attaches
+    # the user when valid credentials ride along on a public path).
+    if getattr(request.state, "user", None) is None:
+        return {"ok": True}
     mem_b = mem_available_bytes()
     mem_g = mem_available_gib()
     try:
@@ -713,8 +816,32 @@ app.include_router(deploy_router)
 app.include_router(releases_router)
 app.include_router(bucket_router)
 
+class _AdminGatedStatic(StaticFiles):
+    """admin.* portal assets are the privileged UI — never serve them to
+    standard users (any *.ua.edu account is auto-approved as role='user').
+    The mutations were already gated server-side; this keeps the admin UI
+    itself unreadable. /admin reads admin.html from disk and the admin's own
+    browser fetches admin.js here — both pass for role='admin'."""
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            name = (scope.get("path") or "").rsplit("/", 1)[-1]
+            if name.startswith("admin."):
+                state = scope.get("state") or {}
+                user = (
+                    state.get("user")
+                    if isinstance(state, dict)
+                    else getattr(state, "user", None)
+                )
+                if user is None or getattr(user, "role", "") != "admin":
+                    resp = PlainTextResponse("admin required", status_code=403)
+                    await resp(scope, receive, send)
+                    return
+        await super().__call__(scope, receive, send)
+
+
 if STATIC_DIR.is_dir():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    app.mount("/static", _AdminGatedStatic(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/", response_model=None)

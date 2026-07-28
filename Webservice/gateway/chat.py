@@ -22,8 +22,10 @@ from fastapi.responses import JSONResponse
 
 try:
     from .config import settings
+    from .limits import chat_messages
 except ImportError:  # allow `python -c 'import chat'` from package dir
     from config import settings  # type: ignore
+    from limits import chat_messages  # type: ignore
 
 log = logging.getLogger("chudware.gateway.chat")
 
@@ -224,6 +226,23 @@ def _user_from_ws(ws: WebSocket) -> tuple[str, str]:
     return str(email).strip().lower(), str(display).strip() or "user"
 
 
+_MAX_TEXT = 2000
+
+
+def _clean_text(text: str) -> str:
+    """Strip control characters and cap length BEFORE persisting.
+
+    The SQLite store is the durable artifact — today's frontend renders with
+    textContent, but history must never carry terminal escapes / bidi
+    overrides into a future renderer. Newlines and tabs survive; DEL and
+    C0/C1 controls do not. The 2000-char cap is enforced server-side.
+    """
+    cleaned = "".join(
+        ch for ch in text if ch in "\n\t" or (ord(ch) >= 0x20 and ord(ch) != 0x7F)
+    )
+    return cleaned[:_MAX_TEXT]
+
+
 def _event(kind: str, email: str, display: str, text: str = "", **extra: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": kind,
@@ -238,12 +257,14 @@ def _event(kind: str, email: str, display: str, text: str = "", **extra: Any) ->
 
 @router.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket) -> None:
+    # Identity comes ONLY from AuthMiddleware-populated scope state. A query
+    # param fallback here is a full impersonation primitive the moment the
+    # middleware is bypassed — never trust client-supplied identity.
+    if getattr(websocket.state, "user", None) is None:
+        await websocket.close(code=4401)
+        return
     await websocket.accept()
     email, display = _user_from_ws(websocket)
-    if not email:
-        # Dev / unauthenticated fallback: allow query params so tests work.
-        email = (websocket.query_params.get("email") or "").strip().lower()
-        display = (websocket.query_params.get("display") or email or "user").strip() or "user"
     if not email:
         await websocket.close(code=4401)
         return
@@ -275,8 +296,24 @@ async def ws_chat(websocket: WebSocket) -> None:
             text = text.strip()
             if not text:
                 continue
-            if len(text) > 2000:
-                text = text[:2000]
+            text = _clean_text(text)
+            if not text:
+                continue
+            if not chat_messages.check(email):
+                # Burst control: drop + notify in-band; do NOT tear down the
+                # socket for a chatty user (HTTPException has no meaning here).
+                await websocket.send_text(
+                    json.dumps(
+                        _event(
+                            "rate_limited",
+                            email,
+                            display,
+                            "too many messages — slow down",
+                        ),
+                        separators=(",", ":"),
+                    )
+                )
+                continue
             msg = await save_message(email, display, text)
             await hub.broadcast(msg)
     except WebSocketDisconnect:

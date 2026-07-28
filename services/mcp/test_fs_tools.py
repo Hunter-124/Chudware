@@ -210,6 +210,114 @@ def test_fs_glob_and_grep():
         assert not t["fs_grep"]("(", path=d)["ok"]  # invalid regex
 
 
+# --------------------------------------------------------------------------- near-miss recovery
+
+def test_fs_read_not_found_suggests_step_plus_sibling():
+    """Our own dual-format trap: CD-1102_MudBucket_OilRig.step does not exist but the
+    .step+ native container sits in that exact directory — the miss must suggest it in
+    did_you_mean AND in hint (a model that only reads hint still recovers)."""
+    t = _tools()
+    with tempfile.TemporaryDirectory() as d:
+        sibling = os.path.join(d, "CD-1102_MudBucket_OilRig.step+")
+        with open(sibling, "wb") as fh:
+            fh.write(b"PK\x03\x04" + b"\x00" * 100)
+        r = t["fs_read"](os.path.join(d, "CD-1102_MudBucket_OilRig.step"))
+        assert not r["ok"] and r["reason"] == "not_found"
+        assert r["did_you_mean"] and r["did_you_mean"][0] == sibling
+        assert "CD-1102_MudBucket_OilRig.step+" in r["hint"]
+
+
+def test_fs_read_not_found_suggests_misspelled_directory():
+    """A wrong folder NAME is diagnosed too: the parent chain is walked up to the nearest
+    existing ancestor and the first missing component is close-matched."""
+    t = _tools()
+    with tempfile.TemporaryDirectory() as d:
+        real_dir = os.path.join(d, "Model Step files")
+        os.makedirs(real_dir)
+        missing = os.path.join(d, "Model Step filez", "part.step")
+        r = t["fs_read"](missing)
+        assert not r["ok"] and r["reason"] == "not_found"
+        assert any(s.endswith("Model Step files") for s in r["did_you_mean"])
+
+
+def test_not_found_recovery_shared_by_list_glob_grep_edit():
+    """_near_misses is wired into every read-class not_found, not just fs_read."""
+    t = _tools()
+    with tempfile.TemporaryDirectory() as d:
+        sibling = os.path.join(d, "bracket.step+")
+        with open(sibling, "wb") as fh:
+            fh.write(b"PK\x03\x04" + b"\x00" * 32)
+        missing = os.path.join(d, "bracket.step")
+        for call in (
+            lambda: t["fs_list"](missing),
+            lambda: t["fs_glob"]("*", path=missing),
+            lambda: t["fs_grep"]("needle", path=missing),
+            lambda: t["fs_edit"](missing, "a", "b"),
+        ):
+            r = call()
+            assert not r["ok"] and r["reason"] == "not_found"
+            assert sibling in r["did_you_mean"] and sibling in r["hint"]
+
+
+def test_fs_read_not_found_in_unreadable_parent_still_clean():
+    """A huge/unreadable parent degrades to NO suggestions — never an exception."""
+    t = _tools()
+    with tempfile.TemporaryDirectory() as d:
+        locked = os.path.join(d, "locked")
+        os.makedirs(locked)
+        os.chmod(locked, 0o000)
+        try:
+            r = t["fs_read"](os.path.join(locked, "missing.txt"))
+            assert not r["ok"] and r["reason"] == "not_found"
+            assert not r.get("did_you_mean")
+        finally:
+            os.chmod(locked, 0o755)
+
+
+# --------------------------------------------------------------------------- CAD redirect
+
+def test_fs_read_step_plus_redirects_to_import_part():
+    """fs_read on a real .step+ (ZIP container) must not answer a useless binary_file —
+    it redirects to import_part + describe/measure/inspect, even with raw=True."""
+    t = _tools()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "CD-1102_MudBucket_OilRig.step+")
+        with open(p, "wb") as fh:
+            fh.write(b"PK\x03\x04" + b"\x00" * 64)
+        for kwargs in ({}, {"raw": True}):
+            r = t["fs_read"](p, **kwargs)
+            assert not r["ok"] and r["reason"] == "use_import_part"
+            assert "import_part" in r["hint"]
+            assert "describe_part" in r["hint"] and "measure_part" in r["hint"]
+
+
+def test_fs_read_text_step_redirects_but_raw_true_escapes():
+    """Plain-text B-rep exchange formats still redirect by default (the geometry reader
+    is the right tool), but an explicit raw=True proceeds with the normal text read."""
+    t = _tools()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "part.step")
+        with open(p, "w") as fh:
+            fh.write("ISO-10303-21;\nHEADER;\nENDSEC;\n")
+        r = t["fs_read"](p)
+        assert not r["ok"] and r["reason"] == "use_import_part"
+        assert "import_part" in r["hint"] and "raw=True" in r["hint"]
+        r2 = t["fs_read"](p, raw=True)
+        assert r2["ok"] and "ISO-10303-21" in r2["text"]
+
+
+def test_fs_read_dxf_mentions_wires_and_allows_raw():
+    t = _tools()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "plate.dxf")
+        with open(p, "w") as fh:
+            fh.write("0\nSECTION\n2\nENTITIES\n")
+        r = t["fs_read"](p)
+        assert not r["ok"] and r["reason"] == "use_import_part"
+        assert "import_part" in r["hint"] and "wires" in r["hint"] and "raw=True" in r["hint"]
+        assert t["fs_read"](p, raw=True)["ok"]
+
+
 # --------------------------------------------------------------------------- write / edit
 
 def test_fs_write_and_edit_safety():

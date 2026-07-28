@@ -37,6 +37,10 @@ def token() -> str:
         return os.environ["CF_API_TOKEN"]
     info = Path(__file__).resolve().parents[1] / "Cloudflare-info.txt"
     if info.exists():
+        # The file holds a LIVE API token; a group/world-readable copy means
+        # any local account can mint tunnels/DNS. Refuse rather than read it.
+        if info.stat().st_mode & 0o077:
+            sys.exit(f"{info} is group/world-readable — run: chmod 600 {info}")
         m = re.search(r"^(cfat_\S+)$", info.read_text(), re.M)
         if m:
             return m.group(1)
@@ -177,18 +181,24 @@ def sync_users(host: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hostname", default="chudware.com")
-    ap.add_argument("--emails", default="haedmonds69@gmail.com",
-                    help="comma-separated allowlist for the Access policy")
+    ap.add_argument("--emails", default=None,
+                    help="comma-separated allowlist for the Access policy (required; no default)")
     ap.add_argument("--sync-users", action="store_true",
                     help="only sync gateway/users.yaml emails into the Access policy")
     args = ap.parse_args()
     host = args.hostname
     zone_name = ".".join(host.split(".")[-2:])
-    emails = [e.strip() for e in args.emails.split(",") if e.strip()]
-
     if args.sync_users:
         sync_users(host)
         return
+    if not args.emails:
+        # No personal default: provisioning with an omitted allowlist would
+        # silently lock everyone out of the Access policy.
+        ap.error("--emails is required (comma-separated Access allowlist)")
+    emails = [e.strip() for e in args.emails.split(",") if e.strip()]
+    if not emails:
+        ap.error("--emails parsed to an empty allowlist")
+
     # 1. tunnel
     tunnels = api("GET", f"/accounts/{ACCOUNT_ID}/cfd_tunnel?is_deleted=false")
     tun = find(tunnels, "name", TUNNEL_NAME) or api(

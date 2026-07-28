@@ -1,12 +1,23 @@
-"""WS /admin/terminal — admin-only shared browser terminals running omp.
+"""WS /admin/terminal — admin-only browser terminals running omp.
 
 Sessions are backed by a persistent **tmux** server (socket ``$CHUDWARE_TMUX_SOCKET``,
 default ``chudware``) started inside its own systemd user scope, so:
 
   * they survive browser disconnects *and* gateway restarts (**saved**);
-  * multiple admins can attach to the same named session at once and see/drive
-    the same omp instance (**shared** + **concurrent**), which makes it easy to
-    keep track of the actual work in flight.
+  * several browser clients can attach to the same session at once and see/drive
+    the same omp instance (**concurrent**).
+
+Security model (this endpoint spawns a shell as the gateway account, so the
+default posture is paranoid):
+
+  * the whole terminal is behind ``settings.terminal_enabled`` (default OFF) —
+    every REST route 404s and the WebSocket closes immediately unless the
+    operator explicitly opted in;
+  * each session records its creating admin (tmux ``@chudware_owner``) and only
+    that admin — or anyone, when explicitly created with ``shared: true`` — may
+    attach or kill it;
+  * session identifiers are unguessable ``secrets.token_urlsafe(16)`` tokens;
+    the human label (``omp-N``) is display metadata, not the address.
 
 Each WebSocket is one tmux *client* (its own PTY). Closing a WebSocket only
 detaches that client — the session keeps running. Killing a session is explicit
@@ -15,8 +26,8 @@ session is destroyed (e.g. the shell exits).
 
 REST (all admin-only):
   GET    /api/admin/terminal/sessions          -> {tmux, sessions:[...]}
-  POST   /api/admin/terminal/sessions {name?}  -> {name}
-  DELETE /api/admin/terminal/sessions/{name}   -> {ok}
+  POST   /api/admin/terminal/sessions {label?, shared?} -> {name, id, ...}
+  DELETE /api/admin/terminal/sessions/{name}   -> {ok}   (name = id or label)
 
 Without tmux the gateway falls back to a private, ephemeral per-connection shell
 (the previous behaviour): still functional, just not shared or persistent.
@@ -31,6 +42,7 @@ import logging
 import os
 import pty
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -60,6 +72,22 @@ _DEFAULT_ROWS = 24
 _READ_SIZE = 65536
 _KILL_GRACE_S = 0.5
 
+# Sustained pty→browser throughput and burst allowance. A `cat /dev/urandom`
+# inside a terminal must not be able to saturate the gateway's uplink (the
+# gateway unit is also capped at MemoryMax=1G, so unbounded buffering is not an
+# option). 512 KiB/s is far above interactive terminal use; throttling applies
+# backpressure into the pty instead of dropping bytes.
+_OUT_RATE_BYTES = 512 * 1024
+_OUT_BURST_BYTES = 1024 * 1024
+
+# Resource ceilings for the systemd user scope that hosts the tmux server (and
+# the legacy fallback shell). The scope deliberately lives OUTSIDE the
+# gateway's MemoryMax=1G cgroup so a heavy build can't OOM-kill the gateway —
+# but without its own ceiling a runaway shell (fork bomb, memory hog) could
+# take the whole host down. 2 GiB / 2 CPUs is ample for omp + builds.
+_SCOPE_MEMORY_MAX = "2G"
+_SCOPE_CPU_QUOTA = "200%"
+
 # tmux backing --------------------------------------------------------------
 _TMUX = shutil.which("tmux")
 _SOCKET = (os.environ.get("CHUDWARE_TMUX_SOCKET") or "chudware").strip() or "chudware"
@@ -70,6 +98,9 @@ _NAME_RE = re.compile(r"[^a-z0-9-]+")
 _LS_FMT = (
     "#{session_name}\t#{session_windows}\t#{session_attached}"
     "\t#{session_created}\t#{session_activity}"
+    # Per-session ownership metadata (user options, empty when unset — i.e. on
+    # sessions created before ownership existed).
+    "\t#{@chudware_owner}\t#{@chudware_label}\t#{@chudware_shared}"
 )
 
 
@@ -184,7 +215,12 @@ def _session_exists(tmux_name: str) -> bool:
 
 
 def _list_sessions() -> list[dict[str, Any]]:
-    """Shared sessions in our pool, oldest first. Empty when no server/tmux."""
+    """All sessions in our pool, oldest first. Empty when no server/tmux.
+
+    Each entry carries the opaque ``id`` (the tmux session suffix), the human
+    ``label``, the creating admin's ``owner`` email ("" for pre-ownership
+    sessions), and the explicit ``shared`` opt-in flag.
+    """
     if not _TMUX:
         return []
     cp = _run_tmux("list-sessions", "-F", _LS_FMT)
@@ -205,9 +241,21 @@ def _list_sessions() -> list[dict[str, Any]]:
             except (TypeError, ValueError):
                 return 0
 
+        sid = _display(name)
+        owner = parts[5].strip() if len(parts) > 5 else ""
+        label = parts[6].strip() if len(parts) > 6 else ""
+        shared = (parts[7].strip() if len(parts) > 7 else "") == "1"
+        # Legacy sessions have no label option; their tmux suffix IS the label.
+        label = label or sid
         out.append(
             {
-                "name": _display(name),
+                # ``name`` mirrors ``label`` for the existing admin UI, which
+                # predates the id/label split.
+                "name": label,
+                "id": sid,
+                "label": label,
+                "owner": owner,
+                "shared": shared,
                 "windows": _int(parts[1]),
                 "clients": _int(parts[2]),
                 "created": _int(parts[3]),
@@ -218,22 +266,66 @@ def _list_sessions() -> list[dict[str, Any]]:
     return out
 
 
-def _next_name() -> str:
-    """Pick the lowest free ``omp-N`` display name."""
-    existing = {s["name"] for s in _list_sessions()}
+def _can_access(session: dict[str, Any], email: str) -> bool:
+    """May this admin attach to / kill this session?
+
+    Default deny across admins: only the creator — or every admin when the
+    session was explicitly created with ``shared: true``. Sessions created
+    before ownership existed have no recorded owner; treating them as shared
+    keeps running work reachable instead of silently locking admins out.
+    """
+    owner = str(session.get("owner") or "")
+    return not owner or owner == email or bool(session.get("shared"))
+
+
+def _resolve_session(name: str, email: str) -> dict[str, Any] | None:
+    """Find a session the caller may access, by opaque id OR by label.
+
+    Label lookup is a convenience for the admin UI (tabs remember labels); the
+    access check applies either way, so a guessed label never crosses admins.
+    """
+    want = (name or "").strip()
+    if not want:
+        return None
+    sessions = _list_sessions()
+    for key in ("id", "label"):
+        for sess in sessions:
+            if sess.get(key) == want and _can_access(sess, email):
+                return sess
+    return None
+
+
+def _mint_session_id() -> str:
+    """Unguessable opaque session identifier (tmux-name-safe alphabet)."""
+    return secrets.token_urlsafe(16)
+
+
+def _next_label(sessions: list[dict[str, Any]]) -> str:
+    """Pick the lowest free ``omp-N`` display label (label only — not the id)."""
+    existing = {str(s.get("label") or "") for s in sessions}
     i = 1
     while f"omp-{i}" in existing:
         i += 1
     return f"omp-{i}"
 
 
-def _create_session(tmux_name: str, cols: int, rows: int, repo: Path) -> None:
+def _create_session(
+    tmux_name: str,
+    cols: int,
+    rows: int,
+    repo: Path,
+    owner: str = "",
+    label: str = "",
+    shared: bool = False,
+) -> None:
     """Create a detached tmux session running omp in the repo.
 
     The very first session also starts the tmux server; that command is wrapped
     in a systemd user scope so the server (and every omp it hosts) lives outside
     the gateway's MemoryMax cgroup — a heavy build can't OOM-kill the gateway.
-    Later sessions attach to the existing server and inherit that scope.
+    The scope gets its OWN MemoryMax/CPUQuota ceilings so a runaway shell can't
+    OOM the whole host either. Later sessions attach to the existing server and
+    inherit that scope.
     """
     env = _child_env(repo)
     conf = Path(__file__).resolve().parent / "chudware-tmux.conf"
@@ -254,7 +346,18 @@ def _create_session(tmux_name: str, cols: int, rows: int, repo: Path) -> None:
     )
     scoped: list[str] | None = None
     if not _server_running() and shutil.which("systemd-run"):
-        scoped = ["systemd-run", "--user", "--scope", "--quiet", "--collect", *base]
+        scoped = [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "-p",
+            f"MemoryMax={_SCOPE_MEMORY_MAX}",
+            "-p",
+            f"CPUQuota={_SCOPE_CPU_QUOTA}",
+            *base,
+        ]
     cp = subprocess.run(  # noqa: S603
         scoped or base, env=env, capture_output=True, text=True, timeout=20, check=False
     )
@@ -276,6 +379,14 @@ def _create_session(tmux_name: str, cols: int, rows: int, repo: Path) -> None:
             detail = (cp.stderr or cp.stdout or "").strip()[-300:] or f"rc={cp.returncode}"
             raise RuntimeError(f"tmux session create failed: {detail}")
     target = f"={tmux_name}"
+    # Ownership metadata lives in tmux itself, so it survives gateway restarts
+    # exactly as long as the session it describes.
+    if owner:
+        _run_tmux("set-option", "-t", target, "@chudware_owner", owner)
+    if label:
+        _run_tmux("set-option", "-t", target, "@chudware_label", label)
+    if shared:
+        _run_tmux("set-option", "-t", target, "@chudware_shared", "1")
     # Clean full-screen omp for shared viewing; keep the session alive with zero
     # attached clients so work is never lost when everyone closes their browser.
     _run_tmux("set-option", "-t", target, "status", "off")
@@ -287,7 +398,14 @@ def _create_session(tmux_name: str, cols: int, rows: int, repo: Path) -> None:
     # Launch omp in the pane. send-keys buffers into the pane pty; bash reads it
     # at its first prompt, so no settle/injection dance is needed.
     _run_tmux("send-keys", "-t", target, _omp_cmd(), "Enter")
-    log.info("terminal session created name=%s repo=%s", _display(tmux_name), repo)
+    log.info(
+        "terminal session created id=%s label=%s owner=%s shared=%s repo=%s",
+        _display(tmux_name),
+        label,
+        owner or "(legacy)",
+        shared,
+        repo,
+    )
 
 
 def _kill_session(tmux_name: str) -> bool:
@@ -321,7 +439,9 @@ def _build_shell_argv(repo: Path) -> list[str]:
     """Argv for the fallback child process (post-pty.fork).
 
     Preferred: systemd-run --user --scope so the shell (and omp) live outside
-    the gateway's MemoryMax cgroup. Fallback: bare interactive login bash.
+    the gateway's MemoryMax cgroup — with its own MemoryMax/CPUQuota ceilings so
+    a runaway shell can't OOM the host either. Fallback: bare interactive login
+    bash.
     """
     if shutil.which("systemd-run"):
         return [
@@ -330,6 +450,10 @@ def _build_shell_argv(repo: Path) -> list[str]:
             "--scope",
             "--quiet",
             "--collect",
+            "-p",
+            f"MemoryMax={_SCOPE_MEMORY_MAX}",
+            "-p",
+            f"CPUQuota={_SCOPE_CPU_QUOTA}",
             f"--working-directory={repo}",
             "--",
             "/bin/bash",
@@ -459,7 +583,16 @@ async def _kill_child(pid: int, master_fd: int | None) -> int | None:
     return code
 
 
-# --- REST: shared session management ---------------------------------------
+# --- REST: session management ----------------------------------------------
+def _require_terminal() -> None:
+    """Kill switch. The terminal is an interactive shell as the gateway
+    account; a public-facing deployment must not carry it unless the operator
+    explicitly opted in (CHUDWARE_WEB_TERMINAL_ENABLED=1). 404 (not 403) so a
+    disabled deployment doesn't even confirm the route exists."""
+    if not settings.terminal_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
 def _require_admin(request: Request):
     user = get_current_user(request)
     if getattr(user, "role", None) != "admin":
@@ -469,48 +602,91 @@ def _require_admin(request: Request):
 
 @router.get("/api/admin/terminal/sessions")
 async def list_terminal_sessions(request: Request) -> dict[str, Any]:
-    _require_admin(request)
+    _require_terminal()
+    user = _require_admin(request)
+    email = getattr(user, "email", "") or ""
     loop = asyncio.get_running_loop()
     sessions = await loop.run_in_executor(None, _list_sessions)
-    return {"tmux": _TMUX is not None, "sessions": sessions}
+    # Each admin sees only their own sessions (+ explicit shared / legacy ones).
+    visible = [s for s in sessions if _can_access(s, email)]
+    return {"tmux": _TMUX is not None, "sessions": visible}
 
 
 @router.post("/api/admin/terminal/sessions")
 async def create_terminal_session(request: Request) -> dict[str, Any]:
-    _require_admin(request)
+    _require_terminal()
+    user = _require_admin(request)
     if not _TMUX:
         raise HTTPException(status_code=400, detail="tmux not available on host")
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
-    slug = _slug((body or {}).get("name") or "") if isinstance(body, dict) else ""
+    body = body if isinstance(body, dict) else {}
+    label = _slug(body.get("label") or body.get("name") or "")
+    # Explicit cross-admin sharing is opt-in per session; the default is
+    # owner-only.
+    shared = bool(body.get("shared"))
+    owner = getattr(user, "email", "") or ""
     loop = asyncio.get_running_loop()
-    if not slug:
-        slug = await loop.run_in_executor(None, _next_name)
-    tmux_name = _tmux_name(slug)
-    exists = await loop.run_in_executor(None, _session_exists, tmux_name)
-    if not exists:
-        try:
-            await loop.run_in_executor(
-                None, _create_session, tmux_name, _DEFAULT_COLS, _DEFAULT_ROWS, _repo_dir()
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("terminal session create failed: %s", exc)
-            raise HTTPException(status_code=500, detail=f"could not create session: {exc}")
-    return {"name": _display(tmux_name), "created": not exists}
+    sessions = await loop.run_in_executor(None, _list_sessions)
+    cap = max(1, settings.terminal_max_sessions)
+    if len(sessions) >= cap:
+        raise HTTPException(
+            status_code=409,
+            detail=f"terminal session cap reached ({cap}); kill a session first",
+        )
+    if not label:
+        label = _next_label(sessions)
+    # The addressable id is always freshly minted and unguessable; a requested
+    # name is only the human label, never the identifier.
+    tmux_name = ""
+    for _ in range(4):
+        candidate = _tmux_name(_mint_session_id())
+        if not await loop.run_in_executor(None, _session_exists, candidate):
+            tmux_name = candidate
+            break
+    if not tmux_name:
+        raise HTTPException(status_code=500, detail="could not mint a session id")
+    try:
+        await loop.run_in_executor(
+            None,
+            _create_session,
+            tmux_name,
+            _DEFAULT_COLS,
+            _DEFAULT_ROWS,
+            _repo_dir(),
+            owner,
+            label,
+            shared,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("terminal session create failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"could not create session: {exc}")
+    sid = _display(tmux_name)
+    return {
+        "name": label,
+        "id": sid,
+        "label": label,
+        "owner": owner,
+        "shared": shared,
+        "created": True,
+    }
 
 
 @router.delete("/api/admin/terminal/sessions/{name}")
 async def kill_terminal_session(name: str, request: Request) -> dict[str, Any]:
-    _require_admin(request)
+    _require_terminal()
+    user = _require_admin(request)
     if not _TMUX:
         raise HTTPException(status_code=400, detail="tmux not available on host")
-    slug = _slug(name)
-    if not slug:
-        raise HTTPException(status_code=400, detail="bad session name")
+    email = getattr(user, "email", "") or ""
     loop = asyncio.get_running_loop()
-    ok = await loop.run_in_executor(None, _kill_session, _tmux_name(slug))
+    sess = await loop.run_in_executor(None, _resolve_session, name, email)
+    if sess is None:
+        # Indistinguishable whether it's absent or owned by another admin.
+        raise HTTPException(status_code=404, detail="session not found")
+    ok = await loop.run_in_executor(None, _kill_session, _tmux_name(str(sess["id"])))
     return {"ok": ok}
 
 
@@ -546,6 +722,7 @@ def _write_layout(layout: dict[str, Any], by: str) -> float:
 
 @router.get("/api/admin/terminal/layout")
 async def get_terminal_layout(request: Request) -> dict[str, Any]:
+    _require_terminal()
     _require_admin(request)
     doc = _read_layout()
     return {"ok": True, "layout": doc["layout"], "mtime": doc["mtime"]}
@@ -553,6 +730,7 @@ async def get_terminal_layout(request: Request) -> dict[str, Any]:
 
 @router.put("/api/admin/terminal/layout")
 async def put_terminal_layout(request: Request) -> dict[str, Any]:
+    _require_terminal()
     user = _require_admin(request)
     try:
         body = await request.json()
@@ -571,6 +749,11 @@ async def put_terminal_layout(request: Request) -> dict[str, Any]:
 async def admin_terminal(ws: WebSocket) -> None:
     await ws.accept()
 
+    # Kill switch first: a disabled deployment doesn't even confirm the route.
+    if not settings.terminal_enabled:
+        await ws.close(code=4404)
+        return
+
     user = getattr(ws.state, "user", None)
     if user is None:
         await ws.close(code=4401)
@@ -578,28 +761,57 @@ async def admin_terminal(ws: WebSocket) -> None:
     if getattr(user, "role", None) != "admin":
         await ws.close(code=4403)
         return
+    email = getattr(user, "email", "") or ""
 
     cols, rows = _parse_size(ws)
     repo = _repo_dir()
     loop = asyncio.get_running_loop()
-    shared = _TMUX is not None
+    tmux_pool = _TMUX is not None
     tmux_name: str | None = None
+    landed_label = ""
     pid = -1
     master_fd = -1
     pump_task: asyncio.Task | None = None
     exit_code: int | None = None
     shell_died = False
+    idle_timed_out = False
+    # Idle deadline: any traffic in EITHER direction counts as activity. A
+    # forgotten browser tab must not pin a shell (and its tmux client) forever.
+    idle_timeout = max(30, int(settings.terminal_idle_timeout_sec))
+    last_activity = loop.time()
 
     try:
-        if shared:
-            req = _slug(ws.query_params.get("name") or "")
-            if not req:
-                req = await loop.run_in_executor(None, _next_name)
-            tmux_name = _tmux_name(req)
-            exists = await loop.run_in_executor(None, _session_exists, tmux_name)
-            if not exists:
+        if tmux_pool:
+            req = (ws.query_params.get("name") or "").strip()
+            sess = (
+                await loop.run_in_executor(None, _resolve_session, req, email)
+                if req
+                else None
+            )
+            if sess is not None:
+                tmux_name = _tmux_name(str(sess["id"]))
+                landed_label = str(sess.get("label") or sess["id"])
+            else:
+                # No accessible session by that id/label: create a NEW one owned
+                # by the caller (a requested name becomes only the label, so a
+                # guessed label can never hijack another admin's session).
+                sessions = await loop.run_in_executor(None, _list_sessions)
+                if len(sessions) >= max(1, settings.terminal_max_sessions):
+                    await ws.close(code=4429, reason="terminal session cap reached")
+                    return
+                label = _slug(req) or _next_label(sessions)
+                landed_label = label
+                tmux_name = ""
+                for _ in range(4):
+                    candidate = _tmux_name(_mint_session_id())
+                    if not await loop.run_in_executor(None, _session_exists, candidate):
+                        tmux_name = candidate
+                        break
+                if not tmux_name:
+                    await ws.close(code=1011)
+                    return
                 await loop.run_in_executor(
-                    None, _create_session, tmux_name, cols, rows, repo
+                    None, _create_session, tmux_name, cols, rows, repo, email, label, False
                 )
             await loop.run_in_executor(None, _ensure_scroll_defaults)
             pid, master_fd = await loop.run_in_executor(
@@ -617,12 +829,18 @@ async def admin_terminal(ws: WebSocket) -> None:
             pass
         return
 
-    # Tell the client which shared session it landed on (for tab labels).
-    if shared and tmux_name and ws.client_state == WebSocketState.CONNECTED:
+    # Tell the client which session it landed on (for tab labels). ``name``
+    # is the human label (what the UI displays and re-attaches with — label
+    # lookup is ownership-checked server-side); ``id`` is the opaque identifier.
+    if tmux_pool and tmux_name and ws.client_state == WebSocketState.CONNECTED:
         try:
             await ws.send_text(
                 json.dumps(
-                    {"type": "session", "name": _display(tmux_name)},
+                    {
+                        "type": "session",
+                        "name": landed_label or _display(tmux_name),
+                        "id": _display(tmux_name),
+                    },
                     separators=(",", ":"),
                 )
             )
@@ -630,7 +848,13 @@ async def admin_terminal(ws: WebSocket) -> None:
             pass
 
     async def pty_to_ws() -> None:
-        nonlocal exit_code, shell_died
+        nonlocal exit_code, shell_died, last_activity
+        # Token-bucket throttle: sustained _OUT_RATE_BYTES with a bounded burst.
+        # Sleeping applies backpressure into the pty (kernel buffer fills → the
+        # producer blocks), so `cat /dev/urandom` can't saturate the link and
+        # nothing unbounded ever buffers in the 1 GiB-capped gateway.
+        bucket = float(_OUT_BURST_BYTES)
+        bucket_ts = loop.time()
         try:
             while True:
                 data = await loop.run_in_executor(None, _read_pty, master_fd)
@@ -643,7 +867,17 @@ async def admin_terminal(ws: WebSocket) -> None:
                     break
                 if ws.client_state != WebSocketState.CONNECTED:
                     break
+                now = loop.time()
+                bucket = min(float(_OUT_BURST_BYTES), bucket + (now - bucket_ts) * _OUT_RATE_BYTES)
+                bucket_ts = now
+                n = float(len(data))
+                if n > bucket:
+                    await asyncio.sleep((n - bucket) / _OUT_RATE_BYTES)
+                    bucket = 0.0
+                else:
+                    bucket -= n
                 await ws.send_bytes(data)
+                last_activity = loop.time()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -654,16 +888,21 @@ async def admin_terminal(ws: WebSocket) -> None:
 
     try:
         # The tmux path launches omp itself; only the legacy shell needs injection.
-        if not shared:
+        if not tmux_pool:
             await _inject_omp(master_fd, loop)
         pump_task = asyncio.create_task(pty_to_ws(), name="term-pty-to-ws")
 
         while True:
             if pump_task.done():
                 break
+            remaining = last_activity + idle_timeout - loop.time()
+            if remaining <= 0:
+                idle_timed_out = True
+                break
             recv_task = asyncio.create_task(ws.receive(), name="term-ws-recv")
             done, pending = await asyncio.wait(
                 {pump_task, recv_task},
+                timeout=remaining,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if recv_task in pending:
@@ -672,6 +911,11 @@ async def admin_terminal(ws: WebSocket) -> None:
                     await recv_task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+            if not done:
+                # asyncio.wait timed out: no traffic in either direction for
+                # the whole idle window — drop the client.
+                idle_timed_out = True
+                break
             if pump_task in done:
                 if recv_task in done:
                     try:
@@ -687,6 +931,7 @@ async def admin_terminal(ws: WebSocket) -> None:
                 break
             if msg.get("type") == "websocket.disconnect":
                 break
+            last_activity = loop.time()
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
                 if data:
@@ -750,13 +995,14 @@ async def admin_terminal(ws: WebSocket) -> None:
                 pass
         if ws.client_state == WebSocketState.CONNECTED:
             try:
-                await ws.close()
+                await ws.close(code=4408 if idle_timed_out else 1000)
             except Exception:  # noqa: BLE001
                 pass
         log.info(
-            "terminal closed email=%s session=%s pid=%s exit=%s",
+            "terminal closed email=%s session=%s pid=%s exit=%s idle=%s",
             getattr(user, "email", "?"),
             _display(tmux_name) if tmux_name else "(private)",
             pid,
             exit_code,
+            idle_timed_out,
         )

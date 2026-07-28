@@ -119,7 +119,11 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             fmt = (fmt or "pdf").lower()
             if fmt not in ("pdf", "dxf"):
                 return _dumps({"ok": False, "error": f"fmt must be 'pdf' or 'dxf', got {fmt!r}"})
-            out_path = path or _tmp("." + fmt)
+            # A caller-supplied relative path resolves against the DAEMON's cwd, not
+            # the worker's project root, so the file silently lands somewhere the user
+            # will never find. Resolve before the payload crosses the process boundary.
+            out_path = (os.path.abspath(os.path.expanduser(path)) if path
+                        else _tmp("." + fmt))
             r = cb.call("export_drawing", {"doc_id": d, "path": out_path, "fmt": fmt})
             return _dumps({"ok": True, "doc_id": d, "format": fmt,
                            "path": r.get("path", out_path),

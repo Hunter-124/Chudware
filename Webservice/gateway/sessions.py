@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import secrets
 import tempfile
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,13 +18,35 @@ import httpx
 try:
     from .auth import User
     from .config import Settings, settings
+    from .limits import session_starts
 except ImportError:
     from auth import User
     from config import Settings, settings
+    from limits import session_starts
 
 log = logging.getLogger("chudware-web.sessions")
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+# AUDIT (CRITICAL, multi-tenant): _podman_run historically copied the HOST's
+# paid provider keys (ai_providers.env -> Firecrawl/Gemini/Moonshot/OpenRouter)
+# into every session container, where the seat owner reads them straight out of
+# the container environment (`podman exec env`). Sharing is now an explicit
+# operator opt-in, default OFF. config.py is owned by another workstream, so
+# the flag is read here with the same _env_bool pattern used there.
+_SHARE_PROVIDER_KEYS = os.environ.get(
+    "CHUDWARE_WEB_SHARE_PROVIDER_KEYS", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+if not _SHARE_PROVIDER_KEYS:
+    log.warning(
+        "AI provider keys withheld from session containers "
+        "(set CHUDWARE_WEB_SHARE_PROVIDER_KEYS=1 to share host keys into seats)"
+    )
+
+
+def _new_sid() -> str:
+    """Session ids are bearer handles in /stream/<sid>/ URLs; use full entropy."""
+    return secrets.token_urlsafe(24)
 
 
 def email_slug(email: str) -> str:
@@ -141,13 +164,22 @@ class SessionManager:
 
     async def reap_idle(self) -> list[str]:
         now = time.time()
-        timeout = self.cfg.idle_timeout_sec
+        idle_timeout = self.cfg.idle_timeout_sec
+        max_lifetime = self.cfg.max_session_lifetime_sec
         to_stop: list[str] = []
         async with self._lock:
             for sid, sess in list(self._sessions.items()):
                 if sess.status in {"stopped", "stopping", "error"}:
                     continue
-                if (now - sess.last_activity) > timeout:
+                # Absolute ceiling from creation: touch() fires on every proxied
+                # request/WS frame, so the idle timeout alone lets a user hold a
+                # seat forever by keeping the stream warm.
+                expired = (now - sess.created_at) > max_lifetime
+                if expired:
+                    log.info(
+                        "session %s hit max lifetime (%ds)", sid, max_lifetime
+                    )
+                if expired or (now - sess.last_activity) > idle_timeout:
                     to_stop.append(sid)
         stopped: list[str] = []
         for sid in to_stop:
@@ -184,7 +216,13 @@ class SessionManager:
         if sess:
             sess.touch()
 
-    def portal_payload(self, sess: Session | None, *, message: str | None = None) -> dict[str, Any]:
+    def portal_payload(
+        self,
+        sess: Session | None,
+        *,
+        message: str | None = None,
+        include_internals: bool = False,
+    ) -> dict[str, Any]:
         if sess is None:
             return {
                 "status": "none",
@@ -196,7 +234,7 @@ class SessionManager:
                 "message": message,
             }
         d = sess.to_dict()
-        return {
+        payload = {
             "status": d["status"],
             "sid": d["sid"],
             "stream_path": d["stream_path"],
@@ -204,9 +242,14 @@ class SessionManager:
             "heavy": d["heavy"],
             "error": d["error"],
             "message": message or d["error"],
-            "host_port": d["host_port"],
-            "container": d["container"],
         }
+        # host_port / container are routing internals: useful on the admin
+        # dashboard, but they tell a seat owner exactly how to reach the
+        # loopback-published port of every other seat.
+        if include_internals:
+            payload["host_port"] = d["host_port"]
+            payload["container"] = d["container"]
+        return payload
 
     async def _container_running(self, name: str) -> bool:
         rc, out, _ = await self.run_podman(
@@ -250,6 +293,19 @@ class SessionManager:
             if self.active_count() >= self.cfg.max_sessions:
                 raise SessionBusy(f"max sessions reached ({self.cfg.max_sessions})")
 
+            # Per-account seat cap: the global cap above is host capacity; this
+            # keeps one account from consuming the whole pool for itself.
+            user_active = sum(
+                1
+                for s in self._sessions.values()
+                if s.email == email and s.status in {"starting", "ready"}
+            )
+            if user_active >= self.cfg.max_sessions_per_user:
+                raise SessionBusy(
+                    "per-user session limit reached "
+                    f"({self.cfg.max_sessions_per_user})"
+                )
+
             avail = mem_available_gib()
             if avail is not None and avail < self.cfg.min_host_ram_gib:
                 raise SessionBusy(
@@ -257,10 +313,15 @@ class SessionManager:
                     f"need ≥{self.cfg.min_host_ram_gib})"
                 )
 
+            # Rate-limit start/stop churn — every fresh seat costs podman plus
+            # a healthcheck cycle. Keyed on the verified identity, never on
+            # client input.
+            session_starts.enforce(email, "session starts")
+
             want_heavy = bool(user.heavy) and self.heavy_count() < self.cfg.max_heavy
             slug = email_slug(email)
             host_port = self._alloc_port()
-            sid = uuid.uuid4().hex[:12]
+            sid = _new_sid()
             container = f"chudware-sess-{slug}"
             home = self.cfg.homes_dir / slug
             home.mkdir(parents=True, exist_ok=True)
@@ -463,14 +524,16 @@ class SessionManager:
                 env["CHUDWARE_DEFAULT_PROJECT"] = user.project
         if user.doc:
             env["CHUDWARE_OPEN_DOC"] = user.doc
-        # Shared remote-model provider credentials (host-owned file); per-user
-        # subscriptions live in the app's own Settings inside the HOME volume.
-        provider_vars = self.cfg.ai_provider_vars()
-        for k, v in provider_vars.items():
-            env.setdefault(k, v)
-        if provider_vars:
-            log.info("forwarding %d AI provider var(s) into %s",
-                     len(provider_vars), sess.container)
+        # Shared remote-model provider credentials (host-owned file). AUDIT:
+        # these are the HOST's paid keys; a seat owner can read its own
+        # container's environment, so forwarding is an explicit opt-in only.
+        if _SHARE_PROVIDER_KEYS:
+            provider_vars = self.cfg.ai_provider_vars()
+            for k, v in provider_vars.items():
+                env.setdefault(k, v)
+            if provider_vars:
+                log.info("forwarding %d AI provider var(s) into %s",
+                         len(provider_vars), sess.container)
         args: list[str] = [
             "run",
             "-d",

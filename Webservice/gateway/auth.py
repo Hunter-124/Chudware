@@ -25,6 +25,17 @@ log = logging.getLogger("chudware-web.auth")
 
 PUBLIC_PATHS = frozenset({"/healthz"})
 
+
+def _is_public_path(path: str) -> bool:
+    """Exact match, or a '<public>/' subpath — never a shared string prefix.
+
+    A bare startswith("/healthz") also passes /healthzFOO, silently skipping
+    auth on any route that happens to share the prefix.
+    """
+    return path in PUBLIC_PATHS or any(
+        path.startswith(p + "/") for p in PUBLIC_PATHS
+    )
+
 # Any email at these domains (or their subdomains) is auto-approved as a STANDARD user
 # (role="user", never admin) without needing an explicit users.yaml entry. University of
 # Alabama: ua.edu, crimson.ua.edu, and any *.ua.edu subdomain.
@@ -268,6 +279,20 @@ class AuthMiddleware:
     ) -> None:
         self.app = app
         self.cfg = cfg or settings
+        # Fail fast on a misconfigured production deploy: with neither CF
+        # Access nor the oauth2-proxy shared secret there is NO strong auth
+        # path at all — refuse to construct rather than run silently broken.
+        if (
+            not self.cfg.dev_mode
+            and not (self.cfg.cf_team_domain and self.cfg.cf_aud)
+            and not self.cfg.sso_shared_secret
+        ):
+            raise RuntimeError(
+                "no strong auth configured: set CHUDWARE_WEB_CF_TEAM_DOMAIN + "
+                "CHUDWARE_WEB_CF_AUD (Cloudflare Access) or "
+                "CHUDWARE_WEB_SSO_SHARED_SECRET (oauth2-proxy front door); "
+                "CHUDWARE_WEB_DEV=1 is for local development only"
+            )
         self.directory = directory or UserDirectory(self.cfg.users_file)
         self._jwks = jwks
         if not self.cfg.dev_mode and self.cfg.cf_team_domain:
@@ -279,9 +304,6 @@ class AuthMiddleware:
             return
 
         path = scope.get("path") or ""
-        if path in PUBLIC_PATHS or path.startswith("/healthz"):
-            await self.app(scope, receive, send)
-            return
 
         headers = {
             k.decode("latin-1").lower(): v.decode("latin-1")
@@ -295,6 +317,19 @@ class AuthMiddleware:
             for k, vals in parse_qs(raw_qs.decode("latin-1"), keep_blank_values=False).items():
                 if vals:
                     query[k.lower()] = vals[0]
+
+        if _is_public_path(path):
+            # Soft-auth: valid credentials riding along attach the user (so
+            # /healthz can serve its detailed body to admins), but anonymous
+            # callers are never denied on a public path.
+            try:
+                pub_user, _ = self._authenticate(headers, cookies, query)
+            except AuthError:
+                pub_user = None
+            if pub_user is not None:
+                self._attach_user(scope, pub_user)
+            await self.app(scope, receive, send)
+            return
 
         set_dev_cookie: str | None = None
         try:
@@ -322,20 +357,21 @@ class AuthMiddleware:
             await response(scope, receive, send)
             return
 
-        state = scope.setdefault("state", {})
-        if isinstance(state, dict):
-            state["user"] = user
-            state["user_email"] = user.email
-        else:
-            try:
-                state.user = user
-                state.user_email = user.email
-            except Exception:
-                scope["state"] = {"user": user, "user_email": user.email}
+        self._attach_user(scope, user)
 
         if set_dev_cookie and scope["type"] == "http":
+            # SameSite=Strict: the dev cookie must never ride a cross-site
+            # request. Secure everywhere EXCEPT plain-http localhost, where a
+            # Secure cookie would never be stored and local dev would break.
+            host = headers.get("host", "").split(":", 1)[0].strip("[]").lower()
+            local_http = scope.get("scheme") == "http" and host in {
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            }
+            secure = "" if local_http else "; Secure"
             cookie_val = (
-                f"dev_user={set_dev_cookie}; Path=/; HttpOnly; SameSite=Lax"
+                f"dev_user={set_dev_cookie}; Path=/; HttpOnly; SameSite=Strict{secure}"
             )
             cookie_header = (b"set-cookie", cookie_val.encode("latin-1"))
 
@@ -350,6 +386,20 @@ class AuthMiddleware:
             return
 
         await self.app(scope, receive, send)
+
+    @staticmethod
+    def _attach_user(scope, user: User) -> None:
+        """Populate scope state — the ONLY source of request identity downstream."""
+        state = scope.setdefault("state", {})
+        if isinstance(state, dict):
+            state["user"] = user
+            state["user_email"] = user.email
+        else:
+            try:
+                state.user = user
+                state.user_email = user.email
+            except Exception:
+                scope["state"] = {"user": user, "user_email": user.email}
 
     def _authenticate(
         self,

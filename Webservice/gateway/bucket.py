@@ -132,9 +132,9 @@ async def bucket_list(request: Request, dir: str = "", scope: str = "") -> dict[
         else:
             files.append({"name": p.name, "path": rel, "size": st.st_size,
                           "mtime": int(st.st_mtime)})
-    # "root" stays a key for client compatibility but is always the RELATIVE
-    # path of the jail root ("") — absolute host paths never leave the server.
-    return {"root": "", "dir": str(base.relative_to(root)) if base != root else "",
+    # Caller's OWN absolute jail root — same WASM client contract as
+    # /workspace/list (host/src/core/fs_backend.h).
+    return {"root": str(root), "dir": str(base.relative_to(root)) if base != root else "",
             "dirs": dirs[:5000], "files": files[:5000]}
 
 

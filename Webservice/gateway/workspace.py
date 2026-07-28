@@ -224,7 +224,11 @@ async def workspace_upload(
         target.unlink(missing_ok=True)
         raise
     log.info("workspace upload: %s (%d bytes) by %s", target, size, user.email)
-    return {"ok": True, "path": str(target.relative_to(root)), "bytes": size}
+    # abs_path is part of the WASM client contract (fs_backend.h): the client
+    # feeds it straight to the daemon's doc_open. It can only ever name a file
+    # inside this caller's own root.
+    return {"ok": True, "path": str(target.relative_to(root)),
+            "abs_path": str(target), "bytes": size}
 
 
 @router.post("/workspace/mkdir")

@@ -13,14 +13,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from pathlib import PurePosixPath
+from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 try:
     from .config import settings
+    from .limits import user_slug
     from .sessions import manager
 except ImportError:  # uvicorn app:app from package dir
     from config import settings
+    from limits import user_slug
     from sessions import manager
 
 log = logging.getLogger("chudware-web.engine")
@@ -60,6 +65,58 @@ def _inject_identity(line: str, email: str, display: str) -> str:
     params["user"] = {"id": email, "display": display}
     msg["params"] = params
     return json.dumps(msg, separators=(",", ":"))
+
+
+# Daemon RPCs address files by ABSOLUTE host path (host/src/core/fs_backend.h:
+# doc_open/doc_save/export_file take the same abs paths /workspace/list hands
+# out). The daemon is SHARED by every web user and resolves whatever path it is
+# handed, so the gateway is the only place per-account containment can be
+# enforced: without this check any authenticated user could doc_open another
+# account's part by guessing its path, defeating the /workspace isolation
+# entirely. Audit 2026-07-28, "engine bridge is a shared daemon pipe".
+_PATH_KEYS = frozenset({
+    "path", "src", "dst", "dest", "file", "filename", "out", "out_path",
+    "output", "output_path", "source", "target", "aicm_path", "export_path",
+    "doc_path", "save_path", "project_dir", "dir",
+})
+
+
+def _collect_paths(node: Any, found: list[str]) -> None:
+    """Gather every string sitting under a path-ish key, at any depth."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str) and key.lower() in _PATH_KEYS:
+                found.append(value)
+            else:
+                _collect_paths(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_paths(item, found)
+
+
+def path_violation(line: str, allowed_roots: list[PurePosixPath]) -> str | None:
+    """Return the offending path when an RPC addresses a file outside the caller's roots.
+
+    Only ABSOLUTE paths are checked: a relative path is resolved by the daemon
+    against its own working directory, never against another account's tree, so
+    it is not a cross-tenant vector. A non-JSON or path-free line is fine.
+    """
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return None
+    found: list[str] = []
+    _collect_paths(msg, found)
+    for raw in found:
+        if not raw or not raw.startswith("/"):
+            continue
+        # normpath, not resolve() — the path names a file on the daemon's host,
+        # may legitimately not exist yet (doc_save), and resolving would do
+        # filesystem I/O plus symlink following on the event loop.
+        candidate = PurePosixPath(os.path.normpath(raw))
+        if not any(candidate == root or root in candidate.parents for root in allowed_roots):
+            return raw
+    return None
 
 
 # Agent-turn RPCs may pin provider/model (and sometimes credentials) from the web
@@ -254,6 +311,16 @@ async def engine_ws(ws: WebSocket) -> None:
     log.info("engine bridge open: %s -> %s", user.email, sock)
     global _active_bridges
     _active_bridges += 1
+    # The absolute paths this caller may name in a daemon RPC: their own
+    # workspace + bucket trees, plus the shared scratch dirs the client uses for
+    # mesh/tess payloads (those carry no other account's data).
+    slug = user_slug(user.email)
+    allowed_roots = [
+        PurePosixPath(os.path.normpath(str(settings.user_workspace_root(slug)))),
+        PurePosixPath(os.path.normpath(str(settings.user_bucket_root(slug)))),
+        PurePosixPath("/dev/shm"),
+        PurePosixPath("/tmp"),
+    ]
 
     async def ws_to_daemon() -> None:
         max_frame = settings.ws_max_message_bytes
@@ -268,6 +335,26 @@ async def engine_ws(ws: WebSocket) -> None:
                 )
                 await ws.close(code=1009, reason="frame too large")
                 return
+            offender = path_violation(line, allowed_roots)
+            if offender is not None:
+                # Do NOT tear the socket down: one bad path is a client bug or a
+                # probe, and killing the bridge would lose the user's live
+                # document. Refuse this single call and keep the session up.
+                log.warning(
+                    "engine bridge %s: rejected out-of-jail path %r",
+                    user.email,
+                    offender,
+                )
+                try:
+                    call_id = json.loads(line).get("id")
+                except (ValueError, AttributeError):
+                    call_id = None
+                await ws.send_text(json.dumps(
+                    {"id": call_id,
+                     "error": {"code": -32001, "message": "path outside your workspace"}},
+                    separators=(",", ":"),
+                ))
+                continue
             # Cheap pre-filters (method sits near the front of the JSON-RPC line);
             # the helpers re-check the method properly before rewriting.
             head = line[:96]

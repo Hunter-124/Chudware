@@ -621,15 +621,17 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,
         ImVec4(pal.accentMid[0], pal.accentMid[1], pal.accentMid[2], pal.accentMid[3]));
     ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 6.0f * sc);
-    // Selectable draws its highlight with FrameRounding (default 0 = square). Match the
-    // popup's rounding so the hover box doesn't read as a hard-edged rectangle inside a
-    // rounded card.
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f * sc);
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * sc, 6.0f * sc));
+    // Horizontal padding MUST be 0: any nonzero value is dead space the row highlight can
+    // never paint over, which reads as "the highlight doesn't fill the box". Text stays
+    // inset via the default FramePadding (Selectable renders its label at bb.Min +
+    // FramePadding), so the look keeps breathing room while the hover fill bleeds
+    // edge-to-edge. Vertical padding stays so the first/last rows don't kiss the card's
+    // rounded corners.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 6.0f * sc));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * sc, 2.0f * sc));
     if (!ImGui::BeginPopup(popupId)) {
-        ImGui::PopStyleVar(5);
+        ImGui::PopStyleVar(4);
         ImGui::PopStyleColor(5);
         return;
     }
@@ -642,7 +644,7 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     auto copyRow = [&](const char* label, bool enabled, const std::string& text) {
         ImGui::BeginDisabled(!enabled);
         const bool clicked = ImGui::Selectable(label, false, ImGuiSelectableFlags_None,
-                                               ImVec2(ImGui::GetContentRegionAvail().x, 0.0f));
+                                               ImVec2(ImGui::GetWindowContentRegionMax().x, 0.0f));
         ImGui::EndDisabled();
         if (clicked) {  // BeginDisabled already keeps a disabled row from ever registering one
             chatCopyToClipboard(text);
@@ -656,7 +658,7 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     copyRow("Copy text", !copyText.empty(), copyText);
     copyRow("Copy all", !all.empty(), all);
     ImGui::EndPopup();
-    ImGui::PopStyleVar(5);
+    ImGui::PopStyleVar(4);
     ImGui::PopStyleColor(5);
 }
 

@@ -336,8 +336,9 @@ class TestWorkspaceApi:
         body = resp.json()
         assert body["path"] == "parts/imported.stl" and body["bytes"] == 7
         assert (workspace / "parts" / "imported.stl").read_bytes() == b"solid x"
-        # Absolute host paths never leave the server (tenant isolation).
-        assert "abs_path" not in body
+        # abs_path is returned for the WASM client's doc_open, but it must name
+        # a file inside this caller's own per-account tree (tenant isolation).
+        assert Path(body["abs_path"]) == workspace / "parts" / "imported.stl"
 
     def test_traversal_rejected(self, workspace, client):
         for bad in ("../secrets", "..", "a/../../b"):

@@ -242,15 +242,26 @@ def test_workspace_disk_quota_enforced(client, monkeypatch):
     assert r.status_code == 507
 
 
-def test_workspace_responses_do_not_leak_host_paths(client):
+def test_workspace_paths_stay_inside_the_callers_own_root(client):
+    """Absolute paths ARE returned — the WASM client needs them to drive
+    doc_open (host/src/core/fs_backend.h) — but they may only ever name the
+    caller's own tree, never the shared root and never another account's."""
+    mine = _ws_user_root("alice@crimson.ua.edu")
+    theirs = _ws_user_root("bob@crimson.ua.edu")
+
     r = _upload_ws(client, A)
     assert r.status_code == 200
-    assert "abs_path" not in r.json()
+    abs_path = Path(r.json()["abs_path"])
+    assert abs_path.is_relative_to(mine)
+    assert not abs_path.is_relative_to(theirs)
+
     listing = client.get("/workspace/list", headers=A).json()
-    assert listing["root"] == ""
+    assert Path(listing["root"]) == mine
+    # A standard user must never be handed the shared legacy root itself, and
+    # no other account's tree may appear in any payload.
     for payload in (r.text, client.get("/workspace/list", headers=A).text):
-        assert str(settings.workspace_root) not in payload
-        assert "/home/" not in payload
+        assert f'"{settings.workspace_root}"' not in payload
+        assert str(theirs) not in payload
 
 
 def test_files_aicm_cannot_read_across_tenants(client):
@@ -278,7 +289,7 @@ def test_bucket_upload_is_invisible_to_other_user(client):
 
     listing = client.get("/api/bucket/list", headers=B).json()
     assert all(f["name"] != "notes.txt" for f in listing["files"])
-    assert listing["root"] == ""
+    assert Path(listing["root"]) == _bucket_user_root("bob@crimson.ua.edu")
 
     r = client.get("/api/bucket/download", params={"path": "notes.txt"}, headers=B)
     assert r.status_code == 404

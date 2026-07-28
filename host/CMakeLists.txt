@@ -97,6 +97,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/cards.cpp              # plan/clarify/corporate/swarm cards + AI-VC
   src/ui/copilot/feed.cpp               # feedTurnActivity stream-event folding
   src/ui/copilot/conversations.cpp      # conversation tabs + chat-history persistence
+  src/ui/copilot/conv_ids.cpp           # session-id allocation (GL-free; unit-tested)
   src/ui/copilot/settings.cpp           # AI settings sections + model dropdown
   src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
@@ -502,6 +503,21 @@ add_test(NAME test_re_points
   COMMAND test_re_points
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end RE-21 ---
+
+# --- copilot session-id allocation: links the REAL conv_ids.cpp (no GL / imgui / AppState).
+# Guards the restart-collision data loss: convCounter restarted at 0 every launch and
+# re-issued c1, c2, c3… over the transcripts already on disk.
+add_executable(test_conv_ids
+  src/ui/copilot/conv_ids.cpp
+  tests/test_conv_ids.cpp)
+target_include_directories(test_conv_ids PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_conv_ids PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_conv_ids
+  COMMAND test_conv_ids
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end session-id allocation ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD

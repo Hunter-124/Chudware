@@ -4077,6 +4077,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         job.errorDetail.clear();
         job.errorHuman.clear();
         st.addLog("[..] run result discarded (stopped by user)");
+        // The success path persists at the end of its branch (line ~4693, under this same
+        // lock); this one never did, so a stopped run's settled transcript lived only in
+        // memory until some later unrelated save. "I stopped it and closed the app" must
+        // not be the one way to lose a conversation.
+        ui::persistChatHistory(st);
       } else {
         // --- C22b: if this was a v2 run, resync the DocMirror tree + reload
         // mesh --- The worker already rebuilt the doc; call doc_rebuild to

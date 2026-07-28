@@ -9,6 +9,11 @@
 #include "ui/ai/ai_workspace.h"  // ui::agentDagToJson / agentDagFromJson — persist the live
                                  // agent-execution DAG with the active session's artifacts.
 
+#include "conv_ids.h"  // session-id allocation (GL-free TU, unit-tested in host/tests)
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
+
 // Defined in feed.cpp — consumes the routing fields stashed by feedTurnActivity's
 // task_route/agent.classification/complexity branch (feedTurnActivity only sees a ChatMsg;
 // the GL draw path applies the assessment to the active Conversation here).
@@ -347,7 +352,30 @@ std::string convDocKey(AppState& st) {
     return d.empty() ? std::string("scratch") : ("doc:" + d);
 }
 
-std::string newConvId(AppState& st) { return "c" + std::to_string(++st.convCounter); }
+// Keep the id source ahead of an id we just took in from disk. st.convCounter starts at 0
+// EVERY launch, so without this a second run handed out c1, c2, c3… straight on top of the
+// c3/c7/c8 transcripts already on disk — and a colliding session was then silently dropped
+// by persistChatHistory's writtenIds guard (the user's session "vanished" after a restart)
+// or written over the older one's file (an archived "Knurled hex standoff" that actually
+// held a mudbucket transcript). Ids must be unique for the life of the store, not the run.
+static void noteConvIdSeen(AppState& st, const std::string& id) {
+    st.convCounter = std::max(st.convCounter, ui::convIdOrdinal(id));
+}
+
+// A session id no resident conversation and no transcript on disk is using. The on-disk
+// probe matters because a session can be archived out of the index yet still own its file.
+std::string newConvId(AppState& st) {
+    std::vector<std::string> taken;
+    taken.reserve(st.conversations.size());
+    for (const auto& c : st.conversations) taken.push_back(c.id);
+    return ui::nextFreeConvId(
+        st.convCounter, taken,
+        [](const std::string& id, void*) {
+            std::error_code ec;
+            return std::filesystem::exists(chatSessionFilePath(id), ec);
+        },
+        nullptr);
+}
 
 // Guarantee the CURRENTLY VIEWED conversation exists, adopting whatever is already in st.chat.
 // Additive: never clears other resident conversations (other doc keys, or idle same-doc
@@ -430,7 +458,16 @@ void persistChatHistory(AppState& st) {
         // Fresh sessions (no messages, no queue, no run, no draft) are never written — same
         // rule as empty parts never autosaving.
         if (conversationIsFresh(st, i) && !sessionHasDraft(st.conversations[i].id)) continue;
-        if (!writtenIds.insert(st.conversations[i].id).second) continue;
+        // A duplicate id used to `continue` here, silently throwing the whole transcript
+        // away — the exact data loss this guard was meant to prevent. Re-key the session
+        // instead: it keeps its content, gets its own file, and the collision is logged.
+        if (!writtenIds.insert(st.conversations[i].id).second) {
+            const std::string clashed = st.conversations[i].id;
+            st.conversations[i].id = newConvId(st);
+            writtenIds.insert(st.conversations[i].id);
+            st.addLog("[chat] duplicate session id '" + clashed + "' re-keyed to '" +
+                      st.conversations[i].id + "' (transcript kept)");
+        }
         if (i == st.activeConv) activeId = st.conversations[i].id;
         // One serializer, used for the live transcript AND for any revert branches parked
         // on this session — a branch is real conversation history and must round-trip
@@ -737,6 +774,9 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
     {
         Conversation c;
         c.id = jc.value("id", newConvId(st));
+        // Every id that comes back from disk pushes the allocator past it, so the next
+        // "+ New session" cannot land on a transcript that already exists.
+        noteConvIdSeen(st, c.id);
         c.title = jc.value("title", std::string("Chat"));
         c.docLink = docLink;
         c.scopeClass = jc.value("scope", -1);  // legacy sessions omit the key

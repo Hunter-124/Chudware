@@ -5148,3 +5148,26 @@ concurrent tab close shifted, so the activation was dropped as "stale" after the
 already cleared the old mesh — it re-resolves the index by docId now. Pre-existing and NOT
 touched: 13 `services/mcp` failures (recon risk-deny env, verify_battery, ecad sim,
 parts dialect, `org` tool family) reproduce identically with these changes stashed.
+
+Composer Alt+Enter (2026-07-28). "alt+enter in the prompt input box doesn't add a new line" —
+two defects stacked, and the second is why suppressing the first alone would not have shown a
+fix. (1) The submit chord excluded only Shift, so Alt+Enter SENT the turn while the multiline
+widget had already inserted a break behind it. A bare Enter submits now, and so does
+Ctrl+Enter — which ImGui's multiline treats as "validate" and never turns into a line break,
+except in slash mode where CtrlEnterForNewLine flips that, so the guard drops Ctrl there. The
+slash-menu accept was fixed the same way: a modified Enter must fall through to the input
+instead of silently completing a command the user was done typing. (2) The break still would
+not have survived. The composer word-wraps by hand (InputTextMultiline does not wrap, so long
+lines ran off the box) by swapping ' ' <-> '\n' IN PLACE — same length, so the active widget's
+caret stays valid — and step one of that wrap flattens EVERY '\n' back to a space to reflow
+from an idempotent source. The user's break was erased on their next keystroke. A '\n' carries
+no marker saying who put it there and the same-length invariant forbids adding one, so the
+offsets the user broke at now live out-of-band in `ui::copilot::WrapState`, keyed by the
+backing buffer, shifted across each edit and claimed from each insertion (Alt/Shift+Enter or a
+multi-line paste). The wrapper reflows around them; `composerText` flattens SOFT breaks only,
+so a hard break reaches the model verbatim while emptiness is still judged on the text around
+it. That bookkeeping is the subtle part, so it is GL-free in its own TU
+(`host/src/ui/copilot/text_wrap.{h,cpp}`) and the ctest `test_text_wrap` LINKS it: typed
+break claimed, inserts/deletes before and after it, backspacing the break, a selection delete
+spanning one break of two, multi-line paste, the wrapper's own same-length swap inventing
+nothing, external re-seed, sortedness.

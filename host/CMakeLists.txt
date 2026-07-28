@@ -99,6 +99,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/conversations.cpp      # conversation tabs + chat-history persistence
   src/ui/copilot/conv_ids.cpp           # session-id allocation (GL-free; unit-tested)
   src/ui/copilot/agent_text.cpp         # doc-id + atlas-glyph text sanitizers (GL-free; unit-tested)
+  src/ui/copilot/text_wrap.cpp          # composer hard-break tracking (GL-free; unit-tested)
   src/ui/copilot/settings.cpp           # AI settings sections + model dropdown
   src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
@@ -538,6 +539,23 @@ add_test(NAME test_agent_text
   COMMAND test_agent_text
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end agent-authored text sanitizers ---
+
+# --- composer hard-break tracking (GL-free) ---
+# Guards the bug where Alt/Shift+Enter appeared to do nothing: the composer's hand-rolled word
+# wrapper flattens every '\n' to reflow from an idempotent source, so a break the user typed
+# was erased on their next keystroke. The offsets live out-of-band and must survive inserts,
+# deletes and pastes elsewhere in the buffer — that shifting is what this test pins down.
+add_executable(test_text_wrap
+  src/ui/copilot/text_wrap.cpp
+  tests/test_text_wrap.cpp)
+target_include_directories(test_text_wrap PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_text_wrap PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_text_wrap
+  COMMAND test_text_wrap
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end composer hard-break tracking ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD

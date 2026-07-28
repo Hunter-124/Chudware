@@ -8,25 +8,37 @@
 #include "copilot_internal.h"
 #include "ui/provider_usage.h"   // THE subscription-usage poller behind the prelude's limit rings
 #include "ui/provider_logos.h"   // brand mark for the model chip (same art as Settings->Providers)
+#include "ui/copilot/text_wrap.h"   // hard-break bookkeeping the rewrapper must not eat
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
 // ImGui's InputTextMultiline does NOT word-wrap (it renders with wrap_width=0, so long lines
 // extend past the box and get clipped — "run off the screen"). So we maintain the wrapping
-// ourselves: rewrapInPlace toggles spaces<->newlines so every visual line fits within wrapW.
+// ourselves: rewrapCore toggles spaces<->newlines so every visual line fits within wrapW.
 // It is SAME-LENGTH (only swaps ' ' <-> '\n'), so cursor indices in the active widget stay
-// valid. The box then grows by counting the newlines. Enter submits; Shift+Enter inserts a
-// soft break that the next rewrap reflows (a prompt rarely needs hard line breaks).
-bool rewrapInPlace(char* buf, int len, float wrapW) {
+// valid. The box then grows by counting the newlines. A bare Enter submits; Shift/Alt+Enter
+// insert a HARD break.
+//
+// Hard breaks have to be tracked out-of-band. The rewrapper's first step flattens every '\n'
+// back to a space so the text can reflow from an idempotent source — which also erased the
+// line breaks the user typed the moment they pressed the next key (live 2026-07-28:
+// "alt+enter doesn't add a new line"). A '\n' carries no marker saying who put it there, and
+// the same-length invariant forbids adding one, so the offsets the USER broke at are kept per
+// buffer in g_wrap and shifted by each edit. Everything else in the buffer is ours to reflow.
+bool rewrapCore(char* buf, int len, float wrapW, const std::vector<int>* hard) {
     if (len <= 0 || wrapW <= 1.0f) return false;
     bool changed = false;
-    // 1) flatten every existing newline back to a space — an idempotent source to re-wrap from
-    //    (so widening the box reflows the text instead of leaving stale breaks).
+    const auto isHard = [&](int i) {
+        return hard && std::binary_search(hard->begin(), hard->end(), i);
+    };
+    // 1) flatten our own newlines back to spaces; leave the user's breaks standing.
     for (int i = 0; i < len; ++i)
-        if (buf[i] == '\n') { buf[i] = ' '; changed = true; }
+        if (buf[i] == '\n' && !isHard(i)) { buf[i] = ' '; changed = true; }
     // 2) greedy word-wrap: break at the last space that keeps the running line within wrapW.
+    //    A hard break ends its visual line, so measuring restarts after it.
     int lineStart = 0, lastSpace = -1;
     float lineW = 0.0f;
     for (int i = 0; i < len; ++i) {
+        if (buf[i] == '\n') { lineStart = i + 1; lastSpace = -1; lineW = 0.0f; continue; }
         float cw = ImGui::CalcTextSize(buf + i, buf + i + 1).x;
         if (lineW + cw > wrapW && lastSpace >= lineStart) {
             buf[lastSpace] = '\n';
@@ -40,12 +52,23 @@ bool rewrapInPlace(char* buf, int len, float wrapW) {
     }
     return changed;
 }
+// Plain soft wrap, for callers with no editing caret (transcript rendering in ui_common).
+bool rewrapInPlace(char* buf, int len, float wrapW) {
+    return rewrapCore(buf, len, wrapW, nullptr);
+}
 namespace {
+using ui::copilot::WrapState;
+using ui::copilot::seedHardBreaks;
+using ui::copilot::noteEdit;
 struct ChatInputCb {
     float wrapW = 0.0f;
     bool  interceptHistory = false;  // slash menu open — eat Up/Down for menu nav
     int*  navDelta = nullptr;        // -1 Up / +1 Down when interceptHistory
+    WrapState* wrap = nullptr;       // hard-break bookkeeping for this input's buffer
 };
+// Keyed by the backing buffer, which every caller has (drawChatInput takes it, composerText
+// reads st.prompt). A vector reallocation just yields a fresh entry, which re-seeds below.
+std::unordered_map<const char*, WrapState> g_wrap;
 // Set by drawComposer when the slash autocomplete is open so drawChatInput routes Up/Down
 // to the menu instead of moving the caret. Clarify cards (cards.cpp) leave this false.
 bool g_slashMenuActive = false;
@@ -76,7 +99,11 @@ int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
         }
     }
     if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
-        if (rewrapInPlace(data->Buf, data->BufTextLen, cb->wrapW))
+        // Order matters: classify the edit against the PRE-rewrap buffer, so a newline the
+        // user just typed is claimed as theirs before the wrapper is allowed to touch it.
+        if (cb->wrap) noteEdit(*cb->wrap, data->Buf, data->BufTextLen, data->CursorPos);
+        if (rewrapCore(data->Buf, data->BufTextLen, cb->wrapW,
+                       cb->wrap ? &cb->wrap->hard : nullptr))
             data->BufDirty = true;   // same length, so BufTextLen/CursorPos are unchanged
     }
     return 0;
@@ -99,8 +126,14 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     // We can't read ImGui's active id (internal API), so track per-id active state across frames.
     static std::unordered_map<ImGuiID, bool> s_activeLast;
     ImGuiID wid = ImGui::GetID(id);
-    if (!s_activeLast[wid])
-        rewrapInPlace(buf.data(), (int)std::strlen(buf.data()), wrapW);
+    WrapState& ws = g_wrap[buf.data()];
+    const int curLen = (int)std::strlen(buf.data());
+    if (!s_activeLast[wid]) {
+        // Idle: a length change can only have come from outside (chip, slash insert, clear),
+        // and any newline in that text was put there deliberately — re-seed from it.
+        if (curLen != ws.lastLen) seedHardBreaks(ws, buf.data(), curLen);
+        rewrapCore(buf.data(), curLen, wrapW, &ws.hard);
+    }
 
     int rows = 1;
     for (const char* p = buf.data(); *p; ++p) if (*p == '\n') ++rows;
@@ -112,6 +145,7 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     cb.wrapW = wrapW;
     cb.interceptHistory = g_slashMenuActive;
     cb.navDelta = &g_slashNavDelta;
+    cb.wrap = &ws;
     ImGuiInputTextFlags flags = ImGuiInputTextFlags_CallbackEdit |
                                 ImGuiInputTextFlags_CallbackAlways;
     if (g_slashMenuActive) {
@@ -122,9 +156,16 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
         ImVec2(rightReserve > 0.0f ? -rightReserve : -1.0f, h),
         flags, chatInputEditCallback, &cb);
     s_activeLast[wid] = ImGui::IsItemActive();
-    // Enter sends, Shift+Enter does not. Detect the KEY (not a trailing '\n') so a newline the
-    // rewrap just inserted can never be mistaken for a submit.
-    bool submit = ImGui::IsItemFocused() && !ImGui::GetIO().KeyShift &&
+    // A BARE Enter sends; so does Ctrl+Enter, which ImGui's multiline treats as "validate"
+    // and never turns into a line break. Shift/Alt+Enter are newlines: the widget inserts one
+    // itself, so counting them as a submit shipped the message AND left a stray break behind
+    // (live 2026-07-28: Alt+Enter sent the prompt instead of breaking the line). Detect the
+    // KEY, not a trailing '\n', so a newline the rewrap just inserted is never read as submit.
+    const ImGuiIO& kio = ImGui::GetIO();
+    // In slash mode CtrlEnterForNewLine is set, so there Ctrl+Enter is a break, not a validate.
+    const bool sendChord = !kio.KeyShift && !kio.KeyAlt && !kio.KeySuper &&
+                           !(kio.KeyCtrl && g_slashMenuActive);
+    bool submit = ImGui::IsItemFocused() && sendChord &&
                   ImGui::IsKeyPressed(ImGuiKey_Enter, false);
     if (buf[0] == 0 && placeholder && placeholder[0]) {
         ImVec2 mn = ImGui::GetItemRectMin();
@@ -961,9 +1002,12 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar(3);
 
-    // Enter or Tab accepts the highlighted row (do not submit the turn).
+    // A bare Enter (or Tab) accepts the highlighted row; the turn is not submitted. A modified
+    // Enter is the user asking for a line break, so it must fall through to the input instead
+    // of silently completing a command they were done typing.
+    const ImGuiIO& sio = ImGui::GetIO();
     if (!accepted && !s_slash.matches.empty() &&
-        ((ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !ImGui::GetIO().KeyShift) ||
+        ((ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !sio.KeyShift && !sio.KeyAlt) ||
          ImGui::IsKeyPressed(ImGuiKey_Tab, false))) {
         accepted = true;
         acceptText = s_slash.matches[(size_t)s_slash.selected].insert;
@@ -3172,17 +3216,27 @@ static void requestStopRun(AppState& st) {
     maybePersistChatHistoryDebounced(st, /*force=*/true);
 }
 
-// The composer buffer, flattened and trimmed — the ONE definition of "is there a message".
-// rewrapInPlace toggles spaces<->newlines as the user types, so a buffer holding nothing but
+// The composer buffer, unwrapped and trimmed — the ONE definition of "is there a message".
+// The rewrapper toggles spaces<->newlines as the user types, so a buffer holding nothing but
 // whitespace still satisfied `prompt[0] != 0` and Enter shipped an empty user bubble to the
 // model (live 2026-07-28: three blank "You" turns in a row). Every send / queue / steer path
-// gates on this instead, and it doubles as the soft-break flattener on the way out.
+// gates on this instead, and it doubles as the soft-break flattener on the way out — SOFT
+// only: a break the user typed with Alt/Shift+Enter is part of their message and survives
+// into the prompt, while emptiness is still judged on the text around those breaks.
 static std::string composerText(const AppState& st) {
-    std::string out(st.prompt.empty() ? "" : st.prompt.data());
-    for (auto& c : out) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-    const size_t b = out.find_first_not_of(' ');
+    if (st.prompt.empty()) return {};
+    std::string out(st.prompt.data());
+    const auto it = g_wrap.find(st.prompt.data());
+    const std::vector<int>* hard = it == g_wrap.end() ? nullptr : &it->second.hard;
+    for (size_t i = 0; i < out.size(); ++i) {
+        char& c = out[i];
+        if (c == '\n' && hard && std::binary_search(hard->begin(), hard->end(), (int)i))
+            continue;
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    }
+    const size_t b = out.find_first_not_of(" \n");
     if (b == std::string::npos) return {};
-    return out.substr(b, out.find_last_not_of(' ') - b + 1);
+    return out.substr(b, out.find_last_not_of(" \n") - b + 1);
 }
 
 // The send/stop control, drawn INSIDE the message input box at its bottom-right (flagship

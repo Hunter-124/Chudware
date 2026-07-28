@@ -4,6 +4,7 @@
 // stick-to-bottom autoscroll. Card/timeline bodies live in cards.cpp / activity_timeline.cpp.
 
 #include "copilot_internal.h"
+#include "agent_text.h"
 
 namespace ui {
 
@@ -391,6 +392,22 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& turnSurf = chatSurf();
     const float sc = ui::uiScale;
+
+    // The assistant bubble is the largest patch of text the copilot did NOT author in C++:
+    // raw model prose, where an arrow renders as "?" (the atlas stops at U+2027) and a doc
+    // id the model quotes back reads as "doc-cpp00000039" instead of the part's name. Both
+    // sanitizers are idempotent with a no-op fast path, and m.text is mutated in place, so
+    // the cost is paid once per message rather than per frame — and the persisted transcript
+    // and the Copy action carry the cleaned text too.
+    if (!m.text.empty()) {
+        std::string clean = ui::substituteDocIds(m.text, [&st](const std::string& id) {
+            for (const auto& t : st.docTabs)
+                if (t.docId == id) return t.displayTitle();
+            return std::string();
+        });
+        clean = ui::foldToAtlasGlyphs(clean);
+        if (clean != m.text) m.text = std::move(clean);
+    }
 
     // Author label. Each card that CAN host it (prose / partial / error) draws the
     // model+age INSIDE itself as the top row (first card wins via metaDrawn).

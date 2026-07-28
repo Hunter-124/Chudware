@@ -91,6 +91,19 @@ int levenshtein(const std::string& a, const std::string& b) {
     return prev[m];
 }
 
+// The words a model reaches for when it means "remove material". None of them is an op;
+// every one of them is add_feature + params.mode:"cut". Keep in lockstep with
+// services/mcp/op_registry.py::_REMOVAL_WORDS.
+bool is_removal_word(const std::string& q) {
+    static const char* kWords[] = {
+        "cut", "pocket", "subtract", "remove", "difference", "hollow_out", "mill",
+        "carve", "excavate", "recess", "cutout", "cut_out", "notch",
+    };
+    for (const char* w : kWords)
+        if (q == w) return true;
+    return false;
+}
+
 // Higher is better. Prefix / token-family beat pure edit distance.
 int score_match(const std::string& q, const std::string& cand) {
     if (q.empty()) return 0;
@@ -117,8 +130,18 @@ int score_match(const std::string& q, const std::string& cand) {
     // Substring containment.
     if (cand.find(q) != std::string::npos) return 20000 + static_cast<int>(q.size());
     if (q.find(cand) != std::string::npos) return 15000 + static_cast<int>(cand.size());
-    // Edit distance (inverted; clamp).
+    // Final resort: a plain typo. A short query is within a handful of edits of almost every
+    // short op name ("cut" -> "eq_set" is 6), so an edit distance that large is NOISE, not a
+    // suggestion — it is what made a live unknown-op report read
+    // "closest: eq_set, rename, set_units, eq_delete, set_folder" for op:"cut". Only a
+    // distance small relative to the words being compared counts as a relation; anything
+    // else scores 0 and suggest_doc_ops drops it entirely.
+    // Keep in lockstep with services/mcp/op_registry.py::_score_match — this C++ copy is
+    // what the LIVE apply path uses, and only the Python one had been fixed.
     const int d = levenshtein(q, cand);
+    const int floor_d = std::max<int>(
+        1, static_cast<int>(std::min(q.size(), cand.size())) / 3);
+    if (d > floor_d) return 0;
     return 10000 - d * 100;
 }
 
@@ -173,7 +196,10 @@ std::vector<std::string> suggest_doc_ops(const std::string& unknown, std::size_t
     std::vector<std::string> out;
     out.reserve(n);
     for (const auto& p : scored) {
-        if (p.first <= 0 && !out.empty()) break;
+        // `&& !out.empty()` used to force one suggestion out even when nothing scored —
+        // that is how a genuinely unrelated word still got a "closest:" list. No relation
+        // now means no list, and unknown_doc_op_message teaches the shape instead.
+        if (p.first <= 0) break;
         out.push_back(p.second);
         if (out.size() >= n) break;
     }
@@ -206,6 +232,20 @@ std::string unknown_doc_op_message(std::size_t idx, const std::string& k) {
         for (std::size_t i = 0; i < closest.size(); ++i) {
             if (i) oss << ", ";
             oss << closest[i];
+        }
+    } else if (matched_ft.empty()) {
+        // Nothing in the vocabulary is even close, so the model is not making a typo — it is
+        // writing in the wrong vocabulary. Teach the shape instead of guessing.
+        // Mirrors services/mcp/op_registry.py::unknown_doc_op_message.
+        oss << ". Ops are add_feature, edit_feature, delete_feature, set_material, rename, "
+               "eq_set, sketch_* — geometry is never an op name: a shape is a feature TYPE "
+               "under add_feature ({\"op\":\"add_feature\",\"feature\":{\"type\":\"extrude\",...}}), "
+               "and a material-REMOVING operation is that same add_feature with "
+               "params.mode:\"cut\"";
+        if (is_removal_word(q)) {
+            oss << " — so \"" << k << "\" is {\"op\":\"add_feature\",\"feature\":"
+                   "{\"type\":\"extrude\",\"name\":\"Pocket\",\"refs\":{\"profile\":[...]},"
+                   "\"params\":{\"mode\":\"cut\",\"depth\":10}}}";
         }
     }
     oss << "; see cad_guide()";

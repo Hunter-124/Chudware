@@ -118,7 +118,24 @@ def _score_match(q: str, cand: str) -> int:
         return 20000 + len(q)
     if cand_l in q:
         return 15000 + len(cand_l)
-    return 10000 - _levenshtein(q, cand_l) * 100
+    # Final resort: a plain typo. A short query is within a handful of edits of almost
+    # every short op name ("cut" -> "eq_set" is 6), so an edit distance that large is
+    # NOISE, not a suggestion — it is what made an unknown op report
+    # "closest: eq_set, rename, set_units". Only a distance small relative to the words
+    # being compared (a third of the shorter one, at least 1) counts as a relation;
+    # anything else scores 0 and suggest_doc_ops drops it entirely.
+    lev = _levenshtein(q, cand_l)
+    if lev > max(1, min(len(q), len(cand_l)) // 3):
+        return 0
+    return 10000 - lev * 100
+
+
+# The words a model reaches for when it means "remove material". None of them is an op;
+# every one of them is add_feature + params.mode:"cut".
+_REMOVAL_WORDS = frozenset({
+    "cut", "pocket", "subtract", "remove", "difference", "hollow_out", "mill",
+    "carve", "excavate", "recess", "cutout", "cut_out", "notch",
+})
 
 
 def doc_op_kinds() -> list[str]:
@@ -140,7 +157,9 @@ def suggest_doc_ops(unknown: str, n: int = 5,
             (200000 if k == "add_feature" else sc, k) for sc, k in scored
         ]
     scored.sort(key=lambda p: (-p[0], p[1]))
-    return [k for _, k in scored[: max(0, n)]]
+    # A zero score is "no genuine relation" (see _score_match). A misleading list is
+    # worse than none: it sent a model chasing eq_set/rename after writing op:"cut".
+    return [k for sc, k in scored[: max(0, n)] if sc > 0]
 
 
 def unknown_doc_op_message(index: int, kind: str,
@@ -157,6 +176,21 @@ def unknown_doc_op_message(index: int, kind: str,
     closest = suggest_doc_ops(kind, 5, feature_types=ftypes)
     if closest:
         msg += ". closest: " + ", ".join(closest)
+    elif not matched:
+        # Nothing in the vocabulary is even close, so the model is not making a typo —
+        # it is writing in the wrong vocabulary. Teach the shape instead of guessing.
+        msg += (
+            ". Ops are add_feature, edit_feature, delete_feature, set_material, rename, "
+            "eq_set, sketch_* … — geometry is never an op name: a shape is a feature TYPE "
+            'under add_feature ({"op":"add_feature","feature":{"type":"extrude",…}}), and '
+            'a material-REMOVING operation is that same add_feature with params.mode:"cut"'
+        )
+        if q in _REMOVAL_WORDS:
+            msg += (
+                f' — so "{kind}" is {{"op":"add_feature","feature":{{"type":"extrude",'
+                f'"name":"Pocket","refs":{{"profile":[…]}},"params":{{"mode":"cut",'
+                f'"depth":10}}}}}}'
+            )
     msg += "; see cad_guide()"
     return msg
 

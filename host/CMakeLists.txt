@@ -98,6 +98,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/feed.cpp               # feedTurnActivity stream-event folding
   src/ui/copilot/conversations.cpp      # conversation tabs + chat-history persistence
   src/ui/copilot/conv_ids.cpp           # session-id allocation (GL-free; unit-tested)
+  src/ui/copilot/agent_text.cpp         # doc-id + atlas-glyph text sanitizers (GL-free; unit-tested)
   src/ui/copilot/settings.cpp           # AI settings sections + model dropdown
   src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
@@ -518,6 +519,25 @@ add_test(NAME test_conv_ids
   COMMAND test_conv_ids
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end session-id allocation ---
+
+# --- copilot agent-authored text sanitizers: links the REAL agent_text.cpp (no GL / imgui /
+# AppState). Guards two live chat defects: tool-call cards printing the opaque engine doc id
+# ("doc-cpp00000039") where the part's name belongs, and U+2192 arrows from the Python harness
+# rendering as notdef '?' because uiGlyphRanges() never requested the arrows block. The test
+# also FAILS if the atlas range table mirrored in agent_text.cpp drifts from ui_theme.cpp.
+add_executable(test_agent_text
+  src/ui/copilot/agent_text.cpp
+  tests/test_agent_text.cpp)
+target_include_directories(test_agent_text PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(test_agent_text PRIVATE
+  UI_THEME_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/ui_theme.cpp")
+set_target_properties(test_agent_text PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_agent_text
+  COMMAND test_agent_text
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end agent-authored text sanitizers ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD

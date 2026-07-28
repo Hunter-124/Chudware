@@ -4,6 +4,7 @@
 // persistence debounce (conversations.cpp) reads. Pure state folding, no drawing.
 
 #include "copilot_internal.h"
+#include "agent_text.h"
 
 // ============================ transparent activity timeline ============================
 // Map a raw orchestrator stage key to a plain-language heading the user can follow.
@@ -1762,9 +1763,15 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ni.stage   = stageKey;
         ni.title   = jstr(data, "tool_name");
         if (ni.title.empty()) ni.title = "tool";
-        ni.reason     = jstr(data, "target");   // human "what it acts on" (may be "")
+        // ni.reason / ni.detail are authored by the Python harness or by the model, so they can
+        // carry codepoints the font atlas has no glyph for — agent_events.py joins tool targets
+        // with U+2192, which rendered as "DevicePocket ? MouthpieceSlot ?+2 more". Folded HERE,
+        // at ingest, so the persisted transcript is clean too. The companion doc-id -> part-name
+        // substitution runs at draw time (activity_timeline.cpp): it needs AppState, which this
+        // TU does not have. Both passes are idempotent.
+        ni.reason     = ui::foldToAtlasGlyphs(jstr(data, "target"));  // human "what it acts on"
         // Doing drawer: args_preview from batch 2a (capped JSON/text). Fall back to args dump.
-        ni.detail     = jstr(data, "args_preview");
+        ni.detail     = ui::foldToAtlasGlyphs(jstr(data, "args_preview"));
         if (ni.detail.empty() && data.contains("args")) {
             if (data["args"].is_string()) ni.detail = data["args"].get<std::string>();
             else if (data["args"].is_object() || data["args"].is_array())

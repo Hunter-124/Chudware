@@ -209,6 +209,18 @@ void openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     t.handoffDocId = docId;
     st.docTabs.push_back(std::move(t));
     const int idx = (int)st.docTabs.size() - 1;
+    // Give the mirror its DocSession NOW, not on first switch-in. The background doc.changed
+    // branch below parks the daemon's pushed snapshot + aicm_path on tab.session and prewarms
+    // its mesh (cacheBackgroundDocMeshAsync) — every one of those writes is guarded on
+    // `tab.session`, so a never-activated mirror (any part after the first: takeFocus is false
+    // once one mirror exists) silently dropped every pushed revision while still setting
+    // meshCacheInvalidated. Clicking such a tab then found an empty cache, wiped the scene
+    // (switchToTabCore's unloadDocMesh) and issued a doc_activate that queues on the doc's
+    // exclusive per-doc engine mutex behind the agent's write burst — the user got the
+    // "Loading" scrim with no geometry and no picking for as long as the agent kept writing.
+    // With the session present the switch binds from the parked snapshot instead (no RPC at
+    // all once the prewarm committed), so spectating and selecting never wait on the writer.
+    st.ensureTabSession(st.docTabs[idx]);
     st.addLog("[daemon] mirror tab opened for " + docId);
     if (takeFocus && !crashLoopBraked) {
         st.switchToTab(idx);  // activates: doc_activate (ro-allowed) -> tree + mesh

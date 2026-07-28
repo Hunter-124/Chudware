@@ -63,14 +63,18 @@ static void pmEditRelease(const std::string& docId) {
     }
 }
 // Open-time hold: busy is surfaced as a warning toast but does NOT block the
-// form (human steering wins; the CAS overlap guard covers a real race).
+// form (human steering wins; the CAS overlap guard covers a real race). The
+// wording mirrors the doc.lease_change "held" toast (engine_events.cpp) — same
+// daemon lease state, so it names the holder AND says the lock is temporary
+// rather than reading as a permanent refusal.
 static std::string pmTakeOpenHold(AppState& st) {
     if (!engine::daemonMode() || !st.docMirror.hasDoc()) return std::string();
     const std::string docId = st.docMirror.docId();
     std::string holder;
     if (!pmEditHold(docId, &holder)) {
         st.toast(ui::ToastLevel::Warn,
-                 "Another client (" + holder + ") is editing this part — previews may conflict");
+                 "An " + holder + " client is editing this part — your edit is not blocked, "
+                 "but its lock is briefly held and previews may conflict");
         return std::string();
     }
     return docId;

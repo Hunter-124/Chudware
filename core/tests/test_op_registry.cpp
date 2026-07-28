@@ -95,6 +95,45 @@ TEST_CASE("suggest_doc_ops prefers sketch_ family for sketch_create") {
     CHECK(sketchish >= 2);
 }
 
+// Live regression (2026-07-28): a copilot batch used op:"cut" and was answered
+//   op[1]: unknown op 'cut'. closest: eq_set, rename, set_units, eq_delete, set_folder
+// Every one of those is 5-6 edits away from "cut" — the old fallback scored
+// 10000 - lev*100, which for a short query ranks short UNRELATED names, and
+// suggest_doc_ops force-emitted the first candidate even at a non-positive score.
+// Noise is worse than silence: the model cannot recover from a wrong hint.
+// Keep in lockstep with services/mcp/op_registry.py (this C++ copy is the LIVE path).
+TEST_CASE("an unrelated op gets no suggestions instead of noise") {
+    for (const char* q : {"cut", "pocket", "zzzzz", "make_it_hollow"}) {
+        auto sug = chudware::doc::suggest_doc_ops(q, 5);
+        CHECK_MESSAGE(sug.empty(), "expected no suggestions for '", q, "', got ",
+                      sug.empty() ? std::string() : sug.front());
+    }
+}
+
+TEST_CASE("a genuine typo still suggests the op it meant") {
+    CHECK(chudware::doc::suggest_doc_ops("renmae", 5).front() == "rename");
+    CHECK(chudware::doc::suggest_doc_ops("add_featur", 5).front() == "add_feature");
+    CHECK(chudware::doc::suggest_doc_ops("set_materal", 5).front() == "set_material");
+    CHECK(chudware::doc::suggest_doc_ops("delete_fature", 5).front() == "delete_feature");
+}
+
+TEST_CASE("no suggestion falls back to teaching the vocabulary shape") {
+    const std::string msg = chudware::doc::unknown_doc_op_message(1, "cut");
+    CHECK(msg.find("closest:") == std::string::npos);   // no noise
+    CHECK(msg.find("add_feature") != std::string::npos);
+    CHECK(msg.find("mode") != std::string::npos);       // names the cut mechanism
+    // "cut" is a removal word, so the message hands over the literal canonical op.
+    CHECK(msg.find("\"type\":\"extrude\"") != std::string::npos);
+    CHECK(msg.find("see cad_guide()") != std::string::npos);
+}
+
+TEST_CASE("a non-removal unknown op teaches without the extrude example") {
+    const std::string msg = chudware::doc::unknown_doc_op_message(0, "zzzzz");
+    CHECK(msg.find("closest:") == std::string::npos);
+    CHECK(msg.find("add_feature") != std::string::npos);
+    CHECK(msg.find("\"name\":\"Pocket\"") == std::string::npos);
+}
+
 TEST_CASE("doc_apply_ops rejects invented op with rich error envelope") {
     using chudware::doc::doc_new;
     using chudware::doc::doc_apply_ops;

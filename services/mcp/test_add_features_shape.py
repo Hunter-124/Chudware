@@ -1352,3 +1352,210 @@ class TestNegativeExtrudeDepth:
         assert params["depth"] == 8
         assert "flip" not in params
         assert not any("DIRECTION" in n for n in notes)
+
+
+class TestFlatFacePocket:
+    """{"op":"pocket","face":"top","shape":"rect","width":…,"depth":…} (live copilot run,
+    2026-07-28, "open the part and pocket it").
+
+    `pocket` aliased straight onto the `extrude` feature type and then died on
+    «refs.profile: required for extrude» — the flat spec names a profile in words but never
+    builds one — while the second element, op:"cut", was rejected outright as an unknown op.
+    Both are fully determined, so both expand into the canonical sketch + extrude-cut pair.
+    """
+
+    LIVE = [
+        {"op": "pocket", "name": "DevicePocket", "face": "top", "shape": "rect",
+         "width": 51.6, "height": 22.5, "depth": 72, "center": [0, 0], "corner_radius": 4},
+        {"op": "cut", "name": "MouthpieceSlot", "face": "top", "shape": "rect",
+         "width": 14, "height": 10, "depth": 8, "center": [0, 0]},
+    ]
+
+    @staticmethod
+    def _expand(ops):
+        notes: list = []
+        return M._expand_face_pockets(ops, notes), notes
+
+    def test_the_live_batch_becomes_two_sketch_extrude_cut_pairs(self):
+        ops, notes = self._expand(self.LIVE)
+        assert len(ops) == 4
+        sk1, ex1, sk2, ex2 = (o["feature"] for o in ops)
+        assert all(o["op"] == "add_feature" for o in ops)
+        assert sk1["type"] == "sketch" and ex1["type"] == "extrude"
+        assert sk1["refs"]["plane"] == {"of": "face", "side": "top"}
+        assert sk1["params"]["entities"] == [
+            {"type": "rectangle", "center": [0.0, 0.0], "width": 51.6, "height": 22.5}]
+        assert sk1["params"]["constraints"] == []
+        assert ex1["params"] == {"mode": "cut", "depth": 72.0}
+        assert ex1["refs"]["profile"] == [
+            {"kind": "region", "sketch": "DevicePocketProfile", "hint_index": 0}]
+        assert sk2["refs"]["plane"] == {"of": "face", "side": "top"}
+        assert ex2["refs"]["profile"][0]["sketch"] == "MouthpieceSlotProfile"
+        text = " ".join(notes)
+        assert "expanded the flat pocket spec" in text
+        assert "expanded the flat cut spec" in text
+
+    def test_a_cut_carrying_the_flat_spec_is_the_same_rewrite_as_a_pocket(self):
+        spec = {"name": "P", "face": "front", "shape": "rect",
+                "width": 20, "height": 10, "depth": 5}
+        as_pocket, _ = self._expand([{"op": "pocket", **spec}])
+        as_cut, notes = self._expand([{"op": "cut", **spec}])
+        assert as_pocket == as_cut
+        assert any('read op:"cut"' in n for n in notes)
+
+    def test_a_boolean_style_cut_is_not_hijacked(self):
+        """{"op":"cut","a":"f1","b":"f2"} is a BOOLEAN — no face, no depth, no profile."""
+        ops = [{"op": "cut", "a": "Body", "b": "Tool"}]
+        out, notes = self._expand(ops)
+        assert out is ops and notes == []
+
+    def test_a_cut_naming_a_face_but_no_shape_is_left_alone(self):
+        """Half a spec is not the spec: a face word alone must not conjure a profile."""
+        ops = [{"op": "cut", "face": "top", "target": "Body"}]
+        out, _notes = self._expand(ops)
+        assert out is ops
+
+    def test_a_circle_pocket_becomes_a_circle_entity_with_a_radius(self):
+        ops, notes = self._expand([{"op": "pocket", "name": "Bore", "face": "top",
+                                    "shape": "circle", "diameter": 12, "depth": 6,
+                                    "center": [10, -5]}])
+        assert ops[0]["feature"]["params"]["entities"] == [
+            {"type": "circle", "center": [10.0, -5.0], "radius": 6.0}]
+        assert any("read diameter=12.0 as radius=6.0" in n for n in notes)
+
+    def test_the_center_defaults_to_the_face_centre(self):
+        ops, _notes = self._expand([{"op": "pocket", "face": "bottom", "shape": "rect",
+                                     "width": 8, "height": 8, "depth": 2}])
+        assert ops[0]["feature"]["params"]["entities"][0]["center"] == [0.0, 0.0]
+        assert ops[1]["feature"]["name"] == "Pocket"
+
+    def test_a_corner_radius_is_dropped_loudly_not_silently(self):
+        """There is no rounded-rectangle sketch entity, so the radius cannot be honoured —
+        but a silently sharp pocket is a wrong part nobody was told about."""
+        _ops, notes = self._expand([{"op": "pocket", "name": "P", "face": "top",
+                                     "shape": "rect", "width": 20, "height": 10,
+                                     "depth": 4, "corner_radius": 3}])
+        note = next(n for n in notes if "corner_radius" in n)
+        assert "dropped corner_radius=3.0" in note
+        assert '"type":"fillet"' in note
+
+    def test_an_unrecognised_shape_teaches_the_accepted_ones(self):
+        with pytest.raises(ValueError) as e:
+            self._expand([{"op": "pocket", "name": "P", "face": "top", "shape": "hexagon",
+                           "width": 20, "height": 10, "depth": 4}])
+        msg = str(e.value)
+        assert 'shape "hexagon" is not a pocket profile' in msg
+        assert 'shape:"rect"' in msg and 'shape:"circle"' in msg
+
+    def test_a_deeper_step_inside_an_earlier_pocket_measures_from_its_floor(self):
+        """The live batch's second cut sits inside the first pocket's footprint: swept only
+        8 mm from the outer top face it would pass through pure void and the engine would
+        reject the batch with "extrude cut removed no material"."""
+        ops, notes = self._expand(self.LIVE)
+        assert ops[3]["feature"]["params"]["depth"] == 80.0  # 72 floor + 8
+        assert any('sits inside "DevicePocket"' in n for n in notes)
+
+    def test_a_pocket_beside_an_earlier_one_keeps_its_own_depth(self):
+        ops, notes = self._expand([
+            {"op": "pocket", "name": "A", "face": "top", "shape": "rect",
+             "width": 20, "height": 20, "depth": 10},
+            {"op": "pocket", "name": "B", "face": "top", "shape": "rect",
+             "width": 5, "height": 5, "depth": 3, "center": [40, 0]}])
+        assert ops[3]["feature"]["params"]["depth"] == 3.0
+        assert not any("sits inside" in n for n in notes)
+
+    def test_a_pocket_on_another_face_keeps_its_own_depth(self):
+        ops, _notes = self._expand([
+            {"op": "pocket", "name": "A", "face": "top", "shape": "rect",
+             "width": 20, "height": 20, "depth": 10},
+            {"op": "pocket", "name": "B", "face": "front", "shape": "rect",
+             "width": 5, "height": 5, "depth": 3}])
+        assert ops[3]["feature"]["params"]["depth"] == 3.0
+
+    def test_a_same_batch_placeholder_after_an_expansion_is_renumbered(self):
+        """Each expansion inserts an op, so a "$N" written against the ORIGINAL indices
+        would silently point one feature too early."""
+        ops, _notes = self._expand([
+            {"op": "pocket", "name": "P", "face": "top", "shape": "rect",
+             "width": 20, "height": 10, "depth": 4},
+            {"op": "add_feature", "feature": {
+                "type": "fillet", "name": "R", "refs": {"edges": ["$0"]},
+                "params": {"radius": 1}}}])
+        assert ops[2]["feature"]["refs"]["edges"] == ["$1"]  # the extrude, not its sketch
+
+    def test_a_batch_with_no_pocket_is_the_very_same_list(self):
+        ops = [_CANON_BOX]
+        assert M._expand_face_pockets(ops, []) is ops
+
+
+class TestUnknownOpSuggestions:
+    """op:"cut" reported «closest: eq_set, rename, set_units, eq_delete, set_folder» (live
+    copilot run, 2026-07-28) — five unrelated ops, because the levenshtein fallback scored
+    every short name. A misleading suggestion list is worse than none."""
+
+    def test_an_unrelated_query_suggests_nothing(self):
+        from services.mcp.op_registry import suggest_doc_ops
+        for q in ("cut", "pocket", "zzzzz"):
+            assert suggest_doc_ops(q) == [], q
+
+    def test_a_genuine_typo_still_suggests(self):
+        from services.mcp.op_registry import suggest_doc_ops
+        assert suggest_doc_ops("add_featur")[0] == "add_feature"
+        assert suggest_doc_ops("set_materal")[0] == "set_material"
+        assert suggest_doc_ops("renmae") == ["rename"]
+        assert suggest_doc_ops("delete_fature") == ["delete_feature"]
+        assert "eq_set" in suggest_doc_ops("eq_st")
+
+    def test_a_feature_type_still_pins_add_feature(self):
+        from services.mcp.op_registry import suggest_doc_ops
+        assert suggest_doc_ops("box") == ["add_feature"]
+
+    def test_the_unknown_op_message_teaches_the_shape_instead_of_noise(self):
+        from services.mcp.op_registry import unknown_doc_op_message
+        msg = unknown_doc_op_message(1, "cut")
+        # No suggestion list at all — the vocabulary names still appear, but only inside
+        # the teaching sentence, never as "closest: …" near misses to go chase.
+        assert "closest" not in msg
+        assert 'params.mode:"cut"' in msg
+        assert '"op":"add_feature"' in msg
+
+    def test_a_feature_type_op_keeps_its_own_teaching_branch(self):
+        from services.mcp.op_registry import unknown_doc_op_message
+        msg = unknown_doc_op_message(0, "box")
+        assert '"type":"box"' in msg
+        assert "closest: add_feature" in msg
+
+
+@enginetest
+def test_live_flat_face_pocket_batch_builds_on_a_stock_block():
+    """The VERBATIM two-op batch from the live run, on the 100x60x80 stock it was aimed at.
+    Both elements used to be batch-killing rejections; the pair must BUILD and remove
+    exactly 51.6*22.5*72 (the pocket) + 14*10*8 (the slot through its floor)."""
+    from services.agent.agent_turn import _bind_tool
+    new_part, add_features = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(new_part(name="flat_face_pocket"))["doc_id"]
+    assert json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "Stock",
+        "params": {"length": 100, "width": 60, "height": 80}}}]))["ok"]
+    r = json.loads(add_features(doc_id=doc, ops=TestFlatFacePocket.LIVE))
+    assert r["ok"], r
+    assert r["changes"]["volume_delta_mm3"] == -(51.6 * 22.5 * 72 + 14 * 10 * 8)
+    text = " ".join(r["interpreted"])
+    assert "expanded the flat pocket spec" in text
+    assert 'read op:"cut"' in text
+
+
+@enginetest
+def test_live_a_pocket_deeper_than_the_stock_is_not_clamped():
+    """A cut deeper than the block is legitimate — it just breaks through the bottom."""
+    from services.agent.agent_turn import _bind_tool
+    new_part, add_features = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(new_part(name="deep_pocket"))["doc_id"]
+    add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "Stock",
+        "params": {"length": 40, "width": 40, "height": 20}}}])
+    r = json.loads(add_features(doc_id=doc, ops=[
+        {"op": "pocket", "name": "ThroughSlot", "face": "top", "shape": "rect",
+         "width": 10, "height": 10, "depth": 200}]))
+    assert r["ok"], r
+    assert r["changes"]["volume_delta_mm3"] == -(10 * 10 * 20)  # only the stock is there

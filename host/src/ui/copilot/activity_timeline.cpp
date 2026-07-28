@@ -5,8 +5,41 @@
 // cards.cpp; the items themselves are built in feed.cpp.
 
 #include "copilot_internal.h"
+#include "agent_text.h"
 
 namespace ui {
+
+// ---- agent-authored text sanitizers (agent_text.{h,cpp}) -------------------------------------
+// Two live defects, both on strings the copilot did NOT author in C++: a tool-call card printed
+// the opaque engine id ("doc-cpp00000039") where the part's NAME belongs, and the U+2192 arrows
+// services/agent/agent_events.py joins tool targets with rendered as notdef '?' (uiGlyphRanges()
+// never requests the arrows block). Fixed HERE rather than at ingest because feed.cpp has no
+// AppState — the doc-id -> name lookup needs the tab list — and because a transcript restored
+// from disk never passes through feed.cpp at all.
+//
+// docLabel() is deliberately NOT used: it returns the literal "a document" for an unknown id,
+// which must never be spliced into a JSON blob. An id with no open tab stays a raw id.
+static std::string sanitizeAgentText(AppState& st, const std::string& s) {
+    if (s.empty()) return s;
+    return foldToAtlasGlyphs(substituteDocIds(s, [&st](const std::string& id) -> std::string {
+        for (const auto& t : st.docTabs)
+            if (t.docId == id) return t.displayTitle();
+        return std::string();
+    }));
+}
+
+// Both halves are idempotent and have no-allocation fast paths, so running this over the same
+// rows every frame is stable and near-free. Applied in place: the persisted transcript and the
+// right-click "Copy text" path (ui_common chatActivityCopyText) then see the same clean strings.
+// Restricted to the prose row kinds (0 thinking/action, 1 context chip, 2 thought box, 3 tool
+// call) — rowKind >= 4 are corporate/swarm cards whose detail is a JSON payload cards.cpp
+// re-parses, and those carry no doc ids.
+static void sanitizeActivityItem(AppState& st, ActivityItem& a) {
+    if (a.rowKind > 3) return;
+    a.reason = sanitizeAgentText(st, a.reason);
+    a.detail = sanitizeAgentText(st, a.detail);
+    a.title  = sanitizeAgentText(st, a.title);
+}
 
 void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     const auto& pal = ui::palette;
@@ -1019,6 +1052,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
 void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
     // Standalone caller (outside the turn timeline): never the live frontier -> collapsed,
     // and with no turn/call ordinal there is no per-call rewind to offer.
+    sanitizeActivityItem(st, a);
     drawToolCallRowImpl(st, a, fonts, /*failCount=*/1, /*liveFrontier=*/false);
 }
 
@@ -1035,6 +1069,9 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
             if (a.status == "running") a.status = "done";
         }
     }
+    // Resolve opaque doc ids to part names and fold uncovered glyphs before ANY row is measured
+    // or drawn — one place, every row kind, and the widths computed below are the final ones.
+    for (auto& a : m.activity) sanitizeActivityItem(st, a);
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     // The live frontier: the most recent row this loop will actually draw (skip conditions
     // below). Only that row auto-expands mid-turn; earlier rows collapse to summary+icon.

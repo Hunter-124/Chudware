@@ -358,6 +358,13 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     for src in (refs_out.get("plane"), params.get("plane"), feat.get("plane")):
         if src is None:
             continue
+        # An already-resolved selector ({"of":"face","side":"top"}, a sid selector, …).
+        # _norm_datum only speaks strings, so this used to fall through the whole loop and
+        # land on the "plane.top" default — a SILENT swap of the real top face for the
+        # origin datum, which is different geometry, not a near miss.
+        if isinstance(src, dict):
+            plane = src
+            break
         query = _face_phrase_query(src)
         if query is not None:
             plane = query
@@ -1218,6 +1225,226 @@ def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
                          f"— the op addresses its feature with `id`")
             return out
     return op
+
+
+# ---------------------------------------------------------------------------
+# FLAT FACE-POCKET expander (model-robustness).
+#
+# The shape a model writes when it wants a milled pocket in a face is flat:
+#   {"op":"pocket","name":"DevicePocket","face":"top","shape":"rect",
+#    "width":51.6,"height":22.5,"depth":72,"center":[0,0],"corner_radius":4}
+# (live copilot run, 2026-07-28). `pocket` used to alias straight onto the `extrude`
+# feature type, which then died on «refs.profile: required for extrude» — the flat spec
+# names a profile in words but never builds one. It is nevertheless fully determined: a
+# rectangle (or circle) of that size, centred at [u,v] on the named face, extruded `depth`
+# as a cut. So it expands here into the canonical pair the engine wants, and the rewrite is
+# echoed so the model learns the form.
+_FACE_POCKET_OPS = frozenset({"pocket", "cut"})
+_FACE_POCKET_SIDES = frozenset({"top", "bottom", "front", "back", "left", "right"})
+_POCKET_RECT_SHAPES = frozenset({"rect", "rectangle", "rectangular", "slot", "square", "box"})
+_POCKET_ROUND_SHAPES = frozenset({"circle", "circular", "round", "bore", "hole", "disc", "disk"})
+_POCKET_DEPTH_KEYS = ("depth", "distance", "height_of_cut", "cut_depth")
+_POCKET_CENTER_KEYS = ("center", "centre", "at", "position", "location", "origin")
+
+
+def _pocket_num(el: dict, *keys) -> Optional[float]:
+    """The first numeric among `keys`, reading a {"value":N} dimension wrapper too."""
+    for k in keys:
+        v = el.get(k)
+        if isinstance(v, dict):
+            v = v.get("value")
+        if _is_num(v):
+            return float(v)
+    return None
+
+
+def _pocket_face_side(v: Any) -> Optional[str]:
+    """The face word a flat pocket names ("top", "the top face", {"side":"top"})."""
+    if isinstance(v, dict):
+        v = v.get("side") or v.get("face")
+    q = _face_phrase_query(v)
+    if q is not None:
+        return q["side"]
+    if isinstance(v, str):
+        w = _slug(v)
+        if w in _FACE_POCKET_SIDES:
+            return w
+    return None
+
+
+def _pocket_center(el: dict) -> list:
+    for k in _POCKET_CENTER_KEYS:
+        v = el.get(k)
+        if isinstance(v, (list, tuple)) and len(v) >= 2 and all(_is_num(x) for x in v[:2]):
+            return [float(v[0]), float(v[1])]
+    u, w = _pocket_num(el, "u", "cx", "x"), _pocket_num(el, "v", "cy", "y")
+    if u is not None or w is not None:
+        return [u or 0.0, w or 0.0]
+    return [0.0, 0.0]  # the face CENTRE, matching the hole `positions` convention
+
+
+def _face_pocket_entity(el: dict, kind: str, label: str, notes: list) -> dict:
+    """The one sketch entity a flat pocket spec names. Raises a teaching ValueError for a
+    shape word the sketch vocabulary has no profile for."""
+    center = _pocket_center(el)
+    raw = el.get("shape") or el.get("profile_shape") or el.get("cross_section")
+    word = _slug(raw) if isinstance(raw, str) else ""
+    w = _pocket_num(el, "width", "w", "size_x", "length_x")
+    h = _pocket_num(el, "height", "h", "size_y", "length_y")
+    dia = _pocket_num(el, "diameter", "dia", "d")
+    rad = _pocket_num(el, "radius", "r")
+    if not word:
+        word = "rect" if (w is not None and h is not None) else "circle"
+    if word in _POCKET_RECT_SHAPES:
+        if w is None or h is None:
+            raise ValueError(
+                f'{kind} "{label}": shape "{raw or word}" needs a numeric width and height '
+                f"(mm) on the face. Got width={w!r}, height={h!r}.")
+        ent = {"type": "rectangle", "center": center, "width": w, "height": h}
+        cr = _pocket_num(el, "corner_radius", "fillet_radius", "corner_r")
+        if cr:
+            # There is no rounded-rectangle sketch entity (line/arc/circle/spline only —
+            # core/doc/sketch_geom.cpp), and rounding the corners after the fact means
+            # picking the pocket's four vertical edges, which is geometry selection, not a
+            # rewrite of what was written. So the radius is dropped, loudly.
+            notes.append(
+                f'{label}: dropped corner_radius={cr} — the sketch vocabulary has no '
+                f"rounded-rectangle entity, so the pocket is sharp-cornered. Round it with a "
+                f'separate {{"op":"add_feature","feature":{{"type":"fillet","refs":'
+                f'{{"edges":[…the pocket\'s 4 vertical edges…]}},"params":{{"radius":{cr}}}}}}} '
+                f"after this cut")
+        return ent
+    if word in _POCKET_ROUND_SHAPES:
+        r = rad if rad is not None else (dia / 2.0 if dia is not None else None)
+        if r is None and w is not None:
+            r = w / 2.0
+        if r is None:
+            raise ValueError(
+                f'{kind} "{label}": shape "{raw or word}" needs a numeric diameter or radius '
+                f"(mm).")
+        if rad is None and dia is not None:
+            notes.append(f'{label}: read diameter={dia} as radius={r} — a sketch circle '
+                         f"carries its RADIUS")
+        return {"type": "circle", "center": center, "radius": r}
+    raise ValueError(
+        f'{kind} "{label}": shape "{raw}" is not a pocket profile. Use shape:"rect" '
+        f'(rect|rectangle|slot, with width+height) or shape:"circle" (circle|round|bore, '
+        f"with diameter or radius) — or write the profile yourself as a sketch feature and "
+        f'extrude it with mode:"cut".')
+
+
+def _pocket_footprint(ent: dict) -> tuple:
+    """The entity's axis-aligned [u0,u1,v0,v1] extent on the face."""
+    cu, cv = ent["center"]
+    if ent["type"] == "rectangle":
+        hu, hv = ent["width"] / 2.0, ent["height"] / 2.0
+    else:
+        hu = hv = ent["radius"]
+    return (cu - hu, cu + hu, cv - hv, cv + hv)
+
+
+def _face_pocket_pair(el: dict, kind: str, notes: list, prior: list) -> Optional[list]:
+    """The flat face-pocket spec -> [sketch, extrude-cut], or None when `el` is not one.
+
+    Deliberately conservative for `cut`: a bare {"op":"cut","a":…,"b":…} is a BOOLEAN and
+    must keep going down its own path, so the flat spec has to be unmistakably present —
+    a named planar face AND a numeric depth AND a profile size.
+    """
+    side = _pocket_face_side(el.get("face") if el.get("face") is not None else el.get("on"))
+    depth = _pocket_num(el, *_POCKET_DEPTH_KEYS)
+    if side is None or depth is None:
+        return None
+    has_size = any(_pocket_num(el, k) is not None for k in (
+        "width", "w", "height", "h", "diameter", "dia", "d", "radius", "r"))
+    if not has_size and not isinstance(el.get("shape"), str):
+        return None
+    name = el.get("name") if isinstance(el.get("name"), str) and el["name"].strip() else None
+    name = (name or "Pocket").strip()
+    label = name
+    if kind == "cut":
+        notes.append(f'{label}: read op:"cut" carrying a face/shape/depth spec as a POCKET '
+                     f'— "cut" is not an op; removing material is an extrude with '
+                     f'params.mode:"cut"')
+    ent = _face_pocket_entity(el, kind, label, notes)
+    sk_name = f"{name}Profile"
+    # A second pocket whose profile sits INSIDE one this batch already cut into the same
+    # face is a deeper STEP, and its depth is measured from that pocket's floor — cutting
+    # only `depth` from the outer face plane would sweep pure void and the engine would
+    # reject the whole batch with "extrude cut removed no material". The live batch is
+    # exactly this: a 72-deep pocket in an 80 block, then a 14x10 slot 8 deep in the same
+    # place, i.e. straight through the 8 mm floor left behind.
+    u0, u1, v0, v1 = _pocket_footprint(ent)
+    total, over = depth, None
+    for p in prior:
+        if (p["side"] == side and p["u0"] - 1e-9 <= u0 and u1 <= p["u1"] + 1e-9
+                and p["v0"] - 1e-9 <= v0 and v1 <= p["v1"] + 1e-9):
+            total, over = p["depth"] + depth, p
+    if over is not None:
+        notes.append(
+            f'{label}: its profile sits inside "{over["name"]}", already cut {over["depth"]} '
+            f'deep into the same {side} face, so depth={depth} is measured from THAT floor — '
+            f"the extrude cuts {total} from the {side} face plane. A cut sketched on the "
+            f"outer face but swept only through the void above an existing pocket removes "
+            f"nothing and the engine rejects it")
+    prior.append({"side": side, "u0": u0, "u1": u1, "v0": v0, "v1": v1,
+                  "depth": total, "name": name})
+    sketch = {"op": "add_feature", "feature": {
+        "type": "sketch", "name": sk_name,
+        "refs": {"plane": {"of": "face", "side": side}},
+        "params": {"entities": [ent], "constraints": []}}}
+    extrude = {"op": "add_feature", "feature": {
+        "type": "extrude", "name": name,
+        "refs": {"profile": [{"kind": "region", "sketch": sk_name, "hint_index": 0}]},
+        "params": {"mode": "cut", "depth": total}}}
+    shape_word = "rectangle" if ent["type"] == "rectangle" else "circle"
+    notes.append(
+        f'{label}: expanded the flat {kind} spec into the canonical pair — a sketch '
+        f'"{sk_name}" on refs.plane={{"of":"face","side":"{side}"}} carrying the {shape_word}, '
+        f'then {{"type":"extrude","params":{{"mode":"cut","depth":{total}}},'
+        f'"refs":{{"profile":[{{"kind":"region","sketch":"{sk_name}"}}]}}}}. A pocket is '
+        f"always those two features; center=[u,v] is FACE-LOCAL and [0,0] is the face centre")
+    return [sketch, extrude]
+
+
+def _shift_batch_placeholders(v: Any, table: dict) -> Any:
+    """Renumber "$N" same-batch placeholders after ops were inserted ahead of them."""
+    if isinstance(v, str):
+        return table.get(v.strip(), v) if _BATCH_REF_RE.match(v.strip()) else v
+    if isinstance(v, list):
+        return [_shift_batch_placeholders(x, table) for x in v]
+    if isinstance(v, dict):
+        return {k: _shift_batch_placeholders(x, table) for k, x in v.items()}
+    return v
+
+
+def _expand_face_pockets(ops: Any, notes: list) -> Any:
+    """Expand every flat face-pocket element. Runs FIRST — ahead of _normalize_op_elements,
+    which would otherwise alias op:"pocket" onto a bare, profile-less extrude."""
+    if not isinstance(ops, list) or not any(
+            isinstance(el, dict) and _slug(el.get("op")) in _FACE_POCKET_OPS for el in ops):
+        return ops
+    out: list = []
+    shift: dict = {}
+    changed = False
+    prior: list = []
+    for i, el in enumerate(ops):
+        pair = None
+        if isinstance(el, dict):
+            kind = _slug(el.get("op"))
+            if kind in _FACE_POCKET_OPS:
+                pair = _face_pocket_pair(el, kind, notes, prior)
+        if pair is None:
+            shift[f"${i}"] = f"${len(out)}"
+            out.append(el)
+            continue
+        changed = True
+        shift[f"${i}"] = f"${len(out) + 1}"  # the pocket IS the extrude, not its sketch
+        out.extend(pair)
+    if not changed:
+        return ops
+    if any(k != v for k, v in shift.items()):
+        out = [_shift_batch_placeholders(o, shift) for o in out]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3043,6 +3270,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             if created and not ops:
                 return _dumps({"ok": True, "doc_id": d, "created_doc": created,
                                "note": "created the part; send its build ops in the next call"})
+            # A flat face-pocket spec ({"op":"pocket","face":"top","shape":"rect",…}) is
+            # two features, so it expands BEFORE the op-element pass aliases it onto a
+            # bare, profile-less extrude.
+            ops = _expand_face_pockets(ops, interpreted)
             # Give every element an `op` (a bare feature dict is the single most common
             # rejection in the field) and map every feature TYPE onto the engine vocabulary
             # FIRST — the sketch/primitive passes below branch on the canonical type, so a

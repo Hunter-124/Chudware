@@ -535,7 +535,11 @@ void drawSessionsPanel(AppState& st, bool busy) {
         } else if (showBadge && c.docLink.rfind("doc:", 0) == 0) {
             const std::string id = c.docLink.substr(4);
             for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
-                if (st.docTabs[ti].docId == id) { badgeTab = ti; badge = st.docTabs[ti].title; break; }
+                if (st.docTabs[ti].docId == id) {
+                    // t.title can still be a placeholder ("Part1") or an opaque id;
+                    // displayTitle() resolves the handoff/tree/path name instead.
+                    badgeTab = ti; badge = st.docTabs[ti].displayTitle(); break;
+                }
         }
         float badgeW = 0.0f;
         float badgeX0 = 0.0f, badgeX1 = 0.0f;
@@ -862,7 +866,10 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                 !seenId.insert("title:" + t.title).second)
                 continue;  // last resort for a tab with neither identifier
             ArtiDocRow r;
-            r.label = t.title.empty() ? (t.path.empty() ? t.docId : t.path) : t.title;
+            // displayTitle() is the one label that refuses to hand back an opaque
+            // "doc-cpp…" id (doc_tabs.cpp:95); the old t.title fallback chain ended on
+            // t.docId, so a part the agent opened listed itself as its engine id.
+            r.label = t.displayTitle();
             // Unsaved in-memory docs have no file to reveal — fall back to their save
             // destination (the project/workspace folder) so the location action always exists.
             r.path  = !t.path.empty() ? t.path : st.plmProjectPath();

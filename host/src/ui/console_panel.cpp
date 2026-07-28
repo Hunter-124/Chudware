@@ -45,7 +45,7 @@ void drawConsoleBody(AppState& st) {
             ImVec2 mx(mn.x + ImGui::GetWindowSize().x, mn.y + ImGui::GetWindowSize().y);
             const ui::AdaptiveSurface& surf = ui::adaptivePanel(
                 ui::panelId("host_agent_glass"), ImRect(mn, mx), ui::GlassGroup::Copilot);
-            ui::drawWindowPillScrollbarV(surf);
+            ui::drawWindowPillScrollbarV(surf, ui::kChatScrollbar);
         }
         ImGui::EndChild();
         ImGui::PopStyleColor();

@@ -130,16 +130,50 @@ static void resetPromptOverride(PromptRecord& pr, AppState& st) {
     loadPrompts(st);
 }
 
-// A dimmed "(?)" marker that reveals a one-line explanation on hover — for discoverability of the
-// less-obvious settings (vision / plan mode / max iters / units). Drawn inline (SameLine first).
+// System-prompt override (Settings > AI > Prompts > system): autosaves. Each edit marks the
+// buffer dirty; a 1s debounce commits it into settings.systemPrompt and persists it, and the
+// modal-closing path force-flushes so no Save button ever owns it.
+static bool   s_spOverrideDirty = false;
+static double s_spOverrideLastEdit = 0.0;
+static void commitSystemPromptOverride(AppState& st) {
+    st.settings.systemPrompt = st.spBuf.data();
+    saveSettings(st.settings);
+    s_spOverrideDirty = false;
+}
+static void flushSystemPromptOverride(AppState& st, bool force) {
+    if (!s_spOverrideDirty) return;
+    if (!force && ImGui::GetTime() - s_spOverrideLastEdit < 1.0) return;
+    commitSystemPromptOverride(st);
+}
+
+// A circled-"?" info chip that reveals a one-line explanation on hover — for discoverability
+// of the less-obvious settings (vision / plan mode / max iters / units). Drawn inline
+// (SameLine first); the chip goes accent on hover so it reads as interactive.
 static void helpMarker(const char* desc) {
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                                 ui::palette.textDim[2], 1));
-    ImGui::TextUnformatted("(?)");
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) {
+    const float sc = ui::uiScale;
+    ImGui::SameLine(0.0f, 4.0f * sc);
+    const float d = ImGui::GetTextLineHeight();
+    ImGui::PushID(desc);
+    ImGui::InvisibleButton("##helpchip", ImVec2(d, d));
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 mn = ImGui::GetItemRectMin();
+    const ImVec2 c(mn.x + d * 0.5f, mn.y + d * 0.5f);
+    const float r = d * 0.5f - 1.0f * sc;
+    const float* base = hov ? ui::palette.accent : ui::palette.textDim;
+    float ring[4], glyph[4];
+    ui::Palette::withAlpha(base, ring, hov ? 0.95f : 0.55f);
+    ui::Palette::withAlpha(base, glyph, hov ? 1.0f : 0.75f);
+    if (hov) {
+        float fill[4];
+        ui::Palette::withAlpha(ui::palette.accent, fill, 0.12f);
+        dl->AddCircleFilled(c, r, ui::Palette::toU32(fill), 20);
+    }
+    dl->AddCircle(c, r, ui::Palette::toU32(ring), 20, 1.2f * sc);
+    const ImVec2 ts = ImGui::CalcTextSize("?");
+    dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ui::Palette::toU32(glyph), "?");
+    ImGui::PopID();
+    if (hov) {
         ImGui::BeginTooltip();
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
         ImGui::TextUnformatted(desc);
@@ -181,11 +215,14 @@ static void settingsGlassSectionEnd() {
 // Window-local accent pill scrollbar for a scrolling child inside the Settings modal. Call
 // immediately before EndChild(); it is a no-op when the content fits. One adaptivePanel id for
 // the whole modal — adaptivePanel is idempotent per frame, so repeated fetches are free.
+// kChatScrollbar: the same 9dp flush-right bar the copilot chat uses (the tab bodies'
+// 10dp right padding is its lane, so content never runs under it).
 static void settingsPillScrollbar() {
     ImVec2 mn = ImGui::GetWindowPos();
     ImVec2 mx(mn.x + ImGui::GetWindowSize().x, mn.y + ImGui::GetWindowSize().y);
     ui::drawWindowPillScrollbarV(ui::adaptivePanel(ui::panelId("settings_modal_glass"),
-                                                  ImRect(mn, mx), ui::GlassGroup::Global));
+                                                  ImRect(mn, mx), ui::GlassGroup::Global),
+                                 ui::kChatScrollbar);
 }
 
 // Sticky Settings tabs: tab bar stays put; only the body child scrolls.
@@ -3016,7 +3053,8 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
     int active = st.settings.copilotMode;
     if (active < 0 || active >= kHarnessModeCount) active = 0;
 
-    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
     if (ImGui::BeginTable("##harness_modes", 2,
                           ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX)) {
         for (int i = 0; i < kHarnessModeCount; ++i) {
@@ -3041,6 +3079,7 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
         }
         ImGui::EndTable();
     }
+    ImGui::PopStyleVar();  // CellPadding
 }
 
 // Settings → AI → Harness: full mirror of copilot Quick settings + extras that
@@ -3049,6 +3088,10 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
 bool drawHarnessSessionKnobs(AppState& st, float sc) {
     Settings& settings = st.settings;
     bool changed = false;
+    // One cell-padding tier for every grid in this function (pref combos, checkboxes,
+    // sliders, budgets) — the default 4x3dp table padding was the biggest vertical waste
+    // in the modal.
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
     static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
 
     auto prefCombo = [&](const char* label, const char* id, int* pref, const char* help) {
@@ -3192,7 +3235,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::EndTable();
     }
 
-    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
 
     // ---- Chat display: how the transcript renders the agent's work. These knobs live in
     // config.json (agent.ui_chat_*) and persist themselves inside the ui/ai/ai_prefs.h setters,
@@ -3261,7 +3304,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::EndTable();
     }
 
-    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
 
     // ---- Sliders / budgets in 2 columns ----
     if (ImGui::BeginTable("##harness_sliders", 2,
@@ -3322,6 +3365,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         }
         ImGui::EndTable();
     }
+    ImGui::PopStyleVar();  // CellPadding
     return changed;
 }
 
@@ -4789,10 +4833,9 @@ void drawSettingsModal(AppState& st, bool busy) {
 
     // ---------- Settings window ----------
     static bool s_settingsOpen = false;
-    // On-open snapshot for Cancel: the AI-tab picker and the Agent/Experimental checkboxes edit
-    // st.settings live, so Cancel restores this copy (real revert semantics — audit P1). The
-    // immediate-persist preferences (units / theme / glass) are re-kept on Cancel below.
-    static Settings s_snapshot;
+    // Every control in this dialog persists on change (theme / glass / units / roles / agent
+    // knobs all save at their edit site, the system-prompt override debounce-flushes below) —
+    // there is deliberately no Save/Cancel footer; closing the window never discards edits.
     bool opening = false;
     if (st.openSettings) {
         if (!s_settingsOpen) opening = true;
@@ -4803,7 +4846,6 @@ void drawSettingsModal(AppState& st, bool busy) {
     // Workspace-folder edit buffer (General tab), reseeded from Settings on every open.
     static std::vector<char> s_wsBuf(512, 0);
     if (opening) {
-        s_snapshot = settings;
         std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
         std::strncpy(s_wsBuf.data(), settings.workspaceDir.c_str(), s_wsBuf.size() - 1);
         // Make sure the glass engine reflects the persisted config before the Appearance
@@ -4834,6 +4876,8 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed,
             ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
                    ui::palette.headerBg[2], 1.0f));
+        // Borderless — the window frame read as a boxed outline around an already-framed dialog.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
         bool settingsBegun = ImGui::Begin("Settings", &s_settingsOpen,
                          ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking);
         ImGui::PopStyleColor(3);  // TitleBg / TitleBgActive / TitleBgCollapsed
@@ -4890,12 +4934,9 @@ void drawSettingsModal(AppState& st, bool busy) {
         // Sticky tab bar: fixed header region (tabs) + scrolling body per tab.
         // Outer child is non-scrolling so the tab row never leaves the top; each
         // tab wraps its content in settingsTabBodyBegin/End so only the body scrolls.
-        // Save/Cancel stay pinned under the whole tabs area.
-        const float footerH = ImGui::GetFrameHeightWithSpacing() + 20.0f * sc;
-        pushGlassChildStyle(10.0f);
-        ImGui::BeginChild("##settabsarea",
-                          ImVec2(0, std::max(120.0f * sc,
-                                             ImGui::GetContentRegionAvail().y - footerH)),
+        // The container is TRANSPARENT — a glass frame around the whole tab region read
+        // as a nested border box; the section cards carry their own glass.
+        ImGui::BeginChild("##settabsarea", ImVec2(0, 0),
                           ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         if (ImGui::BeginTabBar("##settabs")) {
@@ -5392,10 +5433,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                     // Harness is first: full quick-settings mirror + mode grid.
                     // (Behavior was absorbed here so knobs aren't duplicated.)
                     if (s_aiSubSel == 0) {
-                        settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
-                        drawHarnessOrganizationSection(st, sc);
-                        settingsGlassSectionEnd();
-
+                        // Session knobs lead (most-used); the mode grid sits at the bottom
+                        // of the page — it is a read-mostly orientation card.
                         settingsGlassSectionBegin("##ai_harness_session", "Session knobs");
                         dimText("Same knobs as Copilot -> Quick settings, plus modal-only "
                                 "options (role adoption, company auto-route, Eng. Firm budget).");
@@ -5406,6 +5445,10 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                         settingsGlassSectionBegin("##ai_memory", "Memory & Learning");
                         drawMemoryLearningSection(st, sc);
+                        settingsGlassSectionEnd();
+
+                        settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
+                        drawHarnessOrganizationSection(st, sc);
                         settingsGlassSectionEnd();
                     }
 
@@ -5529,13 +5572,17 @@ void drawSettingsModal(AppState& st, bool busy) {
                             ImGui::TextUnformatted("System prompt override");
                             ImGui::PopFont();
                             dimText("Empty = built-in. Custom text fully replaces it \xe2\x80\x94 "
-                                    "keep the result/parts contract. Applied by Save below.");
+                                    "keep the result/parts contract. Autosaves as you type.");
                             ImGui::PushFont(st.fonts.mono);
                             float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
                             if (edH < 100.0f * sc) edH = 100.0f * sc;
-                            ImGui::InputTextMultiline("##sysprompt", st.spBuf.data(), st.spBuf.size(),
-                                                      ImVec2(-1, edH));
+                            if (ImGui::InputTextMultiline("##sysprompt", st.spBuf.data(), st.spBuf.size(),
+                                                      ImVec2(-1, edH))) {
+                                s_spOverrideDirty = true;
+                                s_spOverrideLastEdit = ImGui::GetTime();
+                            }
                             ImGui::PopFont();
+                            flushSystemPromptOverride(st, /*force=*/false);
                             if (!canFetch) ImGui::BeginDisabled();
                             if (ImGui::Button("Load built-in prompt")) {
                                 nlohmann::json pr;
@@ -5546,6 +5593,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     std::strncpy(st.spBuf.data(),
                                                  pr.value("system_prompt", "").c_str(),
                                                  st.spBuf.size() - 1);
+                                    commitSystemPromptOverride(st);  // deliberate load: persist
                                 } else {
                                     st.addLog("[err] get_prompts: " + perr);
                                 }
@@ -5554,8 +5602,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("Copy the built-in prompt into the editor");
                             ImGui::SameLine();
-                            if (ImGui::Button("Clear (use built-in)"))
+                            if (ImGui::Button("Clear (use built-in)")) {
                                 std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
+                                commitSystemPromptOverride(st);  // empty = built-in, persist now
+                            }
                         } else if (s_selectedRole >= 0 &&
                                    s_selectedRole < (int)s_promptRecs.size()) {
                             auto& pr = s_promptRecs[s_selectedRole];
@@ -6814,42 +6864,13 @@ void drawSettingsModal(AppState& st, bool busy) {
             ImGui::EndTabBar();
         }
         ImGui::EndChild();
-        popGlassChildStyle();
-        ImGui::Separator();
-        // Right-align the Save/Cancel pair against the modal's right gutter.
-        const float footBtnsW = 120.0f * sc + 100.0f * sc + ImGui::GetStyle().ItemSpacing.x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             ImGui::GetContentRegionAvail().x - footBtnsW);
-        if (primaryButton("Save", ImVec2(120.0f * sc, 34.0f * sc))) {
-            settings.systemPrompt = st.spBuf.data();
-            saveSettings(settings);
-            st.addLog("[ok] saved settings");
-            s_settingsOpen = false;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(100.0f * sc, 34.0f * sc))) {
-            // Restore the on-open snapshot so live-edited (but unsaved) fields don't linger as
-            // a half-applied in-memory state (audit P1) — EXCEPT the immediate-persist
-            // preferences (units / theme / glass / recent files), which already saved to
-            // config.json when they changed and must keep their live values.
-            Units keepUnits = settings.units;
-            std::string keepTheme = settings.theme;
-            ui::GlassConfig keepGlass = settings.glassCfg;
-            std::string keepWs = settings.workspaceDir;   // persisted by its Apply button
-            std::vector<std::string> keepRecent = settings.recentFiles;
-            settings = s_snapshot;
-            settings.units = keepUnits;
-            settings.theme = keepTheme;
-            settings.glassCfg = keepGlass;
-            settings.workspaceDir = keepWs;
-            settings.recentFiles = keepRecent;
-            std::fill(st.spBuf.begin(), st.spBuf.end(), 0);  // discard prompt edits
-            std::strncpy(st.spBuf.data(), settings.systemPrompt.c_str(), st.spBuf.size() - 1);
-            s_settingsOpen = false;
-        }
         }
         ImGui::End();
+        ImGui::PopStyleVar();  // WindowBorderSize
     }
+
+    // Modal closed (X) with the system-prompt debounce still pending: force-commit it.
+    if (!s_settingsOpen) flushSystemPromptOverride(st, /*force=*/true);
 
     // ---------- About modal ----------
     if (st.showAbout) {

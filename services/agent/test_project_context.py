@@ -10,6 +10,9 @@ Contracts defended:
 - The block actually reaches the system prompt of a real ``run_turn`` call
   (scripted provider), via env CHUDWARE_PROJECT_DIR — and stays out when no
   project root is known.
+- ``resolve_project_root`` climbs to the OUTERMOST real project marker, but
+  NEVER escapes into a system-wide directory (temp dir / $HOME / fs root)
+  just because a stray marker was dropped there.
 """
 from __future__ import annotations
 
@@ -155,3 +158,61 @@ def test_no_project_root_no_block(monkeypatch):
         run_id="t-pctx-2",
     )
     assert "[PROJECT FILES]" not in p.seen_system[0]
+
+
+# ---------------------------------------------------------------------------
+# resolve_project_root: outermost real project, never a system-wide directory
+# ---------------------------------------------------------------------------
+
+
+def test_climbs_to_outermost_nested_project_marker(tmp_path):
+    """Markers nest: a folder opened as a PLM project keeps its marker forever, so
+    the document's own folder is usually NOT the project. The outer one wins."""
+    from services.agent.project_context import resolve_project_root
+
+    project = tmp_path / "489-final"
+    inner = project / "CAD & Design Geometry"
+    (project / ".plm").mkdir(parents=True)
+    (inner / ".plm").mkdir(parents=True)
+
+    assert resolve_project_root(inner) == project
+    assert resolve_project_root(project) == project
+
+
+def test_stray_marker_in_temp_dir_never_widens_the_jail(tmp_path, monkeypatch):
+    """A marker dropped in the SYSTEM TEMP DIR must not make every temp path
+    resolve to it — that jail would cover every other process's scratch space.
+    Regression: one stray .aicadvault in /tmp resolved /tmp/<x>/489-final to /tmp."""
+    import tempfile
+
+    from services.agent.project_context import resolve_project_root
+
+    fake_tmp = tmp_path / "systmp"
+    project = fake_tmp / "run-abc" / "489-final"
+    (fake_tmp / ".aicadvault").mkdir(parents=True)   # the stray marker
+    (project / ".plm").mkdir(parents=True)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp))
+
+    # The real project still resolves to itself, not up to the temp dir.
+    assert resolve_project_root(project) == project
+    # And an unmarked temp path does not get adopted by the stray marker either.
+    loose = fake_tmp / "run-def" / "parts"
+    loose.mkdir(parents=True)
+    assert resolve_project_root(loose) == loose
+
+
+def test_marker_at_home_or_fs_root_is_ignored(tmp_path, monkeypatch):
+    """$HOME (and the filesystem root) are never a project — jailing there is the
+    same as no jail at all."""
+    import pathlib
+
+    from services.agent import project_context as pc
+
+    home = tmp_path / "home" / "hunter"
+    (home / ".plm").mkdir(parents=True)
+    work = home / "work" / "widget"
+    work.mkdir(parents=True)
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: home))
+
+    assert pc.resolve_project_root(work) == work
+    assert pc.resolve_project_root(pathlib.Path("/")) == pathlib.Path("/")

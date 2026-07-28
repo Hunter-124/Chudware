@@ -12,6 +12,7 @@ headless tests and lanes without a workspace are unaffected.
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -35,6 +36,31 @@ _PROJECT_MARKERS = (".plm", ".aicadvault", ".chudware")
 # Never treat these as a project root even if something dropped a marker there —
 # jailing an agent to $HOME or ~/Documents is the same as no jail at all.
 _ROOT_STOP_NAMES = {"Documents", "Desktop", "Downloads", "Music", "Pictures", "Videos"}
+
+
+def _never_project_root(node: Path, home: Path | None) -> bool:
+    """True for directories that must never become the agent's jail root.
+
+    The climb keeps the OUTERMOST marked ancestor, which is right for real nested
+    project folders but catastrophic if a marker ever lands somewhere system-wide:
+    one stray ``.aicadvault`` in ``/tmp`` resolved EVERY temp path to ``/tmp``, i.e.
+    a jail covering every other process's scratch space. The same would apply to
+    ``$HOME`` or ``/``. Stop the climb before those rather than trusting the marker.
+    """
+    if node.parent == node:          # filesystem root
+        return True
+    if home is not None and node == home:
+        return True
+    if node.name in _ROOT_STOP_NAMES:
+        return True
+    try:
+        # The system temp dir is shared scratch space, never one user's project.
+        # Compare through realpath so /tmp vs a symlinked /private/tmp both match.
+        if Path(os.path.realpath(str(node))) == Path(os.path.realpath(tempfile.gettempdir())):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def _is_project_dir(d: Path) -> bool:
@@ -65,9 +91,7 @@ def resolve_project_root(start: str | Path) -> Path:
     node = cur
     # Bounded climb: filesystem depth is finite, but guard anyway.
     for _ in range(64):
-        if home is not None and (node == home or node.name in _ROOT_STOP_NAMES):
-            break
-        if node.parent == node:  # filesystem root
+        if _never_project_root(node, home):
             break
         try:
             if _is_project_dir(node):

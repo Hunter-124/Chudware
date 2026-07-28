@@ -85,3 +85,27 @@ class TestRenderToolsBlock:
             raise RuntimeError("registry down")
         text, meta = render_tools_block(["add_features"], resolver=_bad)
         assert meta["unresolved"] == ["add_features"]
+
+    def test_pseudo_tools_have_fallback_schemas(self):
+        # Advertised pseudo-tools must never render "# schema unavailable".
+        for pseudo in ("delegate", "adopt_role", "enable_tools",
+                       "list_tool_categories", "design_recipe"):
+            text, meta = render_tools_block(
+                [pseudo], resolver=lambda _t: None, include_category_menu=False)
+            assert meta["unresolved"] == [], (pseudo, meta)
+            assert f"{pseudo}(" in text
+            assert "schema unavailable" not in text
+
+    def test_multiline_paragraph_cannot_break_block_indent(self):
+        def _multi() -> dict:
+            """Plan a mission: validate the deliverable manifest and compile the
+            role-assigned mission DAG (does NOT execute)."""
+            return {}
+
+        text, _ = render_tools_block(
+            ["mission_start"],
+            resolver=lambda n: _multi if n == "mission_start" else None,
+            trim=False, include_category_menu=False)
+        body_lines = [ln for ln in text.splitlines()[1:] if ln]
+        for ln in body_lines:
+            assert ln.startswith("- ") or ln.startswith("    "), ln

@@ -1,6 +1,6 @@
 ---
 name: gui-viewport
-description: Chudware (formerly Billet / AI-CAD) 3D viewport specialist — OpenGL rendering, orbit camera, mesh display, face/edge picking, selection highlighting, HUD overlays, section views, splat/point rendering. Use for any task about the 3D view, what's drawn in it, how clicks select geometry, or viewport visual effects. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Chudware 3D viewport specialist — OpenGL rendering, orbit camera, mesh display, face/edge picking, selection highlighting, HUD overlays, section views, splat/point rendering. Use for any task about the 3D view, what's drawn in it, how clicks select geometry, or viewport visual effects. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Viewport Specialist

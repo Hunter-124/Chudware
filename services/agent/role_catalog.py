@@ -130,7 +130,10 @@ def format_role_catalog_block(
             try:
                 from services.agent.roles import load_role  # noqa: PLC0415
                 card = load_role(rid)
-                brief = (card.goal or "").strip().split("\n")[0][:120]
+                brief = (card.goal or "").strip().split("\n")[0]
+                if len(brief) > 120:
+                    # Truncate at a word boundary — never mid-word.
+                    brief = brief[:120].rsplit(" ", 1)[0].rstrip(" ,;:") + " …"
             except Exception:  # noqa: BLE001
                 brief = "specialist role"
         lines.append(f"- **{rid}**: {brief}")
@@ -140,14 +143,13 @@ def format_role_catalog_block(
 
 def harness_context_block() -> str:
     """Big-picture harness facts for the main system prompt."""
-    return """## Chudware / Chudware harness (how this program works)
+    return """## Chudware harness (how this program works)
 - Kernel: OpenCASCADE B-rep via the CAD engine; geometry is parametric (features + sketches), not meshes.
 - Units: millimeters unless the user says otherwise.
 - Tools: MCP tool families (cad, ecad, cam, sim, plm, …). Call real tools — never invent measurements.
 - Verify-before-done: after mutations run describe_part / measure / verify_battery / check_sketch as appropriate.
 - Project memory: durable notes under the PLM project `.plm/memory.db` (token-budgeted recall each turn).
-- Roles: specialized cards (YAML). Build 3D with **model3d** (delegates **sketch2d** for profiles and checks placement with vision). Pure 2D/ECAD drawing → **sketch2d**. Reviews → **reviewer**. Steering → **advisor**. Distill decisions → **memory**.
-- Delegation: `delegate(role, brief, budget_tokens)` spawns a subagent. Nesting capped by agent.max_subagent_depth.
+- Roles: specialized YAML cards (see the role catalog). `delegate(role, brief, budget_tokens)` spawns a subagent — nesting capped by agent.max_subagent_depth.
 - Adoption: main may switch its own role with `adopt_role`; subagents only if role_adoption=free, else ask advisor/main.
 - Ledger / mission: dimensions and decisions go to the ledger with provenance — never recall a number without a driver.
 - Docs: user/GUI-owned docs are sacred; agent-minted docs can be cleaned up. Prefer editing the active part.

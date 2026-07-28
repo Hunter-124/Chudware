@@ -77,6 +77,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Newest first; pass limit to cap tokens on long projects. "
             "Commit ids from here drive plm_compare and plm_restore."
         ),
+        # limit=0 -> `limit or None` -> unbounded vault history; long projects
+        # accumulate hundreds of entries, each with message + summary.
+        "param_defaults": {"limit": 50},
     },
     "plm_restore": {
         "prompt_note": (

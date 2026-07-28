@@ -77,6 +77,25 @@ MAX_SHARED_VALUE_GROUP = 24
 # avoids a silently-truncated (and therefore unsorted-looking) list.
 MAX_DOC_MATERIALS = 8
 
+# Non-CAD files surfaced as `file` graph nodes (contracts/cad_graph.md 2026-07
+# addendum): office documents, text, images, 3D-exchange and fab formats.
+# Metadata only — content extraction is config-gated (office_content).
+_FILE_EXTS = frozenset({
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx",
+    ".csv", ".md", ".txt", ".rst",
+    ".png", ".jpg", ".jpeg", ".svg", ".bmp", ".webp",
+    ".step", ".stp", ".iges", ".igs", ".stl", ".obj", ".3mf",
+    ".gbr", ".drl",
+})
+# Hard cap on file nodes per project (token/cache guard); overflow is reported
+# as `files_truncated` on the graph dict.
+MAX_FILE_NODES = 500
+# Office text extraction caps (used only when graph_config office_content=on).
+MAX_OFFICE_MENTIONS = 20     # REFERENCES edges per office file
+MAX_TEXT_PREVIEW = 300       # meta.text_preview chars
+# part-number-shaped tokens (PRJ-0042) detected in office text
+_OFFICE_PN_RE = re.compile(r"\b[A-Z]{2,5}-\d{3,5}\b")
+
 
 
 # Dir basenames always pruned from the project walk (shadow/cache/VCS).
@@ -96,11 +115,11 @@ DEFAULT_ARCHIVE_DIR_NAMES = frozenset({
 NODE_KINDS = frozenset({
     "project", "doc", "part", "assembly", "body", "feature", "sketch",
     "mate", "bom_item", "drawing", "sim_study", "board", "firmware",
-    "equation",
+    "equation", "file", "keyword",
 })
 EDGE_KINDS = frozenset({
     "CONTAINS", "DEPENDS_ON", "MATES", "INSTANCE_OF", "REFERENCES",
-    "DERIVES_FROM", "DOCUMENTS", "SIMULATES", "MANUFACTURES",
+    "DERIVES_FROM", "DOCUMENTS", "SIMULATES", "MANUFACTURES", "TAGGED",
 })
 
 _CONTAINER_SUFFIXES = (".step+", ".ecad+")
@@ -207,9 +226,19 @@ def build_graph(
     sources = _collect_sources(
         root, open_docs or {}, skip_names=skip_names,
         archive_names=archive_names, include_archive=include_archive)
+    # Non-CAD file-node records participate in cache validation exactly like
+    # container sources (same file:<rel> key namespace, disjoint by suffix).
+    file_recs: list[dict[str, Any]] = []
+    files_truncated = 0
+    if root is not None:
+        file_recs = _collect_files(
+            root, skip_names=skip_names, include_archive=include_archive)
+        if len(file_recs) > MAX_FILE_NODES:
+            files_truncated = len(file_recs) - MAX_FILE_NODES
+            file_recs = file_recs[:MAX_FILE_NODES]
     if not force and root is not None:
         cached = _load_cache_if_valid(
-            root, sources,
+            root, sources + file_recs,
             include_archive=include_archive,
             archive_names=sorted(archive_names),
         )
@@ -659,6 +688,132 @@ def build_graph(
             root, proj_id, add_node, add_edge, path_to_doc_node,
             skip_names=skip_names)
 
+    # --- non-CAD files → `file` nodes (+ config-gated office content) ------
+    if root is not None:
+        items_by_path = _manifest_items_by_path(root)
+        # enrich path-backed doc nodes with PLM item identity (part number
+        # mentions in office text resolve against these)
+        if items_by_path:
+            for n in nodes:
+                it = items_by_path.get(str(n.get("path") or ""))
+                if not it:
+                    continue
+                meta = n.setdefault("meta", {})
+                if it.get("item_id"):
+                    meta.setdefault("item_id", it["item_id"])
+                if it.get("part_number"):
+                    meta.setdefault("part_number", it["part_number"])
+                if it.get("lifecycle"):
+                    meta.setdefault("lifecycle", it["lifecycle"])
+    if root is not None and file_recs:
+        try:
+            from services.plm import graph_config as _gcfg
+            cfg = _gcfg.get_config(root)
+        except Exception:  # noqa: BLE001
+            cfg = {}
+        office_on = bool(cfg.get("office_content"))
+        office_kinds = set(cfg.get("office_kinds") or [])
+        office_max = int(cfg.get("office_max_chars") or 4000)
+        # mention index: path stem / part number → node ids
+        mention_index: dict[str, list[str]] = {}
+        for n in nodes:
+            p = n.get("path")
+            if p:
+                mention_index.setdefault(
+                    Path(str(p)).stem.lower(), []).append(n["id"])
+            pn = (n.get("meta") or {}).get("part_number")
+            if pn:
+                mention_index.setdefault(str(pn).lower(), []).append(n["id"])
+        pending_mentions: list[tuple[str, str]] = []
+        for rec in file_recs:
+            rel = rec["path"]
+            nid = f"file:{rel}"
+            fmeta: dict[str, Any] = {
+                "ext": rec["ext"], "size_bytes": rec["size"],
+                "mt": rec["mtime"],
+                "folder": str(Path(rel).parent).replace("\\", "/")
+                if "/" in rel else "",
+            }
+            item = items_by_path.get(rel)
+            if item:
+                fmeta["item_id"] = item.get("item_id")
+                if item.get("part_number"):
+                    fmeta["part_number"] = item["part_number"]
+                if item.get("lifecycle"):
+                    fmeta["lifecycle"] = item["lifecycle"]
+            # office content extraction (config-gated, never fatal)
+            mention_terms: list[str] = []
+            if office_on and rec["ext"] in office_kinds:
+                ext_res = _extract_office_text(root / rel, office_max)
+                if ext_res is None:
+                    fmeta["extract_error"] = True
+                else:
+                    text = ext_res.get("text") or ""
+                    if text:
+                        fmeta["text_preview"] = re.sub(
+                            r"\s+", " ", text).strip()[:MAX_TEXT_PREVIEW]
+                        mention_terms = sorted(set(
+                            t.lower() for t in _OFFICE_PN_RE.findall(text)))
+                    fmeta["word_count"] = len(text.split())
+            add_node({
+                "id": nid, "kind": "file",
+                "label": Path(rel).name, "path": rel, "doc_id": None,
+                "meta": fmeta, "origin": ORIGIN_EXTRACTED,
+            })
+            add_edge(proj_id, nid, "CONTAINS")
+            mention_index.setdefault(Path(rel).stem.lower(), []).append(nid)
+            if fmeta.get("part_number"):
+                mention_index.setdefault(
+                    str(fmeta["part_number"]).lower(), []).append(nid)
+            for term in mention_terms[:MAX_OFFICE_MENTIONS]:
+                pending_mentions.append((nid, term))
+        for src_nid, term in pending_mentions:
+            tgts = [t for t in mention_index.get(term, []) if t != src_nid]
+            if tgts:
+                add_edge(src_nid, tgts[0], "REFERENCES",
+                         meta={"via": "office_mention", "term": term},
+                         origin=ORIGIN_INFERRED)
+
+    # --- keyword overlay → `keyword` nodes + TAGGED edges ------------------
+    if root is not None:
+        try:
+            from services.plm import keywords as _kwmod
+            kw_entries = _kwmod.list_entries(root)
+        except Exception:  # noqa: BLE001
+            kw_entries = []
+        if kw_entries:
+            node_by_id = {n["id"]: n for n in nodes}
+            tagged_keywords: dict[str, list[str]] = {}
+            for ent in kw_entries:
+                target = str(ent.get("target") or "")
+                keyword = str(ent.get("keyword") or "")
+                if not target or not keyword:
+                    continue
+                # resolve: node id, else project-relative file/doc path
+                tnid = target if target in node_ids else None
+                if tnid is None and f"file:{target}" in node_ids:
+                    tnid = f"file:{target}"
+                if tnid is None and f"doc:{target}" in node_ids:
+                    tnid = f"doc:{target}"
+                if tnid is None:
+                    continue  # unknown endpoint — dropped like overlay links
+                kw_nid = f"kw:{keyword}"
+                if kw_nid not in node_ids:
+                    add_node({
+                        "id": kw_nid, "kind": "keyword", "label": keyword,
+                        "path": None, "doc_id": None, "meta": {},
+                        "origin": str(ent.get("origin") or "manual"),
+                    })
+                add_edge(kw_nid, tnid, "TAGGED",
+                         meta={"entry_id": ent.get("id")},
+                         origin=str(ent.get("origin") or "manual"))
+                tagged_keywords.setdefault(tnid, []).append(keyword)
+            for tnid, kws in tagged_keywords.items():
+                tgt_node = node_by_id.get(tnid)
+                if tgt_node is not None:
+                    tgt_node.setdefault("meta", {})["keywords"] = \
+                        sorted(set(kws))[:8]
+
     # --- resolve __resolve__: targets --------------------------------------
     resolved_edges: list[dict[str, Any]] = []
     for e in edges:
@@ -738,6 +893,11 @@ def build_graph(
     for _e in edges:
         _e["meta"] = _sanitize_meta(_e.get("meta") or {})
 
+    # every node carries its owning project root (cross-project merge key)
+    if root is not None:
+        for _n in nodes:
+            _n.setdefault("meta", {}).setdefault("project", str(root))
+
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     graph = {
         "ok": True,
@@ -745,13 +905,16 @@ def build_graph(
         "edges": edges,
         "generated_at": generated_at,
         "project_dir": str(root) if root else None,
-        "mtimes": {s["key"]: s["mtime"] for s in sources if s.get("key")},
+        "mtimes": {s["key"]: s["mtime"]
+                   for s in (sources + file_recs) if s.get("key")},
         "filter": {
             "include_archive": bool(include_archive),
             "exclude_dirs": sorted(archive_names),
             "skipped_system_dirs": sorted(_SYSTEM_SKIP_DIRS),
         },
     }
+    if files_truncated:
+        graph["files_truncated"] = files_truncated
     if root is not None:
         _save_cache(root, graph)
     return graph
@@ -769,6 +932,7 @@ def get_graph(
     max_edges: int | None = None,
     if_mtimes_max: float | None = None,
     if_sources_count: int | None = None,
+    linked: bool = False,
 ) -> dict[str, Any]:
     """``cad_graph_get`` implementation.
 
@@ -777,6 +941,10 @@ def get_graph(
     ``node_count`` / ``edge_count`` + ``truncated``. Pass ``max_nodes=0`` or
     ``max_edges=0`` to disable a cap. Archive dirs are excluded by default
     (see :func:`build_graph`).
+
+    When ``linked`` is true the primary project's graph is merged with every
+    project in its ``linked_projects`` config list (:func:`merge_linked_graphs`);
+    the response carries ``linked_projects: [root paths]``.
 
     Change probe: when ``if_mtimes_max`` is given (the ``sources_mtime_max``
     from a previous full response, optionally with ``if_sources_count``) and
@@ -792,7 +960,7 @@ def get_graph(
     the full path.
     """
     if (if_mtimes_max is not None and not force and not doc_id
-            and not open_docs and project_dir is not None):
+            and not open_docs and not linked and project_dir is not None):
         root = Path(project_dir)
         cp = _cache_path(root)
         try:
@@ -818,6 +986,9 @@ def get_graph(
         project_dir, open_docs=open_docs, force=force,
         include_archive=include_archive, exclude_dirs=exclude_dirs,
     )
+    linked_dirs: list[str] = []
+    if linked and project_dir is not None:
+        g, linked_dirs = _merge_with_linked(Path(project_dir), g)
     if doc_id:
         # filter to the subgraph of that doc + its neighbors
         keep = {n["id"] for n in g["nodes"]
@@ -876,7 +1047,7 @@ def get_graph(
                       if not str(k).startswith("open:") and isinstance(v, (int, float))]
         sources_mtime_max = max(src_mtimes) if src_mtimes else 0.0
         sources_count = len(src_mtimes)
-    return {
+    out = {
         "ok": True,
         "nodes": nodes,
         "edges": edges,
@@ -892,6 +1063,11 @@ def get_graph(
             "exclude_dirs": sorted(_archive_dir_names(exclude_dirs)),
         },
     }
+    if linked_dirs:
+        out["linked_projects"] = linked_dirs
+    if g.get("files_truncated"):
+        out["files_truncated"] = g["files_truncated"]
+    return out
 
 
 def assembly_tree(
@@ -1096,6 +1272,274 @@ def find_path(src: str, dst: str, graph: dict[str, Any] | None = None,
     return {"ok": True, "path": path}
 
 
+# ---------------------------------------------------------------------------
+# cross-project merge (contracts/cad_graph.md 2026-07 cross-project addendum)
+# ---------------------------------------------------------------------------
+
+
+def resolve_node_ref(
+    ref: str,
+    project_dir: str | os.PathLike,
+    linked_dirs: Iterable[str | os.PathLike] | None = None,
+) -> tuple[str, str] | None:
+    """Resolve a possibly-qualified node reference to ``(project_dir, local_id)``.
+
+    ``<project_key>/<local_node_id>`` addresses a node in the primary project
+    or any of *linked_dirs* (matched via :func:`graph_config.project_key`);
+    anything else is a local id in *project_dir*. Returns None when the key
+    matches no known project.
+    """
+    from services.plm import graph_config as gcfg
+    ref = str(ref or "").strip()
+    if not ref:
+        return None
+    root = Path(project_dir)
+    candidates = [root] + [Path(d) for d in (linked_dirs or [])]
+    if "/" in ref:
+        key, _, local = ref.partition("/")
+        if local:
+            for d in candidates:
+                try:
+                    if gcfg.project_key(d) == key:
+                        return (str(d), local)
+                except Exception:  # noqa: BLE001
+                    continue
+            # fall through — unknown key is not a local id either
+            return None
+    return (str(root), ref)
+
+
+def merge_linked_graphs(
+    primary: dict[str, Any],
+    linked: list[tuple[str, dict[str, Any]]],
+    *,
+    primary_dir: str | None = None,
+) -> dict[str, Any]:
+    """Merge *linked* ``(project_key, graph)`` pairs into *primary*'s graph.
+
+    Node ids stay local per project. ``kw:`` keyword nodes with the same id
+    intentionally merge (a shared keyword is one web); any other id collision
+    gets the non-primary copy prefixed ``<project_key>/``. Qualified overlay
+    links stored in the primary project (``<project_key>/<node_id>``) are
+    resolved against the merged id space and appended as edges.
+    """
+    nodes = [dict(n) for n in primary.get("nodes") or []]
+    edges = [dict(e) for e in primary.get("edges") or []]
+    node_ids = {n["id"] for n in nodes}
+    key_by_dir: dict[str, str] = {}
+    for key, g in linked:
+        proj_root = str(g.get("project_dir") or "")
+        if proj_root:
+            key_by_dir[proj_root] = key
+        id_map: dict[str, str] = {}
+        for n in g.get("nodes") or []:
+            nid = str(n.get("id") or "")
+            if not nid:
+                continue
+            if nid in node_ids and not nid.startswith("kw:"):
+                mapped = f"{key}/{nid}"
+            else:
+                mapped = nid  # new id, or kw: merge into the shared node
+            id_map[nid] = mapped
+            if mapped in node_ids:
+                continue  # kw: merge — keep the existing shared node
+            nn = dict(n)
+            nn["id"] = mapped
+            nn.setdefault("meta", {})
+            if proj_root:
+                nn["meta"]["project"] = proj_root
+                nn["meta"]["project_key"] = key
+            nodes.append(nn)
+            node_ids.add(mapped)
+        for e in g.get("edges") or []:
+            src = id_map.get(str(e.get("src") or ""))
+            dst = id_map.get(str(e.get("dst") or ""))
+            if src and dst:
+                ee = dict(e)
+                ee["src"], ee["dst"] = src, dst
+                edges.append(ee)
+    # qualified overlay links authored in the primary project
+    if primary_dir:
+        try:
+            from services.plm import graph_config as _gcfg
+            from services.plm import graph_links as _gl
+            primary_key = _gcfg.project_key(primary_dir)
+        except Exception:  # noqa: BLE001
+            primary_key = ""
+        try:
+            for lk in _gl.list_links(primary_dir):
+                lsrc, ldst = str(lk.get("src") or ""), str(lk.get("dst") or "")
+                if "/" not in lsrc and "/" not in ldst:
+                    continue  # local links already merged by build_graph
+                rsrc = _qualified_to_merged(
+                    lsrc, key_by_dir, node_ids, primary_key)
+                rdst = _qualified_to_merged(
+                    ldst, key_by_dir, node_ids, primary_key)
+                if rsrc and rdst:
+                    edges.append({
+                        "src": rsrc, "dst": rdst,
+                        "kind": str(lk.get("kind") or "REFERENCES"),
+                        "meta": {"note": lk.get("note") or "",
+                                 "link_id": lk.get("id")},
+                        "origin": str(lk.get("origin") or "manual"),
+                    })
+        except Exception:  # noqa: BLE001
+            pass
+    out = dict(primary)
+    out["nodes"] = nodes
+    out["edges"] = edges
+    return out
+
+
+def _qualified_to_merged(
+    ref: str,
+    key_by_dir: dict[str, str],
+    node_ids: set[str],
+    primary_key: str = "",
+) -> str | None:
+    """Map ``<project_key>/<local_id>`` to its merged-graph id (or None).
+
+    Linked-project copies live either unprefixed (no collision) or
+    ``<key>/<id>``-prefixed; the primary project's own ids are unprefixed.
+    An unqualified ref resolves only as a primary/local id.
+    """
+    if "/" not in ref:
+        return ref if ref in node_ids else None
+    key, _, local = ref.partition("/")
+    if not local:
+        return None
+    if primary_key and key == primary_key:
+        return local if local in node_ids else None
+    if key not in set(key_by_dir.values()):
+        return None
+    if local in node_ids:
+        return local
+    prefixed = f"{key}/{local}"
+    if prefixed in node_ids:
+        return prefixed
+    return None
+
+
+def _merge_with_linked(
+    root: Path, primary_graph: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Build (or load) each linked project's graph and merge into *primary*."""
+    from services.plm import graph_config as gcfg
+    try:
+        cfg = gcfg.get_config(root)
+    except Exception:  # noqa: BLE001
+        return primary_graph, []
+    pairs: list[tuple[str, dict[str, Any]]] = []
+    dirs: list[str] = []
+    for d in cfg.get("linked_projects") or []:
+        try:
+            droot = Path(d)
+            if not droot.is_dir():
+                continue
+            pairs.append((gcfg.project_key(droot), build_graph(droot)))
+            dirs.append(str(droot))
+        except Exception:  # noqa: BLE001
+            continue
+    if not pairs:
+        return primary_graph, []
+    return merge_linked_graphs(
+        primary_graph, pairs, primary_dir=str(root)), dirs
+
+
+def graph_diff(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    """Node/edge set difference between two graph dicts (added/removed).
+
+    Nodes compare by ``id``; edges by ``(src, dst, kind)``. Values are the
+    full node dicts / edge dicts so callers can annotate them (watch flags).
+    """
+    old_nodes = {str(n.get("id")): n for n in old.get("nodes") or []}
+    new_nodes = {str(n.get("id")): n for n in new.get("nodes") or []}
+    nodes_added = [n for nid, n in new_nodes.items() if nid not in old_nodes]
+    nodes_removed = [n for nid, n in old_nodes.items() if nid not in new_nodes]
+
+    def _ekey(e: dict[str, Any]) -> tuple[str, str, str]:
+        return (str(e.get("src")), str(e.get("dst")), str(e.get("kind")))
+
+    old_edges = {_ekey(e): e for e in old.get("edges") or []}
+    new_edges = {_ekey(e): e for e in new.get("edges") or []}
+    return {
+        "ok": True,
+        "nodes_added": nodes_added,
+        "nodes_removed": nodes_removed,
+        "edges_added": [e for k, e in new_edges.items() if k not in old_edges],
+        "edges_removed": [e for k, e in old_edges.items() if k not in new_edges],
+    }
+
+
+def search_graph(
+    graph: dict[str, Any],
+    q: str = "",
+    kinds: Iterable[str] | None = None,
+    keyword: str = "",
+) -> dict[str, Any]:
+    """Substring/kind/keyword search over a graph dict.
+
+    ``q`` matches case-insensitively against node id, label, path,
+    ``meta.keywords`` entries and ``meta.project``. ``keyword`` matches nodes
+    tagged with it (``meta.keywords``) plus the ``kw:<keyword>`` node itself.
+    Returns matching nodes + the edges with both endpoints in the match set.
+    """
+    q = (q or "").strip().lower()
+    keyword = (keyword or "").strip().lower()
+    kind_set = {str(k) for k in kinds} if kinds else None
+    hits: list[dict[str, Any]] = []
+    for n in graph.get("nodes") or []:
+        if kind_set is not None and n.get("kind") not in kind_set:
+            continue
+        meta = n.get("meta") or {}
+        kws = [str(k).lower() for k in (meta.get("keywords") or [])]
+        if keyword:
+            is_kw_node = str(n.get("id")) == f"kw:{keyword}"
+            if keyword not in kws and not is_kw_node:
+                continue
+        if q:
+            hay = [str(n.get("id") or ""), str(n.get("label") or ""),
+                   str(n.get("path") or ""), str(meta.get("project") or "")]
+            hay.extend(kws)
+            if not any(q in h.lower() for h in hay):
+                continue
+        hits.append(n)
+    keep = {n["id"] for n in hits}
+    edges = [e for e in graph.get("edges") or []
+             if e.get("src") in keep and e.get("dst") in keep]
+    return {"ok": True, "nodes": hits, "edges": edges,
+            "node_count": len(hits), "edge_count": len(edges)}
+
+
+def neighbors(
+    graph: dict[str, Any], node_id: str, depth: int = 1,
+) -> dict[str, Any]:
+    """Ego-graph: *node_id* plus everything within *depth* hops (undirected)."""
+    ids = {n["id"] for n in graph.get("nodes") or []}
+    if node_id not in ids:
+        return {"ok": False, "reason": "not_found",
+                "hint": f"no node {node_id!r}"}
+    depth = max(0, min(int(depth), 6))
+    adj: dict[str, list[str]] = {}
+    for e in graph.get("edges") or []:
+        adj.setdefault(e["src"], []).append(e["dst"])
+        adj.setdefault(e["dst"], []).append(e["src"])
+    keep = {node_id}
+    frontier = [node_id]
+    for _ in range(depth):
+        nxt = [m for c in frontier for m in adj.get(c, []) if m not in keep]
+        keep.update(nxt)
+        frontier = nxt
+        if not frontier:
+            break
+    nodes = [n for n in graph.get("nodes") or [] if n["id"] in keep]
+    edges = [e for e in graph.get("edges") or []
+             if e.get("src") in keep and e.get("dst") in keep]
+    return {"ok": True, "nodes": nodes, "edges": edges,
+            "node_count": len(nodes), "edge_count": len(edges),
+            "depth": depth}
+
+
 def assembly_advice(graph: dict[str, Any]) -> dict[str, Any]:
     """Deterministic assembly best-practice advisor over a built graph.
 
@@ -1228,11 +1672,20 @@ def on_ai_vc_checkpoint(
 
 
 def invalidate_cache(project_dir: str | os.PathLike) -> None:
-    """Drop the on-disk cache so the next get rebuilds."""
+    """Drop the on-disk cache so the next get rebuilds.
+
+    The old cache is kept as ``graph.prev.json`` (renamed, not deleted) so
+    :func:`load_cached_graph` still has a "before" snapshot for change-diffs
+    after an overlay mutation.
+    """
     p = _cache_path(Path(project_dir))
     try:
         if p.is_file():
-            p.unlink()
+            prev = p.with_name("graph.prev.json")
+            try:
+                p.replace(prev)
+            except OSError:
+                p.unlink()
     except OSError:
         pass
 
@@ -1347,6 +1800,79 @@ def _read_container(path: Path) -> tuple[dict | None, list[str], str | None]:
         return None, [], None
 
 
+def _collect_files(
+    root: Path | None,
+    *,
+    skip_names: frozenset[str] | None = None,
+    include_archive: bool = False,
+) -> list[dict[str, Any]]:
+    """Walk project for non-CAD files surfaced as `file` graph nodes.
+
+    Metadata only (path/mtime/size/ext) — office content extraction is
+    config-gated and happens in build_graph. Same pruning policy as
+    :func:`_collect_sources`; ``.step+``/``.ecad+`` containers are excluded
+    (they are doc sources, not file nodes). Sorted by rel path so the
+    MAX_FILE_NODES cap is deterministic.
+    """
+    out: list[dict[str, Any]] = []
+    if root is None or not root.is_dir():
+        return out
+    skip = skip_names if skip_names is not None else _skip_dir_names(
+        include_archive=include_archive)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for fn in filenames:
+            lower = fn.lower()
+            if lower.endswith((".step+", ".ecad+")):
+                continue
+            ext = lower.rsplit(".", 1)[-1] if "." in lower else ""
+            if not ext or f".{ext}" not in _FILE_EXTS:
+                continue
+            fp = Path(dirpath) / fn
+            try:
+                st = fp.stat()
+                rel = str(fp.relative_to(root)).replace("\\", "/")
+            except OSError:
+                continue
+            out.append({
+                "key": f"file:{rel}", "path": rel, "mtime": st.st_mtime,
+                "size": st.st_size, "ext": ext,
+            })
+    out.sort(key=lambda r: r["path"])
+    return out
+
+
+def _manifest_items_by_path(root: Path) -> dict[str, dict[str, Any]]:
+    """Best-effort {path: manifest item} for generic-item meta on file nodes.
+
+    Reads the vault head manifest when a vault exists; any failure (no vault,
+    unreadable head) degrades to an empty map — file nodes still emit.
+    """
+    try:
+        from services.plm.vault import Vault
+        m = Vault.open(root).manifest()
+        return {str(it.get("path") or ""): it
+                for it in (m.get("items") or []) if it.get("path")}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _extract_office_text(path: Path, max_chars: int) -> dict[str, Any] | None:
+    """Run the shared office extractor (contracts/office.md §2); None on any
+    failure (missing library, unreadable file) — never fatal to the build."""
+    try:
+        from services.mcp.office_tools import extract_office
+        res = extract_office(str(path))
+        if not isinstance(res, dict) or not res.get("ok"):
+            return None
+        text = str(res.get("text") or "")[:max(0, int(max_chars))]
+        if not text.strip():
+            return {"text": "", "kind": res.get("kind")}
+        return {"text": text, "kind": res.get("kind")}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _walk_project_folders(
     root: Path,
     proj_id: str,
@@ -1449,12 +1975,21 @@ def _cache_path(root: Path) -> Path:
 
 
 def _overlay_mtime(root: Path) -> float:
-    """mtime of graph_links.json overlay (0 if absent)."""
-    p = root / ".plm" / "graph_links.json"
-    try:
-        return p.stat().st_mtime if p.is_file() else 0.0
-    except OSError:
-        return 0.0
+    """Newest mtime across the graph overlays (0 when all absent).
+
+    graph_links / keywords / graph_config all change the built graph, so all
+    three participate in cache invalidation. graph_watch.json is intentionally
+    excluded — watch entries never change the graph.
+    """
+    newest = 0.0
+    for name in ("graph_links.json", "keywords.json", "graph_config.json"):
+        p = root / ".plm" / name
+        try:
+            if p.is_file():
+                newest = max(newest, p.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
 
 
 def _source_mtimes_fast(
@@ -1462,10 +1997,12 @@ def _source_mtimes_fast(
     *,
     skip_names: frozenset[str],
 ) -> dict[str, float]:
-    """Scan source container mtimes without reading zip contents.
+    """Scan source container + file-node mtimes without reading zip contents.
 
     Used by the cache fast-path so a warm ME489-scale tree can validate the
-    on-disk graph without re-parsing every .step+.
+    on-disk graph without re-parsing every .step+. File-node sources
+    (contracts/cad_graph.md file-node addendum) share the ``file:<rel>`` key
+    namespace — containers always end .step+/.ecad+, file nodes never do.
     """
     out: dict[str, float] = {}
     if not root.is_dir():
@@ -1474,15 +2011,19 @@ def _source_mtimes_fast(
         dirnames[:] = [d for d in dirnames if d not in skip_names]
         for fn in filenames:
             lower = fn.lower()
-            if not (lower.endswith(".step+") or lower.endswith(".ecad+")):
-                continue
+            if lower.endswith((".step+", ".ecad+")):
+                pass  # container — always a source
+            else:
+                ext = lower.rsplit(".", 1)[-1] if "." in lower else ""
+                if not ext or f".{ext}" not in _FILE_EXTS:
+                    continue
             fp = Path(dirpath) / fn
             try:
                 rel = str(fp.relative_to(root)).replace("\\", "/")
                 out[f"file:{rel}"] = fp.stat().st_mtime
             except OSError:
                 continue
-    # overlay participates in invalidation (add/remove also invalidate_cache)
+    # overlays participate in invalidation (mutations also invalidate_cache)
     om = _overlay_mtime(root)
     if om > 0:
         out["overlay:graph_links"] = om
@@ -1609,6 +2150,27 @@ def _load_cache_if_valid(
             return None
     data["ok"] = True
     return data
+
+
+def load_cached_graph(project_dir: str | os.PathLike) -> dict[str, Any] | None:
+    """Read the on-disk cached graph as-is (no validity check), else None.
+
+    Used by the change-diff RPC: the cached graph is the "before" snapshot a
+    fresh rebuild is compared against. Falls back to ``graph.prev.json`` —
+    :func:`invalidate_cache` renames the cache there so a mutation doesn't
+    destroy the baseline. Size-guarded like the cache loader.
+    """
+    root = Path(project_dir)
+    for cp in (_cache_path(root), root / ".plm" / "graph.prev.json"):
+        try:
+            if not cp.is_file() or cp.stat().st_size > MAX_CACHE_BYTES:
+                continue
+            data = json.loads(cp.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def _save_cache(root: Path, graph: dict[str, Any]) -> None:

@@ -1,6 +1,6 @@
 ---
 name: gui-orchestrator
-description: Master orchestrator for Chudware (formerly Billet / AI-CAD) GUI change sessions. Use whenever the user hands over one or more GUI/UI changes to make in this repo — visual tweaks, panel behavior, ribbon buttons, icons, layout, theming, any "change the UI so that…" request — even a single small one. Sets up a master-branch session, clarifies ambiguous targets with the user, batches changes into waves of parallel subagents dispatched straight to the right files (no searching), gates each wave on a compiling build, pushes to master as it goes, and hands the user a manual verification checklist instead of screenshots.
+description: Master orchestrator for Chudware GUI change sessions. Use whenever the user hands over one or more GUI/UI changes to make in this repo — visual tweaks, panel behavior, ribbon buttons, icons, layout, theming, any "change the UI so that…" request — even a single small one. Sets up a master-branch session, clarifies ambiguous targets with the user, batches changes into waves of parallel subagents dispatched straight to the right files (no searching), gates each wave on a compiling build, pushes to master as it goes, and hands the user a manual verification checklist instead of screenshots.
 ---
 
 # GUI Orchestrator
@@ -40,8 +40,7 @@ has non-GUI tentacles (e.g. a new command needs a worker RPC).
 
 ## Dispatch table
 
-All production GUI code lives in `host/src/` — per `build.sh`, "the ui/imgui / ui/abstract
-(AI-CAD2) app is retired; host/ is the single cross-platform GUI target". Ignore AGENTS.md's
+All production GUI code lives in `host/src/` — per `build.sh`, "the legacy `ui/imgui` / `ui/abstract` shells are retired; host/ is the single cross-platform GUI target". Ignore AGENTS.md's
 claim that host/ was deleted (stale, T-G11 was reverted); do not send agents to `ui/imgui`. Each subsystem has a
 specialist skill with the deep map; subagent prompts must say **"Read <skill path> first"**
 so workers load only their own subsystem's knowledge.

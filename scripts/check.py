@@ -16,6 +16,9 @@ Gates (all stdlib-only — they parse source/docs, so they need NO engine/OCCT d
                             matches services/agent/prompts/*.md (no C++<->Python agent drift).
   - oracle_import_audit   : no engine/engine_oracle imports in services/ outside
                             scripts/oracle_import_allowlist.txt (thin-client ratchet, T-RF20).
+  - tool_panel_sync       : the Settings → AI → Tools fallback catalog tables
+                            (host/src/ui/tool_panel_tables.h) match their snapshot
+                            (tools/gen_tool_panel_tables.py --check).
 
 The engine + agent pytest suites are NOT run here (they need the runtime venv); run them separately:
     <venv>/python -X utf8 -m pytest engine/doc agent -q
@@ -36,6 +39,7 @@ GATES = [
     ("parity_audit (spec <-> code drift)", ["scripts/parity_audit.py"]),
     ("agent_events_audit (event kinds + role catalog)", ["scripts/agent_events_audit.py"]),
     ("oracle_import_audit (services thin-client ratchet)", ["scripts/oracle_import_audit.py"]),
+    ("tool_panel_sync (Settings → AI → Tools fallback tables)", ["tools/gen_tool_panel_tables.py", "--check"]),
 ]
 
 

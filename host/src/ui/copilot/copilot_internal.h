@@ -167,6 +167,17 @@ void        drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& font
 void        drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
                               bool showThinking);
 
+// Packed tool-row detail: feedTurnActivity writes args_preview, then the capped failure text
+// after "\n\x1eERR\x1e\n" and artifact paths after "\n\x1eART\x1e\n" (ActivityItem gains no
+// fields — app_state.h is integrator-owned). chatActivityCopyText (ui_common) splits the same
+// way so a clipboard copy never carries the raw \x1e marker bytes.
+struct ToolRowDetail {
+    std::string args;
+    std::string err;
+    std::string arts;
+};
+ToolRowDetail splitToolRowDetail(const std::string& detail);
+
 // ---- run launch helpers (composer; shared with the clarify/plan-approve cards) ----
 nlohmann::json agentProviderOverride(const Settings& s);
 void launchDesignRun(AppState& st, const std::string& request,

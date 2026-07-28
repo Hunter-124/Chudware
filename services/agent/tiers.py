@@ -549,10 +549,23 @@ def trim_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
     desc = schema.get("description")
     if not desc:
         return schema
-    # First sentence = text up to (and including) the first period, '!', or '?',
-    # OR the entire string if no sentence boundary found.
+    # First sentence = text up to (and including) the first period, '!', or '?'
+    # that actually ends a sentence, OR the entire string if no boundary found.
+    # A '.' does NOT end a sentence when it closes a common abbreviation
+    # ("e.g.", "i.e.", "etc.") or sits inside a token (version numbers,
+    # decimals, paths) — those used to truncate descriptions mid-word
+    # ("Find paths matching a glob (e.").
+    _ABBREVS = ("e.g", "i.e", "etc", "vs", "cf", "approx", "fig")
     for i, ch in enumerate(desc):
         if ch in ".!?":
+            if ch == ".":
+                head = desc[:i].rstrip().lower()
+                word = (head.rsplit(None, 1)[-1] if head else "").lstrip("([{'\"`")
+                if word in _ABBREVS:
+                    continue
+                nxt = desc[i + 1] if i + 1 < len(desc) else ""
+                if nxt and not nxt.isspace():
+                    continue
             short = desc[: i + 1].strip()
             if short and short != desc.strip():
                 out = dict(schema)

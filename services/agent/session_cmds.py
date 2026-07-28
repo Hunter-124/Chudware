@@ -265,12 +265,22 @@ def compact_session(
     supersede_reads: bool = True,
     drop_useless: bool = True,
     prior_archive: dict | None = None,
+    provider: dict | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """Thin wrapper over compaction engines.
 
     ``strategy`` ∈ ``off`` | ``snapcompact`` | ``shake`` | ``summary``.
     Returns ``{kept_messages, archive?, summary, short_summary}`` (plus
     optional ``saved_tokens`` for shake).
+
+    ``provider`` (``{"provider": <name>, "model": <id>}`` — the host's active
+    provider override) resolves the snap-render spec: under the omp backend a
+    vision provider gets PNG snap frames, anything else stays text-only.
+    ``session_id`` anchors the re-snap chain across rounds (the snap store
+    tracks the session's latest snap). The rebuilt conversation — archive
+    message (reinject) + kept tail — is returned as ``messages`` so the caller
+    can apply it wholesale instead of silently dropping the archive.
     """
     msgs = _snapshot_messages(messages)
     strat = (strategy or "off").strip().lower()
@@ -301,6 +311,18 @@ def compact_session(
             "saved_tokens": int(result.get("saved_tokens") or 0),
         }
 
+    spec = None
+    if isinstance(provider, dict) and (provider.get("provider") or provider.get("model")):
+        try:
+            from services.agent.snap_spec import spec_for  # noqa: PLC0415
+            spec = spec_for(
+                str(provider.get("provider") or "") or None,
+                str(provider.get("model") or "") or None,
+                vision=provider.get("vision") if isinstance(provider.get("vision"), bool) else None,
+            )
+        except Exception:  # noqa: BLE001 — spec resolution must never break compaction
+            spec = None
+
     # snapcompact + summary share the archive engine (summary text from archive)
     result = comp.snapcompact_archive(
         msgs,
@@ -308,6 +330,8 @@ def compact_session(
         prior_archive=prior_archive,
         supersede_reads=bool(supersede_reads),
         drop_useless=bool(drop_useless),
+        provider=spec,
+        session_id=str(session_id) if session_id else None,
     )
     out: dict[str, Any] = {
         "kept_messages": result.get("kept_messages", msgs),
@@ -318,6 +342,10 @@ def compact_session(
         out["archive"] = result["archive"]
     if "cut_index" in result:
         out["cut_index"] = result["cut_index"]
+    try:
+        out["messages"] = comp.reinject_archive(result, provider=spec) + out["kept_messages"]
+    except Exception:  # noqa: BLE001 — fall back to the bare kept tail
+        pass
     return out
 
 

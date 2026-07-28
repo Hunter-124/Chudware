@@ -17,6 +17,7 @@
 #include "imgui.h"
 
 #include "settings_modal.h"
+#include "tool_panel_tables.h"  // generated offline fallback tool catalog (tools/gen_tool_panel_tables.py)
 #include "config_panel.h"
 #include "layout.h"  // drawConfigurationsBody fallback
 
@@ -5673,264 +5674,41 @@ void drawSettingsModal(AppState& st, bool busy) {
                             put("reveng", {"reveng", "research", "cad", "parts"});
                         };
 
-                        struct FamTools { const char* fam; const char* const* tools; int n; };
-                        static const char* kCadTools[] = {
-                            "cad_guide","new_part","add_features","render_part","close_part",
-                            "make_drawing","add_drawing_view","add_dimension","add_gdt",
-                            "export_drawing","measure_part","check_interference","solve_mates"
-                        };
-                        static const char* kSimTools[] = {
-                            "run_fea_static","run_fea_modal","run_fea_thermal","run_cfd_flow",
-                            "run_cfd_accurate","simulate_motion"
-                        };
-                        static const char* kCamTools[] = {
-                            "cam_new_job","cam_set_stock","cam_add_setup","cam_add_tool",
-                            "cam_add_operation","cam_generate","cam_simulate","cam_post"
-                        };
-                        static const char* kEcadTools[] = {
-                            "ecad_new_schematic","ecad_new_pcb","ecad_place_symbol","ecad_wire",
-                            "ecad_autoroute","ecad_run_erc","ecad_run_drc","board_from_schematic"
-                        };
-                        static const char* kEmTools[] = {
-                            "em_status","em_eigenmode","em_driven","em_timedomain"
-                        };
-                        static const char* kPartsTools[] = {
-                            "part_search","part_get","part_place","part_source",
-                            "bom_price","bom_rollup","request_quote"
-                        };
-                        static const char* kRevengTools[] = {
-                            "list_reveng_sessions","get_reveng_session","get_reveng_coverage",
-                            "get_reveng_deviation","describe_reveng_result","reveng_status",
-                            "list_reveng_dims",
-                            "reveng_start_session","reveng_add_images","reveng_add_video",
-                            "reveng_ingest_datasheet","reveng_set_scale","reveng_reconstruct",
-                            "reveng_single_photo","reveng_fit_primitives",
-                            "reveng_build_parametric","reveng_attach_result",
-                            "reveng_print_scale_mat","reveng_make_part_from_library",
-                            "reveng_research_source",
-                            "import_scan_mesh","export_reveng_bundle"
-                        };
-                        static const char* kPlmTools[] = {
-                            "plm_init","plm_open","plm_checkpoint","plm_release",
-                            "plm_history","plm_where_used","plm_rollback","plm_status"
-                        };
-                        static const char* kResearchTools[] = {
-                            "research_web_search","research_fetch_page","research_material_lookup",
-                            "research_eng_calc","fit_calc","recommend_fit"
-                        };
-                        static const char* kMissionTools[] = {
-                            "dag_plan","dag_run","dag_status","mission_start","mission_status",
-                            "buildgraph_plan","replan_request"
-                        };
-                        static const char* kGslTools[] = {
-                            "describe_part","describe_sketch","sketch_health","render_sketch"
-                        };
-                        static const char* kAdvisorTools[] = {
-                            "advise","stage_set","advisory_dispute"
-                        };
-                        static const char* kOfficeTools[] = {
-                            "office_extract","office_read_pptx","office_edit_pptx",
-                            "office_read_xlsx","office_edit_xlsx","office_read_csv",
-                            "office_edit_csv","office_read_pdf","office_edit_pdf",
-                            "office_read_docx","office_edit_docx","office_read_doc",
-                            "office_edit_doc"
-                        };
-                        static const char* kFilesTools[] = {
-                            "fs_read","fs_write","fs_edit","fs_glob","fs_grep","fs_list"
-                        };
-                        static const char* kShellTools[] = {
-                            "run_shell"
-                        };
-                        static const char* kLedgerTools[] = {
-                            "ledger_get","ledger_note"
-                        };
-                        static const char* kIntakeTools[] = {
-                            "req_create","req_update","req_status","confirm_dimensions"
-                        };
-                        static const char* kReconTools[] = {
-                            "reverse_engineer","compare_parts","convert_face_to_sketch",
-                            "project_into_sketch","resolve_process","dfm_check",
-                            "start_capture_session","stop_capture_session",
-                            "request_part_photos","submit_part_photos","measure_from_photo"
-                        };
-                        static const char* kWorkspaceTools[] = {
-                            "workspace_status","workspace_doc_events","enable_tools",
-                            "list_tool_categories","ask_user","delegate"
-                        };
-                        static const FamTools kFamToolMap[] = {
-                            {"cad", kCadTools, (int)(sizeof(kCadTools)/sizeof(kCadTools[0]))},
-                            {"sim", kSimTools, (int)(sizeof(kSimTools)/sizeof(kSimTools[0]))},
-                            {"cam", kCamTools, (int)(sizeof(kCamTools)/sizeof(kCamTools[0]))},
-                            {"ecad", kEcadTools, (int)(sizeof(kEcadTools)/sizeof(kEcadTools[0]))},
-                            {"em", kEmTools, (int)(sizeof(kEmTools)/sizeof(kEmTools[0]))},
-                            {"parts", kPartsTools, (int)(sizeof(kPartsTools)/sizeof(kPartsTools[0]))},
-                            {"reveng", kRevengTools, (int)(sizeof(kRevengTools)/sizeof(kRevengTools[0]))},
-                            {"plm", kPlmTools, (int)(sizeof(kPlmTools)/sizeof(kPlmTools[0]))},
-                            {"research", kResearchTools, (int)(sizeof(kResearchTools)/sizeof(kResearchTools[0]))},
-                            {"mission", kMissionTools, (int)(sizeof(kMissionTools)/sizeof(kMissionTools[0]))},
-                            {"gsl", kGslTools, (int)(sizeof(kGslTools)/sizeof(kGslTools[0]))},
-                            {"advisor", kAdvisorTools, (int)(sizeof(kAdvisorTools)/sizeof(kAdvisorTools[0]))},
-                            {"office", kOfficeTools, (int)(sizeof(kOfficeTools)/sizeof(kOfficeTools[0]))},
-                            {"files", kFilesTools, (int)(sizeof(kFilesTools)/sizeof(kFilesTools[0]))},
-                            {"shell", kShellTools, (int)(sizeof(kShellTools)/sizeof(kShellTools[0]))},
-                            {"ledger", kLedgerTools, (int)(sizeof(kLedgerTools)/sizeof(kLedgerTools[0]))},
-                            {"intake", kIntakeTools, (int)(sizeof(kIntakeTools)/sizeof(kIntakeTools[0]))},
-                            {"recon", kReconTools, (int)(sizeof(kReconTools)/sizeof(kReconTools[0]))},
-                            {"workspace", kWorkspaceTools, (int)(sizeof(kWorkspaceTools)/sizeof(kWorkspaceTools[0]))},
-                        };
-                        static constexpr int kFamToolMapN =
-                            (int)(sizeof(kFamToolMap)/sizeof(kFamToolMap[0]));
+                        // Offline fallback catalog — generated tables
+                        // (tools/gen_tool_panel_tables.py). Whenever the
+                        // runtime is up, the LIVE catalog from the worker
+                        // ai_tool_catalog RPC replaces them (below).
+                        using FamTools = tool_panel_tables::FamTools;
+                        static const auto& kFamToolMap = tool_panel_tables::kFamToolMap;
+                        static constexpr int kFamToolMapN = tool_panel_tables::kFamToolMapN;
+                        static const auto& kToolDescs = tool_panel_tables::kToolDescs;
+                        static constexpr int kToolDescsN = tool_panel_tables::kToolDescsN;
+                        static const auto& kToolGuidance = tool_panel_tables::kToolGuidance;
+                        static constexpr int kToolGuidanceN = tool_panel_tables::kToolGuidanceN;
 
-                        // Short hover help for each tool row — first sentence of the MCP
-                        // tool docstring (services/mcp/*_tools.py + related). Keep in sync
-                        // via scratch/gen_tool_descs.py when tools are added.
-                        static const struct { const char* name; const char* desc; } kToolDescs[] = {
-                            {"add_dimension", "Add a dimension to a view."},
-                            {"add_drawing_view", "Add ONE projected view to a drawing."},
-                            {"add_features", "Apply a list of document ops to build/edit the part (the core modeling tool)."},
-                            {"add_gdt", "Add an ASME Y14.5 feature control frame."},
-                            {"advise", "Run the stage's read-only check battery over *doc_id* and return advisories."},
-                            {"advisory_dispute", "Contest an advisory (contract §9.3)."},
-                            {"ask_user", "Ask the human a typed batch of questions and return machine-readable answers."},
-                            {"board_from_schematic", "ONE-CALL schematic -> preliminary PCB: sync footprints, place (connectivity-aware), autoroute, then (by default) optimize traces (arc cor..."},
-                            {"bom_price", "Roll up the BOM for `doc_path` AND resolve bought-line prices via the provider chain."},
-                            {"bom_rollup", "Roll an assembly (+ any linked ECAD board) up into a unified made/bought BOM."},
-                            {"buildgraph_plan", "Compile a BUILD PLAN or mission into an aicad.buildgraph/1 prerequisite graph."},
-                            {"cad_guide", "Return the engine's modeling/simulation knowledge so you can drive it well."},
-                            {"cam_add_operation", "Add a machining operation to a setup."},
-                            {"cam_add_setup", "Add a machining setup (a stock + WCS + machine/platform)."},
-                            {"cam_add_tool", "Add (or replace by number) a tool in the library."},
-                            {"cam_generate", "Generate toolpaths for the job (or one setup / one op)."},
-                            {"cam_new_job", "Create a new CAM machining job and make it current."},
-                            {"cam_post", "Post-process to controller G-code."},
-                            {"cam_set_stock", "Set/replace a setup's stock."},
-                            {"cam_simulate", "Material-removal simulation: removed/remaining volume, machined fraction, gouge, rapid-through-stock, and holder/shank collision checks,..."},
-                            {"check_interference", "Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?"},
-                            {"close_part", "Close a part document and free it."},
-                            {"compare_parts", "Boolean-compare two documents' solids: how much volume they share and where they differ."},
-                            {"confirm_dimensions", "Close fit-critical demands with TYPED caliper values (the dims we refuse to guess)."},
-                            {"convert_face_to_sketch", "Trace a planar face boundary into a new editable sketch (Convert Entities)."},
-                            {"dag_plan", "Decompose a mission description into an aicad.dag/1 graph JSON."},
-                            {"dag_run", "Start or resume a DAG run from an aicad.dag/1 graph document."},
-                            {"dag_status", "Return the current state of a DAG run."},
-                            {"delegate", "Spawn a sub-agent role with an isolated brief and token budget."},
-                            {"describe_part", "Compact, NAMED outline of the part — use INSTEAD of dumping every face on a complex part."},
-                            {"describe_reveng_result", "Describe the reverse-engineering result for *session_id*."},
-                            {"describe_sketch", "Compose a sketch's PLANE, ENTITY roster, CONSTRAINT roster, closed REGIONS and DOF verdict into text — the non-vision equivalent of looki..."},
-                            {"design_recipe", "Map a natural-language intent to an ordered tool recipe (or list the catalog)."},
-                            {"dfm_check", "Design-for-manufacturing punch list against the part ProcessProfile."},
-                            {"ecad_autoroute", "Auto-route the active board's ratsnest with a basic 2-layer grid (Lee/A*) router."},
-                            {"ecad_new_pcb", "Start a NEW PCB (board) document and make it the active one."},
-                            {"ecad_new_schematic", "Start a NEW schematic document and make it the active one."},
-                            {"ecad_place_symbol", "Place a symbol on the active schematic and return its assigned REF plus its full PIN LIST (name/number/type/world-xy) and the count of pi..."},
-                            {"ecad_run_drc", "Run the Design Rule Check on the active board and return a summary with the worst offenders (clearance, track width, via size, annular ri..."},
-                            {"ecad_run_erc", "Run the Electrical Rules Check on the active schematic and return the violations as readable lines plus a one-line verdict ('N errors, M..."},
-                            {"ecad_wire", "Auto-route an orthogonal wire from one pin to another (emits sch_connect) and return the RESULTING net plus the updated list of what is s..."},
-                            {"em_driven", "Driven S-parameter sweep of a uniform guide section (analytic-uniform default)."},
-                            {"em_eigenmode", "Waveguide eigenmode cutoffs (builtin-fdfd by default)."},
-                            {"em_status", "EM solver matrix — which backends are installed and the default per analysis."},
-                            {"em_timedomain", "Time-domain pulse through a uniform guide (analytic dispersive IFFT default)."},
-                            {"enable_tools", "Pull additional tool category packs into this turn."},
-                            {"export_drawing", "Export a 2D DRAWING document to a vector file so you can deliver it."},
-                            {"export_reveng_bundle", "Export the full RE session directory as a zip bundle to *dest*."},
-                            {"fit_calc", "ISO 286 fit maths, in DESIGN mode (what should the sizes be?) or MEASURED mode (what fit do these two real sizes actually give?) — code d..."},
-                            {"fs_edit", "Replace text in an existing file."},
-                            {"fs_glob", "Find paths matching a glob under the project root."},
-                            {"fs_grep", "Regex-search file contents under a path (optional glob filter)."},
-                            {"fs_list", "List a directory's entries (name, dir flag, size)."},
-                            {"fs_read", "Read a text file, directory, or document with CONTEXT-SAFE, line-numbered output."},
-                            {"fs_write", "Create or OVERWRITE a text file with *content*."},
-                            {"get_reveng_coverage", "Return measured capture coverage against the 11-shot orbit plan."},
-                            {"get_reveng_deviation", "Compute mesh-vs-mesh (or mesh-vs-B-Rep tessellation) deviation (RE-16)."},
-                            {"get_reveng_session", "Return the full ``aicad.reveng_session/1`` manifest for *session_id*."},
-                            {"import_scan_mesh", "Import an externally-produced scan mesh (.ply / .obj) into *session_id*."},
-                            {"ledger_get", "Return the design ledger for *run_id*, rendered within *budget_tokens*."},
-                            {"ledger_note", "Append a structured event to the design ledger for *run_id*."},
-                            {"list_reveng_dims", "Return the dimension ledger the Review stage confirms against."},
-                            {"list_reveng_sessions", "List all reverse engineering sessions in the session store."},
-                            {"list_tool_categories", "List available tool category packs (name + one line)."},
-                            {"make_drawing", "Create a 2D engineering drawing of the current part in ONE shot, then refine it."},
-                            {"measure_from_photo", "Measure one in-plane dimension between two pixel points vs a ChArUco fiducial."},
-                            {"measure_part", "Mass properties of the current part: volume (mm^3), mass (g), centre of mass, inertia."},
-                            {"mission_start", "Plan a mission: validate the deliverable manifest and compile the role-assigned mission DAG (does NOT execute — call dag_run to run it)."},
-                            {"mission_status", "Render a mission's phase state from the ledger (pure read)."},
-                            {"new_part", "Create a new, empty editable part document and make it current."},
-                            {"office_edit_csv", "Full-file rewrite (csv has no partial-edit primitive)."},
-                            {"office_edit_doc", "Lossy round-trip: soffice .doc→.docx, apply ``office_edit_docx``-style *ops*, soffice .docx→.doc back over *out_path* (default: the origi..."},
-                            {"office_edit_docx", "``ops``: ``[{paragraph_index, text}]`` or ``[{op:\"append_paragraph\", text}]``."},
-                            {"office_edit_pdf", "pypdf PAGE-LEVEL ops only — ``{\"op\":\"rotate\",\"page\":0,\"degrees\":90}``, ``{\"op\":\"delete\",\"page\":2}``, ``{\"op\":\"merge\",\"with_path\":\"other.p..."},
-                            {"office_edit_pptx", "``ops``: ``[{slide, shape_index, text}]`` — in-place text-frame replacements (content only; no layout/theme/animation edits)."},
-                            {"office_edit_xlsx", "``cells``: ``{\"B2\": 214.8, \"C3\": \"=SUM(B2:B5)\"}`` — preserves other formulas (opened with ``data_only=False``)."},
-                            {"office_extract", "Read-only text/structure extraction, dispatched by file extension."},
-                            {"office_read_csv", "Returns ``{ok, header, rows}`` (``rows`` capped to *limit* when > 0)."},
-                            {"office_read_doc", "Legacy .doc: ``soffice --headless --convert-to docx`` to a tmp dir, then read the result the same way ``office_read_docx`` does."},
-                            {"office_read_docx", "Returns ``{ok, paragraphs, tables}``."},
-                            {"office_read_pdf", "pypdfium2 text extraction."},
-                            {"office_read_pptx", "Structured slide read."},
-                            {"office_read_xlsx", "Returns ``{ok, sheets:[{name, rows}]}``, or a single sheet if *sheet* is given."},
-                            {"part_get", "Retrieve a single PartRecord by its stable part_id (aicad.parts/1)."},
-                            {"part_place", "Place a standard part into a document — universal insertion across all domains (T-P3)."},
-                            {"part_search", "Search the unified standard-parts library (all domains federated), with V2 taxonomy routing + faceted filtering."},
-                            {"part_source", "Source candidate parts for a plain-language need — deterministic fan-out (no LLM inside): taxonomy match -> facet extraction -> routed se..."},
-                            {"plm_checkpoint", "Save a named checkpoint the user can return to."},
-                            {"plm_history", "Return the timeline (newest first), optionally filtered to one item."},
-                            {"plm_init", "Create a project vault at *path* (a folder), registering existing documents."},
-                            {"plm_open", "Open a project folder, auto-creating history if absent (zero-config)."},
-                            {"plm_release", "Release an item: checks first (unsaved changes, out-of-date component references, never-released components), then stamps the next revisi..."},
-                            {"plm_rollback", "Roll an AI-authored document back to an earlier checkpoint."},
-                            {"plm_status", "Return project state for the Hub/badges: items (with revision + lifecycle), which have unsaved changes, and the current mode."},
-                            {"plm_where_used", "Answer \"where is this used?\": the assemblies, drawings and CAM jobs that consume an item (directly, or the whole chain with ``transitive``)."},
-                            {"project_into_sketch", "Project edges/faces into an existing sketch (SolidWorks Convert Entities)."},
-                            {"recommend_fit", "Map a functional description to recommended ISO 286 fit classes with rationale."},
-                            {"render_part", "Render the current part to an ANNOTATED image and return it so you can SEE the result."},
-                            {"render_sketch", "Render the part containing a 2D sketch as a multi-view image."},
-                            {"replan_request", "Route an ``aicad.replan/1`` request per §17 and report the approvers."},
-                            {"req_create", "Create a new ``aicad.req/1`` requirements document."},
-                            {"req_status", "Record a status transition on a requirement (e.g."},
-                            {"req_update", "Add or update content in a requirements document."},
-                            {"request_part_photos", "Ask the user for photos of a real part so it can be measured."},
-                            {"request_quote", "Request an on-demand manufacturing quote for a doc from an approved supplier API."},
-                            {"research_eng_calc", "Evaluate a named deterministic engineering formula in SI (code does the maths)."},
-                            {"research_fetch_page", "Fetch a page and return clean readability->markdown `content` with provenance."},
-                            {"research_material_lookup", "Look up material properties (yield/ultimate/modulus/density/...) with provenance."},
-                            {"research_web_search", "Search the web for up-to-date facts instead of recalling from memory."},
-                            {"resolve_process", "Decide the manufacturing process from the request (FDM default)."},
-                            {"reveng_add_images", "Add still images to *session_id* for photogrammetry / multi-view reconstruction."},
-                            {"reveng_add_video", "Extract blur-culled stills from a video orbit and add them to *session_id*."},
-                            {"reveng_attach_result", "Attach a parts-hub ``part_ref`` to the completed RE result for *session_id*."},
-                            {"reveng_build_parametric", "Build an editable parametric model from the reconstructed mesh."},
-                            {"reveng_fit_primitives", "Segment the mesh and RANSAC-fit primitive shapes (cylinder, box, cone, etc.)."},
-                            {"reveng_ingest_datasheet", "Ingest a PDF datasheet into *session_id* via docling (RE-04)."},
-                            {"reveng_make_part_from_library", "One-call flow: seed → research → build → attach for a library part with no 3D model."},
-                            {"reveng_print_scale_mat", "Generate a printable ArUco scale-mat PDF for the RE pipeline."},
-                            {"reveng_reconstruct", "Launch sparse + dense reconstruction for *session_id* — returns immediately."},
-                            {"reveng_research_source", "Pull web / datasheet data into a session for the no-photo research lane."},
-                            {"reveng_set_scale", "Solve and record scale calibration for *session_id* (contracts/reveng.md §8.2)."},
-                            {"reveng_single_photo", "Run single-photo mesh reconstruction (TripoSR or TRELLIS tier)."},
-                            {"reveng_start_session", "Create a new reverse engineering session."},
-                            {"reveng_status", "Return the RE workspace readiness probe (contracts/reveng.md §8.1)."},
-                            {"reverse_engineer", "Rebuild an imported solid (STEP/IGES/BREP/STL/...) as an EDITABLE parametric feature tree, verified against the source by boolean compari..."},
-                            {"run_cfd_accurate", "HIGH-FIDELITY external-aero CFD via OpenFOAM (steady RANS, k-omega SST + prism layers)."},
-                            {"run_cfd_flow", "Wind-tunnel CFD over the current part/assembly (LBM)."},
-                            {"run_fea_modal", "Modal FEA — the natural frequencies (Hz) of the held part."},
-                            {"run_fea_static", "Linear-static stress FEA on the current part."},
-                            {"run_fea_thermal", "Thermal (heat-conduction) FEA — steady-state via CalculiX, TRANSIENT via the C++ core solver on the real part mesh."},
-                            {"run_shell", "Run a shell command and capture combined stdout+stderr (byte-capped)."},
-                            {"simulate_motion", "Kinematic motion study: DRIVE one mate over a range, re-solve the mechanism each step, return the trajectory (every body's pose per step)..."},
-                            {"sketch_health", "The single narrated read of a sketch's constraint state — solve it and get back WHY it is under/over-defined plus an ordered plan to reac..."},
-                            {"solve_mates", "Solve the mate constraints of an ASSEMBLY document (positions its components)."},
-                            {"stage_set", "Override the inferred process stage (contract §1: ``stage_set``)."},
-                            {"start_capture_session", "Start a local photo-capture server (QR upload) for photogrammetry."},
-                            {"stop_capture_session", "Stop photo capture and optionally run photogrammetry reconstruction."},
-                            {"submit_part_photos", "Register user photo files and/or measurements read from them."},
-                            {"workspace_doc_events", "Return per-doc event stream entries starting at *since_seq*."},
-                            {"workspace_status", "Return the full workspace snapshot for *run_id*."},
-                        };
-                        static constexpr int kToolDescsN =
-                            (int)(sizeof(kToolDescs) / sizeof(kToolDescs[0]));
+                        // Live tool catalog (worker ai_tool_catalog RPC) — the
+                        // panel shows every registered tool with its real
+                        // family + live description, and the curated
+                        // tool_guidance defaults in the per-tool Options popup.
+                        static bool s_liveCatTried = false;
+                        static bool s_liveCatOk = false;
+                        static double s_liveCatAt = -1e9;
+                        static std::vector<std::string> s_liveFamilies;
+                        static std::map<std::string, std::vector<std::string>> s_liveFamTools;
+                        static std::map<std::string, std::string> s_liveDescs;
+                        static nlohmann::json s_liveGuidance = nlohmann::json::object();
+
+
                         auto toolTooltip = [&](const char* tn) -> const char* {
                             if (!tn || !tn[0]) return "MCP tool.";
-                            // kToolDescs is sorted by name — linear scan is fine at this size.
+                            // Live catalog description (worker ai_tool_catalog) first.
+                            if (s_liveCatOk) {
+                                auto it = s_liveDescs.find(tn);
+                                if (it != s_liveDescs.end() && !it->second.empty())
+                                    return it->second.c_str();
+                            }
+                            // kToolDescs (generated fallback) is sorted by name — linear
+                            // scan is fine at this size.
                             for (int i = 0; i < kToolDescsN; ++i) {
                                 if (!std::strcmp(tn, kToolDescs[i].name))
                                     return kToolDescs[i].desc;
@@ -5960,6 +5738,35 @@ void drawSettingsModal(AppState& st, bool busy) {
                             return "Agent tool — see Options for AI usage parameters.";
                         };
 
+                        // Built-in curated guidance (generated kToolGuidance table)
+                        // as a json object shaped like the live catalog's guidance
+                        // entries — used when the worker ai_tool_catalog RPC has
+                        // no entry for this tool. Linear scan, same as toolTooltip.
+                        auto builtinGuidance = [&](const char* tn) -> nlohmann::json {
+                            nlohmann::json g = nlohmann::json::object();
+                            if (!tn || !tn[0]) return g;
+                            for (int i = 0; i < kToolGuidanceN; ++i) {
+                                if (!std::strcmp(tn, kToolGuidance[i].name)) {
+                                    if (kToolGuidance[i].note && kToolGuidance[i].note[0])
+                                        g["prompt_note"] = kToolGuidance[i].note;
+                                    if (kToolGuidance[i].timeout_s > 0)
+                                        g["timeout_s"] = kToolGuidance[i].timeout_s;
+                                    if (kToolGuidance[i].max_calls > 0)
+                                        g["max_calls_per_turn"] = kToolGuidance[i].max_calls;
+                                    if (kToolGuidance[i].param_defaults_json &&
+                                        kToolGuidance[i].param_defaults_json[0]) {
+                                        nlohmann::json pd = nlohmann::json::parse(
+                                            kToolGuidance[i].param_defaults_json,
+                                            nullptr, false);
+                                        if (pd.is_object() && !pd.empty())
+                                            g["param_defaults"] = pd;
+                                    }
+                                    break;
+                                }
+                            }
+                            return g;
+                        };
+
                         auto famHelp = [](const char* fam) -> const char* {
                             if (!std::strcmp(fam, "cad")) return "Parametric modeling, drawings, measure, mates.";
                             if (!std::strcmp(fam, "sim")) return "FEA, CFD, and motion simulation.";
@@ -5983,8 +5790,56 @@ void drawSettingsModal(AppState& st, bool busy) {
                             return "Tool family.";
                         };
 
+                        // Pull the live tool catalog once the worker is up
+                        // (retry every 15 s until it succeeds). One synchronous
+                        // load on first open — same pattern as loadPrompts().
+                        if (st.workerStarted &&
+                            (!s_liveCatTried ||
+                             (!s_liveCatOk && ImGui::GetTime() - s_liveCatAt > 15.0))) {
+                            s_liveCatTried = true;
+                            s_liveCatAt = ImGui::GetTime();
+                            nlohmann::json p = nlohmann::json::object();
+                            nlohmann::json r;
+                            std::string err;
+                            if (st.worker.call("ai_tool_catalog", p, r, err, 20000) &&
+                                r.value("ok", false)) {
+                                s_liveFamTools.clear();
+                                s_liveDescs.clear();
+                                s_liveGuidance = nlohmann::json::object();
+                                for (const auto& row :
+                                     r.value("tools", nlohmann::json::array())) {
+                                    const std::string name = row.value("name", "");
+                                    const std::string fam = row.value("family", "?");
+                                    if (name.empty()) continue;
+                                    s_liveFamTools[fam].push_back(name);
+                                    s_liveDescs[name] = row.value("description", "");
+                                    if (row.contains("guidance") &&
+                                        row["guidance"].is_object() &&
+                                        !row["guidance"].empty())
+                                        s_liveGuidance[name] = row["guidance"];
+                                }
+                                // Canonical family order (kToolFamilies), then any
+                                // families the config list does not know yet.
+                                s_liveFamilies.clear();
+                                for (int i = 0; i < kToolFamilyCount; ++i)
+                                    if (s_liveFamTools.count(kToolFamilies[i]))
+                                        s_liveFamilies.push_back(kToolFamilies[i]);
+                                for (const auto& kv : s_liveFamTools)
+                                    if (std::find(s_liveFamilies.begin(),
+                                                  s_liveFamilies.end(),
+                                                  kv.first) == s_liveFamilies.end())
+                                        s_liveFamilies.push_back(kv.first);
+                                s_liveCatOk = true;
+                            }
+                        }
+
                         const double nowTf = ImGui::GetTime();
-                        if (s_roleTools.empty() || (nowTf - s_roleToolsLast) > 2.0) {
+                        // Never re-seed/reload while the user has unsaved edits: the 2 s
+                        // poll used to wipe a freshly ticked family (e.g. intake for the
+                        // default role) back to the on-disk state before Save was hit.
+                        if (s_roleTools.empty() ||
+                            (!s_roleToolsDirty && !s_toolOptDirty &&
+                             (nowTf - s_roleToolsLast) > 2.0)) {
                             s_roleToolsLast = nowTf;
                             seedDefaultRoleTools();
                             try {
@@ -6120,13 +5975,28 @@ void drawSettingsModal(AppState& st, bool busy) {
                         // show all when filtering so users can find disabled tools).
                         const std::set<std::string>& selFams =
                             s_roleTools[kRoleKeys[s_roleToolsSel]];
-                        for (int fi = 0; fi < kFamToolMapN; ++fi) {
-                            const FamTools& ft = kFamToolMap[fi];
-                            const bool famAssigned = selFams.count(ft.fam) > 0;
+                        // Unified family→tools view: the LIVE catalog when the
+                        // worker answered, else the generated fallback tables.
+                        std::vector<std::pair<std::string, std::vector<std::string>>> famView;
+                        if (s_liveCatOk) {
+                            for (const auto& fam : s_liveFamilies)
+                                famView.emplace_back(fam, s_liveFamTools[fam]);
+                        } else {
+                            for (int fi = 0; fi < kFamToolMapN; ++fi) {
+                                const FamTools& ft = kFamToolMap[fi];
+                                famView.emplace_back(
+                                    ft.fam,
+                                    std::vector<std::string>(ft.tools, ft.tools + ft.n));
+                            }
+                        }
+                        for (const auto& famEntry : famView) {
+                            const std::string& famName = famEntry.first;
+                            const std::vector<std::string>& famToolList = famEntry.second;
+                            const bool famAssigned = selFams.count(famName) > 0;
                             if (!toolNeedle.empty()) {
                                 int famMatches = 0;
-                                for (int ti = 0; ti < ft.n; ++ti)
-                                    if (toLowerAscii(ft.tools[ti]).find(toolNeedle)
+                                for (const auto& toolName : famToolList)
+                                    if (toLowerAscii(toolName).find(toolNeedle)
                                         != std::string::npos)
                                         ++famMatches;
                                 if (famMatches == 0) continue;
@@ -6137,12 +6007,12 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                             char famLabel[96];
                             std::snprintf(famLabel, sizeof(famLabel), "%s%s",
-                                          ft.fam, famAssigned ? "" : "  (not assigned)");
+                                          famName.c_str(), famAssigned ? "" : "  (not assigned)");
                             if (!ImGui::TreeNode(famLabel)) continue;
                             if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s", famHelp(ft.fam));
-                            for (int ti = 0; ti < ft.n; ++ti) {
-                                const char* tn = ft.tools[ti];
+                                ImGui::SetTooltip("%s", famHelp(famName.c_str()));
+                            for (const auto& toolName : famToolList) {
+                                const char* tn = toolName.c_str();
                                 if (!toolNeedle.empty() &&
                                     toLowerAscii(tn).find(toolNeedle) == std::string::npos)
                                     continue;
@@ -6172,7 +6042,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     ImGui::TextDisabled("%s", toolTooltip(tn));
                                     ImGui::PopTextWrapPos();
                                     ImGui::Separator();
-                                    ImGui::TextDisabled("0 = use global default");
+                                    ImGui::TextDisabled("0 = use built-in / global default");
                                     const float labelW = 150.0f * sc;
                                     const float fieldW = 90.0f * sc;
                                     const float boxW = 360.0f * sc;
@@ -6184,6 +6054,16 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     };
                                     int to = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
                                     int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
+                                    // Built-in curated defaults (tool_guidance,
+                                    // live catalog) — dimmed placeholders; an
+                                    // empty user field inherits them. Falls back
+                                    // to the generated kToolGuidance table when
+                                    // the live catalog has no entry for this
+                                    // tool (worker down / RPC not answered yet).
+                                    const nlohmann::json curated =
+                                        (s_liveCatOk && s_liveGuidance.contains(tn))
+                                            ? s_liveGuidance[tn]
+                                            : builtinGuidance(tn);
                                     popupFieldRow("timeout_s");
                                     if (ImGui::InputInt("##timeout_s", &to)) {
                                         s_toolTimeout[tn] = std::max(0, to);
@@ -6191,7 +6071,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     }
                                     if (to == 0) {
                                         ImGui::SameLine();
-                                        if (s_globalTimeout > 0)
+                                        const int curT = curated.value("timeout_s", 0);
+                                        if (curT > 0)
+                                            ImGui::TextDisabled("(default: %ds)", curT);
+                                        else if (s_globalTimeout > 0)
                                             ImGui::TextDisabled("(global: %ds)", s_globalTimeout);
                                         else
                                             ImGui::TextDisabled("(global: no timeout)");
@@ -6203,7 +6086,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     }
                                     if (mc == 0) {
                                         ImGui::SameLine();
-                                        if (s_globalMaxCalls > 0)
+                                        const int curM = curated.value("max_calls_per_turn", 0);
+                                        if (curM > 0)
+                                            ImGui::TextDisabled("(default: %d)", curM);
+                                        else if (s_globalMaxCalls > 0)
                                             ImGui::TextDisabled("(global: %d)", s_globalMaxCalls);
                                         else
                                             ImGui::TextDisabled("(global: unlimited)");
@@ -6263,7 +6149,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                                         ImGui::PushStyleColor(ImGuiCol_Text,
                                             ui::Palette::toU32(ui::palette.textDim));
                                         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
-                                        ImGui::TextWrapped("Live (no override): %s", liveDesc);
+                                        ImGui::TextWrapped(
+                                            s_liveCatOk ? "Live (no override): %s"
+                                                        : "Built-in (offline snapshot): %s",
+                                            liveDesc);
                                         ImGui::PopTextWrapPos();
                                         ImGui::PopStyleColor();
                                     }
@@ -6278,12 +6167,20 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     if (ImGui::IsItemHovered())
                                         ImGui::SetTooltip(
                                             "prompt_note — appended as \"Note: ...\" under this "
-                                            "tool in the AI tools prompt.");
+                                            "tool in the AI tools prompt. Leave empty to "
+                                            "inherit the built-in default (when one exists).");
+                                    const std::string curNote = curated.value("prompt_note", "");
                                     if (noteBuf[0] == '\0') {
                                         ImGui::PushStyleColor(ImGuiCol_Text,
                                             ui::Palette::toU32(ui::palette.textDim));
-                                        ImGui::TextUnformatted(
-                                            "(empty — no Note: line in the tools prompt)");
+                                        if (!curNote.empty()) {
+                                            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
+                                            ImGui::TextWrapped("(default): %s", curNote.c_str());
+                                            ImGui::PopTextWrapPos();
+                                        } else {
+                                            ImGui::TextUnformatted(
+                                                "(empty — no Note: line in the tools prompt)");
+                                        }
                                         ImGui::PopStyleColor();
                                     }
                                     if (ImGui::InputTextMultiline("##prompt_note",
@@ -6298,6 +6195,28 @@ void drawSettingsModal(AppState& st, bool busy) {
                                         ImGui::SetTooltip(
                                             "param_defaults — kwargs merged under the model's "
                                             "call (model-supplied values win).");
+                                    if (defBuf[0] == '\0' || !std::strcmp(defBuf, "{}")) {
+                                        if (curated.contains("param_defaults") &&
+                                            curated["param_defaults"].is_object() &&
+                                            !curated["param_defaults"].empty()) {
+                                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                                ui::Palette::toU32(ui::palette.textDim));
+                                            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
+                                            ImGui::TextWrapped("(default): %s",
+                                                curated["param_defaults"].dump().c_str());
+                                            ImGui::PopTextWrapPos();
+                                            ImGui::PopStyleColor();
+                                        } else {
+                                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                                ui::Palette::toU32(ui::palette.textDim));
+                                            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
+                                            ImGui::TextWrapped(
+                                                "(none — the tool's own signature defaults "
+                                                "apply; see \"Model receives\" below)");
+                                            ImGui::PopTextWrapPos();
+                                            ImGui::PopStyleColor();
+                                        }
+                                    }
                                     if (ImGui::InputTextMultiline("##param_defaults",
                                             defBuf, sizeof(defBuf),
                                             ImVec2(boxW, 60 * sc))) {
@@ -6332,6 +6251,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                                             entry += "\n    " + body;
                                         if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
                                             entry += "\n    Note: " + s_toolNote[tn];
+                                        else if (!curNote.empty())
+                                            entry += "\n    Note: " + curNote;
                                         s_previewText =
                                             "[TOOLS] Call tools with EXACTLY these kwargs:\n" +
                                             entry;

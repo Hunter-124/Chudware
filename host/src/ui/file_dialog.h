@@ -28,7 +28,6 @@ std::string openFileDialog(const char* filter);
 
 // "Choose folder" dialog. Returns the chosen directory as UTF-8, or "" on cancel/error.
 std::string openFolderDialog();
-
 // Modal Yes/No/Cancel prompt asking whether to import a mesh file as a solid body (vs. keep it as a
 // graphics mesh). Only meaningful for mesh formats. Returns 1 (yes/solid), 0 (no/mesh), -1 (cancel).
 int promptImportMeshAsSolid();
@@ -36,5 +35,20 @@ int promptImportMeshAsSolid();
 // After the engine has written `path` (export/save), desktop no-ops; under
 // __EMSCRIPTEN__ triggers a browser download via GET /workspace/download.
 void afterFileWritten(const std::string& path);
+
+// Reveal a file in the OS file manager, selecting the item where the platform supports
+// it (Explorer /select, Finder `open -R`, freedesktop FileManager1 ShowItems); falls
+// back to opening the containing folder. No-op for empty paths and in the browser build
+// (no OS file manager — component paths there live in the gateway workspace).
+void revealInFileManager(const std::string& path);
+
+// False in the browser build (no OS file manager); callers skip reveal menu items.
+inline bool haveOsFileManager() {
+#ifdef __EMSCRIPTEN__
+    return false;
+#else
+    return true;
+#endif
+}
 
 }  // namespace ui

@@ -537,8 +537,8 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
 # ---------------------------------------------------------------------------
 DEFAULT_TOOL_FAMILIES = (
     "advisor", "cad", "cam", "ecad", "em", "files", "gsl", "intake", "ledger",
-    "mission", "office", "parts", "plm", "recon", "research", "reveng", "shell",
-    "sim", "workspace",
+    "mission", "office", "org", "parts", "plm", "recon", "research", "reveng",
+    "shell", "sim", "workspace",
 )
 
 # ---------------------------------------------------------------------------
@@ -713,6 +713,8 @@ def auto_mission_routing(cfg: dict | None = None) -> bool:
 # Per-tool options (Settings → AI → Tools)
 # agent.tool_options: { "run_fea_static": {"timeout_s": 180, "prompt_note": "..."}, ... }
 # Missing key / missing field = stock behavior.
+# Layering per-field: stock defaults < built-in curated guidance
+# (services/agent.tool_guidance) < config.json entry (the user always wins).
 #
 # Keys (extend in place — do not invent a parallel config tree):
 #   enabled              bool — kill-switch for this tool name
@@ -743,7 +745,11 @@ _TOOL_OPTION_DEFAULTS: dict = {
 
 
 def get_tool_options(cfg: dict | None, name: str) -> dict:
-    """Merged per-tool options for *name*. Unknown stored keys ignored."""
+    """Merged per-tool options for *name*. Unknown stored keys ignored.
+
+    Layering (per-field): stock defaults < built-in curated guidance
+    (``services.agent.tool_guidance``) < the user's config.json entry —
+    the user always wins per-field."""
     out = {
         "enabled": True,
         "timeout_s": None,
@@ -755,6 +761,44 @@ def get_tool_options(cfg: dict | None, name: str) -> dict:
     }
     if not name:
         return out
+
+    def _apply(entry: dict) -> None:
+        if not isinstance(entry, dict):
+            return
+        if "enabled" in entry:
+            out["enabled"] = bool(entry.get("enabled"))
+        if "timeout_s" in entry:
+            try:
+                v = entry.get("timeout_s")
+                out["timeout_s"] = None if v in (None, "", 0, "0") else max(1, int(v))
+            except (TypeError, ValueError):
+                pass
+        if "max_calls_per_turn" in entry:
+            try:
+                v = entry.get("max_calls_per_turn")
+                out["max_calls_per_turn"] = (
+                    None if v in (None, "", 0, "0") else max(1, int(v))
+                )
+            except (TypeError, ValueError):
+                pass
+        if "param_defaults" in entry and isinstance(entry.get("param_defaults"), dict):
+            out["param_defaults"] = dict(entry.get("param_defaults") or {})
+        if "prompt_note" in entry and entry.get("prompt_note") is not None:
+            out["prompt_note"] = str(entry.get("prompt_note") or "")
+        if "description_override" in entry and entry.get("description_override") is not None:
+            out["description_override"] = str(entry.get("description_override") or "")
+        if "schema_trim" in entry:
+            v = entry.get("schema_trim")
+            if v is None or v == "":
+                out["schema_trim"] = None
+            else:
+                out["schema_trim"] = bool(v)
+
+    try:
+        from services.agent.tool_guidance import guidance_for  # noqa: PLC0415
+        _apply(guidance_for(name))
+    except Exception:  # noqa: BLE001 — the curated layer is optional
+        pass
     try:
         c = cfg if isinstance(cfg, dict) else load_config()
     except Exception:  # noqa: BLE001
@@ -763,37 +807,7 @@ def get_tool_options(cfg: dict | None, name: str) -> dict:
     raw_root = agent.get("tool_options") if isinstance(agent, dict) else None
     if not isinstance(raw_root, dict):
         return out
-    entry = raw_root.get(name)
-    if not isinstance(entry, dict):
-        return out
-    if "enabled" in entry:
-        out["enabled"] = bool(entry.get("enabled"))
-    if "timeout_s" in entry:
-        try:
-            v = entry.get("timeout_s")
-            out["timeout_s"] = None if v in (None, "", 0, "0") else max(1, int(v))
-        except (TypeError, ValueError):
-            pass
-    if "max_calls_per_turn" in entry:
-        try:
-            v = entry.get("max_calls_per_turn")
-            out["max_calls_per_turn"] = (
-                None if v in (None, "", 0, "0") else max(1, int(v))
-            )
-        except (TypeError, ValueError):
-            pass
-    if "param_defaults" in entry and isinstance(entry.get("param_defaults"), dict):
-        out["param_defaults"] = dict(entry.get("param_defaults") or {})
-    if "prompt_note" in entry and entry.get("prompt_note") is not None:
-        out["prompt_note"] = str(entry.get("prompt_note") or "")
-    if "description_override" in entry and entry.get("description_override") is not None:
-        out["description_override"] = str(entry.get("description_override") or "")
-    if "schema_trim" in entry:
-        v = entry.get("schema_trim")
-        if v is None or v == "":
-            out["schema_trim"] = None
-        else:
-            out["schema_trim"] = bool(v)
+    _apply(raw_root.get(name))
     return out
 
 
@@ -1053,6 +1067,36 @@ def compaction_backend(cfg: dict | None = None) -> str:
     if isinstance(backend, str) and backend.strip().lower() in _COMPACTION_BACKEND_OMP:
         return "omp"
     return DEFAULT_COMPACTION_BACKEND
+
+
+def _compaction_nested(cfg: dict | None) -> dict:
+    """The nested ``agent.compaction`` block ({} when absent/malformed)."""
+    comp = _agent_block(cfg).get(COMPACTION_KEY)
+    return comp if isinstance(comp, dict) else {}
+
+
+def compaction_snap_frames(cfg: dict | None = None) -> bool:
+    """``agent.compaction.snap_frames`` (bool, default True) — render archived
+    history to OMP snap PNG frames when the backend is ``omp`` and the active
+    provider has vision. Off = text-only archives even under the omp backend."""
+    raw = _compaction_nested(cfg).get("snap_frames")
+    return bool(raw) if isinstance(raw, bool) else True
+
+
+def compaction_snap_dir(cfg: dict | None = None) -> str | None:
+    """``agent.compaction.snap_dir`` (str, default None = snap_store.default_dir)."""
+    raw = _compaction_nested(cfg).get("snap_dir")
+    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
+def compaction_snap_max_frames(cfg: dict | None = None) -> int:
+    """``agent.compaction.snap_max_frames`` (int, default 80 = OMP's
+    MAX_FRAMES_DEFAULT). Upper bound on rendered frames per snap."""
+    try:
+        v = _compaction_nested(cfg).get("snap_max_frames")
+        return max(1, int(v)) if v is not None else 80
+    except (TypeError, ValueError):
+        return 80
 
 
 def cache_warming_enabled(cfg: dict | None = None) -> bool:

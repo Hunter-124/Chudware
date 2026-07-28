@@ -144,12 +144,35 @@ class TestPromptPreview(unittest.TestCase):
         self.assertGreater(out["meta"].get("system_chars", 0), 100)
 
 
+    def test_tool_catalog_covers_registry_and_guidance(self):
+        from services.agent.prompt_preview import tool_catalog
+
+        out = tool_catalog()
+        self.assertTrue(out.get("ok"), out.get("error"))
+        rows = out.get("tools") or []
+        self.assertGreater(len(rows), 300)
+        by_name = {r["name"]: r for r in rows}
+        # Registry tool: family + live description + curated guidance present.
+        lg = by_name.get("ledger_get")
+        self.assertIsNotNone(lg)
+        self.assertEqual(lg["family"], "ledger")
+        self.assertIn("design ledger", lg["description"])
+        self.assertTrue(lg["resolved"])
+        self.assertTrue(lg["guidance"].get("prompt_note"))
+        # Pseudo-tool with no registry callable still listed, with guidance.
+        dlg = by_name.get("delegate")
+        self.assertIsNotNone(dlg)
+        self.assertFalse(dlg["resolved"])
+        self.assertTrue(dlg["guidance"].get("prompt_note"))
+
+
 class TestWorkerPreviewMethods(unittest.TestCase):
     def test_registered(self):
         from services.agent.worker_rpc import WORKER_METHODS
 
         self.assertIn("ai_tool_preview", WORKER_METHODS)
         self.assertIn("ai_prompt_preview", WORKER_METHODS)
+        self.assertIn("ai_tool_catalog", WORKER_METHODS)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 ---
 name: gui-icons
-description: Chudware (formerly Billet / AI-CAD) icon subsystem specialist — generating icons (procedural PIL icons and screenshot-based icons rendered from scripts that drive the modeling engine), editing the atlases, and wiring icons into the GUI. Use for any task mentioning icons, the icon atlas, ribbon/tree glyphs, icon recipes, contact sheets, or the icon pipeline. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Chudware icon subsystem specialist — generating icons (procedural PIL icons and screenshot-based icons rendered from scripts that drive the modeling engine), editing the atlases, and wiring icons into the GUI. Use for any task mentioning icons, the icon atlas, ribbon/tree glyphs, icon recipes, contact sheets, or the icon pipeline. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Icons Specialist

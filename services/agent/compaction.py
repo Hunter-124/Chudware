@@ -18,6 +18,7 @@ import copy
 import json
 import math
 import re
+from pathlib import Path
 from typing import Any, Iterable
 
 # --------------------------------------------------------------------------- constants
@@ -585,21 +586,17 @@ def _plan_text_archive(text: str, edge_chars: int = TEXT_EDGE_CHARS) -> dict[str
     }
 
 
-# --------------------------------------------------------------------------- OMP bridge hybrid backend
-# Optional: snapcompact_archive can route through the OMP bridge's ``compact`` RPC
-# (real reuse of OMP's snapcompact engine over vendor/omp/bridge — see
-# OMP_INTEGRATION_PLAN.md §RPC CONTRACT, docs/omp-integration/01-DECISIONS.md
-# §Compaction) instead of the pure-Python path below. Off by default (unchanged
-# behavior); opt in with env CHUDWARE_COMPACTION_BACKEND=omp or config.json
-# agent.compaction_backend="omp" (legacy nested agent.compaction.backend still
-# honored). Any bridge failure (bun/script missing, crash, timeout, RPC error)
-# raises omp_bridge.BridgeUnavailable, caught here to fall back to the pure-Python
-# path transparently.
-
-def _bridge():
-    from services.agent import omp_bridge  # noqa: PLC0415
-    return omp_bridge
-
+# --------------------------------------------------------------------------- OMP snap rendering
+# Optional: under the omp backend (env CHUDWARE_COMPACTION_BACKEND=omp / config.json
+# agent.compaction_backend="omp") the canonical local archive below is ADDITIONALLY
+# rendered to OMP snapcompact PNG frames via the bridge's ``snap_render`` RPC
+# (vendor/omp/bridge/src/snap-render.ts — foveated text-to-image frames in the active
+# provider's optimal shape; the local cut/serialization stays canonical either way).
+# The full OG source text round-trips through the bridge (``text`` in, ``text`` out)
+# and persists in the snap store (services/agent/snap_store.py), so the next round
+# re-renders with new history appended and a mid-session provider switch re-renders
+# the same source in the new provider's shape — the original contents are never lost.
+# Any bridge/store failure degrades to the text-only archive with a warning.
 
 def _compaction_backend(cfg: dict | None = None) -> str:
     """``"local"`` (default) or ``"omp"``.
@@ -616,164 +613,219 @@ def _compaction_backend(cfg: dict | None = None) -> str:
         return "local"
 
 
-def _to_wire_message(msg: dict) -> dict[str, Any]:
-    """Adapt one CAD transcript message onto the bridge's stricter ``compact``
-    wire shape (vendor/omp/bridge/src/compact.ts ``readCompactMessage``): role
-    ``toolResult`` (not ``tool``) with camelCase ``toolCallId``/``toolName``/
-    ``isError``, assistant tool calls as content parts (not a top-level OpenAI
-    ``tool_calls``). Reuses this module's own role/content accessors
-    (_is_tool_result/_tool_call_id/_tool_name/_is_error_result/_iter_tool_calls)
-    so both the local and bridge paths agree on what a message means.
+# Machine-readable first line of every reinjected snap archive message — the
+# conversation itself is the re-snap chain record (see _snap_anchor).
+_SNAP_STAMP_RE = re.compile(
+    r"\[snap:([0-9a-f]{8,32})(?:\s+api=([\w.-]*))?(?:\s+model=([^\]]*))?\]")
+
+
+def _snap_stamp_line(snap: dict) -> str:
+    return f"[snap:{snap.get('snap_id')} api={snap.get('api') or ''} model={snap.get('model') or ''}]"
+
+
+def _snap_anchor(prior_archive: dict | None, messages: list) -> dict | None:
+    """Resolve the chain parent for the next snap render.
+
+    An explicit ``prior_archive["snap"]`` wins (Python-side callers that thread
+    the archive through); otherwise the NEWEST message carrying a snap stamp
+    line (reinject writes it). If the conversation no longer carries a stamped
+    archive message — the user deleted it, or this is a fresh session — the
+    chain deliberately starts fresh instead of appending history the
+    conversation has lost.
     """
-    if _is_tool_result(msg):
-        out: dict[str, Any] = {
-            "role": "toolResult",
-            "toolCallId": _tool_call_id(msg),
-            "content": _content_as_list(msg.get("content")),
-        }
-        name = _tool_name(msg)
-        if name:
-            out["toolName"] = name
-        if _is_error_result(msg):
-            out["isError"] = True
-        if msg.get("useless") is True:
-            out["useless"] = True
-        return out
-
-    if _is_assistant(msg):
-        parts: list[dict[str, Any]] = []
-        content = msg.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "text" and block.get("text"):
-                    parts.append({"type": "text", "text": str(block["text"])})
-                elif block.get("type") == "thinking" and block.get("thinking"):
-                    parts.append({"type": "thinking", "thinking": str(block["thinking"])})
-        elif isinstance(content, str) and content:
-            parts.append({"type": "text", "text": content})
-        for tc in _iter_tool_calls(msg):
-            if not tc.get("id") or not tc.get("name"):
-                continue
-            part: dict[str, Any] = {
-                "type": "toolCall", "id": tc["id"], "name": tc["name"],
-                "arguments": tc.get("arguments") or {},
-            }
-            if tc.get("intent"):
-                part["intent"] = str(tc["intent"])
-            parts.append(part)
-        return {"role": "assistant", "content": parts}
-
-    return {
-        "role": "developer" if _role(msg) == "developer" else "user",
-        "content": _content_as_list(msg.get("content")),
-    }
-
-
-def _to_wire_archive(archive: dict) -> dict[str, Any]:
-    """CAD's ``archive`` dict (snake_case — this module's own shape, possibly a
-    previous bridge response already mapped back to it) onto compact.ts's
-    camelCase ``Archive`` wire shape (``readArchive``), so a ``prior_archive``
-    round-trips correctly no matter which backend produced it.
-    """
-    out: dict[str, Any] = {"frames": archive.get("frames") or []}
-    total_chars = archive.get("total_chars", archive.get("totalChars"))
-    if total_chars is not None:
-        out["totalChars"] = total_chars
-    truncated_chars = archive.get("truncated_chars", archive.get("truncatedChars"))
-    if truncated_chars is not None:
-        out["truncatedChars"] = truncated_chars
-    if archive.get("text"):
-        out["text"] = archive["text"]
-    text_head = archive.get("text_head", archive.get("textHead"))
-    if text_head:
-        out["textHead"] = text_head
-    text_tail = archive.get("text_tail", archive.get("textTail"))
-    if text_tail:
-        out["textTail"] = text_tail
-    checksum = archive.get("checksum")
-    if checksum:
-        out["checksum"] = checksum
-    return out
-
-
-def _bridge_compact(bridge, messages: list[dict], keep_recent_tokens: int, prior_archive: dict | None,
-                     supersede_reads: bool) -> dict[str, Any]:
-    """``snapcompact_archive`` via the bridge's ``compact`` RPC — OMP's real
-    snapcompact algorithm (vendor/omp/packages/snapcompact: foveation + PNG
-    frame planning), reused verbatim server-side; see
-    vendor/omp/bridge/src/compact.ts and OMP_INTEGRATION_PLAN.md §RPC CONTRACT.
-
-    The bridge owns the keep/discard boundary (it re-derives it from
-    ``messages`` + ``keepRecentTokens`` with its own tool-result-safe cut,
-    mirroring but not reusing this module's ``find_cut_index``); this function
-    only trusts the *count* of ``keptMessages`` it returns and re-slices the
-    original CAD-shaped ``msgs`` at that boundary, so ``kept_messages`` in the
-    result is always this module's own message objects — never the bridge's
-    re-serialized wire copies (role/content get lossily normalized on the
-    wire, e.g. ``tool`` -> ``toolResult``, ``tool_call_id`` -> ``toolCallId``).
-
-    Maps ``{keptMessages,summary,shortSummary,archive?,checksum,frames?,
-    recoverable?,warning?}`` back onto this module's ``{archive,summary,
-    short_summary,kept_messages,cut_index}`` shape (plus ``checksum``/
-    ``recoverable``/``warning`` as additive extra keys when present).
-    """
-    msgs = list(messages or [])
-    if supersede_reads:
-        msgs = apply_supersede_reads(msgs)
-
-    params: dict[str, Any] = {
-        "messages": [_to_wire_message(m) for m in msgs],
-        "keepRecentTokens": int(keep_recent_tokens),
-    }
     if isinstance(prior_archive, dict):
-        params["priorArchive"] = _to_wire_archive(prior_archive)
+        snap = prior_archive.get("snap")
+        if isinstance(snap, dict) and snap.get("snap_id"):
+            return snap
+    for msg in reversed(list(messages or [])):
+        if not isinstance(msg, dict):
+            continue
+        m = _SNAP_STAMP_RE.search(_message_text_blob(msg))
+        if m:
+            return {
+                "snap_id": m.group(1),
+                "api": m.group(2) or "",
+                "model": (m.group(3) or "").strip(),
+            }
+    return None
 
-    result = bridge.call("compact", params, timeout=120)
 
-    wire_kept = result.get("keptMessages")
-    kept_count = len(wire_kept) if isinstance(wire_kept, list) else len(msgs)
-    cut_index = max(0, min(len(msgs), len(msgs) - kept_count))
-    kept_messages = msgs[cut_index:]
+def _snap_render_and_store(out: dict, *, serialized: str, prior_archive: dict | None,
+                           messages: list, provider: dict,
+                           session_id: str | None) -> None:
+    """Best-effort snap render of this round's archive.
 
-    raw_archive = result.get("archive")
-    raw_archive = raw_archive if isinstance(raw_archive, dict) else {}
-    frames = result.get("frames")
-    if not isinstance(frames, list):
-        frames = raw_archive.get("frames") or []
-    text_head = str(raw_archive.get("textHead") or raw_archive.get("text") or "")
-    text_tail = str(raw_archive.get("textTail") or "")
-    if not text_head and not text_tail:
-        # No native/foveated archive (e.g. no pi-natives binary for this platform, or the
-        # renderer threw) — compact.ts's textFallbackResult puts the whole serialized
-        # archive into `summary` instead (vendor/omp/bridge/src/compact.ts:277-292). Mirror
-        # that into archive.text/text_head so reinject_archive() finds it there too.
-        text_head = str(result.get("summary") or "")
-    archive: dict[str, Any] = {
-        "text": str(raw_archive.get("text") or text_head),
-        "text_head": text_head,
-        "text_tail": text_tail,
-        "truncated_chars": int(raw_archive.get("truncatedChars") or 0),
-        "total_chars": int(raw_archive.get("totalChars") or (len(text_head) + len(text_tail))),
-        "frames": frames,
-    }
+    Renders ``serialized`` (this round's newly discarded history) unfolded onto
+    the chain parent's OG source via the bridge ``snap_render`` RPC, persists
+    OG source + frames in the snap store, and attaches a small
+    ``archive["snap"]`` reference (no base64 on the RPC wire). Any failure
+    leaves ``archive["warning"]`` and the archive stays text-only.
+    """
+    archive = out.get("archive")
+    if not isinstance(archive, dict) or not isinstance(provider, dict):
+        return
+    if not provider.get("vision"):
+        return
+    if _compaction_backend() != "omp":
+        return
+    try:
+        from services.agent.config import (  # noqa: PLC0415
+            compaction_snap_frames, compaction_snap_max_frames)
+        if not compaction_snap_frames():
+            return
+        max_frames = compaction_snap_max_frames()
+    except Exception:  # noqa: BLE001 — config unreadable: defaults (on, 80)
+        max_frames = 80
+    api = str(provider.get("api") or "anthropic")
+    model = str(provider.get("model") or provider.get("model_id") or "")
+    try:
+        from services.agent import omp_bridge, snap_store  # noqa: PLC0415
+        anchor = _snap_anchor(prior_archive, messages)
+        prior_source = ""
+        if anchor:
+            prior_source = snap_store.source_of(str(anchor.get("snap_id"))) or ""
+        if not prior_source and isinstance(prior_archive, dict):
+            # Legacy text-only prior: seed the OG chain from its folded text.
+            prior_source = str(prior_archive.get("text") or "")
+            if not prior_source:
+                head = str(prior_archive.get("text_head") or "")
+                tail = str(prior_archive.get("text_tail") or "")
+                prior_source = "\n".join(p for p in (head, tail) if p)
+        if not serialized and not prior_source:
+            return  # nothing archived this round
+        resp = omp_bridge.call("snap_render", {
+            "text": serialized or "",
+            "priorText": prior_source,
+            "modelId": model,
+            "api": api,
+            "maxFrames": max_frames,
+        }, timeout=180)
+        og_source = str(resp.get("text") or "")
+        frames = [f for f in (resp.get("frames") or []) if isinstance(f, dict)]
+        meta = snap_store.put(
+            og_source, frames,
+            parent_id=str(anchor.get("snap_id")) if anchor else None,
+            model=model, api=api,
+            truncated_chars=int(resp.get("truncatedChars") or 0),
+        )
+        if not meta:
+            raise RuntimeError("snap store write failed")
+        snap_ref = {
+            "snap_id": meta["snap_id"],
+            "api": api,
+            "model": model,
+            "frame_count": len(frames),
+            "truncated_chars": int(resp.get("truncatedChars") or 0),
+            "checksum": str(resp.get("checksum") or ""),
+        }
+        if session_id:
+            snap_ref["session_id"] = str(session_id)
+        archive["snap"] = snap_ref
+        if frames:
+            out["short_summary"] = (
+                f'{out.get("short_summary") or ""} (+{len(frames)} snap frames)')
+    except Exception as exc:  # noqa: BLE001 — snap must never break compaction
+        archive["warning"] = f"snap render unavailable ({exc}); archive is text-only"
 
-    out: dict[str, Any] = {
-        "archive": archive,
-        "summary": str(result.get("summary") or ""),
-        "short_summary": str(result.get("shortSummary") or ""),
-        "kept_messages": kept_messages,
-        "cut_index": cut_index,
-    }
-    if "checksum" in result:
-        archive["checksum"] = result["checksum"]  # embedded too, so a later prior_archive round-trip carries it
-        out["checksum"] = result["checksum"]
-    if isinstance(result.get("recoverable"), dict):
-        out["recoverable"] = result["recoverable"]
-    if result.get("warning"):
-        out["warning"] = result["warning"]
+
+def _budget_frames(frames: list, cap: int, byte_budget: int) -> list:
+    """Chronological edge-keeping frame budget: when over *cap*, drop MIDDLE
+    frames first (the foveal edges carry the densest context); then stop adding
+    frames once *byte_budget* of PNG bytes is exhausted."""
+    n = len(frames)
+    if n <= cap:
+        chosen = list(frames)
+    else:
+        head_n = max(1, cap // 2)
+        tail_n = cap - head_n
+        chosen = frames[:head_n] + frames[n - tail_n:]
+    out: list = []
+    total = 0
+    for fr in chosen:
+        size = 0
+        path = fr.get("path")
+        if path:
+            try:
+                size = Path(path).stat().st_size
+            except OSError:
+                size = 0
+        if out and total + size > byte_budget:
+            break
+        total += size
+        out.append(fr)
     return out
+
+
+def _resnap_for_provider(meta: dict, *, api: str, model: str) -> dict | None:
+    """Re-render a snap's stored OG source in a different provider's shape
+    (mid-session provider switch). Returns the freshly stored meta (chained to
+    the old snap via parent_id), or None to keep the old-shape frames."""
+    try:
+        from services.agent import omp_bridge, snap_store  # noqa: PLC0415
+        from services.agent.config import compaction_snap_max_frames  # noqa: PLC0415
+        source = snap_store.source_of(str(meta.get("snap_id") or ""))
+        if not source:
+            return None
+        resp = omp_bridge.call("snap_render", {
+            "text": "",
+            "priorText": source,
+            "modelId": model,
+            "api": api,
+            "maxFrames": compaction_snap_max_frames(),
+        }, timeout=180)
+        new_meta = snap_store.put(
+            str(resp.get("text") or source),
+            [f for f in (resp.get("frames") or []) if isinstance(f, dict)],
+            parent_id=str(meta.get("snap_id") or "") or None,
+            model=model, api=api,
+            truncated_chars=int(resp.get("truncatedChars") or 0),
+        )
+        if not new_meta:
+            return None
+        return snap_store.get(str(new_meta["snap_id"]))
+    except Exception:  # noqa: BLE001 — keep the old-shape frames on any failure
+        return None
+
+
+def _snap_vision_parts(body: dict, provider: dict, text_content: str) -> list | None:
+    """Content-parts reinject for vision providers: the archive text part plus
+    the snap's PNG frame images, capped to the provider's image budget.
+
+    Re-renders from the stored OG source when the active provider differs from
+    the one that rendered the snap (provider switch) or when frame files are
+    missing. Returns None to fall back to the plain-text reinject.
+    """
+    snap = body.get("snap")
+    if not isinstance(snap, dict) or not snap.get("snap_id"):
+        return None
+    try:
+        from services.agent import snap_store, snap_spec  # noqa: PLC0415
+        from services.agent.providers.base import image_part  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    meta = snap_store.get(str(snap["snap_id"]))
+    if meta is None:
+        return None  # store lost/corrupt — the text reinject still carries history
+    api = str(provider.get("api") or "anthropic")
+    model = str(provider.get("model") or provider.get("model_id") or "")
+    if (str(meta.get("api") or "") != api) or (str(meta.get("model") or "") != model):
+        resnap = _resnap_for_provider(meta, api=api, model=model)
+        if resnap is not None:
+            meta = resnap
+    frames = [f for f in (meta.get("frames") or []) if isinstance(f, dict) and f.get("path")]
+    if not frames:
+        return None  # small archive: everything is in the text edges already
+    cap = snap_spec.FAMILY_IMAGE_BUDGETS.get(api, snap_spec.DEFAULT_IMAGE_BUDGET)
+    keep = _budget_frames(frames, int(cap), int(snap_spec.FRAME_BYTES_BUDGET))
+    omitted = len(frames) - len(keep)
+    text = text_content
+    if omitted > 0:
+        text += (f"\n\n({omitted} middle snap frame(s) omitted to fit the provider "
+                 "image budget; the full archive is preserved in the snap store.)")
+    parts = [{"type": "text", "text": text}]
+    for fr in keep:
+        parts.append(image_part(str(fr["path"]), "image/png"))
+    return parts if len(parts) > 1 else None
 
 
 # --------------------------------------------------------------------------- snapcompact_archive
@@ -784,34 +836,37 @@ def snapcompact_archive(
     prior_archive: dict | None = None,
     supersede_reads: bool = True,
     drop_useless: bool = True,
+    provider: dict | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Text-phase snapcompact: archive discarded turns, keep recent tail.
 
     Returns::
 
         {
-          "archive": {text, text_head, text_tail, truncated_chars, total_chars},
+          "archive": {text, text_head, text_tail, truncated_chars, total_chars,
+                      snap?, warning?},
           "summary": <static reading guide>,
           "short_summary": "Archived N chars of history (+M as text)",
           "kept_messages": [...],
           "cut_index": int,
         }
 
-    No LLM call. PNG frames are intentionally omitted (future/vision phase).
-    Never cuts mid tool-result. Cumulative fold of ``prior_archive["text"]``.
+    No LLM call. Never cuts mid tool-result. Cumulative fold of
+    ``prior_archive["text"]``.
 
-    Hybrid backend: when gated on (env CHUDWARE_COMPACTION_BACKEND=omp /
-    agent.compaction_backend="omp" in config.json), routes through the OMP
-    bridge's ``compact`` RPC (vendor/omp/bridge) instead of the pure-Python
-    path below, falling back here whenever the bridge is unavailable. Same
-    return shape either way (see docstring above).
+    OMP snap rendering: when the omp backend is gated on (env
+    CHUDWARE_COMPACTION_BACKEND=omp / agent.compaction_backend="omp") AND
+    *provider* carries ``vision: true``, the archived source is additionally
+    rendered to OMP snapcompact PNG frames (provider-shaped via
+    ``provider["api"]``/``provider["model"]``), the full OG source + frames are
+    persisted in the snap store, and ``archive["snap"]`` carries a small
+    reference (snap_id/api/model/frame_count/checksum; no base64 here).
+    Re-snap chaining resolves via :func:`_snap_anchor` (explicit prior_archive
+    snap, else the stamped archive message in *messages*). Bridge/store
+    failure degrades to text-only with ``archive["warning"]`` — the canonical
+    local archive is produced identically either way.
     """
-    if _compaction_backend() == "omp":
-        bridge = _bridge()
-        try:
-            return _bridge_compact(bridge, messages, keep_recent_tokens, prior_archive, supersede_reads)
-        except bridge.BridgeUnavailable:
-            pass  # OMP bridge unavailable — fall back to the pure-Python path below
     msgs = list(messages or [])
     if supersede_reads:
         msgs = apply_supersede_reads(msgs)
@@ -860,14 +915,14 @@ def snapcompact_archive(
             )
         )
 
-    return {
+    out: dict[str, Any] = {
         "archive": {
             "text": layout["text"],
             "text_head": layout["text_head"],
             "text_tail": layout["text_tail"],
             "truncated_chars": layout["truncated_chars"],
             "total_chars": layout["total_chars"],
-            # frames reserved for vision phase
+            # frames reserved for the snap store (paths, not base64, on this wire)
             "frames": [],
         },
         "summary": summary,
@@ -875,12 +930,26 @@ def snapcompact_archive(
         "kept_messages": kept_messages,
         "cut_index": cut_index,
     }
+    if provider is not None:
+        _snap_render_and_store(
+            out, serialized=serialized, prior_archive=prior_archive,
+            messages=messages, provider=provider, session_id=session_id,
+        )
+    return out
 
 
 # --------------------------------------------------------------------------- reinject_archive
 
-def reinject_archive(archive: dict) -> list[dict]:
-    """Build prepend messages (lead-in summary + archive text edges) for rebuild."""
+def reinject_archive(archive: dict, *, provider: dict | None = None) -> list[dict]:
+    """Build prepend messages (lead-in summary + archive text edges) for rebuild.
+
+    Default return is one plain-text user message. When the archive carries a
+    ``snap`` reference, a machine-readable ``[snap:<id> api=… model=…]`` stamp
+    line leads the text — the conversation itself is the re-snap chain record
+    (:func:`_snap_anchor` finds it next round). With a vision *provider* and a
+    snap present, the message becomes content parts: the same text plus the
+    snap's PNG frames (budget-capped, re-rendered from the stored OG source
+    when the provider changed — :func:`_snap_vision_parts`)."""
     if not isinstance(archive, dict):
         return []
 
@@ -914,6 +983,18 @@ def reinject_archive(archive: dict) -> list[dict]:
 
     history = "\n".join(history_parts) if history_parts else full_text
     content = summary.rstrip() + "\n\n" + history if history else summary
+
+    snap = body.get("snap")
+    if isinstance(snap, dict) and snap.get("snap_id"):
+        content = _snap_stamp_line(snap) + "\n" + content
+
+    if provider and provider.get("vision") and isinstance(snap, dict):
+        try:
+            parts = _snap_vision_parts(body, provider, content)
+        except Exception:  # noqa: BLE001 — reinject must never lose the text
+            parts = None
+        if parts is not None:
+            return [{"role": "user", "content": parts}]
     return [{"role": "user", "content": content}]
 
 

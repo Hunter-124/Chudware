@@ -8,6 +8,7 @@
 // write mutex and client table are already shaped for it.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -76,6 +77,13 @@ public:
     void run(int lingerSecs);
     void stop() { stopping_ = true; }
 
+    // Short idle grace used instead of lingerSecs once the last GUI client has
+    // detached (CHUDWARE_HOSTD_GUI_EXIT_GRACE_S). The daemon exists to serve
+    // the GUI, a connected MCP client (clients>0 pins it anyway), or in-flight
+    // agent work the user chose to continue in the background (inflight>0) —
+    // none of those needs the full linger after the GUI is gone.
+    void setGuiExitGrace(int secs) { guiExitGraceSecs_ = std::max(1, secs); }
+
     Status& status() { return status_; }
     // Count of engine-side calls only (agent_run / doc_* via beginInflight).
     // Distinct from Status::inflight which counts every RPC including hello/status
@@ -114,6 +122,11 @@ private:
     std::string buildId_;
     Status status_;
     std::atomic<bool> stopping_{false};
+    // True once the last "gui" client has detached (reset when a gui hello
+    // lands). idleExpired() uses guiExitGraceSecs_ instead of the full linger
+    // while set, so the daemon does not outlive the GUI without a reason.
+    std::atomic<bool> guiDetached_{false};
+    int guiExitGraceSecs_ = 10;
     std::mutex clientsMtx_;
     std::map<int, std::shared_ptr<ClientConn>> clients_;
     int nextClientId_ = 1;

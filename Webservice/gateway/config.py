@@ -114,6 +114,59 @@ class Settings:
         default_factory=lambda: _env("CHUDWARE_WEB_SSO_SHARED_SECRET", "") or ""
     )
     dev_mode: bool = field(default_factory=lambda: _env_bool("CHUDWARE_WEB_DEV", False))
+    # ---- Multi-tenant abuse controls -------------------------------------
+    # The global seat caps above are host-capacity limits; these are the
+    # per-account limits that keep one user from consuming the whole service.
+    # They matter the moment identities stop being hand-approved teammates.
+    max_sessions_per_user: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_SESSIONS_PER_USER", 1)
+    )
+    max_session_lifetime_sec: int = field(
+        # Hard ceiling regardless of activity — idle_timeout_sec alone lets a
+        # user hold a seat forever by keeping the stream warm.
+        default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_SESSION_LIFETIME_SEC", 8 * 3600)
+    )
+    max_upload_bytes: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_UPLOAD_BYTES", 100 * 1024 * 1024)
+    )
+    max_user_disk_bytes: int = field(
+        # Per-account storage across workspace + bucket. 0 disables the check.
+        default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_USER_DISK_BYTES", 2 * 1024 * 1024 * 1024)
+    )
+    ws_max_message_bytes: int = field(
+        # Per-frame cap on the /engine bridge. The daemon line limit is 256 MiB;
+        # forwarding anything near that OOM-kills a 1 GiB gateway.
+        default_factory=lambda: _env_int("CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES", 4 * 1024 * 1024)
+    )
+    rate_writes_per_min: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_RATE_WRITES_PER_MIN", 120)
+    )
+    rate_uploads_per_min: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_RATE_UPLOADS_PER_MIN", 30)
+    )
+    rate_chat_per_min: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_RATE_CHAT_PER_MIN", 20)
+    )
+    rate_session_starts_per_hour: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_RATE_SESSION_STARTS_PER_HOUR", 20)
+    )
+    # Admin browser-terminal (an interactive shell as the gateway account).
+    # Off by default: it must be an explicit operator opt-in, never something a
+    # public-facing deployment inherits silently.
+    terminal_enabled: bool = field(
+        default_factory=lambda: _env_bool("CHUDWARE_WEB_TERMINAL_ENABLED", False)
+    )
+    terminal_max_sessions: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_TERMINAL_MAX_SESSIONS", 8)
+    )
+    terminal_idle_timeout_sec: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_TERMINAL_IDLE_TIMEOUT_SEC", 30 * 60)
+    )
+    # Colon-separated allowlist of host directories an admin may browse / pick
+    # as a project root. Empty means "the gateway account's home only".
+    project_roots_raw: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_PROJECT_ROOTS", "") or ""
+    )
     users_file: Path = field(default_factory=Path)
     healthcheck_timeout_sec: float = field(
         default_factory=lambda: _env_float("CHUDWARE_WEB_HEALTHCHECK_TIMEOUT_SEC", 90.0)
@@ -190,6 +243,31 @@ class Settings:
     @property
     def refuse_new_flag(self) -> Path:
         return self.data_root / "REFUSE_NEW"
+
+    @property
+    def project_roots(self) -> list[Path]:
+        """Host directories an admin may browse / bind-mount as a project.
+
+        Defaults to the gateway account's home. Anything outside this list is
+        rejected, so a mistyped or malicious project path cannot expose /etc
+        or another user's home to every session.
+        """
+        raw = [p for p in self.project_roots_raw.split(":") if p.strip()]
+        roots: list[Path] = []
+        for entry in raw:
+            try:
+                roots.append(_expand_path(entry).resolve())
+            except OSError:
+                continue
+        return roots or [Path.home().resolve()]
+
+    def user_workspace_root(self, slug: str) -> Path:
+        """Per-account CAD workspace. Isolation boundary for /workspace/*."""
+        return self.workspace_root / "users" / slug
+
+    def user_bucket_root(self, slug: str) -> Path:
+        """Per-account file drop. Isolation boundary for /api/bucket/*."""
+        return self.bucket_root / "users" / slug
 
     @property
     def terminal_layout_file(self) -> Path:

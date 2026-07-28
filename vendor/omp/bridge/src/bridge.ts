@@ -30,9 +30,11 @@
  * auth_oauth_manual{handle,code} | auth_oauth_cancel{handle} | memory_remember{root,content,
  * kind?,source?,importance?} | memory_recall{root,query,limit?,tokenBudget?,kind?} |
  * memory_stats{root} | compact{messages,keepRecentTokens?,priorArchive?,mode?} |
+ * snap_render{text,priorText?,modelId?,api?,maxFrames?,includeThinking?} |
  * stt_status | stt_start{model?,language?} | stt_stop | stt_cancel. Auth/model/
  * cost methods are implemented in the sibling json.ts/models.ts/auth-context.ts/oauth-flow.ts
- * modules; memory_* and compact live in memory.ts/compact.ts; stt_* reuses OMP's pi-natives
+ * modules; memory_* and compact live in memory.ts/compact.ts; snap_render lives in
+ * snap-render.ts; stt_* reuses OMP's pi-natives
  * AudioCapture + Whisper ASR approach under ./stt/. All are wired in through dispatch()
  * below; see those files for the OMP surface each one reuses.
  *
@@ -58,6 +60,7 @@ import {
 	handleAuthValidateKey,
 } from "./auth-context";
 import { handleCompact } from "./compact";
+import { handleSnapRender } from "./snap-render";
 import { handleCachePolicy } from "./cache";
 import { asObject, str, type Json } from "./json";
 import { handleMemoryRecall, handleMemoryRemember, handleMemoryStats } from "./memory";
@@ -345,6 +348,8 @@ async function dispatch(method: string, params: Json, notify: Notify): Promise<J
 			return handleMemoryStats(params);
 		case "compact":
 			return handleCompact(params);
+		case "snap_render":
+			return handleSnapRender(params);
 		case "stt_status":
 			return handleSttStatus(params);
 		case "stt_start":

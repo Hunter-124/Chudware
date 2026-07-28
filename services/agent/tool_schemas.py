@@ -33,6 +33,35 @@ DEFAULT_TOOLS_BUDGET_TOKENS = 2500
 # Params that are call-plumbing, not model-suppliable semantics.
 _SKIP_PARAMS = frozenset({"self", "ctx", "context"})
 
+# Hand-written schemas for agent pseudo-tools that have no live registry
+# callable outside a mission dispatcher (signatures mirror
+# mission_dispatch.MissionDispatch.delegate / .adopt_role).
+_FALLBACK_SCHEMAS: dict[str, str] = {
+    "enable_tools": (
+        "- enable_tools(categories: list[str])\n"
+        "    Request more tool categories mid-turn "
+        "(see [TOOL CATEGORIES] menu)."
+    ),
+    "list_tool_categories": (
+        "- list_tool_categories()\n"
+        "    List requestable tool category packs (name + one line)."
+    ),
+    "design_recipe": (
+        "- design_recipe(query: str, max_results: int = 3)\n"
+        "    NL intent → ordered tool recipe steps (empty query = catalog)."
+    ),
+    "delegate": (
+        "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, "
+        "kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)\n"
+        "    Spawn a sub-agent role with an isolated brief and token budget."
+    ),
+    "adopt_role": (
+        "- adopt_role(role: str = '')\n"
+        "    Switch this session to a specialist role "
+        "(main session only; supervised subagents are refused)."
+    ),
+}
+
 
 def describe_callable(name: str, fn: Callable[..., Any]) -> dict[str, Any]:
     """Build ``{name, signature, description}`` from a real dispatchable callable.
@@ -74,12 +103,18 @@ def _ann(annotation: Any) -> str:
 
 
 def _description_line(desc: str, *, trim: bool) -> str:
-    """One description line: first sentence when *trim*, else first paragraph."""
+    """One description line: first sentence when *trim*, else first paragraph.
+
+    Internal newlines collapse to single spaces so a multi-line source
+    paragraph can never break the tools-slot block indent.
+    """
     if not desc:
         return ""
     if trim:
-        return trim_tool_schema({"description": desc})["description"].strip()
-    return desc.split("\n\n", 1)[0].strip()
+        out = trim_tool_schema({"description": desc})["description"]
+    else:
+        out = desc.split("\n\n", 1)[0]
+    return " ".join(out.split())
 
 
 def render_tools_block(
@@ -132,24 +167,7 @@ def render_tools_block(
             fn = None
         if fn is None:
             # Built-in meta-tool schemas when no live callable is registered yet.
-            if tool == "enable_tools":
-                entry = (
-                    "- enable_tools(categories: list[str])\n"
-                    "    Request more tool categories mid-turn "
-                    "(see [TOOL CATEGORIES] menu)."
-                )
-            elif tool == "list_tool_categories":
-                entry = (
-                    "- list_tool_categories()\n"
-                    "    List requestable tool category packs (name + one line)."
-                )
-            elif tool == "design_recipe":
-                entry = (
-                    "- design_recipe(query: str, max_results: int = 3)\n"
-                    "    NL intent → ordered tool recipe steps (empty query = catalog)."
-                )
-            else:
-                entry = f"- {tool}(…)  # schema unavailable"
+            entry = _FALLBACK_SCHEMAS.get(tool) or f"- {tool}(…)  # schema unavailable"
         else:
             schema = describe_callable(tool, fn)
             # Per-tool agent.tool_options may override the included tool context
@@ -181,9 +199,7 @@ def render_tools_block(
             continue
         lines.append(entry)
         used += cost
-        if fn is None and tool not in (
-            "enable_tools", "list_tool_categories", "design_recipe",
-        ):
+        if fn is None and tool not in _FALLBACK_SCHEMAS:
             unresolved.append(tool)
         else:
             rendered.append(tool)

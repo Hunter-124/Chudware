@@ -96,6 +96,16 @@ def catalog() -> dict[str, dict]:
 _WARMED = False
 
 
+class _NullMCP:
+    """Throwaway stand-in for FastMCP when warming lazily-registered families
+    outside a server process (``register_*_tools`` only needs ``.tool()``)."""
+
+    def tool(self, *args, **kwargs):
+        def deco(fn):
+            return fn
+        return deco
+
+
 def warm_catalog() -> None:
     """Best-effort, memoized: trigger server.py's module-level family registrations.
 
@@ -114,6 +124,17 @@ def warm_catalog() -> None:
     try:
         import mcp_server.server  # noqa: F401 — side-effect: populates _CATALOG via its module-level _reg.view registrations
     except Exception:  # noqa: BLE001 — best-effort; a heavy/failed import must never break role loading
+        pass
+    # The org family (channel_send / request_raise / request_resolve /
+    # council_convene) is lazily registered in production (reviewer_exec /
+    # corporate activation), so server.py never warms it. Role cards reference
+    # these tools and the Tools panel lists them — register them up front so
+    # family:org resolution and the catalog see them unconditionally.
+    try:
+        from services.mcp.org_tools import register_org_tools
+
+        register_org_tools(view(_NullMCP(), "org"))
+    except Exception:  # noqa: BLE001 — best-effort, same contract as above
         pass
 
 

@@ -382,8 +382,9 @@ void drawFitReadout(const FitReport& fit, bool detailed) {
 }
 
 // Draw a run-status glyph (the turning brand mark while running / check / cross / retry ring /
-// pending hollow dot) centered in a `box`-wide cell at the cursor, then advance past it. Shared by
-// the plan checklist and the action cards so every surface shows the same animated status art.
+// "skipped" dash / pending hollow dot) centered in a `box`-wide cell at the cursor, then advance
+// past it. Shared by the plan checklist and the action cards so every surface shows the same
+// animated status art.
 void drawStatusGlyph(const std::string& status, float box) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -395,10 +396,15 @@ void drawStatusGlyph(const std::string& status, float box) {
     const bool pass    = status == "pass" || status == "done";
     const bool retry   = status == "retry";
     const bool fail    = status == "fail";
+    // "skipped" = the step deliberately did NOT run (harness intervention, e.g. the tool-loop
+    // guard refusing a repeated call). Informational, never alarming: iterBuilt blue — the same
+    // palette role the "built" step badge and the AI-VC tool chip use.
+    const bool skipped = status == "skipped";
     ImU32 col = ImGui::ColorConvertFloat4ToU32(
         running || pass ? semanticOnGlass(pal.accent, surf)
         : retry         ? semanticOnGlass(pal.statusWarn, surf)
         : fail          ? semanticOnGlass(pal.statusErr, surf)
+        : skipped       ? semanticOnGlass(pal.iterBuilt, surf)
                         : surf.textTertiary);
     const float th = ui::metrics::stroke(1.6f);
     if (running) {
@@ -431,6 +437,8 @@ void drawStatusGlyph(const std::string& status, float box) {
                     ImVec2(c.x + r * 0.5f, c.y - r * 0.5f), col, th);
     } else if (retry) {
         dl->AddCircle(c, r, col, 12, th);
+    } else if (skipped) {                       // dash: nothing ran, nothing broke
+        dl->AddLine(ImVec2(c.x - r * 0.6f, c.y), ImVec2(c.x + r * 0.6f, c.y), col, th);
     } else {
         dl->AddCircle(c, r * 0.8f, col, 12, th);  // pending hollow dot
     }
@@ -726,7 +734,12 @@ void chatHoverCopyGlyph(const ImRect& rect, const std::string& text) {
     ImGui::SetCursorScreenPos(saved);
 }
 
-// Compose a flat copy string for an activity / tool card.
+// Compose a flat copy string for an activity / tool card. Tool/artifact rows pack
+// args/err/artifact-path segments behind internal "\x1eERR\x1e" / "\x1eART\x1e" markers
+// (feedTurnActivity, activity_timeline.cpp) — split those back out via splitToolRowDetail
+// so a raw control byte and the literal marker text never land on the clipboard. Without
+// this, right-click "Copy text"/"Copy all" on a tool-call or "Session files" row pasted the
+// packed detail verbatim (invisible \x1e bytes + "ART"/"ERR" text mixed into the paste).
 std::string chatActivityCopyText(const ActivityItem& a) {
     std::string out;
     if (!a.title.empty()) out = a.title;
@@ -735,8 +748,28 @@ std::string chatActivityCopyText(const ActivityItem& a) {
         out += a.reason;
     }
     if (!a.detail.empty() && a.detail != a.reason) {
-        if (!out.empty()) out += "\n";
-        out += a.detail;
+        const ui::ToolRowDetail parts = ui::splitToolRowDetail(a.detail);
+        if (!parts.args.empty()) {
+            if (!out.empty()) out += "\n";
+            out += parts.args;
+        }
+        if (!parts.err.empty()) {
+            if (!out.empty()) out += "\n";
+            out += parts.err;
+        }
+        if (!parts.arts.empty()) {
+            // "kind\tpath" lines — copy as a clean path list, one per line.
+            std::istringstream iss(parts.arts);
+            std::string line;
+            while (std::getline(iss, line)) {
+                if (line.empty()) continue;
+                size_t tab = line.find('\t');
+                std::string path = (tab == std::string::npos) ? line : line.substr(tab + 1);
+                if (path.empty()) continue;
+                if (!out.empty()) out += "\n";
+                out += path;
+            }
+        }
     }
     if (out.empty() && !a.stage.empty()) out = a.stage;
     return out;

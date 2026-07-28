@@ -9,7 +9,8 @@ class TestGetToolOptions(unittest.TestCase):
     def test_defaults_when_missing(self):
         from services.agent.config import get_tool_options
 
-        opts = get_tool_options({}, "run_fea_static")
+        # A name with neither a config entry nor curated guidance → stock defaults.
+        opts = get_tool_options({}, "no_such_tool_zzz")
         self.assertTrue(opts["enabled"])
         self.assertIsNone(opts["timeout_s"])
         self.assertIsNone(opts["max_calls_per_turn"])
@@ -50,6 +51,52 @@ class TestGetToolOptions(unittest.TestCase):
         self.assertEqual(opts["max_calls_per_turn"], 3)
         self.assertEqual(opts["description_override"], "Custom search blurb.")
         self.assertIs(opts["schema_trim"], False)
+
+
+class TestCuratedGuidanceLayer(unittest.TestCase):
+    """Built-in curated guidance (tool_guidance) fills fields the user's
+    config.json entry leaves unset — the user always wins per-field."""
+
+    def _opts(self, cfg, name, curated):
+        from services.agent.config import get_tool_options
+
+        with mock.patch(
+            "services.agent.tool_guidance.guidance_for", return_value=curated
+        ):
+            return get_tool_options(cfg, name)
+
+    def test_curated_applies_when_no_user_entry(self):
+        opts = self._opts({}, "t", {"prompt_note": "Curated.", "timeout_s": 60})
+        self.assertEqual(opts["prompt_note"], "Curated.")
+        self.assertEqual(opts["timeout_s"], 60)
+
+    def test_user_wins_per_field(self):
+        cfg = {"agent": {"tool_options": {"t": {"prompt_note": "User."}}}}
+        opts = self._opts(cfg, "t", {"prompt_note": "Curated.", "timeout_s": 60})
+        self.assertEqual(opts["prompt_note"], "User.")
+        self.assertEqual(opts["timeout_s"], 60)  # curated field survives
+
+    def test_user_can_silence_a_curated_note(self):
+        cfg = {"agent": {"tool_options": {"t": {"prompt_note": ""}}}}
+        opts = self._opts(cfg, "t", {"prompt_note": "Curated."})
+        self.assertEqual(opts["prompt_note"], "")
+
+    def test_real_curated_note_renders_in_tools_block(self):
+        # ledger_get ships a curated note (tool_guidance.ledger) — it must reach
+        # the tools slot with NO config entry at all.
+        from services.agent import tool_schemas as ts
+
+        def dummy(run_id: str, section: str | None = None, budget_tokens: int = 800):
+            """Return the design ledger."""
+            return {}
+
+        text, _ = ts.render_tools_block(
+            ["ledger_get"],
+            resolver=lambda n: dummy if n == "ledger_get" else None,
+            budget_tokens=2000,
+            include_category_menu=False,
+        )
+        self.assertIn("Note:", text)
 
 
 class TestDenyReasonEnabled(unittest.TestCase):

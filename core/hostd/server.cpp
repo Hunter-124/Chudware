@@ -215,7 +215,11 @@ bool Server::idleExpired(int lingerSecs) {
         loggedGcPending = gcPending;
     }
     if (gcPending > 0) return false;
-    return monoMs() - status_.lastActivityMs > (long long)lingerSecs * 1000;
+    // After the last GUI detached, only a connected MCP client or in-flight
+    // agent work justifies staying up — both are already guarded above — so use
+    // the short grace rather than the full linger.
+    const int idleLimitSecs = guiDetached_ ? guiExitGraceSecs_ : lingerSecs;
+    return monoMs() - status_.lastActivityMs > (long long)idleLimitSecs * 1000;
 }
 
 void Server::run(int lingerSecs) {
@@ -249,7 +253,8 @@ void Server::run(int lingerSecs) {
         staleBinaryTick();  // mtime watch on hostd binary + libchudware (self-drain)
         if (status_.draining && status_.clients == 0 && status_.inflight == 0) break;
         if (idleExpired(lingerSecs)) {
-            log().line("idle for %ds with no clients — exiting", lingerSecs);
+            log().line("idle for %ds with no clients — exiting",
+                       guiDetached_ ? guiExitGraceSecs_ : lingerSecs);
             break;
         }
     }
@@ -420,6 +425,13 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c) {
             std::lock_guard<std::mutex> lk(clientsMtx_);
             c->thread.detach();  // we're on this thread; the map drop releases the struct
             clients_.erase(c->id);
+            // Last GUI gone: switch idle-exit to the short grace (see guiDetached_).
+            if (c->kind == "gui") {
+                bool anyGuiLeft = false;
+                for (const auto& [id, other] : clients_)
+                    if (other->kind == "gui") { anyGuiLeft = true; break; }
+                if (!anyGuiLeft) guiDetached_ = true;
+            }
         }
         --status_.clients;
         touch();
@@ -437,6 +449,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     if (method == "hello") {
         c.kind = params.value("client", "unknown");
         c.pid = params.value("pid", 0L);
+        if (c.kind == "gui") guiDetached_ = false;  // GUI (re)attached: full linger again
         // Optional multi-user identity: params.user = {id, display}.
         c.userId.clear();
         c.userDisplay.clear();

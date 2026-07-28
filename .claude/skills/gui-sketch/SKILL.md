@@ -1,6 +1,6 @@
 ---
 name: gui-sketch
-description: Chudware (formerly Billet / AI-CAD) sketcher UI specialist — the 2D constraint-solver sketch mode (tools, gestures, snapping, relations, smart dimensions, trim/offset/patterns) and the 3D free-space sketch mode. Use for any task about sketching UX, sketch entities, constraints/relations display, dimension labels, or sketch tool behavior. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Chudware sketcher UI specialist — the 2D constraint-solver sketch mode (tools, gestures, snapping, relations, smart dimensions, trim/offset/patterns) and the 3D free-space sketch mode. Use for any task about sketching UX, sketch entities, constraints/relations display, dimension labels, or sketch tool behavior. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Sketch Specialist

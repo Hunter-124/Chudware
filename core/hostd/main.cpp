@@ -598,6 +598,13 @@ int main(int argc, char** argv) {
     int linger = 120;
     if (const char* l = std::getenv("CHUDWARE_HOSTD_LINGER_SECS"); l && *l)
         linger = std::max(1, std::atoi(l));
+    // Short idle grace once the last GUI has detached (and no MCP client or
+    // in-flight agent work pins the daemon) — the daemon should not outlive
+    // the GUI on its own.
+    int guiExitGrace = 10;
+    if (const char* g = std::getenv("CHUDWARE_HOSTD_GUI_EXIT_GRACE_S"); g && *g)
+        guiExitGrace = std::max(1, std::atoi(g));
+    server.setGuiExitGrace(guiExitGrace);
     server.run(linger);
 
     trayTickerStop.store(true);

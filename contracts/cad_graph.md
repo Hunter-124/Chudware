@@ -85,3 +85,71 @@ Graphify/Sourcegraph analogue over CAD projects: how parts/features/mates/BOM/do
   leaves; cycles and depth are capped.
 - MCP: `cad_graph(query_kind="tree", node_id=<optional root>, project_dir)` exposes the
   same tree to agents.
+
+### File nodes + keyword web + cross-project merge (2026-07-27)
+- New node kinds `file` and `keyword`; new edge kind `TAGGED` (keyword → target).
+- `file` nodes: non-CAD project files walked with the same skip/archive policy as
+  containers, curated extension set: office (`.pdf .doc .docx .xls .xlsx .xlsm .ppt
+  .pptx .csv`), text (`.md .txt .rst`), images (`.png .jpg .jpeg .svg .bmp .webp`),
+  3D exchange (`.step .stp .iges .igs .stl .obj .3mf`), fab (`.gbr .drl`). Node
+  `id="file:<rel>"`, `meta:{ext, size_bytes, mt, folder}`; capped at 500 per project
+  (overflow reported as `files_truncated` on the graph). Vault manifest items match by
+  path onto file AND doc nodes (`meta:{item_id, part_number, lifecycle}`). File-node
+  mtimes participate in cache validation via the same `file:<rel>` key namespace.
+- Keyword overlay `<project>/.plm/keywords.json`, schema `aicad.cad_graph_keywords/1`:
+  `{schema, entries:[{id:"k<8hex>", target, keyword, origin:"manual"|"ai", author{},
+  created_at}]}`. `target` is a node id or project-relative path (resolved to its
+  file/doc node). Merge: one `keyword` node per distinct keyword (`id="kw:<kw>"`) +
+  `TAGGED` edge per entry; targets get `meta.keywords` (sorted, ≤8). Missing file =
+  empty overlay. Mutations invalidate the graph cache.
+- Watch overlay `<project>/.plm/graph_watch.json`, schema `aicad.cad_graph_watch/1`:
+  `{schema, watch:[{id:"w<8hex>", keyword?|node_id?, note, origin, created_at}]}` —
+  "keywords of interest". Never changes the graph (no cache invalidation); consumers
+  flag matching nodes (by node id, `kw:<keyword>` id, or `meta.keywords`).
+- Graph config `<project>/.plm/graph_config.json`, schema `aicad.cad_graph_config/1`:
+  `{office_content=false, office_max_chars=4000, office_kinds=[pdf,docx,xlsx,pptx,csv,
+  doc,xlsm], linked_projects=[], project_key?}`. Zero-config defaults when absent;
+  config mtime participates in cache invalidation.
+- Office content extraction (only when `office_content` is true): each office-kind file
+  node runs through the shared `extract_office` (contracts/office.md §2), capped at
+  `office_max_chars`; meta gains `text_preview` (≤300 chars), `word_count`, or
+  `extract_error: true` on failure (never fatal). Part-number-shaped tokens
+  (`[A-Z]{2,5}-\d{3,5}`) matching a node path-stem or `part_number` emit
+  `file REFERENCES <target>`, `origin=inferred`, `meta:{via:"office_mention", term}`,
+  ≤20 per file.
+- Cross-project: every node carries `meta.project` (owning project root). A node ref
+  may be qualified `<project_key>/<local_id>` (`project_key` = config override or
+  `"p"+sha1(abs path)[:8]`). `cad_graph_get {linked: true}` merges each
+  `linked_projects` graph into the primary: ids stay local, `kw:` nodes with the same
+  id intentionally merge (shared keyword = shared web), other collisions are prefixed
+  `<project_key>/` on the non-primary copy; qualified overlay links in the primary
+  resolve against the merged id space. Response adds `linked_projects: [root paths]`.
+- Change diff: `cad_graph_changes {project_dir, linked?} -> {ok, nodes_added,
+  nodes_removed, edges_added, edges_removed, watched, generated_at}` — set diff of the
+  on-disk cached graph vs a fresh rebuild; added/removed nodes carry `watched: true`
+  when matched by the watch overlay. `invalidate_cache` now renames the cache to
+  `.plm/graph.prev.json` (not delete) so a mutation keeps the diff baseline.
+- New worker RPCs (flat envelope, all take `project_dir`; query RPCs also take
+  `linked?`):
+  - `cad_graph_keyword_add {target, keyword, origin?, author?} -> {ok, entry}`
+    (`invalid_keyword` / `invalid_target`; dedupe returns `{ok, entry, deduped}`).
+  - `cad_graph_keyword_remove {entry_id?|target+keyword} -> {ok, removed}`.
+  - `cad_graph_keyword_list {target?} -> {ok, entries}`.
+  - `cad_graph_search {q?, kinds?, keyword?, linked?} -> {ok, nodes, edges,
+    node_count, edge_count}` — substring over id/label/path/keywords/project + kind and
+    keyword filters; edges are the induced subgraph; response capped 400/400.
+  - `cad_graph_neighbors {node_id, depth?=1, linked?} -> {ok, nodes, edges, depth}` —
+    undirected ego-graph, depth clamped ≤6.
+  - `cad_graph_watch_add {keyword?|node_id?, note?, origin?} -> {ok, entry}`
+    (`invalid_watch` when both/neither given), `cad_graph_watch_remove {entry_id}`,
+    `cad_graph_watch_list -> {ok, watch}`.
+  - `cad_graph_config_get -> {ok, config, project_key}`,
+    `cad_graph_config_set {office_content?|office_max_chars?|office_kinds?|
+    linked_projects?|project_key?} -> {ok, config}` (`invalid_field` /
+    `invalid_project`).
+- MCP (family `cad`, `mcp_server/graph_tools.py`): `plm_graph_keyword`,
+  `plm_graph_search`, `plm_graph_neighbors`, `plm_graph_links` (list/remove),
+  `plm_graph_watch`, `plm_graph_changes`, `plm_graph_configure`, `plm_graph_suggest`
+  (heuristic link suggestions: same_folder / name_match / shared_keyword /
+  content_mention, confidence-ranked), `plm_graph_brief` (one-node dossier).
+  `cad_graph_link` src/dst accept cross-project qualified refs.

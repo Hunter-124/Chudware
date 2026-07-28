@@ -210,6 +210,10 @@ void afterFileWritten(const std::string& path) {
     if (!path.empty()) chudware::fsTriggerDownload(path);
 }
 
+void revealInFileManager(const std::string& /*path*/) {
+    // Browser build: no OS file manager to reveal in.
+}
+
 }  // namespace ui
 
 
@@ -369,6 +373,12 @@ int promptImportMeshAsSolid() {
 
 void afterFileWritten(const std::string& /*path*/) {
     // Desktop: the file is already on the user's disk.
+}
+
+void revealInFileManager(const std::string& path) {
+    if (path.empty()) return;
+    // explorer /select,"C:\path\file" highlights the item in its folder.
+    (void)std::system(("explorer /select,\"" + path + "\"").c_str());
 }
 
 }  // namespace ui
@@ -582,6 +592,26 @@ int promptImportMeshAsSolid() {
 
 void afterFileWritten(const std::string& /*path*/) {
     // Desktop: the file is already on the user's disk.
+}
+
+void revealInFileManager(const std::string& path) {
+    if (path.empty()) return;
+#if defined(__APPLE__)
+    // open -R reveals + selects the file in Finder.
+    (void)std::system(("open -R " + shq(path) + " >/dev/null 2>&1 &").c_str());
+#else
+    // freedesktop FileManager1 D-Bus API selects the item (Nautilus/Dolphin/Nemo/…);
+    // fall back to xdg-open on the containing folder when dbus-send isn't available.
+    const size_t slash = path.find_last_of('/');
+    const std::string dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+    const std::string cmd =
+        "dbus-send --session --print-reply --dest=org.freedesktop.FileManager1 "
+        "--type=method_call /org/freedesktop/FileManager1 "
+        "org.freedesktop.FileManager1.ShowItems array:string:" +
+        shq("file://" + path) + " string:\"\" >/dev/null 2>&1 || xdg-open " + shq(dir) +
+        " >/dev/null 2>&1 &";
+    (void)std::system(cmd.c_str());
+#endif
 }
 
 }  // namespace ui

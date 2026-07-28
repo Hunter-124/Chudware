@@ -55,6 +55,10 @@ struct GNode {
   double metaMt = 0.0;        // source mtime (fallback freshness signal)
   std::string metaUn;         // unit system ("ips"/"mmgs") from doc meta.un
   std::vector<std::string> metaMat; // material names from doc meta.mat
+  std::vector<std::string> metaKeywords; // user tags from meta.keywords
+  std::string metaPreview;    // file text_preview (<=300 chars, file nodes)
+  std::string metaProject;    // owning project root (cross-project merges)
+  std::string metaFolder;     // folder bucket for file nodes (By-folder layout)
   float lx = 0.0f, ly = 0.0f; // layout coords (graph space)
   float lz = 0.0f;            // depth coord (3D projection mode only)
   float radius = 14.0f;
@@ -130,6 +134,16 @@ struct GraphTabState {
   std::string linkPopupDst; // node id chosen as the target
   int linkKindIdx = 4;      // default REFERENCES (see kEdgeKinds)
   char linkNote[192] = {};
+  // Keyword tagging: add-field buffer (chips render from GNode::metaKeywords).
+  char keywordAdd[96] = {};
+  // Cluster-seed layout mode: 0 = current behavior, 1 = By project,
+  // 2 = By keyword, 3 = By folder (project web view only).
+  int clusterMode = 0;
+  // Merge linked projects into the graph (cad_graph_get linked=true).
+  bool linkedProjects = false;
+  // Distinct meta.project values across loaded nodes, sorted (cross-project
+  // rim tint + legend when >1). Rebuilt with every load.
+  std::vector<std::string> projects;
   std::string scopePending; // plmGraphScopeNode request applied on next draw
   std::string focusPending; // plmGraphFocus request to apply on next draw
   // ME489-scale guards ----------------------------------------------------
@@ -307,7 +321,8 @@ std::string summarizeMeta(const nlohmann::json &meta) {
 // Structural kinds shown in project view (everything else is drill-down only).
 bool isProjectKind(const std::string &k) {
   return k == "project" || k == "assembly" || k == "part" || k == "doc" ||
-         k == "drawing" || k == "board" || k == "firmware" || k == "sim_study";
+         k == "drawing" || k == "board" || k == "firmware" || k == "sim_study" ||
+         k == "file" || k == "keyword";
 }
 
 // Kinds a user can double-click to drill into.
@@ -328,10 +343,22 @@ int kindOrder(const std::string &k) {
     return 3;
   if (k == "feature" || k == "sketch" || k == "mate" || k == "equation")
     return 4;
-  if (k == "drawing" || k == "sim_study" || k == "board" || k == "firmware")
+  if (k == "drawing" || k == "sim_study" || k == "board" || k == "firmware" ||
+      k == "file")
     return 5;
+  if (k == "keyword")
+    return 6;
   return 3;
 }
+
+// file/keyword get dedicated hues (same static-color convention as the
+// DOCUMENTS/SIMULATES/MANUFACTURES edge colors below): no palette token fits
+// "neutral file asset" or "pop-out keyword tag" without colliding with an
+// existing kind.
+static const float kFileNodeColor[4] = {0.482f, 0.549f, 0.639f,
+                                        1.0f}; // slate gray-blue
+static const float kKeywordNodeColor[4] = {0.988f, 0.749f, 0.180f,
+                                           1.0f}; // amber/gold — pops
 
 // Theme-token colours only (gui_lint theme rule).
 ImU32 kindColor(const std::string &k, float a = 1.0f) {
@@ -356,6 +383,10 @@ ImU32 kindColor(const std::string &k, float a = 1.0f) {
     c = palette.simMesh;
   else if (k == "board" || k == "firmware")
     c = palette.sketchExternal;
+  else if (k == "file")
+    c = kFileNodeColor;
+  else if (k == "keyword")
+    c = kKeywordNodeColor;
   else
     c = palette.textDim;
   return ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a));
@@ -374,6 +405,9 @@ static const float kSimulatesColor[4] = {0.902f, 0.451f, 0.251f, 1.0f}; // burnt
 static const float kManufacturesColor[4] = {0.243f, 0.780f, 0.729f,
                                             1.0f}; // cyan-teal (distinct from
                                                    // INSTANCE_OF's true green)
+static const float kTaggedColor[4] = {0.965f, 0.820f, 0.110f,
+                                      1.0f}; // pure gold — more yellow than
+                                             // DEPENDS_ON's sandy amber
 
 ImU32 edgeColor(const std::string &k, float a = 0.70f) {
   const float *c = palette.textDim;
@@ -395,7 +429,24 @@ ImU32 edgeColor(const std::string &k, float a = 0.70f) {
     c = kSimulatesColor;
   else if (k == "MANUFACTURES")
     c = kManufacturesColor;
+  else if (k == "TAGGED")
+    c = kTaggedColor;
   return ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a));
+}
+
+// Stable per-project rim color for cross-project merged graphs: FNV-1a of the
+// project root → hue (same idiom as the ai role colors), fixed sat/val keeps
+// it legible as a node border on the dark canvas.
+ImU32 projectColor(const std::string &proj, float a = 1.0f) {
+  std::uint32_t h = 2166136261u;
+  for (unsigned char c : proj) {
+    h ^= c;
+    h *= 16777619u;
+  }
+  const float hue = (float)(h % 360u) / 360.0f;
+  float r, g, b;
+  ImGui::ColorConvertHSVtoRGB(hue, 0.58f, 0.92f, r, g, b);
+  return ImGui::GetColorU32(ImVec4(r, g, b, a));
 }
 
 const char *kindShort(const std::string &k) {
@@ -427,6 +478,10 @@ const char *kindShort(const std::string &k) {
     return "FW";
   if (k == "equation")
     return "EQ";
+  if (k == "file")
+    return "FILE";
+  if (k == "keyword")
+    return "KW";
   return "NODE";
 }
 
@@ -435,7 +490,7 @@ const char *kindShort(const std::string &k) {
 // default).
 static const char *kEdgeKinds[] = {
     "CONTAINS",     "DEPENDS_ON", "MATES",     "INSTANCE_OF",  "REFERENCES",
-    "DERIVES_FROM", "DOCUMENTS",  "SIMULATES", "MANUFACTURES",
+    "DERIVES_FROM", "DOCUMENTS",  "SIMULATES", "MANUFACTURES", "TAGGED",
 };
 
 // Display label for an edge-kind token: "DEPENDS_ON" -> "Depends On". The
@@ -1578,6 +1633,123 @@ void layeredAsmSeed(GraphTabState &G, const std::vector<float> &collR, float S,
   }
 }
 
+// Directory portion of a graph-relative path ("" when the path has none).
+std::string pathDir(const std::string &p) {
+  auto sl = p.find_last_of("/\\");
+  return sl == std::string::npos ? std::string() : p.substr(0, sl);
+}
+
+// Cluster grouping for the toolbar "Layout" modes, by visOrd (-1 = no group).
+// Deterministic: group keys sort, ids assign in sorted-key order.
+//   mode 1 (By project): meta.project root.
+//   mode 2 (By keyword): a node joins the group of the first keyword node
+//     (sorted id) whose TAGGED edge reaches it; keyword nodes anchor their
+//     own group so the tag hub sits inside its neighborhood.
+//   mode 3 (By folder): meta.folder for file nodes, else the path's dir.
+std::vector<int> clusterGroups(GraphTabState &G, int mode) {
+  const int V = (int)G.visibleIdx.size();
+  std::vector<std::string> keys(static_cast<size_t>(V));
+  if (mode == 2) {
+    std::unordered_map<std::string, std::string> firstKw; // target → kw node
+    for (const auto &e : G.edges) {
+      if (e.kind != "TAGGED")
+        continue;
+      auto it = firstKw.find(e.dst);
+      if (it == firstKw.end() || e.src < it->second)
+        firstKw[e.dst] = e.src;
+    }
+    for (int i = 0; i < V; ++i) {
+      const GNode &n = G.nodes[G.visibleIdx[static_cast<size_t>(i)]];
+      if (n.kind == "keyword")
+        keys[static_cast<size_t>(i)] = n.id;
+      else if (auto it = firstKw.find(n.id); it != firstKw.end())
+        keys[static_cast<size_t>(i)] = it->second;
+    }
+  } else if (mode == 1) {
+    for (int i = 0; i < V; ++i)
+      keys[static_cast<size_t>(i)] = G.nodes[G.visibleIdx[static_cast<size_t>(i)]].metaProject;
+  } else if (mode == 3) {
+    for (int i = 0; i < V; ++i) {
+      const GNode &n = G.nodes[G.visibleIdx[static_cast<size_t>(i)]];
+      keys[static_cast<size_t>(i)] =
+          !n.metaFolder.empty() ? n.metaFolder : pathDir(n.path);
+    }
+  }
+  std::map<std::string, int> gid;
+  for (int i = 0; i < V; ++i)
+    if (!keys[static_cast<size_t>(i)].empty())
+      gid[keys[static_cast<size_t>(i)]];
+  int next = 0;
+  for (auto &kv : gid)
+    kv.second = next++;
+  std::vector<int> out(static_cast<size_t>(V), -1);
+  for (int i = 0; i < V; ++i)
+    if (!keys[static_cast<size_t>(i)].empty())
+      out[static_cast<size_t>(i)] = gid[keys[static_cast<size_t>(i)]];
+  return out;
+}
+
+// Cluster seed: initial-position grouping BEFORE force relaxation (the sim
+// stays live — unlike hierarchySeed nothing freezes). Group centroids sit on
+// a coarse deterministic circle; fresh members seed on a golden-angle
+// phyllotaxis disc around their centroid. Warm nodes keep persisted positions.
+// outGid (by visOrd) feeds force group-pull so clusters hold during the
+// relax. Returns false when nothing groups under this mode (caller falls back
+// to the regular seeds).
+bool clusterSeed(GraphTabState &G, const std::vector<char> &isFresh,
+                 float spacing, int mode, std::vector<float> &outX,
+                 std::vector<float> &outY, std::vector<float> &outZ,
+                 std::vector<int> &outGid) {
+  const int V = (int)G.visibleIdx.size();
+  outX.assign(static_cast<size_t>(V), 0.0f);
+  outY.assign(static_cast<size_t>(V), 0.0f);
+  outZ.assign(static_cast<size_t>(V), 0.0f);
+  outGid = clusterGroups(G, mode);
+  int nG = 0;
+  for (int g : outGid)
+    nG = std::max(nG, g + 1);
+  if (nG == 0)
+    return false;
+
+  constexpr float GOLDEN = 2.39996323f;
+  const float ring =
+      nG > 1 ? spacing * 1.7f * std::sqrt((float)nG) : 0.0f;
+  std::vector<std::pair<float, float>> cent(static_cast<size_t>(nG), {0.f, 0.f});
+  for (int g = 0; g < nG; ++g) {
+    const float ang =
+        (float)g * (6.28318530718f / (float)nG) - 1.57079632679f;
+    cent[static_cast<size_t>(g)] = {ring * std::cos(ang), ring * std::sin(ang)};
+  }
+  std::vector<int> memb(static_cast<size_t>(nG), 0);
+  for (int i = 0; i < V; ++i) {
+    const int g = outGid[static_cast<size_t>(i)];
+    if (g < 0)
+      continue;
+    const int k = memb[static_cast<size_t>(g)]++;
+    if (!isFresh[static_cast<size_t>(i)])
+      continue;
+    const float rr = spacing * 0.75f * std::sqrt((float)k + 0.5f);
+    const float a = (float)k * GOLDEN;
+    outX[static_cast<size_t>(i)] =
+        cent[static_cast<size_t>(g)].first + rr * std::cos(a);
+    outY[static_cast<size_t>(i)] =
+        cent[static_cast<size_t>(g)].second + rr * std::sin(a);
+  }
+  // Ungrouped fresh nodes: loose ring outside the cluster pack.
+  int u = 0;
+  for (int i = 0; i < V; ++i) {
+    if (outGid[static_cast<size_t>(i)] >= 0 ||
+        !isFresh[static_cast<size_t>(i)])
+      continue;
+    const float a = (float)u * GOLDEN;
+    const float rr = ring + spacing * (1.2f + 0.4f * std::sqrt((float)u));
+    outX[static_cast<size_t>(i)] = rr * std::cos(a);
+    outY[static_cast<size_t>(i)] = rr * std::sin(a);
+    ++u;
+  }
+  return true;
+}
+
 // Rebuild the force simulation over the VISIBLE subgraph (called when
 // layoutDirty, not per frame). Existing layout coords are reused as seeds so
 // refreshes/filter toggles stay stable; new nodes seed near their CONTAINS
@@ -1714,6 +1886,11 @@ void rebuildForce(GraphTabState &G) {
   std::vector<float> collROrd(static_cast<size_t>(V), 14.0f); // by visOrd
 
   // Radii + freshness first — the deterministic seeds need both.
+  // Keyword hubs scale with their TAGGED degree (r *= min(1 + 0.15*deg, 2)).
+  std::unordered_map<std::string, int> taggedDeg;
+  for (const auto &e : G.edges)
+    if (e.kind == "TAGGED")
+      ++taggedDeg[e.src];
   std::vector<char> isFresh(static_cast<size_t>(V), 0);
   int fresh = 0;
   for (int i = 0; i < V; ++i) {
@@ -1727,6 +1904,11 @@ void rebuildForce(GraphTabState &G) {
     float discR = (10.0f + 2.4f * metric) * S;
     if (n.kind == "project")
       discR *= 1.30f;
+    else if (n.kind == "keyword") {
+      auto td = taggedDeg.find(n.id);
+      if (td != taggedDeg.end())
+        discR *= std::min(1.0f + 0.15f * (float)td->second, 2.0f);
+    }
     discR = std::clamp(discR, 11.0f * S, 36.0f * S);
     n.radius = discR; // drawing uses disc radius
     n.bubbleR = 0.0f; // repacked below when the hierarchy seed runs
@@ -1747,15 +1929,22 @@ void rebuildForce(GraphTabState &G) {
   // Fresh nodes (no persisted/stashed position) get placed by a deterministic
   // algorithm; cached positions are never touched.
   //  - Assembly view: layered tree (Sugiyama-lite) — reads top-down.
+  //  - Cluster modes (Layout combo): group centroids on a coarse circle,
+  //    members around their centroid — seed ONLY, sim relaxes live.
   //  - Mostly-fresh web: balloon hierarchy over the CONTAINS forest +
   //    neighbor-anchored reference singles (hierarchySeed) — pure
   //    structure, sim frozen; no collapse/homogenization modes.
   //  - A few new nodes on a warm layout: cheap golden-angle append (below).
   std::vector<float> seedX, seedY, seedZ;
+  std::vector<int> clusterGid; // by visOrd; overrides component group-pull
   bool haveSeed = false;
   if (fresh > 0 && G.asmView && G.scopeDocId.empty()) {
     layeredAsmSeed(G, collROrd, S, seedX, seedY, seedZ);
     haveSeed = true;
+  } else if (G.clusterMode != 0 && G.scopeDocId.empty() && fresh > 0 &&
+             clusterSeed(G, isFresh, 190.0f * S, G.clusterMode, seedX, seedY,
+                         seedZ, clusterGid)) {
+    haveSeed = true; // clustered seed — the sim relaxes from it, no freeze
   } else if (fresh * 2 > V) {
     hierarchySeed(G, visOrd, adjAll, isFresh, 190.0f * S, seedX,
                   seedY, seedZ);
@@ -1818,8 +2007,14 @@ void rebuildForce(GraphTabState &G) {
     // World-placed nodes hold their real model coordinates in 3D.
     if (G.view3d && n.hasW)
       G.force.setPinned(slot, true);
-    if (cid >= 0)
-      G.force.setGroup(slot, cid);
+    // Cluster modes group-pull by cluster key so the seeded clusters hold
+    // together while the live sim relaxes; otherwise component grouping.
+    int gid = cid;
+    if (!clusterGid.empty() && i < (int)clusterGid.size() &&
+        clusterGid[static_cast<size_t>(i)] >= 0)
+      gid = clusterGid[static_cast<size_t>(i)];
+    if (gid >= 0)
+      G.force.setGroup(slot, gid);
   }
 
   // Springs per visible edge; kind tunes rest / stiffness. Cap springs per
@@ -2095,6 +2290,9 @@ void requestGraph(AppState &st, bool force) {
   // Archive dirs are excluded server-side by default; flip only when the
   // user unchecks "Hide archive/stale".
   p["include_archive"] = !G.hideArchive;
+  // Cross-project merge: linked projects' graphs fold into the response,
+  // each node carrying its owning root in meta.project.
+  p["linked"] = G.linkedProjects;
   if (force)
     p["force"] = true;
   // Change probe: when the worker confirms nothing changed we get a tiny
@@ -2183,6 +2381,15 @@ void requestGraph(AppState &st, bool force) {
               if (mv.is_string())
                 n.metaMat.push_back(mv.get<std::string>());
           }
+          if (auto kw = m->find("keywords");
+              kw != m->end() && kw->is_array()) {
+            for (const auto &kv : *kw)
+              if (kv.is_string())
+                n.metaKeywords.push_back(kv.get<std::string>());
+          }
+          n.metaPreview = jstr(*m, "text_preview");
+          n.metaProject = jstr(*m, "project");
+          n.metaFolder = jstr(*m, "folder");
         }
         if (n.id.empty())
           continue;
@@ -2222,6 +2429,16 @@ void requestGraph(AppState &st, bool force) {
       G.nodeCountFull = (int)G.nodes.size();
     if (G.edgeCountFull <= 0)
       G.edgeCountFull = (int)G.edges.size();
+
+    // Distinct owning project roots (meta.project) — >1 means the response
+    // merged linked projects; drives the rim tint + legend.
+    {
+      std::set<std::string> ps;
+      for (const auto &n : G.nodes)
+        if (!n.metaProject.empty())
+          ps.insert(n.metaProject);
+      G.projects.assign(ps.begin(), ps.end());
+    }
 
     // Probe fingerprint for subsequent polls.
     G.mtimesMax = r.result.value("sources_mtime_max", 0.0);
@@ -2354,6 +2571,47 @@ void requestLinkRemove(AppState &st, const std::string &linkId) {
       return;
     }
     S().selectedEdge = -1;
+    S().lastFetch = -1e9;
+  });
+}
+
+// Keyword tagging (cad_graph_keyword_add/remove). Same invalidation pattern
+// as requestLinkAdd: on any reply the next frame refetches so the kw: node +
+// its TAGGED edge land in the graph.
+void requestKeywordAdd(AppState &st, const std::string &target,
+                       const std::string &keyword) {
+  auto &G = S();
+  if (!G.available || target.empty() || keyword.empty())
+    return;
+  nlohmann::json p;
+  p["project_dir"] = st.plmProjectPath();
+  p["path"] = st.plmProjectPath();
+  p["target"] = target;
+  p["keyword"] = keyword;
+  st.rpc.call("cad_graph_keyword_add", p, [](const core::RpcResult &r) {
+    if (isAbsent(r)) {
+      S().available = false;
+      return;
+    }
+    S().lastFetch = -1e9;
+  });
+}
+
+void requestKeywordRemove(AppState &st, const std::string &target,
+                          const std::string &keyword) {
+  auto &G = S();
+  if (!G.available || target.empty() || keyword.empty())
+    return;
+  nlohmann::json p;
+  p["project_dir"] = st.plmProjectPath();
+  p["path"] = st.plmProjectPath();
+  p["target"] = target;
+  p["keyword"] = keyword;
+  st.rpc.call("cad_graph_keyword_remove", p, [](const core::RpcResult &r) {
+    if (isAbsent(r)) {
+      S().available = false;
+      return;
+    }
     S().lastFetch = -1e9;
   });
 }
@@ -2685,6 +2943,24 @@ void revealInFolder(const std::string &absPath) {
 #endif
 }
 
+// Open a path with the OS default handler (file-manager double-click
+// semantics). Used for non-CAD project files (pdf/office/image) the app
+// cannot edit itself — st.requestOpenPath would route them at a doc parser.
+void openExternally(const std::string &absPath) {
+  if (absPath.empty())
+    return;
+#if defined(_WIN32)
+  std::string cmd = "start \"\" \"" + absPath + "\"";
+  (void)std::system(cmd.c_str());
+#elif defined(__APPLE__)
+  std::string cmd = "open \"" + absPath + "\" >/dev/null 2>&1 &";
+  (void)std::system(cmd.c_str());
+#else
+  std::string cmd = "xdg-open \"" + absPath + "\" >/dev/null 2>&1 &";
+  (void)std::system(cmd.c_str());
+#endif
+}
+
 // Compact labelled field row used by the node inspector.
 void panelFieldLabel(const char *k) {
   ImGui::PushStyleColor(ImGuiCol_Text,
@@ -2785,7 +3061,8 @@ void centerOnNode(GraphTabState &G, const GNode &n, ImVec2 canvasSz) {
 bool matchesSearch(const GNode &n, const char *q) {
   if (!q || !q[0])
     return true;
-  // case-insensitive substring on label / kind / id / path
+  // case-insensitive substring on label / kind / id / path / owning project /
+  // keyword tags
   auto has = [q](const std::string &s) {
     if (s.empty())
       return false;
@@ -2796,7 +3073,13 @@ bool matchesSearch(const GNode &n, const char *q) {
       c = (char)std::tolower((unsigned char)c);
     return a.find(b) != std::string::npos;
   };
-  return has(n.label) || has(n.kind) || has(n.id) || has(n.path);
+  if (has(n.label) || has(n.kind) || has(n.id) || has(n.path) ||
+      has(n.metaProject))
+    return true;
+  for (const auto &kw : n.metaKeywords)
+    if (has(kw))
+      return true;
+  return false;
 }
 
 // Search match cache: matchIds (visible), vis/all match tallies for the
@@ -2845,6 +3128,8 @@ void drawLegend(ImDrawList *dl, ImVec2 origin, bool projectScope) {
     rows.push_back({"assembly", kindColor("assembly"), false, true, false});
     rows.push_back({"part", kindColor("part"), false, true, false});
     rows.push_back({"drawing", kindColor("drawing"), false, true, false});
+    rows.push_back({"file", kindColor("file"), false, true, false});
+    rows.push_back({"keyword", kindColor("keyword"), false, true, false});
     rows.push_back(
         {"(agg ×N)", edgeColor("REFERENCES", 0.85f), false, false, false});
   } else {
@@ -3050,7 +3335,8 @@ void drawSidePanel(AppState &st, float panelW) {
   std::string absPath;
   const GNode *instTgt = instanceTarget(G, *sel);
   const GNode &openNode = instTgt ? *instTgt : *sel;
-  if ((isDrillableKind(openNode.kind) || openNode.kind == "project") &&
+  if ((isDrillableKind(openNode.kind) || openNode.kind == "project" ||
+       openNode.kind == "file") &&
       !openNode.path.empty())
     absPath = resolveNodeAbsPath(st, openNode);
   else if (!openNode.docId.empty()) {
@@ -3076,17 +3362,19 @@ void drawSidePanel(AppState &st, float panelW) {
 
     // Primary: worker-rendered iso thumb (content-hash cache, same pipeline
     // as the grid). Fallback: any thumbnail.png packaged inside the .step+.
+    // file nodes skip both — a pdf/image has no CAD render and no package
+    // thumbnail; the empty state (or the text_preview block below) covers it.
     GraphGridThumb gth;
-    if (!absPath.empty()) {
+    if (!absPath.empty() && sel->kind != "file") {
       const std::string tkey =
           graphThumbKey(openNode.metaDh, openNode.metaMt, absPath);
       gth = graphThumbEnsure(st, G.projectDir, tkey, absPath);
     }
     const GraphThumb *th = nullptr;
-    if (!gth.tex && !absPath.empty())
+    if (!gth.tex && !absPath.empty() && sel->kind != "file")
       th = ensureGraphThumb(absPath);
     // Also try the node's own path if different from open target.
-    if (!gth.tex && !th && !sel->path.empty()) {
+    if (!gth.tex && !th && !sel->path.empty() && sel->kind != "file") {
       const std::string own = resolveNodeAbsPath(st, *sel);
       if (!own.empty() && own != absPath)
         th = ensureGraphThumb(own);
@@ -3264,10 +3552,82 @@ void drawSidePanel(AppState &st, float panelW) {
       trow("units", units);
       trow("material", mats);
       trow("origin", sel->origin);
+      if (!sel->metaProject.empty() && G.projects.size() > 1) {
+        std::string projBase = sel->metaProject;
+        if (auto sl = projBase.find_last_of("/\\"); sl != std::string::npos)
+          projBase = projBase.substr(sl + 1);
+        trow("project", projBase);
+      }
       if (!sel->docId.empty() && sel->docId != sel->id)
         trow("document", sel->docId);
       trow("id", sel->id);
       ImGui::EndTable();
+    }
+  }
+
+  // ---- file text preview (meta.text_preview, <=300 chars) ------------------
+  if (sel->kind == "file" && !sel->metaPreview.empty()) {
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    plmSectionHeader("Preview", "new_doc");
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(palette.textDim[0], palette.textDim[1],
+                                 palette.textDim[2], 1.0f));
+    ImGui::TextWrapped("%s", sel->metaPreview.c_str());
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 6 * S));
+  }
+
+  // ---- keywords (meta.keywords chips + add/remove) -------------------------
+  ImGui::Dummy(ImVec2(0, 4 * S));
+  plmSectionHeader("Keywords", "bom");
+  ImGui::Dummy(ImVec2(0, 4 * S));
+  if (sel->metaKeywords.empty()) {
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                                 palette.textDisabled[2], 1.0f));
+    ImGui::TextWrapped("No keywords yet.");
+    ImGui::PopStyleColor();
+  } else {
+    // Flow-wrap chips: measured SameLine rows, click a chip's × to untag.
+    const float availW = ImGui::GetContentRegionAvail().x;
+    float rowX = 0.0f;
+    for (int ki = 0; ki < (int)sel->metaKeywords.size(); ++ki) {
+      const std::string &kw = sel->metaKeywords[ki];
+      const std::string chip = kw + "  \xc3\x97";
+      const float chipW = ImGui::CalcTextSize(chip.c_str()).x +
+                          ImGui::GetStyle().FramePadding.x * 2.0f;
+      if (rowX > 0.0f && rowX + chipW > availW)
+        rowX = 0.0f;
+      if (rowX > 0.0f)
+        ImGui::SameLine(0, 4 * S);
+      ImGui::PushID(ki);
+      ImGui::PushStyleColor(
+          ImGuiCol_Text,
+          ImGui::ColorConvertU32ToFloat4(kindColor("keyword", 1.0f)));
+      if (ImGui::SmallButton(chip.c_str()))
+        requestKeywordRemove(st, sel->id, kw);
+      ImGui::PopStyleColor();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Remove keyword \"%s\"", kw.c_str());
+      ImGui::PopID();
+      rowX += chipW + 4 * S;
+    }
+  }
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+  const bool kwEnter = ImGui::InputTextWithHint(
+      "##kw_add", "add a keyword, Enter to tag", G.keywordAdd,
+      sizeof(G.keywordAdd), ImGuiInputTextFlags_EnterReturnsTrue);
+  const bool kwBtn = graphGlassButton("##kw_add_btn", "Add keyword", false,
+                                      -1.0f);
+  if ((kwEnter || kwBtn) && G.keywordAdd[0]) {
+    std::string kw = G.keywordAdd;
+    const auto b = kw.find_first_not_of(" \t");
+    const auto e = kw.find_last_not_of(" \t");
+    kw = (b == std::string::npos) ? std::string() : kw.substr(b, e - b + 1);
+    if (!kw.empty()) {
+      requestKeywordAdd(st, sel->id, kw);
+      G.keywordAdd[0] = 0;
     }
   }
 
@@ -3282,21 +3642,38 @@ void drawSidePanel(AppState &st, float panelW) {
   // Model, sim->Simulate). Focus Document: stay in PLM and center the graph
   // on the resolved doc node.
   if (!absPath.empty()) {
-    if (graphGlassButton("##open_doc", "Open document", true, -1.0f, "new_doc"))
-      st.requestOpenPath = absPath;
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-      ImGui::SetTooltip("Open in its editor (Model / Drawing / Simulate /\n"
-                        "Electronics / Manufacture, by document kind).");
-    ImGui::Dummy(ImVec2(0, 4 * S));
-    if (graphGlassButton("##focus_doc", "Focus document", false, -1.0f,
-                         "view_selector")) {
-      G.selectedId = openNode.id;
-      G.selectedEdge = -1;
-      G.pendingCenterId = openNode.id;
+    if (sel->kind == "file") {
+      // Non-CAD asset: hand to the OS, never the doc parser.
+      if (graphGlassButton("##open_ext", "Open externally", true, -1.0f,
+                           "new_doc"))
+        openExternally(absPath);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Open with the system default application.");
+      ImGui::Dummy(ImVec2(0, 4 * S));
+      if (graphGlassButton("##reveal_file", "Reveal in folder", false, -1.0f,
+                           "body_folder"))
+        revealInFolder(absPath);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Show in the file manager.");
+      ImGui::Dummy(ImVec2(0, 4 * S));
+    } else {
+      if (graphGlassButton("##open_doc", "Open document", true, -1.0f,
+                           "new_doc"))
+        st.requestOpenPath = absPath;
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Open in its editor (Model / Drawing / Simulate /\n"
+                          "Electronics / Manufacture, by document kind).");
+      ImGui::Dummy(ImVec2(0, 4 * S));
+      if (graphGlassButton("##focus_doc", "Focus document", false, -1.0f,
+                           "view_selector")) {
+        G.selectedId = openNode.id;
+        G.selectedEdge = -1;
+        G.pendingCenterId = openNode.id;
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Center this document in the PLM graph.");
+      ImGui::Dummy(ImVec2(0, 4 * S));
     }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-      ImGui::SetTooltip("Center this document in the PLM graph.");
-    ImGui::Dummy(ImVec2(0, 4 * S));
     if (graphGlassButton("##copy_path", "Copy path", false, -1.0f, nullptr))
       ImGui::SetClipboardText(absPath.c_str());
     ImGui::Dummy(ImVec2(0, 4 * S));
@@ -3755,12 +4132,26 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     }
   }
 
-  // Double-click drill / back (works at any nesting depth).
+  // Double-click drill / back (works at any nesting depth). file nodes open
+  // with the OS handler; keyword nodes filter the graph to their tagged
+  // targets; structural kinds scope-drill as before.
   if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
     if (!G.hoverId.empty() && G.hoverId != G.scopeDocId) {
       auto it = G.idIndex.find(G.hoverId);
-      if (it != G.idIndex.end() && isDrillableKind(G.nodes[it->second].kind))
-        drillInto(G, G.hoverId);
+      if (it != G.idIndex.end()) {
+        const GNode &hn = G.nodes[it->second];
+        if (hn.kind == "file") {
+          const std::string abs = resolveNodeAbsPath(st, hn);
+          if (!abs.empty())
+            openExternally(abs);
+        } else if (hn.kind == "keyword") {
+          std::snprintf(G.search, sizeof(G.search), "%s", hn.label.c_str());
+          G.centerPending = true;
+          G.matchDirty = true;
+        } else if (isDrillableKind(hn.kind)) {
+          drillInto(G, G.hoverId);
+        }
+      }
     } else if (G.hoverId.empty() && !G.scopeDocId.empty()) {
       scopeBack(G);
     }
@@ -3870,6 +4261,10 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
                  palette.statusWarn[2] * 0.20f, 0.88f * a));
     }
     ImU32 ring = Palette::toU32(palette.border);
+    // Cross-project merged graph (>1 owning root): rim tint per project so
+    // foreign nodes read at a glance. Selection/blast/hover still override.
+    if (G.projects.size() > 1 && !n.metaProject.empty())
+      ring = projectColor(n.metaProject, 0.85f * a);
     if (sel) {
       ring = Palette::toU32(palette.accent);
       r += 2.0f * S;
@@ -4034,6 +4429,10 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
           ImGui::Text("inside  %s", formatDescBadge(dit->second).c_str());
         if (isDrillableKind(hn->kind))
           ImGui::TextUnformatted("double-click to isolate references");
+        else if (hn->kind == "file")
+          ImGui::TextUnformatted("double-click to open");
+        else if (hn->kind == "keyword")
+          ImGui::TextUnformatted("double-click to filter by this keyword");
       }
       ImGui::PopStyleColor();
       ImGui::EndTooltip();
@@ -4073,7 +4472,7 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   }
 
   // Legend bottom-left of canvas.
-  drawLegend(dl, ImVec2(origin.x + 12 * S, origin.y + canvasSz.y - 200 * S),
+  drawLegend(dl, ImVec2(origin.x + 12 * S, origin.y + canvasSz.y - 232 * S),
              projectScope);
 
   // Mode badge top-left: at-a-glance 2D/3D state; in 3D it also lists the
@@ -4119,8 +4518,9 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
 
 // Hierarchy / list view — full graph (search finds hidden internals too).
 // Sorted by kind order then label; search filters the rows. Click selects.
-// Double-click a structural row drills in (mirrors canvas).
-void drawListView(AppState & /*st*/, ImVec2 canvasSz) {
+// Double-click a structural row drills in (mirrors canvas); file rows open
+// with the OS handler; keyword rows filter to their targets.
+void drawListView(AppState &st, ImVec2 canvasSz) {
   auto &G = S();
   const float Sc = ui::uiScale;
 
@@ -4227,8 +4627,18 @@ void drawListView(AppState & /*st*/, ImVec2 canvasSz) {
       }
       if (ImGui::IsItemHovered() &&
           ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
-          isDrillableKind(n.kind) && n.id != G.scopeDocId) {
-        drillInto(G, n.id);
+          n.id != G.scopeDocId) {
+        if (n.kind == "file") {
+          const std::string abs = resolveNodeAbsPath(st, n);
+          if (!abs.empty())
+            openExternally(abs);
+        } else if (n.kind == "keyword") {
+          std::snprintf(G.search, sizeof(G.search), "%s", n.label.c_str());
+          G.centerPending = true;
+          G.matchDirty = true;
+        } else if (isDrillableKind(n.kind)) {
+          drillInto(G, n.id);
+        }
       }
       if (sel || inBlast)
         ImGui::PopStyleColor();
@@ -4551,6 +4961,8 @@ void plmGraphOnProjectChanged() {
   G.linkPopupOpen = false;
   G.linkPopupDst.clear();
   G.linkNote[0] = 0;
+  G.keywordAdd[0] = 0;
+  G.projects.clear();
   G.truncated = false;
   G.nodeCountFull = 0;
   G.edgeCountFull = 0;
@@ -4751,6 +5163,20 @@ void plmDrawGraphPage(AppState &st) {
       ImGui::SetTooltip("Hide nodes with no visible links (default ON).\n"
                         "They remain available in List view.");
     }
+  }
+  ImGui::SameLine();
+  // Linked projects — OFF by default; toggling refetches with linked=true so
+  // the worker merges linked projects' graphs (nodes then carry meta.project).
+  if (graphGlassButton("##linked_proj", "Linked projects", G.linkedProjects,
+                       0.0f)) {
+    G.linkedProjects = !G.linkedProjects;
+    G.lastFetch = -1e9;
+    requestGraph(st, /*force=*/true);
+  }
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+    ImGui::SetTooltip("Merge graphs of projects linked to this one.\n"
+                      "Node rims tint per owning project; a legend lists\n"
+                      "each merged project root.");
   }
   ImGui::SameLine();
   // View mode chips: Graph / List / Grid. The active chip carries the accent
@@ -5070,6 +5496,39 @@ void plmDrawGraphPage(AppState &st) {
     }
   }
 
+  // Cross-project legend: one rim-tint swatch + project basename per owning
+  // root in the merged graph (matches the node border colors on canvas).
+  if (G.projects.size() > 1) {
+    ImDrawList *ldl = ImGui::GetWindowDrawList();
+    const float sq = 10.0f * S;
+    const float rowH = ImGui::GetTextLineHeight();
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                                 palette.textDisabled[2], 1.0f));
+    ImGui::TextUnformatted("Projects:");
+    ImGui::PopStyleColor();
+    for (const auto &proj : G.projects) {
+      ImGui::SameLine(0, 10 * S);
+      const ImVec2 sp = ImGui::GetCursorScreenPos();
+      ldl->AddRectFilled(
+          ImVec2(sp.x, sp.y + (rowH - sq) * 0.5f),
+          ImVec2(sp.x + sq, sp.y + (rowH - sq) * 0.5f + sq),
+          projectColor(proj), 2.0f * S);
+      ImGui::Dummy(ImVec2(sq, rowH));
+      ImGui::SameLine(0, 4 * S);
+      std::string base = proj;
+      if (auto sl = base.find_last_of("/\\"); sl != std::string::npos)
+        base = base.substr(sl + 1);
+      ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(palette.textDim[0], palette.textDim[1],
+                                   palette.textDim[2], 1.0f));
+      ImGui::TextUnformatted(base.c_str());
+      ImGui::PopStyleColor();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("%s", proj.c_str());
+    }
+  }
+
   // Hidden search-match hint (matches outside the current visible scope).
   if (G.search[0] != 0 && !G.nodes.empty()) {
     if (G.matchDirty)
@@ -5112,11 +5571,47 @@ void plmDrawGraphPage(AppState &st) {
         "Arrangement is kept per-session (the layered layout is re-derived\n"
         "deterministically on entry).");
   }
+  // Layout seed mode: Default is the current behavior (balloon hierarchy /
+  // warm append); the cluster modes seed group centroids and let the live
+  // sim relax around them. Switching reseeds from scratch (positions zeroed,
+  // stashes dropped) so the whole web re-groups.
+  ImGui::SameLine(0, 12 * S);
+  {
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                                 palette.textDisabled[2], 1.0f));
+    ImGui::TextUnformatted("Layout:");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 4 * S);
+    static const char *kClusterModes[] = {"Default", "By project", "By keyword",
+                                          "By folder"};
+    ImGui::SetNextItemWidth(124 * S);
+    if (ImGui::Combo("##cluster_mode", &G.clusterMode, kClusterModes,
+                     (int)IM_ARRAYSIZE(kClusterModes))) {
+      for (auto &n : G.nodes)
+        n.lx = n.ly = n.lz = 0.0f;
+      G.projPosStash.clear();
+      G.asmPosStash.clear();
+      G.layoutCache.clear(); // disk file is overwritten on the next settle
+      G.hierarchyLayout = false;
+      G.userNavigated = false;
+      G.layoutDirty = true;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+      ImGui::SetTooltip(
+          "Initial-position seeding for the force layout (project web):\n"
+          "Default — balloon hierarchy / current behavior.\n"
+          "By project — cluster per owning project root (merged graphs).\n"
+          "By keyword — cluster around each keyword's tagged targets.\n"
+          "By folder — cluster per folder (file assets / doc paths).");
+    }
+  }
   // Edge-kind toggle grid: structural relations (containment, deps, mates,
   // instances, references) on top, documentation/derivation relations
-  // (derives-from, documents, simulates, manufactures) stacked directly
-  // beneath — a compact 2-row grid of on/off switches instead of one long
-  // strip that ran off past the window edge.
+  // (derives-from, documents, simulates, manufactures, tagged) stacked
+  // directly beneath — a compact 2-row grid of on/off switches instead of
+  // one long strip that ran off past the window edge.
   ImGui::SameLine(0, 12 * S);
   {
     const float gridX = ImGui::GetCursorPosX();

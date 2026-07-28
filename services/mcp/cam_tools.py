@@ -146,7 +146,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def cam_undo() -> str:
-        """Undo the last CAM edit."""
+        """Undo the last CAM edit on the active job (ops, tools, setups, stock)."""
         try:
             return _dumps(cb.call("cam_undo", {"doc_id": _job()}))
         except Exception as e:  # noqa: BLE001
@@ -154,7 +154,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def cam_redo() -> str:
-        """Redo the last undone CAM edit."""
+        """Redo the last undone CAM edit on the active job."""
         try:
             return _dumps(cb.call("cam_redo", {"doc_id": _job()}))
         except Exception as e:  # noqa: BLE001
@@ -312,7 +312,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def cam_remove_operation(op_id: str) -> str:
-        """Remove an operation by id."""
+        """Remove an operation from the active CAM job by *op_id*."""
         try:
             return _dumps(_apply([{"op": "remove_operation", "op_id": op_id}]))
         except Exception as e:  # noqa: BLE001
@@ -411,7 +411,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
     # ------------------------------------------------------------------ persistence
     @mcp.tool()
     def cam_save(path: str) -> str:
-        """Save the CAM job to a .cam+ file."""
+        """Save the active CAM job to a .cam+ file at *path*."""
         try:
             return _dumps(cb.call("cam_save", {"doc_id": _job(), "path": path}))
         except Exception as e:  # noqa: BLE001
@@ -570,7 +570,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def cam_op_types() -> str:
-        """List the supported operation types."""
+        """List the operation types the CAM engine supports for cam_add_operation."""
         try:
             return _dumps(cb.call("cam_op_types", {}))
         except Exception as e:  # noqa: BLE001

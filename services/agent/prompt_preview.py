@@ -118,6 +118,82 @@ def preview_tool_entry(tool_name: str, *, trim: bool | None = None) -> dict[str,
         }
 
 
+def tool_catalog() -> dict[str, Any]:
+    """Full live tool catalog for Settings → AI → Tools (worker ``ai_tool_catalog``).
+
+    Returns ``{ok, tools, meta, error?}`` where each tool row is
+    ``{name, family, description, resolved, guidance}``:
+
+      * family / name come from the live ``tool_registry`` (after warm_catalog),
+        plus the agent pseudo-tools (delegate, adopt_role) that have no registry
+        callable outside a mission;
+      * description is the live docstring's first paragraph collapsed to one
+        line — exactly what the panel shows as "Live (no override)";
+      * guidance is the built-in curated entry (tool_guidance) the panel shows
+        as dimmed "(default: …)" placeholders in the per-tool Options popup.
+    """
+    try:
+        from services.mcp import tool_registry as _tr  # noqa: PLC0415
+        from services.agent import agent_turn as _at  # noqa: PLC0415
+        from services.agent.tool_schemas import (  # noqa: PLC0415
+            _FALLBACK_SCHEMAS, _description_line, describe_callable,
+        )
+        from services.agent.tool_guidance import (  # noqa: PLC0415
+            PSEUDO_TOOLS, guidance_for,
+        )
+
+        _tr.warm_catalog()
+        cat = _tr.catalog() or {}
+        resolver = _at.resolver_for(None)
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for name in sorted(cat):
+            tags = cat.get(name)
+            fam = (tags or {}).get("family", "?") if isinstance(tags, dict) else "?"
+            fn = None
+            try:
+                fn = resolver(name)
+            except Exception:  # noqa: BLE001
+                fn = None
+            desc = ""
+            if fn is not None:
+                desc = _description_line(
+                    (describe_callable(name, fn) or {}).get("description") or "",
+                    trim=False)
+            if not desc:
+                # Meta-tools (enable_tools, list_tool_categories) are registry
+                # entries with no in-process callable — the model still gets a
+                # description from the fallback schema, so the panel must too
+                # rather than showing an empty "Included tool context".
+                _, _, _desc_line = (_FALLBACK_SCHEMAS.get(name) or "").partition("\n")
+                desc = _desc_line.strip()
+            rows.append({
+                "name": name,
+                "family": fam or "?",
+                "description": desc,
+                "resolved": fn is not None,
+                "guidance": guidance_for(name),
+            })
+            seen.add(name)
+        # Pseudo-tools with no registry entry (fallback-schema driven).
+        for name in sorted(PSEUDO_TOOLS - seen):
+            schema = _FALLBACK_SCHEMAS.get(name) or ""
+            sig_line, _, desc_line = schema.partition("\n")
+            rows.append({
+                "name": name,
+                "family": "workspace",
+                "description": desc_line.strip(),
+                "signature": sig_line.lstrip("- ").strip(),
+                "resolved": False,
+                "guidance": guidance_for(name),
+            })
+        fams = sorted({r["family"] for r in rows})
+        return {"ok": True, "tools": rows,
+                "meta": {"count": len(rows), "families": fams}}
+    except Exception as exc:  # noqa: BLE001 — never raise across the worker seam
+        return {"ok": False, "tools": [], "error": f"{type(exc).__name__}: {exc}"}
+
+
 def preview_main_chat_system(*, include_tools: bool = True) -> dict[str, Any]:
     """Build the system prompt a typical main-chat / ``general_agent`` turn gets.
 

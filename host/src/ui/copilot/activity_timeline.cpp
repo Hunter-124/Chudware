@@ -756,13 +756,9 @@ void chatArtifactActions(AppState& st, const std::string& path) {
 // The packed tool-row detail: feedTurnActivity writes args_preview, then the capped failure
 // text after "\n\x1eERR\x1e\n" and artifact paths after "\n\x1eART\x1e\n" (ActivityItem gains
 // no fields — app_state.h is integrator-owned). Split back into its three parts.
-struct ToolRowDetail {
-    std::string args;
-    std::string err;
-    std::string arts;
-};
-
-static ToolRowDetail splitToolRowDetail(const std::string& detail) {
+// ToolRowDetail / declaration shared via copilot_internal.h — chatActivityCopyText (ui_common)
+// uses the same split so a clipboard copy never carries the raw markers.
+ToolRowDetail splitToolRowDetail(const std::string& detail) {
     ToolRowDetail d;
     d.args = detail;
     const char* kArtMark = "\n\x1e" "ART\x1e\n";

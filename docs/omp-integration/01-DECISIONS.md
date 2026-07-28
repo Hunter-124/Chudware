@@ -30,6 +30,17 @@ the "Open decisions" section of `00-OPTIONS-AND-DECISIONS.md`. Implementation fo
 - **Adopt OMP image tier + keep CAD text compaction**, with the **safety revamp**: recoverable
   artifact side-channel for any drop, per-frame checksums validated across IPC, caller-raisable
   frame cap, text-only fallback tier, cross-provider compatibility, minimize dataloss.
+- **Implemented (2026-07-27)**: bridge exposes an additive **`snap_render` RPC**
+  (`vendor/omp/bridge/src/snap-render.ts`; params `{text, priorText?, modelId?, api?,
+  maxFrames?, includeThinking?}` → `{frames[], text, textHead, textTail, totalChars,
+  truncatedChars, checksum, summary, shortSummary}`). Python compaction consumes ONLY this
+  text→PNG renderer; the canonical cut/serialize stays local in
+  `services/agent/compaction.py` (its tests define the semantics). The earlier full-bridge
+  `compact` consumption (`_bridge_compact`) was deleted — its divergent cut semantics broke
+  the local suite under `CHUDWARE_COMPACTION_BACKEND=omp`; the bridge's `compact` RPC itself
+  remains for the C++ side. OG source + frames persist in `services/agent/snap_store.py`
+  (content-addressed, sha256-validated), enabling cumulative re-snap (stamp-line chain in the
+  conversation) and cross-provider re-snap on switch — no data loss either way.
 - **New UI options**:
   - "Text-compact with cheaper model after cache unloaded."
   - **Cache-warming**: keep model context hot by sending sample hello/continue messages then

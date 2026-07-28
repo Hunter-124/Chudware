@@ -328,6 +328,12 @@ def test_rpc_methods_registered():
         "cad_graph_get", "cad_graph_blast", "cad_graph_path",
         "cad_graph_link_add", "cad_graph_link_remove", "cad_graph_link_list",
         "cad_graph_assembly_tree",
+        "cad_graph_keyword_add", "cad_graph_keyword_remove",
+        "cad_graph_keyword_list",
+        "cad_graph_search", "cad_graph_neighbors",
+        "cad_graph_watch_add", "cad_graph_watch_remove",
+        "cad_graph_watch_list", "cad_graph_changes",
+        "cad_graph_config_get", "cad_graph_config_set",
     }
     from services.plm import worker_rpc
     for name in CAD_GRAPH_METHODS:
@@ -747,3 +753,198 @@ def test_meta_bounding_caps():
     mrefs = mates[0]["meta"].get("refs")
     if isinstance(mrefs, list):
         assert len(mrefs) <= 8
+
+
+# ---------------------------------------------------------------------------
+# file nodes + keyword web + cross-project (2026-07-27 addendum)
+# ---------------------------------------------------------------------------
+
+
+def test_file_nodes_and_extension_policy(project: Path):
+    (project / "Specs").mkdir()
+    (project / "Specs" / "datasheet.pdf").write_bytes(b"%PDF-1.4 fake")
+    (project / "notes.md").write_text("# notes\n")
+    (project / "build.log").write_text("not a graph file\n")
+    (project / "firmware" / "main.c").write_text("int main;\n")  # not in _FILE_EXTS
+    g = cad_graph.build_graph(project, force=True)
+    nodes = {n["id"]: n for n in g["nodes"]}
+    fids = [nid for nid in nodes if nodes[nid]["kind"] == "file"]
+    assert "file:Specs/datasheet.pdf" in fids
+    assert "file:notes.md" in fids
+    assert not any("build.log" in f or "main.c" in f for f in fids)
+    pdf = nodes["file:Specs/datasheet.pdf"]
+    assert pdf["meta"]["ext"] == "pdf"
+    assert pdf["meta"]["folder"] == "Specs"
+    assert pdf["meta"]["size_bytes"] > 0
+    assert "text_preview" not in pdf["meta"]  # office_content default off
+    # every node carries its owning project root
+    for n in g["nodes"]:
+        assert (n.get("meta") or {}).get("project") == str(project)
+    # project CONTAINS file nodes
+    assert any(e["src"] == "project:root"
+               and e["dst"] == "file:notes.md" and e["kind"] == "CONTAINS"
+               for e in g["edges"])
+
+
+def test_file_node_cap(project: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(cad_graph, "MAX_FILE_NODES", 2)
+    for i in range(5):
+        (project / f"f{i}.md").write_text(f"# {i}\n")
+    g = cad_graph.build_graph(project, force=True)
+    files = [n for n in g["nodes"] if n["kind"] == "file"]
+    assert len(files) == 2
+    assert g.get("files_truncated") == 3
+
+
+def test_keyword_overlay_merges(project: Path):
+    from services.plm import keywords as kw
+    (project / "readme.md").write_text("# r\n")
+    r1 = kw.add_keyword(project, "readme.md", "Docs")           # by path
+    r2 = kw.add_keyword(project, "doc:Bracket.step+", "load-bearing",
+                        origin="ai")                            # by node id
+    assert r1["ok"] and r2["ok"]
+    kw.add_keyword(project, "no/such.node", "ghost")            # dropped endpoint
+    g = cad_graph.get_graph(project, force=True)
+    nodes = {n["id"]: n for n in g["nodes"]}
+    assert "kw:docs" in nodes and nodes["kw:docs"]["kind"] == "keyword"
+    assert "kw:load-bearing" in nodes
+    assert "kw:ghost" not in nodes
+    tagged = [(e["src"], e["dst"], e["origin"]) for e in g["edges"]
+              if e["kind"] == "TAGGED"]
+    assert ("kw:docs", "file:readme.md", "manual") in tagged
+    assert ("kw:load-bearing", "doc:Bracket.step+", "ai") in tagged
+    assert nodes["file:readme.md"]["meta"]["keywords"] == ["docs"]
+    assert nodes["doc:Bracket.step+"]["meta"]["keywords"] == ["load-bearing"]
+
+
+def test_office_content_gated_extraction(project: Path):
+    from services.plm import graph_config as gcfg
+    (project / "BRK-0042.pdf").write_bytes(b"%PDF-1.4 fake")
+    (project / "table.csv").write_text("part,qty\nBRK-0042,4\n")
+    # off by default: no preview, no mention edges
+    g = cad_graph.build_graph(project, force=True)
+    csv_node = {n["id"]: n for n in g["nodes"]}["file:table.csv"]
+    assert "text_preview" not in csv_node["meta"]
+    assert not any((e.get("meta") or {}).get("via") == "office_mention"
+                   for e in g["edges"])
+    # on: csv extracts (stdlib), mention edge resolves by part-number stem
+    r = gcfg.set_config(project, office_content=True)
+    assert r["ok"]
+    g = cad_graph.get_graph(project)   # config mtime invalidates cache
+    nodes = {n["id"]: n for n in g["nodes"]}
+    csv_node = nodes["file:table.csv"]
+    assert csv_node["meta"].get("text_preview")
+    assert csv_node["meta"].get("word_count") > 0
+    mentions = [e for e in g["edges"]
+                if (e.get("meta") or {}).get("via") == "office_mention"]
+    assert any(e["src"] == "file:table.csv"
+               and e["dst"] == "file:BRK-0042.pdf"
+               and e["origin"] == "inferred"
+               and e["meta"].get("term") == "brk-0042" for e in mentions)
+
+
+def test_graph_diff(project: Path):
+    g1 = cad_graph.build_graph(project, force=True)
+    (project / "new.md").write_text("# new\n")
+    g2 = cad_graph.build_graph(project, force=True)
+    d = cad_graph.graph_diff(g1, g2)
+    added = {n["id"] for n in d["nodes_added"]}
+    removed = {n["id"] for n in d["nodes_removed"]}
+    assert added == {"file:new.md"}
+    assert removed == set()
+    assert any(e["dst"] == "file:new.md" for e in d["edges_added"])
+    d_same = cad_graph.graph_diff(g2, g2)
+    assert not d_same["nodes_added"] and not d_same["edges_added"]
+
+
+def test_search_and_neighbors(project: Path):
+    from services.plm import keywords as kw
+    kw.add_keyword(project, "doc:Plate.step+", "sheet-metal")
+    g = cad_graph.get_graph(project, force=True)
+    s = cad_graph.search_graph(g, q="plate")
+    assert any(n["id"] == "doc:Plate.step+" for n in s["nodes"])
+    s2 = cad_graph.search_graph(g, kinds=["part"], keyword="sheet-metal")
+    assert [n["id"] for n in s2["nodes"]] == ["doc:Plate.step+"]
+    s3 = cad_graph.search_graph(g, q="zzz-no-hit")
+    assert s3["nodes"] == [] and s3["edges"] == []
+    nb = cad_graph.neighbors(g, "doc:Plate.step+", depth=1)
+    assert nb["ok"] and any(n["id"] == "kw:sheet-metal" for n in nb["nodes"])
+    missing = cad_graph.neighbors(g, "doc:nope", depth=1)
+    assert missing["ok"] is False and missing["reason"] == "not_found"
+
+
+def test_cross_project_merge(tmp_path: Path):
+    from services.plm import graph_config as gcfg
+    from services.plm import keywords as kw
+    pa = tmp_path / "projA"
+    pb = tmp_path / "projB"
+    pa.mkdir()
+    pb.mkdir()
+    _write(pa, "Bracket.step+", _part_a())
+    _write(pb, "Other.step+", _part_b())
+    r = gcfg.add_linked_project(pa, str(pb))
+    assert r["ok"]
+    kw.add_keyword(pa, "doc:Bracket.step+", "shared-tag")
+    kw.add_keyword(pb, "doc:Other.step+", "shared-tag")
+    g = cad_graph.get_graph(pa, linked=True)
+    assert g["ok"]
+    assert g.get("linked_projects") == [str(pb)]
+    nodes = {n["id"]: n for n in g["nodes"]}
+    # shared keyword merges into ONE node spanning both projects
+    assert "kw:shared-tag" in nodes
+    tagged = [(e["src"], e["dst"]) for e in g["edges"] if e["kind"] == "TAGGED"]
+    assert ("kw:shared-tag", "doc:Bracket.step+") in tagged
+    assert ("kw:shared-tag", "doc:Other.step+") in tagged
+    # colliding project node from projB got prefixed
+    bkey = gcfg.project_key(pb)
+    assert f"{bkey}/project:root" in nodes
+    projs = {(n.get("meta") or {}).get("project") for n in g["nodes"]}
+    assert projs == {str(pa), str(pb)}
+    # single-project graph unchanged (no linked key, no merged nodes)
+    g_single = cad_graph.get_graph(pa)
+    assert "linked_projects" not in g_single
+    assert not any(n["id"].startswith(f"{bkey}/") for n in g_single["nodes"])
+
+
+def test_qualified_overlay_link_resolves(tmp_path: Path):
+    from services.plm import graph_config as gcfg
+    from services.plm import graph_links as gl
+    pa = tmp_path / "projA"
+    pb = tmp_path / "projB"
+    pa.mkdir()
+    pb.mkdir()
+    _write(pa, "Bracket.step+", _part_a())
+    _write(pb, "Other.step+", _part_b())
+    gcfg.add_linked_project(pa, str(pb))
+    bkey = gcfg.project_key(pb)
+    r = gl.add_link(pa, "doc:Bracket.step+", f"{bkey}/doc:Other.step+",
+                    "REFERENCES", note="cross-project fit", origin="ai")
+    assert r["ok"]
+    # invisible in the single-project graph (endpoint not local)
+    g_single = cad_graph.get_graph(pa)
+    assert not any((e.get("meta") or {}).get("note") == "cross-project fit"
+                   for e in g_single["edges"])
+    # resolved in the merged graph
+    g = cad_graph.get_graph(pa, linked=True)
+    cross = [e for e in g["edges"]
+             if (e.get("meta") or {}).get("note") == "cross-project fit"]
+    assert len(cross) == 1
+    assert cross[0]["src"] == "doc:Bracket.step+"
+    assert cross[0]["dst"] == "doc:Other.step+"
+    assert cross[0]["origin"] == "ai"
+
+
+def test_invalidate_keeps_prev_baseline(project: Path):
+    g1 = cad_graph.get_graph(project)  # warm cache
+    assert cad_graph.load_cached_graph(project) is not None
+    cad_graph.invalidate_cache(project)
+    prev = project / ".plm" / "graph.prev.json"
+    assert prev.is_file()
+    assert not (project / ".plm" / "graph.json").exists()
+    old = cad_graph.load_cached_graph(project)
+    assert old is not None
+    assert len(old.get("nodes") or []) == len(g1["nodes"])
+    (project / "delta.md").write_text("# d\n")
+    g2 = cad_graph.get_graph(project, force=True)
+    d = cad_graph.graph_diff(old, g2)
+    assert "file:delta.md" in {n["id"] for n in d["nodes_added"]}

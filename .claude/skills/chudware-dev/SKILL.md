@@ -1,9 +1,9 @@
 ---
 name: chudware-dev
-description: Generalist skill for ANY change to the Chudware program (formerly Billet / AI-CAD) in this repo — engine/kernel work, agent loop, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator, which this skill points to). Carries the verified repo map, build/test commands, git workflow, and Hunter's working preferences, so read this before searching the repo or asking basics.
+description: Generalist skill for ANY change to the Chudware program in this repo — engine/kernel work, agent loop, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator, which this skill points to). Carries the verified repo map, build/test commands, git workflow, and Hunter's working preferences, so read this before searching the repo or asking basics.
 ---
 
-# Chudware Generalist Dev (formerly Billet / AI-CAD)
+# Chudware Generalist Dev
 
 How to work in this repo, regardless of which part you're changing. GUI-heavy batches:
 hand off to `.claude/skills/gui-orchestrator/SKILL.md` (it has the panel-level map and
@@ -39,8 +39,7 @@ The repo has a knowledge graph at `graphify-out/` (skill: `.claude/skills/graphi
 ## Repo map (verified against master, 2026-07-10)
 
 ⚠️ **AGENTS.md is stale on GUI ownership** — it claims `host/` was deleted (T-G11) and
-`ui/imgui/` is the GUI. That was **reverted**: `build.sh` is authoritative — "the ui/imgui /
-ui/abstract (AI-CAD2) app is retired; host/ is the single cross-platform GUI target."
+`ui/imgui/` is the GUI. That was **reverted**: `build.sh` is authoritative — "the legacy `ui/imgui` / `ui/abstract` shells are retired; host/ is the single cross-platform GUI target."
 Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they conflict.
 
 | Dir | What it is |
@@ -64,7 +63,6 @@ Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they co
 | `scratch/` | Throwaway output — never commit anything load-bearing here |
 
 Env/naming compat: `CHUDWARE_*` env vars canonical, `CHUDWARE_*` honored; MCP id `chudware`
-with `ai-cad` preserved.
 
 ## Commands
 

@@ -38,7 +38,14 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
   function behind the `cad_guide` tool; topics: overview, simulation, review, intake, gsl,
   cam, narration, parts, reverse, deliverables, requirements, dag, verify, interaction,
   sourcing, cost, spec, piping, hydraulic, firmware, structural, regen, code_compliance,
-  serving, design_review, doc_diff, plm (stub), + per-feature cheatsheets.
+  serving, design_review, doc_diff, plm, + per-feature cheatsheets.
+- services/mcp/graph_tools.py `register_graph_tools(mcp)` — PLM project graph:
+  cad_graph (get/blast/path/tree), cad_graph_link (+ cross-project qualified
+  `<project_key>/<node_id>` endpoints), assembly_plan_review, and the plm_graph_* web
+  family: plm_graph_keyword / search / neighbors / links / watch / changes / configure /
+  suggest / brief over `file` + `keyword` nodes and TAGGED edges (contracts/cad_graph.md
+  2026-07-27 addendum: keyword overlay, watch overlay, graph_config with office_content
+  extraction + linked_projects cross-project merge).
 - services/mcp/gsl_tools.py:1221 `register_gsl_tools(mcp)` — compact geometry read:
   describe_part, query_adjacency, hover, describe_sketch, describe_scene,
   describe_toolpaths, describe_results, describe_assembly, describe_board, describe_project.
@@ -129,6 +136,10 @@ into the C++ engine through `core_bridge.call()` — a ctypes wrapper over the n
 `chudware_call(method, params_json)` C-ABI entry. The tool_registry `view()` wrapper stamps
 each registration with a `{family, risk}` tag and enforces a per-context allow-list at
 dispatch. Default policy = everything allowed; DAG nodes + env can restrict it.
+`tool_registry.warm_catalog()` imports server.py for its module-level registrations AND
+registers the lazily-activated `org` family (channel_send / request_raise / request_resolve /
+council_convene — production registration happens in reviewer_exec / corporate mode), so
+`family:org` resolution and the Settings → AI → Tools panel see it unconditionally.
 
 Python engine_oracle modules (worker.py, kernel.py, formats.py) are called in-process by
 MCP tools, NOT through the worker socket. ECAD is pure Python until 3D (board_to_step).

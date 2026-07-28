@@ -3111,14 +3111,19 @@ static void drawAiVcChatRewind(AppState& st, int msgIdx) {
                                         : aiVcRewindTip(cpState));
 }
 
-// Hover actions on a mutating assistant turn: restore before / after this step.
-// Non-mutating finished turns (turnNum <= 0) instead get the always-visible chat-only
-// rewind above — revert is offered at ANY point in the chat, and the wording never
-// implies geometry was restored when no checkpoint exists for that point.
+// Restore actions for an assistant turn. Drawn as a BOTTOM action row under the turn
+// (alwaysShow=true), mirroring the user bubble's own meta bar so both sides of the chat
+// offer revert in the same place — it used to sit in the header beside the model name,
+// where it read as part of the author label and was hover-gated.
+// Non-mutating finished turns (turnNum <= 0) get the always-visible chat-only rewind —
+// revert is offered at ANY point in the chat, and the wording never implies geometry was
+// restored when no checkpoint exists for that point.
 // Glyph language (◁◁) for Before; text "After" kept. Inline confirm = click again.
 // When call granularity is present, Before uses call:<turn>:<i> for the first tool of the turn
 // if known; otherwise degrades to turn-level "turn:N-1" / "turn:N".
-void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
+// alwaysShow=false keeps the legacy hover-latched behavior for any caller that still anchors
+// the row on a preceding label item.
+void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum, bool alwaysShow) {
     if (!s_aiVc.available || s_aiVc.busy) return;
     if (turnNum <= 0) { drawAiVcChatRewind(st, msgIdx); return; }
     const float sc = ui::uiScale;
@@ -3130,17 +3135,25 @@ void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
     }
     const bool pending = (s_aiVc.confirmMsgIdx == msgIdx);
 
-    // Latch hover for a short window so the user can move from the "Assistant"
-    // label onto the Before/After buttons without them vanishing mid-flight.
+    // Hover latch only matters when the row hangs off a preceding label item. In the
+    // bottom action row there is nothing to hover-latch on, so the buttons are simply
+    // always visible — same as the user bubble's rewind/edit pair.
     static int    s_hovMsg = -1;
     static double s_hovUntil = 0.0;
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlapped)) {
-        s_hovMsg = msgIdx;
-        s_hovUntil = now + 0.6;
+    if (!alwaysShow) {
+        // Latch hover for a short window so the user can move from the "Assistant"
+        // label onto the Before/After buttons without them vanishing mid-flight.
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlapped)) {
+            s_hovMsg = msgIdx;
+            s_hovUntil = now + 0.6;
+        }
+        const bool latched = (s_hovMsg == msgIdx && now <= s_hovUntil);
+        if (!(pending || latched)) return;
+    } else {
+        // Anchor item so the first glyphBtn's SameLine has something to sit beside
+        // (it also supplies the row's small left inset).
+        ImGui::Dummy(ImVec2(0.0f, 0.0f));
     }
-    const bool latched = (s_hovMsg == msgIdx && now <= s_hovUntil);
-    const bool show = pending || latched;
-    if (!show) return;
 
     auto glyphBtn = [&](int kind, const char* tip) {
         ImGui::SameLine(0, 6.0f * sc);

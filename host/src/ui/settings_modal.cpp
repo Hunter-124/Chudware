@@ -6606,6 +6606,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText("API providers, sign-in, and model routing. Credentials are stored by "
                         "the auth bridge \xe2\x80\x94 never written to config.json.");
                 drawOmpProviderManager(st);
+                settingsGlassSectionBegin("##prov_freeai", "Free AI (FreeLLMAPI)");
+                if (ui::drawFreeAiProviderCard(st)) saveSettings(st.settings);
+                settingsGlassSectionEnd();
                 if (!s_omp.available) {
                     // Degrade path: the agent_provider_* C-ABI is absent in this build
                     // (sibling slice mid-flight / older core) — keep the legacy sections so

@@ -1453,10 +1453,12 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             {"auto_source", "live+heuristic"}};
             };
 
-            if (provider == "openai" || provider == "llamacpp" || provider == "xai") {
+            if (provider == "openai" || provider == "llamacpp" || provider == "xai" ||
+                provider == "freellmapi") {
                 std::string root = chudware::agent::openai_normalize_base_url(base_url);
                 if (root.empty()) {
                     if (provider == "xai") root = "https://api.x.ai/v1";
+                    else if (provider == "freellmapi") root = "http://localhost:3001/v1";
                     else root = "https://api.openai.com/v1";
                 }
                 std::vector<std::pair<std::string, std::string>> hdrs;
@@ -1546,6 +1548,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 // absence of this endpoint just means "treat all listed as available".
                 // Skip LM Studio probe for cloud xAI / openai.com roots.
                 bool tryLmStudio = !base_url.empty() && provider != "xai" &&
+                                   provider != "freellmapi" &&
                                    root.find("api.openai.com") == std::string::npos &&
                                    root.find("api.x.ai") == std::string::npos;
                 if (tryLmStudio) {

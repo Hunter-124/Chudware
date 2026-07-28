@@ -30,6 +30,8 @@ int default_context_window(const std::string& name) {
     if (name == "anthropic" || name == "anthropic-sub") return 200000;
     if (name == "gemini") return 1048576;
     if (name == "openai" || name == "xai" || name == "xai-sub") return 128000;
+    if (name == "freellmapi") return 128000;  // FreeLLMAPI aggregates many free-tier models;
+                                              // 128k is a safe generic default (user overridable)
     if (name == "moonshot") return 1048576;  // Kimi K3 1M window (kimi-k3-256k caps via cfg)
     return 8192;  // local / unknown — conservative
 }
@@ -300,6 +302,10 @@ bool provider_offline_safe(const json& provider) {
     if (name == "xai" || name == "xai-sub" || name == "cursor" || name == "cursor-sub" ||
         name == "moonshot")
         return false;
+    // FreeLLMAPI proxies to real cloud providers over the internet even though its default
+    // endpoint is a LOCAL router (http://localhost:3001/v1) — never treat it as loopback-safe
+    // regardless of the configured base_url.
+    if (name == "freellmapi") return false;
     std::optional<std::string> base_url;
     if (provider.contains("base_url") && provider["base_url"].is_string())
         base_url = provider["base_url"].get<std::string>();
@@ -346,7 +352,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
     // Offline refusals BEFORE constructing anything (security-critical path).
     if (offline && (name == "gemini" || name == "xai" || name == "xai-sub" ||
                     name == "anthropic-sub" || name == "cursor" || name == "cursor-sub" ||
-                    name == "moonshot"))
+                    name == "moonshot" || name == "freellmapi"))
         return refusal(
             std::string("offline mode is enabled (config '") + kOfflineSetting +
             "': true): the cloud provider '" + name +
@@ -432,6 +438,34 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
             {"api_key", py_or(py_or(cfg_str(cfg, "api_key"),
                                     env_get(env, "OPENAI_API_KEY").value_or("")),
                               "lm-studio")},
+        };
+    } else if (name == "freellmapi") {
+        // FreeLLMAPI (github.com/tashfeenahmed/freellmapi) — a self-hosted OpenAI-compatible
+        // router that stacks free tiers from ~28 cloud providers behind one endpoint + one
+        // "unified" key. Own config namespace ("freellmapi", not "openai") so it never shares
+        // state with a genuine local OpenAI-compatible server, and so provider_offline_safe's
+        // hard "always cloud" rule above can key off the NAME alone. Default endpoint is the
+        // desktop app / `install.sh` default (http://localhost:3001/v1); "auto" lets the
+        // router's own model picker choose the best available free model per request.
+        std::optional<std::string> fla_base;
+        if (cfg.contains("freellmapi") && cfg["freellmapi"].is_object() &&
+            cfg["freellmapi"].contains("base_url") && cfg["freellmapi"]["base_url"].is_string())
+            fla_base = cfg["freellmapi"]["base_url"].get<std::string>();
+        bool fla_vision = true;
+        if (cfg.contains("freellmapi") && cfg["freellmapi"].is_object() &&
+            cfg["freellmapi"].contains("vision") && cfg["freellmapi"]["vision"].is_boolean())
+            fla_vision = cfg["freellmapi"]["vision"].get<bool>();
+        std::optional<std::string> fla_key;
+        if (cfg.contains("freellmapi") && cfg["freellmapi"].is_object() &&
+            cfg["freellmapi"].contains("api_key") && cfg["freellmapi"]["api_key"].is_string())
+            fla_key = cfg["freellmapi"]["api_key"].get<std::string>();
+        if (!fla_key || fla_key->empty()) fla_key = env_get(env, "FREELLMAPI_API_KEY");
+        desc = json{
+            {"name", "freellmapi"},
+            {"model", py_or(cfg_str(cfg, "model"), std::string("auto"))},
+            {"base_url", py_or(fla_base, std::string("http://localhost:3001/v1"))},
+            {"supports_vision", fla_vision},
+            {"api_key", fla_key.value_or("")},
         };
     } else if (name == "mock") {
         desc = json{{"name", "mock"}, {"model", nullptr}, {"base_url", nullptr},

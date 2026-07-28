@@ -52,6 +52,9 @@ const char* listModelsWireProvider(int provider) {
         case ui::PROV_CLOUDCOMPAT: return "openai";    // OpenAI-compatible API + a cloud base_url
         case ui::PROV_LOCAL:       return "openai";    // local OpenAI-compatible server
         case ui::PROV_LLAMACPP:    return "llamacpp";  // served by the PROV_LOCAL probe below
+        case ui::PROV_FREELLMAPI:  return "freellmapi"; // agent_list_models (libchudware.cpp)
+                                                        // has a matching "freellmapi" branch —
+                                                        // GET's the router's live /v1/models.
         default:                   return nullptr;     // PROV_CURSOR / PROV_KIMISUB / PROV_ZENMUX
     }
 }
@@ -134,7 +137,8 @@ void refreshModelAvailability(AppState& st, bool force) {
     // lives in the bridge auth db and the C++ branch resolves it from there.
     if (ui::providerIsCloud(s.provider))
         dispatch(s.provider,
-                 s.provider == ui::PROV_CLOUDCOMPAT ? s.baseUrl : "",
+                 (s.provider == ui::PROV_CLOUDCOMPAT || s.provider == ui::PROV_FREELLMAPI)
+                     ? s.baseUrl : "",
                  providerKeyBuf(s, s.provider), {s.provider});
 
     // (2) The LOCAL endpoint, regardless of which provider is active, so local models always show
@@ -167,6 +171,7 @@ static char* providerKeyBuf(Settings& s, int provider) {
                 return s.moonshotKey;
             return s.cloudKey;  // DashScope / DeepSeek / OpenRouter
         case ui::PROV_XAI: return s.xaiKey;
+        case ui::PROV_FREELLMAPI: return s.freellmapiKey;
         default: return s.apiKey;  // local OpenAI-compatible optional key
     }
 }
@@ -247,6 +252,119 @@ std::vector<ModelInfo> providerPickerModels(AppState& st, int provider) {
     return out;
 }
 
+// Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) provider card — reused from BOTH
+// the classic Settings -> AI provider picker (drawProviderModel, active only) AND the live
+// Settings -> Providers tab (settings_modal.cpp), which is normally driven entirely by the OMP
+// bridge's own catalog and has no row for a provider outside that catalog. Renders differently
+// depending on whether Free AI is the CURRENTLY ACTIVE Settings::provider:
+//   active   — full base_url/model/key editing (s.baseUrl is a SHARED field across every
+//              base_url-keyed provider, so it's only safe to edit while this one owns it).
+//   dormant  — key-only (freellmapiKey is its own dedicated buffer, safe to edit anytime, same
+//              idiom as the "park a Moonshot key without switching" card) + a switch button.
+// Returns true when a field changed (caller saves); the switch button saves immediately, same
+// as every other instant-persist toggle in this modal (theme, units, ...).
+bool drawFreeAiProviderCard(AppState& st) {
+    Settings& s = st.settings;
+    const float S = ui::uiScale;
+    bool changed = false;
+    const bool active = (s.provider == ui::PROV_FREELLMAPI);
+    auto openInBrowser = [](const std::string& url) {
+#if defined(_WIN32)
+        std::system(("start \"\" \"" + url + "\"").c_str());
+#elif defined(__APPLE__)
+        std::system(("open '" + url + "'").c_str());
+#else
+        std::system(("xdg-open '" + url + "' >/dev/null 2>&1 &").c_str());
+#endif
+    };
+    dimText("Aggregates free tiers from ~28 cloud AI providers behind one OpenAI-compatible "
+            "endpoint + one unified key. Runs on YOUR machine (or a box you control) and "
+            "forwards requests to real cloud providers over the internet \xe2\x80\x94 blocked "
+            "in Offline (ITAR) mode regardless of how local its own endpoint looks.");
+    if (active) {
+        ImGui::TextUnformatted("Router endpoint (base URL)");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##flabase", s.baseUrl, sizeof(s.baseUrl))) {
+            changed = true;
+            refreshModelAvailability(st, true);
+        }
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
+        ImGui::TextUnformatted("Not the active chat provider \xe2\x80\x94 park a key below, or "
+                                "switch now.");
+        ImGui::PopStyleColor();
+        if (ImGui::SmallButton("Use Free AI as provider##fla_activate")) {
+            s.provider = ui::PROV_FREELLMAPI;
+            if (!s.baseUrl[0] || std::strstr(s.baseUrl, "1234") || std::strstr(s.baseUrl, "moonshot") ||
+                std::strstr(s.baseUrl, "dashscope") || std::strstr(s.baseUrl, "deepseek") ||
+                std::strstr(s.baseUrl, "openrouter"))
+                std::strncpy(s.baseUrl, "http://localhost:3001/v1", sizeof(s.baseUrl) - 1);
+            if (!s.model[0] || std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
+                std::strstr(s.model, "claude"))
+                std::strncpy(s.model, "auto", sizeof(s.model) - 1);
+            s.vision = true;
+            saveSettings(s);
+            refreshModelAvailability(st, true);
+        }
+    }
+    ImGui::TextUnformatted("Unified API key (from the router's Keys page)");
+    char* key = providerKeyBuf(s, ui::PROV_FREELLMAPI);
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::InputText("##flakey", key, 256, ImGuiInputTextFlags_Password)) {
+        changed = true;
+        if (!active) saveSettings(s);  // dormant slot — persist immediately, like Moonshot's card
+    }
+    bool haveKey = key[0] != '\0';
+    ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? ui::Palette::toU32(ui::palette.statusOk)
+                                                 : ui::Palette::toU32(ui::palette.statusWarn));
+    ImGui::TextUnformatted(haveKey
+        ? (active ? "unified key set \xe2\x80\x94 blocked in Offline mode"
+                  : "key stored \xe2\x80\x94 Free AI is not the active provider")
+        : "no unified key \xe2\x80\x94 install FreeLLMAPI and paste its Keys-page token below");
+    ImGui::PopStyleColor();
+    if (active) {
+        if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
+        const ProviderModels& flapm = st.providerModels[ui::PROV_FREELLMAPI];
+        const char* msg; ImU32 col;
+        if (!flapm.checked) { msg = "checking router\xe2\x80\xa6"; col = ui::Palette::toU32(ui::palette.textDim); }
+        else if (flapm.ok) { msg = "router reachable"; col = ui::Palette::toU32(ui::palette.statusOk); }
+        else { msg = "router unreachable \xe2\x80\x94 install/start it below"; col = ui::Palette::toU32(ui::palette.statusErr); }
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextUnformatted(msg);
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Dummy(ImVec2(0, 8 * S));
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::TextUnformatted("Don't have FreeLLMAPI installed yet?");
+    dimText("One-liner (Docker) sets up ~/freellmapi and starts the router. A native desktop "
+            "tray app (macOS/Windows) is also available from Releases. Either way, open the "
+            "dashboard afterward, add your free provider keys under Keys, then copy the "
+            "unified key back up here.");
+    static const std::string kInstallCmd = "curl -fsSL https://freellmapi.co/install.sh | bash";
+    if (ImGui::SmallButton("Copy install command##fla"))
+        ImGui::SetClipboardText(kInstallCmd.c_str());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kInstallCmd.c_str());
+    ImGui::SameLine(0, 6.0f * S);
+    if (ImGui::SmallButton("Download desktop app##fla"))
+        openInBrowser("https://github.com/tashfeenahmed/freellmapi/releases/latest");
+    ImGui::SameLine(0, 6.0f * S);
+    if (ImGui::SmallButton("Install guide##fla"))
+        openInBrowser("https://github.com/tashfeenahmed/freellmapi#quick-start");
+    ImGui::SameLine(0, 6.0f * S);
+    {
+        std::string dashUrl = (active && s.baseUrl[0]) ? s.baseUrl : "http://localhost:3001/v1";
+        const size_t v1 = dashUrl.rfind("/v1");
+        if (v1 != std::string::npos && v1 == dashUrl.size() - 3) dashUrl.resize(v1);
+        if (ImGui::SmallButton("Open dashboard##fla")) openInBrowser(dashUrl);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Opens %s in your default browser (Keys page has the unified key "
+                              "once the router is running).", dashUrl.c_str());
+    }
+    return changed;
+}
+
 // Shared AI settings, split by section so Settings can glass-group them.
 // ProviderModel = provider + model + auth/status; Generation = effort/tokens/window.
 bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
@@ -306,6 +424,15 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         } else if (s.provider == ui::PROV_ZENMUX) {
             std::strncpy(s.model, "x-ai/grok-4.5-free", sizeof(s.model) - 1);
             s.vision = true;
+        } else if (s.provider == ui::PROV_FREELLMAPI) {
+            if (!s.baseUrl[0] || std::strstr(s.baseUrl, "1234") || std::strstr(s.baseUrl, "moonshot") ||
+                std::strstr(s.baseUrl, "dashscope") || std::strstr(s.baseUrl, "deepseek") ||
+                std::strstr(s.baseUrl, "openrouter"))
+                std::strncpy(s.baseUrl, "http://localhost:3001/v1", sizeof(s.baseUrl) - 1);
+            if (!s.model[0] || std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
+                std::strstr(s.model, "claude"))
+                std::strncpy(s.model, "auto", sizeof(s.model) - 1);
+            s.vision = true;
         }
         // Populate the newly selected provider's list NOW rather than at the next timer tick:
         // force skips that provider's cooldown. Still fully async — no worker call blocks here.
@@ -344,6 +471,58 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         ImGui::TextUnformatted("Model id");
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##cloudmodel", s.model, sizeof(s.model))) changed = true;
+    } else if (s.provider == ui::PROV_FREELLMAPI) {
+        // Free AI (FreeLLMAPI) — the router's live /v1/models is huge and shifts weekly
+        // (339 endpoints across 28 providers), so this mirrors the LOCAL branch below (probed
+        // list + free-text fallback) rather than the fixed static catalog cloud providers use.
+        // A quick-preset row fills the router's own stable virtual "meta" models first.
+        ImGui::TextUnformatted("Quick pick");
+        dimText("\"auto\" lets the router choose the best available free model per request with "
+                "automatic failover \xe2\x80\x94 the recommended default. Or pick a concrete model "
+                "id below once you know which free-tier models you want.");
+        const auto& flap = ui::freellmapiPresets();
+        std::vector<const char*> plabels;
+        plabels.push_back("(choose\xe2\x80\xa6)");
+        for (const auto& p : flap) plabels.push_back(p.label.c_str());
+        int psel = 0;
+        for (int i = 0; i < (int)flap.size(); ++i)
+            if (s.model[0] && flap[i].id == s.model) { psel = i + 1; break; }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##flapreset", &psel, plabels.data(), (int)plabels.size()) &&
+            psel > 0 && psel - 1 < (int)flap.size()) {
+            std::strncpy(s.model, flap[psel - 1].id.c_str(), sizeof(s.model) - 1);
+            s.vision = flap[psel - 1].vision;
+            changed = true;
+        }
+        if (psel > 0 && psel - 1 < (int)flap.size() && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", flap[psel - 1].note.c_str());
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        ImGui::TextUnformatted("Model id");
+        const ProviderModels& flapm = st.providerModels[ui::PROV_FREELLMAPI];
+        if (flapm.ok && !flapm.models.empty()) {
+            std::vector<const char*> ids;
+            for (const auto& id : flapm.models) ids.push_back(id.c_str());
+            int cur = -1;
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (s.model[0] && std::strcmp(ids[i], s.model) == 0) cur = (int)i;
+            std::string customLabel;
+            if (cur < 0) {
+                customLabel = std::string(s.model[0] ? s.model : "(select)") + "  (custom)";
+                ids.push_back(customLabel.c_str());
+                cur = (int)ids.size() - 1;
+            }
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##flapmodel", &cur, ids.data(), (int)ids.size())) {
+                if (cur >= 0 && (size_t)cur < flapm.models.size()) {
+                    std::strncpy(s.model, flapm.models[cur].c_str(), sizeof(s.model) - 1);
+                    changed = true;
+                }
+            }
+            dimText(("live from " + std::string(s.baseUrl) + "/models").c_str());
+        } else {
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("##flapmodeltext", s.model, sizeof(s.model))) changed = true;
+        }
     } else if (cloud) {
         // This provider's LIVE list when its probe answered (newest first — a Claude release
         // that postdates this build shows up at the top with no catalog edit), else the
@@ -495,6 +674,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                 : "optional \xe2\x80\x94 store a key without switching providers");
             ImGui::PopStyleColor();
         }
+    } else if (s.provider == ui::PROV_FREELLMAPI) {
+        if (drawFreeAiProviderCard(st)) changed = true;
     } else if (s.provider == ui::PROV_XAI) {
         // xAI: SuperGrok / X Premium+ device-code OAuth AND/OR classic API key (console.x.ai).
         // Sign-in uses subscription_login{provider:"xai",device:true}; GUI polls subscription_status.

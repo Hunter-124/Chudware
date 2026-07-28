@@ -35,7 +35,15 @@ enum ProviderIndex {
                           // (Settings → Providers sign-in), not a local config.json key. Default
                           // chat/agent provider (owner directive 2026-07-23: free x-ai/grok-4.5-free
                           // tier works out of the box without an xAI sign-in).
-    PROV_COUNT = 10,
+    PROV_FREELLMAPI = 10, // Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) — a
+                          // self-hosted OpenAI-compatible router stacking ~28 providers' free
+                          // tiers behind one endpoint + one unified key. Own native wire
+                          // "freellmapi" (core/agent/providers.cpp + config.cpp) — NOT the
+                          // shared "openai" slot, so it stays correctly cloud-classified
+                          // (offline/ITAR mode refuses it) even though its default endpoint is
+                          // http://localhost:3001/v1 (the router itself runs locally but
+                          // forwards to real cloud model providers over the internet).
+    PROV_COUNT = 11,
 };
 
 struct ModelInfo {
@@ -66,6 +74,7 @@ inline const char* providerLabel(int provider) {
         case PROV_CURSOR: return "Cursor";
         case PROV_KIMISUB: return "Kimi Code (subscription)";
         case PROV_ZENMUX: return "ZenMux";
+        case PROV_FREELLMAPI: return "Free AI (FreeLLMAPI)";
         default: return "?";
     }
 }
@@ -73,7 +82,7 @@ inline const char* providerLabel(int provider) {
 inline bool providerIsCloud(int provider) {
     return provider == PROV_ANTHROPIC || provider == PROV_OPENAI || provider == PROV_GEMINI ||
            provider == PROV_CLOUDCOMPAT || provider == PROV_XAI || provider == PROV_CURSOR ||
-           provider == PROV_KIMISUB || provider == PROV_ZENMUX;
+           provider == PROV_KIMISUB || provider == PROV_ZENMUX || provider == PROV_FREELLMAPI;
 }
 
 // ---- provider/service CATEGORY keys (for Manage-models categories + bulk on/off) ----
@@ -92,6 +101,7 @@ inline const char* providerCatKey(int provider) {
         case PROV_CURSOR: return "cursor";
         case PROV_KIMISUB: return "kimi-code";
         case PROV_ZENMUX: return "zenmux";
+        case PROV_FREELLMAPI: return "freellmapi";
         default: return "other";
     }
 }
@@ -171,6 +181,7 @@ inline const char* categoryLabel(const std::string& key) {
     if (key == "cursor") return "Cursor";
     if (key == "kimi-code") return "Kimi Code (subscription)";
     if (key == "zenmux") return "ZenMux";
+    if (key == "freellmapi") return "Free AI (FreeLLMAPI)";
     return "Cloud API";
 }
 
@@ -267,6 +278,28 @@ inline const std::vector<LocalPreset>& localPresets() {
         {"deepseek-r1-distill-qwen-32b", "DeepSeek-R1 Distill 32B (reasoning)", false,
          "Reasoning model; the Seek-CAD local design loop runs a Q4 of this on a single 24GB GPU.",
          "http://localhost:1234/v1"},
+    };
+    return kPresets;
+}
+
+// Free AI (FreeLLMAPI, PROV_FREELLMAPI) quick-fill presets — the router's own virtual "meta"
+// models (see docs/api.md#auto-routing-strategies upstream): "auto" picks the best available
+// free model per request with automatic failover, "auto:fast"/"auto:smart" bias the same router
+// toward speed or capability, and "fusion" fans a prompt out to a panel of free models in
+// parallel and synthesizes one answer. The 339 concrete provider/model ids behind these are
+// dynamic (freellmapi.co/models) and change weekly, so unlike builtinModels() this is NOT a
+// live-discovered catalog — the model field stays free-text and these are just starting points.
+inline const std::vector<LocalPreset>& freellmapiPresets() {
+    static const std::vector<LocalPreset> kPresets = {
+        {"auto", "Auto (best available, recommended)", true,
+         "Router picks the best free model per request; falls over to the next on 429/5xx.", ""},
+        {"auto:fast", "Auto — fast", false,
+         "Biases routing toward the quickest free model (small/quantized).", ""},
+        {"auto:smart", "Auto — smart", true,
+         "Biases routing toward the most capable free model available right now.", ""},
+        {"fusion", "Fusion (multi-model synthesis)", true,
+         "Fans the prompt to several free models in parallel; a judge model synthesizes one "
+         "answer. Slower and burns more free-tier budget per request.", ""},
     };
     return kPresets;
 }

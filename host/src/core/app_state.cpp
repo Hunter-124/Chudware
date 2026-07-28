@@ -331,6 +331,7 @@ void loadSettings(Settings& s) {
         std::string prov = j.value("provider", "zenmux");
         auto oai = j.value("openai", nlohmann::json::object());
         auto llama = j.value("llamacpp", nlohmann::json::object());
+        auto fla = j.value("freellmapi", nlohmann::json::object());
         std::string base = oai.value("base_url", "");
         bool hasBase = !base.empty();
         // A base_url whose host is loopback => a LOCAL endpoint; any other host => a cloud
@@ -350,6 +351,7 @@ void loadSettings(Settings& s) {
         else if (prov == "cursor" || prov == "cursor-sub") s.provider = 7;  // PROV_CURSOR
         else if (prov == "kimi-sub") s.provider = 8;  // PROV_KIMISUB (Kimi Code subscription OAuth)
         else if (prov == "zenmux") s.provider = 9;  // PROV_ZENMUX (OMP bridge — default provider)
+        else if (prov == "freellmapi") s.provider = 10;  // PROV_FREELLMAPI (Free AI, native wire)
         else if (prov == "moonshot") {
             // First-class Moonshot (Kimi) wire provider — GUI still uses the cloud-compat slot
             // (PROV_CLOUDCOMPAT=5) so the model picker / base_url path stays shared.
@@ -366,7 +368,7 @@ void loadSettings(Settings& s) {
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
         if (s.provider == 6 && model.empty()) model = "grok-4.5";
         if (s.provider == 9 && model.empty()) model = "x-ai/grok-4.5-free";
-        if (s.provider == 8 && model.empty()) model = "k3";
+        if (s.provider == 10 && model.empty()) model = fla.value("model", std::string("auto"));
         // Stale GUI ids from prior releases → the wire ids the Kimi Code endpoint now
         // accepts directly (k3 / k3-256k / kimi-for-coding). kimi-k2.7 keeps the user's
         // lighter-model pick; the rest fold onto the K3 default.
@@ -403,6 +405,7 @@ void loadSettings(Settings& s) {
         copyStr(s.cloudKey, sizeof(s.cloudKey), keys.value("cloud_compat", std::string()));
         copyStr(s.moonshotKey, sizeof(s.moonshotKey), keys.value("moonshot", std::string()));
         copyStr(s.xaiKey, sizeof(s.xaiKey), keys.value("xai", std::string()));
+        copyStr(s.freellmapiKey, sizeof(s.freellmapiKey), keys.value("freellmapi", std::string()));
         // Back-compat: fold the active provider's top-level api_key into its per-provider slot.
         if (!activeKey.empty()) {
             if (prov == "gemini" && !s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), activeKey);
@@ -444,6 +447,10 @@ void loadSettings(Settings& s) {
             std::string lbase = llama.value("base_url", "http://127.0.0.1:1234/v1");
             std::strncpy(s.baseUrl, lbase.c_str(), sizeof(s.baseUrl) - 1);
             s.vision = llama.value("vision", false);
+        } else if (s.provider == 10) {
+            std::string flabase = fla.value("base_url", std::string("http://localhost:3001/v1"));
+            std::strncpy(s.baseUrl, flabase.c_str(), sizeof(s.baseUrl) - 1);
+            s.vision = fla.value("vision", true);
         } else if (hasBase) {
             std::strncpy(s.baseUrl, base.c_str(), sizeof(s.baseUrl) - 1);
             s.vision = oai.value("vision", false);
@@ -768,10 +775,10 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // Erase GUI-owned keys that are conditionally emitted below, so stale values never linger
     // after the user clears them or switches provider. Unknown top-level keys survive untouched.
     // "keys" / "experimental" are re-emitted via merge-overlay (not a full replace).
-    for (const char* k : {"provider", "model", "api_key", "openai", "llamacpp", "keys",
-                          "reasoning_effort", "max_iters", "max_output_tokens", "context_window",
-                          "system_prompt", "appearance", "workspace_dir", "hidden_models",
-                          "disabled_providers", "experimental"})
+    for (const char* k : {"provider", "model", "api_key", "openai", "llamacpp", "freellmapi",
+                          "keys", "reasoning_effort", "max_iters", "max_output_tokens",
+                          "context_window", "system_prompt", "appearance", "workspace_dir",
+                          "hidden_models", "disabled_providers", "experimental"})
         j.erase(k);
     if (s.provider == 4) {
         j["provider"] = "gemini";
@@ -837,6 +844,15 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         // 2026-07-23) — free x-ai/grok-4.5-free tier.
         j["provider"] = "zenmux";
         j["model"] = s.model[0] ? s.model : "x-ai/grok-4.5-free";
+    } else if (s.provider == 10) {
+        // Free AI (FreeLLMAPI) — native "freellmapi" wire, own config namespace (never shares
+        // cfg["openai"] with a real local OpenAI-compatible server). Requires the unified key;
+        // core/agent/providers.cpp refuses the call with a clear error when it's empty.
+        j["provider"] = "freellmapi";
+        j["model"] = s.model[0] ? s.model : "auto";
+        j["api_key"] = s.freellmapiKey;
+        j["freellmapi"] = {{"base_url", s.baseUrl[0] ? s.baseUrl : "http://localhost:3001/v1"},
+                           {"vision", s.vision}};
     } else if (s.provider == 3) {
         j["provider"] = "llamacpp";
         j["model"] = "local-gguf";
@@ -867,6 +883,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     keysOut["cloud_compat"] = s.cloudKey;
     keysOut["moonshot"] = s.moonshotKey;
     keysOut["xai"] = s.xaiKey;
+    keysOut["freellmapi"] = s.freellmapiKey;
     j["keys"] = std::move(keysOut);
     // Reasoning effort applies only to reasoning-capable models; resolve_provider passes it
     // through to the provider (gemini thinkingConfig / anthropic effort).

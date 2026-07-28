@@ -166,6 +166,9 @@ static const char* providerWireName(int provider) {
         // ZenMux — OMP-bridge provider id, routed through the bun bridge (core/agent/providers.cpp
         // is_omp_bridge_provider) using its own auth db, not a config.json key. Default provider.
         case ui::PROV_ZENMUX:      return "zenmux";
+        // Free AI (FreeLLMAPI) — native wire "freellmapi" (core/agent/providers.cpp +
+        // config.cpp), own config namespace, always cloud-classified.
+        case ui::PROV_FREELLMAPI:  return "freellmapi";
     }
     return "";
 }
@@ -1923,10 +1926,10 @@ void drawRuntimeBanner(AppState& st) {
 
 // Provider display name — TOOLTIP ONLY; the chip itself never shows it.
 static const char* composerProviderName(int provider) {
-    // Keep in lockstep with ui::ProviderIndex (Anthropic..ZenMux).
+    // Keep in lockstep with ui::ProviderIndex (Anthropic..FreeAI).
     static const char* kProvNames[] = {
         "Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API", "xAI", "Cursor",
-        "Kimi Code", "ZenMux"
+        "Kimi Code", "ZenMux", "Free AI"
     };
     static_assert(sizeof(kProvNames) / sizeof(kProvNames[0]) == ui::PROV_COUNT,
                   "composerProviderName kProvNames must match PROV_COUNT");

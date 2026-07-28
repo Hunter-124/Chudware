@@ -50,6 +50,13 @@ bool drawAiSettingsSection(AppState& state, bool busy, AiSettingsSection section
 // Full form: Provider + Generation. (Single-call convenience; slim is a legacy no-op flag.)
 bool drawProviderModelPicker(AppState& state, bool busy, bool slim = false);
 
+// Free AI (FreeLLMAPI) provider card — always reachable from Settings -> Providers regardless
+// of OMP bridge availability (that tab is otherwise entirely bridge-catalog driven and has no
+// row for a native, non-bridge provider). Renders active-editing or dormant-key-park UI
+// depending on whether Free AI is the current Settings::provider. Returns true if a field
+// changed (dormant-slot edits + the switch button persist immediately either way).
+bool drawFreeAiProviderCard(AppState& state);
+
 // Probe model availability (agent_list_models) into state.providerModels: always the LOCAL
 // endpoint, plus the ACTIVE provider when it is a cloud one (so a newly released cloud model
 // shows up without a catalog edit). Throttled PER PROVIDER; pass force=true to skip the

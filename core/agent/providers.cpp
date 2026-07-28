@@ -1853,16 +1853,17 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         return finish(std::move(res));
     }
 
-    // OpenAI-compatible family: openai / llamacpp / xai / xai-sub / moonshot.
+    // OpenAI-compatible family: openai / llamacpp / xai / xai-sub / moonshot / freellmapi.
     // chudware's Python XAISubProvider posts to /v1/chat/completions with Bearer
     // (OAuth access_token or API key). OAuth tokens arrive already refreshed
     // (auth::ensure_fresh_for_run at resolve time, T-RF4).
     if (provider == "openai" || provider == "llamacpp" || provider == "xai" ||
-        provider == "xai-sub" || provider == "moonshot") {
+        provider == "xai-sub" || provider == "moonshot" || provider == "freellmapi") {
         std::string def = (provider == "llamacpp") ? std::string("local-gguf")
                           : (provider == "xai" || provider == "xai-sub")
                               ? std::string("grok-4.5")
                               : (provider == "moonshot") ? std::string("kimi-k3")
+                              : (provider == "freellmapi") ? std::string("auto")
                                                          : std::string(kOpenAIDefaultModel);
         std::string model = str_or(cfg, "model", def);
         if (model == "grok-4-5") model = "grok-4.5";  // normalize hyphen alias
@@ -1872,6 +1873,8 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             base_url = "https://api.x.ai/v1";
         if (provider == "moonshot" && base_url.empty())
             base_url = "https://api.moonshot.ai/v1";
+        if (provider == "freellmapi" && base_url.empty())
+            base_url = "http://localhost:3001/v1";
         if (api_key.empty() && (provider == "xai" || provider == "xai-sub")) {
             res.error = "xai: missing access_token/api_key (sign in via Settings → Accounts)";
             res.model = model;
@@ -1884,11 +1887,19 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             res.endpoint = base_url.empty() ? "https://api.moonshot.ai/v1" : base_url;
             return finish(std::move(res));
         }
+        if (api_key.empty() && provider == "freellmapi") {
+            res.error = "freellmapi: missing unified API key (Settings → Providers → Free AI — "
+                        "grab it from your FreeLLMAPI dashboard's Keys page)";
+            res.model = model;
+            res.endpoint = base_url.empty() ? "http://localhost:3001/v1" : base_url;
+            return finish(std::move(res));
+        }
         BuiltRequest req = openai_build_request(model, eff_system, eff_messages, max_tokens, base_url);
         const char* err_name =
             (provider == "xai" || provider == "xai-sub")
                 ? (provider == "xai-sub" ? "xai-sub" : "xai")
                 : (provider == "moonshot") ? "moonshot"
+                : (provider == "freellmapi") ? "freellmapi"
                                            : "openai";
         // STREAM the completion: token deltas flow continuously so the idle timeout
         // never kills a long-but-active generation (the old 120s hard-cap death), and

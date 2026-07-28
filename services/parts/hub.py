@@ -95,6 +95,14 @@ class PartsHub:
         from .adapters.ecad_kicad_adapter import EcadKicadAdapter
         # T-FIN17 curated heatsink catalog (thermal metadata for heatsink_select)
         from .adapters.heatsinks_adapter import HeatsinksAdapter
+        # T-PL-motion coverage adapters (stepper motors, belts/pulleys, shaft couplings)
+        from .adapters.stepper_motors_adapter import StepperMotorsAdapter
+        from .adapters.belts_pulleys_adapter import BeltsPulleysAdapter
+        from .adapters.shaft_couplings_adapter import ShaftCouplingsAdapter
+        # T-PL-stock coverage adapters (o-rings, raw stock, aluminum extrusion)
+        from .adapters.orings_adapter import OringsAdapter
+        from .adapters.raw_stock_adapter import RawStockAdapter
+        from .adapters.extrusion_adapter import ExtrusionAdapter
         # Watched local library (vendor_parts index) — indexable STEP/STEP+ files
         from .adapters.local_library_adapter import LocalLibraryAdapter
 
@@ -105,6 +113,12 @@ class PartsHub:
         self.register(HydraulicComponentsAdapter())
         self.register(EcadKicadAdapter())
         self.register(HeatsinksAdapter())
+        self.register(StepperMotorsAdapter())
+        self.register(BeltsPulleysAdapter())
+        self.register(ShaftCouplingsAdapter())
+        self.register(OringsAdapter())
+        self.register(RawStockAdapter())
+        self.register(ExtrusionAdapter())
         self.register(LocalLibraryAdapter())
         self._register_browser_catalog_adapters()
         # Build the index immediately so first search is fast.
@@ -282,13 +296,22 @@ class PartsHub:
         stock it. ``None`` preserves the prior behavior (all matching providers).
 
         Primary: FTS5 index over all indexable providers.
-        Fallback: when the index returns no results AND domain matches a live
-        provider (e.g. a browser catalog adapter), query each
-        live-only provider concurrently under a wall-clock budget
-        (``CHUDWARE_PARTS_LIVE_BUDGET_S``, default a few seconds). Live results
-        carry source:"live" and are NEVER indexed. Timed-out sites surface as
-        notice stubs (no part_id/title) so callers can render honest per-site
-        timeout notices. ``include_live=False`` does ZERO network.
+        Fallback: local hits are checked against ``PartsIndex.term_coverage()``
+        (Contract: cheap, never raises). Local is WEAK when a meaningful
+        fraction of the query's term-groups matched nothing in the corpus, or
+        when the local hit count falls well short of ``limit`` — the proven
+        failure mode where a query like "stepper nema 17" gets zero real
+        matches on "stepper"/"nema" but the lone token "17" coincidentally
+        matches bearing designations, and its BM25 rarity makes those junk
+        rows outrank everything. When local is weak AND ``include_live`` is
+        true, the live vendor fan-out still runs and its results are MERGED
+        with local (never gated behind an early return) — see
+        ``_merge_local_live``. Strong local (full term coverage, plentiful
+        hits) returns immediately with no live probe, matching prior
+        behavior and latency. Live results carry source:"live" and are NEVER
+        indexed. Timed-out sites surface as notice stubs (no part_id/title)
+        so callers can render honest per-site timeout notices.
+        ``include_live=False`` does ZERO network, unconditionally.
 
         A stat-only revalidation runs at most every
         ``CHUDWARE_PARTS_REVALIDATE_S`` seconds (default 20, 0 disables) so a
@@ -299,14 +322,47 @@ class PartsHub:
         self._ensure_index()
         results = self._index.search(query, domain=domain, limit=limit)
         if results:
-            return _dedupe_related(results)
+            results = _dedupe_related(results)
         # Local-first phase: the caller wants only the instant FTS layer and will
         # fan out to live vendors separately (Parts Library streaming search). Skip
         # the synchronous browser fan-out so the local call returns immediately.
         if not include_live:
-            return []
-        return self._search_live(query, domain=domain, filters=filters,
+            return results
+        if not self._local_is_weak(query, results, limit):
+            return results
+        live = self._search_live(query, domain=domain, filters=filters,
                                  limit=limit, sites=sites)
+        if not live:
+            return results
+        return _merge_local_live(results, live, limit)
+
+    def _local_is_weak(self, query: str, results: list[dict], limit: int) -> bool:
+        """Weak-local test gating the live fan-out merge (Contract §Recall).
+
+        Weak when there are no local results at all, or when term coverage is
+        partial — some query term-group matched nothing in the corpus, so the
+        rows we do have were assembled from a subset of what the user asked
+        for and a vendor probably stocks the real thing.
+
+        A FULL-coverage query is never weak, however few rows it returns. An
+        exact designation ("608zz", "as568-014 viton") legitimately matches a
+        handful of parts, and treating a small-but-precise answer as weak used
+        to spend a whole vendor fan-out re-deriving a result already sitting at
+        rank 1. The shortfall rule therefore only applies while coverage is
+        already incomplete. Cheap by contract — never raises, never touches the
+        network.
+        """
+        if not results:
+            return True
+        try:
+            matched, total = self._index.term_coverage(query)
+        except Exception:  # noqa: BLE001 — term_coverage must never gate correctness
+            matched, total = (0, 0)
+        if total > 0:
+            return matched < total
+        # No usable coverage signal (empty query, or an index without the
+        # probe): fall back to the hit-count heuristic.
+        return len(results) < max(1, limit // 2)
 
     def _search_live(self, query: str, *,
                      domain: str | list[str] | None,
@@ -728,6 +784,105 @@ def _dedupe_related(results: list[dict]) -> list[dict]:
             out.append(results[idx])
 
     return out
+
+
+# ── Local/live merge & cross-boundary dedupe (weak-local fan-out) ────────────
+
+def _dedupe_key(rec: dict) -> tuple[str, str] | None:
+    """Identity key for merging the same physical part across local + live.
+
+    Designation is the strongest signal (survives vendor-specific part_ids);
+    falls back to normalised title. Notice stubs (no title/designation) get
+    no key and are therefore never merged away.
+    """
+    desig = _normalise_desig(rec.get("designation"))
+    if desig:
+        return ("d", desig)
+    title = str(rec.get("title") or "").strip().lower()
+    if title:
+        return ("t", title)
+    return None
+
+
+def _record_richness(rec: dict) -> int:
+    """Cheap completeness score used to pick the better of two merged records.
+
+    Never raises: every access is defensive against missing/malformed fields
+    (live vendor rows are less structured than local PartRecords).
+    """
+    score = 0
+    try:
+        if rec.get("geometry_ref"):
+            score += 2
+        if rec.get("standard"):
+            score += 1
+        if rec.get("designation"):
+            score += 1
+        params = rec.get("params")
+        if isinstance(params, dict) and params:
+            score += 1
+        sourcing = rec.get("sourcing")
+        if isinstance(sourcing, list):
+            for row in sourcing:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("unit_price") is not None:
+                    score += 1
+                if row.get("cad_format") or row.get("product_url"):
+                    score += 1
+                if row.get("datasheet_url") or row.get("datasheet"):
+                    score += 1
+        # Vendor-flavored live rows (part_source-style) carry these directly
+        # on the record rather than inside sourcing[].
+        if rec.get("price") is not None or rec.get("unit_price") is not None:
+            score += 1
+        if rec.get("datasheet_url") or rec.get("datasheet"):
+            score += 1
+        if rec.get("cad_url") or rec.get("model_url") or rec.get("step_url"):
+            score += 1
+    except Exception:  # noqa: BLE001 — richness is a tiebreaker, never fatal
+        return score
+    return score
+
+
+def _merge_local_live(local: list[dict], live: list[dict], limit: int) -> list[dict]:
+    """Merge weak local results with the live fan-out, deduping by physical part.
+
+    Local rows are added first (strong local hits stay on top), live rows
+    follow. When the same part appears on both sides, the richer record wins
+    in place — position is NOT reshuffled to "prefer live" or "prefer local",
+    only completeness decides. Notice stubs (timeouts/login-required) are
+    never deduped and always survive to the end of the result, exactly as
+    ``_search_live`` already appends them.
+    """
+    real_live = [r for r in live
+                 if r.get("part_id") and str(r.get("title") or "").strip()]
+    notices = [r for r in live if r not in real_live]
+
+    merged: list[dict] = []
+    seen: dict[tuple[str, str], int] = {}
+
+    def _add(rec: dict) -> None:
+        key = _dedupe_key(rec)
+        if key is None:
+            merged.append(rec)
+            return
+        existing_idx = seen.get(key)
+        if existing_idx is None:
+            seen[key] = len(merged)
+            merged.append(rec)
+            return
+        if _record_richness(rec) > _record_richness(merged[existing_idx]):
+            merged[existing_idx] = rec
+
+    for rec in local:
+        _add(rec)
+    for rec in real_live:
+        _add(rec)
+
+    real_merged = [r for r in merged
+                   if r.get("part_id") and str(r.get("title") or "").strip()][:limit]
+    return real_merged + notices
 
 
 def _is_live_only(provider: object) -> bool:

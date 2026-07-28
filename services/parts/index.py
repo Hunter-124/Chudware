@@ -24,24 +24,29 @@ parts_cache_meta (regular table):
 Ranking (contracts/parts.md §4):
     1. Exact designation match  (+1000)
     2. Standard prefix match    (+100)
-    3. FTS5 BM25 score          (abs(bm25))
+    3. Coverage-aware term-quorum bonus (dominates bm25 magnitude)
+    4. FTS5 BM25 score          (-bm25, small non-zero weight on ``text``)
 """
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
 from typing import Iterator
 
+from services.parts.query_norm import expand_terms, normalize_query
+
 log = logging.getLogger(__name__)
 
 # Bumped by hand whenever the on-disk table layout changes. A snapshot written
 # by a different schema version is discarded rather than migrated.
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 _CREATE_FTS = """
@@ -51,7 +56,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS parts_fts USING fts5(
     title,
     standard,
     designation,
-    text
+    text,
+    prefix='2 3'
 );
 """
 
@@ -297,58 +303,112 @@ class PartsIndex:
             return self._enumerate(domain=None, limit=limit)
 
         conn = self._conn
-        norm_q = query.strip().lower()
+        norm_q = normalize_query(query)
 
-        # Build the FTS query string: quote tokens to prevent FTS5 syntax errors.
-        fts_query = _build_fts_query(query)
+        # Build the coverage-aware, quorum-relaxed match plan: an ordered list
+        # of (match_expression, quorum) tiers, most confident (full term-group
+        # coverage) first. A term-group with zero corpus matches is dropped
+        # from every match expression so a single rare/absent token can never
+        # carry the whole query (see contracts/parts.md §4 accuracy bug).
+        plan = _build_fts_query(query, conn)
+        if not plan:
+            if not query.strip():
+                # Whitespace-only query (with a domain filter) → enumerate,
+                # same as the no-domain-and-no-query case above.
+                return self._enumerate(domain=domains, limit=limit)
+            # Real query terms, but NONE of them match anything in the
+            # corpus: this must be an empty result, not an arbitrary
+            # enumeration of unrelated records (that was the original
+            # accuracy bug's twin — silently substituting junk for "no
+            # match").
+            return []
 
-        # Run the FTS query plus scoring.
         domain_filter = ""
         if domains:
             domain_filter = "AND f.domain IN (%s)" % ",".join("?" * len(domains))
-        params: list = []
 
-        if fts_query:
+        # Best score seen per part_id across tiers. Each tier's SQL score
+        # already embeds a large quorum bonus (quorum * _QUORUM_UNIT) that
+        # dwarfs any plausible bm25 magnitude, so merging by max-score and
+        # sorting once at the end can never place a lower-coverage row above
+        # a higher-coverage one, regardless of bm25.
+        best: dict[str, tuple[float, str]] = {}
+        for match_expr, quorum in plan:
             sql = f"""
             SELECT
                 m.record_json,
-                f.domain,
                 f.part_id,
                 (CASE WHEN lower(f.designation) = ?  THEN 1000 ELSE 0 END
                  + CASE WHEN lower(f.standard)   LIKE ? THEN  100 ELSE 0 END
-                 + abs(bm25(parts_fts, 0, 0, 3, 2, 1, 0))) AS score
+                 + {int(quorum) * _QUORUM_UNIT}
+                 + (-1.0 * bm25(parts_fts, 0, 3, 2, 1, 1))) AS score
             FROM parts_fts f
             JOIN parts_meta m ON f.part_id = m.part_id
             WHERE parts_fts MATCH ? {domain_filter}
             ORDER BY score DESC
             LIMIT ?
             """
-            params = [norm_q, norm_q + "%", fts_query]
+            params: list = [norm_q, norm_q + "%", match_expr]
             if domains:
                 params.extend(domains)
             params.append(limit)
-        else:
-            # Empty query with domain filter → enumerate.
-            return self._enumerate(domain=domains, limit=limit)
-
-        try:
-            rows = conn.execute(sql, params).fetchall()
-        except sqlite3.OperationalError:
-            # FTS query parse error (e.g. empty after quoting) → fall back.
-            return self._enumerate(domain=domains, limit=limit)
-
-        results = []
-        seen: set[str] = set()
-        for row in rows:
-            pid = row["part_id"]
-            if pid in seen:
-                continue
-            seen.add(pid)
             try:
-                results.append(json.loads(row["record_json"]))
+                rows = conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                # Malformed match expression for this tier — skip it, try the
+                # next (looser) tier rather than failing the whole search.
+                continue
+            for row in rows:
+                pid = row["part_id"]
+                score = row["score"]
+                prev = best.get(pid)
+                if prev is None or score > prev[0]:
+                    best[pid] = (score, row["record_json"])
+            if len(best) >= limit:
+                # AND (or the current tier) already yields enough — no need to
+                # relax further.
+                break
+
+        if not best:
+            return self._enumerate(domain=domains, limit=limit)
+
+        ordered = sorted(best.values(), key=lambda t: -t[0])[:limit]
+        results = []
+        for _, record_json in ordered:
+            try:
+                results.append(json.loads(record_json))
             except Exception:  # noqa: BLE001
                 pass
         return results
+
+    def term_coverage(self, query: str) -> tuple[int, int]:
+        """(# query term-groups with >=1 corpus match, total term-groups).
+
+        Cheap: one FTS5 existence probe per group. Never raises; returns
+        ``(0, 0)`` for an empty/unparseable query.
+        """
+        try:
+            groups = expand_terms(query)
+        except Exception:  # noqa: BLE001
+            groups = None
+        if not groups:
+            return (0, 0)
+        matched = 0
+        conn = self._conn
+        for group in groups:
+            clause = _group_match_clause(group)
+            if not clause:
+                continue
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM parts_fts WHERE parts_fts MATCH ? LIMIT 1",
+                    (clause,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            if row is not None:
+                matched += 1
+        return (matched, len(groups))
 
     def _enumerate(self, *, domain: str | list[str] | None, limit: int) -> list[dict]:
         """Return up to limit records, optionally filtered by domain(s)."""
@@ -487,18 +547,132 @@ def _insert_batch(conn: sqlite3.Connection, batch: list[tuple]) -> None:
         )
 
 
-def _build_fts_query(query: str) -> str:
-    """Build a safe FTS5 query from a user query string.
+# Score bonus per satisfied term-group-quorum level. Deliberately far larger
+# than any plausible bm25 magnitude (small corpora, short text fields) so a
+# row's coverage tier always dominates the ranking, never the reverse.
+_QUORUM_UNIT = 1000
 
-    Quotes each token to prevent FTS5 operator injection. Returns empty string
-    if there's nothing to search.
+# Above this many surviving term-groups, exhaustively enumerating every
+# "k of n" combination for quorum relaxation is no longer cheap; fall back to
+# a flat OR of every surviving group as the single relaxed tier instead.
+_MAX_QUORUM_GROUPS = 8
+
+# Only alnum survives into an FTS5 *bare* prefix token (`term*`) — prefix
+# queries cannot be quoted, so this is the injection guard for that path.
+_PREFIX_SAFE_RE = re.compile(r"[^0-9a-z]+")
+
+
+def _quote_fts_token(term: str) -> str:
+    """Quote one literal token as an FTS5 phrase — safe against any operator."""
+    return '"' + term.replace('"', '""') + '"'
+
+
+def _prefix_fts_token(term: str) -> str:
+    """Bare alnum-only prefix token (``term*``), or "" if nothing safe remains."""
+    bare = _PREFIX_SAFE_RE.sub("", term.lower())
+    return bare + "*" if bare else ""
+
+
+def _group_match_clause(group: list[str], *, prefix: bool = False) -> str:
+    """FTS5 match expression for one synonym group: ``("a" OR "b" OR c*)``.
+
+    Every literal variant is quoted (safe against FTS5 operator injection).
+    When ``prefix`` is set, an unquoted alnum-only prefix variant of each
+    term is also OR'd in (FTS5 prefix queries cannot be quoted).
     """
-    tokens = query.strip().split()
-    if not tokens:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for term in group or ():
+        term = (term or "").strip()
+        if not term:
+            continue
+        quoted = _quote_fts_token(term)
+        if quoted not in seen:
+            seen.add(quoted)
+            parts.append(quoted)
+        if prefix:
+            pfx = _prefix_fts_token(term)
+            if pfx and pfx not in seen:
+                seen.add(pfx)
+                parts.append(pfx)
+    if not parts:
         return ""
-    # Use OR to match any token; full phrase also tried via prefix matching.
-    # Quote each token for safety.
-    quoted = ['"' + t.replace('"', '') + '"' for t in tokens if t]
-    if not quoted:
-        return ""
-    return " OR ".join(quoted)
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + " OR ".join(parts) + ")"
+
+
+def _build_fts_query(query: str, conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Build a coverage-aware, quorum-relaxed FTS5 match plan for ``query``.
+
+    Splits the query into synonym term-groups (:func:`expand_terms`) and
+    quotes every literal so no bare operator ever reaches FTS5. A group with
+    ZERO corpus matches is dropped from every match expression it would
+    otherwise appear in — one rare/absent token (e.g. a bearing designation
+    like "17") must never carry an unrelated multi-term query — but it still
+    counts toward the group total (see :meth:`PartsIndex.term_coverage`).
+
+    Returns an ordered list of ``(match_expression, quorum)`` tiers, most
+    confident first:
+      1. AND of every surviving group (full coverage), quorum = group count.
+      2. Progressively relaxed "k of n surviving groups" unions, quorum = k,
+         for decreasing k — a higher-quorum hit is always listed in an
+         earlier tier than a lower-quorum one.
+    Returns ``[]`` when nothing in the query matches anything in the corpus.
+    """
+    try:
+        groups = expand_terms(query)
+    except Exception:  # noqa: BLE001
+        groups = None
+
+    if not groups:
+        tokens = [t for t in (query or "").strip().split() if t]
+        if not tokens:
+            return []
+        groups = [[t] for t in tokens]
+
+    n_groups = len(groups)
+    present: list[str] = []
+    for i, group in enumerate(groups):
+        clause = _group_match_clause(group, prefix=(i == n_groups - 1))
+        if not clause:
+            continue
+        try:
+            hit = conn.execute(
+                "SELECT 1 FROM parts_fts WHERE parts_fts MATCH ? LIMIT 1",
+                (clause,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            hit = None
+        if hit is not None:
+            present.append(clause)
+
+    if not present:
+        return []
+
+    m = len(present)
+    plan: list[tuple[str, int]] = []
+    seen_exprs: set[str] = set()
+
+    def _add(expr: str, quorum: int) -> None:
+        if expr and expr not in seen_exprs:
+            seen_exprs.add(expr)
+            plan.append((expr, quorum))
+
+    # Tier 1: every surviving group required (full coverage).
+    _add(" AND ".join(present), m)
+
+    if m > 1:
+        if m <= _MAX_QUORUM_GROUPS:
+            for k in range(m - 1, 0, -1):
+                combos = [
+                    "(" + " AND ".join(combo) + ")"
+                    for combo in itertools.combinations(present, k)
+                ]
+                _add(" OR ".join(combos), k)
+        else:
+            # Too many groups to enumerate combinations cheaply — the single
+            # relaxed fallback tier is "any surviving group matches".
+            _add(" OR ".join(present), 1)
+
+    return plan

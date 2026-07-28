@@ -86,7 +86,8 @@ enum class CopilotMode : int {
 
 struct Settings {
     int provider = 9;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini
-                       // 5=Cloud OpenAI-compat 6=xAI 7=Cursor 8=Kimi Code 9=ZenMux (OMP bridge).
+                       // 5=Cloud OpenAI-compat 6=xAI 7=Cursor 8=Kimi Code 9=ZenMux (OMP bridge)
+                       // 10=Free AI (FreeLLMAPI, native "freellmapi" wire — always cloud-classified).
                        // Default ZenMux x-ai/grok-4.5-free (owner directive 2026-07-23: xAI/grok-4.5
                        // required an xAI sign-in most installs don't have — every fresh chat opened
                        // to "xAI not configured". ZenMux's free tier works out of the box off a
@@ -103,6 +104,7 @@ struct Settings {
     char cloudKey[256] = "";       // cloud OpenAI-compatible API key (DashScope / DeepSeek / etc.)
     char moonshotKey[256] = "";    // Moonshot (Kimi) API key — keys.moonshot / MOONSHOT_API_KEY
     char xaiKey[256] = "";         // xAI (Grok) API key — console.x.ai; empty when using xai-sub OAuth
+    char freellmapiKey[256] = "";  // Free AI (FreeLLMAPI) unified key — keys.freellmapi
     char reasoningEffort[16] = "high";  // off|low|medium|high — only used by reasoning models
     char baseUrl[256] = "http://localhost:1234/v1";
     bool vision = true;
@@ -1069,6 +1071,15 @@ struct AppState {
     // around the live MCP-handoff refresh (pollAiCadHandoff reopens the mirror on every AI build
     // step) so watching the AI build doesn't spam a toast per step. Cleared right after the open.
     bool handoffQuietOpen = false;
+    // Docs whose mirror tab the user CLOSED by hand this session, keyed by doc id
+    // with the label the tab carried. The agent keeps building them (hostd degrades
+    // a user close on an agent-owned doc to a detach), and every subsequent
+    // doc.changed used to re-reveal the tab the user just dismissed — the close read
+    // as a no-op. Membership suppresses the AUTOMATIC reveal only: the Artifacts
+    // panel lists these under "Open Documents" with a Reopen action, and any
+    // deliberate open clears the entry and restores live geometry updates.
+    std::map<std::string, std::string> dismissedMirrorDocs;
+
 
     // ---- document-tab operations (implemented in core/doc_tabs.cpp via ui/doc_tabs) ----
     // Append a tab for an already-created/opened worker doc and make it active (does NOT touch the

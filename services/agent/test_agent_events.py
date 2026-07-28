@@ -386,6 +386,36 @@ def test_derive_artifacts_keeps_user_file_under_temp_dir(tmp_path):
     assert user_file in [a["path"] for a in arts]
 
 
+def test_derive_artifacts_rejects_render_caption_prose():
+    """A render caption is a SENTENCE, not a path. _scene_caption starts with
+    '/'.join(view_names), so a multi-view render's caption contains a slash — the
+    old "any string with a '/'" rule listed it under 'Produced This Session'
+    (live 2026-07-28)."""
+    caption = ("top/front/right view of a 58x26x4 mm part. front: f12(top), "
+               "f3(side) +2 more. Computed from B-rep normals; occlusion not "
+               "modeled.")
+    assert ae.derive_artifacts([caption]) == []
+    # …and the PNG beside it still survives.
+    arts = ae.derive_artifacts(["/tmp/render_out.png", caption])
+    assert [a["path"] for a in arts] == ["/tmp/render_out.png"]
+
+
+def test_derive_artifacts_reads_pathlike_image_objects(tmp_path):
+    """fastmcp Image.path is a PosixPath, not a str — the old isinstance(str)
+    guard dropped every render artifact on the floor."""
+    from pathlib import Path
+
+    class FakeImage:            # same duck type as mcp.server.fastmcp.Image
+        def __init__(self, p):
+            self.path = Path(p)
+
+    png = str(tmp_path / "view_iso.png")
+    arts = ae.derive_artifacts([FakeImage(png), "a caption"])
+    assert [a["path"] for a in arts] == [png]
+    assert arts[0]["kind"] == "image"
+
+
+
 def test_tool_call_read_tool_yields_no_artifacts(tmp_path):
     """Read tools (fs_read, fs_list, read-like describe_*) must NOT contribute
     artifacts — their results are full of paths they merely touched, which was

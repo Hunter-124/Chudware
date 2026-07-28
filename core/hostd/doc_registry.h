@@ -97,6 +97,13 @@ public:
     // client can't destroy a doc another client is still editing.
     bool hasOtherRwWriter(const std::string& docId, int clientId);
 
+    // True when this doc was MINTED by an agent/mcp client. Ownership, not
+    // attachment: an agent's per-turn worker process comes and goes, so between
+    // turns nobody is attached even though a run still owns the work. The server
+    // uses this (with agentWorkInFlight) to refuse to purge a doc the user closed
+    // from their viewport while the agent is still building it.
+    bool isAgentOrigin(const std::string& docId);
+
     // Client disconnected: drop its attachments/holds/subscriptions and notify
     // remaining subscribers (doc.lease_change). Docs left with NO attached
     // client start the doc-GC grace countdown (CHUDWARE_DOC_GC_GRACE_S, default

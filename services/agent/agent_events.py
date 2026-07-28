@@ -468,25 +468,51 @@ def derive_artifacts(result: Any, *, limit: int = 8) -> list[dict]:
             return "mesh"
         return "file"
 
+    def _looks_like_path(p: str) -> bool:
+        """A filesystem path, not a sentence.
+
+        The old rule accepted ANY string containing a '/', which let a render
+        caption become an artifact row: _scene_caption starts with
+        ``"/".join(view_names)`` so a multi-view render captioned
+        "top/front/right view of a 58x26x4 mm part. front: …" was listed under
+        "Produced This Session" (live 2026-07-28). A path is now recognised by a
+        plausible file EXTENSION (or by existing on disk); anything
+        sentence-shaped must exist to count.
+        """
+        if not p or "\n" in p or len(p) > 1024:
+            return False
+        base = p.replace("\\", "/").rsplit("/", 1)[-1]
+        dot = base.rfind(".")
+        # ".step+" is Chudware's native suffix — strip the '+' before the check.
+        ext = base[dot + 1:].rstrip("+").lower() if 0 < dot < len(base) - 1 else ""
+        if not ext or len(ext) > 8 or not ext.isalnum():
+            # Extensionless deliverables are real but rare — demand proof.
+            return ("/" in p or "\\" in p) and os.path.exists(p)
+        if len(p) > 260 or ". " in p or ", " in p or "; " in p:
+            return os.path.exists(p)   # prose that happens to end word.word
+        return True
+
     def _add(path: Any) -> None:
         if path is None:
             return
+        if isinstance(path, os.PathLike):
+            path = os.fspath(path)
         if not isinstance(path, str):
-            # mcp.server.fastmcp.Image (or any object with a filesystem path)
-            path = getattr(path, "path", None)
-            if not isinstance(path, str):
+            # mcp.server.fastmcp.Image (or any object with a filesystem path;
+            # its .path is a PosixPath, not a str) and the normalised
+            # {"kind": "image", "path": …} dict agent_turn now produces.
+            inner = getattr(path, "path", None)
+            if isinstance(inner, os.PathLike):
+                inner = os.fspath(inner)
+            if not isinstance(inner, str):
                 return
+            path = inner
         p = path.strip()
         if not p or p in seen:
             return
         if _is_internal_scratch(p):
             return
-        # Only treat path-looking strings as artifacts (absolute/relative file paths).
-        if not (p.startswith("/") or p.startswith(".") or (len(p) > 2 and p[1] == ":")
-                or "/" in p or "\\" in p or p.lower().endswith(
-                    (".png", ".jpg", ".jpeg", ".webp", ".stl", ".step", ".stp",
-                     ".step+", ".3mf", ".obj", ".ply", ".iges", ".igs", ".brep",
-                     ".pdf", ".dxf", ".dwg", ".gltf", ".glb"))):
+        if not _looks_like_path(p):
             return
         seen.add(p)
         out.append({"path": p, "kind": _kind_for(p)})

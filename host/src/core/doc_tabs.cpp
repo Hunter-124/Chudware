@@ -131,6 +131,9 @@ int AppState::tabIndexForActiveDoc() const {
 
 void AppState::addDocTab(bool isAssembly) {
     if (!docMirror.hasDoc()) return;
+    // Any deliberate open re-arms automatic reveals for this doc (the hand-close
+    // suppression in openMirrorTab is a dismissal, not a permanent block).
+    dismissedMirrorDocs.erase(docMirror.docId());
     // Multi-document: park the currently-active CAD tab's edit/display state before this new doc
     // becomes active, so switching BACK to it later restores its selection/mask/readouts (its PM /
     // sketch / measure already live on its own DocSession and survive regardless). Save its camera
@@ -659,6 +662,19 @@ void AppState::closeDocTab(int idx, bool detachOnly) {
     // call (cleared next frame).
     if (closing.session) retiredSessions.push_back(closing.session);
 
+    // The daemon answers a close with detached:true when the doc SURVIVED it — another
+    // client is editing it, or (2026-07-28) a live agent run owns it between its
+    // per-turn worker processes. That is the only honest signal that the user's close
+    // dropped a view rather than the document: it keeps the part listed in the
+    // Artifacts panel with a Reopen action, and stops openMirrorTab from re-revealing
+    // the tab on the agent's very next edit. A doc that really closed records nothing.
+    auto noteSurvivingClose = [this](const DocTab& t, const nlohmann::json& res) {
+        if (!res.is_object() || !res.value("detached", false) || t.docId.empty()) return;
+        dismissedMirrorDocs[t.docId] = t.displayTitle();
+        if (res.contains("note"))
+            addLog("[tabs] " + t.docId + ": " + res.value("note", std::string("detached")));
+    };
+
     // Tell the worker to drop the document from its registry. (Best-effort: a failure still removes
     // the host tab so the UI never wedges on a doc the user asked to close.) A Drawing tab lives in
     // the separate drawing registry, so it closes via drawing_close {doc_id: <drawing id>}.
@@ -690,18 +706,23 @@ void AppState::closeDocTab(int idx, bool detachOnly) {
         //  * manual X-click (detachOnly=false): an explicit "I'm done" — doc_discard drops
         //    our view AND, if no other client still holds the doc, closes it for good so a
         //    deliberately-closed part doesn't flood back as unsaved-recovery. If the agent
-        //    is still building it, doc_discard degrades to a plain detach.
+        //    is still building it (another writer, or a live agent run owns the doc between
+        //    its per-turn worker processes), the daemon degrades this to a plain detach and
+        //    says so — the agent's work is independent of the user's viewport.
         if (auto* c = engine::client()) {
             nlohmann::json res;
             std::string err;
             c->call(detachOnly ? "detach_doc" : "doc_discard",
                     {{"doc_id", closing.docId}}, res, err);
+            noteSurvivingClose(closing, res);
         }
     } else {
         nlohmann::json res;
         std::string err;
         if (!worker.call("doc_close", {{"doc_id", closing.docId}}, res, err))
             addLog("[tabs] doc_close failed for " + closing.docId + ": " + err);
+        else
+            noteSurvivingClose(closing, res);
     }
 
     const bool closingActive = (idx == activeTab);

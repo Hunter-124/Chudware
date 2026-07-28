@@ -5090,3 +5090,28 @@ host/src/ui/copilot/{activity_timeline,chat_log,composer,panel}.cpp, copilot.h,
 copilot_internal.h, ui/ai/ai_workspace.cpp, ui/metrics.h. Same commit also lands two
 previously-uncommitted prior-session changes interleaved in those files: the tool-row
 loop-guard refusal chrome (guard vs hard-fail) and the Artifacts panel doc/file dedup.
+
+Agent work is independent of the user's viewport (2026-07-28). Three defects, one theme:
+the agent's session must survive whatever the user does to their tabs. (1) MCP render/eval
+tools return `mcp.server.fastmcp.Image`; that object sat verbatim in
+`turn.result.calls[*].result` and only exploded at the worker RPC boundary
+("Object of type Image is not JSON serializable"), throwing away a finished turn as
+`non_modeling_request`. `agent_turn._json_safe_result()` now normalises at every dispatch
+site to `{kind,path,mime}` (its `.path` is a `PosixPath`, not a `str`), and
+`worker_main._emit` gained a `default=str` backstop. (2) `derive_artifacts` accepted any
+string containing a `/` as a path, so `_scene_caption`'s `"/".join(view_names)` prefix put a
+render CAPTION in the Artifacts panel — path-shape is now decided by a plausible file
+extension (or `os.path.exists`), and prose-shaped strings must exist to count. (3) hostd
+purged a doc the user closed even while an agent run owned it: the live general lane spawns a
+FRESH `python -m services.worker_main` per turn, so between turns no client holds an attach
+and `isReapable()` said yes. `DocRegistry::isAgentOrigin` + `Server::agentWorkInFlight()`
+(any `agent_*` RPC on the wire) now degrade both `doc_close` and `doc_discard` to a detach
+for agent-origin docs; an abandoned doc still purges exactly as before. GUI side:
+`closeDocTab` records docs the daemon reports as merely `detached` into
+`AppState::dismissedMirrorDocs`, `openMirrorTab` refuses to re-reveal them (the agent's next
+edit used to re-open the tab the user just dismissed), and the Artifacts panel lists them
+with a Reopen action. Verified headlessly with an isolated hostd (binary copied to a temp
+path so its instance key differs from the live daemon) driving three clients — agent mints
+then disconnects, a staller holds `agent_test_stall` (env-gated, `agent_`-prefixed so it
+registers in `agentWorkInFlight`), gui closes. Deferred: no hostd ctest harness exists, so
+that guard has no in-tree regression test yet.

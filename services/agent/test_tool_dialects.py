@@ -273,3 +273,40 @@ class TestOpToolMigration:
         from services.agent.agent_turn import _unresolved_tool_error
         assert "delete_feature" in _unresolved_tool_error("delete_feature")["error"]
         assert "add_features" in _unresolved_tool_error("add_feature")["error"]
+
+
+class TestToolResultSerialization:
+    """Live 2026-07-28: a render tool's `[Image, caption]` return sat verbatim in
+    turn.result.calls[*].result and blew up at the worker RPC boundary with
+    "Object of type Image is not JSON serializable" — AFTER all the model's work,
+    surfacing to the user as non_modeling_request. Normalise at dispatch."""
+
+    def test_fastmcp_image_becomes_a_plain_dict(self):
+        import json
+        from pathlib import Path
+        from services.agent.agent_turn import _json_safe_result
+
+        class FakeImage:        # duck type of mcp.server.fastmcp.Image
+            def __init__(self, p):
+                self.path = Path(p)
+                self.data = None
+                self._mime_type = "image/png"
+
+        safe = _json_safe_result([FakeImage("/tmp/x.png"), "caption"])
+        json.dumps(safe)        # must not raise
+        assert safe == [{"kind": "image", "path": "/tmp/x.png",
+                         "mime": "image/png"}, "caption"]
+
+    def test_unknown_object_degrades_to_str_instead_of_raising(self):
+        import json
+        from services.agent.agent_turn import _json_safe_result
+
+        class Weird:
+            pass
+
+        json.dumps(_json_safe_result({"r": Weird()}))
+
+    def test_plain_results_pass_through_untouched(self):
+        from services.agent.agent_turn import _json_safe_result
+        payload = {"ok": True, "doc_id": "d1", "n": [1, 2, 3], "s": None}
+        assert _json_safe_result(payload) == payload

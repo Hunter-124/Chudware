@@ -158,6 +158,13 @@ void openMirrorTab(AppState& st, const std::string& docId, const std::string& na
         pendingOpen.erase(docId);  // a deferred reveal is satisfied — don't retry every frame
         return;
     }
+    // The user closed this mirror by hand. The agent keeps building (hostd degraded
+    // that close to a detach), but re-revealing the tab on its next edit made the
+    // close look broken. Stay closed until the user opens it again from Artifacts.
+    if (st.dismissedMirrorDocs.count(docId)) {
+        pendingOpen.erase(docId);
+        return;
+    }
     if (userMidEdit(st)) {                       // defer the reveal, never disrupt
         // Keep a name we already know if this retry arrived without one.
         if (!name.empty() || !pendingOpen.count(docId)) pendingOpen[docId] = name;

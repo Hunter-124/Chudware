@@ -473,11 +473,14 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0}};
     }
     if (method == "ping") return json{{"ok", true}};
-    // TEST-ONLY (env-gated; "__hostd_test_stall" is never a real client RPC): register an
-    // in-flight engine call and sleep, to exercise the watchdog end-to-end. Returns ok if the
+    // TEST-ONLY (env-gated; neither name is ever a real client RPC): register an
+    // in-flight engine call and sleep, to exercise the watchdog end-to-end.
+    // "agent_test_stall" registers under an agent_* name so agentWorkInFlight() —
+    // and therefore the agent-owned-doc close protection — can be exercised
+    // headlessly without spending a real provider completion. Returns ok if the
     // ceiling exceeds the sleep; otherwise the watchdog restarts the daemon mid-sleep.
     if (const char* sm = std::getenv("CHUDWARE_HOSTD_TEST_STALL_MS");
-        sm && *sm && method == "__hostd_test_stall") {
+        sm && *sm && (method == "__hostd_test_stall" || method == "agent_test_stall")) {
         beginInflight(c.id, method);
         std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, std::atoi(sm))));
         endInflight(c.id);
@@ -581,12 +584,26 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         return json{{"opened", opened}};
     }
 
+    // A user closing a viewport tab must never destroy work an agent run is still
+    // doing. Attachment alone can't decide that: the live general lane spawns a
+    // FRESH `python -m services.worker_main` per turn, so between turns the doc has
+    // NO attached client even though the run owns it — a reapability check in that
+    // window purged the part and killed the session (live 2026-07-28). Ownership
+    // (origin_kind agent|mcp) plus "an agent_* RPC is on the wire" is the real
+    // signal, and it is what both close paths below consult.
+    const bool agentOwnedLive = [&] {
+        if (method != "doc_close" && method != "doc_discard") return false;
+        const std::string docId = params.value("doc_id", std::string());
+        if (docId.empty()) return false;
+        return registry_.isAgentOrigin(docId) && agentWorkInFlight();
+    }();
+
     // Explicit user discard: the caller (GUI closing a tab) drops its attach and,
     // if no other client still holds the doc, we close it WITHOUT retiring it to
     // the orphan tier — a deliberately-closed part must not resurface on the next
-    // launch. If an agent is still building it (another attach remains), this is a
-    // plain detach: the doc lives on for that writer. Contrast doc-GC, which
-    // retires abandoned docs for recovery.
+    // launch. If an agent is still building it (another attach remains, or a run
+    // owns it), this is a plain detach: the doc lives on for that writer. Contrast
+    // doc-GC, which retires abandoned docs for recovery.
     if (method == "doc_discard") {
         const std::string docId = params.value("doc_id", std::string());
         if (docId.empty()) {
@@ -598,26 +615,40 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         registry_.handleMethod(c.id, c.kind, "detach_doc", params, det, de);
         // isReapable == no client still attached: the writer (agent) is gone, so
         // this close is safe and the doc was truly abandoned.
-        const bool discarded =
-            registry_.isReapable(docId) && gcCloseDoc(docId, "discarded");
-        return json{{"ok", true}, {"discarded", discarded}};
+        const bool discarded = !agentOwnedLive && registry_.isReapable(docId) &&
+                               gcCloseDoc(docId, "discarded");
+        json out{{"ok", true}, {"discarded", discarded}};
+        if (agentOwnedLive) {
+            out["detached"] = true;
+            out["note"] = "an agent run still owns this doc; detached instead of "
+                          "discarding (its work continues in the background)";
+            log().line("doc_discard %s refused: agent run still owns it — detached",
+                       docId.c_str());
+        }
+        return out;
     }
 
     // Co-edit protection: a plain doc_close destroys the doc for EVERY client.
     // When another client still holds an rw attach (e.g. the user adopted an AI
     // doc and is editing it, or an agent is still building a doc the user closed),
-    // degrade the close to a detach so one client can't yank the doc out from
-    // under another. Pass {"force": true} to close anyway.
+    // or an agent run owns the doc between turns, degrade the close to a detach so
+    // one client can't yank the doc out from under another. {"force": true} closes
+    // anyway — that is the deliberate escape hatch, not the default.
     if (method == "doc_close" && !params.value("force", false)) {
         const std::string docId = params.value("doc_id", std::string());
-        if (!docId.empty() && registry_.hasOtherRwWriter(docId, c.id)) {
+        if (!docId.empty() && (agentOwnedLive || registry_.hasOtherRwWriter(docId, c.id))) {
             json det;
             bool de = false;
             registry_.handleMethod(c.id, c.kind, "detach_doc", params, det, de);
             return json{{"ok", true},
                         {"detached", true},
-                        {"note", "another client is editing this doc; detached "
-                                 "instead of closing (pass force:true to close anyway)"}};
+                        {"note", agentOwnedLive
+                                     ? "an agent run still owns this doc; detached "
+                                       "instead of closing (its work continues in "
+                                       "the background)"
+                                     : "another client is editing this doc; detached "
+                                       "instead of closing (pass force:true to close "
+                                       "anyway)"}};
         }
     }
 
@@ -768,6 +799,20 @@ void Server::endInflight(int clientId) {
 int Server::engineInflightCount() const {
     std::lock_guard<std::mutex> lk(inflightMtx_);
     return (int)inflight_.size();
+}
+
+// True while ANY client has an agent RPC on the wire (agent_run / agent_run_v2 /
+// agent_admin_turn / agent_step …). The doc a run is building must survive the
+// user closing its viewport tab: the live general lane spawns a FRESH
+// `python -m services.worker_main` per turn, so between turns no client holds an
+// attach and a naive reapability check would happily purge live work.
+bool Server::agentWorkInFlight() const {
+    std::lock_guard<std::mutex> lk(inflightMtx_);
+    for (const auto& [cid, call] : inflight_) {
+        (void)cid;
+        if (call.method.rfind("agent_", 0) == 0) return true;
+    }
+    return false;
 }
 
 // Background watchdog: force-restart the daemon when a tracked engine call blows its tier's

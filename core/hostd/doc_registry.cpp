@@ -718,4 +718,12 @@ bool DocRegistry::hasOtherRwWriter(const std::string& docId, int clientId) {
     return false;
 }
 
+bool DocRegistry::isAgentOrigin(const std::string& docId) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = docs_.find(docId);
+    if (it == docs_.end()) return false;
+    const std::string& k = it->second.originKind;
+    return k == "agent" || k == "mcp";
+}
+
 }  // namespace hostd

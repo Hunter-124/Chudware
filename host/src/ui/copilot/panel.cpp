@@ -21,6 +21,7 @@
 
 #include "copilot_internal.h"
 #include "ui/tesseract.h"  // ui::drawTesseract — the animated 4-cube brand mark in the header
+#include "core/engine_events.h"  // core::mirrorRecoveredDocs — Reopen a dismissed live agent doc
 
 namespace ui {
 
@@ -875,6 +876,22 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
             r.path  = !t.path.empty() ? t.path : st.plmProjectPath();
             r.tooltip = r.path.empty() ? r.label : (r.label + "\n" + r.path);
             r.open  = [&st, ti]() { st.switchToTab(ti); };
+            docRows.push_back(std::move(r));
+        }
+        // Docs the user closed from the viewport while an agent kept building them.
+        // hostd degraded that close to a detach (the work is independent of the
+        // user's tabs), so the part is still live — list it with a Reopen action
+        // instead of letting it vanish from the session's artifacts entirely.
+        for (const auto& [docId, label] : st.dismissedMirrorDocs) {
+            if (docId.empty() || !seenId.insert(docId).second) continue;
+            ArtiDocRow r;
+            r.label = (label.empty() ? docId : label) + "  (closed \xe2\x80\x94 agent may still be building)";
+            r.path.clear();     // no file yet; the only action is to reopen the view
+            r.tooltip = "Reopen the live view of this part";
+            r.open = [&st, docId]() {
+                st.dismissedMirrorDocs.erase(docId);
+                core::mirrorRecoveredDocs(st, {docId});
+            };
             docRows.push_back(std::move(r));
         }
         // Cross-source dedup: seed `seen` with the doc tabs' real file paths so a file

@@ -90,6 +90,11 @@ public:
     // and makes the tray show a permanent "1 in-flight" while any client polls.
     int engineInflightCount() const;
 
+    // True while any client has an agent_* RPC on the wire. Agent-origin docs are
+    // protected from user-initiated purges (doc_close/doc_discard) while this holds,
+    // so an agent's in-flight work is independent of the user's viewport tabs.
+    bool agentWorkInFlight() const;
+
 private:
     void clientLoop(std::shared_ptr<ClientConn> c);
     nlohmann::json dispatch(ClientConn& c, const std::string& method,

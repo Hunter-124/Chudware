@@ -485,6 +485,17 @@ def test_drawing_overhaul_gdt_section_export():
                                          "a": [bb[2], cy], "pos": [bb[2] + 10, cy + 8]})
     assert sf["ok"], sf
 
+    # set_view / set_titleblock must report the RESULTING state, not a bare ok (audit fix).
+    sv, _ = _call("set_view", {"doc_id": dwg, "view_id": base["view_id"], "x": 77.0, "y": 88.0,
+                               "scale": 0.5})
+    assert sv["ok"] and sv["position"] == [77.0, 88.0] and sv["scale"] == 0.5, sv
+
+    tb, _ = _call("set_titleblock", {"doc_id": dwg, "fields": {"rev": "B", "drawn_by": "AI"}})
+    assert tb["ok"] and tb["fields_set"] == ["drawn_by", "rev"], tb
+    assert tb["title_block"]["rev"] == "B" and tb["title_block"]["drawn_by"] == "AI", tb
+    # prior title field (set by make_drawing's title=) must survive — full state, not a diff.
+    assert tb["title_block"].get("title") == "PLATE", tb
+
     ex, _ = _call("export_drawing", {"fmt": "dxf", "doc_id": dwg})
     assert ex["ok"], ex
     assert ex["entities"] > 0

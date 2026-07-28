@@ -8,12 +8,43 @@ loaded (e.g. the C++ core hasn't been built) so it never blocks a Python-only ru
 """
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import json
 import math
 import os
 import sys
 import tempfile
 
+import pytest
+
 from mcp_server import core_bridge as cb
+
+_HERE = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+
+
+def _unshadow_mcp_sdk() -> None:
+    """Repair a pytest package-import collision: this directory has no ``mcp`` subpackage,
+    but under some collection orders ``services.mcp`` still ends up bound at ``sys.modules
+    ["mcp"]`` (same repair as test_cam_audit.py / test_cad_tools.py), which would otherwise
+    break ``from mcp.server.fastmcp import FastMCP`` below."""
+    shadow = sys.modules.get("mcp")
+    sfile = getattr(shadow, "__file__", None)
+    if shadow is None or not sfile or os.path.dirname(os.path.realpath(sfile)) != _HERE:
+        return
+    for p in list(sys.path):
+        init = os.path.join(os.path.abspath(p or os.getcwd()), "mcp", "__init__.py")
+        if os.path.isfile(init) and os.path.dirname(os.path.realpath(init)) != _HERE:
+            spec = importlib.util.spec_from_file_location(
+                "mcp", init, submodule_search_locations=[os.path.dirname(init), _HERE])
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["mcp"] = module
+            spec.loader.exec_module(module)
+            return
+    raise ImportError("could not locate the real `mcp` SDK to un-shadow services/mcp")
+
+
+_unshadow_mcp_sdk()
 
 
 def _build_part_step() -> str:
@@ -389,6 +420,255 @@ def main() -> int:
         return 1
     print("\nALL CAM SMOKE CHECKS PASSED.")
     return 0
+
+
+# --------------------------------------------------------------------------------------- #
+# Semantic write-confirmation tests (fake bridge, no live engine) — cover the mutating
+# cam_* MCP tools whose responses were upgraded from a bare id/tree echo to a dense
+# "changes" summary (+ "job_stats" counts), and cam_save's output-path resolution fix.
+# --------------------------------------------------------------------------------------- #
+def _call_tool(mcp, name, args):
+    async def _run():
+        _c, structured = await mcp.call_tool(name, args)
+        text = structured.get("result") if isinstance(structured, dict) else None
+        return json.loads(text) if isinstance(text, str) else text
+    return asyncio.run(_run())
+
+
+def test_cam_add_tool_changes_field(monkeypatch):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        params = dict(params or {})
+        if method == "cam_apply_ops":
+            tool = params["ops"][0]["tool"]
+            return {"revision": 1, "id_map": {}, "tree": {"tools": [tool], "setups": []}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+
+    mcp = FastMCP("test-cam-add-tool")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_add_tool",
+                      {"number": 3, "type": "drill", "diameter": 5.0, "flutes": 2})
+    assert "tree" not in out, out
+    assert out.get("job_stats") == {"tools": 1, "setups": 0, "operations": 0}, out
+    changes = out.get("changes", "")
+    assert "#3" in changes and "drill" in changes and "5" in changes, changes
+
+
+def test_cam_add_setup_changes_field(monkeypatch):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        params = dict(params or {})
+        if method == "material_cam_id":
+            return {"result": "aluminum"}
+        if method == "cam_apply_ops":
+            setup = dict(params["ops"][0]["setup"])
+            setup["id"] = "su1"
+            setup["operations"] = []
+            return {"revision": 1, "id_map": {"_s": "su1"}, "tree": {"tools": [], "setups": [setup]}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+
+    mcp = FastMCP("test-cam-add-setup-changes")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_add_setup", {"name": "S1", "machine": "mill3", "material": "aluminum"})
+    assert out.get("setup_id") == "su1", out
+    assert "tree" not in out, out
+    assert out.get("job_stats") == {"tools": 0, "setups": 1, "operations": 0}, out
+    changes = out.get("changes", "")
+    assert "S1" in changes and "aluminum" in changes, changes
+
+
+def test_cam_set_stock_changes_field(monkeypatch):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        params = dict(params or {})
+        if method == "cam_apply_ops":
+            stock = params["ops"][0]["stock"]
+            return {"revision": 2, "id_map": {},
+                    "tree": {"tools": [], "setups": [{"id": "su1", "stock": stock, "operations": []}]}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+
+    mcp = FastMCP("test-cam-set-stock")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_set_stock",
+                      {"setup_id": "su1", "stock": {"type": "box", "min": [0, 0, 0], "max": [10, 10, 10]}})
+    changes = out.get("changes", "")
+    assert "su1" in changes and "box" in changes, changes
+
+
+def test_cam_add_operation_changes_field(monkeypatch):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        params = dict(params or {})
+        if method == "cam_apply_ops":
+            op = params["ops"][0]["operation"]
+            return {"revision": 3, "id_map": {"_o": "op1"},
+                    "tree": {"tools": [], "setups": [{"id": "su1", "operations": [op]}]}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+
+    mcp = FastMCP("test-cam-add-operation")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_add_operation",
+                      {"type": "pocket2d", "tool_number": 1, "setup_id": "su1",
+                       "geometry": {"regions": [{"outer": [[0, 0], [10, 0], [10, 10], [0, 10]]}]}})
+    assert out.get("op_id") == "op1", out
+    assert out.get("job_stats") == {"tools": 0, "setups": 1, "operations": 1}, out
+    changes = out.get("changes", "")
+    assert "pocket2d" in changes and "#1" in changes and "regions" in changes, changes
+
+
+def test_cam_update_operation_changes_field(monkeypatch):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        if method == "cam_apply_ops":
+            return {"revision": 4, "id_map": {},
+                    "tree": {"tools": [], "setups": [{"id": "su1", "operations": [{"id": "op1"}]}]}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+
+    mcp = FastMCP("test-cam-update-operation")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_update_operation", {"op_id": "op1", "params": {"stepover": 2, "feed": 900}})
+    assert out.get("changes") == "operation op1 updated: feed, stepover", out
+
+
+def test_cam_remove_operation_changes_field(monkeypatch):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        if method == "cam_apply_ops":
+            return {"revision": 5, "id_map": {}, "tree": {"tools": [], "setups": [{"id": "su1", "operations": []}]}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+
+    mcp = FastMCP("test-cam-remove-operation")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_remove_operation", {"op_id": "op1"})
+    assert out.get("job_stats") == {"tools": 0, "setups": 1, "operations": 0}, out
+    changes = out.get("changes", "")
+    assert "op1" in changes and "removed" in changes and "0 operation" in changes, changes
+
+
+def test_cam_undo_redo_changes_field(monkeypatch):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    state = {"undo_calls": 0}
+
+    def fake_call(method, params=None):
+        if method == "cam_undo":
+            state["undo_calls"] += 1
+            if state["undo_calls"] == 1:
+                return {"revision": 5, "tree": {"tools": [], "setups": []}}
+            return {"revision": 5, "tree": {"tools": [], "setups": []}, "noop": True}
+        if method == "cam_redo":
+            return {"revision": 6, "tree": {"tools": [], "setups": []}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+
+    mcp = FastMCP("test-cam-undo-redo")
+    ct.register_cam_tools(mcp)
+
+    out1 = _call_tool(mcp, "cam_undo", {})
+    assert "tree" not in out1 and out1.get("changes") == "undid last CAM edit -> revision 5", out1
+
+    out2 = _call_tool(mcp, "cam_undo", {})
+    assert out2.get("changes") == "nothing to undo", out2
+
+    out3 = _call_tool(mcp, "cam_redo", {})
+    assert out3.get("changes") == "redid last undone CAM edit -> revision 6", out3
+
+
+def test_cam_save_resolves_path_and_confirms_write(tmp_path, monkeypatch):
+    """T-fix: cam_save must resolve a relative `path` against THIS process's cwd (via
+    _sanitize_output_path — same convention as cad_exchange_tools/cad_drawing_tools),
+    not whatever cwd the engine daemon happens to run under, and the response must
+    prove the file actually landed there (exists + size), not just echo the input."""
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        if method == "cam_save":
+            p = params["path"]
+            assert os.path.isabs(p), f"cam_save must receive an already-resolved abs path, got {p!r}"
+            with open(p, "wb") as f:
+                f.write(b"CAMDATA")
+            return {"path": p}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    monkeypatch.chdir(tmp_path)
+
+    mcp = FastMCP("test-cam-save")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_save", {"path": "job.cam+"})
+    expected = str(tmp_path / "job.cam+")
+    assert out.get("path") == expected, out
+    assert out.get("exists") is True, out
+    assert out.get("size_bytes") == len(b"CAMDATA"), out
+    assert expected in out.get("changes", "") and "7 bytes" in out.get("changes", ""), out
+
+
+def test_cam_open_changes_field(monkeypatch, tmp_path):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        if method == "cam_open":
+            assert os.path.isabs(params["path"]), params["path"]
+            return {"doc_id": "doc-2", "revision": 0,
+                    "tree": {"tools": [{"number": 1}],
+                             "setups": [{"id": "su1", "operations": [{"id": "op1"}]}]}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", None)
+    monkeypatch.chdir(tmp_path)
+
+    mcp = FastMCP("test-cam-open")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_open", {"path": "job.cam+"})
+    assert ct._CAM["doc_id"] == "doc-2", out
+    assert out.get("job_stats") == {"tools": 1, "setups": 1, "operations": 1}, out
+    changes = out.get("changes", "")
+    assert "1 setup" in changes and "1 tool" in changes and "1 operation" in changes, changes
 
 
 if __name__ == "__main__":

@@ -394,6 +394,52 @@ def test_sync_autoroute_zone_flow(tools: dict) -> None:
     print("  [sync_autoroute_zone_flow] PASS")
 
 
+def test_export_fab_outputs(tools: dict) -> None:
+    """ecad_export('gerber'/'drill'/'bom'/'placement') must resolve a relative path against
+    THIS process's cwd, and confirm every written file actually landed on disk with a size
+    (not just echo the intended path back)."""
+    import os
+    import tempfile
+
+    _build_footprinted_divider(tools)
+    _call(tools, "ecad_new_pcb", name="export_board")
+    _call(tools, "ecad_update_from_sch")
+    _call(tools, "ecad_autoroute")
+
+    with tempfile.TemporaryDirectory() as td:
+        rel = os.path.relpath(td, os.getcwd())
+        gb = _call(tools, "ecad_export", kind="gerber", path=rel)
+        _assert_context(gb, "ecad_export(gerber)")
+        assert gb["ok"], f"gerber export failed: {gb.get('error')}"
+        assert gb["dir"] == os.path.abspath(td), \
+            f"relative path must resolve against cwd, got {gb['dir']!r}"
+        assert gb["exists"], "gerber export must confirm files exist on disk"
+        assert gb["total_bytes"] > 0, "gerber export must report nonzero bytes written"
+        assert gb["layer_count"] == len(gb["files"]), "layer_count must match files written"
+        for layer, p in gb["files"].items():
+            assert os.path.isabs(p) and os.path.exists(p), f"gerber layer {layer} not on disk"
+            assert gb["file_bytes"][layer] == os.path.getsize(p)
+        print(f"  export(gerber): {gb['layer_count']} layer(s), {gb['total_bytes']} bytes @ {gb['dir']}")
+
+        bom_path = os.path.join(rel, "out.csv")
+        bm = _call(tools, "ecad_export", kind="bom", path=bom_path)
+        _assert_context(bm, "ecad_export(bom)")
+        assert bm["ok"] and bm["exists"], f"bom export failed: {bm.get('error')}"
+        assert bm["path"] == os.path.abspath(bom_path), \
+            f"bom path must resolve to an absolute path, got {bm['path']!r}"
+        assert bm["bytes"] > 0 and bm["bytes"] == os.path.getsize(bm["path"])
+        print(f"  export(bom): {bm['rows']} row(s), {bm['bytes']} bytes @ {bm['path']}")
+
+        place_path = os.path.join(td, "place.csv")
+        pl = _call(tools, "ecad_export", kind="placement", path=place_path)
+        _assert_context(pl, "ecad_export(placement)")
+        assert pl["ok"] and pl["exists"]
+        assert pl["path"] == os.path.abspath(place_path)
+        assert pl["bytes"] > 0
+        print(f"  export(placement): {pl['rows']} row(s), {pl['bytes']} bytes")
+    print("  [export_fab_outputs] PASS")
+
+
 def test_add_zone_unknown_net(tools: dict) -> None:
     """ecad_add_zone on a net the board does not have yet must guide, not crash."""
     _call(tools, "ecad_new_pcb", name="zone_guard")
@@ -1186,6 +1232,9 @@ def test_fin8_to_3d_boardphys_sidecar(tools: dict) -> None:
     if not r.get("ok") and "still" in str(r.get("error", "")).lower():
         r = _call(tools, "ecad_to_3d", path=out, doc_id=mb["doc_id"])  # kernel warm now
     assert r["ok"], f"ecad_to_3d failed: {r.get('error')!r}"
+    assert r["exists"] and r["bytes"] > 0, \
+        f"ecad_to_3d must confirm the STEP file exists with a size: {r}"
+    assert r["bytes"] == os.path.getsize(r["step_path"]), "reported bytes must match on disk"
     assert r["n_components"] >= 2, f"expected component bodies, got {r['n_components']}"
     sidecar = r.get("boardphys_path")
     assert sidecar and os.path.isfile(sidecar), f"sidecar not written: {sidecar!r}"
@@ -1322,6 +1371,10 @@ def test_fin11_fpga_check_and_constraints(tools: dict) -> None:
         x = _call(tools, "ecad_export", kind="constraints", path=td, doc_id=doc_id)
         _assert_context(x, "ecad_export(constraints)")
         assert x["ok"] and x["kind"] == "constraints", x
+        assert x["exists"] and x["total_bytes"] > 0, \
+            f"constraints export must confirm files exist with sizes: {x}"
+        for f in x["files"]:
+            assert x["file_bytes"][f] == os.path.getsize(f)
         exts = sorted(os.path.splitext(f)[1] for f in x["files"])
         assert exts == [".csv", ".lpf"], f"expected LPF+CSV for a Lattice part, got {exts}"
         csv_file = next(f for f in x["files"] if f.endswith(".csv"))
@@ -1955,6 +2008,7 @@ def _run_all() -> None:
     test_sweep_guard(tools)
     test_pcb_and_drc(tools)
     test_sync_autoroute_zone_flow(tools)
+    test_export_fab_outputs(tools)
     test_add_zone_unknown_net(tools)
     test_export_guard(tools)
     test_ecad_design(tools)

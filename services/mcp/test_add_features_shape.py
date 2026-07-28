@@ -377,6 +377,85 @@ def test_a_fully_canonical_sketch_is_left_alone():
     assert M._normalize_sketch_feature(feat) is feat
 
 
+class TestSketchEntityShorthand:
+    """Flat entity shorthand a model plausibly writes instead of the engine's canonical
+    fields — the live 2026-07-28 payload ({"type":"circle","cx":-23,"cy":0,"r":2.5}, a
+    29-circle keychain-hole lattice) used to SIGSEGV the worker; with the crash fixed it
+    just became a clean "center: required for circle" rejection instead of a build.
+    """
+
+    def _norm(self, entities, notes=None):
+        sink = notes if notes is not None else []
+        out = M._normalize_sketch_feature(
+            {"type": "sketch", "name": "S", "params": {"entities": entities}}, sink)
+        return out["params"]["entities"], sink
+
+    def test_circle_cx_cy_r_becomes_center_and_radius(self):
+        ents, notes = self._norm([{"type": "circle", "cx": -23, "cy": 0, "r": 2.5}])
+        assert ents[0]["center"] == [-23, 0]
+        assert ents[0]["radius"] == 2.5
+        assert "cx" not in ents[0] and "cy" not in ents[0] and "r" not in ents[0]
+        assert any("cx/cy -> center" in n and "r -> radius" in n for n in notes)
+
+    def test_a_diameter_key_is_halved_into_radius(self):
+        for key in ("d", "dia", "diameter"):
+            ents, notes = self._norm([{"type": "circle", "cx": 0, "cy": 0, key: 10}])
+            assert ents[0]["radius"] == 5
+            assert any("halved" in n for n in notes), key
+
+    def test_agreeing_radius_and_diameter_resolve(self):
+        ents, _ = self._norm([{"type": "circle", "cx": 0, "cy": 0, "r": 5, "d": 10}])
+        assert ents[0]["radius"] == 5
+
+    def test_disagreeing_radius_and_diameter_is_left_for_the_engine(self):
+        ents, _ = self._norm([{"type": "circle", "cx": 0, "cy": 0, "r": 5, "d": 999}])
+        assert "radius" not in ents[0]
+        assert ents[0]["r"] == 5 and ents[0]["d"] == 999
+
+    def test_a_lone_cx_with_no_cy_is_not_guessed(self):
+        ents, _ = self._norm([{"type": "circle", "cx": 0, "r": 5}])
+        assert "center" not in ents[0]
+        assert ents[0]["cx"] == 0
+
+    def test_arc_gets_the_same_center_radius_shorthand(self):
+        ents, notes = self._norm([{"type": "arc", "cx": 1, "cy": 2, "r": 3,
+                                   "start": 0, "end": 90}])
+        assert ents[0]["center"] == [1, 2] and ents[0]["radius"] == 3
+        assert ents[0]["ccw"] is True
+
+    def test_ellipse_center_shorthand_leaves_rx_ry_alone(self):
+        ents, _ = self._norm([{"type": "ellipse", "cx": 1, "cy": 1, "rx": 4, "ry": 2,
+                               "rot": 0}])
+        assert ents[0]["center"] == [1, 1]
+        assert ents[0]["rx"] == 4 and ents[0]["ry"] == 2
+
+    def test_line_x1_y1_x2_y2_becomes_p1_p2(self):
+        ents, notes = self._norm([{"type": "line", "x1": 0, "y1": 0, "x2": 10, "y2": 0}])
+        assert ents[0]["p1"] == [0, 0] and ents[0]["p2"] == [10, 0]
+        assert any("x1/y1/x2/y2 -> p1/p2" in n for n in notes)
+
+    def test_point_x_y_becomes_p(self):
+        ents, notes = self._norm([{"type": "point", "x": 3, "y": 4}])
+        assert ents[0]["p"] == [3, 4]
+        assert any("x/y -> p" in n for n in notes)
+
+    def test_29_circles_emit_one_note_not_29(self):
+        entities = [{"type": "circle", "cx": float(i), "cy": 0, "r": 1.0}
+                    for i in range(29)]
+        ents, notes = self._norm(entities)
+        assert len(ents) == 29
+        assert all(e["radius"] == 1.0 and "center" in e for e in ents)
+        shorthand_notes = [n for n in notes if "expanded flat entity shorthand" in n]
+        assert len(shorthand_notes) == 1
+
+    def test_an_already_canonical_circle_is_untouched(self):
+        ents, notes = self._norm([{"type": "circle", "id": "e1", "construction": False,
+                                   "center": [0, 0], "radius": 5}])
+        assert ents == [{"type": "circle", "id": "e1", "construction": False,
+                         "center": [0, 0], "radius": 5}]
+        assert notes == []
+
+
 # --------------------------------------------------------------------- other schema
 
 def test_a_value_wrapper_around_a_coordinate_is_unwrapped():
@@ -1559,3 +1638,239 @@ def test_live_a_pocket_deeper_than_the_stock_is_not_clamped():
          "width": 10, "height": 10, "depth": 200}]))
     assert r["ok"], r
     assert r["changes"]["volume_delta_mm3"] == -(10 * 10 * 20)  # only the stock is there
+
+
+# ------------------------------------------------------- prose EDGE refs (live 2026-07-28)
+
+class TestProseEdgeRefs:
+    """The four-rung rejection ladder a live copilot climbed asking for a fillet on
+    "the vertical edges" of a keychain body — each rejection taught exactly one more
+    validation layer, and the turn died before it reached the top. The engine already
+    resolves the geometry (picks.cpp kQueryGrammar of/side/parallel; parse_axis_vec reads
+    "vertical" as z), so every rung is dialect, not a missing capability."""
+
+    #: The VERBATIM op from the live run.
+    LIVE = {"op": "add_feature", "feature": {
+        "type": "fillet", "name": "CornerRound",
+        "params": {"radius": {"value": 12, "expr": None}},
+        "refs": {"edges": {"query": "the vertical edges"}}}}
+
+    @staticmethod
+    def _refs(refs, ftype="fillet"):
+        notes: list = []
+        out = M._normalize_feature_refs(
+            {"type": ftype, "name": "CornerRound", "refs": refs}, ftype, notes)
+        return out["refs"], notes
+
+    def test_the_live_query_wrapper_becomes_a_vertical_edge_query(self):
+        refs, notes = self._refs(dict(self.LIVE["feature"]["refs"]))
+        assert refs["edges"] == [{"of": "edge", "parallel": "z"}]
+        text = " ".join(notes)
+        assert "the vertical edges" in text and '{"of":"edge","parallel":"z"}' in text
+
+    def test_rung1_a_bare_dict_in_a_list_slot_is_wrapped(self):
+        refs, notes = self._refs({"edges": {"of": "edge", "parallel": "z"}})
+        assert refs["edges"] == [{"of": "edge", "parallel": "z"}]
+        assert any("takes a LIST" in n for n in notes)
+
+    def test_rung2_a_bare_prose_string_becomes_the_query(self):
+        refs, _ = self._refs({"edges": ["the vertical edges"]})
+        assert refs["edges"] == [{"of": "edge", "parallel": "z"}]
+
+    def test_rung3_a_query_wrapper_inside_the_list_becomes_the_query(self):
+        refs, _ = self._refs({"edges": [{"query": "the vertical edges"}]})
+        assert refs["edges"] == [{"of": "edge", "parallel": "z"}]
+
+    def test_rung4_a_query_wrapper_around_a_query_dict_is_unwrapped(self):
+        refs, _ = self._refs({"edges": [{"query": {"of": "edge", "parallel": "z"}}]})
+        assert refs["edges"] == [{"of": "edge", "parallel": "z"}]
+
+    def test_a_side_word_reuses_the_face_side_vocabulary(self):
+        refs, _ = self._refs({"edges": ["the top edges"]})
+        assert refs["edges"] == [{"of": "edge", "side": "top"}]
+
+    def test_all_edges_is_the_unfiltered_query(self):
+        for phrase in ("all edges", "every edge"):
+            refs, _ = self._refs({"edges": [phrase]})
+            assert refs["edges"] == [{"of": "edge"}], phrase
+
+    def test_horizontal_is_two_axes_so_it_is_left_for_the_engine(self):
+        feat = {"type": "fillet", "name": "R", "refs": {"edges": ["the horizontal edges"]}}
+        assert M._normalize_feature_refs(feat, "fillet", []) is feat
+
+    def test_an_unmappable_phrase_is_left_for_the_engine(self):
+        for phrase in ("the weird edges", "the vertical bits"):
+            feat = {"type": "fillet", "name": "R", "refs": {"edges": [phrase]}}
+            assert M._normalize_feature_refs(feat, "fillet", []) is feat, phrase
+
+    def test_an_unmappable_query_wrapper_is_not_silently_dropped(self):
+        refs, _ = self._refs({"edges": [{"query": "the weird edges"}]})
+        assert refs["edges"] == [{"query": "the weird edges"}]
+
+    def test_a_canonical_query_list_passes_through_byte_identical(self):
+        feat = {"type": "fillet", "name": "R",
+                "refs": {"edges": [{"of": "edge", "parallel": "z"}]}}
+        notes: list = []
+        assert M._normalize_feature_refs(feat, "fillet", notes) is feat
+        assert notes == []
+
+    def test_a_face_phrase_works_the_same_way_in_a_face_slot(self):
+        refs, _ = self._refs({"faces": ["the top face"]}, ftype="draft")
+        assert refs["faces"] == [{"of": "face", "side": "top"}]
+
+
+@enginetest
+def test_live_the_vertical_edges_fillet_builds_on_a_real_box():
+    """The verbatim live payload, through the real resolver, against the real kernel."""
+    from services.agent.agent_turn import _bind_tool
+    new_part, add_features = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(new_part(name="keychain_body"))["doc_id"]
+    r0 = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "Body",
+        "params": {"length": 60, "width": 40, "height": 8}}}]))
+    assert r0["ok"], r0
+    r = json.loads(add_features(doc_id=doc, ops=[TestProseEdgeRefs.LIVE]))
+    assert r["ok"], r
+    # A 12mm fillet on the four vertical edges of a 60x40 body removes real material.
+    assert r["changes"]["volume_delta_mm3"] < 0, r["changes"]
+    assert any("the vertical edges" in n for n in r["interpreted"]), r["interpreted"]
+
+
+# ------------------------------------------------------------- ref-resolution geometry hint
+#
+# The live failure this defends against: a fillet on "the vertical edges" was rejected
+# four times and the model never once could SEE what edges the part actually had. A
+# ref-RESOLUTION failure (no such edge/face, a query matching nothing, a prose phrase the
+# normalizer declined to guess at) now carries a real, capped inventory of the document's
+# actual geometry — never a syntax failure, which the C++ validator already teaches.
+
+class TestRefResolutionGeometryHint:
+    def test_ref_failure_kind_reads_edge_resolution_markers(self):
+        assert M._ref_failure_kind("f2 (Round): fillet: edge query matched no edges") == "edge"
+        assert M._ref_failure_kind("hole: query matched no face") == "face"
+        assert M._ref_failure_kind("edges[0]: face selector dangling — unresolved") == "edge"
+
+    def test_ref_failure_kind_is_none_for_a_syntax_rejection(self):
+        # "unknown ref slot" / "must be a non-empty list" are SYNTAX errors the C++
+        # validator already teaches in full — never re-taught here.
+        assert M._ref_failure_kind(
+            "features[0].refs.remove: unknown ref slot for shell") is None
+        assert M._ref_failure_kind(
+            "features[0](f1).refs.edges: must be a non-empty list") is None
+
+    def test_declined_geom_phrases_finds_a_leftover_edge_phrase(self):
+        ops = [{"op": "add_feature", "feature": {
+            "type": "fillet", "name": "R", "refs": {"edges": "horizontal edges"}}}]
+        found = M._declined_geom_phrases(ops)
+        assert found == [("edge", "edges", "horizontal edges")]
+
+    def test_declined_geom_phrases_ignores_already_canonical_refs(self):
+        ops = [{"op": "add_feature", "feature": {
+            "type": "fillet", "name": "R",
+            "refs": {"edges": [{"of": "edge", "parallel": "z"}]}}}]
+        assert M._declined_geom_phrases(ops) == []
+
+    def test_inventory_line_summarizes_and_caps_many_buckets(self, monkeypatch):
+        # 9 distinct surf buckets (well past the cap) + a large axis-aligned bucket, so
+        # both the "roll the tail into N other" AND the "biggest buckets first" behaviour
+        # are exercised — a lattice part's hundreds of edges must summarize, never dump.
+        matches = [{"surf": "line", "axis": [0, 0, 1]} for _ in range(40)]
+        for i, surf in enumerate(["circle", "ellipse", "bspline", "bezier", "offset",
+                                   "hyperbola", "parabola", "other1", "other2"]):
+            matches.append({"surf": surf, "axis": None})
+        monkeypatch.setattr(M.cb, "call",
+                             lambda op, args: {"matches": matches} if op == "doc_query"
+                             else (_ for _ in ()).throw(AssertionError(op)))
+        line = M._geometry_inventory_line("doc-x", "edge")
+        assert line is not None
+        assert "49 edges" in line
+        assert "40 parallel to z (vertical)" in line
+        assert "other edge(s)" in line  # the tail past the cap is rolled up, not enumerated
+        # Bounded — never a per-edge dump.
+        bucket_clause = line.split(" — ")[1]  # "40 parallel to z…, 1 bezier…, 4 other edge(s)"
+        assert len(bucket_clause.split(", ")) <= M._INVENTORY_BUCKET_CAP + 1  # +1 = the roll-up
+
+    def test_inventory_line_reports_empty_body_honestly(self, monkeypatch):
+        monkeypatch.setattr(M.cb, "call", lambda op, args: {"matches": []})
+        line = M._geometry_inventory_line("doc-x", "face")
+        assert "no faces at all" in line
+
+    def test_enrich_only_fires_on_a_failed_dict_result(self):
+        ok_result = {"ok": True}
+        assert M._enrich_ref_resolution_error(ok_result, "doc-x", []) is ok_result
+        assert M._enrich_ref_resolution_error("not a dict", "doc-x", []) == "not a dict"
+
+    def test_enrich_leaves_a_syntax_error_alone_with_no_declined_phrase(self):
+        result = {"ok": False, "error": "features[0].refs.edges: must be a non-empty list"}
+        out = M._enrich_ref_resolution_error(result, "doc-x", [{"op": "add_feature",
+            "feature": {"type": "fillet", "name": "R", "params": {}}}])
+        assert "geometry_hint" not in out
+        assert out == result
+
+
+@enginetest
+def test_live_a_zero_match_edge_query_names_the_real_inventory():
+    """A structured query that matches NOTHING useful (no circular edges on a plain box)
+    now teaches the real edge roster instead of a flat rejection."""
+    from services.agent.agent_turn import _bind_tool
+    new_part, add_features = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(new_part(name="zero_match_edge_query"))["doc_id"]
+    r0 = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "Box1",
+        "params": {"length": 40, "width": 30, "height": 20}}}]))
+    assert r0["ok"], r0
+    r = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "fillet", "name": "CornerRound", "params": {"radius": {"value": 12, "expr": None}},
+        "refs": {"edges": [{"of": "edge", "surf": "circle", "parallel": "z"}]}}}]))
+    assert not r["ok"], r
+    assert "matched no edges" in r["error"]
+    assert "geometry_hint" in r, r
+    assert "12 edges" in r["geometry_hint"]
+    assert "parallel to z" in r["geometry_hint"]
+    print("LIVE zero-match edge query error:", r["error"])
+
+
+@enginetest
+def test_live_horizontal_edges_names_the_candidate_orientations():
+    """"horizontal edges" is genuinely ambiguous (x or y) and the normalizer declines to
+    guess — the resulting rejection now lists the actual candidate orientations so the
+    model can pick one, instead of guessing blind."""
+    from services.agent.agent_turn import _bind_tool
+    new_part, add_features = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(new_part(name="horizontal_edges_ambiguous"))["doc_id"]
+    r0 = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "box", "name": "Box1",
+        "params": {"length": 40, "width": 30, "height": 20}}}]))
+    assert r0["ok"], r0
+    r = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "fillet", "name": "HFillet", "params": {"radius": {"value": 3, "expr": None}},
+        "refs": {"edges": "horizontal edges"}}}]))
+    assert not r["ok"], r
+    assert "geometry_hint" in r, r
+    assert "parallel to x" in r["geometry_hint"]
+    assert "parallel to y" in r["geometry_hint"]
+    print("LIVE horizontal-edges ambiguous error:", r["error"])
+    print("LIVE horizontal-edges geometry_hint:", r["geometry_hint"])
+
+
+@enginetest
+def test_live_the_29_circle_pattern_sketch_builds():
+    """The VERBATIM live payload (2026-07-28): a keychain hole-lattice sketch written
+    entirely in cx/cy/r shorthand. The engine SIGSEGV on this shape is fixed separately;
+    this proves the shape itself now normalizes into a real, buildable sketch."""
+    from services.agent.agent_turn import _bind_tool
+    new_part, add_features = _bind_tool("new_part"), _bind_tool("add_features")
+    doc = json.loads(new_part(name="keychain_pattern"))["doc_id"]
+    entities = [{"type": "circle", "cx": -23 + i * 1.5, "cy": 0, "r": 2.5 - i * 0.01}
+                for i in range(29)]
+    r = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "sketch", "name": "PatternSk",
+        "params": {"plane": "XY", "entities": entities}}}]))
+    assert r["ok"], r
+    assert any("expanded flat entity shorthand" in n for n in r["interpreted"]), r["interpreted"]
+    tree = json.loads(_bind_tool("get_part")(doc_id=doc))
+    sk_ents = tree["tree"]["features"][0]["params"]["entities"]
+    assert len(sk_ents) == 29
+    assert all("center" in e and "radius" in e for e in sk_ents)
+    print("LIVE 29-circle PatternSk interpreted:", r["interpreted"])
+    print("LIVE 29-circle PatternSk changes:", r.get("changes"))

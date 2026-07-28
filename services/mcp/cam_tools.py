@@ -19,7 +19,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import core_bridge as cb
 from .core_bridge import CoreError
-from .cad_common import _wire_materials_registry  # engine-side registry env default
+from .cad_common import _sanitize_output_path, _wire_materials_registry  # engine-side registry env default
 from .cad_tools import _CUR  # the "current part" doc_id (shared with the modeling tools)
 
 # The "current CAM job" so single-argument calls just work.
@@ -66,15 +66,33 @@ def _err(e: Exception) -> str:
     return _dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
+def _job_stats(tree: Optional[dict]) -> Optional[dict]:
+    """Dense counts from a cam_apply_ops/cam_tree ``tree`` blob — tools/setups/operations —
+    so mutating tools can confirm a measurable job size instead of echoing the whole nested
+    tree (which cam_job_tree already exists to fetch on demand)."""
+    if not isinstance(tree, dict):
+        return None
+    setups = tree.get("setups") or []
+    n_ops = sum(len((su or {}).get("operations") or []) for su in setups if isinstance(su, dict))
+    return {"tools": len(tree.get("tools") or []), "setups": len(setups), "operations": n_ops}
+
+
 def _job() -> str:
     d = _CAM["doc_id"]
     if not d:
-        raise ValueError("No CAM job. Call cam_new_job(...) first.")
+        raise ValueError("No current CAM job. Call cam_new_job first.")
     return d
 
 
 def _apply(ops: list) -> dict:
-    return cb.call("cam_apply_ops", {"doc_id": _job(), "base_revision": -1, "ops": ops})
+    """Apply a batch of cam_apply_ops edits and trim the (potentially large) echoed job
+    ``tree`` down to dense ``job_stats`` counts — callers layer a specific ``changes``
+    summary on top of this (see cam_add_tool / cam_add_setup / etc.)."""
+    r = cb.call("cam_apply_ops", {"doc_id": _job(), "base_revision": -1, "ops": ops})
+    stats = _job_stats(r.pop("tree", None))
+    if stats is not None:
+        r["job_stats"] = stats
+    return r
 
 
 def add_tool_from_dict(tool: dict) -> dict:
@@ -96,7 +114,11 @@ def add_tool_from_dict(tool: dict) -> dict:
     if not t.get("name"):
         t["name"] = f"T{number} {t['type']}"
     t["number"] = number
-    return _apply([{"op": "add_tool", "tool": t}])
+    r = _apply([{"op": "add_tool", "tool": t}])
+    stats = r.get("job_stats") or {}
+    r["changes"] = (f"tool #{number} added ({t['type']}, \u2300{t['diameter']:g}mm, "
+                     f"{t['flutes']}fl); library now has {stats.get('tools', '?')} tool(s)")
+    return r
 
 
 def existing_tool_numbers() -> list[int]:
@@ -131,6 +153,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
         try:
             r = cb.call("cam_new", {"name": name, "post": post})
             _CAM["doc_id"] = r.get("doc_id")
+            r["changes"] = f"created CAM job '{name}' (post={post}, doc_id={r.get('doc_id')})"
             return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -148,7 +171,13 @@ def register_cam_tools(mcp: FastMCP) -> None:
     def cam_undo() -> str:
         """Undo the last CAM edit on the active job (ops, tools, setups, stock)."""
         try:
-            return _dumps(cb.call("cam_undo", {"doc_id": _job()}))
+            r = cb.call("cam_undo", {"doc_id": _job()})
+            stats = _job_stats(r.pop("tree", None))
+            if stats is not None:
+                r["job_stats"] = stats
+            r["changes"] = ("nothing to undo" if r.get("noop")
+                             else f"undid last CAM edit -> revision {r.get('revision')}")
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -156,7 +185,13 @@ def register_cam_tools(mcp: FastMCP) -> None:
     def cam_redo() -> str:
         """Redo the last undone CAM edit on the active job."""
         try:
-            return _dumps(cb.call("cam_redo", {"doc_id": _job()}))
+            r = cb.call("cam_redo", {"doc_id": _job()})
+            stats = _job_stats(r.pop("tree", None))
+            if stats is not None:
+                r["job_stats"] = stats
+            r["changes"] = ("nothing to redo" if r.get("noop")
+                             else f"redid last undone CAM edit -> revision {r.get('revision')}")
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -255,6 +290,10 @@ def register_cam_tools(mcp: FastMCP) -> None:
             r["setup_id"] = r.get("id_map", {}).get("_s")
             if note:
                 r["material_note"] = note
+            stats = r.get("job_stats") or {}
+            r["changes"] = (f"setup '{name}' added (machine={mach.get('kind')}, "
+                             f"material={resolved}, stock={st.get('type')}); "
+                             f"job now has {stats.get('setups', '?')} setup(s)")
             return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -266,7 +305,9 @@ def register_cam_tools(mcp: FastMCP) -> None:
         from_sim form: {"type":"from_sim","setup_id":"<id>"} uses the remaining
         stock mesh from a prior cam_simulate of that setup."""
         try:
-            return _dumps(_apply([{"op": "set_stock", "setup_id": setup_id, "stock": stock}]))
+            r = _apply([{"op": "set_stock", "setup_id": setup_id, "stock": stock}])
+            r["changes"] = f"stock on setup {setup_id} set to type={stock.get('type', '?')}"
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -298,6 +339,12 @@ def register_cam_tools(mcp: FastMCP) -> None:
                 o["setup_id"] = setup_id
             r = _apply([o])
             r["op_id"] = r.get("id_map", {}).get("_o")
+            stats = r.get("job_stats") or {}
+            geo_kinds = sorted(k for k in ("regions", "contours", "points", "profile", "mesh")
+                                if geometry and geometry.get(k)) if geometry else []
+            r["changes"] = (f"{type} operation added (tool #{tool_number}"
+                             + (f", geometry={'+'.join(geo_kinds)}" if geo_kinds else "")
+                             + f"); job now has {stats.get('operations', '?')} operation(s)")
             return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -306,7 +353,10 @@ def register_cam_tools(mcp: FastMCP) -> None:
     def cam_update_operation(op_id: str, params: dict) -> str:
         """Update fields on an existing operation (merge). e.g. {"stepover":2,"feed":900}."""
         try:
-            return _dumps(_apply([{"op": "update_operation", "op_id": op_id, "operation": params}]))
+            r = _apply([{"op": "update_operation", "op_id": op_id, "operation": params}])
+            keys = ", ".join(sorted(params.keys())) if params else "(no fields given)"
+            r["changes"] = f"operation {op_id} updated: {keys}"
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -314,7 +364,11 @@ def register_cam_tools(mcp: FastMCP) -> None:
     def cam_remove_operation(op_id: str) -> str:
         """Remove an operation from the active CAM job by *op_id*."""
         try:
-            return _dumps(_apply([{"op": "remove_operation", "op_id": op_id}]))
+            r = _apply([{"op": "remove_operation", "op_id": op_id}])
+            stats = r.get("job_stats") or {}
+            r["changes"] = (f"operation {op_id} removed; job now has "
+                             f"{stats.get('operations', '?')} operation(s)")
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -411,9 +465,21 @@ def register_cam_tools(mcp: FastMCP) -> None:
     # ------------------------------------------------------------------ persistence
     @mcp.tool()
     def cam_save(path: str) -> str:
-        """Save the active CAM job to a .cam+ file at *path*."""
+        """Save the active CAM job to a .cam+ file at *path*. The path is resolved to an
+        absolute path (matching this MCP process's cwd, not the engine daemon's) before the
+        core writes it; the response confirms the resolved path, that the file exists on
+        disk, and its size."""
         try:
-            return _dumps(cb.call("cam_save", {"doc_id": _job(), "path": path}))
+            out_path = _sanitize_output_path(path)
+            r = cb.call("cam_save", {"doc_id": _job(), "path": out_path})
+            exists = os.path.exists(out_path)
+            size = os.path.getsize(out_path) if exists else 0
+            r["path"] = out_path
+            r["exists"] = exists
+            r["size_bytes"] = size
+            r["changes"] = (f"CAM job saved to {out_path} ({size} bytes)" if exists else
+                             f"cam_save reported ok but {out_path} was not found on disk after write")
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -421,8 +487,17 @@ def register_cam_tools(mcp: FastMCP) -> None:
     def cam_open(path: str) -> str:
         """Open a .cam+ file and make it the current job."""
         try:
-            r = cb.call("cam_open", {"path": path})
+            in_path = _sanitize_output_path(path)
+            r = cb.call("cam_open", {"path": in_path})
             _CAM["doc_id"] = r.get("doc_id")
+            stats = _job_stats(r.pop("tree", None))
+            r["path"] = in_path
+            if stats is not None:
+                r["job_stats"] = stats
+                r["changes"] = (f"opened CAM job from {in_path} ({stats['setups']} setup(s), "
+                                 f"{stats['tools']} tool(s), {stats['operations']} operation(s))")
+            else:
+                r["changes"] = f"opened CAM job from {in_path}"
             return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)

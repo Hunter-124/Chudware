@@ -101,6 +101,48 @@ def _xy(v: Any) -> Any:
     return v
 
 
+#: Flat radius-shaped keys a model plausibly writes instead of the canonical `radius`.
+_RADIUS_KEYS = ("r", "radius")
+#: Flat diameter-shaped keys — halved into the canonical radius.
+_DIAMETER_KEYS = ("d", "dia", "diameter")
+
+
+def _flat_point(e: dict, xk: str, yk: str) -> Optional[list]:
+    """[x, y] from two flat numeric keys, or None.
+
+    Only BOTH present resolves it: one flat coordinate with its twin missing is
+    half-specified, not unambiguous, so it is left for the engine's own error.
+    """
+    x, y = e.get(xk), e.get(yk)
+    if isinstance(x, (int, float)) and not isinstance(x, bool) \
+            and isinstance(y, (int, float)) and not isinstance(y, bool):
+        return [x, y]
+    return None
+
+
+def _flat_radius(e: dict) -> tuple[Optional[float], bool]:
+    """(radius, was_diameter) for a circle/arc entity that names its size flat.
+
+    r/radius is the radius itself; d/dia/diameter is a DIAMETER and is halved. Both a
+    radius-shaped and a diameter-shaped key present is only resolved when they agree
+    (r == d/2) — disagreeing values are genuinely ambiguous and left for the engine,
+    never guessed away.
+    """
+    def _num(k: str) -> Optional[float]:
+        v = e.get(k)
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    r_val = next((v for k in _RADIUS_KEYS if (v := _num(k)) is not None), None)
+    d_val = next((v for k in _DIAMETER_KEYS if (v := _num(k)) is not None), None)
+    if r_val is not None and d_val is not None:
+        return (r_val, False) if abs(r_val * 2 - d_val) < 1e-9 else (None, False)
+    if r_val is not None:
+        return r_val, False
+    if d_val is not None:
+        return d_val / 2.0, True
+    return None, False
+
+
 def _norm_datum(v: Any) -> Optional[str]:
     """A plane/axis word -> the engine's reserved datum token. Non-strings -> None.
 
@@ -211,6 +253,12 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
             return True
         if e.get("type") == "line" and ("p1" not in e or "p2" not in e):
             return True
+        if e.get("type") in ("circle", "arc", "ellipse", "ellipse_arc") and "center" not in e:
+            return True
+        if e.get("type") in ("circle", "arc") and "radius" not in e:
+            return True
+        if e.get("type") == "point" and "p" not in e:
+            return True
     for c in (cons or []):
         if not isinstance(c, dict):
             continue
@@ -254,6 +302,82 @@ def _face_phrase_query(v: Any) -> Optional[dict]:
     return {"of": "face", "side": sides.pop()}
 
 
+#: Nouns that make a prose phrase name an EDGE (mirrors _FACE_NOUNS for the face path).
+#: "corner" is deliberately NOT here: a corner is as often a vertex as an edge.
+_EDGE_NOUNS = ("edge", "edges")
+#: Words that mean "parallel to the Z axis". parse_axis_vec (core/doc/picks.cpp:585) reads
+#: the literal "vertical" as Z too, so this is the engine's own vocabulary, not a guess.
+_EDGE_VERTICAL_WORDS = ("vertical", "vertically", "upright")
+#: "all edges" / "every edge" — an unfiltered query IS every edge, so it is unambiguous.
+_EDGE_ALL_WORDS = ("all", "every", "each")
+
+
+def _compact(v: Any) -> str:
+    """A dict/value spelled the way the model should have written it (no stray spaces)."""
+    return json.dumps(v, separators=(",", ":"), sort_keys=False)
+
+
+def _edge_phrase_query(v: Any) -> Optional[dict]:
+    """'the vertical edges' -> {"of":"edge","parallel":"z"}; anything ambiguous -> None.
+
+    The EDGE twin of _face_phrase_query, and the same defect one slot over: a live copilot
+    run (2026-07-28) asked for a fillet on "the vertical edges" and climbed four rejections
+    — non-empty list, not-a-datum, kind not in [...], centroid missing — because prose is
+    neither a selector nor a datum. The engine already resolves this exact geometry:
+    picks.cpp::kQueryGrammar takes of/side/parallel, and parse_axis_vec reads "vertical"
+    as the Z axis, so the phrase has one meaning and becomes that query.
+
+    A phrase must name an EDGE noun and exactly one filter, or it stays untouched:
+      * "horizontal edges" is TWO axes (x and y) — genuinely ambiguous, never guessed;
+      * "the weird edges" names no filter the engine has;
+    both keep the engine's teaching error instead of a silent wrong pick.
+    """
+    if not isinstance(v, str):
+        return None
+    words = re.findall(r"[a-z]+", v.lower())
+    if not any(w in _EDGE_NOUNS for w in words):
+        return None
+    sides = {_FACE_SIDE_WORDS[w] for w in words if w in _FACE_SIDE_WORDS}
+    vertical = any(w in _EDGE_VERTICAL_WORDS for w in words)
+    if vertical and not sides:
+        return {"of": "edge", "parallel": "z"}
+    if sides and not vertical:
+        if len(sides) != 1:
+            return None
+        return {"of": "edge", "side": sides.pop()}
+    if not sides and not vertical and any(w in _EDGE_ALL_WORDS for w in words):
+        return {"of": "edge"}
+    return None
+
+
+def _prose_geom_query(v: Any, kind: str) -> Optional[dict]:
+    """The geometry query a prose FACE/EDGE phrase names, or None."""
+    if kind == "face":
+        return _face_phrase_query(v)
+    if kind == "edge":
+        return _edge_phrase_query(v)
+    return None
+
+
+def _geom_ref_member(v: Any, kind: str) -> Optional[dict]:
+    """One ref member -> the canonical geometry query it means, or None to leave it alone.
+
+    Handles the prose phrase itself and the {"query": …} wrapper the model reaches for
+    ({"edges":{"query":"the vertical edges"}} — the live 2026-07-28 rejection). A wrapper
+    around a query DICT is just the query nested one level too deep, so it is unwrapped; a
+    wrapper around prose that does not map is left in place so the engine still reports it.
+    """
+    q = _prose_geom_query(v, kind)
+    if q is not None:
+        return q
+    if isinstance(v, dict) and set(v) == {"query"}:
+        inner = v["query"]
+        if isinstance(inner, dict) and inner:
+            return dict(inner)
+        return _prose_geom_query(inner, kind)
+    return None
+
+
 def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     """Rewrite a natural/flat sketch add_feature into the engine's canonical shape."""
     params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
@@ -279,6 +403,11 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     id_map: dict[str, str] = {}
     norm_ents: list = []
     eid = 0
+    # Flat shorthand a model writes instead of the engine's canonical entity fields
+    # (cx/cy for center, r/d/dia/diameter for radius, x1/y1/x2/y2 for a line's
+    # endpoints, x/y for a lone point) — tracked here so a 29-circle lattice sketch
+    # emits ONE batch note, not one per entity.
+    used_shorthand: set[str] = set()
     for e in ents_in:
         if not isinstance(e, dict):
             norm_ents.append(e)
@@ -307,24 +436,80 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
         etype = ne.get("type")
         if etype == "line":
             # Endpoint aliases models write: p1/p2 canonical; start/end, from/to, and
-            # a/b all seen in live rejected batches (a/b from a 2026-07-27 copilot run).
+            # a/b all seen in live rejected batches (a/b from a 2026-07-27 copilot run);
+            # x1/y1/x2/y2 is the flat-coordinate dialect (the same shape a model reaches
+            # for on circle/arc, one slot over).
             p1 = ne.get("p1", ne.get("start", ne.get("from", ne.get("a"))))
             p2 = ne.get("p2", ne.get("end", ne.get("to", ne.get("b"))))
+            if p1 is None:
+                p1 = _flat_point(ne, "x1", "y1")
+                if p1 is not None:
+                    used_shorthand.add("line_xy")
+            if p2 is None:
+                p2 = _flat_point(ne, "x2", "y2")
+                if p2 is not None:
+                    used_shorthand.add("line_xy")
             if p1 is not None:
                 ne["p1"] = _xy(p1)
             if p2 is not None:
                 ne["p2"] = _xy(p2)
-            for k in ("start", "end", "from", "to", "a", "b"):
+            for k in ("start", "end", "from", "to", "a", "b", "x1", "y1", "x2", "y2"):
                 ne.pop(k, None)
-        elif etype in ("circle", "arc"):
+        elif etype == "point":
+            if isinstance(ne.get("p"), list):
+                ne["p"] = _xy(ne["p"])
+            elif "p" not in ne:
+                flat_p = _flat_point(ne, "x", "y")
+                if flat_p is not None:
+                    ne["p"] = flat_p
+                    ne.pop("x", None)
+                    ne.pop("y", None)
+                    used_shorthand.add("point_xy")
+        elif etype in ("circle", "arc", "ellipse", "ellipse_arc"):
+            # cx/cy for the center — the live 2026-07-28 SIGSEGV payload
+            # ({"type":"circle","cx":-23,"cy":0,"r":2.5}, a 29-circle keychain-hole
+            # lattice) reached allocate_entity with no "center"/"radius" at all; the
+            # crash is fixed, but the shape still needs normalizing or it just becomes
+            # a clean rejection ("center: required for circle") instead of a build.
             if "center" in ne:
                 ne["center"] = _xy(ne["center"])
+            else:
+                flat_c = _flat_point(ne, "cx", "cy")
+                if flat_c is not None:
+                    ne["center"] = flat_c
+                    ne.pop("cx", None)
+                    ne.pop("cy", None)
+                    used_shorthand.add("center")
             for k in ("start", "end"):
                 if isinstance(ne.get(k), list):
                     ne[k] = _xy(ne[k])
             if etype == "arc" and "ccw" not in ne:
                 ne["ccw"] = True
+            if etype in ("circle", "arc") and "radius" not in ne:
+                flat_r, was_diam = _flat_radius(ne)
+                if flat_r is not None:
+                    ne["radius"] = flat_r
+                    for k in ("r",) + _DIAMETER_KEYS:
+                        ne.pop(k, None)
+                    used_shorthand.add("diameter" if was_diam else "radius")
         norm_ents.append(ne)
+
+    if used_shorthand:
+        rewrites = []
+        if "center" in used_shorthand:
+            rewrites.append('cx/cy -> center:[x,y]')
+        if "radius" in used_shorthand:
+            rewrites.append('r -> radius')
+        if "diameter" in used_shorthand:
+            rewrites.append('d/dia/diameter -> radius (halved)')
+        if "line_xy" in used_shorthand:
+            rewrites.append('x1/y1/x2/y2 -> p1/p2')
+        if "point_xy" in used_shorthand:
+            rewrites.append('x/y -> p')
+        sink.append(
+            f'{_feat_label(feat, "sketch")}: expanded flat entity shorthand '
+            f'({"; ".join(rewrites)}) into the engine\'s canonical entity fields '
+            f"— one note for the whole sketch, not per entity")
 
     def _remap(h: Any) -> Any:
         if not isinstance(h, str) or h in ("origin", "origin.p"):
@@ -1918,6 +2103,16 @@ _SINGLE_REF_SLOTS = frozenset({
     "centerline", "target_face", "middle_face", "reference_face", "neutral", "pull",
     "face", "positions_sketch", "dir1", "dir2", "edge", "sketch",
 })
+# Ref slots the engine types SelList (validate.cpp::FEATURE_TYPES) — a LIST of selectors or
+# queries. A model that hands one bare selector/query to a list slot said exactly one thing,
+# so wrap it; that is the first rung of the live 2026-07-28 fillet ladder
+# («refs.edges: must be a non-empty list»). dir1/dir2 and `positions` are deliberately out:
+# dir1/dir2 are SelList only on surf_boundary and SelOrDatum on asm_linear_pattern, and
+# `positions` is a list of face-local [u,v] pairs, not selectors.
+_LIST_REF_SLOTS = frozenset({
+    "profile", "sections", "guides", "edges", "faces", "vertices", "remove", "parting",
+    "face_set_a", "face_set_b", "targets", "tools", "bodies", "surfaces", "points",
+})
 # The keys that make a dict a geometry QUERY rather than a topology selector.
 _QUERY_KEYS = frozenset({"side", "surf", "nearest", "largest", "smallest", "index", "at",
                          "all", "where", "contains", "min", "max"})
@@ -1994,7 +2189,40 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
                              f'{{"kind":"datum","feature":"{fixed["feature"]}"}} — a datum '
                              f"selector names its datum under `feature`")
             continue
+        # Prose the model uses to NAME geometry ("the vertical edges", "the top face"),
+        # and the {"query": …} wrapper it puts around it. Both are dialect for a geometry
+        # query the engine already resolves — mapped here, never guessed: a phrase that
+        # names no unambiguous filter is left for the engine's teaching error.
         kind = _REF_SLOT_KIND.get(slot)
+        if kind in ("face", "edge"):
+            members = v if isinstance(v, list) else [v]
+            new_members = []
+            rewrote = False
+            for m in members:
+                q = _geom_ref_member(m, kind)
+                if q is None:
+                    new_members.append(m)
+                    continue
+                new_members.append(q)
+                rewrote = True
+                notes.append(
+                    f"{label}: read refs.{slot} {_compact(m)} as the geometry query "
+                    f"{_compact(q)} — a ref slot takes a selector, a query, a reserved "
+                    f'datum, an f<N> id or a "$N" placeholder, never a prose phrase')
+            if rewrote:
+                v = new_members if isinstance(v, list) else new_members[0]
+                out_refs[slot] = v
+                changed = True
+        # One bare selector/query handed to a LIST slot says exactly one thing. Only a
+        # dict that IS a selector/query is wrapped — a dict that merely nests the list one
+        # level deeper ({"sections":[…]}) means something else entirely.
+        if (slot in _LIST_REF_SLOTS and isinstance(v, dict)
+                and (v.get("kind") or v.get("of") or v.get("sid") or (set(v) & _QUERY_KEYS))):
+            notes.append(f"{label}: wrapped refs.{slot} {_compact(v)} in a list — "
+                         f"refs.{slot} takes a LIST of selectors/queries, even for one")
+            v = [v]
+            out_refs[slot] = v
+            changed = True
         if kind is None:
             continue
         if isinstance(v, list):
@@ -2340,6 +2568,182 @@ def _sid_roster(doc_id: str, kind: str, limit: int = 12) -> list:
         out.append(f"{sid} ({'/'.join(bits)})" if bits else str(sid))
         if len(out) >= limit:
             break
+    return out
+
+
+#: Substrings that mark a kernel error as a genuine RESOLUTION failure — a selector or
+#: query that reached the engine but matched nothing/ambiguously — as opposed to a
+#: SYNTAX failure (bad shape, unknown slot). The C++ validator already teaches syntax in
+#: full (kQueryGrammar, unknown-ref-slot, "must be a non-empty list") and duplicating that
+#: here would bloat every error; only these markers mean "the model was flying blind on
+#: geometry it could not see" (core/doc/document.cpp / picks.cpp throw sites).
+_REF_RESOLUTION_MARKERS = (
+    "dangling", "matched no edge", "matched no face", "matched no geometry",
+    "no edges matched", "no candidates of matching kind", "selector dangling",
+    "query matched no",
+)
+
+
+def _ref_failure_kind(text: str) -> Optional[str]:
+    """'edge'/'face' — the entity kind a kernel error's RESOLUTION failure was about.
+
+    None when the text carries no resolution marker at all (a syntax rejection, which the
+    C++ validator already teaches) — see _REF_RESOLUTION_MARKERS.
+    """
+    low = text.lower()
+    if not any(marker in low for marker in _REF_RESOLUTION_MARKERS):
+        return None
+    has_edge, has_face = "edge" in low, "face" in low
+    if has_edge and not has_face:
+        return "edge"
+    if has_face and not has_edge:
+        return "face"
+    if has_edge:  # both mentioned — fillet/chamfer (edge ops) are the common case
+        return "edge"
+    return None
+
+
+def _declined_geom_phrases(ops: Any) -> list:
+    """[(kind, slot, phrase), …] for every ref member that is STILL raw face/edge prose
+    at apply time.
+
+    By the time `ops` reaches here every normalizer pass (_geom_ref_member and friends)
+    has already had its shot at rewriting prose into a query; a string that still names a
+    face/edge noun ("horizontal edges") is one the normalizer looked at and deliberately
+    declined to guess at (genuinely ambiguous, or names no filter the engine has) — never
+    one it silently skipped, since anything unambiguous is rewritten in place.
+    """
+    out = []
+    for op in ops if isinstance(ops, list) else ():
+        feat = op.get("feature") if isinstance(op, dict) else None
+        refs = feat.get("refs") if isinstance(feat, dict) else None
+        if not isinstance(refs, dict):
+            continue
+        for slot, v in refs.items():
+            kind = _REF_SLOT_KIND.get(slot)
+            if kind not in ("face", "edge"):
+                continue
+            nouns = _FACE_NOUNS if kind == "face" else _EDGE_NOUNS
+            for m in (v if isinstance(v, list) else [v]):
+                if not isinstance(m, str):
+                    continue
+                if any(w in nouns for w in re.findall(r"[a-z]+", m.lower())):
+                    out.append((kind, slot, m))
+    return out
+
+
+#: Exact labels _classify_edge_match emits for an axis-aligned bucket -> the `parallel`
+#: letter query_geometry accepts. Kept as an explicit map (not string-parsed back out of
+#: the label) so the label wording can change freely without silently breaking the
+#: suggested-query text.
+_AXIS_LABEL_LETTER = {
+    "parallel to z (vertical)": "z",
+    "parallel to x": "x",
+    "parallel to y": "y",
+}
+
+
+def _classify_edge_match(m: dict) -> str:
+    """One doc_query edge match -> a short orientation/surface bucket label."""
+    surf = m.get("surf")
+    axis = m.get("axis")
+    if surf == "line" and isinstance(axis, list) and len(axis) == 3:
+        ax, ay, az = (abs(c) for c in axis)
+        if az > 0.999:
+            return "parallel to z (vertical)"
+        if ax > 0.999:
+            return "parallel to x"
+        if ay > 0.999:
+            return "parallel to y"
+        return "diagonal (non-axis-aligned)"
+    return f"{surf} edges" if surf else "other edges"
+
+
+def _classify_face_match(m: dict) -> str:
+    """One doc_query face match -> a short side/surface bucket label."""
+    side, surf = m.get("side"), m.get("surf")
+    if side:
+        return f"{side} ({surf})" if surf and surf != "plane" else side
+    return f"{surf} faces" if surf else "other faces"
+
+
+#: How many distinct orientation/side buckets a geometry-inventory hint enumerates before
+#: rolling the rest into a single "N other" bucket — a lattice part can carry hundreds of
+#: edges, and a full dump would be worse than no hint at all.
+_INVENTORY_BUCKET_CAP = 6
+
+
+def _geometry_inventory_line(doc_id: str, kind: str) -> Optional[str]:
+    """A short, REAL, capped inventory of the doc's edges/faces for a ref-resolution error.
+
+    Built from a live doc_query against the CURRENT document — never a guess or a
+    hardcoded list. Bucketed by orientation (edges) or side (faces) so a model can act on
+    it directly, e.g. "this body has 12 edges — 4 parallel to z (vertical), 4 parallel to
+    x, 4 parallel to y".
+    """
+    try:
+        res = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": kind}}) or {}
+    except Exception:  # noqa: BLE001
+        return None
+    matches = [m for m in (res.get("matches") or []) if isinstance(m, dict)]
+    total = len(matches)
+    if total == 0:
+        return f"this body has no {kind}s at all — check the body/feature you targeted"
+    classify = _classify_edge_match if kind == "edge" else _classify_face_match
+    counts: dict[str, int] = {}
+    for m in matches:
+        label = classify(m)
+        counts[label] = counts.get(label, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = ranked[:_INVENTORY_BUCKET_CAP]
+    rest = sum(c for _, c in ranked[_INVENTORY_BUCKET_CAP:])
+    parts = [f"{c} {label}" for label, c in shown]
+    if rest:
+        parts.append(f"{rest} other {kind}(s)")
+    example = next((label for label, _ in shown if label in _AXIS_LABEL_LETTER), None)
+    suggestion = ""
+    if example:
+        axis = _AXIS_LABEL_LETTER[example]
+        suggestion = (f' — call query_geometry({{"of":"{kind}","parallel":"{axis}"}}) '
+                      f"to select those")
+    return f"this body has {total} {kind}s — {', '.join(parts)}{suggestion}"
+
+
+def _enrich_ref_resolution_error(result: Any, doc_id: Optional[str], ops: Any) -> Any:
+    """Append a real geometry inventory to a ref-RESOLUTION failure (dict form).
+
+    Mirrors op_vocab.enrich_unknown_op_error's shape (mega-8 F7): detect a thin kernel
+    error, and only when it names a genuine resolution failure (never a syntax one — the
+    C++ validator already teaches that), attach what the document ACTUALLY has so the
+    model can act instead of guessing again. Live root cause: a fillet on "the vertical
+    edges" was rejected four times and the model never once could see what edges the part
+    had (2026-07-28).
+    """
+    if not isinstance(result, dict) or result.get("ok") is not False or not doc_id:
+        return result
+    if "geometry_hint" in result:
+        return result
+    text = str(result.get("error") or result.get("message") or "")
+    if not text:
+        return result
+    kind = _ref_failure_kind(text)
+    if kind is None:
+        # Kernel text alone doesn't say "resolution" (e.g. the syntax path this batch
+        # actually hit) — but a phrase our own normalizer declined to guess at, sitting in
+        # exactly the ref slot this error names, is just as much "flying blind on
+        # geometry" and deserves the same real inventory.
+        for phrase_kind, slot, _phrase in _declined_geom_phrases(ops):
+            if f".refs.{slot}" in text:
+                kind = phrase_kind
+                break
+    if kind is None:
+        return result
+    line = _geometry_inventory_line(doc_id, kind)
+    if not line:
+        return result
+    out = dict(result)
+    out["geometry_hint"] = line
+    out["error"] = f"{text.rstrip()} — {line}"
     return out
 
 
@@ -3544,11 +3948,16 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # (C++ path sometimes returns only "unknown op 'cylinder'").
             try:
                 from services.mcp import op_vocab as _ov  # noqa: PLC0415
-                enriched = _ov.enrich_unknown_op_error(raw)
-                if isinstance(enriched, dict):
-                    return _dumps(enriched)
-                if isinstance(enriched, str):
-                    return enriched
+                raw = _ov.enrich_unknown_op_error(raw)
+            except Exception:  # noqa: BLE001
+                pass
+            # A ref that never RESOLVED (no such edge/face, a query matching zero/many, a
+            # prose phrase the normalizer declined to guess at) is exactly when the model
+            # is flying blind: attach a real, capped inventory of what the document
+            # actually has so it can act instead of guessing again (live root cause,
+            # 2026-07-28 — see _enrich_ref_resolution_error).
+            try:
+                raw = _enrich_ref_resolution_error(raw, d, ops)
             except Exception:  # noqa: BLE001
                 pass
             return _dumps(raw) if not isinstance(raw, str) else raw

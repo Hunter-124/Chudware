@@ -6,8 +6,9 @@ from typing import Any
 ENTRIES: dict[str, dict[str, Any]] = {
     "describe_part": {
         "prompt_note": (
-            "Make this the first read on any part — the returned sids are "
-            "the stable addresses every later hover() and edit call uses."
+            "Make this the first read on any part — the returned sids (faces AND edges) "
+            "are the stable addresses every later hover() / query_geometry / edit call "
+            "uses. Call it before naming geometry you have not confirmed exists."
         ),
     },
     "query_adjacency": {

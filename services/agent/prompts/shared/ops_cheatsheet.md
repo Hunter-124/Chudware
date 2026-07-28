@@ -36,6 +36,10 @@ approximate a curved or organic body with a stack of boxes.
   - A plain rectangular/cylindrical block            -> a primitive (box/cylinder) is fine.
 Use a raw `script` feature ONLY when no combination of the features below can express the geometry.
 
+READ THE RESULT — add_feature's response carries a `changes` summary ("added 2 faces
+(+2 cylinder); 2 new bore/hole(s); volume 24000→23435") or "no geometry change". Read it
+before building the next feature on the mutation instead of assuming the op did what you meant.
+
 ----------------------------------------------------------------- ADD geometry (op "add_feature")
 
 PRIMITIVES — box/cylinder/sphere/cone/torus. Centered on the origin by default; an optional
@@ -80,9 +84,10 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
      SWEEP    params {mode}, refs.profile = [region] (the cross-section),
               refs.path = a selector naming the PATH sketch (an open line/arc/spline, or a `helix`).
 
-DRESS / TRANSFORM an existing body — name edges/faces with a geometry QUERY (no clicking needed).
-You describe the geometry IN PLAIN WORDS; the engine finds the matching edges/faces. You never
-need a face number or a coordinate.
+DRESS / TRANSFORM an existing body — name edges/faces with a geometry QUERY (no clicking
+needed), same vocabulary for faces AND edges. INSPECT before you ACT: when you cannot name the
+geometry with certainty, call query_geometry FIRST and build the pick from what it returns
+rather than guessing a filter. You never need a face number, an edge number, or a coordinate.
   fillet  params {radius} refs.edges = {"of":"edge", ...}
           VARIABLE-RADIUS: add params.radius2 — a linear taper r→r2 along each edge (requires
           explicit edge picks, not a direction filter). e.g. r=3, radius2=1 tapers each selected
@@ -118,9 +123,10 @@ need a face number or a coordinate.
     surf:"flat" matches it 0 times — that is correct, there are no planar faces. A `side` query on
     such a body returns the freeform wall (the only face facing that way), not a flat cap, because
     there is no cap. If you need selectable FLAT end faces (e.g. the rim of a tube), build the body
-    so it HAS them: revolve a wall-profile ring (flat end faces) rather than a solid pole-to-pole
-    profile. Use the doc_query tool FIRST if unsure what faces a part has — it returns each
-    edge/face's shape (surf) + side so you can see what will resolve.
+    profile. Query predicates match zero or more than one? Narrow with near/count/index rather
+    than guessing which one you meant. Call query_geometry / doc_query FIRST whenever you are
+    not certain what edges/faces a part has — it returns each edge/face's shape (surf) + side so
+    you can see what will resolve before you commit a fillet/chamfer/shell/draft to it.
 
 HELIX / COIL / SPRING PATH (type "helix"). A helix is a CURVE feature — it emits no body by
 itself; use it as refs.path of a SWEEP to make a spring, coil, or thread.

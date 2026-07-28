@@ -227,7 +227,9 @@ def register_plm_tools(mcp: FastMCP) -> None:
         it). ``op`` ∈ ``list`` | ``create`` | ``update`` | ``delete``;
         ``entity`` ∈ ``task`` | ``issue`` | ``milestone``. ``data`` carries the
         fields (title, status/priority, assignee, links to items/revisions, …).
-        Returns ``{ok, items, entity?}``."""
+        Returns ``{ok, items, count, entity?, deleted_id?}`` — ``count`` is
+        the number of remaining ``entity`` items, ``entity`` is the created/
+        updated record, ``deleted_id`` confirms which id was removed."""
         try:
             Vault, VaultError = _vault_module()
         except ImportError:
@@ -240,7 +242,11 @@ def register_plm_tools(mcp: FastMCP) -> None:
                 v.close()
         except VaultError as e:
             return _err(e.reason, e.hint)
-        return _ok(**res)
+        fields = dict(res)
+        fields["count"] = len(fields.get("items") or [])
+        if op == "delete" and "entity" not in fields:
+            fields["deleted_id"] = id
+        return _ok(**fields)
 
     @mcp.tool()
     def plm_where_used(path: str, item_id: str, transitive: bool = False) -> str:
@@ -516,7 +522,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def plm_unlock(path: str, item_id: str, remote_id: str = "origin") -> str:
-        """Release an advisory lock you hold. Returns ``{ok}``."""
+        """Release an advisory lock you hold. Returns ``{ok, item_id,
+        remote_id}`` confirming which lock was released."""
         try:
             from services.plm import remote as remote_mod
         except ImportError:
@@ -525,4 +532,5 @@ def register_plm_tools(mcp: FastMCP) -> None:
         if not out.get("ok"):
             return _err(str(out.get("reason") or "internal"),
                         str(out.get("hint") or ""))
-        return _ok(**{k: v for k, v in out.items() if k != "ok"})
+        return _ok(item_id=item_id, remote_id=remote_id,
+                   **{k: v for k, v in out.items() if k != "ok"})

@@ -364,8 +364,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "query_geometry": {
         "prompt_note": (
-            "Confirm a selector resolves before referencing it in a feature or study; a "
-            "sentence is not a query — open-ended explore → describe_part + hover."
+            "Plain-word phrases work for faces AND edges ('the vertical edges', 'the top "
+            "face') — confirm a pick resolves before referencing it in a feature; zero or "
+            ">1 match on a slot needing one → narrow with pick/near/count/index. Fully "
+            "open-ended explore → describe_part + hover instead."
         ),
     },
     "recover_parts": {

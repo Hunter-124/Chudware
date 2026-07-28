@@ -57,6 +57,20 @@ def _gerber_ext(layer_id: str) -> str:
     return f".G_{layer_id.replace('.', '_')}"
 
 
+def _resolve_out_path(path: str) -> str:
+    """Canonicalize a caller-supplied output path/dir: expanduser + abspath, mirroring
+    cad_exchange_tools.py's _sanitize_output_path so a relative path resolves against THIS
+    process's cwd (not some other daemon's) and the caller always learns the real location."""
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _file_sizes(paths: dict) -> tuple[dict, int]:
+    """{key: path} -> ({key: bytes-on-disk (0 if missing)}, total bytes) — confirms every
+    claimed write actually landed rather than trusting the writer's return value."""
+    sizes = {k: (os.path.getsize(p) if os.path.exists(p) else 0) for k, p in paths.items()}
+    return sizes, sum(sizes.values())
+
+
 def _write_fab_files(session, kind: str, out_dir: str) -> dict[str, str]:
     """C++ ecad_export (gerber/drill) -> files on disk; returns {layer_id|pth/npth -> path},
     mirroring engine.ecad.fab.write_gerbers / write_drill."""
@@ -610,7 +624,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                                  "known devices: " + ", ".join(
                                      d["device"] for d in fpga.load_devices().values()),
                             next_actions=["ecad_fpga_check()"])
-            out_dir = path or str(_default_out_dir(session.doc.get("name", "board")))
+            out_dir = _resolve_out_path(path) if path else str(_default_out_dir(session.doc.get("name", "board")))
             os.makedirs(out_dir, exist_ok=True)
             files = []
             for ref, texts in sorted(exports.items()):
@@ -620,12 +634,17 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                         fh.write(text)
                     files.append(fp)
             _ECAD["out_dir"] = out_dir
+            file_sizes, total_bytes = _file_sizes({f: f for f in files})
+            all_exist = all(file_sizes[f] > 0 for f in files) if files else False
             return _dumps({
                 "ok": True, "kind": "constraints", "doc_id": session.doc_id,
-                "dir": out_dir, "files": files, "warnings": [],
+                "dir": out_dir, "files": files, "file_bytes": file_sizes,
+                "total_bytes": total_bytes, "exists": all_exist, "warnings": [],
                 "hint": ("Wrote pin constraints for "
-                         f"{', '.join(sorted(exports))}: native dialect (XDC/LPF) + neutral "
-                         "CSV pinout. Feed the XDC/LPF straight to Vivado/nextpnr."),
+                         f"{', '.join(sorted(exports))}: {len(files)} file(s), {total_bytes} "
+                         f"byte(s) total, confirmed on disk at {out_dir}. Native dialect "
+                         "(XDC/LPF) + neutral CSV pinout. Feed the XDC/LPF straight to "
+                         "Vivado/nextpnr."),
                 "next_actions": ["ecad_fpga_check()  # bank/diff/clock/config validation"],
             })
         try:
@@ -634,33 +653,41 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="Export needs an open board.",
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
-        out_dir = path or str(_default_out_dir(doc.get("name", "board")))
+        out_dir = _resolve_out_path(path) if path else str(_default_out_dir(doc.get("name", "board")))
         try:
             if kind == "gerber":
                 files = _write_fab_files(session, "gerber", out_dir)
-                result = {"kind": "gerber", "dir": out_dir, "files": files}
+                file_sizes, total_bytes = _file_sizes(files)
+                result = {"kind": "gerber", "dir": out_dir, "files": files,
+                          "file_bytes": file_sizes, "total_bytes": total_bytes,
+                          "layer_count": len(files)}
             elif kind == "drill":
                 files = _write_fab_files(session, "drill", out_dir)
-                result = {"kind": "drill", "dir": out_dir, "files": files}
+                file_sizes, total_bytes = _file_sizes(files)
+                result = {"kind": "drill", "dir": out_dir, "files": files,
+                          "file_bytes": file_sizes, "total_bytes": total_bytes,
+                          "layer_count": len(files)}
             elif kind == "bom":
                 text = _fab_text(session, "bom", "bom")
-                fp = path or os.path.join(out_dir, "bom.csv")
+                fp = _resolve_out_path(path) if path else os.path.join(out_dir, "bom.csv")
                 os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
                 with open(fp, "w", encoding="utf-8") as fh:
                     fh.write(text)
                 # M5: text.count("\n") includes the header line; subtract 1 to report
                 # only DATA rows (the meaningful count for a 5-component board = 5, not 6).
                 result = {"kind": "bom", "path": fp,
-                          "rows": max(0, text.count("\n") - 1)}
+                          "rows": max(0, text.count("\n") - 1),
+                          "bytes": os.path.getsize(fp) if os.path.exists(fp) else 0}
             elif kind == "placement":
                 text = _fab_text(session, "cpl", "cpl")
-                fp = path or os.path.join(out_dir, "placement.csv")
+                fp = _resolve_out_path(path) if path else os.path.join(out_dir, "placement.csv")
                 os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
                 with open(fp, "w", encoding="utf-8") as fh:
                     fh.write(text)
                 # M5: same header-line subtraction for placement CSV
                 result = {"kind": "placement", "path": fp,
-                          "rows": max(0, text.count("\n") - 1)}
+                          "rows": max(0, text.count("\n") - 1),
+                          "bytes": os.path.getsize(fp) if os.path.exists(fp) else 0}
             else:
                 return _err(f"unknown export kind {kind!r}",
                             hint="Use 'gerber', 'drill', 'bom', 'placement', or "
@@ -670,8 +697,14 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             return _err(f"export {kind} failed: {type(e).__name__}: {e}",
                         hint="Check ecad_run_drc() and that the board has footprints/copper.")
         _ECAD["out_dir"] = out_dir
-        result.update({"ok": True, "doc_id": session.doc_id, "warnings": [],
-                       "hint": f"Wrote {kind} to {result.get('path') or result.get('dir')}.",
+        written_path = result.get("path") or result.get("dir")
+        exists = (os.path.exists(result["path"]) if "path" in result
+                  else bool(result.get("files")) and all(
+                      os.path.exists(p) for p in result["files"].values()))
+        size_note = (f"{result['bytes']} byte(s)" if "bytes" in result else
+                     f"{result.get('layer_count', 0)} file(s), {result.get('total_bytes', 0)} byte(s) total")
+        result.update({"ok": exists, "exists": exists, "doc_id": session.doc_id, "warnings": [],
+                       "hint": f"Wrote {kind} to {written_path} ({size_note}), confirmed on disk.",
                        "next_actions": ["ecad_export('drill')  # the other fab outputs",
                                         "ecad_export('bom')"]})
         return _dumps(result)
@@ -706,7 +739,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         doc = session.doc
 
         # Build the output path (default: Chudware cache dir named after the board).
-        out_path = path or str(_default_out_dir(doc.get("name", "board")) / "board.step")
+        out_path = (_resolve_out_path(path) if path
+                    else str(_default_out_dir(doc.get("name", "board")) / "board.step"))
 
         # The FIRST ecad_to_3d call cold-imports OCP/build123d (OpenCASCADE Python bindings) — that
         # import alone can take 10-30 s in a freshly-warmed server, which on its own overruns the
@@ -763,20 +797,26 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 sidecar_warnings.append(f"boardphys sidecar write failed: {e}")
                 sidecar_path = None
         totals = (boardphys or {}).get("totals") or {}
+        step_exists = os.path.exists(step_path)
+        step_bytes = os.path.getsize(step_path) if step_exists else 0
+        sidecar_bytes = (os.path.getsize(sidecar_path)
+                         if sidecar_path and os.path.exists(sidecar_path) else 0)
         return _dumps({
-            "ok": True, "doc_id": session.doc_id, "kind": "step",
-            "step_path": step_path,
-            "boardphys_path": sidecar_path,
+            "ok": step_exists, "doc_id": session.doc_id, "kind": "step",
+            "step_path": step_path, "exists": step_exists, "bytes": step_bytes,
+            "boardphys_path": sidecar_path, "boardphys_bytes": sidecar_bytes,
             "power": totals or None,
             "board_volume_mm3": summary.get("board_volume", 0.0),
             "n_components": summary.get("n_components", 0),
             "n_proxies": summary.get("n_proxies", 0),
             "summary": summary,
-            "warnings": list(summary.get("warnings", [])) + sidecar_warnings,
-            "hint": (f"Wrote STEP to {step_path} "
-                     f"(board volume {summary.get('board_volume', 0):.1f} mm³, "
+            "warnings": (list(summary.get("warnings", [])) + sidecar_warnings
+                        + ([] if step_exists else [f"STEP write did not land at {step_path}"])),
+            "hint": (f"Wrote STEP to {step_path} ({step_bytes} bytes, confirmed on disk; "
+                     f"board volume {summary.get('board_volume', 0):.1f} mm³, "
                      f"{summary.get('n_components', 0)} component body/bodies)"
-                     + (f" + boardphys sidecar {sidecar_path} (power/thermal map)."
+                     + (f" + boardphys sidecar {sidecar_path} ({sidecar_bytes} bytes, "
+                        "power/thermal map)."
                         if sidecar_path else ".")
                      + " Open this STEP in the CAD app as an import feature to design "
                        "the enclosure."),

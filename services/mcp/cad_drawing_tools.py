@@ -329,7 +329,11 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                  scale: Optional[float] = None, doc_id: Optional[str] = None) -> str:
         """Move and/or rescale a view. doc_id = drawing_doc_id. x,y reposition the view on the
         sheet (mm); scale sets the view scale (1.0 = 1:1, 0.5 = 1:2, 2.0 = 2:1). Use this to
-        spread overlapping views apart after review_drawing."""
+        spread overlapping views apart after review_drawing.
+
+        Returns {ok, view_id, position, scale, orientation} — the view's RESULTING state (not
+        just an echo of the args), so you can confirm the move landed before the next call.
+        """
         try:
             d = _doc(doc_id)
             params = {"doc_id": d, "view_id": view_id}
@@ -337,8 +341,11 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 params["position"] = [x, y]
             if scale is not None:
                 params["scale"] = scale
-            cb.call("drawing_set_view", params)
-            return _dumps({"ok": True, "view_id": view_id})
+            r = cb.call("drawing_set_view", params)
+            view = r.get("view") or {}
+            return _dumps({"ok": True, "view_id": r.get("view_id", view_id),
+                           "position": view.get("position"), "scale": view.get("scale"),
+                           "orientation": view.get("orientation")})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -347,10 +354,17 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def set_titleblock(fields: dict, doc_id: Optional[str] = None) -> str:
         """Fill the drawing's title block. doc_id = drawing_doc_id. fields is a dict of any of:
-        title, drawn_by, date, material, finish, scale, rev, sheet, part_number, company."""
+        title, drawn_by, date, material, finish, scale, rev, sheet, part_number, company.
+
+        Returns {ok, sheet_id, fields_set, title_block} where title_block is the sheet's FULL
+        resulting field set (not just what you just passed) — confirms the write landed and
+        shows any prior fields it's layered on top of.
+        """
         try:
             d = _doc(doc_id)
-            cb.call("drawing_set_titleblock", {"doc_id": d, "sheet_id": "s1", "fields": fields})
-            return _dumps({"ok": True})
+            r = cb.call("drawing_set_titleblock", {"doc_id": d, "sheet_id": "s1", "fields": fields})
+            tb = r.get("title_block") or {}
+            return _dumps({"ok": True, "sheet_id": r.get("sheet_id", "s1"),
+                           "fields_set": sorted(fields.keys()), "title_block": tb})
         except Exception as e:  # noqa: BLE001
             return _err(e)

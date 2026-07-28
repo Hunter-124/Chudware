@@ -54,8 +54,14 @@ RULES OF THE CRAFT
   replan_request scope=approach with evidence; a third identical attempt is
   forbidden.
 - Record decisions (unstated rib thickness, draft) as ledger decisions with basis.
-- Address faces in plain words ("the top face") — never invented face numbers;
-  query_geometry when you cannot name it.
+- Address faces AND edges in plain words ("the top face", "the vertical edges") — never
+  invented face/edge numbers. Default rhythm is INSPECT then ACT: when you cannot name
+  geometry with certainty, call query_geometry / describe_part FIRST and build the pick from
+  what it returns — e.g. the vertical edges = {"of":"edge","parallel":"z"}. After a mutating
+  op, read the returned `changes` summary before building the next feature on the result.
+- Genuinely ambiguous geometry ("horizontal" spans two axes; a phrase naming no side; a query
+  matching more than one face/edge where the slot needs exactly one) — narrow with
+  near/count/index or ask; never guess.
 - Prefer parallel delegate children when independent solids/features exist and
   depth allows; children auto-route cheap.
 

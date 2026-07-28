@@ -243,3 +243,66 @@ def test_end_to_end_via_real_fastmcp_dispatch(tmp_path):
         assert any(e["message"] == "e2e checkpoint" for e in h["entries"])
 
     asyncio.run(_run())
+
+
+def test_plm_plan_lifecycle_confirms_changes(tmp_path, tools):
+    """create/update/delete on plm_plan echoes a count and, for delete, the
+    removed id — not just a bare {ok:true}."""
+    (tmp_path / "Bracket.step+").write_bytes(_container(_part()))
+    tools["plm_open"](str(tmp_path))
+
+    created = _j(tools["plm_plan"](
+        str(tmp_path), "create", "task", {"title": "Chamfer the edge"}, ""))
+    assert created["ok"] is True
+    assert created["entity"]["title"] == "Chamfer the edge"
+    assert created["count"] == 1
+    task_id = created["entity"]["id"]
+
+    updated = _j(tools["plm_plan"](
+        str(tmp_path), "update", "task", {"status": "done"}, task_id))
+    assert updated["ok"] is True
+    assert updated["entity"]["status"] == "done"
+    assert updated["count"] == 1
+
+    deleted = _j(tools["plm_plan"](str(tmp_path), "delete", "task", None, task_id))
+    assert deleted["ok"] is True
+    assert deleted["deleted_id"] == task_id
+    assert deleted["count"] == 0
+    assert deleted["items"] == []
+
+
+def test_plm_lock_unlock_via_tool_confirms_scope(tmp_path, tools):
+    """plm_unlock must echo which item/remote it released, not a bare
+    {ok:true} indistinguishable from every other call."""
+    from services.plm import remote as remote_mod
+
+    src = tmp_path / "alice"
+    src.mkdir()
+    (src / "Bracket.step+").write_bytes(_container(_part()))
+    tools["plm_open"](str(src))
+    item_id = _j(tools["plm_status"](str(src)))["items"][0]["item_id"]
+
+    bare = tmp_path / "central.git"
+    assert remote_mod.seed_remote(src, bare)["ok"] is True
+
+    lock_res = _j(tools["plm_lock"](str(src), item_id))
+    assert lock_res["ok"] is True
+    assert lock_res["lock"]["item_id"] == item_id
+
+    unlock_res = _j(tools["plm_unlock"](str(src), item_id))
+    assert unlock_res["ok"] is True
+    assert unlock_res["item_id"] == item_id
+    assert unlock_res["remote_id"] == "origin"
+
+    # lock is actually released: someone else can now acquire it
+    import os
+
+    os.environ["CHUDWARE_USER_ID"] = "bob"
+    os.environ["CHUDWARE_USER_DISPLAY"] = "Bob"
+    try:
+        relock = _j(tools["plm_lock"](str(src), item_id))
+    finally:
+        os.environ.pop("CHUDWARE_USER_ID", None)
+        os.environ.pop("CHUDWARE_USER_DISPLAY", None)
+    assert relock["ok"] is True
+    assert relock["lock"]["holder"] == "bob"

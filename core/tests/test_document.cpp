@@ -4118,7 +4118,8 @@ TEST_CASE("validate: a rejected selector slot teaches the whole grammar, incl. q
         const std::string e = edge_err(json::array({json{{"query", "the vertical edges"}}}));
         REQUIRE_MESSAGE(!e.empty(), "a non-query object element must be rejected");
         MESSAGE(e);
-        CHECK(e.find(".kind: not in") != std::string::npos);
+        CHECK(e.find(".kind: ") != std::string::npos);
+        CHECK(e.find("not in") != std::string::npos);
         teaches_query(e);
     }
     SUBCASE("rung 4: a half-built topology selector the model cannot finish") {

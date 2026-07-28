@@ -2376,7 +2376,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     results[id] = PlaneResult{chudware::geom::SketchPlane::from(origin, normal)};
 
                 } else {
-                    throw std::runtime_error("plane: method '" + method + "' not supported");
+                    // Class-5 fix: name the accepted vocabulary — the if/else chain above
+                    // IS the plane method list, so a typo ("midpoint" for "midplane")
+                    // used to get only "not supported" with nothing to compare it against.
+                    throw std::runtime_error(
+                        "plane: method '" + method + "' not supported. Plane methods: "
+                        "offset, midplane, angle, three_point, parallel_point, "
+                        "point_normal, normal_to_curve, on_surface");
                 }
                 st.ok = true;
 
@@ -3285,7 +3291,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // resulting piece is a separate body — gated on exact piece volume.
                 const std::string keep = feat.value("keep", std::string("both"));
                 if (keep != "both" && keep != "above" && keep != "below")
-                    throw std::runtime_error("split: unknown keep '" + keep + "'");
+                    throw std::runtime_error(
+                        "split: unknown keep '" + keep + "'. keep must be one of "
+                        "\"both\", \"above\", \"below\"");
                 if (!feat.contains("tool"))
                     throw std::runtime_error("split: refs.tool is required (a planar datum)");
 
@@ -3663,7 +3671,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             ? chudware::doc::bbox_diag(require_solid(results, tgt_id, "target")) * 2.2
                             : 1.05 * (bbox_diag_of_face(faces[0]) * 2.0);
                     } else {
-                        throw std::runtime_error("extrude: end2 '" + end2 + "' not supported");
+                        throw std::runtime_error(
+                            "extrude: end2 '" + end2 + "' not supported. end2 must be "
+                            "\"none\", \"blind\", or \"through_all\"");
                     }
                     if (!(depth2 > 0.0))
                         throw std::runtime_error("extrude: effective depth2 must be > 0");
@@ -4390,7 +4400,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (op == "fuse")        out = ::geom::fuse_unify(a, b);  // T-PERF10: skip unify if no section edges
                 else if (op == "cut")    out = ::geom::cut(a, b);
                 else if (op == "common") out = ::geom::common(a, b);
-                else throw std::runtime_error("unknown boolean op '" + op + "'");
+                else throw std::runtime_error(
+                    "unknown boolean op '" + op + "'. Boolean ops: fuse, cut, common");
                 if (out.IsNull())
                     throw std::runtime_error("boolean '" + op + "' produced an empty shape");
 

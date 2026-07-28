@@ -5230,3 +5230,15 @@ Verified end to end: box 65mm minus sphere r25 → 209432.7 mm3 against an exact
 209175.2 mm3, the 0.12% being sphere tessellation. Also fixed a test-isolation bug: the
 kimi-keychain replay reused new_part's CURRENT document, so the second dialect re-cut hexes
 the first had already removed; it passes fresh=True now.
+
+Engine-side error QUALITY sweep (2026-07-28), same motivation as the entity-type fix: a
+rejection that names neither the offending value nor the accepted vocabulary is why a model
+abandons a task instead of correcting one key. Ten messages rewritten across
+core/doc/validate.cpp and core/doc/document.cpp — feature type, sketch constraint type,
+face-surf and edge-curve type, selector kind, sketch3d entity and constraint type, assembly
+mate type, plane method, split keep, extrude end2, boolean op — each now printing the value
+received AND the table it was checked against. Semantics are untouched: nothing newly
+accepted, nothing newly rejected, only the text. The substring contracts consumers
+pattern-match on are preserved deliberately: core/agent/run.cpp::looks_like_unknown_op_error
+still finds "is not a feature type" / "unknown op" / "no compiler for feature type", and
+services/mcp/test_bugreport_tools.py still finds "not a sketch entity type".

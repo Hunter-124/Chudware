@@ -816,7 +816,12 @@ vector<string> validate_selector(const json& sel, const string& where) {
                     "B-rep topology and can only come from describe_part / query_geometry, "
                     "not from a hand-written guess" + selector_forms()};
         }
-        return {where + ".kind: not in " + sorted_set_str(SELECTOR_KINDS) + selector_forms()};
+        // Name the offending value too — "not in [...]" alone hid a typo like plural
+        // "faces" or wrong case "Face" behind an otherwise-correct-looking vocabulary list.
+        string kgot = kindj.is_string() ? ("\"" + kind + "\"")
+                      : kindj.is_null()  ? "absent"
+                                        : "not a string";
+        return {where + ".kind: " + kgot + " not in " + sorted_set_str(SELECTOR_KINDS) + selector_forms()};
     }
     if (kind == "datum") {
         const json& feat = get(sel, "feature");
@@ -867,12 +872,18 @@ vector<string> validate_selector(const json& sel, const string& where) {
     const json& surf = get(sel, "surf");
     if (kind == "face" && !surf.is_null()) {
         if (!surf.is_string() || FACE_SURFS.find(surf.get<string>()) == FACE_SURFS.end()) {
-            errs.push_back(where + ".surf: not a face surface type");
+            // Live class-5 gap: "not a face surface type" alone named neither the bad
+            // value nor the vocabulary — same failure mode the entity-type fix addressed.
+            string got = surf.is_string() ? ("\"" + surf.get<string>() + "\"") : surf.dump();
+            errs.push_back(where + ".surf: " + got + " is not a face surface type. "
+                           "Face surface types: " + sorted_set_str(FACE_SURFS));
         }
     }
     if (kind == "edge" && !surf.is_null()) {
         if (!surf.is_string() || EDGE_SURFS.find(surf.get<string>()) == EDGE_SURFS.end()) {
-            errs.push_back(where + ".surf: not an edge curve type");
+            string got = surf.is_string() ? ("\"" + surf.get<string>() + "\"") : surf.dump();
+            errs.push_back(where + ".surf: " + got + " is not an edge curve type. "
+                           "Edge curve types: " + sorted_set_str(EDGE_SURFS));
         }
     }
     const json& axis = get(sel, "axis");
@@ -1018,7 +1029,14 @@ vector<string> validate_constraint(const json& c, const string& where,
     string ctype = ctypej.is_string() ? ctypej.get<string>() : "";
     auto sit = CONSTRAINT_SPECS.find(ctype);
     if (!ctypej.is_string() || sit == CONSTRAINT_SPECS.end()) {
-        return {where + ".type: not a constraint type"};
+        // Contentless before: "not a constraint type" named neither the offending
+        // value nor the vocabulary — same class-5 gap as validate_entity's type check.
+        string got = ctypej.is_string() ? ("\"" + ctype + "\"")
+                     : ctypej.is_null()  ? "absent"
+                                         : "not a string";
+        string known;
+        for (const auto& kv : CONSTRAINT_SPECS) known += (known.empty() ? "" : ", ") + kv.first;
+        return {where + ".type: " + got + " is not a constraint type. Constraint types: " + known};
     }
     const json& id = get(c, "id");
     if (!id.is_string() || !std::regex_match(id.get<string>(), CONSTRAINT_ID_RE)) {
@@ -1276,7 +1294,9 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
             if (!get(e, "t1").is_number()) errs.push_back(ew + ".t1: must be a number");
             if (!get(e, "t2").is_number()) errs.push_back(ew + ".t2: must be a number");
         } else {
-            errs.push_back(ew + ".type: '" + t + "' is not a sketch3d entity type");
+            // Named vocabulary: the if/else chain above IS the sketch3d entity type list.
+            errs.push_back(ew + ".type: '" + t + "' is not a sketch3d entity type. "
+                           "Sketch3d entity types: point, line, arc, spline, eq_curve3d");
         }
     }
 
@@ -1318,7 +1338,10 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
         const string t = get(c, "type").is_string() ? c["type"].get<string>() : "";
         auto tit = CON3.find(t);
         if (tit == CON3.end()) {
-            errs.push_back(cw + ".type: '" + t + "' is not a sketch3d constraint type");
+            string known;
+            for (const auto& kv : CON3) known += (known.empty() ? "" : ", ") + kv.first;
+            errs.push_back(cw + ".type: '" + t + "' is not a sketch3d constraint type. "
+                           "Sketch3d constraint types: " + known);
             continue;
         }
         const json& refs = get(c, "refs");
@@ -1390,7 +1413,15 @@ vector<string> validate_feature(const json& f, const string& where,
     string ftype = ftypej.is_string() ? ftypej.get<string>() : "";
     auto spit = FEATURE_TYPES.find(ftype);
     if (!ftypej.is_string() || spit == FEATURE_TYPES.end()) {
-        return {where + ".type: is not a feature type"};
+        // Contentless before: "is not a feature type" alone — substring preserved
+        // (core/agent/run.cpp::looks_like_unknown_op_error matches on it) while the
+        // offending value and the full vocabulary are now named, per validate_entity's fix.
+        string got = ftypej.is_string() ? ("\"" + ftype + "\"")
+                     : ftypej.is_null()  ? "absent"
+                                         : "not a string";
+        string known;
+        for (const auto& kv : FEATURE_TYPES) known += (known.empty() ? "" : ", ") + kv.first;
+        return {where + ".type: " + got + " is not a feature type. Feature types: " + known};
     }
     const FeatureSpec& spec = spit->second;
     const json& fid = get(f, "id");
@@ -2032,7 +2063,7 @@ vector<string> validate_assembly(const json& doc) {
             string mtype = mtj.is_string() ? mtj.get<string>() : "";
             if (!mtj.is_string() || !MATE_TYPES.count(mtype))
                 errs.push_back(loc + ".type: '" + (mtj.is_string() ? mtype : mtj.dump()) +
-                               "' not a mate type");
+                               "' not a mate type. Mate types: " + sorted_set_str(MATE_TYPES));
             const json& alj = get(m, "align");
             if (!(alj.is_string() && (alj.get<string>() == "aligned" || alj.get<string>() == "anti")))
                 errs.push_back(loc + ".align: must be 'aligned' or 'anti'");

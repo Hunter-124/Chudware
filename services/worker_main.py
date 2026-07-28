@@ -146,7 +146,15 @@ _register("multiphysics", ["services.sim.multiphysics_rpc"], "WORKER_METHODS")
 
 
 def _emit(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj) + "\n")
+    # Backstop: a tool result carrying a non-JSON object (e.g. fastmcp Image)
+    # must never destroy an otherwise-completed turn at the RPC boundary.
+    # Producers normalise first (agent_turn._json_safe_result); this catches
+    # anything that slips through by stringifying the offender.
+    try:
+        payload = json.dumps(obj)
+    except TypeError:
+        payload = json.dumps(obj, default=str)
+    sys.stdout.write(payload + "\n")
     sys.stdout.flush()
 
 

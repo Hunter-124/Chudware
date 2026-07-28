@@ -3169,6 +3169,19 @@ static void requestStopRun(AppState& st) {
     maybePersistChatHistoryDebounced(st, /*force=*/true);
 }
 
+// The composer buffer, flattened and trimmed — the ONE definition of "is there a message".
+// rewrapInPlace toggles spaces<->newlines as the user types, so a buffer holding nothing but
+// whitespace still satisfied `prompt[0] != 0` and Enter shipped an empty user bubble to the
+// model (live 2026-07-28: three blank "You" turns in a row). Every send / queue / steer path
+// gates on this instead, and it doubles as the soft-break flattener on the way out.
+static std::string composerText(const AppState& st) {
+    std::string out(st.prompt.empty() ? "" : st.prompt.data());
+    for (auto& c : out) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    const size_t b = out.find_first_not_of(' ');
+    if (b == std::string::npos) return {};
+    return out.substr(b, out.find_last_not_of(' ') - b + 1);
+}
+
 // The send/stop control, drawn INSIDE the message input box at its bottom-right (flagship
 // composer pattern — the input reserves right padding so text never runs under it). Idle: a
 // rounded accent button with an enter/return-key glyph (Enter submits). During a turn the same
@@ -3307,11 +3320,11 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     }
 
     const bool active = aiTurnActive(st);
-    bool canStart = canRun && st.prompt[0] && !active;  // start now only when idle
+    bool canStart = canRun && !composerText(st).empty() && !active;  // start now only when idle
     bool submit   = false;   // send / queue requested this frame
     bool stopReq  = false;   // stop requested this frame
 
-    // ---- queued messages (shown above the composer, each removable) ----
+    // ---- queued messages (shown above the composer: send-now-and-interrupt, or remove) ----
     if (!st.queuedPrompts.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
         for (size_t qi = 0; qi < st.queuedPrompts.size(); ++qi) {
@@ -3327,6 +3340,19 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                 break;
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove from queue");
+            // Send now: interrupt the live run so the drain at the top of the next frame
+            // launches THIS message instead of waiting for the turn to finish on its own.
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - xBtn * 2.0f);
+            if (ImGui::SmallButton("\xE2\x96\xB6")) {   // ▶
+                if (qi != 0) std::rotate(st.queuedPrompts.begin(),
+                                         st.queuedPrompts.begin() + (long)qi,
+                                         st.queuedPrompts.begin() + (long)qi + 1);
+                if (active) requestStopRun(st);
+                ImGui::PopID();
+                break;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Send now \xE2\x80\x94 interrupts the current run");
             ImGui::PopID();
         }
         ImGui::PopStyleColor();
@@ -3521,14 +3547,6 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
 
     // ---- stop / submit / queue ----
     if (stopReq) requestStopRun(st);
-    // The composer re-wraps text by toggling spaces<->newlines (rewrapInPlace). Flatten those
-    // soft breaks back to spaces on the way OUT so submitted/queued/steered prompts — and the
-    // user bubble that echoes them — never carry the composer's visual line breaks.
-    auto flattenComposer = [](const char* s) {
-        std::string out(s ? s : "");
-        for (auto& c : out) if (c == '\n') c = ' ';
-        return out;
-    };
     auto clearComposerBox = [&]() {
         clearPromptDraft(st);
         st.prompt[0] = 0;
@@ -3536,19 +3554,19 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         s_refocusComposer = true; // keep typing without re-clicking
     };
     if (submit || submitInput) {
+        const std::string text = composerText(st);   // flattened + trimmed; empty = no message
         if (active) {
             // A turn is running — STEER it mid-run when the engine knows the run_id
             // (agent_steer: text is folded into the live turn at its next step). Fall
             // back to next-turn queueing only when no run_id is available (e.g. the
             // run hasn't announced itself yet). Never both — that would double-send.
-            if (st.prompt[0]) {
+            if (!text.empty()) {
                 std::string runId;
                 {
                     auto steerRun = st.activeRun();
                     std::lock_guard<std::mutex> lk(steerRun->mtx);
                     runId = steerRun->runId;
                 }
-                const std::string text = flattenComposer(st.prompt.data());
                 if (!runId.empty() && st.workerStarted) {
                     agentControlDispatch(st, runId, text);
                     // Record the steering text in the visible conversation (it otherwise
@@ -3562,11 +3580,17 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                     st.queuedPrompts.emplace_back(text);
                 }
                 clearComposerBox();
+            } else if (!st.queuedPrompts.empty()) {
+                // Enter on an EMPTY composer with something queued = "send it now": the message
+                // didn't interrupt the run (it queued instead of steering), so a second Enter
+                // stops the run and the drain at the top of the next frame launches the queued
+                // message immediately. Same action as the ▶ button on the queued row.
+                requestStopRun(st);
             }
         } else if (canStart) {
             // Stage the rollback only on send (Esc cancelled without this).
             if (s_edit.active) commitEditStageOnSend(st);
-            submitTurn(st, flattenComposer(st.prompt.data()));
+            submitTurn(st, text);
             clearComposerBox();
         }
     }

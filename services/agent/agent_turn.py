@@ -31,6 +31,7 @@ import difflib
 import inspect
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -361,7 +362,7 @@ def _force_first_tool(
         ok = bool(result.get("ok"))
     else:
         try:
-            result = dispatch(tool, args)
+            result = _json_safe_result(dispatch(tool, args))
             ok = True
             payload = result
             if isinstance(result, str):
@@ -2607,7 +2608,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             ok = False
         else:
             try:
-                result = dispatch(tool, args)
+                result = _json_safe_result(dispatch(tool, args))
                 # mega-8: MCP tools often return JSON/dicts with ok:false without
                 # raising. Treat payload ok as the call outcome so productive_tools
                 # / new_part→add_features gates don't count rejected ops as success
@@ -2703,7 +2704,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         )})
                         tool_calls_made += 1
                         try:
-                            result2 = dispatch(tool, new_args)
+                            result2 = _json_safe_result(dispatch(tool, new_args))
                             ok2 = True
                             payload2 = result2
                             if isinstance(result2, str):
@@ -4462,6 +4463,47 @@ def _sanitize_history(history: Any) -> list[tuple[str, str]]:
 
 def _parts(text: str) -> list[dict]:
     return [{"type": "text", "text": str(text)}]
+
+
+def _json_safe_result(result: Any, _depth: int = 0) -> Any:
+    """Coerce a tool result into something ``json.dumps`` can encode.
+
+    MCP render/eval tools return ``mcp.server.fastmcp.Image`` objects (bare or
+    inside a ``[Image, caption]`` list). Those objects reach the worker RPC
+    envelope inside ``turn.result.calls[*].result`` and used to kill the whole
+    turn at serialization time with "Object of type Image is not JSON
+    serializable" (live 2026-07-28, export_part run) — the model's work was
+    already done and got thrown away. Normalise at the dispatch boundary so
+    every downstream consumer (ledger, events, worker envelope) sees plain data.
+    """
+    if result is None or isinstance(result, (str, int, float, bool)):
+        return result
+    if isinstance(result, os.PathLike):
+        return os.fspath(result)
+    if _depth > 6:
+        return str(result)
+    if isinstance(result, dict):
+        return {str(k): _json_safe_result(v, _depth + 1) for k, v in result.items()}
+    if isinstance(result, (list, tuple, set)):
+        return [_json_safe_result(v, _depth + 1) for v in result]
+    # fastmcp Image: `path` is a PosixPath (or None when the bytes are inline).
+    if hasattr(result, "_mime_type") and (hasattr(result, "path") or hasattr(result, "data")):
+        out: dict[str, Any] = {"kind": "image"}
+        path = getattr(result, "path", None)
+        if path is not None:
+            out["path"] = os.fspath(path)
+        data = getattr(result, "data", None)
+        if path is None and isinstance(data, (bytes, bytearray)):
+            out["bytes"] = len(data)
+        mime = getattr(result, "_mime_type", None)
+        if isinstance(mime, str):
+            out["mime"] = mime
+        return out
+    try:
+        json.dumps(result)
+    except Exception:  # noqa: BLE001
+        return str(result)
+    return result
 
 
 _TOOL_RESULT_CHARS = 8000
@@ -6943,7 +6985,7 @@ def _ecad_dispatch_forced_step(
     )})
     tool_calls_made += 1
     try:
-        result = dispatch(tool, dispatch_args)
+        result = _json_safe_result(dispatch(tool, dispatch_args))
         ok = True
         payload = result
         if isinstance(result, str):
@@ -6999,7 +7041,7 @@ def _ecad_dispatch_forced_step(
                 if new_args and new_args != args:
                     tool_calls_made += 1
                     try:
-                        result2 = dispatch(tool, new_args)
+                        result2 = _json_safe_result(dispatch(tool, new_args))
                         ok2 = True
                         payload2 = result2
                         if isinstance(result2, str):

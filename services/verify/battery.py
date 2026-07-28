@@ -509,24 +509,37 @@ def _adapt_check_kwargs(
         return call_kwargs, None
 
     if check_name == "ecad_run_erc":
-        # Prefer schematic session when mechanical doc_id is wrong.
-        if doc_id and "doc-cpp" in str(doc_id):
-            try:
-                from services.mcp.ecad_common import ecad_session as esess  # noqa: PLC0415
-                for s in esess.iter_sessions():
-                    kind = str(getattr(s, "kind", "") or "").lower()
-                    did = getattr(s, "doc_id", None)
-                    if did and kind in ("sch", "schematic", ""):
-                        doc = getattr(s, "doc", None) or {}
-                        if isinstance(doc, dict) and (
-                            doc.get("symbols") is not None
-                            or kind in ("sch", "schematic")
-                        ):
-                            call_kwargs["doc_id"] = did
-                            break
-            except Exception:  # noqa: BLE001
-                pass
-        return call_kwargs, None
+        # ERC needs a schematic. Look for one regardless of what doc_id says: the
+        # caller often passes a mechanical doc (or nothing at all), and the check
+        # must resolve to the real schematic session or be skipped.
+        sch_doc = None
+        try:
+            from services.mcp.ecad_common import ecad_session as esess  # noqa: PLC0415
+            for s in esess.iter_sessions():
+                kind = str(getattr(s, "kind", "") or "").lower()
+                did = getattr(s, "doc_id", None)
+                if did and kind in ("sch", "schematic", ""):
+                    doc = getattr(s, "doc", None) or {}
+                    if isinstance(doc, dict) and (
+                        doc.get("symbols") is not None
+                        or kind in ("sch", "schematic")
+                    ):
+                        sch_doc = did
+                        break
+        except Exception:  # noqa: BLE001
+            sch_doc = None
+        if sch_doc is not None:
+            call_kwargs["doc_id"] = sch_doc
+            return call_kwargs, None
+        # No schematic anywhere: ERC cannot apply. Running it anyway scored 0.0,
+        # which is indistinguishable from a real failure — live 2026-07-27 that
+        # phantom zero made haiku re-run verify_battery three times chasing a
+        # score it could never move, until the loop guard refused it. Every
+        # sibling ecad check already skips in this situation.
+        return None, _skip_json(
+            check_name,
+            "no schematic open — ERC does not apply to a mechanical part",
+        )
 
     return call_kwargs, None
 

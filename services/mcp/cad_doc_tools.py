@@ -1907,6 +1907,60 @@ _SID_REF_SLOTS = frozenset({
 })
 
 
+#: Slots the engine reads from ``feature.refs``. A model that writes them under
+#: ``params`` is not wrong about the GEOMETRY, only about which bag they live in.
+#: Live 2026-07-27 (claude-haiku-4-5): it resolved the four real corner edges and
+#: sent
+#:     {"type":"fillet","params":{"radius":{...},"edges":[{"sid":"Ed7ec5d"},…]}}
+#: three times in a row, each rejected with ".refs.edges: required for fillet" —
+#: correct selectors, wrong bag, and nothing in the error said which bag.
+_REFS_ONLY_SLOTS = frozenset({
+    "edges", "edge", "edge_a", "edge_b", "faces", "face", "target_face",
+    "middle_face", "face_set_a", "face_set_b", "vertices", "profile",
+    "sections", "remove", "parting", "neutral", "reference_face", "surface",
+    "tool", "guides", "up_to", "up_to2", "start_ref", "end_ref", "end2_ref",
+})
+
+
+def _migrate_ref_slots(ops: Any, notes: Optional[list] = None) -> Any:
+    """Move ref-only slots out of ``params`` into ``refs``.
+
+    Only moves a key when ``refs`` does not already define it, so an explicit
+    ref always wins; ``params`` keeps everything else untouched.
+    """
+    if not isinstance(ops, list):
+        return ops
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        feat = op.get("feature")
+        if not isinstance(feat, dict):
+            continue
+        params = feat.get("params")
+        if not isinstance(params, dict):
+            continue
+        present = [k for k in list(params) if k in _REFS_ONLY_SLOTS]
+        if not present:
+            continue
+        refs = dict(feat.get("refs") or {})
+        new_params = dict(params)
+        moved = []
+        for key in present:
+            value = new_params.pop(key)  # never leave a selector in params
+            if isinstance(refs.get(key), (list, dict, str)):
+                continue  # an explicit ref wins; the params copy is just dropped
+            refs[key] = value
+            moved.append(key)
+        feat["refs"] = refs
+        feat["params"] = new_params
+        if notes is not None:
+            for key in moved:
+                notes.append(f"{feat.get('name') or feat.get('type') or 'feature'}: "
+                             f"moved {key!r} from params to refs (the engine reads "
+                             f"geometry selectors from refs)")
+    return ops
+
+
 def _bare_sid(v: Any) -> Optional[str]:
     """The stable sid this ref value IS, or None (a datum / f<N> id / selector is not one)."""
     if not isinstance(v, str):
@@ -2889,6 +2943,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # sketch spelled "profile" used to slip past the sketch normalizer entirely.
             ops = _normalize_op_elements(ops, interpreted)
             ops = _normalize_feature_types(ops, interpreted)
+            # Geometry selectors written into `params` belong in `refs` — the
+            # model had the right edges, just the wrong bag. Runs before the
+            # sketch/primitive passes so they see the canonical layout.
+            ops = _migrate_ref_slots(ops, interpreted)
             # Model-robustness: accept the natural/flat sketch shape LLMs emit
             # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
             # to the engine's canonical schema before validation.

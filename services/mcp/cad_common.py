@@ -1503,6 +1503,23 @@ def _resolve_appearance(material: Union[str, dict, list, tuple]) -> dict:
     key = str(material).strip().lower()
     key = _APPEARANCE_ALIASES.get(key, key)
     if key not in _APPEARANCE_PRESETS:
+        # Engineering designations are what a CAD model actually says: "A36
+        # steel", "6061-T6 Al", "304 stainless", "PLA filament". These are
+        # APPEARANCE presets, so the right answer is the closest visual match,
+        # not a rejection (live 2026-07-27: haiku lost a call to each of
+        # "A36 steel" and "6061-T6 Al"). Longest name first so "stainless
+        # steel" never resolves as plain "steel".
+        import re as _re  # noqa: PLC0415
+        tokens = set(_re.findall(r"[a-z]+", key))
+        candidates = sorted(
+            set(_APPEARANCE_PRESETS) | set(_APPEARANCE_ALIASES),
+            key=len, reverse=True)
+        for cand in candidates:
+            hit = cand in key if " " in cand else cand in tokens
+            if hit:
+                key = _APPEARANCE_ALIASES.get(cand, cand)
+                break
+    if key not in _APPEARANCE_PRESETS:
         raise ValueError(
             f"Unknown appearance material {material!r}. Known: {sorted(_APPEARANCE_PRESETS)} "
             f"(or pass {{'color':[r,g,b], 'metallic':0..1, 'roughness':0..1}})."

@@ -9,8 +9,11 @@ AuthMiddleware — /app is intentionally NOT on the public allowlist.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import mimetypes
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -97,11 +100,54 @@ _APP_CSP = (
 )
 
 
+# The app's index.html carries inline bootstrap <script> blocks. Rather than
+# weakening script-src with 'unsafe-inline' (which would forfeit the XSS
+# protection on an authenticated surface), hash them and name the hashes. The
+# bundle is rebuilt by install_webd.sh, so the hashes are computed from the
+# file on disk and re-derived whenever its mtime/size changes — a rebuild can
+# never silently lock the client out again.
+_INLINE_SCRIPT_RE = re.compile(
+    rb"<script(?![^>]*\bsrc\s*=)[^>]*>(.*?)</script\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_csp_cache: dict[tuple[str, int, int], str] = {}
+
+
+def _csp_for_html(path: Path) -> str:
+    """_APP_CSP plus a sha256 source for each inline script in *path*."""
+    try:
+        st = path.stat()
+        key = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return _APP_CSP
+    cached = _csp_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        body = path.read_bytes()
+    except OSError:
+        return _APP_CSP
+    hashes = " ".join(
+        "'sha256-" + base64.b64encode(hashlib.sha256(m.group(1)).digest()).decode() + "'"
+        for m in _INLINE_SCRIPT_RE.finditer(body)
+    )
+    csp = _APP_CSP.replace(
+        "script-src 'self' 'wasm-unsafe-eval'",
+        f"script-src 'self' 'wasm-unsafe-eval' {hashes}".rstrip(),
+    ) if hashes else _APP_CSP
+    # Bounded: one entry per app html file, re-keyed on mtime.
+    if len(_csp_cache) > 64:
+        _csp_cache.clear()
+    _csp_cache[key] = csp
+    return csp
+
+
 def _coop_headers(path: Path) -> dict[str, str]:
+    csp = _csp_for_html(path) if path.suffix.lower() in {".html", ".htm"} else _APP_CSP
     return {
         "Cross-Origin-Opener-Policy": "same-origin",
         "Cross-Origin-Embedder-Policy": "require-corp",
-        "Content-Security-Policy": _APP_CSP,
+        "Content-Security-Policy": csp,
         "Cache-Control": _cache_control(path),
     }
 

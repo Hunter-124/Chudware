@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -2000,3 +2001,161 @@ def test_a_deliberately_empty_sketch_still_normalizes():
         {"type": "sketch", "name": "Empty", "params": {"plane": "top", "entities": []}}, [])
     assert feat["params"]["entities"] == []
     assert feat["params"]["constraints"] == []
+
+
+# ---------------------------------------------------------------------------
+# Live run run-96954661041418 (2026-07-28). Three add_features calls, three distinct
+# rejections, one abandoned part. Every payload below is verbatim from that ledger.
+
+def test_entity_kind_is_read_as_the_shape_word():
+    """Six valid lines saying "kind" instead of "type" were rejected one by one as
+    "not a sketch entity type" — a whole hexagon lost to a synonym."""
+    feat = M._normalize_sketch_feature({"type": "sketch", "name": "Hex1", "params": {
+        "plane": "XY", "entities": [
+            {"kind": "line", "p1": [30, 0], "p2": [15, 25.98]},
+            {"kind": "line", "p1": [15, 25.98], "p2": [-15, 25.98]}]}}, [])
+    ents = feat["params"]["entities"]
+    assert [e["type"] for e in ents] == ["line", "line"]
+    assert not any("kind" in e for e in ents)
+    assert ents[0]["p1"] == [30, 0] and ents[0]["p2"] == [15, 25.98]
+
+
+@pytest.mark.parametrize("alias", ["kind", "shape", "entity", "entity_type", "etype"])
+def test_every_entity_type_synonym_is_read(alias):
+    feat = M._normalize_sketch_feature({"type": "sketch", "name": "S", "params": {
+        "plane": "top", "entities": [{alias: "circle", "center": [0, 0], "radius": 4}]}}, [])
+    assert feat["params"]["entities"][0]["type"] == "circle"
+
+
+def test_an_explicit_type_beats_a_synonym():
+    """`kind` is also a legitimate word inside selectors — it must never override a
+    `type` the model actually wrote."""
+    feat = M._normalize_sketch_feature({"type": "sketch", "name": "S", "params": {
+        "plane": "top", "entities": [
+            {"type": "circle", "kind": "region", "center": [0, 0], "radius": 4}]}}, [])
+    assert feat["params"]["entities"][0]["type"] == "circle"
+
+
+def test_polygon_extrude_becomes_a_polygon_sketch_and_an_extrude():
+    """There is no prism primitive, so a model asks for the compound it wishes existed.
+    Sides, size and height are all present — that is a complete spec, not a guess."""
+    notes = []
+    out = M._expand_prisms([{"op": "add_feature", "feature": {
+        "type": "polygon_extrude", "name": "Level1",
+        "params": {"sides": 6, "radius": {"value": 30, "expr": None},
+                   "height": {"value": 20, "expr": None}}}}], notes)
+    assert [o["feature"]["type"] for o in out] == ["sketch", "extrude"]
+    ent = out[0]["feature"]["params"]["entities"][0]
+    assert ent == {"type": "polygon", "sides": 6, "center": [0, 0], "radius": 30}
+    assert out[1]["feature"]["params"] == {"mode": "boss", "depth": 20}
+    assert out[1]["feature"]["refs"]["profile"][0]["sketch"] == "Level1Profile"
+    assert any("polygon_extrude" in n for n in notes)
+
+
+def test_a_prism_word_implies_its_own_side_count():
+    out = M._expand_prisms([{"op": "add_feature", "feature": {
+        "type": "hexagonal_prism", "name": "Nut",
+        "params": {"across_flats": 17, "height": 6}}}], [])
+    ent = out[0]["feature"]["params"]["entities"][0]
+    assert ent["sides"] == 6
+    # across_flats is the INSCRIBED diameter: circumradius = (17/2) / cos(pi/6).
+    assert ent["radius"] == pytest.approx((17 / 2) / math.cos(math.pi / 6))
+
+
+def test_an_incomplete_prism_is_a_teaching_error_not_a_guess():
+    with pytest.raises(ValueError) as ei:
+        M._expand_prisms([{"op": "add_feature", "feature": {
+            "type": "polygon_extrude", "name": "X", "params": {"sides": 6}}}], [])
+    assert "radius" in str(ei.value) and "height" in str(ei.value)
+
+
+def test_a_plain_extrude_is_not_mistaken_for_a_prism():
+    """`extrude` carries the token but is the canonical feature — expanding it would
+    invent a profile the model never asked for."""
+    ops = [{"op": "add_feature", "feature": {"type": "extrude", "name": "E",
+                                             "params": {"depth": 5}}}]
+    assert M._expand_prisms(ops, []) is ops
+
+
+def test_profile_last_resolves_to_the_sketch_just_created():
+    """Five stacked sketch/extrude levels, every extrude saying params.sketch:"last" —
+    the whole batch was rejected with «profile 'last' -> 'last' not found» x4."""
+    notes = []
+    out = M._resolve_relative_profile_refs([
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "Hex2",
+                                          "params": {"plane": "top", "entities": []}}},
+        {"op": "add_feature", "feature": {"type": "extrude", "name": "Level2",
+                                          "params": {"sketch": "last", "depth": 20}}}], notes)
+    assert out[1]["feature"]["params"]["sketch"] == "$0"
+    assert any("relative profile word" in n for n in notes)
+
+
+def test_relative_profile_picks_the_NEAREST_preceding_sketch():
+    out = M._resolve_relative_profile_refs([
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "A", "params": {}}},
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "B", "params": {}}},
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "E",
+            "refs": {"profile": [{"kind": "region", "sketch": "previous"}]}}}], [])
+    assert out[2]["feature"]["refs"]["profile"][0]["sketch"] == "$1"
+
+
+def test_relative_words_are_not_applied_to_face_or_edge_slots():
+    """"last" in a topology slot is not this sketch, and guessing there would silently
+    select the wrong geometry."""
+    ops = [{"op": "add_feature", "feature": {"type": "sketch", "name": "A", "params": {}}},
+           {"op": "add_feature", "feature": {"type": "fillet", "name": "F",
+                                             "refs": {"edges": ["last"]}}}]
+    assert M._resolve_relative_profile_refs(ops, [])[1]["feature"]["refs"]["edges"] == ["last"]
+
+
+def test_a_relative_word_with_no_preceding_sketch_is_left_alone():
+    ops = [{"op": "add_feature", "feature": {"type": "extrude", "name": "E",
+                                             "params": {"sketch": "last", "depth": 5}}}]
+    assert M._resolve_relative_profile_refs(ops, []) is ops
+
+
+@enginetest
+@pytest.mark.parametrize("case", ["prism", "kind_entities", "profile_last"])
+def test_the_live_run_96954661041418_batches_build(case):
+    """Each of the three rejected calls, verbatim, must now produce real geometry."""
+    from services.agent.agent_turn import _bind_tool
+    from services.mcp import cad_common as cc
+    doc = json.loads(_bind_tool("new_part")(name=f"live_{case}"))["doc_id"]
+    ops = {
+        "prism": [{"op": "add_feature", "feature": {
+            "type": "polygon_extrude", "name": "Level1",
+            "params": {"sides": 6, "radius": {"value": 30, "expr": None},
+                       "height": {"value": 20, "expr": None}}}}],
+        "kind_entities": [{"op": "add_feature", "feature": {
+            "type": "sketch", "name": "Hex1", "params": {"plane": "XY", "entities": [
+                {"kind": "line", "p1": [30, 0], "p2": [15, 25.98]},
+                {"kind": "line", "p1": [15, 25.98], "p2": [-15, 25.98]},
+                {"kind": "line", "p1": [-15, 25.98], "p2": [-30, 0]},
+                {"kind": "line", "p1": [-30, 0], "p2": [-15, -25.98]},
+                {"kind": "line", "p1": [-15, -25.98], "p2": [15, -25.98]},
+                {"kind": "line", "p1": [15, -25.98], "p2": [30, 0]}]}}}],
+        "profile_last": [
+            {"op": "add_feature", "feature": {"type": "sketch", "name": "Hex2", "params": {
+                "plane": "XY", "entities": [
+                    {"type": "line", "start": [25.11, 6.73], "end": [6.73, 25.11]},
+                    {"type": "line", "start": [6.73, 25.11], "end": [-18.39, 18.39]},
+                    {"type": "line", "start": [-18.39, 18.39], "end": [-25.11, -6.73]},
+                    {"type": "line", "start": [-25.11, -6.73], "end": [-6.73, -25.11]},
+                    {"type": "line", "start": [-6.73, -25.11], "end": [18.39, -18.39]},
+                    {"type": "line", "start": [18.39, -18.39], "end": [25.11, 6.73]}]}}},
+            {"op": "add_feature", "feature": {"type": "extrude", "name": "Level2", "params": {
+                "sketch": "last", "depth": {"value": 20, "expr": None}}}}],
+    }[case]
+    r = json.loads(_bind_tool("add_features")(doc_id=doc, ops=ops))
+    assert r["ok"] is True, r.get("error")
+    if case == "kind_entities":
+        tree = json.loads(_bind_tool("get_part")(doc_id=doc))["tree"]
+        ents = tree["features"][0]["params"]["entities"]
+        assert len(ents) == 6 and {e["type"] for e in ents} == {"line"}
+        return
+    # Both solid cases must be a real hexagonal prism 20 tall, not a sliver or a point.
+    size = cc.cb.call("doc_bbox", {"doc_id": doc})["size"]
+    assert size[2] == pytest.approx(20, abs=1e-3)
+    expect_x = 60.0 if case == "prism" else 50.22
+    assert size[0] == pytest.approx(expect_x, abs=1e-2)

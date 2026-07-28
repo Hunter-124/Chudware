@@ -9,6 +9,7 @@ from typing import Union
 
 from pydantic import Field  # noqa: TC002 — runtime-read by FastMCP's schema builder
 import json
+import math
 import os
 import re
 
@@ -236,6 +237,24 @@ def _expand_polyline(ent: dict, start_id: int) -> list:
              "p1": list(a), "p2": list(b)} for i, (a, b) in enumerate(segs)]
 
 
+#: What a model calls the field naming a sketch entity's shape. The engine reads only
+#: `type`; a live run (2026-07-28) sent a perfectly valid six-line hexagon as
+#: {"kind":"line","p1":…,"p2":…} and every entity was rejected as "not a sketch entity
+#: type" — a whole sketch lost to one synonym.
+_ENTITY_TYPE_ALIASES = ("kind", "shape", "entity", "entity_type", "etype", "geom_type")
+
+
+def _entity_type_alias(e: dict) -> Optional[str]:
+    """The alias key carrying this entity's shape word, when `type` is missing."""
+    if isinstance(e.get("type"), str) and e["type"].strip():
+        return None
+    for k in _ENTITY_TYPE_ALIASES:
+        v = e.get(k)
+        if isinstance(v, str) and v.strip():
+            return k
+    return None
+
+
 def _sketch_needs_norm(feat: dict, params: dict) -> bool:
     ents = params.get("entities") if isinstance(params.get("entities"), list) else feat.get("entities")
     cons = params.get("constraints") if isinstance(params.get("constraints"), list) else feat.get("constraints")
@@ -259,6 +278,8 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
     for e in (ents or []):
         if not isinstance(e, dict):
             continue
+        if _entity_type_alias(e):
+            return True
         # An object-form point ({"x":…,"y":…}) on an otherwise canonical entity: the
         # engine reads points only as arrays and would silently place the shape at the
         # origin, so this needs normalizing even though nothing else looks wrong.
@@ -481,10 +502,16 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     # endpoints, x/y for a lone point) — tracked here so a 29-circle lattice sketch
     # emits ONE batch note, not one per entity.
     used_shorthand: set[str] = set()
+    used_alias_keys: set[str] = set()
     for e in ents_in:
         if not isinstance(e, dict):
             norm_ents.append(e)
             continue
+        alias = _entity_type_alias(e)
+        if alias:
+            # {"kind":"line",…} — the shape word is right, the FIELD name is a synonym.
+            e = {"type": e[alias], **{k: v for k, v in e.items() if k != alias}}
+            used_alias_keys.add(alias)
         if _slug(e.get("type")) in _POLYLINE_TYPES:
             seg = _expand_polyline(e, eid)
             if seg:
@@ -573,7 +600,10 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             for k in ("center", "corner1", "corner2", "p1", "p2", "start", "end"):
                 if k in ne:
                     coerced = _xy(ne[k])
-                    if coerced is not ne[k]:
+                    # By VALUE: _xy hands back a fresh list even for an already-canonical
+                    # [x,y], and an identity test made every polygon claim a rewrite that
+                    # never happened — a note that teaches the model a lie.
+                    if coerced != ne[k]:
                         ne[k] = coerced
                         used_shorthand.add("point_obj")
             if "center" not in ne:
@@ -585,6 +615,11 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
                     used_shorthand.add("center")
         norm_ents.append(ne)
 
+    if used_alias_keys:
+        sink.append(
+            f'{_feat_label(feat, "sketch")}: read the entity shape word from '
+            f'{"/".join(sorted(used_alias_keys))} as `type` — a sketch entity names its '
+            f'shape in "type" ({{"type":"line","p1":[x,y],"p2":[x,y]}})')
     if used_shorthand:
         rewrites = []
         if "center" in used_shorthand:
@@ -950,6 +985,21 @@ def _dim_mm(s: Any) -> Optional[Union[int, float]]:
 
 def _is_num(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _plain_num(v: Any) -> Optional[float]:
+    """The number a param carries, however it is spelled: bare, numeric string, or the
+    canonical {"value":N,"expr":null} dim object. None for a real expression."""
+    if _is_num(v):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return None
+    if isinstance(v, dict) and not v.get("expr") and _is_num(v.get("value")):
+        return float(v["value"])
+    return None
 
 
 def _is_dim_object(v: Any) -> bool:
@@ -1728,6 +1778,111 @@ def _expand_face_pockets(ops: Any, notes: list) -> Any:
         out.extend(pair)
     if not changed:
         return ops
+    if any(k != v for k, v in shift.items()):
+        out = [_shift_batch_placeholders(o, shift) for o in out]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# EXTRUDED-POLYGON sugar. The primitive vocabulary has box/cylinder/cone/sphere but no
+# prism, so a model that wants a hexagonal slab writes the compound it wishes existed:
+# {"type":"polygon_extrude","params":{"sides":6,"radius":30,"height":20}} (live run
+# 2026-07-28, five stacked levels, rejected on the first op). The intent is complete and
+# unambiguous — sides, size and height are all there — and a prism IS a polygon sketch
+# plus an extrude, so build that pair instead of teaching the model to type it out.
+_POLY_SIDE_WORDS = {"triangle": 3, "triangular": 3, "square": 4, "pentagon": 5,
+                    "pentagonal": 5, "hexagon": 6, "hexagonal": 6, "hex": 6,
+                    "heptagon": 7, "octagon": 8, "octagonal": 8, "nonagon": 9,
+                    "decagon": 10}
+_PRISM_TOKENS = ("extrude", "extrusion", "extruded", "prism", "prismatic")
+_PRISM_SIDE_KEYS = ("sides", "n_sides", "num_sides", "side_count", "edges", "n")
+_PRISM_HEIGHT_KEYS = ("height", "depth", "thickness", "length", "extent", "h")
+
+
+def _prism_spec(ftype: str) -> Optional[int]:
+    """Sides implied by a compound feature-type word, or 0 when it says "polygon" without
+    naming a shape. None when the word is not an extruded-polygon request at all."""
+    parts = set(_slug(ftype).split("_"))
+    if not (parts & set(_PRISM_TOKENS)):
+        return None
+    for word in parts:
+        if word in _POLY_SIDE_WORDS:
+            return _POLY_SIDE_WORDS[word]
+    if parts & {"polygon", "ngon", "poly"}:
+        return 0
+    return None
+
+
+def _prism_pair(feat: dict, notes: list) -> Optional[list]:
+    """[sketch, extrude] for an extruded-polygon feature, or None when `feat` is not one."""
+    implied = _prism_spec(feat.get("type"))
+    if implied is None:
+        return None
+    params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+    name = feat.get("name") if isinstance(feat.get("name"), str) and feat["name"] else "Prism"
+    sides = next((int(n) for k in _PRISM_SIDE_KEYS
+                  if (n := _plain_num(params.get(k))) is not None), implied or 0)
+    radius = _plain_num(params.get("radius") if params.get("radius") is not None
+                        else params.get("circumradius") or params.get("r"))
+    if radius is None:
+        dia = _plain_num(params.get("diameter") or params.get("d")
+                         or params.get("across_corners"))
+        if dia is not None:
+            radius = dia / 2.0
+    if radius is None and sides >= 3:
+        # Across-flats/apothem is the inscribed radius: circumradius = a / cos(pi/n).
+        flats = _plain_num(params.get("across_flats") or params.get("apothem")
+                           or params.get("width"))
+        if flats is not None:
+            apothem = flats / 2.0 if params.get("apothem") is None else flats
+            radius = apothem / math.cos(math.pi / sides)
+    height = next((_plain_num(params[k]) for k in _PRISM_HEIGHT_KEYS
+                   if _plain_num(params.get(k)) is not None), None)
+    if sides < 3 or radius is None or height is None:
+        raise ValueError(
+            f'"{feat.get("type")}" is an extruded polygon, which this kernel builds as a '
+            f"polygon SKETCH plus an extrude — but the spec is incomplete: got sides="
+            f"{sides or None}, radius={radius}, height={height}. Give all three (radius "
+            f"is to a CORNER; across_flats works too), or write the two features yourself.")
+    center = _xy(params.get("center") or params.get("at") or [0, 0])
+    plane = params.get("plane") or (feat.get("refs") or {}).get("plane") or "top"
+    sk_name = f"{name}Profile"
+    sketch = {"op": "add_feature", "feature": {
+        "type": "sketch", "name": sk_name,
+        "params": {"plane": plane, "entities": [
+            {"type": "polygon", "sides": sides, "center": center,
+             "radius": _clean_num(radius)}]}}}
+    extrude = {"op": "add_feature", "feature": {
+        "type": "extrude", "name": name,
+        "refs": {"profile": [{"kind": "region", "sketch": sk_name, "hint_index": 0}]},
+        "params": {"mode": params.get("mode") or "boss", "depth": _clean_num(height)}}}
+    notes.append(
+        f'{name}: expanded "{feat.get("type")}" into the canonical pair — a '
+        f"{sides}-sided polygon sketch \"{sk_name}\" of radius {_clean_num(radius)} on "
+        f"{plane}, then an extrude of depth {_clean_num(height)} through "
+        f'refs.profile=[{{"kind":"region","sketch":"{sk_name}"}}]. There is no prism '
+        f"primitive: every extruded profile is those two features")
+    return [sketch, extrude]
+
+
+def _expand_prisms(ops: Any, notes: list) -> Any:
+    """Expand every extruded-polygon feature into its sketch+extrude pair."""
+    if not isinstance(ops, list) or not any(
+            isinstance(el, dict) and isinstance(el.get("feature"), dict)
+            and _prism_spec((el["feature"] or {}).get("type")) is not None for el in ops):
+        return ops
+    out: list = []
+    shift: dict = {}
+    for i, el in enumerate(ops):
+        pair = None
+        if isinstance(el, dict) and isinstance(el.get("feature"), dict):
+            pair = _prism_pair(el["feature"], notes)
+        if pair is None:
+            shift[f"${i}"] = f"${len(out)}"
+            out.append(el)
+            continue
+        shift[f"${i}"] = f"${len(out) + 1}"  # the prism IS the extrude, not its sketch
+        out.extend(pair)
     if any(k != v for k, v in shift.items()):
         out = [_shift_batch_placeholders(o, shift) for o in out]
     return out
@@ -2996,6 +3151,68 @@ def _normalize_feature_schema(feat: dict, ftype: str, notes: list) -> dict:
     return out
 
 
+#: "the sketch I just made". A live run (2026-07-28) built five stacked hexagon levels as
+#: sketch/extrude pairs, every extrude carrying params.sketch:"last", and the whole batch
+#: was rejected — «profile 'last' -> 'last' not found» ×4 — because a profile ref must name
+#: an f<N> id or a "$N" batch position. The word is unambiguous when this batch created a
+#: sketch before that feature, so resolve it there and nowhere else.
+_RELATIVE_PROFILE_WORDS = frozenset({
+    "last", "latest", "previous", "prev", "prior", "above", "preceding", "current",
+    "this", "it", "last_sketch", "previous_sketch", "prev_sketch", "current_sketch",
+    "the_last_sketch", "last_one", "recent", "most_recent"})
+
+#: Where a profile lives. Deliberately NOT every slot: "last" in refs.face/refs.edges is
+#: not this sketch, and guessing there would silently pick the wrong geometry.
+_PROFILE_SLOTS = ("profile", "profiles", "sections", "section", "sketch")
+
+
+def _sub_relative_profile(v: Any, target: str) -> Any:
+    """Swap a relative profile word for `target`, through a list or a region selector."""
+    if isinstance(v, str):
+        return target if _slug(v) in _RELATIVE_PROFILE_WORDS else v
+    if isinstance(v, list):
+        return [_sub_relative_profile(x, target) for x in v]
+    if isinstance(v, dict) and isinstance(v.get("sketch"), str):
+        sk = _sub_relative_profile(v["sketch"], target)
+        return v if sk == v["sketch"] else {**v, "sketch": sk}
+    return v
+
+
+def _resolve_relative_profile_refs(ops: Any, notes: list) -> Any:
+    """`params.sketch:"last"` -> the "$N" of the nearest sketch EARLIER in this batch."""
+    if not isinstance(ops, list):
+        return ops
+    out, last_sketch, hits = [], None, []
+    for i, op in enumerate(ops):
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if not (isinstance(feat, dict) and op.get("op") == "add_feature"):
+            out.append(op)
+            continue
+        if last_sketch is not None:
+            nf = dict(feat)
+            for holder in ("refs", "params"):
+                src = nf.get(holder)
+                if not isinstance(src, dict):
+                    continue
+                new = {k: (_sub_relative_profile(v, last_sketch) if k in _PROFILE_SLOTS else v)
+                       for k, v in src.items()}
+                if new != src:
+                    nf[holder] = new
+            if nf != feat:
+                hits.append(feat.get("name") or f"op {i}")
+                op = {**op, "feature": nf}
+        if _slug(feat.get("type")) == "sketch":
+            last_sketch = f"${i}"
+        out.append(op)
+    if not hits:
+        return ops  # identity — nothing to renumber, nothing to say
+    notes.append(
+        "resolved the relative profile word on " + ", ".join(str(h) for h in hits)
+        + ' to the sketch created earlier in this batch — a profile names an f<N> id '
+          'or a "$N" position, never "last"/"previous"')
+    return out
+
+
 def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
     """Rewrite a reference to a feature this SAME batch creates, by NAME, into its "$N".
 
@@ -3793,6 +4010,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # two features, so it expands BEFORE the op-element pass aliases it onto a
             # bare, profile-less extrude.
             ops = _expand_face_pockets(ops, interpreted)
+            # …and an extruded-polygon compound, before the vocabulary check rejects it.
+            ops = _expand_prisms(ops, interpreted)
             # Give every element an `op` (a bare feature dict is the single most common
             # rejection in the field) and map every feature TYPE onto the engine vocabulary
             # FIRST — the sketch/primitive passes below branch on the canonical type, so a
@@ -3823,6 +4042,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             ops = _resolve_sid_refs(ops, d, interpreted)
             # Finally, a ref that names a feature THIS batch creates -> its "$N" placeholder.
             ops = _resolve_batch_name_refs(ops, interpreted)
+            # …and "the sketch I just made", which no name table can carry.
+            ops = _resolve_relative_profile_refs(ops, interpreted)
             interpreted = _interpreted_notes(interpreted)
 
             def _apply() -> dict:

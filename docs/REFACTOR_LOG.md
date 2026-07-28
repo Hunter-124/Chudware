@@ -5171,3 +5171,29 @@ it. That bookkeeping is the subtle part, so it is GL-free in its own TU
 break claimed, inserts/deletes before and after it, backspacing the break, a selection delete
 spanning one break of two, multi-line paste, the wrapper's own same-length swap inventing
 nothing, external re-seed, sortedness.
+
+Second live batch, run-96954661041418 (2026-07-28) — three add_features calls, three
+distinct rejections, one abandoned part. All three are now normalized and replayed as
+tests (`test_the_live_run_96954661041418_batches_build`), and each was a whole class:
+(1) `{"kind":"line","p1":…,"p2":…}` — a perfectly valid six-line hexagon lost to ONE
+synonym, rejected entity-by-entity as "not a sketch entity type". `_entity_type_alias`
+now reads the shape word from kind/shape/entity/entity_type/etype/geom_type, and an
+explicit `type` always wins (`kind` is also a legitimate word inside a selector).
+(2) `{"type":"polygon_extrude","params":{"sides":6,"radius":30,"height":20}}` — the
+primitive vocabulary has box/cylinder/cone/sphere but no PRISM, so the model wrote the
+compound it wished existed. The spec is complete, and a prism IS a polygon sketch plus an
+extrude, so `_expand_prisms` builds that pair (same `$N`-shifting machinery as
+`_expand_face_pockets`; the prism resolves to the EXTRUDE, not its sketch). It reads the
+side count from the word itself ("hexagonal_prism") and accepts across_flats/apothem
+(circumradius = a/cos(pi/n)); an incomplete spec raises a teaching ValueError rather than
+guessing, and a plain `extrude` is never claimed. (3) `params.sketch:"last"` on five
+stacked levels — «profile 'last' -> 'last' not found» ×4, batch discarded.
+`_resolve_relative_profile_refs` maps last/previous/prev/current/… to the "$N" of the
+NEAREST sketch earlier in the batch, and only in profile slots: "last" in refs.edges is
+not this sketch, and resolving it there would silently pick the wrong geometry.
+Also: `validate_entity`'s rejection now names the offending value AND the vocabulary
+("absent is not a sketch entity type … Sketch entity types: arc, arc_slot, circle, …") —
+the old bare string told a model nothing, which is why it got six identical contentless
+errors and gave up. And the flat-shorthand note compared points by IDENTITY, so `_xy`
+returning a fresh list made every polygon claim a `{"x":…} -> [x,y]` rewrite that never
+happened — a note that teaches the model a lie. Compared by value now.

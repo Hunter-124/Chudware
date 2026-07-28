@@ -944,7 +944,19 @@ vector<string> validate_entity(const json& e, const string& where) {
     string etype = etypej.is_string() ? etypej.get<string>() : "";
     auto fit = ENTITY_FIELDS.find(etype);
     if (!etypej.is_string() || fit == ENTITY_FIELDS.end()) {
-        return {where + ".type: not a sketch entity type"};
+        // Name the offending value AND the vocabulary. The bare "not a sketch entity type"
+        // this used to emit told a model nothing: a live run (2026-07-28) sent a valid
+        // hexagon whose entities said "kind" instead of "type", got six identical
+        // contentless rejections, and abandoned the sketch.
+        string got = etypej.is_string() ? ("\"" + etype + "\"")
+                     : etypej.is_null()  ? "absent"
+                                         : "not a string";
+        string known;
+        for (const auto& kv : ENTITY_FIELDS) {
+            known += (known.empty() ? "" : ", ") + kv.first;
+        }
+        return {where + ".type: " + got + " is not a sketch entity type. An entity names "
+                "its shape in \"type\". Sketch entity types: " + known};
     }
     const json& id = get(e, "id");
     if (!id.is_string() || !std::regex_match(id.get<string>(), ENTITY_ID_RE)) {

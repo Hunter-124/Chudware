@@ -433,10 +433,17 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
 
     # Fresh ledger for this cell (its own file under the run dir). A cell is
     # deterministic, so a re-run must start CLEAN — the Ledger loads-from-disk if the
-    # file exists (appending would double-write events on re-run). Remove any stale one.
+    # file exists (appending would double-write events on re-run).
+    #
+    # The Ledger now keeps its events in a `ledger.jsonl` SIDECAR (services/agent/
+    # ledger.py: `_events_path = path.with_suffix(".jsonl")`) and ledger.json holds
+    # only the materialized state snapshot. Deleting ledger.json alone therefore left
+    # the sidecar behind and the next Ledger() APPENDED to the previous cell's events
+    # — exactly the double-write this cleanup exists to prevent. Drop BOTH.
     ledger_path = run_dir / "ledger.json"
-    if ledger_path.exists():
-        ledger_path.unlink()
+    for stale in (ledger_path, ledger_path.with_suffix(".jsonl")):
+        if stale.exists():
+            stale.unlink()
     ledger = Ledger(run_id, path=ledger_path)
     ledger.set_brief("pipeline", title=f"Gym {challenge.id}", summary=challenge.request[:400])
 
@@ -467,7 +474,15 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     # GAP-INJECT (WI-6): after scripted/real build tool_calls, apply declared faults.
     apply_inject_faults(ledger, challenge)
 
-    ledger_doc = json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))
+    # The gym run dir is a self-contained replay bundle, and its ledger.json is the
+    # WHOLE-document (`events` + `state`) shape every gym consumer reads: the graders
+    # and classifier below, cli.py, monitor.py, report.py, leaderboard.py and the
+    # offline replay_ledger_failures corpus miner. Since the live Ledger writes only
+    # the state snapshot to that path, re-reading the file yielded a doc with NO
+    # events — every acceptance criterion then graded FAIL on an empty ledger. Publish
+    # the full document from the in-memory ledger instead.
+    ledger_doc = {"events": list(ledger.events), "state": ledger.state}
+    ledger_path.write_text(json.dumps(ledger_doc, indent=2), encoding="utf-8")
 
     # Division HARD tool surface (WI-1.4): LOCAL never offers vision tools.
     tools_offered = default_tools_for_division(division)
@@ -671,6 +686,104 @@ def _provider_for_tier(tier: str):
 
 
 
+def _drive_mission_pipeline(challenge: Challenge, run_id: str, *,
+                            provider, execute_dag: bool) -> dict:
+    """Drive the mission pipeline for ONE gym cell and return its mission record.
+
+    T-RF5 deleted the Python mission front door (``services.agent.loop.run_mission``)
+    in favour of the C++ core's ``agent_mission_v1``, but the gym kept calling it —
+    so every cell's mission record had been the string
+    ``AttributeError: module 'services.agent.loop' has no attribute 'run_mission'``.
+    The gym grades the PYTHON ledger the pipeline writes, so it cannot go through the
+    core RPC; it composes the surviving deterministic primitives itself, in the same
+    order and with the same phase/status vocabulary the deleted front door used:
+
+      INTAKE (fixture ``intake_fn``) → ``validate_manifest`` → manifest + AC mirror
+      into the ledger → ``PhaseMachine`` INTAKE gate → ``build_mission_graph`` →
+      ``services.dag.executor.run`` when ``execute_dag``.
+
+    With ``execute_dag=False`` the mission is PLANNED only: status ``running``, phase
+    ``plan``, ``intake`` completed — the contract the gym's mock cells grade against.
+    No phase past PLAN is ever reported without a DAG result behind it; this function
+    never fabricates a gate verdict it did not run.
+    """
+    from services.agent.ledger import Ledger
+    from services.agent.pipeline import (Phase, PhaseMachine, PipelineFlags,
+                                         blocking_ambiguities, manifest_valid,
+                                         validate_manifest)
+    from services.dag.mission_template import build_mission_graph
+
+    flags = PipelineFlags.from_env()
+    ledger = Ledger.load(run_id)
+    ledger.set_brief("pipeline", title=f"Mission {run_id}",
+                     summary=challenge.request[:400])
+
+    manifest = make_intake_fn(challenge)(challenge.request)
+    findings = validate_manifest(manifest)
+    finding_strs = [str(f) for f in findings]
+    if not manifest_valid(findings):
+        return {"status": "blocked", "phase": Phase.INTAKE.value,
+                "phases_completed": [], "findings": finding_strs,
+                "stop_reason": "manifest_invalid"}
+
+    # Mirror the manifest (and every AC as a requirement) into the ledger, as the
+    # front door did: ledger_get(section="manifest"/"requirements") and the gym's
+    # own graders both read these, and an empty requirements list used to send
+    # models thrashing (mega-2).
+    ledger.add_artifact(
+        "intake_analyst", "manifest", "manifest", path="",
+        stage=Phase.INTAKE.value,
+        note=f"{len(manifest.get('deliverables', []))} deliverables",
+        manifest=manifest)
+    for deliverable in (manifest.get("deliverables") or []):
+        if not isinstance(deliverable, dict):
+            continue
+        did = deliverable.get("id") or "?"
+        for ac in (deliverable.get("acceptance_criteria") or []):
+            if not isinstance(ac, dict):
+                continue
+            ac_id = ac.get("id") or "?"
+            ledger.add_requirement("intake_analyst", f"{did}/{ac_id}",
+                                   ac.get("text") or f"{did} {ac_id}",
+                                   source="manifest", status="open")
+
+    machine = PhaseMachine(ledger=ledger, flags=flags)
+    machine.enter(Phase.INTAKE)
+    machine.exit(Phase.INTAKE, machine.run_gate(Phase.INTAKE,
+                                                {"manifest_findings": findings}))
+    completed = [Phase.INTAKE.value]
+
+    # A blocking ambiguity halts at CLARIFY — the pipeline never invents answers.
+    if blocking_ambiguities(findings):
+        machine.enter(Phase.CLARIFY)
+        return {"status": "blocked", "phase": Phase.CLARIFY.value,
+                "phases_completed": completed, "findings": finding_strs,
+                "stop_reason": "blocking_ambiguity"}
+
+    graph = build_mission_graph(manifest, graph_id=run_id,
+                               org_layer=flags.org_layer, default_autonomy="auto")
+    if not execute_dag:
+        return {"status": "running", "phase": Phase.PLAN.value,
+                "phases_completed": completed, "findings": finding_strs,
+                "stop_reason": None}
+
+    from services.dag import executor as dag_exec
+    from services.dag import node_runner
+    # Bind the mission ledger + THIS cell's provider into the node agent_fn, so node
+    # turns land as real events and a local-* tier cannot leak to the ambient cloud
+    # default (the provider-leak half of T-DP19).
+    agent_fn = node_runner.make_default_agent_fn(ledger=ledger, provider=provider)
+    dag_result = dag_exec.run(graph, run_id=run_id, agent_fn=agent_fn,
+                              autonomy_default="auto")
+    dag_status = str(dag_result.get("status") or "")
+    # Report the DAG's own verdict; do NOT claim phases whose exit gates never ran.
+    status = {"done": "done", "paused": "blocked"}.get(dag_status, "failed")
+    return {"status": status, "phase": Phase.PLAN.value,
+            "phases_completed": completed, "findings": finding_strs,
+            "stop_reason": None if status == "done" else f"dag_{dag_status or 'unknown'}",
+            "dag_status": dag_status, "mode": "real"}
+
+
 def _run_mission_real(challenge: Challenge, run_id: str, tier: str) -> dict | None:
     """Drive the FULL pipeline for a REAL cell (T-W30): execute_dag=True with the
     node_runner's real tool-executing agent_fn and the tier's provider (T-DP19: a
@@ -679,48 +792,45 @@ def _run_mission_real(challenge: Challenge, run_id: str, tier: str) -> dict | No
     Honest failure handling: a mission/DAG/model error is CAPTURED into the mission
     record (and the ledger already holds whatever real events were emitted), never
     swallowed — the C1 proof needs the observed failure class, not a hidden stub."""
-    # A cell is deterministic, so a re-run must start CLEAN: run_mission does
-    # Ledger.load(run_id) which APPENDS to any existing mission ledger — a stale
-    # file from an earlier attempt would contaminate the folded events. Same rule
-    # as the gym cell ledger above.
+    # A cell is deterministic, so a re-run must start CLEAN: the mission ledger is
+    # loaded by run_id and APPENDS to whatever is on disk — a stale file from an
+    # earlier attempt would contaminate the folded events. Same rule as the gym cell
+    # ledger above, and same sidecar caveat: events live in the .jsonl next to it.
     try:
         from services.agent.ledger import run_ledger_path
         mp = run_ledger_path(run_id)
-        if mp.exists():
-            mp.unlink()
+        for stale in (mp, mp.with_suffix(".jsonl")):
+            if stale.exists():
+                stale.unlink()
     except Exception:  # noqa: BLE001 — best-effort cleanup
         pass
     try:
-        from services.agent import loop
         provider = _provider_for_tier(tier)  # local-* → bundled qwen3-4b, not ambient cloud (T-DP19)
-        mr = loop.run_mission(
-            challenge.request, provider,
-            name=run_id, intake_fn=make_intake_fn(challenge),
-            execute_dag=True, autonomy_default="auto")
-        return {"status": mr.status, "phase": mr.phase,
-                "phases_completed": mr.phases_completed,
-                "findings": mr.findings, "stop_reason": mr.stop_reason,
-                "mode": "real"}
+        rec = _drive_mission_pipeline(challenge, run_id, provider=provider,
+                                      execute_dag=True)
+        rec.setdefault("mode", "real")
+        return rec
     except Exception as exc:  # a real-run failure is DATA, not a crash
         return {"status": "error", "phase": "intake", "mode": "real",
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _merge_mission_ledger(run_id: str, gym_ledger) -> None:
-    """Fold the mission's own ledger (written by run_mission at the default run path)
-    into the gym cell ledger, so the real events land in the committed run dir.
+    """Fold the mission's own ledger into the gym cell ledger, so the real events land
+    in the committed run dir.
 
-    run_mission does ``Ledger.load(run_id)`` → ``run_ledger_path(run_id)``; the gym
-    ledger is a separate file under the run dir.  We copy the mission events across
-    (skipping the gym's own brief) so grading/classification see the real turns."""
+    The mission ledger lives at ``run_ledger_path(run_id)``; the gym ledger is a
+    separate file under the run dir. We copy the mission events across (skipping the
+    gym's own brief) so grading/classification see the real turns.
+
+    Read the events through ``Ledger`` rather than by parsing the json: events live in
+    the ``.jsonl`` sidecar now, so reading ledger.json directly folded NOTHING."""
     try:
-        from services.agent.ledger import run_ledger_path
-        import json as _json
+        from services.agent.ledger import Ledger, run_ledger_path
         mp = run_ledger_path(run_id)
-        if not mp.exists():
+        if not mp.exists() and not mp.with_suffix(".jsonl").exists():
             return
-        mdoc = _json.loads(mp.read_text(encoding="utf-8"))
-        for ev in mdoc.get("events", []):
+        for ev in Ledger(run_id, path=mp).events:
             if ev.get("kind") == "brief":
                 continue  # the gym ledger already has its own brief
             gym_ledger.append(ev.get("actor", "mission"), ev.get("kind", "note"),
@@ -730,17 +840,11 @@ def _merge_mission_ledger(run_id: str, gym_ledger) -> None:
 
 
 def _run_mission_safe(challenge: Challenge, run_id: str) -> dict | None:
-    """Drive run_mission for its INTAKE + validate + compile phases. Never fatal."""
+    """Drive the pipeline's INTAKE + validate + compile phases (no DAG). Never fatal."""
     try:
-        from services.agent import loop
         from services.agent.providers.mock_provider import MockProvider
-        mr = loop.run_mission(
-            challenge.request, MockProvider([]),
-            name=run_id, intake_fn=make_intake_fn(challenge),
-            execute_dag=False, autonomy_default="auto")
-        return {"status": mr.status, "phase": mr.phase,
-                "phases_completed": mr.phases_completed,
-                "findings": mr.findings, "stop_reason": mr.stop_reason}
+        return _drive_mission_pipeline(challenge, run_id,
+                                       provider=MockProvider([]), execute_dag=False)
     except Exception as exc:  # a pipeline error must not sink the gym cell
         return {"status": "error", "phase": "intake", "error": f"{type(exc).__name__}: {exc}"}
 

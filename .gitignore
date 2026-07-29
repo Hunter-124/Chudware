@@ -125,3 +125,6 @@ signal-desktop*
 services/corpora/
 .omp/
 repomix-output.*
+
+# Per-project agent memory (mnemopi SQLite) — runtime state, created on demand.
+.plm/

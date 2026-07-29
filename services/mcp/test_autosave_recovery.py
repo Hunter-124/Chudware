@@ -180,6 +180,217 @@ class TestKill9Recovery:
         assert not stale_step.exists(), "Stale autosave should have been pruned"
         assert (autosave_dir / f"{fresh_id}.step+").exists(), "Fresh autosave must survive"
 
+# ---------------------------------------------------------------------------
+# 2b. Autosave DEBRIS: a big pile must not poison the rest of the turn, and
+#     retention must not silently eat a part nobody saved.
+#
+# Measured on the real workstation pile (~/.local/share/Chudware/mcp_autosave,
+# 2,000 snapshots / 512 sessions / 270 docs in the largest session) BEFORE the fix:
+#   recover_autosaved(scope="recent") opened 270 docs, scope="all" opened 1,803;
+#   the next doc-scoped call then either silently adopted whichever snapshot sorted
+#   last, or refused with doc_ambiguous naming 108 (recent) / 619 (all) candidates.
+# Everything below synthesises its own pile in tmp_path — the real data dir is
+# never read or written by these tests.
+# ---------------------------------------------------------------------------
+
+def _write_snapshot(d, session, doc_id, name, saved_at):
+    """One autosave snapshot + sidecar, mtime pinned to `saved_at`."""
+    stem = f"{session}-{doc_id}"
+    (d / f"{stem}.step+").write_bytes(b"MOCK")
+    (d / f"{stem}.json").write_text(json.dumps(
+        {"session": session, "doc_id": doc_id, "name": name, "saved_at": saved_at}))
+    os.utime(d / f"{stem}.step+", (saved_at, saved_at))
+    return d / f"{stem}.step+"
+
+
+class TestAutosaveDebris:
+    SESSIONS = 512          # distinct sessions on disk
+    RECENT_DOCS = 270       # docs in the most-recent prior session
+    NAMES = ["bracket", "plate", "AI part", "bracket", "housing"]
+
+    def _pile(self, tmp_path, monkeypatch):
+        """Synthesise the measured pile shape. Returns (dir, recent_session)."""
+        d = tmp_path / "debris"
+        d.mkdir()
+        monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", str(d))
+        monkeypatch.setattr(cad_tools, "_SESSION_ID", "cur000000000")
+        monkeypatch.setattr(cad_tools, "_DOC_ALIASES", {})
+        monkeypatch.setattr(cad_tools, "_CUR", {"doc_id": None})
+        # Age-prune must not interfere: keep the whole pile inside the age window,
+        # and disable the count cap so recovery sees every snapshot.
+        monkeypatch.setattr(cad_tools, "_AUTOSAVE_MAX_AGE_DAYS", 3650)
+        monkeypatch.setattr(cad_tools, "_AUTOSAVE_MAX_FILES", 0)
+        now = time.time()
+        for s in range(self.SESSIONS - 1):
+            for i in range(3):
+                _write_snapshot(d, f"{s:012x}", f"doc-cpp{i:08x}", self.NAMES[i % 5],
+                                now - 86400 - s * 10 - i)
+        recent = "ffffffffffff"
+        for i in range(self.RECENT_DOCS):
+            _write_snapshot(d, recent, f"doc-cpp{i:08x}", self.NAMES[i % 5],
+                            now - 100 + i * 0.001)
+        return d, recent
+
+    @staticmethod
+    def _fake_engine(monkeypatch):
+        """A doc_open/doc_list engine stub. Returns the live-doc map it fills."""
+        opened: dict = {}
+        n = [0]
+
+        def call(op, args=None):
+            args = args or {}
+            if op == "doc_open":
+                n[0] += 1
+                p = pathlib.Path(args["path"])
+                meta = json.loads((p.parent / f"{p.name[:-6]}.json").read_text())
+                nid = f"live-{n[0]:04d}"
+                opened[nid] = {"doc_id": nid, "name": meta["name"]}
+                return {"doc_id": nid, "name": meta["name"]}
+            if op == "doc_list":
+                return {"docs": list(opened.values())}
+            return {}
+
+        monkeypatch.setattr(cad_tools.cb, "call", call)
+        return opened
+
+    def test_debris_pile_does_not_make_next_call_ambiguous(self, monkeypatch, tmp_path):
+        """1,803 snapshots on disk, and the following doc-scoped call still resolves.
+
+        The number that matters is how many docs land in the engine: 270 (scope=recent)
+        / 1,803 (scope=all) before, _RECOVER_MAX_DOCS after. _doc(None) must then return
+        the NEWEST recovered snapshot's live id — a specific value, not "some doc"."""
+        d, recent = self._pile(tmp_path, monkeypatch)
+        opened = self._fake_engine(monkeypatch)
+        total = len(list(d.glob("*.step+")))
+        assert total == 1803, f"pile shape changed: {total}"
+
+        for scope, on_disk in (("recent", self.RECENT_DOCS), ("all", total)):
+            opened.clear()
+            cad_tools._CUR["doc_id"] = None
+            rec = cad_tools.recover_autosaved(scope=scope)
+            cap = cad_tools._RECOVER_MAX_DOCS
+            assert len(rec) == cap, f"scope={scope}: opened {len(rec)}, expected {cap}"
+            assert len(opened) == cap, f"scope={scope}: engine holds {len(opened)} docs"
+            assert cad_tools.recover_skipped() == on_disk - cap
+
+            # The newest snapshot of the recent session is doc-cpp<269> -> "housing".
+            newest = rec[0]
+            assert newest["original_doc_id"] == f"doc-cpp{self.RECENT_DOCS - 1:08x}", \
+                f"scope={scope}: newest recovered is {newest}"
+            assert newest["name"] == "housing"
+            # ...and an omitted doc_id resolves to exactly that doc, not an arbitrary one.
+            assert cad_tools._doc(None) == newest["doc_id"]
+
+    def test_recovered_candidates_named_in_refusal(self, monkeypatch, tmp_path):
+        """An unresolvable handle after recovery lists the recovered docs by name/id."""
+        self._pile(tmp_path, monkeypatch)
+        self._fake_engine(monkeypatch)
+        rec = cad_tools.recover_autosaved(scope="recent")
+        with pytest.raises(cad_tools.DocRefError) as ei:
+            cad_tools._doc("the part")
+        err = ei.value
+        assert err.detail["recovered_documents"], "refusal named no recovered candidate"
+        assert len(err.detail["recovered_documents"]) == len(rec)
+        assert err.detail["recovery_skipped"] == self.RECENT_DOCS - len(rec)
+        assert rec[0]["doc_id"] in str(err), "newest recovered doc not offered in the message"
+        assert "recover_parts" in str(err)
+
+
+class TestAutosaveRetention:
+    """The count cap evicts WHOLE sessions, so it can never half-restore a part.
+
+    A snapshot IS potentially-unsaved user work (no dirty flag exists on disk), so the
+    safety rule is structural rather than a guess: a session survives entirely or not at
+    all, and this process's own session is never touched.
+    """
+    def _sessions(self, tmp_path, monkeypatch, n_sessions=3, per=3):
+        d = tmp_path / "ret"
+        d.mkdir()
+        monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", str(d))
+        monkeypatch.setattr(cad_tools, "_SESSION_ID", "cur000000000")
+        now = time.time()
+        for s in range(n_sessions):
+            for i in range(per):
+                # SAME doc_ids in every session: engine doc_ids reset per process, so
+                # this is the real on-disk shape — and the trap the old per-doc_id
+                # protection fell into.
+                _write_snapshot(d, f"{s:012x}", f"doc-cpp{i:08x}", f"part-s{s}-d{i}",
+                                now - (n_sessions - s) * 60 + i)
+        return d
+
+    def test_count_cap_evicts_whole_sessions_only(self, monkeypatch, tmp_path):
+        """After a prune, no surviving session is missing any of its snapshots.
+
+        The old cap protected "the newest snapshot of each doc_id" — but doc_ids repeat
+        across sessions, so it kept 3 files from the newest session and one stray from an
+        older one, leaving that older session half-recoverable. Now: 3 sessions x 3 docs,
+        cap 4, keep_sessions 1 -> the two older sessions go whole and session 2 survives
+        intact (3 files), which is ABOVE the cap on purpose.
+        """
+        d = self._sessions(tmp_path, monkeypatch, n_sessions=3, per=3)
+        assert len(list(d.glob("*.step+"))) == 9
+        cad_tools._prune_autosaves(max_age_days=3650, max_files=4, keep_sessions=1)
+
+        by_session: dict = {}
+        for p in d.glob("*.step+"):
+            by_session.setdefault(cad_tools._autosave_session_key(p), []).append(p)
+        assert set(by_session) == {f"{2:012x}"}, f"surviving sessions: {sorted(by_session)}"
+        assert len(by_session[f"{2:012x}"]) == 3, "a surviving session lost snapshots"
+        # Sidecars go with their snapshot; a snapshot with no sidecar recovers nameless.
+        assert len(list(d.glob("*.json"))) == 3
+
+    def test_retention_never_discards_unsaved_work(self, monkeypatch, tmp_path):
+        """This process's own snapshots survive even when they are the OLDEST on disk.
+
+        Our session's .step+ files ARE the live unsaved work of the running turn; there is
+        no on-disk copy of it anywhere else. Making them the oldest snapshots isolates the
+        own-session rule from the newest-N window (which would otherwise protect them
+        incidentally), and cap=1 is the harshest cap there is: it goes unmet rather than
+        touching them.
+        """
+        d = self._sessions(tmp_path, monkeypatch, n_sessions=2, per=2)
+        old = time.time() - 100000  # older than every other session in the pile
+        mine = [_write_snapshot(d, "cur000000000", f"doc-cpp{i:08x}", f"live-{i}", old + i)
+                for i in range(3)]
+        cad_tools._prune_autosaves(max_age_days=3650, max_files=1, keep_sessions=1)
+        for p in mine:
+            assert p.exists(), f"prune deleted live unsaved work: {p.name}"
+        # keep_sessions=1 protects only the newest session (000000000001); the other
+        # prior session goes WHOLE, and the cap (1) is left unmet at 5 surviving files.
+        assert not list(d.glob(f"{0:012x}-*.step+")), "older session should have gone whole"
+        assert len(list(d.glob(f"{1:012x}-*.step+"))) == 2, "newest session must stay intact"
+        assert len(list(d.glob("*.step+"))) == 5
+
+    def test_prune_plan_is_all_or_nothing_per_session(self, monkeypatch, tmp_path):
+        """The planner itself never returns a partial session, at any cap."""
+        d = self._sessions(tmp_path, monkeypatch, n_sessions=6, per=4)
+        entries = [(p.stat().st_mtime, p) for p in d.glob("*.step+")]
+        for cap in range(0, 25):
+            doomed = set(cad_tools._autosave_prune_plan(
+                entries, cap, keep_sessions=1, own_session="cur000000000"))
+            per_session: dict = {}
+            for _mt, p in entries:
+                k = cad_tools._autosave_session_key(p)
+                per_session.setdefault(k, []).append(p in doomed)
+            for k, flags in per_session.items():
+                assert len(set(flags)) == 1, \
+                    f"cap={cap}: session {k} partially pruned ({flags})"
+
+    def test_opt_in_cleanup_is_dry_run_by_default(self, monkeypatch, tmp_path):
+        """prune_autosave_debris() reports what it WOULD delete and touches nothing."""
+        d = self._sessions(tmp_path, monkeypatch, n_sessions=5, per=2)
+        before = sorted(p.name for p in d.glob("*.step+"))
+        r = cad_tools.prune_autosave_debris(keep_sessions=2)
+        assert r["applied"] is False and r["deleted"] == 0
+        assert r["sessions"] == 5 and r["snapshots"] == 10
+        assert r["would_delete"] == 6, r          # 3 oldest sessions x 2 snapshots
+        assert sorted(p.name for p in d.glob("*.step+")) == before, "dry run deleted files"
+
+        r2 = cad_tools.prune_autosave_debris(keep_sessions=2, apply=True)
+        assert r2["deleted"] == 6 and r2["applied"] is True
+        assert len(list(d.glob("*.step+"))) == 4
+
+
 
 # ---------------------------------------------------------------------------
 # 3. Periodic autosave timer

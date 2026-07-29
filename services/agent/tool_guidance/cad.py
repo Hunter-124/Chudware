@@ -419,7 +419,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "recover_parts": {
         "prompt_note": (
             "After a server restart reloads the LAST dropped session's autosaves with "
-            "FRESH doc_ids (re-map your handles); all=True reaches the full history."
+            "FRESH doc_ids (re-map your handles); all=True reaches the full history. "
+            "BOUNDED to the newest 8 docs; `skipped` counts what stayed on disk. Raise "
+            "limit= only if the part you want is not among them, because reopening a big "
+            "pile leaves nothing able to resolve 'the part'."
         ),
     },
     "redo": {

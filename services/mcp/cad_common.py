@@ -296,13 +296,35 @@ def _doc_listing(docs: list, limit: int = _DOC_LIST_MAX) -> str:
 
 def _doc_error(problem: str, docs: list, hint: str, code: str) -> DocRefError:
     """One teaching shape for every way a doc handle fails: what was wrong (naming the
-    offending value), the FULL open-document set, and the corrected call."""
-    return DocRefError(
-        f"{problem} Open parts: {_doc_listing(docs)}. {hint}",
-        code=code,
-        detail={"open_documents": [{"doc_id": e.get("doc_id"), "name": e.get("name") or ""}
-                                   for e in docs[:_DOC_LIST_MAX]],
-                "hint": hint})
+    offending value), the FULL open-document set, and the corrected call.
+
+    When recover_autosaved() ran in this process, the recovered docs are called out
+    SEPARATELY. In the raw open-document list a batch of recovered snapshots is
+    indistinguishable noise — often several sharing one name — so a bare "no such
+    document" or "ambiguous" left the caller with no way to tell which ids it had just
+    been handed. Naming them, with the pre-crash id each one replaces, turns the refusal
+    into the disambiguation the caller actually needs."""
+    recovered = [{"doc_id": r.get("doc_id"), "name": r.get("name") or "",
+                  "original_doc_id": r.get("original_doc_id") or ""}
+                 for r in _RECOVERED if r.get("doc_id")]
+    msg = f"{problem} Open parts: {_doc_listing(docs)}. {hint}"
+    detail = {"open_documents": [{"doc_id": e.get("doc_id"), "name": e.get("name") or ""}
+                                 for e in docs[:_DOC_LIST_MAX]],
+              "hint": hint}
+    if recovered:
+        listing = ", ".join(f'{r["doc_id"]}="{r["name"]}"'
+                            for r in recovered[:_DOC_LIST_MAX])
+        extra = f" +{len(recovered) - _DOC_LIST_MAX} more" \
+            if len(recovered) > _DOC_LIST_MAX else ""
+        msg += (f" Of those, {len(recovered)} were just reopened by recover_parts "
+                f"(newest first): {listing}{extra} — pick one of THOSE if you meant the "
+                "recovered work.")
+        detail["recovered_documents"] = recovered[:_DOC_LIST_MAX]
+        if _RECOVER_SKIPPED:
+            msg += (f" {_RECOVER_SKIPPED} older autosaved doc(s) were deliberately NOT "
+                    "reopened; call recover_parts(limit=…) if you need one of them.")
+            detail["recovery_skipped"] = _RECOVER_SKIPPED
+    return DocRefError(msg, code=code, detail=detail)
 
 
 def _docs_named(docs: list, value: str) -> list:
@@ -1127,7 +1149,43 @@ def _autosave_dir() -> Path:
 #: hours. These are crash-recovery snapshots, not user deliverables (those go to the
 #: project folder via _project_save), so the directory is also bounded by count.
 _AUTOSAVE_MAX_FILES = int(os.environ.get("CHUDWARE_AUTOSAVE_MAX_FILES") or 2000)
-_autosave_pruned = False
+
+#: Autosave SESSION retention. The count cap above kept the pile at exactly its cap but
+#: could not bound how many distinct SESSIONS it spanned: 2,000 surviving snapshots on
+#: this workstation were spread over 512 sessions, and the single largest session held
+#: 270 docs. That is what makes recovery a footgun (see _RECOVER_MAX_DOCS). The count
+#: cap now evicts whole sessions oldest-first, and never touches the newest
+#: _AUTOSAVE_KEEP_SESSIONS of them nor this process's own.
+#:
+#: WHY WHOLE SESSIONS: an autosave snapshot IS potentially-unsaved user work — there is
+#: no dirty/clean flag in the sidecar, so we cannot tell debris from a part the user
+#: never saved. The only honest safety rule is therefore structural: a session is either
+#: kept ENTIRELY or dropped ENTIRELY, so a retained session is always fully recoverable
+#: and a prune can never leave one half-restorable. The old per-doc_id protection was
+#: actively unsafe here: doc_ids ("doc-cpp00000001") are engine-allocated and RESET per
+#: process, so "keep the newest snapshot of each doc_id" happily deleted session A's
+#: part because session B happened to reuse the same id for a different one.
+_AUTOSAVE_KEEP_SESSIONS = int(os.environ.get("CHUDWARE_AUTOSAVE_KEEP_SESSIONS") or 12)
+
+#: How many docs a single recovery call may reopen. recover_autosaved used to open EVERY
+#: snapshot in the recovered scope: measured on this workstation's real pile that is 270
+#: docs for scope="recent" and 1,803 for scope="all", in ONE turn. The engine then holds
+#: hundreds of near-identically-named parts, so the very next doc-scoped call cannot
+#: resolve "the part" — _doc() either refuses with a doc_ambiguous naming 108 candidates
+#: or silently adopts whichever snapshot happened to sort last. Recovery means "give me
+#: back what I was working on", not "reconstitute the whole history", so it takes the
+#: newest N and REPORTS the rest instead of opening them.
+_RECOVER_MAX_DOCS = int(os.environ.get("CHUDWARE_RECOVER_MAX_DOCS") or 8)
+
+#: What the last recover_autosaved() call in this process reopened, newest first —
+#: [{doc_id, name, original_doc_id}]. _doc() quotes it back when a handle fails, so a
+#: post-recovery "which part?" refusal names the recovered candidates instead of only
+#: the raw open-document list (in which the recovered docs are indistinguishable).
+_RECOVERED: list = []
+
+#: How many docs the last recover_autosaved() deliberately LEFT on disk because of the
+#: bound above. Nothing is deleted — a call with a bigger `limit` reaches them.
+_RECOVER_SKIPPED = 0
 
 
 def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
@@ -1365,17 +1423,74 @@ def autosave_p95_ms() -> float | None:
     return s[int(len(s) * 0.95)] * 1000.0
 
 
+def _autosave_session_key(step_path: Path) -> str:
+    """The session a snapshot belongs to, from its FILENAME (`{session}-{doc_id}.step+`).
+
+    Filename, not sidecar, deliberately: the count cap runs on every autosave, and reading
+    2,000 sidecar JSONs per snapshot to learn something the name already encodes is pure
+    I/O. Session ids are uuid4 hex (never contain "-"), so everything up to the FIRST "-"
+    is the session and the rest is the doc_id. A legacy untagged snapshot ("doc-cpp…")
+    yields "doc"; that groups all of them into one pseudo-session, which is exactly the
+    whole-or-nothing unit the retention rule wants for them too.
+
+    Matching on the prefix rather than a 12-hex pattern also keeps the rule honest for any
+    _SESSION_ID a caller injects: a key that failed to parse would silently drop this
+    process's own-session protection."""
+    return step_path.name[:-6].split("-", 1)[0]
+
+
+def _autosave_prune_plan(entries: list[tuple[float, Path]], cap: int,
+                         keep_sessions: int, own_session: str) -> list[Path]:
+    """Which snapshots the COUNT cap may delete: whole sessions, oldest first.
+
+    `entries` is [(mtime, path)]. Sessions rank by their NEWEST snapshot. Never
+    prunable: `own_session` (live crash-recovery data for the running process) and the
+    newest `keep_sessions` sessions. Sessions are then dropped WHOLE, oldest first, until
+    the surviving count is within `cap` — and if no whole prunable session is left, the
+    cap simply goes unmet. The invariant outranks the cap: a session that survives a
+    prune is always fully recoverable, so no part is ever silently half-restored.
+    """
+    by_session: dict[str, list[Path]] = {}
+    newest: dict[str, float] = {}
+    for mt, p in entries:
+        key = _autosave_session_key(p)
+        by_session.setdefault(key, []).append(p)
+        if mt > newest.get(key, -1.0):
+            newest[key] = mt
+    ranked = sorted(by_session, key=lambda k: newest[k], reverse=True)  # newest session first
+    protected = set(ranked[:max(0, keep_sessions)]) | {own_session}
+    doomed: list[Path] = []
+    surviving = len(entries)
+    for key in reversed(ranked):  # oldest session first
+        if surviving <= cap:
+            break
+        if key in protected:
+            continue
+        doomed.extend(by_session[key])
+        surviving -= len(by_session[key])
+    return doomed
+
+
 def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS,
-                     max_files: int = 0) -> int:
+                     max_files: int = 0, keep_sessions: int = 0) -> int:
     """Delete autosave .step+ / sidecars older than max_age_days (by mtime).
 
-    *max_files* (0 = use _AUTOSAVE_MAX_FILES) additionally caps how many snapshots
-    may remain, deleting OLDEST FIRST. The age rule alone never bounded anything in
-    practice — the worker forks per turn, so every snapshot on disk is young — which
-    is how the directory reached 39k files in one day. Two things are never removed
-    by the count cap: this process's own snapshots (live crash recovery) and the
-    newest surviving snapshot of any doc_id, so the most recent recoverable copy of
-    a document always stays on disk. Returns the number of snapshots deleted.
+    *max_files* (0 = use _AUTOSAVE_MAX_FILES) additionally caps how many snapshots may
+    remain. The age rule alone never bounded anything in practice — the worker forks per
+    turn, so every snapshot on disk is young — which is how the directory reached 39k
+    files in one day.
+
+    The count cap evicts WHOLE SESSIONS, oldest first, keeping the newest
+    *keep_sessions* (0 = _AUTOSAVE_KEEP_SESSIONS) plus this process's own. A snapshot is
+    potentially-unsaved user work and nothing on disk says otherwise, so the cap's safety
+    rule is structural rather than a guess: a session survives entirely or not at all, and
+    the cap yields to that invariant rather than shaving a session down.
+
+    CAVEAT, stated rather than papered over: the AGE prune is still per-file, so a session
+    straddling the cutoff loses only its stale snapshots. That is the pre-existing,
+    documented contract (CHUDWARE_AUTOSAVE_MAX_AGE_DAYS, default 7) — work nobody saved in
+    a week is deliberately not kept forever. Only the count cap, which deletes YOUNG files,
+    is session-granular. Returns the number of snapshots deleted.
     """
     n = 0
     cutoff = time.time() - max_age_days * 86400.0
@@ -1397,22 +1512,9 @@ def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS,
             entries.append((mt, p))
         cap = max_files or _AUTOSAVE_MAX_FILES
         if cap > 0 and len(entries) > cap:
-            entries.sort(key=lambda e: e[0], reverse=True)  # newest first
-            keep_doc: set[str] = set()
-            protected: set[Path] = set()
-            for _mt, p in entries:
-                stem = p.name[:-6]
-                doc = stem.split("-", 1)[1] if "-" in stem else stem
-                if doc not in keep_doc:
-                    keep_doc.add(doc)
-                    protected.add(p)          # newest snapshot of this document
-                if stem.startswith(f"{_SESSION_ID}-"):
-                    protected.add(p)          # our own live recovery data
-            for _mt, p in reversed(entries):  # oldest first
-                if len(entries) - n <= cap:
-                    break
-                if p in protected:
-                    continue
+            for p in _autosave_prune_plan(entries, cap,
+                                          keep_sessions or _AUTOSAVE_KEEP_SESSIONS,
+                                          _SESSION_ID):
                 try:
                     p.unlink(missing_ok=True)
                     p.with_suffix(".json").unlink(missing_ok=True)
@@ -1422,6 +1524,39 @@ def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS,
     except Exception:  # noqa: BLE001
         pass
     return n
+
+
+def prune_autosave_debris(keep_sessions: int = _AUTOSAVE_KEEP_SESSIONS,
+                          apply: bool = False) -> dict:
+    """OPT-IN maintenance sweep of the autosave directory — never called by any tool.
+
+    Collapses the snapshot pile to the newest *keep_sessions* sessions using the same
+    whole-session rule as the count cap, so a retained session stays fully recoverable.
+    DRY RUN by default: returns what it WOULD delete and touches nothing. Pass apply=True
+    to actually unlink. Reports {sessions, snapshots, keep_sessions, would_delete,
+    deleted, applied}."""
+    d = _autosave_dir()
+    entries: list[tuple[float, Path]] = []
+    for p in d.glob("*.step+"):
+        try:
+            entries.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    sessions = {_autosave_session_key(p) for _mt, p in entries}
+    # cap=0 -> every session outside the keep window is prunable.
+    doomed = _autosave_prune_plan(entries, 0, keep_sessions, _SESSION_ID)
+    deleted = 0
+    if apply:
+        for p in doomed:
+            try:
+                p.unlink(missing_ok=True)
+                p.with_suffix(".json").unlink(missing_ok=True)
+                deleted += 1
+            except OSError:
+                continue
+    return {"dir": str(d), "sessions": len(sessions), "snapshots": len(entries),
+            "keep_sessions": keep_sessions, "would_delete": len(doomed),
+            "deleted": deleted, "applied": bool(apply)}
 
 
 def _autosave_session_of(step_path: Path) -> tuple[Optional[str], float, str, str]:
@@ -1481,37 +1616,52 @@ def _recover_via_daemon() -> list:
     return out
 
 
-def _recover_orphans_via_daemon() -> list:
+def _recover_orphans_via_daemon(limit: int = 0) -> list:
     """Open the daemon's orphan-tier docs (retired by clean shutdown / doc-GC —
     never auto-opened; see core/hostd/autosave.h). Only called from the explicit
-    recover_parts tool, never at startup. Best-effort; never raises."""
+    recover_parts tool, never at startup.
+
+    Opens at most `limit` (0 = _RECOVER_MAX_DOCS) entries, NEWEST FIRST, one
+    recovery_open{"id":…} per entry rather than the old single recovery_open{"all":true}:
+    the tier holds up to CHUDWARE_ORPHAN_KEEP (50) crash survivors and reopening every
+    one of them left the engine unable to say which was "the part". `_RECOVER_SKIPPED`
+    records what was left in the tier — nothing is discarded, the next call reaches it.
+    Best-effort; never raises."""
+    global _RECOVER_SKIPPED
     out: list = []
     try:
         from . import daemon_bridge
         c = daemon_bridge.client()
-        entries = (c.call("recovery_list") or {}).get("entries") or []
+        entries = [e for e in ((c.call("recovery_list") or {}).get("entries") or [])
+                   if isinstance(e, dict) and e.get("id")]
         if not entries:
             return out
-        opened = (c.call("recovery_open", {"all": True}) or {}).get("opened") or []
-        names = {e.get("id"): e for e in entries if isinstance(e, dict)}
-        for o in opened:
-            if not isinstance(o, dict):
-                continue
-            meta = names.get(o.get("id"), {})
-            new_id = o.get("doc_id") or ""
-            old_id = meta.get("doc_id") or ""
-            if old_id and new_id and old_id != new_id:
-                _DOC_ALIASES[old_id] = new_id
-            out.append({"path": meta.get("path"), "doc_id": new_id,
-                        "name": meta.get("name", ""), "original_doc_id": old_id})
-            if new_id:
-                _CUR["doc_id"] = new_id
+        # recoveryList() documents newest-first; sort defensively so the bound is
+        # deterministic even if that ever changes.
+        entries.sort(key=lambda e: e.get("mtime_ms") or 0, reverse=True)
+        cap = limit or _RECOVER_MAX_DOCS
+        chosen = entries[:cap] if cap > 0 else entries
+        _RECOVER_SKIPPED += max(0, len(entries) - len(chosen))
+        for meta in chosen:
+            opened = (c.call("recovery_open", {"id": meta["id"]}) or {}).get("opened") or []
+            for o in opened:
+                if not isinstance(o, dict):
+                    continue
+                new_id = o.get("doc_id") or ""
+                old_id = meta.get("doc_id") or ""
+                if old_id and new_id and old_id != new_id:
+                    _DOC_ALIASES[old_id] = new_id
+                out.append({"path": meta.get("path"), "doc_id": new_id,
+                            "name": meta.get("name", ""), "original_doc_id": old_id})
+                if new_id:
+                    _CUR["doc_id"] = new_id
     except Exception:  # noqa: BLE001
         pass
     return out
 
 
-def recover_autosaved(scope: str = "recent", include_orphaned: bool = False) -> list:
+def recover_autosaved(scope: str = "recent", include_orphaned: bool = False,
+                      limit: int = 0) -> list:
     """Reopen autosaved .step+ docs into the engine. A reopened doc gets a FRESH doc_id;
     returns [{path, doc_id, name, original_doc_id}] for the ones that loaded.
 
@@ -1520,20 +1670,36 @@ def recover_autosaved(scope: str = "recent", include_orphaned: bool = False) -> 
     include_orphaned: open the daemon's on-disk recovery tier (crash-retired docs) —
     only the explicit recover_parts tool passes this. Startup must NOT (the tier keeps a
     deep history of crash recoveries; auto-opening all of it would flood the engine).
-    Prunes stale autosaves first.
+    limit: the most docs this call may reopen (0 = _RECOVER_MAX_DOCS), NEWEST FIRST.
+    The rest stay on disk and are counted in `recover_skipped()`; a second call with a
+    bigger limit reaches them. Unbounded recovery is the autosave-debris footgun: on a
+    real pile scope="recent" opened 270 docs and scope="all" 1,803, after which no
+    doc-scoped call could resolve "the part". The bound applies to the STARTUP call in
+    server.py too, deliberately: silently auto-opening a 270-doc session is the same
+    flood, just without anyone asking for it. Prunes stale autosaves first.
 
     Daemon mode: recovery lives in the orphan tier — a crashed daemon's autosaves and
     any crash-abandoned doc (GC-retired) are REGISTERED there, never auto-opened. A
     clean app quit sends doc_discard, so the tier holds only genuine crash survivors.
     recover_parts opens them DELIBERATELY; startup recovers nothing here (the hello
     id_remap fallback is empty on a current daemon)."""
+    global _RECOVER_SKIPPED
+    _RECOVERED.clear()
+    _RECOVER_SKIPPED = 0
+    cap = limit or _RECOVER_MAX_DOCS
     if cb._daemon_mode():
         out = _recover_via_daemon()  # [] on a current daemon (no auto-open)
         if include_orphaned:
             seen = {r.get("original_doc_id") for r in out}
-            for r in _recover_orphans_via_daemon():
-                if r.get("original_doc_id") not in seen:
-                    out.append(r)
+            # The rebind map already spent part of the budget; the tier gets what is left.
+            # Exhausted budget (room <= 0) means we must NOT touch the tier at all —
+            # limit=0 would mean "use the default", i.e. no bound at all.
+            room = (cap - len(out)) if cap > 0 else 0
+            if cap <= 0 or room > 0:
+                for r in _recover_orphans_via_daemon(limit=room):
+                    if r.get("original_doc_id") not in seen:
+                        out.append(r)
+        _RECOVERED.extend(out)
         return out
     _prune_autosaves()
     out: list = []
@@ -1557,7 +1723,18 @@ def recover_autosaved(scope: str = "recent", include_orphaned: bool = False) -> 
         else:
             info = []
 
-    for p, _sess, _ts, name, orig_id in info:
+    # NEWEST FIRST, then bounded: one session on this workstation's real pile held 270
+    # snapshots, so "the recovered scope" is not a safe number of docs to open. Sorting by
+    # saved_at also makes the LAST doc opened — and therefore `_CUR`, the part an omitted
+    # doc_id resolves to — the OLDEST of the batch by construction, so the loop below
+    # reverses back to chronological order and _CUR lands on the newest snapshot instead of
+    # whichever stem happened to sort last lexically.
+    info.sort(key=lambda t: t[2], reverse=True)
+    if cap > 0 and len(info) > cap:
+        _RECOVER_SKIPPED = len(info) - cap
+        info = info[:cap]
+
+    for p, _sess, _ts, name, orig_id in reversed(info):  # oldest -> newest
         try:
             r = cb.call("doc_open", {"path": str(p)})
             did = r.get("doc_id")
@@ -1580,7 +1757,14 @@ def recover_autosaved(scope: str = "recent", include_orphaned: bool = False) -> 
                     _LAST_VOLUME[did] = vol
         except Exception:  # noqa: BLE001
             continue
+    out.reverse()  # report newest first, matching the order they were chosen in
+    _RECOVERED.extend(out)
     return out
+
+
+def recover_skipped() -> int:
+    """How many autosaved docs the last recover_autosaved() left unopened (still on disk)."""
+    return _RECOVER_SKIPPED
 
 
 # --- async jobs ------------------------------------------------------------------------

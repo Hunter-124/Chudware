@@ -41,6 +41,7 @@ from .cad_common import (
     _write_diff,
     cb,
     recover_autosaved,
+    recover_skipped,
 )
 
 from .cad_guide import (
@@ -5715,7 +5716,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def recover_parts(all: bool = False) -> str:
+    def recover_parts(all: bool = False, limit: int = 0) -> str:
         """Reopen auto-saved parts after a server restart (recover a dropped session).
 
         Every successful add_features auto-persists the part to a recoverable .step+; if the
@@ -5730,12 +5731,25 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         Each entry returns its fresh `doc_id` plus the saved `name` and `original_doc_id` so you
         can re-map old handles. Stale autosaves (older than CHUDWARE_AUTOSAVE_MAX_AGE_DAYS,
         default 7) are pruned automatically.
+
+        limit: at most this many docs are reopened, NEWEST FIRST (0 = the default bound,
+        CHUDWARE_RECOVER_MAX_DOCS, 8). Recovery is BOUNDED because a big autosave pile made
+        this tool a footgun: one real session held 270 snapshots and all=True reached 1,803,
+        and once the engine holds hundreds of similarly-named parts no later call can resolve
+        "the part". `skipped` reports how many were left ON DISK (nothing is deleted) — raise
+        `limit` to reach them, or name a specific part after a first small recovery.
         """
         try:
             recovered = recover_autosaved(scope="all" if all else "recent",
-                                          include_orphaned=True)
-            return _dumps({"ok": True, "recovered": recovered, "count": len(recovered),
-                           "scope": "all" if all else "recent"})
+                                          include_orphaned=True, limit=limit)
+            skipped = recover_skipped()
+            out = {"ok": True, "recovered": recovered, "count": len(recovered),
+                   "scope": "all" if all else "recent", "skipped": skipped}
+            if skipped:
+                out["note"] = (f"{skipped} older autosaved doc(s) were NOT reopened (they are "
+                               "still on disk). Reopening them all leaves no way to identify "
+                               "'the part'. Call recover_parts(limit=N) if you need more.")
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

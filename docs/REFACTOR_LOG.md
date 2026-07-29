@@ -5397,3 +5397,48 @@ plus test_add_features_shape now run 333 passed against the private daemon, and 
 connecting to a shared daemon after a full run sees ZERO documents. Pre-existing and NOT
 caused by this: 13 baseline `services/mcp` failures plus 6 in `test_interface_check.py`,
 which reproduce identically under `CHUDWARE_ENGINE_DAEMON=0` (no daemon in the picture).
+
+## Task-list planning surface + interactive-lane turn honesty (2026-07-29)
+
+The copilot's Task list panel was permanently empty on every normal run and a live
+opus-5 turn had just reported `status=done stop_reason=confirmed` while producing no
+geometry. Both traced to the general lane — the universal online entry — being unable to
+reach machinery that only existed on the C++ side. Root causes, all reproduced from
+`cache/runs/asm-152734881473315`: (1) `plan_state` had exactly one producer family,
+`core/agent/machine.cpp` + `run.cpp`'s mission loop, which the general lane never enters;
+(2) `agent_turn.completion_cap` defaults to 2048 and `run_linear_role_turn` never passed
+`max_tokens`, so opus-5's adaptive thinking plus a long `mission_start` brief overran the
+cap mid-fence — `_parse_directive` returned None, the bare-prose finish accepted it because
+three earlier research calls satisfied `_did_real_work`, and the fabricated summary WAS the
+truncated fragment; (3) `get_plan_preference` / `get_subagent_preference` had zero consumers
+repo-wide, so two shipped Settings combos were dead UI; (4) `run_assembly_design` burned an
+intake+planner probe before `run_design`'s pre-flight handed the request to `general_agent`
+anyway, which is what painted the user's red "probe plan: provider call failed" card.
+
+Landed: `services/agent/task_list.py` (run-scoped store, stable `task:<n>` ids, contextvar
+event sink) + a forgiving `task_list` tool (`services/mcp/task_list_tools.py`, `tasklist`
+module_key in `reviewer_exec`) that publishes `plan_state` through the worker `_emit` that
+`run.cpp` already relays verbatim — the panel fills with no C++ change. New
+`task_list_preference` knob (Settings → AI → Harness + copilot Quick settings,
+`Settings::taskListPreference`, config.json top-level AND `agent.*`, default Encourage,
+`config.get_task_list_preference`). `mission_dispatch._apply_session_preferences` now
+consumes all three preferences on the `general_agent` lane only — dropping/adding tools
+BEFORE `render_tools_block` so the model is never shown a tool it cannot call.
+`agent_turn._looks_truncated` + `_json_balance` detect a cut-off directive textually
+(providers expose no finish_reason here), nudge once, and end with `no_code` rather than
+`confirmed` on a second truncation. `LINEAR_ROLE_MAX_OUTPUT_TOKENS = 8192`.
+
+Gotchas for the next person. `MAX_TOOLS_PER_ROLE` is 14 and explicit `tool:` seats are
+filled before family expansions: putting `task_list` in `general_agent.yaml` silently evicted
+`plm_checkpoint` off the tail of `family: plm` (caught by `test_router_dispatch`), so the tool
+is granted from `_apply_session_preferences` instead — never spend a role-card seat on a
+harness surface. Adding any tool also requires re-running `tools/gen_tool_panel_tables.py`
+(needs `.venv-mcp`) or `test_tool_guidance.py::TestPanelTablesSnapshot` fails. And soft
+guidance is not enough: with the tool advertised, resolvable and the role prompt demanding it,
+a live opus-5 run still made 20 calls without publishing — hence the one-shot `[TASK LIST]`
+nudge, armed by `auto_enable_packs` (true only on the interactive lane). Verified live: a
+fresh build published four task-list revisions, produced `new_part` + 6 `add_features`, and
+checkpointed via the restored `plm_checkpoint`. Pre-existing and NOT caused by this: `ctest`
+`firmware` fails under `-j6` and passes in isolation (reproduced identically with the
+`run.cpp` change stashed); `scripts/gate.sh` looks for a `Chudware/mcp-venv` that does not
+exist on this box, so its pytest stage SKIPs — the real venv is `AI-CAD/mcp-venv`.

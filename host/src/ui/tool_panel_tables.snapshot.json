@@ -467,6 +467,7 @@
    "enable_tools",
    "list_tool_categories",
    "submit_bug_report",
+   "task_list",
    "workspace_doc_events",
    "workspace_status"
   ]
@@ -517,7 +518,7 @@
   "cam_post_dialects": "List the available post-processor controller dialects.",
   "cam_redo": "Redo the last undone CAM edit on the active job.",
   "cam_remove_operation": "Remove an operation from the active CAM job by *op_id*.",
-  "cam_save": "Save the active CAM job to a .cam+ file at *path*.",
+  "cam_save": "Save the active CAM job to a .cam+ file at *path*. The path is resolved to an absolute path (matching this MCP process's cwd, not the …",
   "cam_set_stock": "Set/replace a setup's stock. stock types: box | box_offset | cylinder | cylinder_offset | from_solid | from_sim (see cad_guide('cam')). …",
   "cam_setup_sheet": "Generate the operator setup sheet (HTML + text): tool list + per-operation cut length and time + total machining time.",
   "cam_simulate": "Material-removal simulation: removed/remaining volume, machined fraction, gouge, rapid-through-stock, and holder/shank collision checks …",
@@ -614,9 +615,9 @@
   "fit_calc": "ISO 286 fit maths, in DESIGN mode (what should the sizes be?) or MEASURED mode (what fit do these two real sizes actually give?) — code …",
   "fit_report": "The fit report to review before printing: each mating pair's modeled-vs-source dimension, the clearance applied for the process, its …",
   "fs_edit": "Replace text in an existing file. By default *old* MUST occur exactly once (a safe, unambiguous edit); set replace_all=True to replace …",
-  "fs_glob": "Find paths matching a glob (e.g. 'src/**/*.py'). Returns matches newest-first. Capped at 1000. Risk: read.",
+  "fs_glob": "Find paths matching a glob (e.g. 'src/**/*.py'). Returns matches newest-first. Capped at 1000.",
   "fs_grep": "Regex-search files under *path* (optionally filtered by *glob*, e.g. '*.py'). Returns {file, line, text} matches, capped at 500. Risk: read.",
-  "fs_list": "List a directory's entries (name, dir flag, size). Capped at 1000 entries. Risk: read.",
+  "fs_list": "List a directory's entries (name, dir flag, size). Capped at 1000 entries.",
   "fs_read": "Read a text file, directory, or document with CONTEXT-SAFE, line-numbered output.",
   "fs_write": "Create or OVERWRITE a text file with *content*. Parent dirs are created by default. Returns {ok, path, bytes}. Risk: write.",
   "fw_avr_flash": "Flash an AVR target via avrdude and return FlashResult.",
@@ -701,7 +702,7 @@
   "mission_status": "Render a mission's phase state from the ledger (pure read).",
   "motion_fea_handoff": "Motion → static FEA handoff: \"is this link strong enough at the worst instant?\" in one call (aicad.simhandoff/1, coupling `motion_to_fea`).",
   "new_assembly": "Create a new, empty ASSEMBLY document and make it current. Returns its doc_id.",
-  "new_part": "Create a new, empty editable part document and make it current. Returns its doc_id.",
+  "new_part": "Create an editable part document named `name` and make it current.",
   "office_edit_csv": "Full-file rewrite (csv has no partial-edit primitive). Returns ``{ok, path, row_count}``.",
   "office_edit_doc": "Lossy round-trip: soffice .doc→.docx, apply ``office_edit_docx``-style *ops*, soffice .docx→.doc back over *out_path* (default: the …",
   "office_edit_docx": "``ops``: ``[{paragraph_index, text}]`` or ``[{op:\"append_paragraph\", text}]``. Returns ``{ok, path, paragraphs_changed}``.",
@@ -756,7 +757,7 @@
   "plm_status": "Return project state for the Hub/badges: items (with revision + lifecycle), which have unsaved changes, and the current mode. Returns …",
   "plm_sync": "One-button team sync: pull others' changes, publish yours. Same-item collisions become a copy under a new name (never a merge). Returns …",
   "plm_timeline": "List AI-authored checkpoints for a document (newest first).",
-  "plm_unlock": "Release an advisory lock you hold. Returns ``{ok}``.",
+  "plm_unlock": "Release an advisory lock you hold. Returns ``{ok, item_id, remote_id}`` confirming which lock was released.",
   "plm_where_used": "Answer \"where is this used?\": the assemblies, drawings and CAM jobs that consume an item (directly, or the whole chain with …",
   "power_budget": "System power/energy budget — rail tree, duty cycle, battery verdict (aicad.powerbudget/1).",
   "preflight_ops": "Dry-run validate planned ops on a shadow clone of the document.",
@@ -1125,7 +1126,7 @@
    "prompt_note": "Needs an open ECAD doc (ecad_new_schematic / ecad_new_pcb) first; narrates stored ERC/DRC numbers only — it never re-runs the checks."
   },
   "describe_part": {
-   "prompt_note": "Make this the first read on any part — the returned sids are the stable addresses every later hover() and edit call uses."
+   "prompt_note": "Make this the first read on any part — the returned sids (faces AND edges) are the stable addresses every later hover() / query_geometry / edit call uses. Call it before naming geometry you have not confirmed exists."
   },
   "describe_project": {
    "prompt_note": "Pass dag_status()['run'] for live status; a bare brief string is only narrated back — describe_project reports runs, dag_plan creates them."
@@ -1803,7 +1804,7 @@
    "prompt_note": "Reach for it to reason about a shared edge — convex outside-corner vs concave pocket edge — which the flat per-face read-back never carries."
   },
   "query_geometry": {
-   "prompt_note": "Confirm a selector resolves before referencing it in a feature or study; a sentence is not a query — open-ended explore → describe_part + hover."
+   "prompt_note": "Plain-word phrases work for faces AND edges ('the vertical edges', 'the top face') — confirm a pick resolves before referencing it in a feature; zero or >1 match on a slot needing one → narrow with pick/near/count/index. Fully open-ended explore → describe_part + hover instead."
   },
   "recommend_fit": {
    "prompt_note": "Function-to-fit-class step before fit_calc; pass the diameter in the same call to get the computed band and skip the follow-up fit_calc entirely."
@@ -2158,6 +2159,10 @@
   },
   "tap_drill": {
    "prompt_note": "Quick drill size for a thread string; feeds_speeds(thread=...) returns the same value alongside cutting data."
+  },
+  "task_list": {
+   "max_calls_per_turn": 40,
+   "prompt_note": "Publish the FULL list every call (omitted items disappear from the panel) — same order, updated statuses, after each step."
   },
   "undo": {
    "prompt_note": "Usually denied for agents (undo_denied) — prefer doc_checkpoint/doc_revert; if it does run, render_part to confirm the rolled-back state."

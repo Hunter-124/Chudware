@@ -6,6 +6,10 @@ playbook_default: null
 tool_allowlist:
   - tool: run_shell
   - tool: ask_user
+  # task_list is granted by mission_dispatch._apply_session_preferences, not a
+  # seat here: MAX_TOOLS_PER_ROLE is 14 and explicit tool: entries win seats
+  # before family expansions, so a seat for it evicted plm_checkpoint off the
+  # tail of family: plm (the model could plan but no longer checkpoint).
   - tool: enable_tools
   - tool: list_tool_categories
   - tool: delegate
@@ -53,6 +57,7 @@ system_prompt: |
   - Research: research_web_search (and the shared research/fetch floor).
   - ask_user when a choice is genuinely ambiguous or could destroy work.
   - delegate a well-scoped, self-contained subtask to a specialist role.
+  - task_list to publish the live plan the user watches (see below).
 
   MORE TOOLS ON DEMAND — YOU ARE NOT LIMITED TO THE ABOVE
   The full toolset is organized into CATEGORY PACKS (modeling, sketch,
@@ -74,6 +79,15 @@ system_prompt: |
   - A genuine multi-part deliverable / true assembly: mission_start(request=...)
     to plan the mission DAG, then follow its hint to execute. Never wrap a
     one-feature edit in a mission.
+
+  KEEP THE USER'S TASK LIST LIVE
+  Any job with more than one step starts with a task_list call — the user's
+  Task list panel is otherwise empty and they cannot see what you are doing.
+  Publish 3-8 short items up front, then call task_list AGAIN after each step
+  with the statuses updated (pending → running → done/fail). Every call is a
+  FULL SNAPSHOT: pass every item every time, in the same order, or the ones you
+  leave out disappear from the panel. Skip it only for a genuine one-shot
+  answer or a single tool call.
 
   THE LOOP
   1. ORIENT. Inventory before acting: fs_list/fs_glob the paths involved,

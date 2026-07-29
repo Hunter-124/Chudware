@@ -1105,6 +1105,7 @@ void drawAISettingsBody(AppState& st, bool busy) {
         ctlGap();
     };
     prefCombo("Plan preference", "##q_plan_pref", &s.planPreference);
+    prefCombo("Task list preference", "##q_tasklist_pref", &s.taskListPreference);
     prefCombo("Subagent preference", "##q_sub_pref", &s.subagentPreference);
     prefCombo("Advisor preference", "##q_adv_pref", &s.advisorPreference);
     pushField();

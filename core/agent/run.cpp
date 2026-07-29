@@ -2897,6 +2897,31 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
             return run_design(request, doc_id, provider_cfg, emit, options);
     }
 
+    // Online top-level runs never need the probe: run_design's PRE-FLIGHT (see the
+    // `!is_sub_run && (!offline || is_general_work_request(request))` gate below its
+    // offline check) hands EVERY non-sub-run online request to the general_agent turn
+    // over agent_admin_turn, where the MODEL decides whether to mission_start a
+    // multi-part build. So the intake+planner probe's want_asm verdict can only ever
+    // route somewhere the general lane already reaches on its own — while costing two
+    // extra billed completions, ~20s of dead air, and a red stage card whenever the
+    // planner call fails (see the "probe plan: provider call failed" emit further
+    // down). Live evidence: run asm-152734881473315 (2026-07-28) painted exactly that
+    // red card and then routed to general_agent anyway. Short-circuit BEFORE
+    // classify_complexity so no classification work is done for a run we are about to
+    // hand off. Derived from the SAME options run_design reads so the two cannot drift;
+    // the probe below stays alive for the paths that still need it — offline runs and
+    // sub-runs (a parent-authored delegated build step), plus explicit mission mode
+    // which never reaches here.
+    {
+        // Mirror run_design: nested sub-run depth (delegate / swarm unit).
+        const int run_depth = options.value("run_depth", 0);
+        const bool is_sub_run = options.value("is_sub_run", false) || run_depth > 0;
+        // Mirror run_design: explicit options.offline flag (run.cpp:943).
+        const bool offline = options.value("offline", false);
+        if (!is_sub_run && !offline)
+            return run_design(request, doc_id, provider_cfg, emit, options);
+    }
+
     // Free classify first — skip the expensive intake+planner probe when the
     // request is confidently single-part (not assembly-plausible). Err toward
     // probing when unsure (Complex, Domain::Assembly, or multi-part cues).

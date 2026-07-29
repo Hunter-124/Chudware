@@ -405,6 +405,10 @@ VALID_PREFERENCES = frozenset({"off", "option", "encourage", "require"})
 # plan/intake breakdown (Settings → AI → Harness "Plan preference").
 DEFAULT_PLAN_PREFERENCE = "off"
 DEFAULT_SUBAGENT_PREFERENCE = "option"
+# Default Encourage: the copilot Task-list panel is only useful if the model
+# actually publishes to it, and before this knob existed the panel read
+# "No task list yet" on every general-lane run.
+DEFAULT_TASK_LIST_PREFERENCE = "encourage"
 DEFAULT_ADVISOR_PREFERENCE = "encourage"
 DEFAULT_PROACTIVE_ADVISOR = False
 DEFAULT_MEMORY_ENABLED = True
@@ -458,6 +462,18 @@ def get_subagent_preference(cfg: dict | None = None) -> str:
     if isinstance(c, dict) and "subagent_preference" in c:
         return _parse_preference(c.get("subagent_preference"), DEFAULT_SUBAGENT_PREFERENCE)
     return DEFAULT_SUBAGENT_PREFERENCE
+
+
+def get_task_list_preference(cfg: dict | None = None) -> str:
+    """off|option|encourage|require — how hard to push the model to publish a
+    live task list (Settings → AI → Harness "Task list preference")."""
+    c = cfg if cfg is not None else load_config()
+    agent = _agent_block(c if isinstance(c, dict) else None)
+    if "task_list_preference" in agent:
+        return _parse_preference(agent.get("task_list_preference"), DEFAULT_TASK_LIST_PREFERENCE)
+    if isinstance(c, dict) and "task_list_preference" in c:
+        return _parse_preference(c.get("task_list_preference"), DEFAULT_TASK_LIST_PREFERENCE)
+    return DEFAULT_TASK_LIST_PREFERENCE
 
 
 

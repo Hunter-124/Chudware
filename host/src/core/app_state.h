@@ -110,10 +110,12 @@ struct Settings {
     bool vision = true;
     bool offlineMode = false;    // C35: local-only mode — refuse any non-loopback provider (ITAR)
     // PreferenceMode 0=Off 1=Option 2=Encourage 3=Require. Serialized as
-    // plan_preference / subagent_preference / advisor_preference strings.
+    // plan_preference / task_list_preference / subagent_preference / advisor_preference strings.
     // planMode stays as the binary gate (planPreference != 0) for legacy call sites
     // and plan_mode bool in config.json (Python still reads it).
     int planPreference = 0;      // default Off — direct tool use in main chat (no forced plan/intake)
+    // Gates whether the agent publishes the live task list rendered by the copilot Task list panel.
+    int taskListPreference = 2;  // default Encourage
     int subagentPreference = 1;  // default Option — model may spawn subagents
     int advisorPreference = 2;   // default Encourage — pull advisor + tone for guidance
     bool planMode = false;       // binary: planPreference != 0 (Supervised vs Autopilot)

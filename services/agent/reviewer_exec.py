@@ -111,7 +111,7 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
                        "regen", "buildgraph", "intake", "designreview", "req", "cost",
                        "structural", "dimscheme", "workspace", "firmware", "em", "antenna",
                        "mission", "org", "sourcing", "dag", "advisor", "camaudit",
-                       "spec", "sketch3d"):
+                       "spec", "sketch3d", "tasklist"):
         fn = _resolve_extra(module_key, tool)
         if fn is not None:
             return fn
@@ -268,6 +268,13 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 # sketch2d advertises render_sketch (its own preview tool).
                 from mcp_server.sketch3d_tools import register_sketch3d_tools
                 register_sketch3d_tools(mcp)
+            elif module_key == "tasklist":
+                # general_agent.yaml advertises task_list — the ONLY plan_state
+                # producer reachable from the general lane. Unresolved here it
+                # would render as "schema unavailable" and fail at dispatch, so
+                # the copilot Task-list panel would stay empty on every run.
+                from mcp_server.task_list_tools import register_task_list_tools
+                register_task_list_tools(mcp)
             else:
                 return None
             _EXTRA_MCP[module_key] = mcp

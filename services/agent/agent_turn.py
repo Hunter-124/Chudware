@@ -211,6 +211,83 @@ def error_detail_for_stop(
 # directive was dropped as free text (observed live in the r4 PLAN node).
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
+_TRUNC_OPENER_RE = re.compile(r'"(?:tool|status|done)"')
+
+
+def _json_balance(text: str) -> tuple[int, int, bool]:
+    """(brace_depth, bracket_depth, inside_string) counted OUTSIDE literals.
+
+    A naive ``count('{')`` is wrong for JSON: model directives routinely carry
+    braces, brackets and escaped quotes INSIDE string values (a `mission_start`
+    request paragraph is the live example), so a text scan must track string
+    state and backslash escapes or it reports garbage depth.
+    """
+    depth = brack = 0
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        elif ch == "[":
+            brack += 1
+        elif ch == "]":
+            brack -= 1
+    return depth, brack, in_str
+
+
+def _looks_truncated(reply: str) -> bool:
+    """True when *reply* is a tool directive CUT OFF mid-emission.
+
+    Live 2026-07-28 (run asm-152734881473315): after three research calls the
+    model began a ```json {"tool":"mission_start", ...} directive and the
+    completion hit the 2048-token output cap mid-string. `_parse_directive`
+    returned None, the bare-handoff path accepted the fragment as a
+    natural-language finish, and the run reported `stop_reason=confirmed` with
+    ZERO geometry. Providers here return a bare string from `complete()` — there
+    is no finish_reason to consult — so detection has to be textual.
+
+    Deliberately conservative: a false positive costs one wasted completion, so
+    an unmistakable directive OPENER is required, never unbalance alone (prose
+    discussing `{` would otherwise trip it).
+    """
+    text = reply or ""
+    if not text.strip():
+        return False
+    # A closed fence means the model finished emitting; whatever went wrong
+    # afterwards is a parse/dialect problem, not truncation.
+    if _FENCE_RE.search(text):
+        return False
+    fence = text.rfind("```")
+    if fence != -1:
+        body = text[fence + 3:]
+        if body[:4].lower() == "json":
+            body = body[4:]
+        if not _TRUNC_OPENER_RE.search(body):
+            return False
+        depth, brack, in_str = _json_balance(body)
+        return depth > 0 or brack > 0 or in_str
+    # No fence at all: some models emit raw JSON. Anchor on the LAST directive
+    # opener so earlier, complete objects in the same reply cannot mask it.
+    last = None
+    for last in re.finditer(r'\{\s*"(?:tool|status)"', text):
+        pass
+    if last is None:
+        return False
+    depth, brack, in_str = _json_balance(text[last.start():])
+    return depth > 0 or brack > 0 or in_str
+
 
 def _attach_typed_refusal_if_needed(handoff: dict, calls: list) -> dict:
     """mega-24 a2: multi-domain gate needs typed_refusal OR delegate.
@@ -1003,6 +1080,9 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     ``assistant_delta`` events on the same on_event path the other agent
     events use. When *on_event* is None (headless/tests) nothing is installed
     — zero overhead, today's behaviour byte-for-byte.
+
+    The same on_event also becomes the task-list sink (``task_list``'s
+    ``plan_state`` events) for the duration of the turn.
     """
     if on_event is None:
         return _run_turn_impl(
@@ -1025,19 +1105,38 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         _ae.emit_event(kind, payload, live=on_event, journal=None)
 
     coalescer = _AssistantDeltaCoalescer(_emit_delta)
-    with _pbase.ProviderDeltaGuard(coalescer):
-        return _run_turn_impl(
-            request, provider, name=name, allowed_tools=allowed_tools,
-            system_prompt=system_prompt, max_tool_calls=max_tool_calls,
-            max_tokens=max_tokens, ledger=ledger, actor=actor,
-            tool_dispatch=tool_dispatch, mission_dispatch=mission_dispatch,
-            tools_text=tools_text, on_event=on_event, run_id=run_id,
-            node_id=node_id, parent_id=parent_id, subagent_id=subagent_id,
-            capability=capability, tier=tier, model_id=model_id, phase=phase,
-            task_class=task_class, msg_idx=msg_idx, doc_id=doc_id,
-            context_refs=context_refs, mode=mode, plan_only=plan_only,
-            options=options, history=history, attachments=attachments,
-            auto_enable_packs=auto_enable_packs)
+    # Task-list sink: the `task_list` tool publishes `plan_state` events that
+    # drive the copilot's live Task-list panel, but the tool is dispatched deep
+    # under the loop with no on_event of its own. Same contextvar idiom as the
+    # delta sink above, same try/finally discipline. Import-guarded so a missing
+    # module can never break a turn.
+    _tl = None
+    _tl_tok = None
+    try:
+        from services.agent import task_list as _tl  # noqa: PLC0415
+        _tl_tok = _tl.set_event_sink(on_event, run_id)
+    except Exception:  # noqa: BLE001
+        _tl = None
+    try:
+        with _pbase.ProviderDeltaGuard(coalescer):
+            return _run_turn_impl(
+                request, provider, name=name, allowed_tools=allowed_tools,
+                system_prompt=system_prompt, max_tool_calls=max_tool_calls,
+                max_tokens=max_tokens, ledger=ledger, actor=actor,
+                tool_dispatch=tool_dispatch, mission_dispatch=mission_dispatch,
+                tools_text=tools_text, on_event=on_event, run_id=run_id,
+                node_id=node_id, parent_id=parent_id, subagent_id=subagent_id,
+                capability=capability, tier=tier, model_id=model_id, phase=phase,
+                task_class=task_class, msg_idx=msg_idx, doc_id=doc_id,
+                context_refs=context_refs, mode=mode, plan_only=plan_only,
+                options=options, history=history, attachments=attachments,
+                auto_enable_packs=auto_enable_packs)
+    finally:
+        if _tl is not None and _tl_tok is not None:
+            try:
+                _tl.clear_event_sink(_tl_tok)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
@@ -1604,6 +1703,24 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     # At most one "you described the step instead of taking it" nudge, so a
     # chatty model is pushed once and never loops.
     _continue_nudge = [0]
+    # At most one "your last message was cut off" re-emit request per turn. A
+    # second truncation must end the turn honestly (no_code) rather than burn
+    # the whole budget re-asking for the same oversized directive.
+    _trunc_nudge = [0]
+    # At most one "publish a task list" push per turn, and the preference that
+    # arms it. Read lazily here rather than plumbed through the signature: the
+    # knob is lane-scoped and `auto_enable_packs` already marks the one lane it
+    # applies to (the interactive general_agent turn), so no caller changes.
+    _tasklist_nudge = [0]
+    _tasklist_pref = "off"
+    if auto_enable_packs:
+        try:
+            from services.agent import config as _cfg_tl  # noqa: PLC0415
+            _fn_tl = getattr(_cfg_tl, "get_task_list_preference", None)
+            if callable(_fn_tl):
+                _tasklist_pref = str(_fn_tl() or "off").strip().lower()
+        except Exception:  # noqa: BLE001 — a preference read never breaks a turn
+            _tasklist_pref = "off"
     # T-W21 §20 / mega-25: trigger-injection bookkeeping scoped to THIS
     # run_turn() call — messages/context is always fresh per call (no cross-
     # call conversation continuity), so cooldown only needs to hold across
@@ -1955,6 +2072,36 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         parsed = _parse_directive(reply)
 
         if parsed is None:
+            # Truncation guard (live 2026-07-28, run asm-152734881473315): a
+            # completion cut off mid-directive parses as None and used to fall
+            # straight through to the bare-handoff acceptance below, so a run
+            # that built NOTHING reported status=done stop_reason=confirmed.
+            # Ask ONCE for a compact re-emit; a second truncation ends the turn
+            # honestly instead of looping on the same oversized directive.
+            if _looks_truncated(reply):
+                if tool_calls_made < budget and _trunc_nudge[0] < 1:
+                    _trunc_nudge[0] += 1
+                    _log(ledger, actor, {
+                        "event": "reply_truncated_retry",
+                        "tool_calls": tool_calls_made,
+                        "tail": (reply or "")[-160:],
+                    })
+                    messages.append({"role": "user", "content": _parts(
+                        "[TRUNCATED] Your previous message was cut off mid "
+                        "tool call, so nothing ran. Re-emit ONLY that single "
+                        "tool call as compact JSON in one ```json fence - no "
+                        "prose, no restated long text, and keep every string "
+                        "argument short. If the call genuinely needs a long "
+                        "body, do smaller steps instead."
+                    )})
+                    last_reason = _RETRY
+                    continue
+                _log(ledger, actor, {
+                    "event": "reply_truncated_fatal",
+                    "tool_calls": tool_calls_made,
+                })
+                last_reason = _NOCODE
+                break
             # No structured directive. If the model already ran tools, treat a bare
             # natural-language finish as done-with-handoff; otherwise it produced
             if tool_calls_made > 0:
@@ -2838,6 +2985,38 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 pass
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
+
+        # Task-list preference enforcement (Settings → AI → Harness). The role
+        # prompt already asks for a task_list call and the tool is advertised and
+        # resolvable — and a live claude-opus-5 run still made 20 tool calls
+        # without publishing one, leaving the copilot's Task list panel empty for
+        # the whole build. Soft guidance loses to the immediate modeling task, so
+        # the knob gets one real nudge: Require fires at the first tool call,
+        # Encourage waits until the run is demonstrably multi-step. Once per turn
+        # (same idiom as _continue_nudge/_novol_nudge) — never a block, so it can
+        # not false-refuse real work.
+        if (
+            auto_enable_packs                       # interactive general lane only
+            and _tasklist_nudge[0] < 1
+            and _tasklist_pref in ("encourage", "require")
+            and "task_list" in (allow or set())
+            and tool_calls_made < budget
+            and not any(c.get("tool") == "task_list" for c in calls)
+            and tool_calls_made >= (1 if _tasklist_pref == "require" else 3)
+        ):
+            _tasklist_nudge[0] += 1
+            messages.append({"role": "user", "content": _parts(
+                f"[TASK LIST] {tool_calls_made} tool call(s) in and you have not "
+                f"published a task list, so the user's Task list panel is empty "
+                f"and they cannot see what you are doing. Call task_list now with "
+                f"3-8 short items covering the whole job (the step you just "
+                f"finished marked done, the one you are on running, the rest "
+                f"pending), then carry on. Re-publish the FULL list whenever a "
+                f"status changes."
+            )})
+            _log(ledger, actor, {"event": "task_list_nudge",
+                                 "preference": _tasklist_pref,
+                                 "tool_calls": tool_calls_made})
 
         # Proactive advisor (opt-in checkbox): cheap gated mid-run guidance.
         # Hard gate = proactive_advisor_enabled(); preference sets tone/frequency.

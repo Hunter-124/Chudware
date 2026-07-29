@@ -27,14 +27,18 @@ from typing import Any
 _FAMILIES = (
     "advisor", "cad", "cam", "ecad", "em", "files", "gsl", "intake",
     "ledger", "mission", "office", "org", "parts", "plm", "recon",
-    "research", "reveng", "shell", "sim", "workspace",
+    "research", "reveng", "shell", "sim", "tasklist", "workspace",
 )
 
 # Agent pseudo-tools with no live registry callable outside a mission
 # dispatcher (hand-written schemas in tool_schemas._FALLBACK_SCHEMAS).
+# task_list is deliberately NOT registered in services/mcp/server.py: it
+# publishes to the in-app copilot Task-list panel, which means nothing to an
+# external MCP client. It resolves for agent dispatch through reviewer_exec's
+# "tasklist" module_key.
 PSEUDO_TOOLS: frozenset[str] = frozenset({
     "enable_tools", "list_tool_categories", "design_recipe",
-    "delegate", "adopt_role",
+    "delegate", "adopt_role", "task_list",
 })
 
 # Option keys a guidance entry may set (config.TOOL_OPTION_KEYS minus the

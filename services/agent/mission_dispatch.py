@@ -2029,6 +2029,117 @@ class MissionDispatch:
 # ever gets.
 LINEAR_ROLE_MAX_TOOL_CALLS = 30
 
+# 2048 output tokens (agent_turn's `completion_cap` default) truncated the live
+# 2026-07-28 general-lane turn mid-`mission_start` directive: the reply was cut
+# off inside a string, parsed as no-directive, and the run reported success with
+# zero geometry. This lane is the UNIVERSAL online entry and its directives carry
+# whole project briefs, so it needs real headroom, not a DAG node's.
+LINEAR_ROLE_MAX_OUTPUT_TOKENS = 8192
+
+
+def _apply_session_preferences(
+    role: str, allowed: list[str], system_prompt: str,
+) -> tuple[list[str], str]:
+    """Fold the Settings → AI → Harness preference knobs into the role card.
+
+    ``get_plan_preference``/``get_subagent_preference`` had ZERO consumers
+    repo-wide: the combos persisted to config.json and nothing ever read them,
+    so both were dead UI. This is the one place the interactive lane's system
+    prompt and allow-set are assembled, so it is where they belong.
+
+    Interactive lane ONLY (``general_agent``). Curated DAG-node / sub-agent
+    cards keep their allow-list as a hard, unmodified boundary — a session knob
+    must never widen or narrow a curated role's scope.
+
+    Returns the possibly-trimmed allow-set and the prompt with one compact
+    SESSION PREFERENCES block appended. Never raises into the turn path.
+
+    ``task_list`` is granted HERE rather than from a ``tool:`` seat in
+    general_agent.yaml: role cards are capped at ``MAX_TOOLS_PER_ROLE`` (14) and
+    explicit entries win seats before family expansions, so spending a seat on it
+    silently evicted ``plm_checkpoint`` off the tail of ``family: plm`` — the
+    model kept a planning tool and lost the ability to checkpoint the work it
+    planned. It is a harness surface (like enable_tools), not a CAD capability,
+    so it belongs on the lane floor where the cap does not apply.
+    """
+    if role != "general_agent":
+        return allowed, system_prompt
+    try:
+        from services.agent import config as agent_config  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — preferences are best-effort
+        return allowed, system_prompt
+
+    def _pref(name: str, fallback: str) -> str:
+        # getattr-guarded: get_task_list_preference is newer than some installs.
+        fn = getattr(agent_config, name, None)
+        if not callable(fn):
+            return fallback
+        try:
+            return str(fn() or fallback).strip().lower()
+        except Exception:  # noqa: BLE001
+            return fallback
+
+    task_pref = _pref("get_task_list_preference", "encourage")
+    plan_pref = _pref("get_plan_preference", "off")
+    sub_pref = _pref("get_subagent_preference", "option")
+
+    drop: set[str] = set()
+    add: set[str] = set()
+    lines: list[str] = []
+
+    if task_pref == "off":
+        drop.add("task_list")
+    else:
+        add.add("task_list")
+    if task_pref == "encourage":
+        lines.append(
+            "Task list: for any job with more than about three steps, publish "
+            "a task list with `task_list` before you start, and re-publish it "
+            "as item statuses change."
+        )
+    elif task_pref == "require":
+        lines.append(
+            "Task list: REQUIRED. For any multi-step job your FIRST tool call "
+            "must be `task_list`, and you must re-publish it (same item ids) "
+            "every time a status changes."
+        )
+
+    if plan_pref == "off":
+        lines.append(
+            "Planning: do NOT draft a plan first - act directly on the "
+            "request with real tool calls."
+        )
+    elif plan_pref in ("encourage", "require"):
+        lines.append(
+            "Planning: state your plan before you mutate anything, then "
+            "execute it."
+        )
+
+    if sub_pref == "off":
+        drop.update({"delegate", "mission_start"})
+        lines.append(
+            "Sub-agents: disabled for this session - `delegate` and "
+            "`mission_start` are not available. Do the work yourself."
+        )
+    elif sub_pref in ("encourage", "require"):
+        lines.append(
+            "Sub-agents: when the work splits into genuinely independent "
+            "pieces, fan them out with `delegate` instead of doing them "
+            "serially."
+        )
+
+    if add:
+        allowed = sorted(set(allowed) | add)
+    if drop:
+        allowed = [t for t in allowed if t not in drop]
+    if lines:
+        system_prompt = (
+            (system_prompt or "").rstrip()
+            + "\n\nSESSION PREFERENCES\n"
+            + "\n".join(f"- {ln}" for ln in lines)
+        )
+    return allowed, system_prompt
+
 
 def run_linear_role_turn(
     request: str,
@@ -2041,6 +2152,7 @@ def run_linear_role_turn(
     mission_dispatch: MissionDispatch | None = None,
     capability: Any | None = None,
     max_tool_calls: int | None = None,
+    max_tokens: int | None = None,
     tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
     options: dict | None = None,
     history: list[dict] | None = None,
@@ -2108,6 +2220,12 @@ def run_linear_role_turn(
     except Exception:  # noqa: BLE001
         system_prompt = card.system_prompt
 
+    # Preferences BEFORE render_tools_block: a dropped tool must also vanish
+    # from the schema block, or the model is shown a tool every call to which
+    # will be refused.
+    allowed, system_prompt = _apply_session_preferences(
+        role, allowed, system_prompt)
+
     tools_text = None
     try:
         from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
@@ -2123,6 +2241,7 @@ def run_linear_role_turn(
         allowed_tools=allowed,
         tools_text=tools_text,
         max_tool_calls=max_tool_calls or LINEAR_ROLE_MAX_TOOL_CALLS,
+        max_tokens=max_tokens or LINEAR_ROLE_MAX_OUTPUT_TOKENS,
         ledger=ledger,
         mission_dispatch=mission_dispatch,
         tool_dispatch=tool_dispatch,

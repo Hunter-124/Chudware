@@ -487,12 +487,15 @@ void loadSettings(Settings& s) {
             s.planPreference = 0;  // default Off — direct agent, no forced plan/intake
         s.planMode = (s.planPreference != 0);
         s.subagentPreference = parsePref(j, "subagent_preference", 1);
+        s.taskListPreference = parsePref(j, "task_list_preference", 2);
         s.advisorPreference = parsePref(j, "advisor_preference", 2);
         // Nested agent.* also accepted (overlay / Python write path).
         if (j.contains("agent") && j["agent"].is_object()) {
             const auto& ag = j["agent"];
             if (ag.contains("subagent_preference"))
                 s.subagentPreference = parsePref(ag, "subagent_preference", s.subagentPreference);
+            if (ag.contains("task_list_preference"))
+                s.taskListPreference = parsePref(ag, "task_list_preference", s.taskListPreference);
             if (ag.contains("advisor_preference"))
                 s.advisorPreference = parsePref(ag, "advisor_preference", s.advisorPreference);
             if (ag.contains("proactive_advisor"))
@@ -903,6 +906,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["plan_preference"] = prefName(planPref);
         j["plan_mode"] = (planPref != 0);  // Python / older readers
         j["subagent_preference"] = prefName(s.subagentPreference);
+        j["task_list_preference"] = prefName(s.taskListPreference);
         j["advisor_preference"] = prefName(s.advisorPreference);
         j["proactive_advisor"] = s.proactiveAdvisor;
         j["corporate_mode"] = s.corporateMode;
@@ -921,6 +925,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         agent["auto_mission_routing"] = s.autoMissionRouting;
         agent["direct_agent_full_tools"] = s.directAgentFullTools;
         agent["subagent_preference"] = prefName(s.subagentPreference);
+        agent["task_list_preference"] = prefName(s.taskListPreference);
         agent["memory_enabled"] = s.memoryEnabled;
         agent["role_adoption"] = (s.roleAdoption != 0) ? "free" : "supervised";
         agent["memory_token_budget"] = s.memoryTokenBudget;

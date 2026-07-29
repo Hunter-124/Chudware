@@ -3112,7 +3112,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         }
     };
 
-    // ---- Preferences (3 combos) + flags in a 2-col grid ----
+    // ---- Preferences (4 combos) + role adoption in a 2-col grid ----
     if (ImGui::BeginTable("##harness_prefs", 2,
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
@@ -3122,6 +3122,12 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                   "Option = model may plan. "
                   "Encourage = plan by default. "
                   "Require = always draft a plan before building.");
+        ImGui::TableNextColumn();
+        prefCombo("Task list preference", "##h_tasklist_pref", &settings.taskListPreference,
+                  "Whether the agent publishes a live task list (the Tasks panel "
+                  "in the copilot). Off = never. Option = model's choice. "
+                  "Encourage = publish for any multi-step job. "
+                  "Require = always publish before starting work.");
         ImGui::TableNextColumn();
         prefCombo("Subagent preference", "##h_sub_pref", &settings.subagentPreference,
                   "How freely the main agent may spawn subagents. "
@@ -4790,6 +4796,7 @@ const SettingsEntry kSettingsEntries[] = {
     { "Plan before building",     "AI",           2 },
     { "Plan mode",                "AI",           2 },
     { "Subagent preference",      "AI",           2 },
+    { "Task list preference",     "AI",           2 },
     { "Role adoption",            "AI",           2 },
     { "Advisor preference",       "AI",           2 },
     { "Proactive advisor",        "AI",           2 },

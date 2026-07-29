@@ -1864,12 +1864,28 @@ static void drawOmpProviderManager(AppState& st) {
             const OmpProviderRow& r = *rp;
             ImGui::PushID(r.id.c_str());
             const bool sel = (r.id == s_omp.selectedId);
+            // ImGui's Selectable hard-codes a SQUARE frame (rounding 0.0f), so hide its
+            // header colors and paint the highlight ourselves with rounded corners below.
+            ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
             if (ImGui::Selectable("##row", sel, 0,
                                   ImVec2(0, ImGui::GetTextLineHeight() * 2 + 8.0f * sc))) {
                 s_omp.selectedId = r.id;
             }
+            ImGui::PopStyleColor(3);
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const ImVec2 mn = ImGui::GetItemRectMin();
+            const ImVec2 mx = ImGui::GetItemRectMax();
+            const bool hov = ImGui::IsItemHovered();
+            const bool act = ImGui::IsItemActive();
+            if (sel || hov || act) {
+                const ImVec4 hc = ImGui::GetStyleColorVec4(
+                    (act && hov) ? ImGuiCol_HeaderActive
+                                 : (hov ? ImGuiCol_HeaderHovered : ImGuiCol_Header));
+                dl->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(hc),
+                                  ui::metrics::rounding(6.0f));
+            }
             const float fh = ImGui::GetFontSize();
             const float rowH = fh * 2.0f + 8.0f * sc;
             const float badgeSide = fh * 1.4f;

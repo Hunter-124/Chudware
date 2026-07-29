@@ -1182,6 +1182,17 @@ void drawWindowPillScrollbarV(const AdaptiveSurface& surf, const PillScrollbarSt
 
     // Drag interaction — a fixed-position (screen-space) hit strip along the track, so it doesn't
     // move with the scrolled content.
+    //
+    // The strip MUST NOT contribute to the window's content size. It is placed at a SCREEN
+    // position, so its local offset is (scrollY + …): ImGui folds that into CursorMaxPos and
+    // hence ContentSize, making ScrollMaxY grow by roughly (WindowPadding.y - margin) on top of
+    // whatever the caller already scrolled to. That ratchets a few px of extra range every frame,
+    // which is the "I can keep scrolling past the end into blank space" bug — in the Settings
+    // modal and every other pane that paints this bar. Snapshot CursorMaxPos and the cursor
+    // around the item and restore both, so the bar is purely an overlay.
+    ImGuiWindow* win = ImGui::GetCurrentWindow();
+    const ImVec2 savedCursorMax = win->DC.CursorMaxPos;
+    const ImVec2 savedCursor = ImGui::GetCursorPos();
     ImGui::SetCursorScreenPos(ImVec2(trackX0, trackTop));
     ImGui::InvisibleButton("##pillscroll_v", ImVec2(bandW, trackLen));
     const bool hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
@@ -1190,6 +1201,8 @@ void drawWindowPillScrollbarV(const AdaptiveSurface& surf, const PillScrollbarSt
         const float t = (my - trackTop - thumbLen * 0.5f) / std::max(1.0f, trackLen - thumbLen);
         ImGui::SetScrollY(std::min(std::max(t, 0.0f), 1.0f) * scrollMax);
     }
+    win->DC.CursorMaxPos = savedCursorMax;
+    ImGui::SetCursorPos(savedCursor);
     drawScrollPill(ImGui::GetWindowDrawList(), ImVec2(pillX0, trackTop),
                    ImVec2(pillX1, trackBot), thumbTop, thumbBot,
                    /*vertical=*/true, hov, surf, style.thickness);

@@ -1311,6 +1311,11 @@ def register_parts_tools(mcp: FastMCP) -> None:
             # id rewrite the caller cannot see is an id rewrite it cannot learn from.
             if str(rec.get("part_id") or "") not in ("", str(part_id)):
                 notes.append(f"read part_id {part_id!r} as {rec['part_id']!r}")
+            # An ECAD id may also carry a PIN PERMUTATION (Device:Q_NPN_BCE is our Q_NPN
+            # renumbered). The record says so; repeat it in `interpreted` because a
+            # renumbering the caller skims past is a wire on the wrong leg.
+            if rec.get("pin_remap_note"):
+                notes.append(str(rec["pin_remap_note"]))
             out = {"ok": True, "part": rec}
             if notes:
                 out["interpreted"] = _interpreted_notes(notes)

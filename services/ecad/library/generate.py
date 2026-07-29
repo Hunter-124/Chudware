@@ -44,10 +44,11 @@ DFM, PDN) works unchanged.
 PIN PERMUTATION
 ---------------
 ``pins`` carries ``number`` and ``name`` as INDEPENDENT caller-set fields, and layout
-is derived from ``number`` alone. A future importer that has to remap a foreign pin
-order (see ``partid.py``: ~9 KiCad ids refuse purely because their pin NUMBERING
-disagrees with ours) only has to emit the right ``number`` per name — no new mechanism
-and no change here.
+is derived from ``number`` alone, so an importer that has to remap a foreign pin order
+only has to emit the right ``number`` per name — no new mechanism and no change here.
+``partid.py`` now does exactly that for the KiCad pin-order variants (``Q_NPN_BCE``,
+``Conn_02xNN_Counter_Clockwise``, ...) via its own hand-audited permutation table, and
+needed nothing from this module to do it.
 
 STORAGE
 -------
@@ -735,8 +736,9 @@ def generate_footprint(name: str, *, package: str, pins, fpid: str = "",
             #              half+1..n up the RIGHT — starter's Package_DIP:DIP-8 order.
             #   'odd_even' (KiCad 2xNN connectors): odd numbers down the left, even
             #              down the right, so 1 and 2 are the SAME top row.
-            # They disagree about which pad pin 3 is (partid.py refuses Conn_02xNN for
-            # exactly this reason), so the caller picks — nothing is inferred.
+            # They disagree about which pad pin 3 is (partid.py carries an explicit
+            # audited permutation per Conn_02xNN variant for exactly this reason), so the
+            # caller picks — nothing is inferred.
             odd_even = str(numbering or "").lower() in ("odd_even", "oddeven", "kicad")
             right_top_down = odd_even
             if groups:

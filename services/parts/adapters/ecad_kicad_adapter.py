@@ -72,18 +72,43 @@ class EcadKicadAdapter:
         # (ecad:Device:R_0603) is NEVER mapped onto a different record; it stays a
         # refusal whose hint names the real ids instead.
         want = str(part_id or "")
+        remap: list[dict] | None = None
+        remap_note = ""
         try:
             from services.ecad.library.partid import resolve as _resolve_ecad_id
+            from services.ecad.library.partid import resolved_pins as _resolved_ecad_pins
             hit = _resolve_ecad_id(part_id)
             if hit:
                 want = hit["part_id"]
+                # A pin PERMUTATION row (Device:Q_NPN_BCE, Conn_02x03_Counter_Clockwise:
+                # the same device, numbered differently) resolves onto the record we really
+                # have, whose pins carry OUR numbers. Carrying the translation on the record
+                # is the whole point: a caller that read "pin 2 = C" off its own KiCad id
+                # must wire pin 3 of this symbol, and an id rewrite that stayed silent about
+                # the renumbering would move every such wire onto the wrong leg.
+                if hit.get("pin_remap"):
+                    remap = _resolved_ecad_pins(part_id)
+                    remap_note = str(hit.get("note") or "")
         except Exception as exc:  # noqa: BLE001
             log.debug("EcadKicadAdapter: part-id resolver unavailable: %s", exc)
         if not want.startswith("ecad:"):
             return None
+
+        def _out(rec: dict) -> dict:
+            """The record, plus the pin translation when the id carried a permutation."""
+            if not remap:
+                return rec
+            rec = dict(rec)
+            rec["pin_remap"] = [dict(p) for p in remap]
+            rec["pin_remap_note"] = (
+                remap_note + ". Wire by native_number: "
+                + ", ".join(f"your pin {p['number']} ({p['name']}) = pin "
+                            f"{p['native_number']}" for p in remap))
+            return rec
+
         for rec in self.iter_records():
             if rec.get("part_id") == want:
-                return rec
+                return _out(rec)
         # Generated parts (ecad_make_part -> resolution tier 2) are served HERE and
         # deliberately NOT from iter_records(): iter_records feeds the FTS index, which is
         # snapshotted to <app data>/cache/parts_index.sqlite and revalidated against a
@@ -93,7 +118,7 @@ class EcadKicadAdapter:
         # able to fetch a part the agent just made, with nothing cached.
         for rec in _load_native_dirs():
             if rec.get("part_id") == want:
-                return rec
+                return _out(rec)
         return None
 
     def count(self) -> int:

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 DOMAIN = "ecad"
 _PREFIX = DOMAIN + ":"
@@ -119,29 +119,149 @@ def _fold(libid: str) -> str:
 #
 #   * drawing-STYLE variants only (``_Small``, ``_US``, ``_ALT``) — same device, same pins;
 #   * package/punctuation suffixes on the same part number (LM7805_TO220, MPU-6050);
-#   * pin-ORDER suffixes ONLY where the order matches ours exactly. ``Device:Q_NPN_BEC``
-#     maps because our Q_NPN really is 1=B, 2=E, 3=C; ``Q_NPN_BCE``/``_EBC``/``_CBE`` do
-#     NOT map, because binding them would renumber the transistor's pins and every wire
-#     drawn to them would land on the wrong leg while the call reported success.
+#   * pin-ORDER variants, via an explicit hand-audited PERMUTATION (``pins=``) that states
+#     which of OUR pins each KiCad pin is. ``Device:Q_NPN_BEC`` needs none — our Q_NPN
+#     really is 1=B, 2=E, 3=C — while ``Device:Q_NPN_BCE`` carries ``{1:1, 2:3, 3:2}``.
 #
-# Deliberately ABSENT, and they must stay absent:
+# A permutation is only ever acceptable when it is KNOWN and audited, never guessed, and it
+# MUST name every pin of the native symbol exactly once (:func:`_remap_problem`). A partial
+# permutation completed by an identity fallback would put some wires on the right leg and
+# some on the wrong one while the call reported success — the exact failure this table is
+# built to prevent — so a partial or unauditable permutation is a hard refusal, both at
+# import (:func:`_audit_remaps`) and per call in :func:`resolve`.
+#
+# Deliberately ABSENT, and they must stay absent — none of these is a pin-numbering
+# question, so no permutation can rescue them:
 #   Device:Crystal        -> two candidates here (Crystal_HSE, Crystal_32k768) and picking a
 #                            frequency class is a substitution, not a spelling.
 #   Device:D_Schottky     -> a Schottky is not the generic diode; different Vf.
-#   Device:R_Shunt        -> KiCad's is a 4-terminal Kelvin symbol; our R_Sense has 2 pins.
+#   Device:R_Shunt        -> KiCad's is a 4-terminal Kelvin symbol (2 force + 2 sense) and
+#                            our R_Sense has 2 pins. There is no permutation: a mapping
+#                            would have to DROP the sense pair, and dropped pins are
+#                            silently unconnected sense lines.
 #   Switch:SW_Push        -> momentary; our Switch carries no momentary/latching semantics.
-#   Connector_Generic:Conn_02xNN -> KiCad's Odd_Even/Counter_Clockwise numbering variants
-#                            disagree about which physical pin is pin 3.
-#   Timer:LM555 / ICM7555 -> different silicon (CMOS vs bipolar), not a spelling of NE555.
+#   Timer:ICM7555         -> CMOS silicon, not a spelling of the bipolar NE555 (its bipolar
+#                            siblings LM555/SA555 ARE the same device and do map, below).
+#   Connector_Generic:Conn_02xNN_Row_Letter_First / _Row_Letter_Last / _Top_Bottom
+#                         -> the letter variants number pins ``a1..bN`` rather than 1..2N,
+#                            and for _Top_Bottom we could not establish from a primary
+#                            source which physical pad the second row starts at. An
+#                            UNVERIFIED permutation is worse than a refusal.
 # Each of those still gets the candidate hint, which names the real ids and lets the MODEL
 # choose. A mapping table is the right long-term home for a real KiCad importer; this one is
 # closed, small and hand-checked on purpose.
-_KICAD_IDENTITY: dict[str, str] = {}
 
 
-def _kicad(native: str, *kicad_ids: str) -> None:
+class _Entry(NamedTuple):
+    """One row of the KiCad dialect table.
+
+    ``native``  the libid in THIS library that the KiCad id denotes.
+    ``pins``    ``{KiCad pin number: our pin number}`` when the two symbols number the same
+                device differently, or ``None`` when the numbering already agrees. When
+                present it MUST be a one-to-one cover of every pin of ``native``.
+    """
+
+    native: str
+    pins: dict[str, str] | None = None
+
+
+def _pins_of(libid: str) -> list[dict]:
+    """The pin list of a native libid (starter tier, then the generated tier); ``[]`` when
+    unknown. Never raises — a resolver must not die on a library import."""
+    sdef: Any = None
+    try:
+        from .starter import SYMBOLS
+        sdef = SYMBOLS.get(libid)
+    except Exception:  # noqa: BLE001
+        sdef = None
+    if sdef is None:
+        try:
+            from .native import resolve as _lib_resolve
+            sdef = _lib_resolve(libid)
+        except Exception:  # noqa: BLE001
+            sdef = None
+    return list((sdef or {}).get("pins") or [])
+
+
+def _pin_names(libid: str) -> dict[str, str]:
+    """``{pin number: pin name}`` for a native libid."""
+    return {str(p.get("number")): str(p.get("name") or "") for p in _pins_of(libid)}
+
+
+def _pin_key(number: Any) -> tuple[int, str]:
+    """Sort key that orders pin numbers 1,2,...,10 rather than 1,10,2."""
+    text = str(number)
+    return (int(text), "") if text.isdigit() else (10 ** 9, text)
+
+
+def _remap_problem(entry: _Entry) -> str:
+    """``''`` when *entry*'s permutation is a full one-to-one cover of the native symbol's
+    pins, else the reason the row must be REFUSED.
+
+    A permutation that misses a pin, sends two KiCad pins to one of ours, or names a pin the
+    symbol does not have is not a renumbering — it is a partial guess. Completing it with an
+    identity fallback is what produces a netlist that looks finished with some wires on the
+    wrong leg, so it refuses instead.
+    """
+    if entry.pins is None:
+        return ""
+    native = _pin_names(entry.native)
+    if not native:
+        return (f"pin permutation for {entry.native!r} cannot be audited — that symbol has "
+                f"no pin list here")
+    mapped = [str(v) for v in entry.pins.values()]
+    unknown = sorted(set(mapped) - set(native), key=_pin_key)
+    if unknown:
+        return (f"pin permutation for {entry.native!r} names pin(s) {', '.join(unknown)}, "
+                f"which that symbol does not have")
+    dupes = sorted({p for p in mapped if mapped.count(p) > 1}, key=_pin_key)
+    if dupes:
+        return (f"pin permutation for {entry.native!r} sends more than one source pin to "
+                f"pin(s) {', '.join(dupes)}")
+    missing = sorted(set(native) - set(mapped), key=_pin_key)
+    if missing:
+        return (f"pin permutation for {entry.native!r} covers {len(mapped)} of "
+                f"{len(native)} pins — pin(s) {', '.join(missing)} unaccounted for")
+    return ""
+
+
+def _remap_sentence(entry: _Entry) -> str:
+    """The renumbering, spelled out pin by pin, for the ``note`` a caller reads."""
+    if not entry.pins:
+        return ""
+    names = _pin_names(entry.native)
+    moved = [f"your pin {k} ({names.get(str(v), '?')}) is pin {v} here"
+             for k, v in sorted(entry.pins.items(), key=lambda kv: _pin_key(kv[0]))
+             if str(k) != str(v)]
+    if not moved:
+        return (f"pin numbering is IDENTICAL to {entry.native}, audited pin by pin for all "
+                f"{len(entry.pins)} pins")
+    return "PIN REMAP: " + ", ".join(moved)
+
+
+_KICAD_IDENTITY: dict[str, _Entry] = {}
+
+
+def _kicad(native: str, *kicad_ids: str, pins: dict | None = None) -> None:
+    entry = _Entry(native, {str(k): str(v) for k, v in pins.items()} if pins else None)
     for k in kicad_ids:
-        _KICAD_IDENTITY[_fold(k)] = native
+        _KICAD_IDENTITY[_fold(k)] = entry
+
+
+def _audit_remaps() -> None:
+    """Fail loudly at import if any row's permutation is not a full one-to-one cover.
+
+    Same posture as ``substitute._validate``: a table this small is hand-checked, and a bad
+    row must stop the process rather than quietly mis-wire one device.
+    """
+    bad = []
+    for key, entry in _KICAD_IDENTITY.items():
+        problem = _remap_problem(entry)
+        if problem:
+            bad.append(f"{key}: {problem}")
+    if bad:
+        raise RuntimeError("KiCad pin permutations are not one-to-one covers: "
+                           + "; ".join(sorted(bad)))
 
 
 #                     our libid                KiCad spellings of the SAME device
@@ -156,27 +276,74 @@ _kicad("Device:Zener", "Device:D_Zener", "Device:D_Zener_Small", "Device:D_Zener
 _kicad("Device:NTC", "Device:Thermistor_NTC", "Device:Thermistor_NTC_Small", "Device:R_NTC")
 _kicad("Device:Ferrite_Bead", "Device:FerriteBead", "Device:FerriteBead_Small",
        "Device:Ferrite_Bead_Small")
-_kicad("Device:Q_NPN", "Device:Q_NPN_BEC")      # ours: 1=B 2=E 3=C
-_kicad("Device:Q_PNP", "Device:Q_PNP_BEC")      # ours: 1=B 2=E 3=C
-_kicad("Device:NMOS", "Device:Q_NMOS_GSD")      # ours: 1=G 2=S 3=D
-_kicad("Device:PMOS", "Device:Q_PMOS_GSD")      # ours: 1=G 2=S 3=D
+
+# ---- discrete three-legged devices: KiCad states the pin order in the suffix -------------
+# SOURCE OF THE KiCad NUMBERING: the KiCad ``Device`` library names a discrete's pin order in
+# the suffix, one letter per pin in pin-number order — ``Q_NPN_BCE`` is 1=B, 2=C, 3=E. That
+# is the same convention the pre-existing ``Q_NPN_BEC`` row was audited against.
+# SOURCE OF OUR NUMBERING: starter.py, which numbers these for the SOT-23 JEDEC pad order —
+# Q_NPN/Q_PNP 1=B, 2=E, 3=C (MMBT3904/MMBT3906 class) and NMOS/PMOS 1=G, 2=S, 3=D
+# (2N7002/BSS84 class). So for the BJTs B->1, E->2, C->3 and for the FETs G->1, S->2, D->3,
+# and each permutation below is just the suffix read through that map.
+for _fam, _ours in (("Q_NPN", "Device:Q_NPN"), ("Q_PNP", "Device:Q_PNP")):
+    _slot = {"B": "1", "E": "2", "C": "3"}
+    for _order in ("BCE", "BEC", "CBE", "CEB", "EBC", "ECB"):
+        _kicad(_ours, f"Device:{_fam}_{_order}",
+               pins={str(i): _slot[letter] for i, letter in enumerate(_order, start=1)})
+for _fam, _ours in (("Q_NMOS", "Device:NMOS"), ("Q_PMOS", "Device:PMOS")):
+    _slot = {"G": "1", "S": "2", "D": "3"}
+    for _order in ("DGS", "DSG", "GDS", "GSD", "SDG", "SGD"):
+        _kicad(_ours, f"Device:{_fam}_{_order}",
+               pins={str(i): _slot[letter] for i, letter in enumerate(_order, start=1)})
+del _fam, _ours, _slot, _order
+
 _kicad("Device:Switch", "Switch:SW_SPST")
 _kicad("Connector:Conn_2", "Connector_Generic:Conn_01x02")
 _kicad("Connector:Conn_3", "Connector_Generic:Conn_01x03")
 _kicad("Connector:Conn_4", "Connector_Generic:Conn_01x04")
+
+# ---- 2xN connectors: the two KiCad numbering schemes ------------------------------------
+# SOURCE OF THE KiCad NUMBERING: the ``Connector_Generic`` 2xNN variants, as documented and
+# already implemented in-repo at services/ecad/library/generate.py (the ``two_row`` branch) —
+# ``_Odd_Even`` runs the odd numbers down the first row and the even numbers down the second,
+# so 1 and 2 are the same physical row; ``_Counter_Clockwise`` is the DIP topology, 1..N down
+# the first row then N+1..2N back UP the second. Pin 1 is the same corner pad in both.
+# SOURCE OF OUR NUMBERING: starter.py ``_header_2xn`` — odd pins down the left column top to
+# bottom, even pins down the right, i.e. Odd_Even exactly, hence the identity permutation.
+_kicad("Connector:Header_2x03", "Connector_Generic:Conn_02x03_Odd_Even",
+       pins={"1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6"})
+_kicad("Connector:Header_2x03", "Connector_Generic:Conn_02x03_Counter_Clockwise",
+       pins={"1": "1", "2": "3", "3": "5", "4": "6", "5": "4", "6": "2"})
+_kicad("Connector:Header_2x05", "Connector_Generic:Conn_02x05_Odd_Even",
+       pins={str(i): str(i) for i in range(1, 11)})
+_kicad("Connector:Header_2x05", "Connector_Generic:Conn_02x05_Counter_Clockwise",
+       pins={"1": "1", "2": "3", "3": "5", "4": "7", "5": "9",
+             "6": "10", "7": "8", "8": "6", "9": "4", "10": "2"})
+
 _kicad("power:+3V3", "power:+3.3V")
 _kicad("Regulator_Linear:7805", "Regulator_Linear:L7805", "Regulator_Linear:LM7805",
        "Regulator_Linear:LM7805_TO220", "Regulator_Linear:LM7805_TO263",
        "Regulator_Linear:7805_TO220")
 _kicad("Timer:NE555", "Timer:NE555P", "Timer:NE555D", "Timer:NE555N")
+# LM555 (TI/National, datasheet SNAS548) and SA555 (TI SLFS022, the same datasheet as our
+# NE555 seed in starter.py) are the BIPOLAR 555 — the same device as NE555 from another
+# vendor, exactly like the L7805/LM7805 rows above — and the datasheet DIP-8/SOIC-8 pinout is
+# identical: 1=GND, 2=TRIG, 3=OUT, 4=RESET, 5=CONT, 6=THRES, 7=DISCH, 8=VCC, which is
+# starter.py's Timer:NE555 numbering pin for pin. The permutation is spelled out anyway
+# rather than left absent, so the audit records that all EIGHT pins were checked. The CMOS
+# 555s (ICM7555/TLC555/LMC555) are different silicon and stay refused.
+_kicad("Timer:NE555", "Timer:LM555", "Timer:SA555",
+       pins={str(i): str(i) for i in range(1, 9)})
 _kicad("Sensor_Motion:MPU6050", "Sensor_Motion:MPU-6050")
 _kicad("Sensor_Pressure:BMP280", "Sensor_Pressure:BMP-280")
+
+_audit_remaps()
 
 
 def resolve(part_id: Any) -> dict | None:
     """EXACT resolution of a model-written id to a real catalogue id, else ``None``.
 
-    Returns ``{"part_id", "libid", "kind", "note"}`` where ``kind`` is ``"symbol"`` or
+    Returns ``{"part_id", "libid", "kind", "note", "pin_remap"}`` where ``kind`` is
     ``"footprint"`` and ``note`` is the interpretation to echo back (empty when the id was
     already canonical). Three things are forgiven, in this order, and nothing else:
 
@@ -184,7 +351,10 @@ def resolve(part_id: Any) -> dict | None:
       2. spelling noise that cannot change which record you get — ``ecad:`` domain prefix,
          case, whitespace;
       3. a KiCad standard-library spelling of a device we already have, from the closed
-         hand-audited ``_KICAD_IDENTITY`` table above.
+         hand-audited ``_KICAD_IDENTITY`` table above, including its PIN PERMUTATION when
+         KiCad numbers that device's pins differently (``pin_remap``, ``{KiCad pin: our
+         pin}``, ``None`` when the numbering already agrees). A row whose permutation is
+         partial or unauditable is REFUSED, never identity-mapped.
 
     A near miss is NEVER resolved — see the module docstring.
     """
@@ -193,8 +363,9 @@ def resolve(part_id: Any) -> dict | None:
         return None
     symbols, footprints = _catalog()
 
-    def _hit(real: str, kind: str, why: str) -> dict:
+    def _hit(real: str, kind: str, why: str, remap: dict | None = None) -> dict:
         return {"part_id": _PREFIX + real, "libid": real, "kind": kind,
+                "pin_remap": dict(remap) if remap else None,
                 "note": "" if why == "" else
                         (f"read part_id {str(part_id).strip()!r} as {_PREFIX + real!r} "
                          f"({why})")}
@@ -211,15 +382,51 @@ def resolve(part_id: Any) -> dict | None:
         return _hit(real, kind, f"same {kind}, canonical spelling")
     if len(matches) > 1:
         return None  # the same spelling names a symbol AND a footprint -> ambiguous
-    native = _KICAD_IDENTITY.get(key)
-    if native:
+    entry = _KICAD_IDENTITY.get(key)
+    if entry:
+        if _remap_problem(entry):
+            return None  # partial/unauditable permutation -> refuse, never identity-fill
         # The table only ever points at ids this library really has; a stale row must
         # refuse rather than resolve to nothing.
         for kind, table in (("symbol", symbols), ("footprint", footprints)):
-            if native in table:
-                return _hit(native, kind,
-                            f"KiCad standard-library spelling of the same {kind}")
+            if entry.native in table:
+                why = f"KiCad standard-library spelling of the same {kind}"
+                sentence = _remap_sentence(entry)
+                if sentence:
+                    why += "; " + sentence
+                return _hit(entry.native, kind, why, entry.pins)
     return None
+
+
+def resolved_pins(part_id: Any) -> list[dict] | None:
+    """The pin table for *part_id* IN THE NUMBERING THE CALLER WROTE, or ``None``.
+
+    This is where the permutation is applied. Each item is
+    ``{"number", "native_number", "name", "type"}``: ``number`` is the pin number in the
+    dialect of the id that was passed in, ``native_number`` is the pin on the symbol that
+    will actually be placed. For a ``Device:Q_NPN_BCE`` the entry for ``number='2'`` carries
+    ``native_number='3'`` and ``name='C'`` — a caller that meant "KiCad pin 2" must wire our
+    pin 3, and this says so instead of leaving it to be inferred.
+
+    ``None`` when the id does not resolve, does not name a symbol, or the symbol's pin list
+    is not available — never a partial or identity-filled table.
+    """
+    hit = resolve(part_id)
+    if hit is None or hit.get("kind") != "symbol":
+        return None
+    by_number = {str(p.get("number")): p for p in _pins_of(hit["libid"])}
+    if not by_number:
+        return None
+    remap = hit.get("pin_remap") or {n: n for n in by_number}
+    out: list[dict] = []
+    for caller, native in sorted(remap.items(), key=lambda kv: _pin_key(kv[0])):
+        pin = by_number.get(str(native))
+        if pin is None:
+            return None  # unreachable past _remap_problem; still never guess a pin
+        out.append({"number": str(caller), "native_number": str(native),
+                    "name": str(pin.get("name") or ""),
+                    "type": str(pin.get("type") or "")})
+    return out
 
 
 def _tokens(libid: str) -> list[str]:

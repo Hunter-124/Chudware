@@ -86,25 +86,34 @@ def _hermetic_config():
 
 @pytest.fixture(scope="session", autouse=True)
 def _private_engine_daemon(_hermetic_config):
-    """Give this suite its OWN hostd, and refuse to run against the user's.
+    """Give this suite its OWN hostd, or SKIP — never run against the user's.
 
-    ``private_daemon()`` yields False when it could not isolate — no hostd binary built,
+    ``private_daemon()`` yields False when it could not isolate: no hostd binary built,
     or it failed to come up within the timeout. That flag used to be DISCARDED here, so a
-    missing or broken binary silently handed the suite the user's live daemon: the exact
-    outcome this fixture exists to prevent, in the one code path where nobody would look.
-    Now a failed isolation degrades to in-process mode instead, which shares nothing at
-    all. Tests that genuinely require a daemon fail loudly on their own terms rather than
-    quietly passing while polluting the user's app.
+    missing or broken binary silently handed the suite the user's live daemon — the exact
+    outcome this fixture exists to prevent, in the one path nobody would look at. Every
+    test then passed while depositing documents into the window the user was working in.
+
+    The degrade is a SKIP naming the missing prerequisite, not a fallback, because neither
+    alternative is honest. Attaching to the user's daemon corrupts their app. Falling back
+    to in-process shares nothing (good) but is NOT equivalent for a full-suite run: these
+    2000+ tests then share ONE process-wide document pool for the whole session instead of
+    a daemon's, and the accumulation makes doc resolution ambiguous — measured 2026-07-29
+    in a worktree with no daemon build, where ~44 ECAD/FEA/CFD tests failed in batch while
+    every one of them passed in isolation. Reporting a build prerequisite as 44 unrelated
+    geometry failures is worse than saying what is missing.
     """
     import os
 
     with private_daemon() as isolated:
-        forced = False
-        if not isolated and not os.environ.get("CHUDWARE_HOSTD_SOCKET"):
-            os.environ["CHUDWARE_ENGINE_DAEMON"] = "0"
-            forced = True
-        try:
-            yield isolated
-        finally:
-            if forced:
-                os.environ.pop("CHUDWARE_ENGINE_DAEMON", None)
+        if not isolated and not os.environ.get("CHUDWARE_HOSTD_SOCKET") \
+                and os.environ.get("CHUDWARE_ENGINE_DAEMON") != "0":
+            pytest.skip(
+                "services/mcp needs a PRIVATE chudware-hostd and one could not be "
+                "started, so this suite would otherwise attach to the user's live "
+                "daemon and deposit documents in their open app. Build the daemon "
+                "(./build.sh daemon, giving core/build-occt-linux/bin/chudware-hostd), "
+                "or set CHUDWARE_ENGINE_DAEMON=0 to accept in-process mode explicitly "
+                "(single shared document pool — expect order-dependent failures).",
+                allow_module_level=True)
+        yield isolated

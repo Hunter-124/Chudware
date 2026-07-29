@@ -154,6 +154,52 @@ def _isolated_subagent_registry(tmp_path_factory):
 
 
 # ---------------------------------------------------------------------------
+# Engine isolation for test sessions. `services/mcp/core_bridge` defaults to daemon mode
+# (CHUDWARE_ENGINE_DAEMON unset == "1") and attaches to whatever chudware-hostd is
+# already listening — on a developer box, the daemon behind the user's open Chudware
+# window. Anything that mints a document then fans out `doc.opened`, the GUI opens a
+# mirror tab for it, and the documents OUTLIVE the run, so the next run's
+# new_part("SwingArm") collides with the stale one and gets a uniquified "SwingArm8" —
+# the duplication compounding itself.
+#
+# That was fixed on 2026-07-28 in services/mcp/conftest.py and ONLY there. Every other
+# suite — services/agent (3000+ tests), ecad, sim, parts, browser, tools — plus every
+# bare script kept attaching to the user's live daemon. Measured 2026-07-29: a brand-new
+# process saw 40 already-open FOREIGN documents on the default path and 0 with
+# CHUDWARE_ENGINE_DAEMON=0. That is the mechanism behind the duplicate-part and
+# "artifacts show whatever the user has open" reports.
+#
+# Why in-process (=0) here and NOT private_hostd.private_daemon(): a private daemon runs
+# the ON-DISK chudware-hostd, which is a separate artifact built by `./build.sh daemon`
+# and routinely older than the freshly relinked libchudware.so (observed 15:18 binary vs
+# 17:35 engine). Hoisting the private daemon would therefore have traded a pollution bug
+# for a STALE-ENGINE bug in every suite — the more expensive of the two, and the exact
+# failure that scored six live agent sweeps against two-day-old code. Legacy in-process
+# at the resolved CHUDWARE_LIBCHUDWARE is both cheaper (no spawn) and stricter (no shared
+# pool can exist at all).
+#
+# services/mcp opts OUT because that suite asserts real daemon wire semantics
+# (origin_kind, fanout, drain-replace) and must have a daemon; its conftest sets the
+# sentinel below at import time, which is before any fixture runs. An explicit
+# CHUDWARE_HOSTD_SOCKET or CHUDWARE_ENGINE_DAEMON always wins — that caller has already
+# chosen what to talk to.
+_WANTS_DAEMON_ENV = "CHUDWARE_TEST_WANTS_DAEMON"
+
+
+@_pytest.fixture(autouse=True, scope="session")
+def _isolated_engine_session():
+    if os.environ.get(_WANTS_DAEMON_ENV) == "1" \
+            or os.environ.get("CHUDWARE_HOSTD_SOCKET") \
+            or "CHUDWARE_ENGINE_DAEMON" in os.environ:
+        yield False
+        return
+    os.environ["CHUDWARE_ENGINE_DAEMON"] = "0"
+    try:
+        yield True
+    finally:
+        os.environ.pop("CHUDWARE_ENGINE_DAEMON", None)
+
+# ---------------------------------------------------------------------------
 # `live` marker (Parts Library V2): tests that hit real vendor sites over the
 # network under a saved browser profile. Skipped by default; opt in with
 # `pytest --live` or CHUDWARE_LIVE_TESTS=1.

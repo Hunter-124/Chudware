@@ -24,6 +24,7 @@ same isolation — one implementation, so a fix to the instance-key trap reaches
 """
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -31,6 +32,14 @@ from pathlib import Path
 import pytest
 
 from services.mcp.private_hostd import private_daemon
+
+# Opt OUT of the root conftest's in-process engine isolation. That fixture forces
+# CHUDWARE_ENGINE_DAEMON=0 for every other suite (no shared daemon can exist, so no
+# document pollution is possible), but THIS suite asserts real daemon wire semantics —
+# test_hostd_registry.py and friends check origin_kind, fanout and drain-replace — so it
+# needs an actual daemon, just a PRIVATE one. Set at import time, which is before any
+# fixture runs, so the root fixture sees it and stands down.
+os.environ.setdefault("CHUDWARE_TEST_WANTS_DAEMON", "1")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -77,5 +86,25 @@ def _hermetic_config():
 
 @pytest.fixture(scope="session", autouse=True)
 def _private_engine_daemon(_hermetic_config):
-    with private_daemon():
-        yield
+    """Give this suite its OWN hostd, and refuse to run against the user's.
+
+    ``private_daemon()`` yields False when it could not isolate — no hostd binary built,
+    or it failed to come up within the timeout. That flag used to be DISCARDED here, so a
+    missing or broken binary silently handed the suite the user's live daemon: the exact
+    outcome this fixture exists to prevent, in the one code path where nobody would look.
+    Now a failed isolation degrades to in-process mode instead, which shares nothing at
+    all. Tests that genuinely require a daemon fail loudly on their own terms rather than
+    quietly passing while polluting the user's app.
+    """
+    import os
+
+    with private_daemon() as isolated:
+        forced = False
+        if not isolated and not os.environ.get("CHUDWARE_HOSTD_SOCKET"):
+            os.environ["CHUDWARE_ENGINE_DAEMON"] = "0"
+            forced = True
+        try:
+            yield isolated
+        finally:
+            if forced:
+                os.environ.pop("CHUDWARE_ENGINE_DAEMON", None)

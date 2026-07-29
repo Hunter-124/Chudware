@@ -9,6 +9,8 @@
 #include "ui/provider_usage.h"   // THE subscription-usage poller behind the prelude's limit rings
 #include "ui/provider_logos.h"   // brand mark for the model chip (same art as Settings->Providers)
 #include "ui/copilot/text_wrap.h"   // hard-break bookkeeping the rewrapper must not eat
+#include "ui/clipboard_image.h"          // image-kind probe / mime / clipboard->PNG capture
+#include "ui/copilot/image_lightbox.h"   // attachment thumbnail tile + full-size viewer
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
 // ImGui's InputTextMultiline does NOT word-wrap (it renders with wrap_width=0, so long lines
@@ -298,19 +300,37 @@ static bool readAttachmentText(const std::string& path, std::string& out) {
 
 // Consume st.pendingAttachments into (a) an augmented request string — the text the model
 // actually receives: small text files inlined verbatim, everything else as an explicit path —
-// and (b) the structured "attachments" array carried in the RPC payload. HONESTY: the core's
-// agent handlers currently pass only the request TEXT to the model, so the inline injection here
-// is what actually delivers attachment content today; the structured field rides along (clearly
-// named) for handler-side consumption later.
+// and (b) the structured "attachments" array carried in the RPC payload, where every entry now
+// declares its "kind" ("image"|"file") and, for images, its "mime".
+//
+// The two kinds are delivered by DIFFERENT routes, and both are real:
+//   TEXT files  — the inline injection below is what actually delivers their content, because
+//                 the request text is all a text-only model ever sees.
+//   IMAGES      — ride STRUCTURALLY: the kind/mime entry is forwarded through the core to the
+//                 Python worker, which turns it into a provider image part for the vision model.
+//                 The request text only gets a short marker naming the file, so a text-only
+//                 model still knows an image was attached rather than silently missing it.
 static nlohmann::json consumeAttachments(AppState& st, std::string& requestText) {
     nlohmann::json atts = nlohmann::json::array();
     if (st.pendingAttachments.empty()) return atts;
     for (const std::string& path : st.pendingAttachments) {
-        nlohmann::json a = {{"path", path}, {"name", attachmentBaseName(path)}};
+        const std::string base = attachmentBaseName(path);
+        nlohmann::json a = {{"path", path}, {"name", base}};
+        if (ui::isImageAttachment(path)) {
+            // Explicitly NOT run through readAttachmentText: an image is binary, that probe
+            // would reject it on the first NUL anyway, and inlining is not how it travels.
+            a["kind"]   = "image";
+            a["mime"]   = ui::imageMimeForPath(path);
+            a["inline"] = false;
+            requestText += "\n\n[Attached image: " + base + " (" + path + ")]\n";
+            atts.push_back(std::move(a));
+            continue;
+        }
+        a["kind"] = "file";
         std::string content;
         if (readAttachmentText(path, content)) {
             a["inline"] = true;
-            requestText += "\n\n[Attached file: " + attachmentBaseName(path) + " (" + path +
+            requestText += "\n\n[Attached file: " + base + " (" + path +
                            ")]\n```\n" + content;
             if (content.empty() || content.back() != '\n') requestText += "\n";
             requestText += "```";
@@ -1397,9 +1417,18 @@ void submitTurn(AppState& st, const std::string& text) {
         ChatMsg u; u.fromUser = true; u.text = text;
         u.copilotMode = st.aiInteraction;  // stamp composer mode for colored border
         if (!attachments.empty()) {
-            u.text += "\n[attached:";
-            for (const auto& a : attachments) u.text += " " + a.value("name", std::string());
-            u.text += "]";
+            // Images get one line each so chat_log.cpp can lift them out and render the real
+            // picture; the plain [attached:] roster lists ONLY the non-image files, and is
+            // omitted entirely when every attachment was an image. A name never appears twice.
+            std::string files;
+            for (const auto& a : attachments) {
+                const std::string nm = a.value("name", std::string());
+                if (a.value("kind", std::string("file")) == "image")
+                    u.text += "\n[attached image: " + nm + "]";
+                else
+                    files += " " + nm;
+            }
+            if (!files.empty()) u.text += "\n[attached:" + files + "]";
         }
         if (!contextRefs.empty()) {
             u.text += "\n[context:";
@@ -3433,27 +3462,96 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                                                       asurf.textPrimary.z, 0.35f)),
                 ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
         };
-        auto placeChip = [&](float chipW) {
+        auto placeChip = [&](float chipW, float gap) {
             if (anyDrawn) {
-                ImGui::SameLine(0, 4 * sc);
+                ImGui::SameLine(0, gap);
                 if (ImGui::GetCursorPosX() + chipW > maxX) ImGui::NewLine();
             }
             anyDrawn = true;
         };
 
+        // Attachment chips are THREE hit targets, not one button: for an image the thumbnail
+        // and the name both OPEN the viewer, and ONLY the × detaches. (As one button the chip
+        // destroyed the attachment on any click, so there was no way to look at what you had
+        // attached.) Being several widgets, the chip can no longer borrow ImGuiCol_Button for
+        // its fill — paint it on a lower draw channel so it lands behind the content.
+        ImDrawList* chipDl = ImGui::GetWindowDrawList();
+        ImDrawListSplitter chipSplit;
+        chipSplit.Split(chipDl, 2);
+        chipSplit.SetCurrentChannel(chipDl, 1);
+        const ImU32 chipFillCol = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(asurf.textPrimary.x, asurf.textPrimary.y, asurf.textPrimary.z, 0.08f));
+        const ImU32 chipEdgeCol = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(asurf.textPrimary.x, asurf.textPrimary.y, asurf.textPrimary.z, 0.35f));
+        const ImU32 chipInkCol  = ImGui::ColorConvertFloat4ToU32(asurf.textPrimary);
+        const float chipPadX = 6 * sc, chipPadY = 3 * sc;
+
         for (size_t ai = 0; ai < st.pendingAttachments.size(); ++ai) {
             ImGui::PushID((int)ai + 12000);
-            std::string name = attachmentBaseName(st.pendingAttachments[ai]);
+            const std::string apath = st.pendingAttachments[ai];  // copy: the vector can erase
+            const bool  isImg   = ui::isImageAttachment(apath);
+            std::string name    = attachmentBaseName(apath);
             if (name.size() > 30) name = name.substr(0, 29) + "\xE2\x80\xA6";
-            const std::string lbl = name + "  \xC3\x97";   // "name  ×"
-            const float chipW = ImGui::CalcTextSize(lbl.c_str()).x + 16 * sc;
-            placeChip(chipW);
-            const bool removed = ImGui::SmallButton(lbl.c_str());
-            drawChipBorder();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s\nAttached — rides your next message. Click to remove.",
-                                  st.pendingAttachments[ai].c_str());
-            if (removed) {
+            const float lineH   = ImGui::GetTextLineHeight();
+            const float thumbSz = lineH * 2.0f;            // about two text lines tall
+            const float rowH    = isImg ? thumbSz : lineH;
+            const float nameW   = ImGui::CalcTextSize(name.c_str()).x;
+            const float xBtnW   = ImGui::CalcTextSize("\xC3\x97").x +
+                                  ImGui::GetStyle().FramePadding.x * 2.0f;
+            const float chipW   = chipPadX * 2.0f + (isImg ? thumbSz + 4 * sc : 0.0f) +
+                                  nameW + 6 * sc + xBtnW;
+            placeChip(chipW, 14 * sc);   // wider gap than the ref chips: these fills are inflated
+
+            bool view = false, detach = false;
+            ImGui::BeginGroup();
+            const float rowTop = ImGui::GetCursorPosY();
+            if (isImg) {
+                const bool thumbClicked = ui::attachmentThumbnail(apath, thumbSz);
+                const bool thumbHovered = ImGui::IsItemHovered();
+                if (thumbClicked) view = true;
+                if (thumbHovered) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("%s\nClick to view.", apath.c_str());
+                }
+                ImGui::SameLine(0, 4 * sc);
+                ImGui::SetCursorPosY(rowTop);
+            }
+            // The name is an InvisibleButton + hand-drawn text rather than a Text item so it
+            // hit-tests reliably while the composer input holds ImGui's active id.
+            ImGui::InvisibleButton("##attname", ImVec2(nameW, rowH));
+            const bool nameClicked = ImGui::IsItemClicked();
+            const bool nameHovered = ImGui::IsItemHovered();
+            const ImVec2 nameMin = ImGui::GetItemRectMin();
+            chipDl->AddText(ImVec2(nameMin.x, nameMin.y + (rowH - lineH) * 0.5f),
+                            chipInkCol, name.c_str());
+            if (isImg) {
+                if (nameClicked) view = true;
+                if (nameHovered) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("%s\nClick to view.", apath.c_str());
+                }
+            } else if (nameHovered) {
+                // Deliberately inert: detaching is the × alone.
+                ImGui::SetTooltip("%s\nAttached \xE2\x80\x94 rides your next message.",
+                                  apath.c_str());
+            }
+            ImGui::SameLine(0, 6 * sc);
+            ImGui::SetCursorPosY(rowTop + (rowH - lineH) * 0.5f);
+            if (ImGui::SmallButton("\xC3\x97")) detach = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Detach");
+            ImGui::EndGroup();
+            {
+                const ImVec2 gmn = ImGui::GetItemRectMin(), gmx = ImGui::GetItemRectMax();
+                const ImVec2 bmn(gmn.x - chipPadX, gmn.y - chipPadY);
+                const ImVec2 bmx(gmx.x + chipPadX, gmx.y + chipPadY);
+                chipSplit.SetCurrentChannel(chipDl, 0);
+                chipDl->AddRectFilled(bmn, bmx, chipFillCol, ui::metrics::rounding(6.0f));
+                chipDl->AddRect(bmn, bmx, chipEdgeCol, ui::metrics::rounding(6.0f), 0,
+                                ui::metrics::stroke(1.0f));
+                chipSplit.SetCurrentChannel(chipDl, 1);
+            }
+            if (view) ui::openImageLightbox(apath);
+            if (detach) {
                 st.pendingAttachments.erase(st.pendingAttachments.begin() + ai);
                 savePromptDraft(st, /*force=*/true);
                 ImGui::PopID();
@@ -3461,6 +3559,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             }
             ImGui::PopID();
         }
+        chipSplit.Merge(chipDl);
 
         // Context-ref chips: kind letter + label + ×
         for (size_t ci = 0; ci < st.pendingContextRefs.size(); ++ci) {
@@ -3480,7 +3579,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             if (name.size() > 28) name = name.substr(0, 27) + "\xE2\x80\xA6";
             const std::string lbl = std::string(1, kindLetter) + "  " + name + "  \xC3\x97";
             const float chipW = ImGui::CalcTextSize(lbl.c_str()).x + 16 * sc;
-            placeChip(chipW);
+            placeChip(chipW, 4 * sc);
             const bool removed = ImGui::SmallButton(lbl.c_str());
             drawChipBorder();
             if (ImGui::IsItemHovered())
@@ -3564,11 +3663,42 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         g_slashMenuActive = parseSlashQuery(st.prompt.data(), q);
     }
 
+    // ---- Ctrl+V of an IMAGE ------------------------------------------------------------------
+    // InputTextMultiline claims Ctrl+V itself (imgui_widgets.cpp: Shortcut(Ctrl+V, id) -> is_paste)
+    // and pastes the clipboard's TEXT flavour, which for a copied image is empty or a stale
+    // leftover string. So the image case has to be decided BEFORE the widget runs. On success we
+    // take ownership of the V key for this frame: the widget's Shortcut() then fails its owner
+    // test, so the chord is swallowed and no stale text lands in the box alongside the chip.
+    // (This is the composer's own idiom for a swallowed chord — the slash menu likewise decides
+    // Enter before/around the widget rather than clearing global input state.)
+    // Scoped to "the input was active last frame" so clipboardHasImage() — a real windowing-system
+    // round trip, throttled but not free — is never polled while the user is elsewhere in the app.
+    static bool s_composerInputActive = false;
+    {
+        const ImGuiIO& pio = ImGui::GetIO();
+        if (s_composerInputActive && (pio.KeyCtrl || pio.KeySuper) &&
+            ImGui::IsKeyPressed(ImGuiKey_V, false) && ui::clipboardHasImage()) {
+            std::string imgPath, imgErr;
+            if (ui::clipboardImageToPng(imgPath, imgErr)) {
+                if (std::find(st.pendingAttachments.begin(), st.pendingAttachments.end(),
+                              imgPath) == st.pendingAttachments.end()) {
+                    st.pendingAttachments.push_back(imgPath);
+                    savePromptDraft(st, /*force=*/true);
+                }
+                ImGui::SetKeyOwner(ImGuiKey_V, ImGui::GetID("##aipromptimagepaste"));
+            } else {
+                // Not swallowed: the ordinary text paste still runs, so nothing is lost.
+                st.toast(ui::ToastLevel::Warn, imgErr);
+            }
+        }
+    }
+
     char inputId[32];
     std::snprintf(inputId, sizeof(inputId), "##aiprompt%d", s_composerGen);
     bool submitInput = drawChatInput(inputId, st.prompt, placeholder,
                                      ui::metrics::copilotInputMaxLines(),
                                      sendSz + sendInset * 2.0f);
+    s_composerInputActive = ImGui::IsItemActive();
     const ImVec2 inputMin = ImGui::GetItemRectMin();
     const ImVec2 inputMax = ImGui::GetItemRectMax();
     // Crash-safe draft: debounce-write whatever is in the box.
@@ -3651,6 +3781,11 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             clearComposerBox();
         }
     }
+
+    // Full-size attachment viewer, drawn LAST in the composer so it sits above the chips and
+    // the input. drawComposer is the composer's single per-frame entry point, so this is the
+    // one and only call — the viewer is a no-op on frames where nothing was opened.
+    ui::drawImageLightbox(st);
 }
 
 // ---- M19: endless scroll-back via render-windowing --------------------------------------------

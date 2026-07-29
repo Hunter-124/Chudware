@@ -578,7 +578,10 @@ std::string admin_worker_repo_root() {
 }
 
 // Spawns `python -m services.worker_main`, sends ONE {"id":1,"method":
-// "agent_admin_turn",...} line, relays every streamed {"event":...,"data":...}
+// "agent_admin_turn",...} line carrying the request text, run_id, resolved
+// provider descriptor, workspace_dir, the prior-turn `history`, and the turn's
+// `attachments` array (pasted images / attached files, as built by the GUI
+// composer's consumeAttachments), relays every streamed {"event":...,"data":...}
 // notification onto `events` as it arrives (same live stream the rest of the
 // run uses), and fills `turn_out` with the handler's `turn` object on success.
 // Returns false (with `err` set) on ANY transport failure, timeout, or a
@@ -597,7 +600,8 @@ std::string admin_worker_repo_root() {
 // caller reports stop_reason "worker_crash".
 bool call_admin_worker_turn(const std::string& request, const std::string& run_id,
                             const json& provider_cfg, const std::string& workspace_dir,
-                            const json& history, RunEvents& events, json& turn_out,
+                            const json& history, const json& attachments,
+                            RunEvents& events, json& turn_out,
                             std::string& err, bool& crashed) {
     const std::string python = admin_worker_python_bin();
     if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
@@ -734,6 +738,11 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     // first — the worker forks fresh per turn, so without this every follow-up was a
     // cold start. Absent/empty array == previous behaviour (no key sent at all).
     if (history.is_array() && !history.empty()) params["history"] = history;
+    // Turn attachments ({path,name,kind,mime,...}) from the composer — the vision
+    // path needs the image objects to reach the provider, and the worker is the
+    // only place that can build them. Absent/empty array == previous behaviour
+    // (no key sent at all).
+    if (attachments.is_array() && !attachments.empty()) params["attachments"] = attachments;
     if (provider_cfg.is_object()) {
         auto put = [&](const char* cfg_key, const char* param_key) {
             const auto it = provider_cfg.find(cfg_key);
@@ -886,7 +895,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
 }
 #else   // _WIN32
 bool call_admin_worker_turn(const std::string&, const std::string&, const json&,
-                            const std::string&, const json&, RunEvents&,
+                            const std::string&, const json&, const json&, RunEvents&,
                             json&, std::string& err, bool&) {
     err = "admin worker bridge unavailable on this platform";
     return false;
@@ -1116,8 +1125,14 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         std::string worker_err;
         bool worker_crashed = false;
         const std::string ws_dir = agent_workspace_dir(options);
+        // Only `options` is reachable here: libchudware's agent_run handler splits the
+        // RPC params into (request, doc_id, provider, options) and run_design never sees
+        // the top-level payload, so a top-level `attachments` field must be relayed into
+        // options by the caller to arrive.
         const json history = options.value("history", json::array());
-        if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, history, events,
+        const json attachments = options.value("attachments", json::array());
+        if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, history,
+                                    attachments, events,
                                     turn, worker_err, worker_crashed)) {
             if (worker_err == "cancelled" || run_ctl.cancelled()) {
                 events.emit("run_finished", json{{"status", "cancelled"},

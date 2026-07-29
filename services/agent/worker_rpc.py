@@ -1400,10 +1400,16 @@ OFFICE_METHODS: dict[str, Callable] = {
 # may pass ``role`` to run a more specialized linear card (e.g. project_organizer).
 
 
+#: shape-level cap on params["attachments"] — agent_turn enforces the real
+#: per-image limits (existence, size, <=8 folded into the message).
+_ATTACH_MAX = 32
+
+
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     """``agent_admin_turn {request, run_id?, role?, provider?, model?, api_key?,
-    base_url?, reasoning_effort?, workspace_dir?, history?} -> {ok, turn:{success, stop_reason,
-    result, role, allowed_tools}} | {ok:false, reason}``.
+    base_url?, reasoning_effort?, workspace_dir?, history?, attachments?} ->
+    {ok, turn:{success, stop_reason, result, role, allowed_tools}}
+    | {ok:false, reason}``.
 
     Streams turn events through ``_emit`` — worker_main.py's serve loop tags each
     one with this request's id and pushes it as a ``{"event":...}`` line
@@ -1521,6 +1527,21 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         except Exception:  # noqa: BLE001 — history must never break a turn
             return None
 
+    def _attachments() -> list[dict] | None:
+        """params["attachments"] — the GUI composer's attachment list, entries
+        shaped {"path", "name", "kind": "image"|"file", "mime"?}. Only the shape
+        is checked here (a list of dicts); agent_turn validates each entry's
+        path/size before it becomes an image part. Absent/invalid == today's
+        behaviour exactly (None, not [])."""
+        try:
+            raw = (params or {}).get("attachments")
+            if not isinstance(raw, list):
+                return None
+            kept = [a for a in raw if isinstance(a, dict)][:_ATTACH_MAX]
+            return kept or None
+        except Exception:  # noqa: BLE001 — attachments must never break a turn
+            return None
+
     try:
         turn = run_linear_role_turn(
             request, role, provider,
@@ -1530,6 +1551,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             # project-memory lookup).
             options={"project_dir": project_root} if project_root else None,
             history=_history(),
+            attachments=_attachments(),
         )
         return {"ok": True, "turn": turn}
     except Exception as exc:  # noqa: BLE001 — never raise across the worker seam

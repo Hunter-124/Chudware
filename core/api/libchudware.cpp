@@ -2136,6 +2136,15 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             // run_design / run_assembly_design / run_micro_design always see a consistent
             // shape. Absent mode = legacy byte-identical behavior.
             if (!options.is_object()) options = json::object();
+            // Composer attachments (pasted images / attached files) ride the payload
+            // TOP-LEVEL — services/worker/worker_client.cpp forwards them alongside
+            // provider/model/reasoning_effort, not inside `options`. run_design only ever
+            // receives `options`, so without this relay the array is dropped right here and
+            // a pasted screenshot never reaches the vision model. An attachments key already
+            // inside `options` wins (an explicit nesting by a newer host is not overwritten).
+            if (!options.contains("attachments") && params.contains("attachments") &&
+                params["attachments"].is_array() && !params["attachments"].empty())
+                options["attachments"] = params["attachments"];
             if (!options.contains("advisor")) options["advisor"] = true;  // default ON
             // mode ∈ agent|plan|swarm|edit|ask — leave absent when unset (legacy).
             // plan mode implies plan_only unless an approved_plan is already attached.

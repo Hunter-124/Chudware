@@ -101,6 +101,8 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/agent_text.cpp         # doc-id + atlas-glyph text sanitizers (GL-free; unit-tested)
   src/ui/copilot/text_wrap.cpp          # composer hard-break tracking (GL-free; unit-tested)
   src/ui/copilot/tool_phrase.cpp        # tool-call human phrasing + grouping keys (GL-free; unit-tested)
+  src/ui/clipboard_image.cpp            # system clipboard -> PNG on disk (paste-an-image)
+  src/ui/copilot/image_lightbox.cpp     # attachment thumbnails + full-size image viewer
   src/ui/copilot/settings.cpp           # AI settings sections + model dropdown
   src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
@@ -575,6 +577,24 @@ add_test(NAME test_tool_phrase
   COMMAND test_tool_phrase
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end tool-call human phrasing ---
+
+# --- pasted-image attachment naming (GL-free) ---
+# Ctrl+V in the composer writes the clipboard bitmap to a file whose name and location the
+# rest of the app then trusts. The platform clipboard read cannot be unit-tested here, but the
+# naming, the image-extension predicate and the cache-directory layout can — and a bad name is
+# exactly what silently strands an attachment or lets it escape the cache dir.
+add_executable(test_clipboard_image
+  src/ui/clipboard_image.cpp
+  tests/test_clipboard_image.cpp)
+target_compile_definitions(test_clipboard_image PRIVATE CHUDWARE_CLIPBOARD_IMAGE_TEST=1)
+target_include_directories(test_clipboard_image PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_clipboard_image PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_clipboard_image
+  COMMAND test_clipboard_image
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end pasted-image attachment naming ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD

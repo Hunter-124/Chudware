@@ -503,6 +503,149 @@ def test_drawing_overhaul_gdt_section_export():
     os.unlink(ex["path"])
 
 
+# ── add_section_view's axis/mode discriminators ──────────────────────────────────────
+#
+# The defect: `cut = horizontal_line if axis == "horizontal" else vertical_line`. Every
+# value that was not the exact string "horizontal" — "vert", "y", even "x" and "diagonal" —
+# produced a VERTICAL cut, and a section on the wrong plane looks entirely normal on the
+# sheet. `mode` was the same class: core/doc/drawing_session.cpp:926 honours only
+# "full"/"half" and silently drops anything else back to a full section.
+
+def test_section_axis_and_mode_vocabulary_is_total():
+    """Pure vocabulary check — no engine. Every accepted spelling maps to a REAL cut, and
+    nothing falls through to a default."""
+    from services.mcp.cad_drawing_tools import _canon_section_axis, _canon_section_mode
+
+    for spelling in ("horizontal", "Horizontal", " HORIZ ", "horiz", "hor", "h",
+                     "horizontally", "horizontal-cut"):
+        assert _canon_section_axis(spelling) == ("horizontal", None), spelling
+    for spelling in ("vertical", "VERTICAL", "vert", "v", "vertically", "vertical cut"):
+        assert _canon_section_axis(spelling) == ("vertical", None), spelling
+
+    # Axis LETTERS are refused, not guessed: "along x" and "normal to x" are opposite cuts,
+    # and the cut line lives in the parent view's sheet frame, not model space.
+    for letter in ("x", "y", "+z", "-y"):
+        val, bad = _canon_section_axis(letter)
+        assert val is None, letter
+        assert "ambiguous" in bad["error"] and letter in bad["error"], bad
+        assert bad["valid_axis"] == ["horizontal", "vertical"], bad
+
+    for junk in ("diagonal", "", None, "auxiliary", "42"):
+        val, bad = _canon_section_axis(junk)
+        assert val is None, junk
+        assert bad["valid_axis"] == ["horizontal", "vertical"], bad
+        assert "horizontal" in bad["hint"] and "vertical" in bad["hint"], bad
+
+    for spelling in ("full", "Full", "full_section", "FULLSECTION", "whole"):
+        assert _canon_section_mode(spelling) == ("full", None), spelling
+    for spelling in ("half", "Half Section", "half-section", "halfsection"):
+        assert _canon_section_mode(spelling) == ("half", None), spelling
+    # "partial" is a DIFFERENT drafting construct (broken-out) — mapping it onto half would
+    # be the same silent-wrong-answer bug wearing a synonym.
+    for junk in ("partial", "quarter", "", None, "broken_out"):
+        val, bad = _canon_section_mode(junk)
+        assert val is None, junk
+        assert bad["valid_mode"] == ["full", "half"], bad
+
+
+def _plate_drawing() -> str:
+    doc = _new_plate_with_hole()
+    mk, _ = _call("make_drawing", {"doc_id": doc, "views": ["front", "top"],
+                                   "model_items": False, "hole_callouts": False})
+    assert mk["ok"], mk
+    return mk["drawing_doc_id"]
+
+
+def _section_views(dwg: str) -> list:
+    full = cb.call("drawing_get", {"doc_id": dwg})
+    return [v for v in full["sheets"][0]["views"] if v.get("type") == "section"]
+
+
+def test_section_view_axis_selects_a_real_and_DIFFERENT_cut():
+    """Geometry proof, not ok:true — the two axes must produce different cut lines AND
+    different projected section geometry, so 'which axis' is an answer that matters."""
+    dwg = _plate_drawing()
+    h, _ = _call("add_section_view", {"doc_id": dwg, "parent": "front", "axis": "horizontal"})
+    v, _ = _call("add_section_view", {"doc_id": dwg, "parent": "front", "axis": "vertical"})
+    assert h["ok"] and v["ok"], (h, v)
+    assert h["axis"] == "horizontal" and v["axis"] == "vertical", (h, v)
+
+    # The cut line itself: constant y spanning x, vs constant x spanning y.
+    (hx0, hy0), (hx1, hy1) = h["cut_line"]
+    (vx0, vy0), (vx1, vy1) = v["cut_line"]
+    assert hy0 == hy1 and hx0 < hx1, h["cut_line"]   # horizontal cutting LINE
+    assert vx0 == vx1 and vy0 < vy1, v["cut_line"]   # vertical cutting LINE
+    assert h["cut_line"] != v["cut_line"]
+
+    secs = {s["view_id"]: s for s in _section_views(dwg)}
+    sh, sv = secs[h["view_id"]], secs[v["view_id"]]
+    # …and the resulting projected sections genuinely differ (a 60x40x10 plate cut the two
+    # ways gives different cut faces / hatch / extents).
+    assert sh["bbox"] != sv["bbox"], (sh["bbox"], sv["bbox"])
+    assert (len(sh.get("section_faces", [])), len(sh.get("hatch", []))) != \
+           (len(sv.get("section_faces", [])), len(sv.get("hatch", []))), (sh, sv)
+
+    # Spellings a model actually writes land on the same real cut, not on a default.
+    hh, _ = _call("add_section_view", {"doc_id": dwg, "parent": "front", "axis": "HORIZ"})
+    assert hh["ok"] and hh["cut_line"] == h["cut_line"], hh
+
+
+def test_section_view_rejects_bad_axis_without_adding_a_view():
+    """An out-of-vocabulary axis errors NAMING the valid set, and adds nothing. 'y' — which
+    the affix rule reaches via section_axis='y' — used to silently yield the vertical cut."""
+    dwg = _plate_drawing()
+    before = len(_section_views(dwg))
+    for bad_axis in ("diagonal", "y", "x"):
+        r, _ = _call("add_section_view", {"doc_id": dwg, "parent": "front", "axis": bad_axis})
+        assert r["ok"] is False, (bad_axis, r)
+        assert r["valid_axis"] == ["horizontal", "vertical"], r
+        assert bad_axis in r["error"], r
+        assert len(_section_views(dwg)) == before, (bad_axis, "a view was added anyway")
+
+
+def test_section_view_mode_is_honoured_and_validated():
+    """full vs half produce different section geometry; an unknown mode errors instead of
+    silently degrading to full."""
+    dwg = _plate_drawing()
+    f, _ = _call("add_section_view", {"doc_id": dwg, "parent": "front",
+                                      "axis": "vertical", "mode": "full"})
+    hf, _ = _call("add_section_view", {"doc_id": dwg, "parent": "front",
+                                       "axis": "vertical", "mode": "Half Section"})
+    assert f["ok"] and hf["ok"], (f, hf)
+    assert f["mode"] == "full" and hf["mode"] == "half", (f, hf)
+    secs = {s["view_id"]: s for s in _section_views(dwg)}
+    sf, sh_ = secs[f["view_id"]], secs[hf["view_id"]]
+    # Same cut line, different result: the half section leaves half the part unsectioned.
+    assert f["cut_line"] == hf["cut_line"], (f, hf)
+    assert len(sf.get("hatch", [])) != len(sh_.get("hatch", [])), (sf, sh_)
+
+    before = len(_section_views(dwg))
+    for bad_mode in ("quarter", "partial"):
+        r, _ = _call("add_section_view", {"doc_id": dwg, "parent": "front",
+                                          "axis": "vertical", "mode": bad_mode})
+        assert r["ok"] is False, (bad_mode, r)
+        assert r["valid_mode"] == ["full", "half"], r
+        assert bad_mode in r["error"], r
+        assert len(_section_views(dwg)) == before, (bad_mode, "a view was added anyway")
+
+
+def test_make_drawing_rejects_a_bad_section_discriminator():
+    """The engine's auto-section path (drawing_session.cpp:2048) has the identical
+    fall-through, so make_drawing's `sections` spec is validated the same way."""
+    doc = _new_plate_with_hole()
+    r, _ = _call("make_drawing", {"doc_id": doc, "views": ["front"],
+                                  "sections": [{"parent": "front", "axis": "diagonal"}]})
+    assert r["ok"] is False and "sections[0]" in r["error"], r
+    assert r["valid_axis"] == ["horizontal", "vertical"], r
+    # A good spec still builds, with the spelling canonicalised on the way in.
+    ok, _ = _call("make_drawing", {"doc_id": doc, "views": ["front"], "model_items": False,
+                                   "hole_callouts": False,
+                                   "sections": [{"parent": "front", "axis": "vert",
+                                                 "mode": "half"}]})
+    assert ok["ok"], ok
+    assert len(_section_views(ok["drawing_doc_id"])) == 1, ok
+
+
 def test_transform_moves_a_body():
     """transform translates a non-primitive-addressable body (COM shifts by the vector)."""
     r, _ = _call("new_part", {"name": "mv"})
@@ -1157,6 +1300,203 @@ def test_check_feature_overlap_boss_swallowed():
     assert swallowed[0]["volume_mm3"] > 0, swallowed
     assert boss_id in ov["dead_features"], ov
     assert "boss_swallowed" in ov["summary"], ov["summary"]
+
+
+# --- ref-slot bag dialect: refs written one level too deep, inside params ---------------
+#
+# Live 2026-07-28, ONE "stepped shaft + dimensioned drawing" task burned 7 add_features
+# calls on this. The model wrote the whole refs bag inside params —
+#   {"type":"extrude","params":{"refs":{"profile":[{"kind":"region","sketch":"$0",
+#                                                   "hint_index":0}]},"depth":…}}
+# — and got "refs.profile: required for extrude". The profile WAS supplied, and even the
+# same-batch "$0" spelling was exactly right; only the nesting was wrong. The sketch in
+# the same batch nested refs.plane="plane.front", which is worse than a rejection: no
+# pass could see it, so the sketch silently defaulted to plane.top.
+
+_NESTED_CIRCLE = [{"type": "circle", "center": [0, 0], "radius": 20}]
+
+
+def _exact_volume(doc: str) -> float:
+    """The document's EXACT solid volume (mm^3).
+
+    add_features' own `volume_mm3` is measured off the tessellation, so a curved solid
+    reads ~0.2% light — fine as a delta, useless as a closed-form check. measure_part goes
+    through the kernel's mass properties, which is the number geometry claims must be
+    proved against.
+    """
+    r, _ = _call("measure_part", {"doc_id": doc})
+    assert r["ok"], r
+    return r["mass"]["volume_mm3"]
+
+
+def _nested_refs_extrude_ops(nested: bool) -> list:
+    """The failing extrude payload, with refs nested inside params or at the top level."""
+    extrude = {"type": "extrude", "name": "Base_Section",
+               "params": {"depth": cb.dim(60), "mode": "boss"}}
+    profile = [{"kind": "region", "sketch": "$0", "hint_index": 0}]
+    if nested:
+        extrude["params"]["refs"] = {"profile": profile}
+    else:
+        extrude["refs"] = {"profile": profile}
+    return [
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "S",
+                                          "params": {"plane": "plane.top"},
+                                          "entities": _NESTED_CIRCLE}},
+        {"op": "add_feature", "feature": extrude},
+    ]
+
+
+def test_nested_params_refs_hoisted_builds_the_same_solid():
+    """params.refs is the refs bag one level too deep — hoisting it must build the SAME
+    geometry as the top-level spelling, not merely stop erroring."""
+    r, _ = _call("new_part", {"name": "nested_refs_hoist"})
+    doc = r["doc_id"]
+    rn, _ = _call("add_features", {"doc_id": doc, "ops": _nested_refs_extrude_ops(True)})
+    assert rn["ok"], rn
+    r2, _ = _call("new_part", {"name": "nested_refs_control"})
+    doc_control = r2["doc_id"]
+    rc, _ = _call("add_features", {"doc_id": doc_control,
+                                   "ops": _nested_refs_extrude_ops(False)})
+    assert rc["ok"], rc
+    # pi*20^2*60 = 75398.22 mm^3 — a real solid, and the same one both ways.
+    vol_nested, vol_control = _exact_volume(doc), _exact_volume(doc_control)
+    assert vol_nested > 0, vol_nested
+    assert abs(vol_nested - math.pi * 400 * 60) < 1e-6, vol_nested
+    assert vol_nested == vol_control, (vol_nested, vol_control)
+    # The hoist is ECHOED — the model must learn that refs is a sibling of params.
+    assert any("params.refs" in n for n in rn.get("interpreted") or []), rn
+
+
+@pytest.mark.parametrize("plane", ["plane.top", "plane.front", "plane.right"])
+def test_nested_reserved_datum_plane_lands_on_that_datum(plane):
+    """A reserved datum plane nested in params.refs must reach the slot and orient the
+    solid exactly as the top-level spelling does — NOT silently fall back to plane.top.
+
+    Bare "plane.top"/"plane.front"/"plane.right" are already valid ref values
+    (core/doc/validate.cpp RESERVED_DATUMS + validate_sel_or_datum), so the world bbox is
+    the proof the value arrived: each datum extrudes along a different world axis.
+    """
+    def build(nested: bool) -> list:
+        r, _ = _call("new_part", {"name": f"datum_{plane}_{nested}"})
+        doc = r["doc_id"]
+        sketch = {"type": "sketch", "name": "S",
+                  "entities": [{"type": "circle", "center": [0, 0], "radius": 10}]}
+        if nested:
+            sketch["params"] = {"refs": {"plane": plane}}
+        else:
+            sketch["refs"] = {"plane": plane}
+        rb, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "add_feature", "feature": sketch},
+            {"op": "add_feature", "feature": {"type": "extrude", "name": "E",
+                                              "refs": {"profile": "$0"},
+                                              "params": {"depth": cb.dim(30),
+                                                         "mode": "boss"}}}]})
+        assert rb["ok"], rb
+        return cb.call("doc_bbox", {"doc_id": doc})["size"]
+
+    nested_size, top_size = build(True), build(False)
+    # The 30 mm extrusion runs along the datum's normal, so its axis identifies the plane.
+    long_axis = max(range(3), key=lambda i: nested_size[i])
+    assert long_axis == {"plane.top": 2, "plane.front": 1, "plane.right": 0}[plane], \
+        (plane, nested_size)
+    assert max(abs(a - b) for a, b in zip(nested_size, top_size)) < 1e-9, (nested_size,
+                                                                          top_size)
+
+
+def test_nested_revolve_axis_datum_builds():
+    """refs.axis is REQUIRED for a revolve (validate.cpp FEATURE_TYPES), and a nested
+    params.refs.axis used to reach no slot at all. Prove the solid, not ok:true."""
+    r, _ = _call("new_part", {"name": "nested_revolve_axis"})
+    doc = r["doc_id"]
+    # A 10x5 rectangle 10 mm off the axis, revolved 360 deg about Z -> an annular ring.
+    prof = [{"type": "line", "p1": [10, 0], "p2": [20, 0]},
+            {"type": "line", "p1": [20, 0], "p2": [20, 5]},
+            {"type": "line", "p1": [20, 5], "p2": [10, 5]},
+            {"type": "line", "p1": [10, 5], "p2": [10, 0]}]
+    rb, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "RS",
+                                          "params": {"refs": {"plane": "plane.front"}},
+                                          "entities": prof}},
+        {"op": "add_feature", "feature": {"type": "revolve", "name": "Rev",
+                                          "params": {"refs": {"profile": "$0",
+                                                              "axis": "axis.z"},
+                                                     "angle": cb.dim(360),
+                                                     "mode": "boss"}}}]})
+    assert rb["ok"], rb
+    # pi*(20^2 - 10^2)*5 = 4712.389 mm^3.
+    assert abs(_exact_volume(doc) - math.pi * 300 * 5) < 1e-6, _exact_volume(doc)
+
+
+def test_conflicting_params_refs_is_taught_and_mutates_nothing():
+    """The same slot filled DIFFERENTLY at both levels names two pieces of geometry for
+    one selection — a guess there could build the wrong solid, so it must be rejected with
+    a teaching error and leave the document untouched."""
+    r, _ = _call("new_part", {"name": "refs_conflict"})
+    doc = r["doc_id"]
+    ops = [{"op": "add_feature", "feature": {
+        "type": "extrude", "name": "E", "refs": {"profile": "f1"},
+        "params": {"refs": {"profile": "f9"}, "depth": cb.dim(5), "mode": "boss"}}}]
+    snapshot = json.dumps(ops, sort_keys=True)
+    rb, _ = _call("add_features", {"doc_id": doc, "ops": ops})
+    assert rb["ok"] is False, rb
+    err = rb["error"]
+    assert "params.refs" in err and "DIFFERENT" in err, err
+    assert "'f1'" in err and "'f9'" in err, err  # both candidates named, so it is fixable
+    assert json.dumps(ops, sort_keys=True) == snapshot, "the batch was mutated"
+    tree, _ = _call("get_part", {"doc_id": doc, "summary": True})
+    assert tree["feature_count"] == 0, tree
+
+
+def test_identical_refs_at_both_levels_is_not_a_conflict():
+    """Saying the same thing twice is not a contradiction — it builds."""
+    r, _ = _call("new_part", {"name": "refs_same_both"})
+    doc = r["doc_id"]
+    rb, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "S",
+                                          "refs": {"plane": "plane.top"},
+                                          "params": {"refs": {"plane": "plane.top"}},
+                                          "entities": _NESTED_CIRCLE}},
+        {"op": "add_feature", "feature": {"type": "extrude", "name": "E",
+                                          "refs": {"profile": "$0"},
+                                          "params": {"depth": cb.dim(10),
+                                                     "mode": "boss"}}}]})
+    assert rb["ok"], rb
+    assert abs(_exact_volume(doc) - math.pi * 400 * 10) < 1e-6, _exact_volume(doc)
+
+
+# --- primitive placement dialect: `center` is the placement point ------------------------
+
+def test_primitive_center_spelling_places_the_cylinder():
+    """`center:[x,y,z]` on a primitive IS its `at` point (a primitive is built centred and
+    `at` moves its CENTRE — core/doc/document.cpp:3049-3058). It was not an alias, so the
+    engine dropped it, built both coaxial cylinders on the origin, and reported only
+    "cylinder boss added no material (it is buried inside the existing solid)"."""
+    r, _ = _call("new_part", {"name": "prim_center"})
+    doc = r["doc_id"]
+    rb, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("cylinder", "C1", {"radius": cb.dim(20), "height": cb.dim(60),
+                                   "center": [0, 0, 0]}),
+        cb.feat("cylinder", "C2", {"radius": cb.dim(12), "height": cb.dim(50),
+                                   "center": [0, 0, 55]})]})
+    assert rb["ok"], rb
+    # C1 spans z -30..30, C2 spans z 30..80 — a real stepped shaft, so the volumes ADD.
+    expected = math.pi * (400 * 60 + 144 * 50)
+    assert abs(_exact_volume(doc) - expected) < 1e-6, (_exact_volume(doc), expected)
+
+
+def test_primitive_center_with_centered_false_is_taught():
+    """`center` names the CENTRE but `centered:false` makes `at` the BASE — the two
+    together are contradictory, and quietly relocating the solid is worse than a
+    rejection. Nothing is built."""
+    r, _ = _call("new_part", {"name": "prim_center_conflict"})
+    doc = r["doc_id"]
+    rb, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("cylinder", "C", {"radius": cb.dim(5), "height": cb.dim(10),
+                                  "center": [0, 0, 60], "centered": False})]})
+    assert rb["ok"] is False, rb
+    assert "centered" in rb["error"] and "contradictory" in rb["error"], rb["error"]
+    tree, _ = _call("get_part", {"doc_id": doc, "summary": True})
+    assert tree["feature_count"] == 0, tree
 
 
 def test_add_features_attaches_overlap_warnings():
@@ -2154,6 +2494,157 @@ def test_query_geometry_echoes_the_resolved_query():
     r, _ = _call("query_geometry", {"doc_id": doc, "query": {"of": "face", "surf": "sphere"}})
     assert r["ok"] is True and not r.get("matches"), r
     assert "no face/edge matched" in r["note"], r
+
+
+# ---- inline-sketch auto-split + semantic hole depth -----------------------------------
+
+#: The exact I-beam profile from the live run that was rejected for carrying its sketch
+#: inline: 75 wide x 150 tall, 12.5 flange, 12.5 web. Section area is
+#: 2 * (75 * 12.5) + 12.5 * 125 = 3437.5 mm^2.
+_IBEAM_ENTS = [
+    {"type": "line", "p1": [-37.5, -75], "p2": [37.5, -75]},
+    {"type": "line", "p1": [37.5, -75], "p2": [37.5, -62.5]},
+    {"type": "line", "p1": [37.5, -62.5], "p2": [6.25, -62.5]},
+    {"type": "line", "p1": [6.25, -62.5], "p2": [6.25, 62.5]},
+    {"type": "line", "p1": [6.25, 62.5], "p2": [37.5, 62.5]},
+    {"type": "line", "p1": [37.5, 62.5], "p2": [37.5, 75]},
+    {"type": "line", "p1": [37.5, 75], "p2": [-37.5, 75]},
+    {"type": "line", "p1": [-37.5, 75], "p2": [-37.5, 62.5]},
+    {"type": "line", "p1": [-37.5, 62.5], "p2": [-6.25, 62.5]},
+    {"type": "line", "p1": [-6.25, 62.5], "p2": [-6.25, -62.5]},
+    {"type": "line", "p1": [-6.25, -62.5], "p2": [-37.5, -62.5]},
+    {"type": "line", "p1": [-37.5, -62.5], "p2": [-37.5, -75]},
+]
+
+
+def test_inline_profile_sketch_builds_the_same_solid_as_the_two_op_form():
+    """A profile written INLINE on the extrude is auto-split into sketch+extrude.
+
+    The single-op payload is verbatim from the live run that was rejected with
+    "params.sketch carries INLINE geometry". Proof is GEOMETRY: the volume must equal
+    both the analytic 3437.5 mm^2 * 500 mm and the hand-written two-op form's volume.
+    """
+    r, _ = _call("new_part", {"name": "ibeam_inline"})
+    inline_doc = r["doc_id"]
+    inline, _ = _call("add_features", {"doc_id": inline_doc, "ops": [
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "I-Beam Body",
+            "params": {"depth": {"value": 500},
+                       "sketch": {"plane": "XY", "entities": _IBEAM_ENTS}}}}]})
+    assert inline["ok"], inline
+    assert abs(inline["volume_mm3"] - 3437.5 * 500) < 1e-3, inline["volume_mm3"]
+
+    r, _ = _call("new_part", {"name": "ibeam_pair"})
+    pair_doc = r["doc_id"]
+    pair, _ = _call("add_features", {"doc_id": pair_doc, "ops": [
+        {"op": "add_feature", "feature": {
+            "type": "sketch", "name": "P", "refs": {"plane": "plane.top"},
+            "params": {"entities": _IBEAM_ENTS, "constraints": []}}},
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "I-Beam Body",
+            "params": {"mode": "boss", "depth": {"value": 500}},
+            "refs": {"profile": [{"kind": "region", "sketch": "$0", "hint_index": 0}]}}}]})
+    assert pair["ok"], pair
+    assert abs(inline["volume_mm3"] - pair["volume_mm3"]) < 1e-6, (inline, pair)
+    assert any("INLINE" in n for n in inline.get("interpreted") or []), inline
+
+
+def test_inline_profile_split_emits_a_sketch_op_referenced_by_batch_index():
+    """The lifted sketch is a real op BEFORE its consumer, referenced as "$<index>"."""
+    from mcp_server import cad_doc_tools as T
+
+    notes: list = []
+    ops = T._split_inline_profile_sketches([
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Body",
+            "params": {"depth": {"value": 10},
+                       "sketch": {"plane": "XZ", "entities": _IBEAM_ENTS}}}}], notes)
+    assert len(ops) == 2, ops
+    assert ops[0]["feature"]["type"] == "sketch", ops[0]
+    assert ops[0]["feature"]["refs"]["plane"] == "plane.front", ops[0]
+    assert "sketch" not in ops[1]["feature"]["params"], ops[1]
+    # The ref is by NAME here; _resolve_batch_name_refs turns it into the "$N" position.
+    resolved = T._resolve_batch_name_refs(ops, notes)
+    assert resolved[1]["feature"]["refs"]["profile"] == [
+        {"kind": "region", "sketch": "$0", "hint_index": 0}], resolved[1]
+
+
+def test_inline_profile_split_covers_revolve_and_a_bare_point_loop():
+    """Every profile-bearing type is covered, and a bare point loop becomes a polyline."""
+    from mcp_server import cad_doc_tools as T
+
+    notes: list = []
+    ops = T._split_inline_profile_sketches([
+        {"op": "add_feature", "feature": {
+            "type": "revolve", "name": "Cup",
+            "params": {"axis": "Z", "angle": 360,
+                       "profile": {"plane": "XZ",
+                                   "points": [[10, 0], [20, 0], [20, 40], [10, 40]]}}}}],
+        notes)
+    assert len(ops) == 2 and ops[0]["feature"]["type"] == "sketch", ops
+    ent = ops[0]["feature"]["params"]["entities"]
+    assert len(ent) == 1 and ent[0]["type"] == "polyline" and ent[0]["closed"], ent
+    assert ops[1]["feature"]["refs"]["profile"][0]["sketch"] == "CupProfile", ops[1]
+
+
+def test_inline_profile_with_no_resolvable_plane_keeps_the_teaching_error():
+    """Ambiguity is never guessed away — a plane-less inline profile still teaches."""
+    from mcp_server import cad_doc_tools as T
+
+    notes: list = []
+    ops = [{"op": "add_feature", "feature": {
+        "type": "extrude", "name": "Body",
+        "params": {"depth": {"value": 10}, "sketch": {"entities": _IBEAM_ENTS}}}}]
+    assert T._split_inline_profile_sketches(ops, notes) is ops, "must not split"
+    assert notes == [], notes
+    with pytest.raises(ValueError) as ei:
+        T._normalize_profile_feature(ops[0]["feature"], "extrude", [])
+    assert "INLINE geometry" in str(ei.value), str(ei.value)
+
+
+def test_hole_depth_through_all_drills_all_the_way_through():
+    """depth:{"value":"through_all"} is an END CONDITION, not a non-numeric distance.
+
+    Rejected live as "params.depth.value: missing or non-numeric". `through_all` is the
+    engine's own through-hole end (core/doc/document.cpp), so it needs no depth at all.
+    Proof is geometry: the bore breaches BOTH faces, so it leaves no bottom cap — 7 faces
+    against a blind hole's 8 — and removes exactly twice the material of a half-deep one.
+    """
+    def _drill(depth, tag):
+        r, _ = _call("new_part", {"name": tag})
+        doc = r["doc_id"]
+        b, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "Blk", "params": {
+                "length": {"value": 100}, "width": {"value": 100},
+                "height": {"value": 50}}}},
+            {"op": "add_feature", "feature": {
+                "type": "hole", "name": "Bore",
+                "params": {"diameter": {"value": 20}, "depth": depth},
+                "refs": {"face": {"of": "face", "side": "top"}}}}]})
+        assert b["ok"], b
+        q, _ = _call("query_geometry", {"doc_id": doc, "query": "all faces"})
+        return b["volume_mm3"], q["count"]
+
+    thru_vol, thru_faces = _drill({"value": "through_all"}, "bore_thru")
+    blind_vol, blind_faces = _drill({"value": 25}, "bore_blind")
+    solid = 100.0 * 100.0 * 50.0
+    # Breached: no bottom cap face, where the blind bore keeps one.
+    assert thru_faces == blind_faces - 1, (thru_faces, blind_faces)
+    # Twice the depth -> twice the material removed (the blind bore is exactly half-deep).
+    assert abs((solid - thru_vol) - 2.0 * (solid - blind_vol)) < 1.0, (thru_vol, blind_vol)
+    assert thru_vol < blind_vol < solid, (thru_vol, blind_vol)
+
+
+def test_hole_depth_nonsense_word_still_fails_with_the_end_condition_vocabulary():
+    """An unparseable depth word must never become a silent no-op or a units complaint."""
+    from mcp_server import cad_doc_tools as T
+
+    with pytest.raises(ValueError) as ei:
+        T._normalize_hole_feature(
+            {"type": "hole", "name": "Bore",
+             "params": {"diameter": {"value": 20}, "depth": {"value": "halfway"}}}, [])
+    msg = str(ei.value)
+    assert "halfway" in msg and "through_all" in msg and "blind hole" in msg, msg
 
 
 if __name__ == "__main__":

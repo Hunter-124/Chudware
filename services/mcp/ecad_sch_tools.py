@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
-import json
 
 from .ecad_common import (
     OpError,
@@ -30,6 +29,302 @@ from .ecad_common import (
     lib_search,
     netlist_mod,
 )
+from typing import Any, Union
+
+from .cad_common import coerce_json_or_repr, require_list
+
+# ------------------------------------------------------- model-dialect normalizers (boundary)
+# ecad_place_symbol/ecad_wire used to accept exactly ONE rigid argument shape while their
+# ecad_pcb_tools.py siblings (ecad_set_net_class:844, ecad_autoroute:341, ecad_add_zone:476)
+# already take Union[dict, str] for the same concepts. Live models write that sibling dialect,
+# a batch ops:[...] list, or a nested placement/connection dict — and got a hard rejection.
+# Everything below normalizes at the TOOL BOUNDARY only: the ops handed to the core RPC are
+# identical to the strict path, and a genuinely malformed call still raises a teaching
+# ValueError naming every accepted shape (never a silent ok:true no-op). The coercion itself
+# is the SHARED helper the rest of services/mcp already uses —
+# cad_common.require_list / coerce_json_or_repr (services/mcp/cad_common.py:130 / :91).
+
+# Keys a model uses to wrap a batch of placements/connections in one object.
+_BATCH_KEYS = ("ops", "batch", "items", "symbols", "placements", "parts",
+               "wires", "connections")
+# Wire-endpoint aliases for "which symbol" — the vocabulary the sch_connect op itself uses
+# ("sym") plus the ref-des words the docstrings/guidance name.
+_REF_KEYS = ("ref", "reference", "refdes", "ref_des", "designator", "sym", "symbol",
+             "component")
+# ...and for "which pin" (ecad_place_symbol's pin list exposes number + name).
+_PIN_KEYS = ("pin", "pin_number", "pin_num", "pin_name", "number", "name")
+# Placement aliases. libid first so {"part": "Device:R", "ref": "R5"} reads correctly, and
+# "fpid" because ecad_find_part returns libid OR fpid and models paste whichever they got.
+_LIBID_KEYS = ("libid", "lib_id", "lib", "part", "part_id", "symbol", "component",
+               "fpid", "name")
+_REFDES_KEYS = ("ref", "reference", "refdes", "ref_des", "designator")
+_POS_KEYS = ("pos", "position", "at", "xy", "location")
+_ANGLE_KEYS = ("angle", "rotation", "rot", "orientation")
+_FOOTPRINT_KEYS = ("footprint", "fpid", "fp", "package")
+_SIMPARAM_KEYS = ("sim_params", "simparams", "sim", "spice")
+_VALUE_KEYS = ("value", "val")
+_FROM_KEYS = ("from", "from_ref", "a", "source", "src", "start")
+_TO_KEYS = ("to", "to_ref", "b", "target", "dst", "end")
+_FROM_PIN_KEYS = ("from_pin", "fromPin", "a_pin", "source_pin", "src_pin", "start_pin")
+_TO_PIN_KEYS = ("to_pin", "toPin", "b_pin", "target_pin", "dst_pin", "end_pin")
+
+# ------------------------------------------------- refdes collision + sim_params dialect
+# `ecad_place_symbol` is ADD-ONLY: no MCP tool edits an existing symbol (`sch_edit_symbol` is
+# a core op with no tool surface), so a duplicate refdes can only mean the model lost count of
+# its own designators — never "modify that part". Measured live 3x across 2 passes:
+#   ecad_place_symbol('Device:C_pol', ref='C1', value='10u')
+#   -> could not place: resulting document failed validation: symbols[4].ref: duplicate 'C1'
+# Renumber into the next free slot of the SAME series and SAY SO: the caller wires to that ref
+# on its very next call and needs the real name. A silent renumber would be worse than the
+# error it replaces.
+
+def _next_free_ref(doc: dict, requested: str) -> str:
+    """Next unused refdes in the same prefix series as `requested` (C1 taken -> C2)."""
+    taken = {str(s.get("ref")) for s in doc.get("symbols", []) if s.get("ref")}
+    req = str(requested)
+    cut = len(req)
+    while cut > 0 and req[cut - 1].isdigit():
+        cut -= 1
+    prefix, digits = req[:cut], req[cut:]
+    if not prefix:
+        prefix = "U"  # an all-numeric "refdes" has no series; park it on the IC series
+    n = int(digits) if digits else 0
+    while True:
+        n += 1
+        cand = f"{prefix}{n}"
+        if cand not in taken:
+            return cand
+
+
+# sim_params keys the pipeline ACTUALLY reads: ac_mag/ac_phase/eng (ecad_common
+# _NetlistFacade.build_netlist) and waveform + its flat fields (_apply_sim_source_params).
+# Anything else is dropped silently downstream, so it is rejected at this boundary instead.
+_SIMPARAM_WAVEFORM_FIELDS = ("amplitude", "freq", "offset", "td", "theta",
+                             "v1", "v2", "tr", "tf", "pw", "per")
+_SIMPARAM_NUMERIC = ("ac_mag", "ac_phase") + _SIMPARAM_WAVEFORM_FIELDS
+_SIMPARAM_ALLOWED = ("waveform", "eng", "points") + _SIMPARAM_NUMERIC
+# Device MAGNITUDE written SPICE-style. These have NO sim_params slot at all — a passive's
+# magnitude lives in the symbol's `value` field, and inventing a nested slot for it would
+# silently corrupt the simulation it was meant to configure.
+_SIMPARAM_VALUE_FIELD_KEYS = ("capacitance", "resistance", "inductance", "value",
+                              "cap", "res", "ind", "c", "r", "l")
+
+
+def _parse_kv_sim_params(text: str) -> tuple[dict | None, str]:
+    """Parse the SPICE-style ``key=value[,key=value]`` sim_params dialect.
+
+    Returns ``(params, "")`` when every key has a real sim_params slot, else
+    ``(None, reason)`` — a key we cannot place is NEVER guessed into a nested slot.
+    """
+    s = str(text).strip().strip(";,")
+    if "=" not in s:
+        return None, ""
+    out: dict = {}
+    for part in s.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            return None, f"{part!r} is not a key=value pair"
+        raw_key, raw_val = part.split("=", 1)
+        key, val = raw_key.strip().strip("'\"").lower(), raw_val.strip().strip("'\"")
+        if key in _SIMPARAM_VALUE_FIELD_KEYS:
+            return None, (f"{raw_key.strip()!r} is the part's MAGNITUDE, not a sim_params "
+                          f"field — pass it as value={val!r} instead")
+        if key not in _SIMPARAM_ALLOWED:
+            return None, f"{raw_key.strip()!r} is not a sim_params field"
+        if key == "waveform":
+            out[key] = val.upper()
+        elif key in _SIMPARAM_NUMERIC:
+            try:
+                out[key] = float(val)
+            except ValueError:
+                return None, f"{raw_key.strip()}={val!r} must be a number"
+        else:
+            return None, f"{raw_key.strip()!r} needs a JSON object value, not key=value"
+    return (out, "") if out else (None, "")
+
+
+def _pick(d: dict, keys: tuple[str, ...]) -> Any:
+    """First non-empty value among `keys` in `d` (alias resolution); None when none present."""
+    for k in keys:
+        if k in d:
+            v = d[k]
+            if v is not None and v != "":
+                return v
+    return None
+
+
+def _batch_of(d: dict) -> list | None:
+    """The wrapped batch list inside e.g. {"ops": [...]} / {"symbols": [...]}, else None."""
+    for k in _BATCH_KEYS:
+        v = d.get(k)
+        if isinstance(v, (list, tuple)):
+            return list(v)
+    return None
+
+
+def _split_dotted(token: str) -> tuple[str, str]:
+    """'R1.2' / 'R1:2' -> ('R1', '2') — the exact ref.pin spelling THESE TOOLS PRINT BACK in
+    net_members / unconnected_pins, so a model echoing our own output isn't a syntax error.
+    Also tolerates the _pretty_pin 'R1.2(passive)' decoration."""
+    for sep in (".", ":"):
+        if sep in token:
+            ref, _, pin = token.rpartition(sep)
+            pin = pin.split("(")[0].strip()
+            if ref and pin:
+                return ref.strip(), pin
+    return token, ""
+
+
+def _endpoint(value: Any, pin: Any, side: str) -> tuple[str, str]:
+    """Normalize ONE wire endpoint to (ref, pin). Accepts the documented 'R1' + separate pin,
+    the sibling Union[dict, str] endpoint {'ref': 'R1', 'pin': '1'} (ref/sym/designator +
+    pin/number/name aliases), a ['R1', '1'] pair, and the dotted 'R1.1'."""
+    v = coerce_json_or_repr(value)
+    if isinstance(v, (list, tuple)) and len(v) == 2:
+        if pin is None or pin == "":
+            pin = v[1]
+        v = v[0]
+    if isinstance(v, dict):
+        pin_v = _pick(v, _PIN_KEYS)
+        v = _pick(v, _REF_KEYS)
+        if pin_v is not None:
+            pin = pin_v
+    if v is None or not str(v).strip():
+        raise ValueError(
+            f"the {side} endpoint names no symbol — pass a ref like 'R1' with its pin, "
+            f"{{'ref': 'R1', 'pin': '1'}}, or the dotted 'R1.1'")
+    ref = str(v).strip()
+    if pin is None or str(pin).strip() == "":
+        ref, pin = _split_dotted(ref)
+    if pin is None or str(pin).strip() == "":
+        raise ValueError(
+            f"the {side} endpoint {ref!r} carries no pin — pass the pin number/name "
+            f"separately, as {{'ref': {ref!r}, 'pin': '1'}}, or dotted as '{ref}.1'")
+    return ref, str(pin).strip()
+
+
+def _wire_specs(from_ref: Any, from_pin: Any, to_ref: Any, to_pin: Any) -> list[dict]:
+    """Normalize ecad_wire's four rigid args into a LIST of
+    {from_ref, from_pin, to_ref, to_pin} — one entry for the plain call, N for a batch."""
+    first = coerce_json_or_repr(from_ref)
+    conns: list | None = None
+    if isinstance(first, dict):
+        conns = _batch_of(first)
+        if conns is None and (_pick(first, _FROM_KEYS) is not None
+                              or _pick(first, _TO_KEYS) is not None):
+            conns = [first]  # ONE whole-connection dict {'from': ..., 'to': ...}
+    elif isinstance(first, (list, tuple)) and first and all(
+            isinstance(e, dict) for e in first):
+        conns = list(first)  # a batch of connection dicts
+    if conns is None:
+        fr0, fp0 = _endpoint(from_ref, from_pin, "from")
+        to0, tp0 = _endpoint(to_ref, to_pin, "to")
+        return [{"from_ref": fr0, "from_pin": fp0, "to_ref": to0, "to_pin": tp0}]
+    conns = require_list(conns, "from_ref",
+                         "a list of connections, e.g. "
+                         "[{'from': 'R1.1', 'to': 'R2.2'}]")
+    if not conns:
+        raise ValueError("no connections to make — the wire batch is empty")
+    out: list[dict] = []
+    for entry in conns:
+        e = coerce_json_or_repr(entry)
+        if not isinstance(e, dict):
+            raise ValueError(
+                "each wire in a batch must be an object like "
+                "{'from': 'R1.1', 'to': 'R2.2'} or "
+                "{'from': {'ref': 'R1', 'pin': '1'}, 'to': {'ref': 'R2', 'pin': '2'}}, "
+                f"got {type(entry).__name__}")
+        a, b = _pick(e, _FROM_KEYS), _pick(e, _TO_KEYS)
+        if a is None or b is None:
+            raise ValueError(
+                "each wire needs BOTH a 'from' and a 'to' endpoint, e.g. "
+                "{'from': 'R1.1', 'to': 'R2.2'}")
+        fr, fp = _endpoint(a, _pick(e, _FROM_PIN_KEYS), "from")
+        to, tp2 = _endpoint(b, _pick(e, _TO_PIN_KEYS), "to")
+        out.append({"from_ref": fr, "from_pin": fp, "to_ref": to, "to_pin": tp2})
+    return out
+
+
+def _merge_place_spec(base: dict, e: dict) -> dict:
+    """Fold ONE model-written placement dict onto the top-level defaults."""
+    lib = _pick(e, _LIBID_KEYS)
+    if lib is None or not str(lib).strip():
+        raise ValueError(
+            "each placement needs a libid from ecad_find_part, e.g. "
+            "{'libid': 'Device:R', 'x': 0, 'y': 0, 'value': '1k'} "
+            "(libid/lib_id/part/symbol are all accepted)")
+    spec = dict(base, libid=str(lib).strip())
+    pos = _pick(e, _POS_KEYS)
+    if pos is not None:
+        pos = coerce_json_or_repr(pos)
+        if isinstance(pos, dict):
+            spec["x"] = pos.get("x", spec["x"])
+            spec["y"] = pos.get("y", spec["y"])
+        else:
+            pt = require_list(pos, "pos", "an [x, y] point in mm")
+            if len(pt) < 2:
+                raise ValueError(f"pos must be an [x, y] point in mm, got {pos!r}")
+            spec["x"], spec["y"] = pt[0], pt[1]
+    for slot, keys in (("x", ("x", "pos_x")), ("y", ("y", "pos_y")),
+                       ("ref", _REFDES_KEYS), ("value", _VALUE_KEYS),
+                       ("angle", _ANGLE_KEYS), ("footprint", _FOOTPRINT_KEYS),
+                       ("sim_params", _SIMPARAM_KEYS)):
+        got = _pick(e, keys)
+        if got is not None:
+            spec[slot] = got
+    for slot in ("x", "y", "angle"):
+        raw = spec[slot]
+        try:
+            spec[slot] = float(raw) if raw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{slot} must be a number ({'degrees' if slot == 'angle' else 'mm'}), "
+                f"got {raw!r}") from None
+    return spec
+
+
+def _place_specs(libid: Any, x: Any, y: Any, ref: Any, value: Any, angle: Any,
+                 footprint: Any, sim_params: Any) -> list[dict]:
+    """Normalize ecad_place_symbol's args into a LIST of placement specs. Accepts the
+    documented libid string, ONE placement dict, a {'symbols': [...]} / {'ops': [...]} wrapper,
+    or a bare list of placement dicts/libid strings (batch)."""
+    base = {"libid": "", "x": x, "y": y, "ref": ref, "value": value, "angle": angle,
+            "footprint": footprint, "sim_params": sim_params}
+    v = coerce_json_or_repr(libid)
+    if isinstance(v, str):
+        if not v.strip():
+            raise ValueError(
+                "libid is required — find one with ecad_find_part, then pass e.g. "
+                "'Device:R' (or a placement dict / list of placement dicts)")
+        return [_merge_place_spec(base, {"libid": v})]
+    if isinstance(v, dict):
+        entries = _batch_of(v) or [v]
+    elif isinstance(v, (list, tuple)):
+        entries = list(v)
+    else:
+        raise ValueError(
+            "libid must be a library id like 'Device:R', ONE placement dict "
+            "{'libid': 'Device:R', 'x': 0, 'y': 0}, or a list of those, got "
+            f"{type(libid).__name__}")
+    if not entries:
+        raise ValueError("no symbols to place — the placement batch is empty")
+    out: list[dict] = []
+    for entry in entries:
+        en = coerce_json_or_repr(entry)
+        if isinstance(en, str):
+            if not en.strip():
+                raise ValueError("a placement entry is an empty libid string")
+            out.append(_merge_place_spec(base, {"libid": en}))
+        elif isinstance(en, dict):
+            out.append(_merge_place_spec(base, en))
+        else:
+            raise ValueError(
+                "each placement must be a libid string or an object like "
+                "{'libid': 'Device:R', 'x': 0, 'y': 0, 'value': '1k'}, got "
+                f"{type(entry).__name__}")
+    return out
 
 def register_ecad_sch_tools(mcp: FastMCP) -> None:
     """ECAD schematic MCP tools (T-RF8 split of ecad_tools.py): ecad_new_schematic, find_part, place_symbol, wire, add_power, label, status, run_erc, update_from_sch."""
@@ -65,51 +360,145 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
 
     # ---------------------------------------------------------------- find part
 
+    def _symbol_record(libid: str, lib_resolve, *, score: int = 0,
+                       name: str = "", description: str = "") -> dict:
+        """Build one symbol hit record (pins, ref prefix, sim flag) from a libid."""
+        sdef = lib_resolve(libid) or {}
+        pins = sdef.get("pins", [])
+        rec = {"kind": "symbol", "libid": libid,
+               "name": name or sdef.get("name", ""),
+               "description": description or sdef.get("description", ""),
+               "score": score,
+               "pin_count": len(pins),
+               "pins": [f"{p.get('number')}:{p.get('name')}({p.get('type')})"
+                        for p in pins[:12]],
+               "reference_prefix": sdef.get("reference_prefix", ""),
+               "default_value": sdef.get("value", "")}
+        if sdef.get("sim"):
+            rec["simulatable"] = True
+        return rec
+
     @mcp.tool()
-    def ecad_find_part(query: str, limit: int = 12) -> str:
+    def ecad_find_part(query: str, limit: int = 12, category: str = "") -> str:
         """Search the component library and return RANKED real parts so you place an actual part
         instead of inventing a libid.
 
         For each hit: its ``libid`` (symbols) or ``fpid`` (footprints), name, description, and
         PIN COUNT (symbols) so you know how many pins you'll have to wire. Hits are sorted best
         first. Pass the exact ``libid``/``fpid`` of a hit to ecad_place_symbol / a footprint op.
+
+        The library is a clean-room GENERIC set — it holds no manufacturer part numbers. Ask for
+        a real one ('TPS62840', 'ESP32-S3') and you get the closest generic by FUNCTION, flagged
+        ``substituted: true`` with a warning naming what you asked for, what you got, and how its
+        pinout differs. Never place a substituted symbol without reading that warning.
+
+        ``ecad_find_part('list')`` browses every library part grouped by family.
+        ``category`` restricts the search to one family prefix (e.g. 'Device', 'MCU',
+        'Regulator_Switching'); an unknown category errors with the valid list.
         """
         from services.ecad.library import resolve as lib_resolve  # STAYS (T-RF20): no ecad_library RPC; pin-count lookup
-        hits = lib_search(query) or []
+        from services.ecad.library import substitute as _sub
+
+        q = (query or "").strip()
+        families = _sub.family_names()
+
+        # Browse mode. The old miss hint named a fixed example list that happened to omit the
+        # MCU and regulator families a model most often wants; this is the real index.
+        if q.lower() in _sub.LIST_QUERIES:
+            index = _sub.family_index()
+            total = sum(f["count"] for f in index)
+            return _dumps({
+                "ok": True, "query": q, "count": total, "families": index,
+                "categories": families, "warnings": [],
+                "hint": f"{total} generic library symbols in {len(index)} families. "
+                        "These are GENERIC parts — search by function ('buck regulator', "
+                        "'mcu', 'imu') or by a real part number to get the closest generic.",
+                "next_actions": ["ecad_place_symbol('<libid>', x=0, y=0, value='<value>')"],
+            })
+
+        cat = (category or "").strip()
+        if cat:
+            resolved_cat = next((f for f in families if f.lower() == cat.lower()), None)
+            if resolved_cat is None:
+                return _err(f"unknown category {category!r}",
+                            hint="category filters on the library prefix of a libid (the part "
+                                 f"before the colon). Valid: {', '.join(families)}.",
+                            next_actions=["ecad_find_part('list')  # browse every family",
+                                          f"ecad_find_part({q!r})  # search without a category"],
+                            query=q, hits=[], categories=families)
+            cat = resolved_cat
+
+        if not q:
+            return _err("query is empty",
+                        hint="Pass a function or a part number, e.g. ecad_find_part('buck "
+                             "regulator') or ecad_find_part('TPS62840').",
+                        next_actions=["ecad_find_part('list')  # browse every library part"],
+                        query=query, hits=[], categories=families)
+
+        hits = lib_search(q) or []
+        if cat:
+            hits = [h for h in hits
+                    if (h.get("libid") or h.get("fpid") or "").split(":", 1)[0] == cat]
         out_hits: list[dict] = []
         for h in hits[:max(1, int(limit))]:
-            rec = {"kind": h.get("kind"), "name": h.get("name", ""),
-                   "description": h.get("description", ""), "score": h.get("score", 0)}
             if h.get("kind") == "symbol":
-                libid = h.get("libid", "")
-                rec["libid"] = libid
-                sdef = lib_resolve(libid) or {}
-                pins = sdef.get("pins", [])
-                rec["pin_count"] = len(pins)
-                rec["pins"] = [f"{p.get('number')}:{p.get('name')}({p.get('type')})"
-                               for p in pins[:12]]
-                rec["reference_prefix"] = sdef.get("reference_prefix", "")
-                rec["default_value"] = sdef.get("value", "")
-                if sdef.get("sim"):
-                    rec["simulatable"] = True
+                out_hits.append(_symbol_record(h.get("libid", ""), lib_resolve,
+                                               score=h.get("score", 0),
+                                               name=h.get("name", ""),
+                                               description=h.get("description", "")))
             else:
-                rec["fpid"] = h.get("fpid", "")
-            out_hits.append(rec)
+                out_hits.append({"kind": h.get("kind"), "name": h.get("name", ""),
+                                 "description": h.get("description", ""),
+                                 "score": h.get("score", 0), "fpid": h.get("fpid", "")})
+
         if not out_hits:
-            return _err(f"no library parts match {query!r}",
-                        hint="Try a broader keyword (e.g. 'resistor', 'cap', 'led', 'opamp', "
-                             "'connector', 'voltage', 'gnd', '0603').",
-                        next_actions=["ecad_find_part('resistor')",
-                                      "ecad_find_part('voltage')"],
-                        query=query, hits=[])
+            # No literal match. Offer the closest GENERIC by inferred function rather than
+            # burning another call — but say so LOUDLY: a silent generic swap would put wrong
+            # pins in the netlist, which is far worse than a miss.
+            sug = _sub.suggest(q)
+            if sug and cat and sug["libid"].split(":", 1)[0] != cat:
+                sug = None
+            if sug:
+                rec = _symbol_record(sug["libid"], lib_resolve)
+                rec["substituted"] = True
+                rec["requested"] = q
+                warning = (f"SUBSTITUTED: the library has no symbol for {q!r}. Offering the "
+                           f"closest generic {sug['family']}: {sug['libid']} "
+                           f"({rec['pin_count']} pins). {sug['caveat']}")
+                return _dumps({
+                    "ok": True, "query": q, "requested": q, "substituted": True,
+                    "exact_match": False, "substitute_libid": sug["libid"],
+                    "substitute_family": sug["family"],
+                    "count": len(out_hits) + 1, "hits": [rec],
+                    "warnings": [warning],
+                    "hint": f"No exact part — {sug['libid']} is the generic "
+                            f"{sug['family']} standing in for {q!r}. Placeable as-is; its "
+                            "pin map is NOT the requested part's. "
+                            + sug["caveat"],
+                    "next_actions": [
+                        f"ecad_place_symbol('{sug['libid']}', x=0, y=0, value={q!r})",
+                        "ecad_find_part('list')  # browse every library part",
+                    ],
+                })
+            scope = f" in category {cat!r}" if cat else ""
+            return _err(f"no library parts match {q!r}{scope}, and no generic equivalent "
+                        "covers that function",
+                        hint="This is a clean-room GENERIC library — no manufacturer part "
+                             f"numbers. Families: {', '.join(families)}. Search by FUNCTION "
+                             "('buck regulator', 'mcu', 'opamp', 'imu', 'header', 'crystal') "
+                             "or call ecad_find_part('list') for every part with its pin count.",
+                        next_actions=["ecad_find_part('list')  # every part, grouped by family",
+                                      "ecad_find_part('resistor')"],
+                        query=q, hits=[], categories=families, substituted=False)
+
         first = out_hits[0]
         first_id = first.get("libid") or first.get("fpid")
         ex = (f"ecad_place_symbol('{first.get('libid')}', x=0, y=0)"
               if first.get("kind") == "symbol"
               else f"use fpid '{first.get('fpid')}' on the board")
         return _dumps({
-            "ok": True, "query": query, "count": len(out_hits), "hits": out_hits,
-            "warnings": [],
+            "ok": True, "query": q, "count": len(out_hits), "hits": out_hits,
+            "substituted": False, "exact_match": True, "warnings": [],
             "hint": f"Best match: {first_id} ({first.get('description') or first.get('name')}). "
                     "Place it with its EXACT libid/fpid — do not invent ids.",
             "next_actions": [ex],
@@ -119,32 +508,9 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
 
     # ---------------------------------------------------------------- place symbol
 
-    @mcp.tool()
-    def ecad_place_symbol(libid: str, x: float = 0.0, y: float = 0.0,
-                          ref: str = "", value: str = "",
-                          angle: float = 0.0, footprint: str = "", doc_id: str = "",
-                          sim_params: str = "") -> str:
-        """Place a symbol on the active schematic and return its assigned REF plus its full PIN
-        LIST (name/number/type/world-xy) and the count of pins still unconnected.
-
-        The pin list is the context you need to wire: each pin's world ``xy`` is where a wire must
-        reach, and ``net`` tells you what it already touches. ``value`` matters for simulation —
-        a resistor needs e.g. '1k', a voltage source '5' — set it now or with ecad_set later.
-        ``ref`` auto-assigns (R1, R2, ...) if omitted. ``footprint`` (an fpid like
-        'Resistor_SMD:R_0603') makes the part board-ready for ecad_update_from_sch; omit it and a
-        sane default for the part's libid is used automatically when you sync to a board.
-
-        ``sim_params`` (JSON object string) attaches per-instance simulation/engineering data.
-        Its ``"eng"`` sub-object overrides the library engineering metadata for THIS instance
-        (partial dict — e.g. '{"eng": {"power_w": {"typ": 0.02}}}'); see
-        contracts/ecad/boardphys.md. Overrides flow onto the board footprint at sync and into
-        the aicad.boardphys/1 sidecar + ecad_status power totals.
-        """
-        try:
-            session = _get_sch(doc_id or None)
-        except OpError as e:
-            return _err(e.message, hint="Open a schematic first.",
-                        next_actions=["ecad_new_schematic('mydesign')"])
+    def _place_one(session, spec: dict, attach_readback: bool) -> dict:
+        """Place ONE normalized spec and build its payload dict (ok or teaching error)."""
+        libid = spec["libid"]
         # E7: Validate libid resolves BEFORE dispatching the op. An unresolvable libid would
         # silently produce a 2-pin stub with ok:true, which then corrupts the netlist. Fail fast
         # with a clear error and direct the user to ecad_find_part.
@@ -152,7 +518,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         _resolved_def = _lib.resolve(libid)
         if _resolved_def is None:
             keyword = libid.split(":")[-1] if ":" in libid else libid
-            return _err(
+            return _rs.err_envelope(
                 f"unknown library part {libid!r} — use ecad_find_part to find a real libid",
                 hint=(f"'{libid}' is not in the component library. "
                       f"Run ecad_find_part('{keyword}') to discover the correct libid."),
@@ -165,58 +531,99 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         # The C++ core has no symbol library server-side (core/ecad/ops.cpp ensure_lib_def
         # stubs when no def rides the op) — pass the resolved def inline so lib_cache,
         # ref-prefix annotation (R1, not U1) and pin geometry are identical to the old path.
-        op: dict = {"op": "sch_add_symbol", "libid": libid, "pos": [float(x), float(y)],
-                    "angle": float(angle), "def": _resolved_def}
-        if ref:
-            op["ref"] = ref
-        if value:
-            op["value"] = value
-        if footprint:
-            op["footprint"] = footprint
+        op: dict = {"op": "sch_add_symbol", "libid": libid,
+                    "pos": [float(spec["x"]), float(spec["y"])],
+                    "angle": float(spec["angle"]), "def": _resolved_def}
+        ref_warnings: list[str] = []
+        if spec["ref"]:
+            want_ref = str(spec["ref"])
+            existing = {str(s.get("ref")) for s in session.doc.get("symbols", [])}
+            if want_ref in existing:
+                # Add-only tool: a taken ref means the model lost count, not "edit that one".
+                assigned = _next_free_ref(session.doc, want_ref)
+                ref_warnings.append(
+                    f"REFDES REASSIGNED: {want_ref} is already used on this schematic — "
+                    f"{libid} was placed as {assigned} instead. Wire to {assigned}, not "
+                    f"{want_ref}. (ecad_place_symbol only ADDS symbols; to change an existing "
+                    f"part, delete it and place it again.)")
+                want_ref = assigned
+            op["ref"] = want_ref
+        if spec["value"]:
+            op["value"] = str(spec["value"])
+        if spec["footprint"]:
+            op["footprint"] = str(spec["footprint"])
+        sim_params = spec["sim_params"]
         if sim_params:
-            try:
-                sp = json.loads(sim_params)
-            except (TypeError, ValueError) as e:
-                return _err(f"sim_params is not valid JSON: {e}",
-                            hint='Pass a JSON object string, e.g. '
-                                 '\'{"eng": {"power_w": {"typ": 0.02}}}\'.',
-                            next_actions=["ecad_place_symbol(...)  # retry with valid JSON"])
+            # Widened with the rest of the boundary: a real dict (the sibling
+            # ecad_set_net_class params dialect), a JSON / python-repr object string, or the
+            # SPICE-style 'key=value,key=value' form. The kv form is accepted ONLY for keys
+            # with a real slot — 'Capacitance=10u' has none (a passive's magnitude lives in
+            # `value`), and guessing a nested slot for it would silently corrupt the sim.
+            sp = coerce_json_or_repr(sim_params)
+            if isinstance(sp, str):
+                kv, why = _parse_kv_sim_params(sp)
+                if kv is not None:
+                    sp = kv
+                else:
+                    detail = f" — {why}" if why else ""
+                    return _rs.err_envelope(
+                        f"sim_params {sim_params!r} is neither a JSON object nor a usable "
+                        f"key=value list{detail}",
+                        hint="sim_params carries SIMULATION STIMULUS and ENGINEERING "
+                             "metadata, not the part's magnitude. Accepted fields: "
+                             f"{', '.join(_SIMPARAM_ALLOWED)}. A passive's magnitude goes in "
+                             "value= (e.g. value='10u'). Shapes: "
+                             '{"eng": {"power_w": {"typ": 0.02}}} or '
+                             "'waveform=SIN,amplitude=5,freq=1000'.",
+                        next_actions=[
+                            "ecad_place_symbol('Device:C', x=0, y=0, value='10u')",
+                            "ecad_place_symbol('Simulation_SPICE:V_source', x=0, y=0, "
+                            "value='5', sim_params='waveform=SIN,amplitude=5,freq=1000')",
+                        ],
+                        accepted_sim_params=list(_SIMPARAM_ALLOWED))
             if not isinstance(sp, dict):
-                return _err("sim_params must be a JSON object",
-                            hint='e.g. \'{"eng": {"power_w": {"typ": 0.02}}}\'.')
+                return _rs.err_envelope(
+                    "sim_params must be a JSON object",
+                    hint='e.g. {"eng": {"power_w": {"typ": 0.02}}} or '
+                         "'waveform=SIN,amplitude=5,freq=1000'.",
+                    accepted_sim_params=list(_SIMPARAM_ALLOWED))
             op["sim_params"] = sp
         try:
             resp = _apply(session, [op])
         except OpError as e:
-            return _err(f"could not place {libid!r}: {e.message}",
-                        hint="Check the libid with ecad_find_part; pass an exact match.",
-                        next_actions=[f"ecad_find_part('{libid.split(':')[-1]}')"],
-                        detail=e.detail)
+            return _rs.err_envelope(
+                f"could not place {libid!r}: {e.message}",
+                hint="Check the libid with ecad_find_part; pass an exact match.",
+                next_actions=[f"ecad_find_part('{libid.split(':')[-1]}')"],
+                detail=e.detail)
         sid = resp.get("id_map", {}).get("$0")
         doc = session.doc
         sym = next((s for s in doc.get("symbols", []) if s.get("id") == sid), None)
         if sym is None:
-            return _err("placed symbol but could not locate it (internal)",
-                        hint="Call ecad_status() to inspect the document.")
+            return _rs.err_envelope("placed symbol but could not locate it (internal)",
+                                    hint="Call ecad_status() to inspect the document.")
         pins = _placed_pins(doc, sym)
         nl = netlist_mod.build_netlist(doc)
         unconnected = _unconnected_pins(doc, nl)
         this_unconnected = [p for p in unconnected if p["ref"] == sym.get("ref")]
-        warnings = list(resp.get("warnings", []))
+        warnings = ref_warnings + list(resp.get("warnings", []))
         pin_labels = ", ".join(f"{p['number']}({p['name']}/{p['type']})" for p in pins)
         payload = {
             "ok": True, "doc_id": session.doc_id, "revision": session.revision,
             "ref": sym.get("ref"), "id": sid, "libid": libid,
+            "requested_ref": str(spec["ref"]) if spec["ref"] else "",
+            "ref_reassigned": bool(ref_warnings),
             "value": sym.get("value", ""), "pos": sym.get("pos"),
             "pins": pins,
             "unconnected_pins_this_symbol": [p["pinref"] for p in this_unconnected],
             "total_unconnected": len(unconnected),
             "warnings": warnings,
-            "hint": (f"Placed {sym.get('ref')} with pins: {pin_labels}. "
-                     f"All {len(this_unconnected)} of its pins are floating — wire each pin to "
-                     "another pin (ecad_wire) or to a power/ground port (ecad_add_power)."
-                     if this_unconnected else
-                     f"Placed {sym.get('ref')}; its pins are already on existing nets."),
+            "hint": ((f"{ref_warnings[0]} " if ref_warnings else "")
+                     + (f"Placed {sym.get('ref')} with pins: {pin_labels}. "
+                        f"All {len(this_unconnected)} of its pins are floating — wire each pin "
+                        "to another pin (ecad_wire) or to a power/ground port (ecad_add_power)."
+                        if this_unconnected else
+                        f"Placed {sym.get('ref')}; its pins are already on existing nets.")),
             "next_actions": (
                 [f"ecad_wire('{sym.get('ref')}', '{pins[0]['number']}', '<otherRef>', "
                  f"'<otherPin>')  # connect pin {pins[0]['number']}"]
@@ -224,40 +631,100 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
             ) + ["ecad_status()  # see the whole design + what's still unconnected",
                  "render_schematic_ascii()  # full sheet ASCII + grid for edits"],
         }
-        _attach_schematic_ascii_readback(payload, doc_id=session.doc_id,
-                                         focus=list(sym.get("pos") or []))
-        return _dumps(payload)
-
-
-
-    # ---------------------------------------------------------------- wire
+        if attach_readback:
+            _attach_schematic_ascii_readback(payload, doc_id=session.doc_id,
+                                             focus=list(sym.get("pos") or []))
+        return payload
 
     @mcp.tool()
-    def ecad_wire(from_ref: str, from_pin: str, to_ref: str, to_pin: str,
-                  doc_id: str = "") -> str:
-        """Auto-route an orthogonal wire from one pin to another (emits sch_connect) and return
-        the RESULTING net plus the updated list of what is still unconnected.
+    def ecad_place_symbol(libid: Union[str, dict, list] = "", x: float = 0.0, y: float = 0.0,
+                          ref: str = "", value: str = "",
+                          angle: float = 0.0, footprint: str = "", doc_id: str = "",
+                          sim_params: Union[str, dict] = "") -> str:
+        """Place a symbol on the active schematic and return its assigned REF plus its full PIN
+        LIST (name/number/type/world-xy) and the count of pins still unconnected.
 
-        ``from_ref``/``to_ref`` are ref-des ('R1') or internal ids; pins are pin numbers ('1') or
-        names. The engine names the net automatically (power/label name wins, else N$n). The
-        returned ``net`` + ``net_members`` confirm the two pins really joined.
+        The pin list is the context you need to wire: each pin's world ``xy`` is where a wire must
+        reach, and ``net`` tells you what it already touches. ``value`` matters for simulation —
+        a resistor needs e.g. '1k', a voltage source '5' — set it now or with ecad_set later.
+        ``ref`` auto-assigns (R1, R2, ...) if omitted. ``footprint`` (an fpid like
+        'Resistor_SMD:R_0603') makes the part board-ready for ecad_update_from_sch; omit it and a
+        sane default for the part's libid is used automatically when you sync to a board.
+
+        ``libid`` also accepts the shapes the PCB-side tools accept, so one call can place many
+        parts:
+          - 'Device:R' with x/y/value/angle/footprint (the plain form)
+          - ONE placement dict: {'libid': 'Device:R', 'pos': [20, 0], 'value': '1k',
+            'angle': 90}  (pos/position/at, ref/designator, value/val, angle/rotation,
+            footprint/fpid are all accepted)
+          - a BATCH: [{'libid': 'Device:R', ...}, {'libid': 'Device:C', ...}] or
+            {'symbols': [...]} / {'ops': [...]}. The response then carries ``placed`` (one
+            per-symbol payload each) plus ``refs``.
+
+        ``sim_params`` (a JSON object, or an object string) attaches per-instance simulation/
+        engineering data. Its ``"eng"`` sub-object overrides the library engineering metadata for
+        THIS instance (partial dict — e.g. '{"eng": {"power_w": {"typ": 0.02}}}'); see
+        contracts/ecad/boardphys.md. Overrides flow onto the board footprint at sync and into
+        the aicad.boardphys/1 sidecar + ecad_status power totals.
         """
         try:
             session = _get_sch(doc_id or None)
         except OpError as e:
             return _err(e.message, hint="Open a schematic first.",
                         next_actions=["ecad_new_schematic('mydesign')"])
+        try:
+            specs = _place_specs(libid, x, y, ref, value, angle, footprint, sim_params)
+        except ValueError as e:
+            return _err(
+                str(e),
+                hint="ecad_place_symbol takes a libid string (with x/y/value/ref/angle/"
+                     "footprint), ONE placement dict, or a list of placement dicts, e.g. "
+                     "[{'libid': 'Device:R', 'pos': [20, 0], 'value': '1k'}].",
+                next_actions=["ecad_find_part('resistor')  # get a real libid",
+                              "ecad_place_symbol('Device:R', x=0, y=0, value='1k')"])
+        single = len(specs) == 1
+        results = [_place_one(session, s, attach_readback=single) for s in specs]
+        if single:
+            return _dumps(results[0])
+        placed = [r for r in results if r.get("ok")]
+        failed = [{"libid": s["libid"], "error": r.get("error")}
+                  for s, r in zip(specs, results) if not r.get("ok")]
+        refs = [r.get("ref") for r in placed]
+        payload = {
+            "ok": not failed, "doc_id": session.doc_id, "revision": session.revision,
+            "count": len(placed), "refs": refs, "placed": results, "failed": failed,
+            "total_unconnected": (placed[-1].get("total_unconnected") if placed else 0),
+            "warnings": [w for r in results for w in (r.get("warnings") or [])],
+            "hint": (f"Placed {len(placed)}/{len(specs)} symbol(s): "
+                     f"{', '.join(str(r) for r in refs) or '(none)'}."
+                     + (f" {len(failed)} failed: "
+                        + "; ".join(f"{f['libid']}: {f['error']}" for f in failed)
+                        if failed else "")),
+            "next_actions": ["ecad_wire('<ref>', '<pin>', '<otherRef>', '<otherPin>')",
+                             "ecad_status()  # see the whole design + what's unconnected"],
+        }
+        _attach_schematic_ascii_readback(payload, doc_id=session.doc_id)
+        return _dumps(payload)
+
+
+
+    # ---------------------------------------------------------------- wire
+
+    def _wire_one(session, spec: dict, attach_readback: bool) -> dict:
+        """Connect ONE normalized {from_ref, from_pin, to_ref, to_pin} spec."""
+        from_ref, from_pin = spec["from_ref"], spec["from_pin"]
+        to_ref, to_pin = spec["to_ref"], spec["to_pin"]
         doc = session.doc
         a = _resolve_ref_or_id(doc, from_ref)
         b = _resolve_ref_or_id(doc, to_ref)
         if a is None or b is None:
             missing = from_ref if a is None else to_ref
             refs = [s.get("ref") for s in doc.get("symbols", [])]
-            return _err(f"no symbol {missing!r} on the schematic",
-                        hint=f"Placed refs are: {', '.join(refs) or '(none)'}. "
-                             "Place the part first or fix the ref.",
-                        next_actions=["ecad_status()"],
-                        placed_refs=refs)
+            return _rs.err_envelope(f"no symbol {missing!r} on the schematic",
+                                    hint=f"Placed refs are: {', '.join(refs) or '(none)'}. "
+                                         "Place the part first or fix the ref.",
+                                    next_actions=["ecad_status()"],
+                                    placed_refs=refs)
         op = {"op": "sch_connect",
               "from": {"sym": a.get("id"), "pin": str(from_pin)},
               "to": {"sym": b.get("id"), "pin": str(to_pin)}}
@@ -267,12 +734,13 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
             # Most common cause: a bad pin name/number — list the real pins to recover.
             a_pins = [p["number"] for p in _placed_pins(doc, a)]
             b_pins = [p["number"] for p in _placed_pins(doc, b)]
-            return _err(f"could not wire {from_ref}.{from_pin} -> {to_ref}.{to_pin}: {e.message}",
-                        hint=f"{from_ref} pins: {a_pins}; {to_ref} pins: {b_pins}. "
-                             "Use a real pin number/name.",
-                        next_actions=[f"ecad_wire('{from_ref}', '{a_pins[0] if a_pins else '1'}', "
-                                      f"'{to_ref}', '{b_pins[0] if b_pins else '1'}')"],
-                        detail=e.detail)
+            return _rs.err_envelope(
+                f"could not wire {from_ref}.{from_pin} -> {to_ref}.{to_pin}: {e.message}",
+                hint=f"{from_ref} pins: {a_pins}; {to_ref} pins: {b_pins}. "
+                     "Use a real pin number/name.",
+                next_actions=[f"ecad_wire('{from_ref}', '{a_pins[0] if a_pins else '1'}', "
+                              f"'{to_ref}', '{b_pins[0] if b_pins else '1'}')"],
+                detail=e.detail)
         doc = session.doc
         nl = netlist_mod.build_netlist(doc)
         # which net did this pin land on?
@@ -300,6 +768,69 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                  "ecad_simulate('op')  # solve DC node voltages",
                  "render_schematic_ascii()  # full sheet ASCII + grid"]
             ),
+        }
+        if attach_readback:
+            _attach_schematic_ascii_readback(payload, doc_id=session.doc_id)
+        return payload
+
+    @mcp.tool()
+    def ecad_wire(from_ref: Union[str, dict, list] = "", from_pin: Union[str, int] = "",
+                  to_ref: Union[str, dict] = "", to_pin: Union[str, int] = "",
+                  doc_id: str = "") -> str:
+        """Auto-route an orthogonal wire from one pin to another (emits sch_connect) and return
+        the RESULTING net plus the updated list of what is still unconnected.
+
+        ``from_ref``/``to_ref`` are ref-des ('R1') or internal ids; pins are pin numbers ('1') or
+        names. The engine names the net automatically (power/label name wins, else N$n). The
+        returned ``net`` + ``net_members`` confirm the two pins really joined.
+
+        Endpoints also accept the shapes the PCB-side tools accept:
+          - 'R1', '1', 'R2', '2' (the plain form)
+          - the dotted spelling this tool PRINTS BACK: ecad_wire('R1.1', to_ref='R2.2')
+          - endpoint dicts: ecad_wire({'ref': 'R1', 'pin': '1'}, to_ref={'ref': 'R2',
+            'pin': '2'})  (ref/sym/designator + pin/number/name aliases)
+          - ONE connection dict: ecad_wire({'from': 'R1.1', 'to': 'R2.2'})
+          - a BATCH: ecad_wire([{'from': 'R1.1', 'to': 'R2.2'}, {'from': 'R2.2',
+            'to': 'V1.-'}]) or {'ops': [...]}. The response then carries ``wires`` (one
+            per-connection payload each).
+        """
+        try:
+            session = _get_sch(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Open a schematic first.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        try:
+            specs = _wire_specs(from_ref, from_pin, to_ref, to_pin)
+        except ValueError as e:
+            return _err(
+                str(e),
+                hint="ecad_wire takes ('R1', '1', 'R2', '2'), the dotted 'R1.1'/'R2.2', "
+                     "endpoint dicts {'ref': 'R1', 'pin': '1'}, ONE connection dict "
+                     "{'from': 'R1.1', 'to': 'R2.2'}, or a list of connection dicts.",
+                next_actions=["ecad_status()  # list the placed refs and their pins",
+                              "ecad_wire('R1', '1', 'R2', '2')"])
+        single = len(specs) == 1
+        results = [_wire_one(session, s, attach_readback=single) for s in specs]
+        if single:
+            return _dumps(results[0])
+        made = [r for r in results if r.get("ok")]
+        failed = [{"from": f"{s['from_ref']}.{s['from_pin']}",
+                   "to": f"{s['to_ref']}.{s['to_pin']}", "error": r.get("error")}
+                  for s, r in zip(specs, results) if not r.get("ok")]
+        last = made[-1] if made else {}
+        payload = {
+            "ok": not failed, "doc_id": session.doc_id, "revision": session.revision,
+            "count": len(made), "wires": results, "failed": failed,
+            "nets": [r.get("net") for r in made],
+            "total_unconnected": last.get("total_unconnected", 0),
+            "unconnected_pins": last.get("unconnected_pins", []),
+            "warnings": [w for r in results for w in (r.get("warnings") or [])],
+            "hint": (f"Connected {len(made)}/{len(specs)} wire(s); "
+                     f"{last.get('total_unconnected', 0)} pin(s) still unconnected."
+                     + (" Failed: " + "; ".join(f"{f['from']}->{f['to']}: {f['error']}"
+                                                for f in failed) if failed else "")),
+            "next_actions": ["ecad_run_erc()  # verify the design electrically",
+                             "ecad_status()  # see what's still unconnected"],
         }
         _attach_schematic_ascii_readback(payload, doc_id=session.doc_id)
         return _dumps(payload)

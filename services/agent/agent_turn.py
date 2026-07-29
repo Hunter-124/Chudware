@@ -645,8 +645,20 @@ _UNEARNED_FINISH_NUDGE = (
     "artifacts you did not create, and never finish silently."
 )
 
-#: Meta tools let the model reach for capability; they are never a deliverable.
-_META_TOOLS_NOT_WORK = frozenset({"enable_tools", "list_tool_categories"})
+#: Meta tools let the model reach for capability, or describe intent; they are
+#: never a deliverable.
+#:
+#: ``task_list`` belongs here and was missed when the planning surface shipped
+#: (2026-07-27), which made "publish a plan, then stop" register as real work.
+#: Live firmware-p1-3 ("create an STM32F4 project that toggles PA5, build it,
+#: emulate it, report the GPIO event count") spent three of its four calls on
+#: task_list, built nothing, and the turn still reported success=confirmed. A plan
+#: is a statement of what you are ABOUT to do; counting it as having done it is
+#: precisely the fabricated-progress failure the unearned-finish gate exists to
+#: catch.
+_META_TOOLS_NOT_WORK = frozenset({
+    "enable_tools", "list_tool_categories", "task_list",
+})
 
 
 def _did_real_work(calls: list) -> bool:

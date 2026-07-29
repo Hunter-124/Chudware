@@ -466,3 +466,42 @@ def test_resolve_categories_cap_is_a_hard_ceiling():
 
     capped = resolve_categories(list(CATEGORY_PACKS.keys()), cap=5)
     assert len(capped) <= 5
+
+
+def test_publishing_a_task_list_is_not_doing_the_work():
+    """A plan is a statement of intent, never a deliverable.
+
+    Regression for a live firmware run (firmware-p1-3): asked to "create an
+    STM32F4 firmware project that toggles PA5, build it, emulate it and confirm
+    from the GPIO trace that PA5 actually toggled", the model spent three of its
+    four calls publishing task_list snapshots, built nothing, and the turn still
+    reported success=confirmed. task_list shipped with the planning surface
+    without being classified as meta, so `_did_real_work` counted a published plan
+    as work and the unearned-finish gate never fired.
+    """
+    import services.agent.agent_turn as at
+
+    assert "task_list" in at._META_TOOLS_NOT_WORK
+
+    # A turn made only of plan publications has done nothing.
+    plan_only = [{"tool": "task_list", "ok": True} for _ in range(3)]
+    assert not at._did_real_work(plan_only)
+
+    # Mixed with any genuine tool call it IS work, even a failed one.
+    assert at._did_real_work(plan_only + [{"tool": "fw_build", "ok": False}])
+
+    # And the finish gate must refuse a plan-only "done" against a work request.
+    assert at._unearned_finish_block(
+        plan_only,
+        "Created the project, built it and confirmed PA5 toggling.",
+        request="Create an STM32F4 firmware project that toggles PA5, build it",
+        can_act=True,
+    ) is not None
+
+    # Pure conversation is still allowed to finish without tool work.
+    assert at._unearned_finish_block(
+        plan_only,
+        "Here is how I would approach it.",
+        request="What would it take to toggle PA5 on an STM32F4?",
+        can_act=True,
+    ) is None

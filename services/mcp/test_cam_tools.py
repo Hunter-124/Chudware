@@ -460,6 +460,186 @@ def test_cam_add_tool_changes_field(monkeypatch):
     assert "#3" in changes and "drill" in changes and "5" in changes, changes
 
 
+# --------------------------------------------------------------------------------------- #
+# Discriminator VALUE guards (silent-fall-through regressions).
+#
+# core/cam/model.cpp:100  tool_type_from_string -> lookup_rev(kTool, s, EndmillFlat)
+# core/cam/extract.cpp:361 the kind if/else chain's final `else` is the "all" payload
+# Both substitute a default for an unrecognised value WITHOUT erroring. Measured on this
+# engine before the fix: cam_add_tool(type="ball"|"DRILL"|"driller") each stored
+# type="endmill_flat" (so feeds/speeds resolved a flat endmill's cutting class), and
+# cam_extract(kind="regions") answered with the "all" payload, which has no `regions` key.
+# --------------------------------------------------------------------------------------- #
+def test_resolve_tool_type_vocabulary_and_aliases():
+    """Pure-Python: the accepted set, the mapped short forms, and the rejections."""
+    from mcp_server import cam_tools as ct
+
+    # Every id in the kTool mirror is accepted and returned unchanged.
+    for tid in ct._TOOL_TYPES_KTOOL:
+        assert ct._resolve_tool_type(tid) == tid, tid
+    # Plain equivalents map to the tool they obviously mean.
+    for word, want in [("ball", "endmill_ball"), ("ballnose", "endmill_ball"),
+                       ("flat", "endmill_flat"), ("endmill", "endmill_flat"),
+                       ("chamfer", "chamfer_mill"), ("facemill", "face_mill"),
+                       ("twist_drill", "drill"), ("driller", "drill"),
+                       ("v_bit", "vbit"), ("bullnose", "endmill_bull"),
+                       ("parting_blade", "parting_tool"), ("laser", "laser_head")]:
+        assert ct._resolve_tool_type(word) == want, (word, want)
+    # Case and padding are noise, not a different tool.
+    assert ct._resolve_tool_type("DRILL") == "drill"
+    assert ct._resolve_tool_type("  Endmill_Ball  ") == "endmill_ball"
+    # A word naming no specific tool stays rejected — guessing one is the very silent
+    # substitution this guard exists to stop.
+    for bad in ("totally_bogus", "mill", "cutter", "", "   ", None, 7):
+        with pytest.raises(ValueError):
+            ct._resolve_tool_type(bad)
+
+
+def test_resolve_tool_type_error_names_the_valid_set():
+    from mcp_server import cam_tools as ct
+
+    with pytest.raises(ValueError) as ei:
+        ct._resolve_tool_type("wobble_mill")
+    msg = str(ei.value)
+    assert "wobble_mill" in msg
+    for tid in ("endmill_flat", "endmill_ball", "drill", "tap", "face_mill",
+                "boring_bar_id", "probe"):
+        assert tid in msg, (tid, msg)
+    assert "cam_tool_types" in msg, msg
+
+
+def test_resolve_tool_type_folds_in_the_live_engine_enum(monkeypatch):
+    """The vocabulary is the ENGINE's cam_tool_types unioned with the mirror, so a type
+    the engine gains is never rejected by a stale Python list — and an unreachable
+    engine must not pin the mirror-only floor for the rest of the process."""
+    from mcp_server import cam_tools as ct
+
+    monkeypatch.setitem(ct._TOOL_TYPES_CACHE, "ids", None)
+    monkeypatch.setattr(ct.cb, "call", lambda m, p=None: {
+        "tool_types": [{"id": "endmill_flat"}, {"id": "brand_new_cutter"}]})
+    assert ct._resolve_tool_type("brand_new_cutter") == "brand_new_cutter"
+    assert ct._TOOL_TYPES_CACHE["ids"] is not None      # a real answer IS cached
+
+    def boom(method, params=None):
+        raise RuntimeError("engine down")
+
+    monkeypatch.setitem(ct._TOOL_TYPES_CACHE, "ids", None)
+    monkeypatch.setattr(ct.cb, "call", boom)
+    assert ct._resolve_tool_type("drill") == "drill"    # the mirror still validates
+    assert ct._TOOL_TYPES_CACHE["ids"] is None          # ... and is NOT pinned
+
+
+def test_cam_add_tool_rejects_unknown_type_without_touching_the_library(monkeypatch):
+    """The negative case: no add_tool op reaches the engine, and the response names the set."""
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    applied: list = []
+
+    def fake_call(method, params=None):
+        if method == "cam_tool_types":
+            return {"tool_types": [{"id": t} for t in ct._TOOL_TYPES_KTOOL]}
+        if method == "cam_apply_ops":
+            applied.append(dict(params or {}))
+            tool = params["ops"][0]["tool"]
+            return {"revision": 1, "id_map": {}, "tree": {"tools": [tool], "setups": []}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setitem(ct._TOOL_TYPES_CACHE, "ids", None)
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    mcp = FastMCP("test-cam-add-tool-badtype")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_add_tool", {"number": 1, "type": "driller_9000"})
+    assert out.get("ok") is False, out
+    assert "driller_9000" in out["error"] and "endmill_flat" in out["error"], out
+    assert applied == [], applied     # the tool table was never written to
+
+
+def test_cam_add_tool_stores_the_canonical_type_and_matching_name(monkeypatch):
+    """A valid type still lands, and an alias lands as the tool it means — record AND
+    label. Before the fix, type="ball" stored endmill_flat under the name "T3 ball"."""
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    stored: list = []
+
+    def fake_call(method, params=None):
+        if method == "cam_tool_types":
+            return {"tool_types": [{"id": t} for t in ct._TOOL_TYPES_KTOOL]}
+        if method == "cam_apply_ops":
+            tool = params["ops"][0]["tool"]
+            stored.append(tool)
+            return {"revision": 1, "id_map": {}, "tree": {"tools": [tool], "setups": []}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setitem(ct._TOOL_TYPES_CACHE, "ids", None)
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    mcp = FastMCP("test-cam-add-tool-canon")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_add_tool", {"number": 2, "type": "drill", "diameter": 5.0})
+    assert stored[-1]["type"] == "drill" and stored[-1]["name"] == "T2 drill", stored[-1]
+    assert "drill" in out.get("changes", ""), out
+
+    _call_tool(mcp, "cam_add_tool", {"number": 3, "type": "ballnose", "diameter": 4.0})
+    assert stored[-1]["type"] == "endmill_ball", stored[-1]
+    assert stored[-1]["name"] == "T3 endmill_ball", stored[-1]
+
+    # An explicit name is still the caller's to choose.
+    _call_tool(mcp, "cam_add_tool", {"number": 4, "type": "tap", "name": "M6 tapper"})
+    assert stored[-1]["type"] == "tap" and stored[-1]["name"] == "M6 tapper", stored[-1]
+
+
+def test_resolve_extract_kind_vocabulary_and_aliases():
+    from mcp_server import cam_tools as ct
+
+    for kind in ct._EXTRACT_KINDS:
+        assert ct._resolve_extract_kind(kind) == kind, kind
+    for word, want in [("regions", "section"), ("slice", "section"),
+                       ("levels", "sections"), ("waterline", "sections"),
+                       ("drill_points", "holes"), ("points", "holes"),
+                       ("silhouette", "profile"), ("bounds", "stock"),
+                       ("triangles", "mesh"), ("STOCK", "stock"), ("  Mesh  ", "mesh")]:
+        assert ct._resolve_extract_kind(word) == want, (word, want)
+    with pytest.raises(ValueError) as ei:
+        ct._resolve_extract_kind("bogus_kind")
+    msg = str(ei.value)
+    assert "bogus_kind" in msg and "section" in msg and "profile" in msg, msg
+
+
+def test_cam_extract_rejects_unknown_kind_before_exporting_anything(monkeypatch):
+    """A bad kind must cost nothing: no STEP export, no cam_extract RPC."""
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    seen: list = []
+
+    def fake_call(method, params=None):
+        seen.append(method)
+        if method == "export_file":
+            return {"path": params["path"]}
+        if method == "cam_extract":
+            return {"bbox": {}, "kind_seen": params["kind"]}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CUR, "doc_id", "part-1")
+    mcp = FastMCP("test-cam-extract-kind")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_extract", {"kind": "bogus_kind"})
+    assert out.get("ok") is False and "bogus_kind" in out["error"], out
+    assert seen == [], seen
+
+    # A mapped equivalent reaches the engine as the kind it means.
+    out = _call_tool(mcp, "cam_extract", {"kind": "regions"})
+    assert out.get("kind_seen") == "section", out
+    assert seen == ["export_file", "cam_extract"], seen
+
+
 def test_cam_add_setup_changes_field(monkeypatch):
     from mcp_server import cam_tools as ct
     from mcp.server.fastmcp import FastMCP

@@ -20,6 +20,110 @@ from .cad_common import (
     sh,
 )
 
+import re as _re
+
+# ---------------------------------------------------------------- section discriminators
+#
+# SILENT-WRONG-OUTPUT guard. `add_section_view(axis=…)` used to read
+#     cut = horizontal_line if axis == "horizontal" else vertical_line
+# so EVERY value that was not the exact string "horizontal" produced a VERTICAL cut —
+# axis="vert", axis="y", axis="diagonal", axis="x" all cut vertically, and a section on the
+# wrong plane looks completely normal on the sheet. Same class one slot over: `mode` was
+# forwarded into `opts` untouched, and core/doc/drawing_session.cpp:926 only honours it when
+# it is literally "full" or "half" (`if (mode == "full" || mode == "half") view["mode"] = mode`)
+# — anything else is dropped and the section silently comes back FULL.
+#
+# Vocabulary sources, not guesses:
+#   axis — the cut is a 2D cutting LINE laid across the parent view's sheet-mm bbox
+#          (add_section_view below, and the engine's own auto-section at
+#          core/doc/drawing_session.cpp:2049-2050). "horizontal" builds
+#          [[x0-pad, cy], [x1+pad, cy]] — a line at constant sheet y spanning x, i.e. the
+#          cutting LINE is horizontal. So this codebase uses the drafting convention
+#          (horizontal = horizontal cutting line), not "normal to X".
+#   mode — core/doc/drawing_session.cpp:926, exactly {"full", "half"}.
+
+
+def _canon_word(v: Any) -> str:
+    """lower/strip and fold spaces + hyphens onto '_' so 'Half Section' == 'half_section'."""
+    return _re.sub(r"[\s\-]+", "_", str(v if v is not None else "").strip().lower())
+
+
+#: Accepted spellings of the two REAL cuts. A model that writes "vert" plainly means the
+#: vertical cut, so mapping it is a fix, not a guess; anything absent here is rejected.
+_SECTION_AXIS_WORDS = {
+    "horizontal": "horizontal", "horizontally": "horizontal", "horiz": "horizontal",
+    "hor": "horizontal", "h": "horizontal", "horizontal_cut": "horizontal",
+    "vertical": "vertical", "vertically": "vertical", "vert": "vertical",
+    "v": "vertical", "vertical_cut": "vertical",
+}
+
+#: Bare axis LETTERS are deliberately NOT in the table above — see _canon_section_axis.
+#: Matches "x", "-y", "+z", "x_axis" (whitespace/hyphens are already folded onto "_").
+_SECTION_AXIS_LETTER_RE = _re.compile(r"[+\-_]*([xyz])(_axis)?")
+
+#: core/doc/drawing_session.cpp:926 honours exactly these two.
+_SECTION_MODE_WORDS = {
+    "full": "full", "full_section": "full", "fullsection": "full", "whole": "full",
+    "half": "half", "half_section": "half", "halfsection": "half",
+}
+
+
+def _canon_section_axis(axis: Any) -> tuple[Optional[str], Optional[dict]]:
+    """('horizontal'|'vertical', None) or (None, an error dict naming the valid set).
+
+    x/y/z are REJECTED rather than mapped, and that is the deliberate call. A letter has two
+    equally common readings — "the cutting line runs along X" (a horizontal cut) and "the
+    section plane's normal is X" (a vertical cut) — and they give OPPOSITE cuts. Worse, the
+    cut line lives in the PARENT view's sheet frame, whose axes are not model axes at all:
+    sheet-y is model Y on a top view but model Z on a front view, so even a settled reading
+    of the letter would not settle which model plane gets cut. An ambiguous mapping that is
+    silently wrong half the time is exactly the defect this guard exists to remove, so the
+    letter earns a loud error that names the two unambiguous words instead.
+    """
+    w = _canon_word(axis)
+    hit = _SECTION_AXIS_WORDS.get(w)
+    if hit:
+        return hit, None
+    if _SECTION_AXIS_LETTER_RE.fullmatch(w):
+        return None, {
+            "ok": False,
+            "error": f"ambiguous section axis {axis!r} — use 'horizontal' or 'vertical'",
+            "hint": "An axis LETTER does not say which cut you mean: 'x' reads equally as a "
+                    "cutting line ALONG x (a horizontal section) or a plane NORMAL to x (a "
+                    "vertical one), and the cut line is in the parent view's sheet frame, not "
+                    "model space. Name the cut line: axis='horizontal' (cut line across the "
+                    "view, left-to-right) or axis='vertical' (cut line down the view).",
+            "valid_axis": ["horizontal", "vertical"],
+        }
+    return None, {
+        "ok": False,
+        "error": f"unknown section axis {axis!r}",
+        "hint": "Use one of: 'horizontal' (a horizontal cutting line through the parent "
+                "view's centre) or 'vertical' (a vertical one). 'horiz'/'h' and 'vert'/'v' "
+                "are accepted spellings.",
+        "valid_axis": ["horizontal", "vertical"],
+    }
+
+
+def _canon_section_mode(mode: Any) -> tuple[Optional[str], Optional[dict]]:
+    """('full'|'half', None) or (None, an error dict naming the valid set).
+
+    'partial' is NOT mapped onto 'half': a partial/broken-out section is a different drafting
+    construct, so accepting it would be the same silent-wrong-answer bug wearing a synonym.
+    """
+    w = _canon_word(mode)
+    hit = _SECTION_MODE_WORDS.get(w)
+    if hit:
+        return hit, None
+    return None, {
+        "ok": False,
+        "error": f"unknown section mode {mode!r}",
+        "hint": "Use one of: 'full' (the whole part is sectioned) or 'half' (half sectioned, "
+                "half left as an external view). The engine honours no other value — it "
+                "would silently fall back to a full section.",
+        "valid_mode": ["full", "half"],
+    }
+
 def register_cad_drawing_tools(mcp: FastMCP) -> None:
     """CAD 2D-drawing MCP tools (T-RF8 split of cad_tools.py): make_drawing, export_drawing, review_drawing, view/section/detail/dimension/gdt/datum/surface-finish/titleblock tools."""
 
@@ -74,6 +178,29 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             # all — the class-5 "reports success but ignored the arg" failure). Coerce all three.
             views = require_list(views, "views", 'a list of view names, e.g. ["front","top"]') if views else None
             sections = require_list(sections, "sections", "a list of section-request dicts") if sections else None
+            if sections:
+                # Same discriminator guard as add_section_view: the engine's own auto-section
+                # (core/doc/drawing_session.cpp:2048) is the identical
+                # `axis == "horizontal" ? … : vertical` fall-through, so an unrecognised axis
+                # here also cuts vertically without a word of complaint. Canonicalise in
+                # place; reject before the drawing is created, so a bad spec builds nothing.
+                norm = []
+                for i, sec in enumerate(sections):
+                    if not isinstance(sec, dict):
+                        norm.append(sec)
+                        continue
+                    sec = dict(sec)
+                    for key, canon in (("axis", _canon_section_axis),
+                                       ("mode", _canon_section_mode)):
+                        if key not in sec or sec[key] is None:
+                            continue
+                        val, bad = canon(sec[key])
+                        if bad:
+                            bad["error"] = f"sections[{i}]: {bad['error']}"
+                            return _dumps(bad)
+                        sec[key] = val
+                    norm.append(sec)
+                sections = norm
             title = require_mapping(title, "title", "a title-block fields dict") if title else None
             spec = {"views": views or ["front", "top", "right", "iso"],
                     "model_items": bool(model_items), "hole_callouts": bool(hole_callouts)}
@@ -190,12 +317,23 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         """Add a SECTION view by cutting a parent view through its centre. doc_id = drawing_doc_id.
 
         parent: the orientation ("front"/"top"/...) or view_id of the view to cut.
-        axis  : "vertical" or "horizontal" cut line through the part centre.
+        axis  : "vertical" or "horizontal" — the orientation of the CUT LINE through the part
+                centre ("horiz"/"h" and "vert"/"v" also accepted). An axis letter (x/y/z) is
+                refused as ambiguous rather than guessed at.
         mode  : "full" (whole part sectioned) or "half" (half sectioned, half external view).
         reverse: flip which side of the cut is removed.
         No sheet-mm math needed — the engine places the cut line across the parent's bbox.
         """
         try:
+            # Discriminator guard: an unvalidated axis/mode produced a plausible-looking
+            # section on the WRONG plane (or a silently-full one) with nothing in the output
+            # to reveal it. Validate BEFORE any engine call so a bad value adds no view.
+            axis_c, bad = _canon_section_axis(axis)
+            if bad:
+                return _dumps(bad)
+            mode_c, bad = _canon_section_mode(mode)
+            if bad:
+                return _dumps(bad)
             d = _doc(doc_id)
             # Reuse make-style auto-section via a tiny spec on the existing drawing.
             full = cb.call("drawing_get", {"doc_id": d})
@@ -213,14 +351,15 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             x0, y0, x1, y1 = bbox
             cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
             pad = 0.1 * max(x1 - x0, y1 - y0) + 2.0
-            cut = ([[x0 - pad, cy], [x1 + pad, cy]] if axis == "horizontal"
+            cut = ([[x0 - pad, cy], [x1 + pad, cy]] if axis_c == "horizontal"
                    else [[cx, y0 - pad], [cx, y1 + pad]])
             params = {"doc_id": d, "parent_view_id": vid, "cut_line": cut,
-                      "opts": {"mode": mode, "reverse": reverse}}
+                      "opts": {"mode": mode_c, "reverse": reverse}}
             if label:
                 params["label"] = label
             r = cb.call("drawing_add_section", params)
-            return _dumps({"ok": True, "view_id": r.get("view_id")})
+            return _dumps({"ok": True, "view_id": r.get("view_id"),
+                           "axis": axis_c, "mode": mode_c, "cut_line": cut})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

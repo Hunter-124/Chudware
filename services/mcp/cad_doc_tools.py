@@ -757,7 +757,19 @@ def _normalize_sketch_ops(ops: Any, notes: Optional[list] = None) -> Any:
 # leftover key is now a rejected batch. Conservative: primitives only, and only a
 # feature that actually shows a dialect key; canonical ops pass through untouched.
 _PRIMITIVE_TYPES = frozenset({"box", "cylinder", "sphere", "cone", "torus"})
-_AT_ALIASES = ("position", "location", "origin")
+#: Aliases for the canonical placement point `at`. `center`/`centre` are listed
+#: separately because they are the ONE spelling whose meaning depends on `centered`:
+#: a primitive is built centred on the origin and `at` moves its CENTRE
+#: (core/doc/document.cpp:3049-3058), so `center` IS `at` — but only while `centered`
+#: is true. With `centered:false` the same `at` names the BASE, so the two together are
+#: a genuine contradiction and get taught, never guessed (see below).
+#: Live 2026-07-28: a stepped shaft sent two coaxial cylinders as center:[0,0,0] then
+#: center:[0,0,60]; `center` was not an alias, so the engine ignored it, built BOTH on
+#: the origin, and reported only "cylinder boss added no material (it is buried inside
+#: the existing solid)" — a placement word dropped on the floor, read back as a
+#: modelling mistake.
+_CENTER_AT_ALIASES = ("center", "centre")
+_AT_ALIASES = ("position", "location", "origin") + _CENTER_AT_ALIASES
 _AXIS_ALIASES = ("direction", "dir", "normal", "orientation")
 _BOOLEAN_ALIASES = ("boolean", "operation")
 _PLACEMENT_AT_KEYS = ("at", "origin", "position", "location", "point")
@@ -840,10 +852,24 @@ def _normalize_primitive_feature(feat: dict) -> dict:
                 axis_val = place[k]
                 break
 
+    at_from: Optional[str] = None
     for k in _AT_ALIASES:
         v = consume(k)
         if at_val is _MISSING and v is not _MISSING and v is not None:
             at_val = v
+            at_from = k
+    # `center` means the CENTRE, and `at` only means the centre while `centered` is true —
+    # so center + centered:false says two contradictory things about the same point. The
+    # engine would happily build the base at that point, which is silently NOT what was
+    # asked for; the whole reason `center` is honoured at all is that dropping a placement
+    # word is worse than rejecting it, and quietly relocating one is worse still.
+    if at_from in _CENTER_AT_ALIASES and peek("centered") is False:
+        raise ValueError(
+            f"add_feature {feat.get('type')}: '{at_from}':{at_val!r} together with "
+            f"'centered':false is contradictory — a primitive is built centred and "
+            f"'at' moves its CENTRE, but with 'centered':false 'at' names the BASE "
+            f"instead. Pick one: 'at':{at_val!r} (that point is the centre), or "
+            f"'at':[…],'centered':false (that point is the base/corner).")
     for k in _AXIS_ALIASES:
         v = consume(k)
         if axis_val is _MISSING and v is not _MISSING and v is not None:
@@ -2262,15 +2288,34 @@ def _normalize_hole_feature(feat: dict, notes: list) -> dict:
             end_raw = v
 
     # "depth":"through" — an END CONDITION written into the depth slot. The engine reads
-    # `depth` as a number, so leaving it there is a hard parse failure later.
+    # `depth` as a number, so leaving it there is a hard parse failure later. It arrives
+    # BARE and dim-WRAPPED ({"depth":{"value":"through_all"}}, live run 2026-07-28): the
+    # model wraps every size the same way, and validate.cpp then rejects the whole batch
+    # with "params.depth.value: missing or non-numeric" — a units complaint about
+    # something that was never a number. `through_all` IS the engine's through-hole
+    # representation (document.cpp:5459 sizes it as 1.1x the body diagonal), so it needs
+    # no depth at all once it is read as the end condition.
     depth_v = peek("depth")
-    if isinstance(depth_v, str) and _slug(depth_v) in _HOLE_END_WORDS:
+    depth_word = depth_v if isinstance(depth_v, str) else (
+        depth_v.get("value") if _is_dim_object(depth_v) else None)
+    if isinstance(depth_word, str) and _slug(depth_word) in _HOLE_END_WORDS:
         if end_raw is _MISSING:
-            end_raw = depth_v
+            end_raw = depth_word
         consume("depth")
         changed = True
-        notes.append(f'{label}: read depth="{depth_v}" as the end condition, not a distance '
-                     f'— a hole takes end:"through_all"|"blind" plus a numeric depth when blind')
+        wrapped = "" if depth_v is depth_word else " (wrapped as a dimension object)"
+        notes.append(f'{label}: read depth="{depth_word}"{wrapped} as the end condition, not '
+                     f'a distance — a hole takes end:"through_all"|"blind" plus a numeric '
+                     f"depth when blind")
+    elif isinstance(depth_word, str):
+        # Neither a distance nor an end word, and _normalize_feature_dims already had its
+        # go at "15mm". Bounce it HERE with the vocabulary — left alone it reaches
+        # validate.cpp as "params.depth.value: missing or non-numeric", which reads as a
+        # units problem for something that was never a number.
+        raise ValueError(
+            f'hole "{label}": params.depth "{depth_word}" is neither a distance in mm nor an '
+            f"end condition. Give a number for a blind hole (depth:15), or "
+            f'end:"through_all" to drill straight through.')
 
     style = None
     if style_raw is not _MISSING:
@@ -2839,6 +2884,155 @@ def _normalize_profile_feature(feat: dict, ftype: str, notes: list) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# INLINE-SKETCH AUTO-SPLIT (model-robustness).
+#
+# The single most frequent modeling dialect failure in the live ledger: the model writes
+# the whole profile INSIDE the feature that consumes it —
+# {"type":"extrude","params":{"depth":…,"sketch":{"plane":"XY","entities":[…]}}} — because
+# to a person that is one thought, not two. `_normalize_profile_feature` raises a good
+# teaching error for it, but when the inline value names BOTH its plane and its geometry
+# the transformation is purely MECHANICAL: lift it into its own sketch op ahead of the
+# consumer and point the consumer's ref at it. Anything less than certain (no resolvable
+# plane, a shapeless value) falls through UNTOUCHED so that teaching error still fires —
+# an auto-split that builds the wrong geometry is far worse than a clear rejection.
+#
+# Covers every engine feature whose refs carry a profile/sections SelList
+# (core/doc/validate.cpp::FEATURE_TYPES), not just extrude.
+_INLINE_PROFILE_TYPES = frozenset({
+    "extrude", "revolve", "sweep", "loft", "rib", "sm_base_flange",
+    "surf_extrude", "surf_revolve", "surf_sweep", "surf_planar",
+})
+#: Where an inline sketch names the plane it is drawn on.
+_INLINE_PLANE_KEYS = ("plane", "sketch_plane", "on", "datum", "reference_plane")
+
+
+def _inline_plane(src: Any) -> Optional[str]:
+    """The reserved datum token `src` names a sketch plane as, or None."""
+    if not isinstance(src, dict):
+        return None
+    for k in _INLINE_PLANE_KEYS:
+        v = src.get(k)
+        tok = _norm_datum(v) if isinstance(v, str) else None
+        if tok in _DATUM_TOKENS:
+            return tok
+    return None
+
+
+def _inline_sketch_members(v: Any, ftype: str) -> Optional[list]:
+    """The inline sketch dict(s) a profile slot carries, or None when it carries none.
+
+    A canonical region selector ({"kind":"region","sketch":"P"}) holds no entities/points,
+    so it is never mistaken for one. Only a loft may carry a LIST of them — its sections.
+    """
+    def _one(x: Any) -> bool:
+        return isinstance(x, dict) and bool(x.get("entities") or x.get("points"))
+    if _one(v):
+        return [v]
+    if ftype == "loft" and isinstance(v, list) and v and all(_one(x) for x in v):
+        return list(v)
+    return None
+
+
+def _inline_sketch_feature(src: dict, name: str, plane: str) -> Optional[dict]:
+    """A canonical sketch FEATURE for one inline profile, or None when it is ambiguous.
+
+    None for anything the value does not say outright — an entity list that is not typed
+    entity dicts and no usable point loop behind it — so the caller leaves the feature
+    alone and the teaching error survives.
+    """
+    ents = src.get("entities")
+    if isinstance(ents, list) and ents and all(
+            isinstance(e, dict) and isinstance(e.get("type"), str) for e in ents):
+        ents = [dict(e) for e in ents]
+    else:
+        pts = src.get("points")
+        if not (isinstance(pts, list) and len(pts) >= 3 and all(
+                isinstance(p, (list, tuple)) and len(p) >= 2
+                and all(_is_num(c) for c in p[:2]) for p in pts)):
+            return None
+        # A closed polyline is what a bare point loop IS; _normalize_sketch_ops expands it
+        # into the N `line` entities the engine's vocabulary actually has.
+        ents = [{"type": "polyline", "closed": True,
+                 "points": [[float(p[0]), float(p[1])] for p in pts]}]
+    return {"type": "sketch", "name": name, "refs": {"plane": plane},
+            "params": {"entities": ents, "constraints": []}}
+
+
+def _split_inline_profile_sketches(ops: Any, notes: list) -> Any:
+    """Lift an inline profile into its own sketch op AHEAD of the feature consuming it."""
+    if not isinstance(ops, list):
+        return ops
+    used = set()
+    for el in ops:
+        f = el.get("feature") if isinstance(el, dict) else None
+        if isinstance(f, dict) and isinstance(f.get("name"), str):
+            used.add(f["name"].strip())
+    out: list = []
+    shift: dict = {}
+    changed = False
+    for i, op in enumerate(ops):
+        feat = op.get("feature") if isinstance(op, dict) else None
+        ftype = _slug(feat.get("type")) if isinstance(feat, dict) else ""
+        made: list = []
+        if (isinstance(op, dict) and op.get("op") == "add_feature"
+                and isinstance(feat, dict) and ftype in _INLINE_PROFILE_TYPES):
+            params = dict(feat.get("params") or {})
+            refs = dict(feat.get("refs") or {})
+            slot = "sections" if ftype == "loft" else "profile"
+            keys = _PROFILE_SOURCE_KEYS + (
+                _LOFT_SECTION_ALIASES if ftype == "loft" else ())
+            label = _feat_label(feat, ftype)
+            for k in keys:
+                bag = params if k in params else (refs if k in refs else None)
+                if bag is None:
+                    continue
+                members = _inline_sketch_members(bag[k], ftype)
+                if members is None:
+                    continue
+                built: Optional[list] = []
+                for n, src in enumerate(members):
+                    # The plane may sit on the inline value or on the consuming feature;
+                    # both say it outright. Nowhere else — a guessed plane is wrong
+                    # geometry that builds successfully, the worst possible outcome.
+                    plane = (_inline_plane(src) or _inline_plane(params)
+                             or _inline_plane(refs))
+                    base = f"{label}Profile" + (str(n + 1) if len(members) > 1 else "")
+                    name, bump = base, 2
+                    while name in used:
+                        name, bump = f"{base}{bump}", bump + 1
+                    sk = _inline_sketch_feature(src, name, plane) if plane else None
+                    if sk is None:
+                        built = None
+                        break
+                    used.add(name)
+                    built.append(sk)
+                if not built:
+                    continue  # ambiguous — the teaching error names it better than a guess
+                bag.pop(k)
+                refs[slot] = [{"kind": "region", "sketch": s["name"], "hint_index": 0}
+                              for s in built]
+                made = [{"op": "add_feature", "feature": s} for s in built]
+                op = {**op, "feature": {**feat, "params": params, "refs": refs}}
+                changed = True
+                names = ", ".join(f'"{s["name"]}"' for s in built)
+                notes.append(
+                    f'{label}: {"params" if bag is params else "refs"}.{k} carried the '
+                    f"profile INLINE — lifted it into its own sketch feature {names} on "
+                    f'{built[0]["refs"]["plane"]}, placed BEFORE this {ftype} in the same '
+                    f"batch, and pointed refs.{slot} at it. A profile is always a sketch "
+                    f"FEATURE the {ftype} references by its \"$<index>\" batch position")
+                break
+        shift[f"${i}"] = f"${len(out) + len(made)}"
+        out.extend(made)
+        out.append(op)
+    if not changed:
+        return ops
+    if any(k != v for k, v in shift.items()):
+        out = [_shift_batch_placeholders(o, shift) for o in out]
+    return out
+
+
 # A ref slot -> the selector kind its members must carry.
 _REF_SLOT_KIND = {
     "face": "face", "faces": "face", "target_face": "face", "middle_face": "face",
@@ -3346,13 +3540,62 @@ _REFS_ONLY_SLOTS_TYPE_EXCLUDE = {"tool": frozenset({"boolean"})}
 
 
 def _migrate_ref_slots(ops: Any, notes: Optional[list] = None) -> Any:
-    """Move ref-only slots out of ``params`` into ``refs``.
+    """Move ref-only slots out of ``params`` into ``refs`` — including a whole nested
+    ``params.refs`` sub-dict.
 
-    Only moves a key when ``refs`` does not already define it, so an explicit
-    ref always wins; ``params`` keeps everything else untouched.
+    Two distinct mistakes, one bag problem:
+
+    * A ref-only slot written as a PARAM (``params.edges``). Only moved when ``refs``
+      does not already define it, so an explicit ref always wins; ``params`` keeps
+      everything else untouched.
+    * The whole ``refs`` bag written one level too DEEP, inside ``params``. Live
+      2026-07-28 a stepped-shaft build sent
+      ``{"type":"extrude","params":{"refs":{"profile":[{"kind":"region","sketch":"$0",
+      "hint_index":0}]},"depth":{"value":60},"mode":"boss"}}`` and was rejected with
+      ``refs.profile: required for extrude`` — the profile WAS supplied, and the
+      same-batch ``"$0"`` spelling was exactly right; only the nesting was wrong. The same
+      batch also lost a sketch's ``params.refs.plane`` = ``"plane.front"``, which is
+      WORSE than a rejection: ``_normalize_sketch_ops`` finds no plane anywhere and
+      defaults to ``plane.top``, so the sketch silently lands on the wrong datum.
+      Hoisting here makes the reserved datum visible again — every documented spelling
+      (``plane.top``/``plane.front``/``plane.right``, ``axis.x``/``axis.y``/``axis.z``,
+      core/doc/validate.cpp:31-35 RESERVED_DATUMS) is already accepted as a BARE STRING by
+      validate_sel_or_datum (validate.cpp:900-911), so nothing further is needed once the
+      value reaches ``feature.refs``.
+
+    The nested bag MERGES: a slot already present at the top level wins (same rule as the
+    per-slot migration above). A slot present in BOTH with a DIFFERENT value is a genuine
+    contradiction — the model named two different pieces of geometry for one slot — so it
+    raises a teaching error instead of picking one, and the whole batch is scanned for that
+    before anything is mutated so a rejection leaves ``ops`` exactly as it arrived.
     """
     if not isinstance(ops, list):
         return ops
+
+    def _nested_refs(feat: dict) -> dict:
+        params = feat.get("params")
+        nested = params.get("refs") if isinstance(params, dict) else None
+        return nested if isinstance(nested, dict) and nested else {}
+
+    # Pre-scan: a conflict anywhere rejects the batch with NOTHING mutated.
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if not isinstance(feat, dict):
+            continue
+        nested = _nested_refs(feat)
+        top = feat.get("refs") if isinstance(feat.get("refs"), dict) else {}
+        clash = sorted(k for k, v in nested.items() if k in top and top[k] != v)
+        if clash:
+            label = feat.get("name") or feat.get("type") or "feature"
+            details = "; ".join(
+                f"refs.{k}={top[k]!r} vs params.refs.{k}={nested[k]!r}" for k in clash)
+            raise ValueError(
+                f"{label}: params.refs is the refs bag written one level too deep, but "
+                f"{'this slot names' if len(clash) == 1 else 'these slots name'} DIFFERENT "
+                f"geometry at each level — {details}. A ref slot holds exactly one "
+                f"selection, so pick the one you meant and put it in the feature's "
+                f"top-level refs (refs is a SIBLING of params, never a param).")
+
     for op in ops:
         if not isinstance(op, dict):
             continue
@@ -3362,13 +3605,25 @@ def _migrate_ref_slots(ops: Any, notes: Optional[list] = None) -> Any:
         params = feat.get("params")
         if not isinstance(params, dict):
             continue
-        ftype = feat.get("type")
-        present = [k for k in list(params) if k in _REFS_ONLY_SLOTS
-                  and ftype not in _REFS_ONLY_SLOTS_TYPE_EXCLUDE.get(k, ())]
-        if not present:
-            continue
         refs = dict(feat.get("refs") or {})
         new_params = dict(params)
+        label = feat.get("name") or feat.get("type") or "feature"
+
+        nested = _nested_refs(feat)
+        if nested:
+            # Never leave a second refs bag in params. An EMPTY or non-dict params.refs is
+            # not a bag we understand, so it stays put for the engine to name.
+            new_params.pop("refs", None)
+        hoisted = []
+        for key, value in nested.items():
+            if key in refs:
+                continue  # identical (a conflict already raised above) — drop the copy
+            refs[key] = value
+            hoisted.append(key)
+
+        ftype = feat.get("type")
+        present = [k for k in list(new_params) if k in _REFS_ONLY_SLOTS
+                  and ftype not in _REFS_ONLY_SLOTS_TYPE_EXCLUDE.get(k, ())]
         moved = []
         for key in present:
             value = new_params.pop(key)  # never leave a selector in params
@@ -3376,11 +3631,18 @@ def _migrate_ref_slots(ops: Any, notes: Optional[list] = None) -> Any:
                 continue  # an explicit ref wins; the params copy is just dropped
             refs[key] = value
             moved.append(key)
+
+        if not nested and not present:
+            continue
         feat["refs"] = refs
         feat["params"] = new_params
         if notes is not None:
+            if hoisted:
+                notes.append(f"{label}: hoisted params.refs ({', '.join(sorted(hoisted))}) "
+                             f"up to the feature's own refs — refs is a SIBLING of params, "
+                             f"not a param, so a nested copy reached no slot at all")
             for key in moved:
-                notes.append(f"{feat.get('name') or feat.get('type') or 'feature'}: "
+                notes.append(f"{label}: "
                              f"moved {key!r} from params to refs (the engine reads "
                              f"geometry selectors from refs)")
     return ops
@@ -4671,9 +4933,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         PRIMITIVE PLACEMENT + ORIENTATION (box/cylinder/sphere/cone/torus) — feature-level
         keys beside "type"/"name"/"params", all optional. An unrecognised key is REJECTED,
         never silently ignored, so use exactly these spellings:
-          "at":[x,y,z]           where it goes (default: centred on the origin). May instead
-                                 be a geometry query — "at":{"of":"face","side":"top"} places
-                                 it at that face's centroid.
+          "at":[x,y,z]           where its CENTRE goes (default: centred on the origin) — so
+                                 two coaxial cylinders of height h stack at "at" z = 0 and
+                                 z = h, not 0 and h/2. Also spelled "center"/"centre", which
+                                 mean the same thing and are rejected outright next to
+                                 "centered":false (then "at" is the BASE, not the centre).
+                                 May instead be a geometry query — "at":{"of":"face",
+                                 "side":"top"} places it at that face's centroid.
           "at_offset":[dx,dy,dz] world-axis nudge added on top of "at".
           "axis":[x,y,z] | "+x"|"-x"|"+y"|"-y"|"+z"|"-z"   which way it POINTS: the primitive's
                                  natural local +Z is rotated onto "axis" (default "+z" = up).
@@ -4689,6 +4955,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
               "at":[200,0,40],"axis":[1,0,0],"centered":false,"mode":"boss"}}
           WRONG: "placement":{"origin":[…],"direction":[…]} / "boolean":"union"
           RIGHT: "at":[…], "axis":[…], "mode":"boss"
+          Selectors live in the feature's OWN "refs" — a SIBLING of "params", never inside it:
+          WRONG: "params":{"refs":{"profile":[…]},"depth":{…}}   (reaches no slot at all)
+          RIGHT: "refs":{"profile":[…]}, "params":{"depth":{…}}
+          A datum slot takes a bare reserved name: "plane.top"|"plane.front"|"plane.right",
+          "axis.x"|"axis.y"|"axis.z", "origin" — no wrapper object, no centroid.
 
         Returns revision, body_count, volume_mm3, and per-feature status (ok / error / warning)
         so you can immediately tell a dropped cut, a failed reference, or a stray extra body.
@@ -4800,6 +5071,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # An enum wrapped as a dimension ({"mode":{"value":"blind"}}) is
             # rejected as non-numeric — unwrap before the dim passes run.
             ops = _unwrap_enum_dims(ops, interpreted)
+            # A profile written INLINE on the feature that consumes it is two features —
+            # split it here, ahead of the sketch pass that normalizes the one we mint.
+            ops = _split_inline_profile_sketches(ops, interpreted)
             # Model-robustness: accept the natural/flat sketch shape LLMs emit
             # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
             # to the engine's canonical schema before validation.

@@ -2269,3 +2269,361 @@ def test_fin19_live_cht_smoke(tmp_path) -> None:
     assert temps["c_U1"]["peak_c"] >= temps["board"]["mean_c"], temps
     print(f"  FIN19: live CHT — board {temps['board']}, U1 {temps['c_U1']}")
     print("  [fin19_live_cht_smoke] PASS")
+
+# ------------------------------------------------- schematic argument-dialect tolerance
+# ecad_place_symbol/ecad_wire used to accept exactly ONE rigid argument shape while their
+# ecad_pcb_tools.py siblings already took Union[dict, str] for the same concepts. These drive
+# the dialects a live model actually writes (nested dict, batch ops:[...], the dotted ref.pin
+# spelling the tools PRINT BACK) and pin the teaching error for genuine garbage — a malformed
+# call must FAIL clearly, never become a silent ok:true no-op.
+
+
+def test_dialect_place_symbol_nested_dict(tools: dict) -> None:
+    """ONE placement dict with pos/rotation/val aliases must place exactly like the plain form."""
+    _call(tools, "ecad_new_schematic", name="dialect_place")
+    r = _call(tools, "ecad_place_symbol",
+              libid={"libid": "Device:R", "pos": [20, 20], "val": "1k", "rotation": 90})
+    _assert_context(r, "ecad_place_symbol/dict")
+    assert r["ok"] and r["ref"] == "R1", f"nested placement dict rejected: {r}"
+    assert r["pos"] == [20.0, 20.0], f"pos alias must reach the op: {r['pos']}"
+    assert r["value"] == "1k", f"val alias must reach the op: {r}"
+    # 'part' + 'at' + a python-repr STRING of the same dict (the coerce_json_or_repr dialect).
+    r2 = _call(tools, "ecad_place_symbol", libid="{'part': 'Device:R', 'at': [40, 20]}")
+    assert r2["ok"] and r2["ref"] == "R2" and r2["pos"] == [40.0, 20.0], f"repr dialect: {r2}"
+    print(f"  dialect place dict -> {r['ref']} @ {r['pos']}, repr -> {r2['ref']} @ {r2['pos']}")
+    print("  [dialect_place_symbol_nested_dict] PASS")
+
+
+def test_dialect_place_symbol_batch(tools: dict) -> None:
+    """A LIST of placement dicts (and the {'symbols': [...]} wrapper) places every one and
+    reports per-symbol payloads."""
+    _call(tools, "ecad_new_schematic", name="dialect_batch")
+    b = _call(tools, "ecad_place_symbol", libid=[
+        {"libid": "Device:R", "x": 20, "y": 20, "value": "1k", "angle": 90},
+        {"part": "Device:R", "at": [20, 0], "val": "2k", "rotation": 90},
+        {"libid": "Simulation_SPICE:V_source", "pos": [0, 20], "value": "10"},
+    ])
+    _assert_context(b, "ecad_place_symbol/batch")
+    assert b["ok"] and b["count"] == 3, f"batch placement failed: {b}"
+    assert b["refs"] == ["R1", "R2", "V1"], f"batch refs: {b['refs']}"
+    assert len(b["placed"]) == 3 and all(p["pins"] for p in b["placed"]), \
+        "each batch entry must carry its own pin list"
+    st = _call(tools, "ecad_status")
+    assert st["component_count"] == 3, f"batch must really place 3 parts: {st}"
+    wrapped = _call(tools, "ecad_place_symbol",
+                    libid={"symbols": [{"libid": "Device:R", "pos": [60, 20], "value": "3k"}]})
+    # A one-entry batch collapses to the normal single-symbol payload shape.
+    assert wrapped["ok"] and wrapped["ref"] == "R3", f"symbols-wrapper batch: {wrapped}"
+    print(f"  dialect batch placed {b['refs']} + wrapper {wrapped['ref']}")
+    print("  [dialect_place_symbol_batch] PASS")
+
+
+def test_dialect_place_symbol_sim_params_dict(tools: dict) -> None:
+    """sim_params accepts a real dict (the sibling ecad_set_net_class params dialect), and a
+    malformed string is STILL rejected."""
+    s = _call(tools, "ecad_new_schematic", name="dialect_simparams")
+    sid = s["doc_id"]
+    r = _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, value="1k",
+              footprint="Resistor_SMD:R_0805", doc_id=sid,
+              sim_params={"eng": {"power_w": {"typ": 0.02}}})
+    assert r["ok"], f"dict sim_params rejected: {r.get('error')!r}"
+    st = _call(tools, "ecad_status", doc_id=sid)
+    r1 = {c["ref"]: c for c in st["components"]}["R1"]
+    assert abs(r1["power_w"]["typ"] - 0.02) < 1e-9, \
+        f"dict sim_params.eng override must reach the op unchanged: {r1['power_w']}"
+    bad = _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=0, doc_id=sid,
+                sim_params="{not json")
+    assert not bad["ok"] and "JSON" in bad["error"], f"garbage sim_params must fail: {bad}"
+    print("  [dialect_place_symbol_sim_params_dict] PASS")
+
+
+def _dialect_divider_parts(tools: dict, name: str) -> None:
+    """The _build_divider layout, placed in ONE batch call (dialect under test)."""
+    _call(tools, "ecad_new_schematic", name=name)
+    b = _call(tools, "ecad_place_symbol", libid={"ops": [
+        {"libid": "Simulation_SPICE:V_source", "pos": [0, 20], "value": "10"},
+        {"libid": "Device:R", "pos": [20, 20], "value": "1k", "angle": 90},
+        {"libid": "Device:R", "pos": [20, 0], "value": "2k", "angle": 90},
+    ]})
+    assert b["ok"] and b["refs"] == ["V1", "R1", "R2"], f"batch place: {b}"
+
+
+def test_dialect_wire_endpoint_shapes(tools: dict) -> None:
+    """Dotted 'R1.1' (what the tools print back) and endpoint dicts wire the same net as the
+    four-positional form."""
+    _dialect_divider_parts(tools, "dialect_wire_shapes")
+    w1 = _call(tools, "ecad_wire", from_ref="V1.+", to_ref="R1.2")
+    _assert_context(w1, "ecad_wire/dotted")
+    assert w1["ok"] and w1["net_size"] >= 2, f"dotted endpoints rejected: {w1}"
+    assert set(w1["net_members"]) >= {"V1.+", "R1.2"}, f"wrong pins joined: {w1['net_members']}"
+    w2 = _call(tools, "ecad_wire", from_ref={"ref": "R1", "pin": "1"},
+               to_ref={"sym": "R2", "number": "2"})
+    assert w2["ok"] and set(w2["net_members"]) >= {"R1.1", "R2.2"}, f"endpoint dicts: {w2}"
+    w3 = _call(tools, "ecad_wire", from_ref={"from": "R2.1", "to": "V1.-"})
+    assert w3["ok"] and set(w3["net_members"]) >= {"R2.1", "V1.-"}, f"connection dict: {w3}"
+    assert w3["total_unconnected"] == 0, f"divider must be fully wired: {w3}"
+    print(f"  dialect wire nets: {w1['net']}, {w2['net']}, {w3['net']}")
+    print("  [dialect_wire_endpoint_shapes] PASS")
+
+
+def test_dialect_wire_batch_solves(tools: dict) -> None:
+    """A batch ops:[...] wire call must build a REAL divider — proven by the closed-form
+    midpoint 10 * 2k/3k = 6.667 V, not by ok:true."""
+    _dialect_divider_parts(tools, "dialect_wire_batch")
+    w = _call(tools, "ecad_wire", from_ref={"ops": [
+        {"from": "V1.+", "to": "R1.2"},
+        {"from": {"ref": "R1", "pin": "1"}, "to": {"ref": "R2", "pin": "2"}},
+        {"from": "R2.1", "to": "V1.-"},
+    ]})
+    _assert_context(w, "ecad_wire/batch")
+    assert w["ok"] and w["count"] == 3, f"wire batch failed: {w}"
+    assert len(w["wires"]) == 3 and all(x["net"] for x in w["wires"]), \
+        f"each batch wire must report its net: {w['wires']}"
+    assert w["total_unconnected"] == 0, f"batch must wire every pin: {w}"
+    _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+    sim = _call(tools, "ecad_simulate", analysis="op")
+    assert sim["ok"], f"sim of the dialect-built divider failed: {sim.get('error')}"
+    vvals = {k: v for k, v in sim["op"].items() if k.startswith("V(") and v is not None}
+    mid = min(vvals.values()) if vvals else None
+    assert mid is not None and abs(mid - 6.6667) < 0.05, \
+        f"dialect-built divider must solve to ~6.667 V: {vvals}"
+    print(f"  dialect batch wired 3 nets; divider midpoint {mid:.4f} V")
+    print("  [dialect_wire_batch_solves] PASS")
+
+
+def test_dialect_malformed_still_teaches(tools: dict) -> None:
+    """Genuine garbage must fail with a CLEAR error naming the accepted shapes — never a
+    silent ok:true no-op, and never a raw AttributeError/TypeError."""
+    _dialect_divider_parts(tools, "dialect_malformed")
+    before = _call(tools, "ecad_status")["component_count"]
+
+    bad_lib = _call(tools, "ecad_place_symbol", libid=42)
+    assert not bad_lib["ok"], f"libid=42 must be rejected: {bad_lib}"
+    assert "placement dict" in bad_lib["hint"] and "libid" in bad_lib["error"], bad_lib
+
+    no_lib = _call(tools, "ecad_place_symbol", libid={"x": 1, "y": 2})
+    assert not no_lib["ok"] and "ecad_find_part" in no_lib["error"], \
+        f"a placement dict without a libid must teach: {no_lib}"
+
+    bad_pos = _call(tools, "ecad_place_symbol", libid={"libid": "Device:R", "pos": "over there"})
+    assert not bad_pos["ok"] and "pos" in bad_pos["error"], f"garbage pos must fail: {bad_pos}"
+
+    no_pin = _call(tools, "ecad_wire", from_ref="R1", to_ref="R2")
+    assert not no_pin["ok"] and "pin" in no_pin["error"], \
+        f"a wire with no pins must name the missing pin: {no_pin}"
+    assert "{'from': 'R1.1', 'to': 'R2.2'}" in no_pin["hint"], no_pin["hint"]
+
+    half = _call(tools, "ecad_wire", from_ref=[{"from": "R1.1"}])
+    assert not half["ok"] and "'to'" in half["error"], \
+        f"a batch wire missing its 'to' must teach: {half}"
+
+    assert _call(tools, "ecad_status")["component_count"] == before, \
+        "a rejected call must not mutate the schematic"
+    print("  [dialect_malformed_still_teaches] PASS")
+
+
+# ----------------------------------------------------------- library substitution (measured)
+# A live general-lane run asked for a "3V3 buck regulator schematic with an ESP32-S3 and a
+# TPS62840" and burned FOUR consecutive ecad_find_part calls (ESP32-S3-WROOM / ESP32 / TPS62840 /
+# ESP32-S3), every one "no library parts match", before manually placing MCU:Generic_QFP48. The
+# library is a clean-room GENERIC set; models always ask for real part numbers. find_part now
+# answers with the closest generic BY FUNCTION, flagged loudly.
+
+
+def test_library_exact_hit_is_not_substituted(tools: dict) -> None:
+    """A real library keyword must still return the literal hit with substituted=False."""
+    p = _call(tools, "ecad_find_part", query="resistor")
+    _assert_context(p, "ecad_find_part")
+    assert p["ok"] and p["hits"], p
+    assert p.get("substituted") is False, f"an exact hit must not be flagged substituted: {p}"
+    assert p.get("exact_match") is True, p
+    assert not p["warnings"], f"an exact hit must carry no substitution warning: {p['warnings']}"
+    assert "Device:R" in [h.get("libid") for h in p["hits"]], p["hits"]
+    print("  [library_exact_hit_is_not_substituted] PASS")
+
+
+def test_library_substitutes_real_part_numbers(tools: dict) -> None:
+    """The four queries measured dead in the live run must now each return a placeable symbol."""
+    cases = {
+        "TPS62840": ("Regulator_Switching:Buck_3V3", 6),
+        "ESP32-S3": ("MCU:Generic_QFP48", 48),
+        "ESP32-S3-WROOM": ("MCU:Generic_QFP48", 48),
+        "ESP32": ("MCU:Generic_QFP48", 48),
+    }
+    for query, (want_libid, want_pins) in cases.items():
+        p = _call(tools, "ecad_find_part", query=query)
+        _assert_context(p, f"ecad_find_part({query!r})")
+        assert p["ok"], f"{query}: still a dead call: {p}"
+        assert p.get("substituted") is True, f"{query}: must be flagged substituted: {p}"
+        assert p.get("exact_match") is False, p
+        assert p["substitute_libid"] == want_libid, \
+            f"{query}: expected {want_libid}, got {p.get('substitute_libid')}"
+        hit = p["hits"][0]
+        assert hit["libid"] == want_libid and hit["pin_count"] == want_pins, hit
+        assert hit["pins"], f"{query}: a substitute with no pins is unplaceable: {hit}"
+        # A SILENT generic swap is unacceptable — the warning must name both sides.
+        warn = " ".join(p["warnings"])
+        assert p["warnings"], f"{query}: substitution with no warning: {p}"
+        assert "SUBSTITUT" in warn.upper(), warn
+        assert query in warn and want_libid in warn, \
+            f"{query}: the warning must name what was asked AND what is offered: {warn}"
+        assert query in p["hint"] and want_libid in p["hint"], p["hint"]
+    print(f"  find_part substitutes {len(cases)} real part numbers -> generic symbols")
+    print("  [library_substitutes_real_part_numbers] PASS")
+
+
+def test_library_substitute_is_actually_placeable(tools: dict) -> None:
+    """NAMED RECORD proof: substituted libids place, and the component count increments."""
+    _call(tools, "ecad_new_schematic", name="sub_proof")
+    before = _call(tools, "ecad_status")["component_count"]
+
+    buck = _call(tools, "ecad_find_part", query="TPS62840")
+    mcu = _call(tools, "ecad_find_part", query="ESP32-S3")
+    p1 = _call(tools, "ecad_place_symbol", libid=buck["substitute_libid"],
+               x=0, y=0, value="TPS62840")
+    p2 = _call(tools, "ecad_place_symbol", libid=mcu["substitute_libid"],
+               x=40, y=0, value="ESP32-S3")
+    assert p1["ok"] and p2["ok"], (p1, p2)
+    assert len(p1["pins"]) == 6, f"buck placed with {len(p1['pins'])} pins: {p1['pins']}"
+    assert len(p2["pins"]) == 48, f"mcu placed with {len(p2['pins'])} pins"
+
+    st = _call(tools, "ecad_status")
+    assert st["component_count"] == before + 2, \
+        f"component_count {before} -> {st['component_count']}, expected +2"
+    refs = {c.get("ref") for c in st.get("components", [])}
+    assert {p1["ref"], p2["ref"]} <= refs, f"{p1['ref']}/{p2['ref']} missing from {refs}"
+    print(f"  placed {p1['ref']}(6 pins) + {p2['ref']}(48 pins); "
+          f"component_count {before} -> {st['component_count']}")
+    print("  [library_substitute_is_actually_placeable] PASS")
+
+
+def test_library_unmatchable_still_fails_honestly(tools: dict) -> None:
+    """No function inferred -> an honest miss naming the real families, never a wrong symbol."""
+    p = _call(tools, "ecad_find_part", query="quantum flibbertigibbet 9000")
+    assert not p["ok"], f"a meaningless query must NOT be substituted: {p}"
+    assert p.get("substituted") is False, p
+    assert not p.get("hits"), p
+    assert "Regulator_Switching" in p["hint"] and "MCU" in p["hint"], \
+        f"the miss must name the families that actually exist: {p['hint']}"
+    assert "ecad_find_part('list')" in " ".join(p["next_actions"]), p["next_actions"]
+    print("  [library_unmatchable_still_fails_honestly] PASS")
+
+
+def test_library_list_and_category(tools: dict) -> None:
+    """The browse capability named in the miss hint must exist, and category must filter."""
+    idx = _call(tools, "ecad_find_part", query="list")
+    _assert_context(idx, "ecad_find_part('list')")
+    assert idx["ok"] and idx["count"] >= 50, idx.get("count")
+    libids = {p["libid"] for fam in idx["families"] for p in fam["parts"]}
+    assert {"MCU:Generic_QFP48", "Regulator_Switching:Buck_3V3", "Device:R"} <= libids
+
+    scoped = _call(tools, "ecad_find_part", query="regulator", category="Regulator_Linear")
+    assert scoped["ok"], scoped
+    assert all(h.get("libid", "").startswith("Regulator_Linear:") for h in scoped["hits"]), \
+        scoped["hits"]
+
+    bad = _call(tools, "ecad_find_part", query="resistor", category="Nonsense")
+    assert not bad["ok"] and "Nonsense" in bad["error"], bad
+    assert "Regulator_Linear" in bad["hint"], f"must list valid categories: {bad['hint']}"
+    print(f"  find_part('list') -> {idx['count']} parts in {len(idx['families'])} families")
+    print("  [library_list_and_category] PASS")
+
+
+# ------------------------------------------------ place_symbol refdes + sim_params (measured)
+# Two defects that recurred across two independent live passes:
+#   ecad_place_symbol('Device:C_pol', ref='C1', value='10u')
+#     -> "could not place: ... symbols[4].ref: duplicate 'C1' (also symbols[1])"  (3 occurrences)
+#   ecad_place_symbol(..., sim_params='Capacitance=10u')
+#     -> "sim_params is not valid JSON"
+
+
+def test_place_duplicate_ref_auto_assigns(tools: dict) -> None:
+    """A taken refdes must renumber into the same series and SAY SO, not hard-fail."""
+    _call(tools, "ecad_new_schematic", name="dupref")
+    a = _call(tools, "ecad_place_symbol", libid="Device:C", x=0, y=0, ref="C1", value="100n")
+    assert a["ok"] and a["ref"] == "C1", a
+
+    b = _call(tools, "ecad_place_symbol", libid="Device:C_pol", x=10, y=0,
+              ref="C1", value="10u")
+    assert b["ok"], f"a duplicate ref must no longer be a hard failure: {b}"
+    assert b["ref"] == "C2", f"C1 taken -> expected C2, got {b['ref']}"
+    assert b["requested_ref"] == "C1" and b["ref_reassigned"] is True, b
+    warn = " ".join(b["warnings"])
+    assert "C1" in warn and "C2" in warn, \
+        f"the warning must name BOTH the requested and the assigned ref: {warn}"
+    assert "C2" in b["hint"], f"the hint must carry the real ref to wire to: {b['hint']}"
+
+    u1 = _call(tools, "ecad_place_symbol", libid="MCU:Generic_QFP48", x=40, y=0, ref="U1")
+    u2 = _call(tools, "ecad_place_symbol", libid="MCU:Generic_QFP48", x=90, y=0, ref="U1")
+    assert u1["ref"] == "U1" and u2["ref"] == "U2", (u1["ref"], u2["ref"])
+
+    # The reassigned ref must be REAL — wiring to it has to work.
+    w = _call(tools, "ecad_wire", from_ref="C2", from_pin="1", to_ref="C1", to_pin="1")
+    assert w["ok"], f"the reassigned ref must be wireable: {w}"
+
+    st = _call(tools, "ecad_status")
+    refs = [c.get("ref") for c in st["components"]]
+    assert st["component_count"] == 4 and set(refs) == {"C1", "C2", "U1", "U2"}, (refs, st)
+    print(f"  duplicate C1/U1 -> {refs}; component_count={st['component_count']}")
+    print("  [place_duplicate_ref_auto_assigns] PASS")
+
+
+def test_place_duplicate_ref_in_one_batch(tools: dict) -> None:
+    """Two identical refs inside ONE batch call must both land, not collide."""
+    _call(tools, "ecad_new_schematic", name="dupbatch")
+    b = _call(tools, "ecad_place_symbol",
+              libid=[{"libid": "Device:R", "pos": [0, 40], "ref": "R1", "value": "1k"},
+                     {"libid": "Device:R", "pos": [20, 40], "ref": "R1", "value": "2k"}])
+    assert b["ok"] and b["refs"] == ["R1", "R2"], b
+    assert any("R2" in w for w in b["warnings"]), b["warnings"]
+    assert _call(tools, "ecad_status")["component_count"] == 2, b
+    print("  [place_duplicate_ref_in_one_batch] PASS")
+
+
+def test_place_sim_params_kv_reaches_the_solver(tools: dict) -> None:
+    """'waveform=SIN,amplitude=5,freq=1000' must drive a real transient, not DC."""
+    def _swing(sim_params) -> float:
+        _call(tools, "ecad_new_schematic", name="kvsim")
+        kw = {"sim_params": sim_params} if sim_params else {}
+        v = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
+                  x=0, y=20, angle=90, value="0", **kw)
+        assert v["ok"], v
+        r = _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=20,
+                  angle=90, value="1k")
+        _call(tools, "ecad_wire", from_ref=v["ref"], from_pin="1", to_ref=r["ref"], to_pin="1")
+        _call(tools, "ecad_wire", from_ref=v["ref"], from_pin="2", to_ref=r["ref"], to_pin="2")
+        _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+        s = _call(tools, "ecad_simulate", analysis="tran",
+                  params={"tstep": 2e-5, "tstop": 2e-3})
+        assert s["ok"], s
+        tr = s["tran"]["traces"]
+        return max(t["max"] - t["min"] for t in tr.values())
+
+    driven = _swing("waveform=SIN,amplitude=5,freq=1000")
+    flat = _swing(None)
+    assert flat < 1e-9, f"control run should be flat DC, got {flat}"
+    assert driven > 1.0, f"kv sim_params never reached the solver: swing={driven}"
+    print(f"  tran swing with kv SIN = {driven:.4f} V vs {flat:.4f} V without")
+    print("  [place_sim_params_kv_reaches_the_solver] PASS")
+
+
+def test_place_sim_params_magnitude_rejected_informatively(tools: dict) -> None:
+    """'Capacitance=10u' has NO sim_params slot — reject it, but name the right home."""
+    _call(tools, "ecad_new_schematic", name="badsim")
+    before = _call(tools, "ecad_status")["component_count"]
+    bad = _call(tools, "ecad_place_symbol", libid="Device:C", x=0, y=0,
+                sim_params="Capacitance=10u")
+    assert not bad["ok"], f"a magnitude in sim_params must not be silently accepted: {bad}"
+    assert "Capacitance" in bad["error"], bad["error"]
+    assert "value=" in bad["hint"], f"the error must name the real home: {bad['hint']}"
+    for key in ("waveform", "eng", "ac_mag"):
+        assert key in bad["hint"], f"the error must list accepted fields: {bad['hint']}"
+    assert "value" in bad["hint"] and "10u" in bad["error"], bad
+    assert _call(tools, "ecad_status")["component_count"] == before, \
+        "a rejected sim_params must not mutate the schematic"
+
+    junk = _call(tools, "ecad_place_symbol", libid="Device:C", x=0, y=0,
+                 sim_params="!! not params at all !!")
+    assert not junk["ok"] and "sim_params" in junk["error"], junk
+    assert "waveform" in junk["hint"], junk["hint"]
+    print("  [place_sim_params_magnitude_rejected_informatively] PASS")

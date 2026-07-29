@@ -5,6 +5,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from typing import Optional
 from typing import Union
 import math
+import re
 
 from .cad_common import (
     CoreError,
@@ -22,11 +23,238 @@ from .cad_common import (
     _persist_study,
     _resolve_face_points,
     _resolve_material,
+    _sid_match,
     _solve_sync_or_handoff,
     _start_job,
     _tmp,
+    _SID_RE,
     cb,
 )
+
+
+# ------------------------------------------------------- boundary-condition dialect (live fix)
+# Measured 2026-07-28, one static-FEA task, claude-sonnet-4-5 — FOUR distinct rejections, every
+# one of them a setup the solver fully supports written in a shape the tool didn't read:
+#   loads=[{"face": q, "type":"force", "magnitude":200, "direction":[1,0,0]}]
+#       -> "load needs 'force':[x,y,z] or 'pressure':<MPa>"   — the SAME vector, polar form.
+#   fixtures=[{"faces":["the planar face at Z=0"], ...}], loads=[{"faces":[...], ...}]
+#       -> "each load needs a 'face' query"                   — the plural key.
+#   loads=[{"face":"Fb7fb00", "force":[0,-2000,0]}]
+#       -> "the grammar is TOKENS, not prose"                 — a real face sid it already had.
+#   run_fea_static(..., mesh_fineness="coarse")                — run_cfd_accurate's preset word.
+# All four are EXACT, lossless conversions, so they are normalized here at the tool boundary,
+# before any study payload is built. This is semantic normalization, not argument-NAME aliasing:
+# name aliases live only in services/agent/arg_reconciliation.py.
+
+# mesh_fineness keyword <-> number. The words are run_cfd_accurate's / services/sim/foam_case.py
+# preset vocabulary (coarse/medium/fine), which is why a model reaches for them here too; 0.5 is
+# this file's own default, so "medium" is a no-op rather than a new behaviour.
+_FINENESS_WORDS = {
+    "coarsest": 0.1, "very_coarse": 0.1, "verycoarse": 0.1,
+    "coarse": 0.25, "low": 0.25, "draft": 0.25,
+    "medium": 0.5, "normal": 0.5, "default": 0.5, "standard": 0.5, "moderate": 0.5,
+    "fine": 0.75, "high": 0.75,
+    "finest": 1.0, "very_fine": 1.0, "veryfine": 1.0,
+}
+
+# Signed-axis spellings a model writes instead of a 3-vector `direction`. parse_side's
+# convention (core/doc/picks.cpp): Chudware is Z-up, so up=+Z / down=-Z.
+_AXIS_DIRS = {
+    "+x": (1.0, 0.0, 0.0), "x": (1.0, 0.0, 0.0), "-x": (-1.0, 0.0, 0.0),
+    "+y": (0.0, 1.0, 0.0), "y": (0.0, 1.0, 0.0), "-y": (0.0, -1.0, 0.0),
+    "+z": (0.0, 0.0, 1.0), "z": (0.0, 0.0, 1.0), "-z": (0.0, 0.0, -1.0),
+    "up": (0.0, 0.0, 1.0), "down": (0.0, 0.0, -1.0),
+}
+
+_BC_SHAPE_HELP = ('accepted shapes: {"face": <query>, "force": [fx,fy,fz]} (N, world XYZ), '
+                  '{"face": <query>, "pressure": <MPa>}, or the polar form '
+                  '{"face": <query>, "magnitude": <N>, "direction": [dx,dy,dz]}. '
+                  '"faces": [<query>, ...] is accepted as the plural of "face".')
+
+
+def _norm_fineness(value, arg_name: str = "mesh_fineness") -> float:
+    """mesh_fineness as a 0..1 float, accepting the preset WORDS as well as a number."""
+    if isinstance(value, str):
+        key = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if key in _FINENESS_WORDS:
+            return _FINENESS_WORDS[key]
+        try:
+            return float(value)
+        except ValueError:
+            raise ValueError(
+                f"{arg_name} must be a number 0..1 or one of "
+                f"{sorted(set(_FINENESS_WORDS))} — got {value!r}.") from None
+    return float(value)
+
+
+def _norm_direction(d, where: str) -> list:
+    """A `direction` value -> a UNIT 3-vector. Normalizing first is the whole point: a
+    non-unit direction must never silently scale the load magnitude. Zero length is an
+    error, not a silent no-op force."""
+    raw = d
+    if isinstance(d, str):
+        s = d.strip().lower()
+        if s in _AXIS_DIRS:
+            return list(_AXIS_DIRS[s])
+        d = coerce_json_or_repr(d)
+    if isinstance(d, dict) and all(k in d for k in ("x", "y", "z")):
+        d = [d["x"], d["y"], d["z"]]
+    if not isinstance(d, (list, tuple)) or len(d) != 3:
+        raise ValueError(f"{where}: 'direction' must be [dx,dy,dz] (or one of "
+                         f"{sorted(_AXIS_DIRS)}), got {raw!r}.")
+    try:
+        comps = [float(x) for x in d]
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}: 'direction' components must be numbers, "
+                         f"got {raw!r}.") from None
+    n = math.sqrt(sum(c * c for c in comps))
+    if n <= 1e-12:
+        raise ValueError(f"{where}: 'direction' {raw!r} has zero length — it cannot point "
+                         "anywhere, so the load is undefined. Give a real direction "
+                         "[dx,dy,dz] (any length; it is normalized), or drop "
+                         "magnitude/direction and pass force:[fx,fy,fz] directly.")
+    return [c / n for c in comps]
+
+
+def _split_face_list(e: dict, where: str) -> list:
+    """Fan a plural `faces: [q1, q2]` entry out to one entry per face, siblings preserved."""
+    if "faces" in e and "face" in e:
+        raise ValueError(f"{where}: both 'face' and 'faces' were given ({e['face']!r} vs "
+                         f"{e['faces']!r}) — that is ambiguous. Pass exactly one: 'face' for "
+                         "a single query, 'faces' for a list.")
+    key = "faces" if "faces" in e else ("face" if "face" in e else None)
+    if key is None:
+        return [e]
+    v = e[key]
+    if isinstance(v, str) and v.strip()[:1] in ("[", "{"):
+        v = coerce_json_or_repr(v)
+    if isinstance(v, (list, tuple)):
+        if not v:
+            raise ValueError(f"{where}: {key!r} is an empty list — there is nothing to apply "
+                             "this boundary condition to. Name at least one face query "
+                             "(query_geometry(...) or describe_part(doc_id) to find one).")
+        rest = {k: x for k, x in e.items() if k != key}
+        return [{**rest, "face": f} for f in v]
+    if key == "faces":
+        rest = {k: x for k, x in e.items() if k != key}
+        return [{**rest, "face": v}]
+    return [e]
+
+
+def _polar_to_force(e: dict, where: str) -> dict:
+    """`magnitude` (+ `direction`) -> the explicit `force` vector the solver payload wants.
+
+    force = unit(direction) * magnitude. A supplied `force` that DISAGREES with the polar
+    form is ambiguous and rejected rather than silently resolved one way."""
+    if e.get("magnitude") is None:
+        return e
+    try:
+        mag = float(e["magnitude"])
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}: 'magnitude' must be a number, got {e['magnitude']!r}. "
+                         + _BC_SHAPE_HELP) from None
+    d = e.get("direction")
+    kind = str(e.get("type") or "").strip().lower()
+    is_pressure = kind.startswith("press")
+
+    if d is None:
+        if "force" in e:
+            vec = [float(x) for x in e["force"]]
+            nf = math.sqrt(sum(c * c for c in vec))
+            if abs(nf - mag) > 1e-6 * max(1.0, abs(mag)):
+                raise ValueError(
+                    f"{where}: 'force' {e['force']!r} has magnitude {nf:g} but 'magnitude' "
+                    f"says {mag:g} — those disagree, so which load was meant is ambiguous. "
+                    "Pass force:[fx,fy,fz] alone, or magnitude + direction alone.")
+            return {k: v for k, v in e.items() if k != "magnitude"}
+        if "pressure" in e:
+            if abs(float(e["pressure"]) - mag) > 1e-6 * max(1.0, abs(mag)):
+                raise ValueError(
+                    f"{where}: 'pressure' {e['pressure']!r} and 'magnitude' {mag:g} disagree "
+                    "— ambiguous. Pass one of them.")
+            return {k: v for k, v in e.items() if k != "magnitude"}
+        if is_pressure:
+            out = {k: v for k, v in e.items() if k not in ("magnitude", "type")}
+            out["pressure"] = mag
+            return out
+        raise ValueError(f"{where}: 'magnitude':{mag:g} was given with no 'direction', so the "
+                         "load has no orientation and cannot be built. " + _BC_SHAPE_HELP)
+
+    if is_pressure:
+        raise ValueError(f"{where}: type 'pressure' was given together with a 'direction' "
+                         f"{d!r} — pressure acts along the face normal and takes no direction. "
+                         "Pass pressure:<MPa> for a pressure, or force/magnitude+direction "
+                         "for a vector load.")
+    unit = _norm_direction(d, where)
+    vec = [c * mag for c in unit]
+    if "force" in e:
+        given = [float(x) for x in e["force"]]
+        tol = 1e-6 * max(1.0, abs(mag))
+        if len(given) != 3 or any(abs(a - b) > tol for a, b in zip(given, vec)):
+            raise ValueError(
+                f"{where}: 'force' {e['force']!r} disagrees with magnitude {mag:g} x "
+                f"direction {d!r} (= {[round(c, 6) for c in vec]}) — ambiguous. Pass "
+                "force:[fx,fy,fz] alone, or magnitude + direction alone.")
+    out = {k: v for k, v in e.items() if k not in ("magnitude", "direction", "type")}
+    out["force"] = vec
+    return out
+
+
+def _norm_bc_list(entries: list, arg_name: str, *, unwrap_query: bool = False) -> list:
+    """Normalize a fixtures/loads list at the tool boundary. IDENTITY for entries already
+    in the accepted shape — the payload handed to the C++ solver is unchanged for inputs
+    that already worked.
+
+    unwrap_query: fixtures consume only the face QUERY, so a wrapper dict
+    ({"face": q, "type": "fixed"}) collapses to `q`; loads / hot_faces / cold_faces keep
+    their siblings (force, pressure, temperature, flux_w_m2, schedule, ...)."""
+    out: list = []
+    for i, raw in enumerate(entries):
+        where = f"{arg_name}[{i}]"
+        e = raw
+        if isinstance(e, str) and e.strip()[:1] == "{":
+            e = coerce_json_or_repr(e)
+        if not isinstance(e, dict):
+            out.append(raw)          # a bare query string / already-structured query
+            continue
+        for one in _split_face_list(e, where):
+            one = _polar_to_force(one, where)
+            if unwrap_query and "face" in one:
+                out.append(one["face"])
+            else:
+                out.append(one)
+    return out
+
+
+def _sim_face_points(doc_id: str, query) -> list:
+    """_resolve_face_points, plus the raw face SID handle a model pastes back from an earlier
+    describe_part / query_geometry result.
+
+    The ENGINE query grammar (core/doc/picks.h kQueryGrammar) has no sid predicate, so a sid
+    string cannot be a query — but a sid IS resolvable to the very selector doc_face_points
+    needs, by scanning the live roster (cad_common._sid_match). Live 2026-07-28 a model passed
+    the real face id "Fb7fb00" it had just been handed and got "the grammar is TOKENS, not
+    prose", which teaches nothing about the id it was holding."""
+    if isinstance(query, str):
+        s = query.strip()
+        if _SID_RE.fullmatch(s):
+            m = _sid_match(doc_id, s)
+            if m is not None:
+                fp = cb.call("doc_face_points", {"doc_id": doc_id, "selector": m})
+                if not fp.get("points"):
+                    raise ValueError(f"face sid {s!r} resolved but carries no surface points.")
+                return [fp]
+            raise ValueError(
+                f"No face with sid {s!r} in this document (sids change whenever the model "
+                "changes). Call describe_part(doc_id) for the current face/edge sid roster, "
+                "or query_geometry(...) for a geometry query.")
+        if re.fullmatch(r"[fF]\d+", s):
+            raise ValueError(
+                f"{s!r} is a FEATURE id, not a face — a boundary condition needs a face. "
+                "Call describe_part(doc_id) for the face sid roster (F58db6d style, which "
+                "this tool accepts directly), or query_geometry(...) for a geometry query.")
+    return _resolve_face_points(doc_id, query)
+
 
 def register_cad_sim_tools(mcp: FastMCP) -> None:
     """CAD simulation MCP tools (T-RF8 split of cad_tools.py): run_fea_* + run_cfd_*."""
@@ -37,7 +265,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def run_fea_static(fixtures: Union[list, str], loads: Union[list, str],
                        material: Union[str, dict] = "steel",
-                       mesh_fineness: float = 0.5, doc_id: Optional[str] = None,
+                       mesh_fineness: Union[float, str] = 0.5, doc_id: Optional[str] = None,
                        background: bool = False) -> str:
         """Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.
 
@@ -46,9 +274,16 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         loads    : list of {face query + a force or pressure}, e.g.
                    [{"face":"top","force":[0,0,-500]}]   # newtons, world XYZ
                    [{"face":"top","pressure":0.5}]       # MPa, inward
+                   [{"face":"top","magnitude":500,"direction":[0,0,-1]}]  # polar form of the
+                   #   force above — direction is normalized, so its length never scales the load
+                   Plural "faces":[q1,q2] is accepted and applies the SAME load to each face.
+                   A face query is query_geometry vocabulary ("top", {"of":"face",...}) or a face
+                   SID from describe_part / query_geometry ("F58db6d") — a FEATURE id is not a face.
         material : a name ("steel","aluminum","titanium","stainless","brass","abs","pla") or an
                    explicit dict {E_mpa, nu, density_g_cm3, yield_mpa, ...}.
-        mesh_fineness : 0..1 (default 0.5). Second-order (tet10) elements are used for accuracy.
+        mesh_fineness : 0..1 (default 0.5), or a preset word
+                   ("coarse"=0.25, "medium"=0.5, "fine"=0.75, "finest"=1.0).
+                   Second-order (tet10) elements are used for accuracy.
         background : if True, return a job_id immediately and solve on a worker thread — poll
                      get_job(job_id). Use it for fine meshes that may exceed the call timeout.
 
@@ -63,13 +298,16 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             loads = require_list(loads, "loads",
                                   'a list of {face query + force/pressure}, e.g. '
                                   '[{"face":"top","force":[0,0,-500]}]')
+            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True)
+            loads = _norm_bc_list(loads, "loads")
+            mesh_fineness = _norm_fineness(mesh_fineness)
             mat = _resolve_material(coerce_json_or_repr(material))
             step = _tmp(".step")
             cb.call("doc_export_step", {"doc_id": d, "path": step})
 
             fixture_sets: list = []
             for q in fixtures:
-                fixture_sets.extend(_resolve_face_points(d, q))
+                fixture_sets.extend(_sim_face_points(d, q))
             if not fixture_sets:
                 return _dumps({"ok": False, "error":
                                "no fixture faces resolved — the face queries you provided "
@@ -79,8 +317,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             load_specs: list = []
             for ld in loads:
                 if not isinstance(ld, dict) or "face" not in ld:
-                    raise ValueError(f"each load needs a 'face' query: {ld!r}")
-                faces = _resolve_face_points(d, ld["face"])
+                    raise ValueError(f"each load needs a 'face' query: {ld!r}. "
+                                     + _BC_SHAPE_HELP)
+                faces = _sim_face_points(d, ld["face"])
                 # Merge multiple face-point sets for this load (keeps face_normal/surface
                 # hints exactly when they stay valid — see _merge_face_sets).
                 merged = _merge_face_sets(faces)
@@ -92,7 +331,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     spec["type"] = "force"
                     spec["vector"] = [float(x) for x in ld["force"]]
                 else:
-                    raise ValueError(f"load needs 'force':[x,y,z] or 'pressure':<MPa>: {ld!r}")
+                    raise ValueError(f"load needs 'force':[x,y,z] or 'pressure':<MPa>: {ld!r}. "
+                                     + _BC_SHAPE_HELP)
                 load_specs.append(spec)
 
             study = {
@@ -138,25 +378,30 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def run_fea_modal(fixtures: Union[list, str], material: Union[str, dict] = "steel",
                       n_modes: int = 6,
-                      mesh_fineness: float = 0.5, doc_id: Optional[str] = None,
+                      mesh_fineness: Union[float, str] = 0.5, doc_id: Optional[str] = None,
                       background: bool = False) -> str:
         """Modal FEA — the natural frequencies (Hz) of the held part. Returns the first n_modes.
 
         fixtures : list of face queries held fixed (e.g. ["bottom"]). An unconstrained part has
-                   rigid-body modes near 0 Hz, so fix it like it is mounted.
+                   rigid-body modes near 0 Hz, so fix it like it is mounted. A query is
+                   query_geometry vocabulary, a face SID from describe_part ("F58db6d"), or a
+                   wrapper {"face": q} / {"faces": [q1, q2]}.
         material : name or explicit dict (density drives the mode frequencies).
+        mesh_fineness : 0..1, or a preset word ("coarse"/"medium"/"fine"/"finest").
         background : if True, return a job_id and solve on a worker thread — poll get_job(job_id).
         """
         try:
             d = _doc(doc_id)
             fixtures = require_list(fixtures, "fixtures",
                                      'a list of face queries held fixed, e.g. ["bottom"]')
+            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True)
+            mesh_fineness = _norm_fineness(mesh_fineness)
             mat = _resolve_material(coerce_json_or_repr(material))
             step = _tmp(".step")
             cb.call("doc_export_step", {"doc_id": d, "path": step})
             fixture_sets: list = []
             for q in fixtures:
-                fixture_sets.extend(_resolve_face_points(d, q))
+                fixture_sets.extend(_sim_face_points(d, q))
             # F6 (free-free modal): when fixtures=[] the caller is requesting an unconstrained
             # solve — the C++ fea_modal_solve handles empty fixed_nodes by computing the full
             # 6 rigid-body modes near 0 Hz followed by the elastic modes. Only reject when the
@@ -243,7 +488,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                    vibration_spec: Optional[Union[dict, str]] = None,
                                    n_modes: int = 6,
                                    material: Union[str, dict] = "steel",
-                                   mesh_fineness: float = 0.5,
+                                   mesh_fineness: Union[float, str] = 0.5,
                                    doc_id: Optional[str] = None,
                                    background: bool = False) -> str:
         """Harmonic + random (PSD) vibration response of the held part vs a base excitation.
@@ -273,6 +518,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             d = _doc(doc_id)
             fixtures = require_list(fixtures, "fixtures",
                                      'face queries held fixed, e.g. ["bottom"]')
+            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True)
+            mesh_fineness = _norm_fineness(mesh_fineness)
             if excitation_dir is not None:
                 excitation_dir = require_list(excitation_dir, "excitation_dir",
                                                "a 3-vector [dx,dy,dz]")
@@ -298,7 +545,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             cb.call("doc_export_step", {"doc_id": d, "path": step})
             fixture_sets: list = []
             for q in fixtures:
-                fixture_sets.extend(_resolve_face_points(d, q))
+                fixture_sets.extend(_sim_face_points(d, q))
             if fixtures and not fixture_sets:
                 return _dumps({"ok": False, "error": "no fixture faces resolved — "
                                "the face queries you provided didn't match any surface "
@@ -573,7 +820,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         load_type: str = "reversed", load_ratio: float = -1.0,
                         surface: str = "machined", reliability_pct: float = 50.0,
                         temperature_c: float = 20.0, theory: str = "goodman",
-                        mesh_fineness: float = 0.5, doc_id: Optional[str] = None,
+                        mesh_fineness: Union[float, str] = 0.5, doc_id: Optional[str] = None,
                         background: bool = False) -> str:
         """High-cycle fatigue life (S-N) on the current part — reuses the linear-static
         stress field, then applies mean-stress theory + Marin correction + Basquin life.
@@ -585,7 +832,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         correction + reliability + the Shigley S-N life line (mirrors the desktop app's
         fatigue math exactly) to report cycles-to-failure + a factor of safety.
 
-        fixtures/loads : SAME plain-English face queries as run_fea_static.
+        fixtures/loads : SAME shapes as run_fea_static — including the polar
+                         {"magnitude": N, "direction": [dx,dy,dz]} load form, plural
+                         "faces": [q1, q2], and a face SID ("F58db6d") as a query.
         material       : name or dict (needs ultimate_mpa + endurance_mpa; the built-in
                          materials all carry them).
         load_type      : "reversed" (R=-1, default) | "zero_based" (R=0) | "ratio" (use
@@ -605,6 +854,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                      'SAME plain-English face queries as run_fea_static')
             loads = require_list(loads, "loads",
                                   'SAME {face + force/pressure} shape as run_fea_static')
+            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True)
+            loads = _norm_bc_list(loads, "loads")
+            mesh_fineness = _norm_fineness(mesh_fineness)
             mat = _resolve_material(coerce_json_or_repr(material))
             Sut = float(mat.get("ultimate_mpa") or 0.0)
             Se_base = float(mat.get("endurance_mpa") or 0.0)
@@ -616,15 +868,16 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             cb.call("doc_export_step", {"doc_id": d, "path": step})
             fixture_sets: list = []
             for q in fixtures:
-                fixture_sets.extend(_resolve_face_points(d, q))
+                fixture_sets.extend(_sim_face_points(d, q))
             if not fixture_sets:
                 return _dumps({"ok": False, "error": "no fixture faces resolved — use "
                                "query_geometry() to confirm the face query."})
             load_specs: list = []
             for ld in loads:
                 if not isinstance(ld, dict) or "face" not in ld:
-                    raise ValueError(f"each load needs a 'face' query: {ld!r}")
-                faces = _resolve_face_points(d, ld["face"])
+                    raise ValueError(f"each load needs a 'face' query: {ld!r}. "
+                                     + _BC_SHAPE_HELP)
+                faces = _sim_face_points(d, ld["face"])
                 merged = _merge_face_sets(faces)
                 spec: dict = {"faces": merged}
                 if "pressure" in ld:
@@ -632,7 +885,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 elif "force" in ld:
                     spec["type"] = "force"; spec["vector"] = [float(x) for x in ld["force"]]
                 else:
-                    raise ValueError(f"load needs 'force' or 'pressure': {ld!r}")
+                    raise ValueError(f"load needs 'force' or 'pressure': {ld!r}. "
+                                     + _BC_SHAPE_HELP)
                 load_specs.append(spec)
 
             surf_map = {"ground": 0, "machined": 1, "hot_rolled": 2, "as_forged": 3}
@@ -707,7 +961,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         transient: Optional[Union[dict, str]] = None,
                         loads: Optional[Union[list, str]] = None,
                         specific_heat_j_kgk: Optional[float] = None,
-                        mesh_fineness: float = 0.5,
+                        mesh_fineness: Union[float, str] = 0.5,
                         doc_id: Optional[str] = None) -> str:
         """Thermal (heat-conduction) FEA — steady-state via CalculiX, TRANSIENT via the
         C++ core solver on the real part mesh.
@@ -738,6 +992,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                        {"points": [[t_s, scale], ...], "period_s": <opt>}  piecewise
                           sample-and-hold (a residency timeline maps verbatim)
           specific_heat_j_kgk : cp override; else material dict, else a typical value.
+        hot_faces/cold_faces/loads all accept the plural "faces": [q1, q2] key (fanned out to
+        one entry per face, siblings kept) and a face SID ("F58db6d") as a face query.
         Returns frame times + per-frame max temperature, the PEAK temperature over the
         whole run (max-temp envelope) and when it occurred. Full nodal frames stay in
         the study result inside the doc.
@@ -754,6 +1010,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 loads = require_list(loads, "loads",
                                       'a list of {"face": <query>, "flux_w_m2": <q>} or '
                                       '{"face": <query>, "h_w_m2k": <h>} entries')
+                loads = _norm_bc_list(loads, "loads")
+            hot_faces = _norm_bc_list(hot_faces, "hot_faces")
+            cold_faces = _norm_bc_list(cold_faces, "cold_faces")
+            mesh_fineness = _norm_fineness(mesh_fineness)
             if transient is not None:
                 transient = require_mapping(transient, "transient",
                                              'a dict like {"t_end_s": 60, "dt_s": 0.5}')
@@ -774,7 +1034,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 cb.call("doc_export_step", {"doc_id": d, "path": step})
 
                 def _faceset(q):
-                    merged = _merge_face_sets(_resolve_face_points(d, q))
+                    merged = _merge_face_sets(_sim_face_points(d, q))
                     return merged if merged["points"] else None
 
                 fixtures = []
@@ -904,7 +1164,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
         fixtures : face(s) held fixed (the mounted/clamped end), e.g. ["bottom"].
         load     : the compressive load as a single {face + force}, e.g.
-                   [{"face":"top","force":[0,0,-1000]}] — magnitude is what λ scales.
+                   [{"face":"top","force":[0,0,-1000]}] — magnitude is what λ scales. The
+                   polar form [{"face":"top","magnitude":1000,"direction":[0,0,-1]}] is
+                   equivalent (direction is normalized before scaling).
         n_modes  : number of buckling modes to return (lowest first).
 
         CalculiX GPL-2.0 → subprocess-only. Absent ccx ⇒ {ok:false, skipped:true}.
@@ -916,6 +1178,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             d = _doc(doc_id)
             load = require_list(load, "load",
                                  'a single-item list [{"face": <query>, "force": [x,y,z]}]')
+            load = _norm_bc_list(load, "load")
             mat = _resolve_material(coerce_json_or_repr(material))
             E = float(mat["E_mpa"]); nu = float(mat.get("nu", 0.3))
             # A malformed load used to fall back to a hard-coded 1000 N SILENTLY (ok:true,
@@ -926,7 +1189,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 raise ValueError(
                     "load must be a single-item list [{'face': <query>, 'force': [x,y,z]}] "
                     f"— got {load!r}. The force magnitude is what the buckling load factor "
-                    "scales; there is no safe default to assume.")
+                    "scales; there is no safe default to assume. " + _BC_SHAPE_HELP)
             vec = load[0]["force"]
             P = max(1.0, math.sqrt(sum(float(x) ** 2 for x in vec)))
             L, b, h = _part_bbox_dims(d)

@@ -20,6 +20,7 @@ both dispatch paths import it, so a fix here reaches both by construction.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Sequence
 
 # Explicit argument-name synonyms the affix heuristic in `resolve_unknown` can
@@ -37,10 +38,87 @@ ARG_SYNONYMS: dict[str, str] = {
 
 # Synonyms that are only unambiguous for ONE tool. "type" is far too generic
 # to map globally, but export_part(fmt, path, doc_id) has no other parameter
-# a str `type=` could mean.
+# a str `type=` could mean. Every entry below was added only after READING the
+# tool's real signature — a synonym whose target is not a real parameter turns
+# an honest refusal into a silently wrong call, which is strictly worse.
 TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
     "export_part": {"type": "fmt"},
+    # run_cfd_flow(velocity, aoa, fluid, cells, n_steps, doc_id, background).
+    # Live 2026-07-29 (claude-sonnet-4-5): inlet_velocity_mps=5.0 was refused.
+    # `velocity` is the only speed slot, so every inlet/free-stream spelling of
+    # it is unambiguous HERE; globally "speed" could mean a feed rate, hence
+    # tool-scoped.
+    "run_cfd_flow": {
+        "inletvelocitymps": "velocity",
+        "inletvelocity": "velocity",
+        "freestreamvelocity": "velocity",
+        "flowvelocity": "velocity",
+        "airspeed": "velocity",
+        "speed": "velocity",
+        "angleofattack": "aoa",
+        "medium": "fluid",
+        "iterations": "nsteps",
+    },
+    # ecad_find_part(query, limit[, category]). One free-text slot and one
+    # integer slot, so search/count spellings cannot be misrouted.
+    "ecad_find_part": {
+        "partnumber": "query",
+        "mpn": "query",
+        "keyword": "query",
+        "keywords": "query",
+        "searchterm": "query",
+        "search": "query",
+        "term": "query",
+        "q": "query",
+        "component": "query",
+        "maxresults": "limit",
+        "maxhits": "limit",
+        "topk": "limit",
+        "count": "limit",
+    },
+    # ecad_new_schematic(name). Live 2026-07-29: title='Decoupling Capacitor
+    # Demo' was refused. When `name` is FREE a title IS the name; when the
+    # model supplied both, `name` is taken and the redundant label is dropped
+    # by drop_descriptive() instead.
+    "ecad_new_schematic": {"title": "name"},
+    # apply_ascii_edits(kind, edits_json, doc_id, layer, sketch_id, grid_json,
+    # index_json, dry_run). Live 2026-07-29: edits=[...] refused by a tool
+    # literally named apply_ascii_EDITS. The affix rule already reaches
+    # edits_json; what blocked it was the `str` annotation against a decoded
+    # list — see bind_value().
+    "apply_ascii_edits": {
+        "edits": "editsjson",
+        "ops": "editsjson",
+        "changes": "editsjson",
+        "editlist": "editsjson",
+    },
+    # ecad_simulate(analysis, params, probes, doc_id, backend). Live 2026-07-29:
+    # kind='s-param' was refused. `analysis` IS the discriminator `kind` names,
+    # and an alias on a discriminator is only safe if a wrong value fails LOUDLY
+    # — it does: ecad_sim_tools.py:213 returns "unknown analysis <x>" listing
+    # op/dc/tran/ac/four/mc/temp/noise, so kind='s-param' gets told the real
+    # vocabulary instead of a parameter list. NOTE this does NOT make that live
+    # call work, and must not: ecad_simulate is a SPICE circuit simulator with no
+    # S-parameter analysis and no port concept (see the capability-gap note in
+    # test_ecad_simulate_still_refuses_the_s_parameter_port_arguments).
+    "ecad_simulate": {"kind": "analysis", "analysistype": "analysis",
+                      "simtype": "analysis", "solver": "backend"},
 }
+
+# Argument names that are PURELY a human-readable label: they name the call for
+# a reader and can never change what the tool computes. When a model adds one
+# to an otherwise-correct call, refusing the whole call is the worse failure —
+# `drop_descriptive` ignores it with a visible note instead.
+#
+# This list is deliberately closed and hand-audited. NEVER add anything that
+# could carry semantics (geometry, quantities, units, refs, ids, flags,
+# materials, selections) and never derive membership from a heuristic like
+# "ends in _name": an ignored VALUE is invisible to the model, a refusal is
+# not. Keyed by normalised name (see `norm_arg`).
+DESCRIPTIVE_ARGS: frozenset[str] = frozenset({
+    "studyname", "title", "label", "caption", "comment", "note", "notes",
+    "description", "displayname", "friendlyname",
+})
 
 
 def synonyms_for(tool: str) -> dict[str, str]:
@@ -102,6 +180,30 @@ def annotation_admits(ann: str, value: Any) -> bool:
     return False
 
 
+def bind_value(target: str, ann: str, value: Any) -> Any:
+    """The value that should actually be bound to *target*.
+
+    One case only: a ``*_json`` parameter annotated ``str`` is a JSON DOCUMENT
+    slot, and a model that already has the document in structured form sends
+    the list/dict itself (live 2026-07-29: ``apply_ascii_edits(edits=[{...}])``).
+    Renaming alone is not enough — the agent path would hand a list to a str
+    parameter and the MCP path's pydantic model would reject it outright
+    ("edits_json: Input should be a valid string"). Serialising here gives both
+    paths exactly what the signature declares.
+
+    Everything else is returned untouched: this is a spelling/encoding fix, not
+    a type coercion layer.
+    """
+    if isinstance(value, (list, dict)) and str(target).endswith("_json"):
+        a = str(ann or "").lower()
+        if ("str" in a or "string" in a) and "dict" not in a and "list" not in a:
+            try:
+                return json.dumps(value)
+            except (TypeError, ValueError):
+                return value
+    return value
+
+
 def resolve_unknown(supplied: str, value: Any, params: Sequence[str],
                     ann: Mapping[str, str], used: set,
                     synonyms: Mapping[str, str] | None = None) -> str | None:
@@ -126,7 +228,8 @@ def resolve_unknown(supplied: str, value: Any, params: Sequence[str],
         want = synonyms.get(ns)
         if want:
             cand = [p for p in free if norm_arg(p) == want]
-            if len(cand) == 1 and annotation_admits(ann.get(cand[0], ""), value):
+            if len(cand) == 1 and annotation_admits(
+                    ann.get(cand[0], ""), bind_value(cand[0], ann.get(cand[0], ""), value)):
                 return cand[0]
     affix = []
     for p in free:
@@ -138,7 +241,122 @@ def resolve_unknown(supplied: str, value: Any, params: Sequence[str],
     if len(affix) != 1:
         return None
     target = affix[0]
-    return target if annotation_admits(ann.get(target, ""), value) else None
+    at = ann.get(target, "")
+    return target if annotation_admits(at, bind_value(target, at, value)) else None
+
+
+def plausible_targets(supplied: str, params: Sequence[str], used: set,
+                      synonyms: Mapping[str, str] | None = None) -> list[str]:
+    """Free parameters *supplied* could conceivably have been meant for.
+
+    Deliberately LOOSER than `resolve_unknown`: it ignores the annotation guard
+    and the "exactly one candidate" rule, because it answers the opposite
+    question. `resolve_unknown` asks "may I bind this?"; this asks "is there any
+    chance this belongs somewhere?" — used by `drop_descriptive` to refuse to
+    ignore an argument that might have had a home.
+    """
+    ns = norm_arg(supplied)
+    if not ns:
+        return []
+    want = (synonyms or {}).get(ns)
+    out = []
+    for p in params:
+        if p in used:
+            continue  # already filled by the model's own explicit argument
+        np = norm_arg(p)
+        if np == ns or (want and np == want):
+            out.append(p)
+        elif min(len(np), len(ns)) >= 3 and (
+                ns.startswith(np) or ns.endswith(np)
+                or np.startswith(ns) or np.endswith(ns)):
+            out.append(p)
+    return out
+
+
+def drop_descriptive(supplied: str, value: Any, params: Sequence[str], used: set,
+                     synonyms: Mapping[str, str] | None = None) -> bool:
+    """True when *supplied* is a purely-cosmetic label safe to IGNORE.
+
+    Live 2026-07-29 (claude-sonnet-4-5): ``ecad_new_schematic(name='x',
+    title='X Demo')`` and ``run_cfd_flow(study_name='air_flow_5mps', ...)``
+    were refused outright because the model attached a human label to an
+    otherwise-correct call. Refusing a correct call over a helpful label is the
+    worse failure — but a SILENT drop is worse still, so every caller must
+    surface the drop in its response (see the note-emitting call sites in
+    ``agent_turn._reconcile_kwargs`` and ``server._install_arg_teaching``).
+
+    Four conditions, all required — when any is unmet the caller refuses
+    exactly as before:
+
+    1. the name is on the closed `DESCRIPTIVE_ARGS` allowlist (never a
+       heuristic);
+    2. the value is a plain string — a dict/list/number/bool carries structure,
+       a quantity or a flag, i.e. semantics, whatever it is called;
+    3. no FREE parameter could plausibly have received it (`plausible_targets`)
+       — a value routed to the wrong slot, or ignored when a real slot was
+       standing empty, is invisible; a refusal is not;
+    4. `resolve_unknown` already declined it (the caller's ordering), so this
+       can never outvote a real mapping.
+    """
+    if norm_arg(supplied) not in DESCRIPTIVE_ARGS:
+        return False
+    if not isinstance(value, str):
+        return False
+    return not plausible_targets(supplied, params, used, synonyms)
+
+
+def dropped_note(supplied: str, tool: str) -> str:
+    """The one wording both dispatch paths use for an ignored label."""
+    return (f"ignored {supplied!r}: {tool} has no such parameter and it is a "
+            f"purely descriptive label — the call ran WITHOUT it")
+
+
+def attach_warnings(result: Any, warnings: Sequence[str]) -> Any:
+    """Merge *warnings* into a tool result under a ``warnings`` key.
+
+    Tool results come back as a dict, a JSON object string, or free text
+    depending on the tool; a drop must be visible in all three, so text falls
+    back to an appended ``[warning]`` line rather than being dropped itself.
+    Appends to any ``warnings`` the tool already produced instead of clobbering.
+    """
+    warnings = list(warnings)
+    if not warnings:
+        return result
+
+    def _merge(obj: dict) -> dict:
+        out = dict(obj)
+        existing = out.get("warnings")
+        if isinstance(existing, list):
+            out["warnings"] = [*existing, *warnings]
+        elif isinstance(existing, str):
+            out["warnings"] = [existing, *warnings]
+        else:
+            out["warnings"] = warnings
+        return out
+
+    if isinstance(result, dict):
+        return _merge(result)
+    if isinstance(result, str):
+        stripped = result.lstrip()
+        if stripped.startswith("{"):
+            try:
+                obj = json.loads(stripped)
+            except ValueError:
+                obj = None
+            if isinstance(obj, dict):
+                return json.dumps(_merge(obj), indent=2, default=str)
+        return result + "".join(f"\n[warning] {w}" for w in warnings)
+    if isinstance(result, (list, tuple)):
+        return [*result, *(f"[warning] {w}" for w in warnings)]
+    return [result, *(f"[warning] {w}" for w in warnings)]
+
+
+# Parameters that are a tool's "everything else" bag: analysis settings, solver
+# options and the like live INSIDE them as dict keys, not as top-level
+# arguments. Live 2026-07-29: ecad_simulate(freq_start_hz=..., freq_stop_hz=...,
+# freq_points=...) was refused with a correct but unhelpful list of five
+# parameter names; those settings really do exist, one level down in `params`.
+SETTINGS_BAG_PARAMS: tuple[str, ...] = ("params", "options", "opts", "config", "settings")
 
 
 def unknown_arg_payload(tool: str, params: Sequence[str], required: Sequence[str],
@@ -177,6 +395,20 @@ def unknown_arg_payload(tool: str, params: Sequence[str], required: Sequence[str
             f" NOTE: {', '.join(repr(c) for c in from_config)} came from "
             f"agent.tool_options param_defaults (Settings → AI → Tools), NOT "
             f"from your call — you cannot fix it by rephrasing; report it."
+        )
+    bag = next((p for p in params
+                if norm_arg(p) in SETTINGS_BAG_PARAMS and p not in supplied), None)
+    if bag:
+        # A pointer, NOT a mapping: we do not claim the rejected names belong in
+        # there (guessing that would be the silent-wrong-call failure this whole
+        # module exists to avoid), only that this tool keeps its per-analysis
+        # settings one level down, which is where a model that flattened them
+        # should look first.
+        payload["settings_param"] = bag
+        payload["error"] += (
+            f" NOTE: {tool} takes its analysis/solver-specific settings as keys "
+            f"inside the `{bag}` dict, not as top-level arguments — read the tool "
+            f"description for the keys {bag} accepts before re-issuing."
         )
     try:
         from services.agent.tool_hints import hint_for  # noqa: PLC0415

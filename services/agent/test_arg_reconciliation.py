@@ -253,3 +253,283 @@ def test_synonyms_for_merges_global_and_per_tool():
     assert merged["format"] == "fmt"
     assert merged["type"] == "fmt"
     assert "type" not in recon.synonyms_for("some_other_tool")
+
+
+# --------------------------------------------------------------------- live 2026-07-29
+# (claude-sonnet-4-5, general lane): five tools refused plausible argument NAMES with
+# status=unknown_argument. Each block below pins one of them, and each alias was added
+# only after reading the tool's real signature.
+
+def test_every_tool_synonym_target_is_a_real_parameter():
+    """The invariant that keeps this table from being dangerous.
+
+    A synonym whose target does not exist can never resolve, so it is dead
+    weight at best; worse, it documents a parameter the tool does not have and
+    invites the next reader to "fix" the tool instead of the table. Checked
+    against the REAL signature of every tool named in TOOL_ARG_SYNONYMS."""
+    import inspect
+
+    bad = []
+    for tool, table in recon.TOOL_ARG_SYNONYMS.items():
+        fn = at._bind_tool(tool)
+        assert fn is not None, f"{tool} does not resolve for the built-in agent"
+        real = {recon.norm_arg(p) for p in inspect.signature(fn).parameters}
+        for supplied, target in table.items():
+            if target not in real:
+                bad.append(f"{tool}: {supplied!r} -> {target!r} (not a parameter)")
+    assert not bad, bad
+
+
+def test_a_synonym_pointing_at_a_missing_parameter_never_resolves():
+    """The negative half of the invariant above, at the resolver level: even if
+    such an entry were added, `resolve_unknown` must refuse rather than invent
+    a slot — an unknown_argument error is recoverable, a wrong call is not."""
+    target = recon.resolve_unknown(
+        "inlet_velocity_mps", 5.0, ["fluid", "cells"], {}, set(),
+        {"inletvelocitymps": "velocity"})  # `velocity` is not in params here
+    assert target is None
+
+
+# --- 1. run_cfd_flow(velocity, aoa, fluid, cells, n_steps, doc_id, background)
+
+def test_run_cfd_flow_inlet_velocity_mps_resolves_to_velocity():
+    kwargs, notes, err = _agent_reconcile("run_cfd_flow", doc_id="d1", fluid="air",
+                                          inlet_velocity_mps=5.0)
+    assert err is None, err
+    assert kwargs["velocity"] == 5.0
+    assert "interpreted 'inlet_velocity_mps' as 'velocity'" in notes
+
+
+def test_run_cfd_flow_drops_the_descriptive_study_name():
+    """A label the tool has no slot for must not cost the whole call — but the
+    drop has to be stated, not silent."""
+    kwargs, notes, err = _agent_reconcile("run_cfd_flow", doc_id="d1", fluid="air",
+                                          inlet_velocity_mps=5.0,
+                                          study_name="air_flow_5mps")
+    assert err is None, err
+    assert kwargs == {"doc_id": "d1", "fluid": "air", "velocity": 5.0}
+    assert any("ignored 'study_name'" in n for n in notes), notes
+
+
+def test_run_cfd_flow_still_refuses_inlet_face():
+    """The footgun guard. `inlet_face={...}` is not a label: it asks for a
+    boundary condition this LBM tool does not implement. Ignoring it would run
+    a DIFFERENT simulation than the model asked for and report success."""
+    _kwargs, _notes, err = _agent_reconcile("run_cfd_flow", doc_id="d1",
+                                            inlet_velocity_mps=5.0,
+                                            inlet_face={"kind": "face", "id": 3},
+                                            outlet_face={"kind": "face", "id": 4})
+    assert err is not None
+    assert err["status"] == "unknown_argument"
+    assert set(err["unknown_params"]) == {"inlet_face", "outlet_face"}
+
+
+# --- 2. ecad_find_part(query, limit, category)
+
+def test_ecad_find_part_query_and_limit_synonyms():
+    kwargs, notes, err = _agent_reconcile("ecad_find_part", mpn="ESP32-S3",
+                                          max_results=5)
+    assert err is None, err
+    assert kwargs == {"query": "ESP32-S3", "limit": 5}
+    assert "interpreted 'mpn' as 'query'" in notes
+
+
+def test_ecad_find_part_category_is_a_real_parameter_not_an_alias():
+    """`category` was refused live, but it is a genuine FILTER, not a spelling
+    of `query` — aliasing it would have silently widened the search. The tool
+    grew the parameter instead; this pins that it is passed through untouched."""
+    kwargs, notes, err = _agent_reconcile("ecad_find_part", query="ESP32-S3",
+                                          category="MCU")
+    assert err is None, err
+    assert kwargs == {"query": "ESP32-S3", "category": "MCU"}
+    assert notes == []
+
+
+# --- 3. ecad_new_schematic(name)
+
+def test_ecad_new_schematic_title_alone_becomes_the_name():
+    kwargs, notes, err = _agent_reconcile("ecad_new_schematic",
+                                          title="Decoupling Capacitor Demo")
+    assert err is None, err
+    assert kwargs == {"name": "Decoupling Capacitor Demo"}
+    assert "interpreted 'title' as 'name'" in notes
+
+
+def test_ecad_new_schematic_drops_a_redundant_title_on_the_agent_path():
+    kwargs, notes, err = _agent_reconcile("ecad_new_schematic",
+                                          name="decoupling_demo",
+                                          title="Decoupling Capacitor Demo")
+    assert err is None, err
+    assert kwargs == {"name": "decoupling_demo"}  # the model's own `name` wins
+    assert any("ignored 'title'" in n for n in notes), notes
+
+
+def test_ecad_new_schematic_drop_is_visible_in_warnings_on_the_mcp_path():
+    """Deliberate asymmetry: the MCP wrapper has a free result-shaping seam so
+    it uses a `warnings` key; the agent path reports the same drop through its
+    existing notes channel (`arg_interpretation`). Never silent on either."""
+    payload = _server_call("ecad_new_schematic", {"name": "decoupling_demo",
+                                                  "title": "Decoupling Capacitor Demo"})
+    assert payload.get("ok") is True, payload
+    assert payload.get("name") == "decoupling_demo"
+    assert any("ignored 'title'" in w for w in payload.get("warnings", [])), payload
+
+
+# --- 4. apply_ascii_edits(kind, edits_json, ...)
+
+def test_apply_ascii_edits_accepts_an_edits_list():
+    """A tool named apply_ascii_EDITS refused `edits=[...]`. The name maps to
+    `edits_json` by affix already — what blocked it was the `str` annotation
+    against a decoded list, so `bind_value` serialises it back to the JSON text
+    the signature declares."""
+    edits = [{"op": "move", "ref": "R1", "to_cell": [12, 4]}]
+    kwargs, notes, err = _agent_reconcile("apply_ascii_edits", kind="pcb",
+                                          doc_id="pcb_001", edits=edits)
+    assert err is None, err
+    assert json.loads(kwargs["edits_json"]) == edits
+    assert "interpreted 'edits' as 'edits_json'" in notes
+
+
+def test_apply_ascii_edits_list_survives_pydantic_on_the_mcp_path():
+    """Renaming alone was NOT enough here: ToolManager validates against a
+    pydantic model, which rejects a list for `edits_json: str`. Reaching the
+    tool body (a doc error, not an argument error) is the proof."""
+    payload = _server_call("apply_ascii_edits", {
+        "kind": "pcb", "doc_id": "pcb_001",
+        "edits": [{"op": "move", "ref": "R1", "to_cell": [12, 4]}]})
+    assert payload.get("status") != "unknown_argument", payload
+    assert "invalid arguments" not in str(payload.get("error", "")), payload
+    assert payload.get("interpreted") == ["interpreted 'edits' as 'edits_json'"], payload
+
+
+def test_bind_value_only_touches_json_document_parameters():
+    assert recon.bind_value("edits_json", "str", [{"op": "move"}]) == '[{"op": "move"}]'
+    # not a *_json slot -> untouched, whatever the annotation says
+    assert recon.bind_value("edits", "str", [{"op": "move"}]) == [{"op": "move"}]
+    # a *_json slot that really wants a dict -> untouched
+    assert recon.bind_value("grid_json", "optional[dict]", {"a": 1}) == {"a": 1}
+    # scalars are never reshaped
+    assert recon.bind_value("edits_json", "str", "[]") == "[]"
+
+
+# --- 5. research_eng_calc: NOT an argument-name problem.
+
+def test_research_eng_calc_is_var_kw_so_this_layer_never_sees_its_args():
+    """Live 2026-07-29 the call was ACCEPTED and failed inside the formula
+    registry ("beam() missing 3 required positional arguments"). research_eng_calc
+    declares **kwargs, so reconciliation is bypassed entirely — no synonym here
+    could ever have reached it. Pinned so nobody re-files it against this table."""
+    fn = at._bind_tool("research_eng_calc")
+    assert fn is not None
+    assert at._signature_spec(fn)["var_kw"] is True
+    supplied = {"formula": "beam", "params": {"load_n": 2000, "span_mm": 500}}
+    kwargs, notes, err = at._reconcile_kwargs("research_eng_calc", fn, dict(supplied))
+    assert err is None and notes == []
+    assert kwargs == supplied  # handed through UNTOUCHED
+
+
+# --------------------------------------------------------------------- drop_descriptive guards
+
+def test_drop_descriptive_refuses_anything_not_on_the_allowlist():
+    """No heuristics. `fillet_name` looks every bit as cosmetic as `title`; it
+    is not on the list, so it is refused."""
+    params = ["doc_id"]
+    assert not recon.drop_descriptive("fillet_name", "outer", params, set())
+    assert not recon.drop_descriptive("material", "6061", params, set())
+    assert recon.drop_descriptive("title", "Outer fillet", params, set())
+
+
+def test_drop_descriptive_refuses_a_non_string_value():
+    """Constraint 4: structure, quantities and flags carry semantics whatever
+    the argument happens to be called."""
+    params = ["doc_id"]
+    assert not recon.drop_descriptive("label", {"face": 3}, params, set())
+    assert not recon.drop_descriptive("label", [1, 2, 3], params, set())
+    assert not recon.drop_descriptive("label", 12.5, params, set())
+    assert not recon.drop_descriptive("label", True, params, set())
+
+
+def test_drop_descriptive_never_shadows_a_free_parameter():
+    """Constraint 2: if any FREE parameter could have received the value,
+    refuse — an ignored value next to an empty slot is invisible."""
+    # `title` could be `title_block`: refuse.
+    assert not recon.drop_descriptive("title", "Sheet 1", ["title_block"], set())
+    # `title` -> `name` is a registered synonym for this tool: refuse the drop
+    # while the slot is free (resolve_unknown maps it instead).
+    syn = recon.synonyms_for("ecad_new_schematic")
+    assert not recon.drop_descriptive("title", "Demo", ["name"], set(), syn)
+    # once `name` is taken by the model's own argument, nothing can receive it.
+    assert recon.drop_descriptive("title", "Demo", ["name"], {"name"}, syn)
+
+
+def test_attach_warnings_appends_and_never_clobbers():
+    assert recon.attach_warnings({"ok": True}, ["w1"]) == {"ok": True, "warnings": ["w1"]}
+    merged = recon.attach_warnings({"ok": True, "warnings": ["pre"]}, ["w1"])
+    assert merged["warnings"] == ["pre", "w1"]
+    as_text = recon.attach_warnings("plain result", ["w1"])
+    assert "[warning] w1" in as_text
+    assert recon.attach_warnings({"ok": True}, []) == {"ok": True}
+
+
+# --------------------------------------------------------------------- live 2026-07-29, ECAD pass 2
+# ecad_simulate(kind='s-param', ports=[...], freq_start_hz=2e9, freq_stop_hz=3e9,
+# freq_points=201) -> all five refused. Real signature:
+#   ecad_simulate(analysis='op', params=None, probes=None, doc_id='', backend='mna')
+# with analysis in op/dc/tran/ac/four/mc/temp/noise (ecad_sim_tools.py:153-165).
+
+def test_ecad_simulate_kind_resolves_to_analysis():
+    """`analysis` is the discriminator `kind` names. Safe to alias ONLY because
+    an unrecognised value fails loudly ("unknown analysis <x>" + the vocabulary,
+    ecad_sim_tools.py:213) rather than defaulting to a different analysis."""
+    kwargs, notes, err = _agent_reconcile("ecad_simulate", kind="tran",
+                                          params={"tstep": 1e-6, "tstop": 1e-3})
+    assert err is None, err
+    assert kwargs["analysis"] == "tran"
+    assert "interpreted 'kind' as 'analysis'" in notes
+
+
+def test_ecad_simulate_still_refuses_the_s_parameter_port_arguments():
+    """CAPABILITY GAP, not a naming gap — pinned so nobody "fixes" it with an alias.
+
+    ecad_simulate is a SPICE circuit simulator: no S-parameter analysis, and no
+    port concept at all. The nearest S-param tools are em_driven (waveguide
+    standards, not a PCB net) and ecad_antenna_analyze (parametric antenna S11,
+    also not a board net), so there is nowhere honest to redirect `ports` to.
+    Aliasing any of these would make a nonsense call report success."""
+    _kwargs, _notes, err = _agent_reconcile(
+        "ecad_simulate", doc_id="ecadcpp0000001a", kind="s-param",
+        ports=[{"net": "ANT", "x": 7.3335, "y": -3.2}],
+        freq_start_hz=2e9, freq_stop_hz=3e9, freq_points=201)
+    assert err is not None
+    assert err["status"] == "unknown_argument"
+    assert set(err["unknown_params"]) == {"ports", "freq_start_hz",
+                                          "freq_stop_hz", "freq_points"}
+
+
+def test_unknown_argument_points_at_the_settings_dict_when_the_tool_has_one():
+    """freq_start/stop/points really do exist for an AC sweep — one level down,
+    as params={'fstart':..,'fstop':..,'points':..}. The payload says where such
+    settings live without CLAIMING these particular names map there."""
+    _kwargs, _notes, err = _agent_reconcile("ecad_simulate", analysis="ac",
+                                            freq_start_hz=2e9)
+    assert err is not None
+    assert err["settings_param"] == "params"
+    assert "inside the `params` dict" in err["error"]
+
+
+def test_settings_dict_pointer_is_silent_when_the_bag_was_already_supplied():
+    """No noise when the model already used it — the note would be wrong advice."""
+    _kwargs, _notes, err = _agent_reconcile("ecad_simulate", analysis="ac",
+                                            params={"fstart": 1.0},
+                                            freq_start_hz=2e9)
+    assert err is not None
+    assert "settings_param" not in err
+    assert "settings" not in err["error"]
+
+
+def test_export_part_payload_has_no_settings_pointer():
+    """export_part(fmt, path, doc_id) has no settings bag; the note must not
+    appear on tools that do not have one."""
+    _kwargs, _notes, err = _agent_reconcile("export_part", bogus_xyz="step")
+    assert err is not None
+    assert "settings_param" not in err

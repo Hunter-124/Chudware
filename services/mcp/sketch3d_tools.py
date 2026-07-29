@@ -543,6 +543,71 @@ def _profile_plane_ops(start: list, tangent: list) -> tuple:
     return plane_op, [0.0, 0.0], 0.0
 
 
+# ───────────────────── sweep `mode` value guard (silent-fall-through class) ───────────────────────
+#
+# The engine never validates a sweep's `mode`. core/doc/document.cpp:4274-4304 reads it as
+#     smode  = feat.value("mode", "boss")
+#     smerge = feat.value("merge", true) && (smode=="boss" || smode=="add" || smode=="cut")
+#     out    = (smode == "cut") ? cut(target, tool) : fuse_unify(target, tool)
+# — four TESTS and no vocabulary check, so an unrecognised value simply fails every test:
+# nothing merges, and the swept tube is committed as a second DISJOINT body. Measured on a
+# 50 mm cube with a Ø12 spine driven straight through it (2026-07-29, this engine):
+#     mode="cut"      ok=true   -5654.867 mm³   1 body    material removed, as asked
+#     mode="remove"   ok=true   +9047.787 mm³   2 bodies  material ADDED
+# "remove" is the plainest spelling of the intent, `boolean_mode='cut'` reconciles onto this
+# very parameter, and the wrong answer arrives as a successful build. Hence the value is
+# checked HERE — the tool is the only layer that can, and the failure direction is the
+# dangerous one.
+#
+#: The four values document.cpp actually tests for. A canonical value is forwarded
+#: BYTE-IDENTICAL: "add" stays "add" (it fuses exactly like "boss"), never rewritten.
+_PIPE_MODES = ("boss", "add", "cut", "new")
+#: Equivalent spellings a caller (or the argument-reconciliation affix rule) plausibly
+#: writes. Kept consistent with cad_doc_tools._BOOLEAN_MODES / _BOOLEAN_NEW_BODY, which
+#: map the same words for primitives, plus the pocket/protrusion words a sweep attracts.
+_PIPE_MODE_ALIASES = {
+    "union": "boss", "join": "boss", "fuse": "boss", "merge": "boss", "weld": "boss",
+    "additive": "boss", "protrusion": "boss", "pad": "boss", "material_add": "boss",
+    "subtract": "cut", "remove": "cut", "difference": "cut", "pocket": "cut",
+    "subtractive": "cut", "minus": "cut", "cutout": "cut", "cut_out": "cut",
+    "material_remove": "cut",
+    "new_body": "new", "newbody": "new", "separate": "new", "standalone": "new",
+    "disjoint": "new", "none": "new",
+}
+#: The vocabulary, named in the error the way ecad_simulate names its analyses.
+_PIPE_MODE_VALUES = ("'boss' (default — fuse the tube into the current body); "
+                     "'cut' (subtract it); 'new' (leave it as a separate body). "
+                     "Also accepted: union|join|fuse|merge|weld|additive|protrusion|pad "
+                     "-> boss; subtract|remove|difference|pocket|subtractive|minus|cutout "
+                     "-> cut; new_body|separate|standalone|none -> new")
+
+
+def _resolve_pipe_mode(mode: Any, merge: bool) -> str:
+    """Validate a sweep `mode` VALUE, case/whitespace-insensitively.
+
+    Returns the engine spelling (a canonical value passes through unchanged). Raises
+    ValueError naming the whole vocabulary for anything else — an unknown value used to
+    build a disjoint boss where the caller asked for a cut, reporting success.
+    """
+    raw = mode if isinstance(mode, str) else ("" if mode is None else str(mode))
+    word = raw.strip().lower()
+    canon = word if word in _PIPE_MODES else _PIPE_MODE_ALIASES.get(word)
+    if canon is None:
+        raise ValueError(
+            f"unknown sweep mode {raw!r} — nothing was built. Use one of: "
+            f"{_PIPE_MODE_VALUES}. An unrecognised mode does NOT error in the engine: it "
+            f"silently leaves the tube as a separate body, ADDING material.")
+    # merge=False switches the engine's boolean off entirely, so a "cut" would be committed
+    # as a standalone +volume body (measured: +9047.787 mm³ where -5654.867 was asked for).
+    # The two arguments contradict each other; say so instead of adding material.
+    if canon == "cut" and not merge:
+        raise ValueError(
+            "mode='cut' with merge=False cannot remove material — the engine only subtracts "
+            "a swept tool when it is merged into a body, so this would ADD the tube as a "
+            "separate solid. Pass merge=True to cut, or mode='new' for a separate body.")
+    return canon
+
+
 # ──────────────────────────────────────────── registration ───────────────────────────────────────
 
 def register_sketch3d_tools(mcp: FastMCP) -> None:
@@ -974,13 +1039,23 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         guide: optional guide-curve ref — a sketch3d/curve feature id or
           {"feature": fid, "wire": k}.  ONE guide max; must differ from the path; it drives
           profile orientation + SCALING along the path (SolidWorks Guide Curves).
-        mode: 'boss' (default) or 'cut'.  merge: fuse with existing bodies (default True).
+        mode: 'boss' (default — fuse into the current body), 'cut' (subtract the tube from
+          it), or 'new' (leave it as a separate body).  'add' is accepted as the engine's
+          synonym for boss, and equivalent words (union/join/fuse, subtract/remove/pocket,
+          new_body/separate) are mapped; ANY OTHER value is REJECTED rather than silently
+          building a disjoint boss where a cut was asked for.  merge: fuse with existing
+          bodies (default True) — merge=False plus mode='cut' is a contradiction and errors.
 
         Returns {ok, feature_ids {plane?, profile?, sweep}, body_count, volume_mm3,
         start_point, start_tangent, warning?}.  On a zero-volume/pierce error the engine
         names the actual gap distance — fix the profile location and retry.
         """
         try:
+            # FIRST, before any engine call: an out-of-vocabulary mode used to sail through
+            # to the engine, which tests the value without validating it and commits the
+            # swept tube as a separate body — reporting ok:true while ADDING material a
+            # 'cut' asked it to remove. Nothing is touched when this raises.
+            mode = _resolve_pipe_mode(mode, merge)
             d = _doc(doc_id)
             _find_sketch3d(d, sketch3d_id)
             if (diameter_mm is None) == (profile_sketch is None):

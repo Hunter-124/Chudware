@@ -104,13 +104,18 @@ def add_tool_from_dict(tool: dict) -> dict:
     Module-level seam shared by ``cam_add_tool`` and the parts-library
     ``cam_tool_import`` tool (services/mcp/parts_tools.py). Fills the same
     defaults cam_add_tool historically applied; raises when no CAM job is
-    current (callers surface that as data)."""
+    current, or when ``type`` is not a tool type the engine knows (callers
+    surface both as data)."""
     # LIVE-DIALECT guard: `dict(tool or {})` crashes on a stringified tool dict (a bare
     # ValueError with no naming of the offence) — this seam is shared with parts_tools.py's
     # cam_tool_import, which forwards a model-supplied `tool` verbatim. Coerce first.
     t = dict(require_mapping(tool, "tool", "a tool dict, e.g. {'number':1,'type':'endmill_flat'}")) if tool else {}
     number = int(t.get("number", 0))
-    t.setdefault("type", "endmill_flat")
+    # VALUE guard (not a shape guard): tool_type_from_string falls back to a FLAT ENDMILL
+    # for anything it does not recognise, so a wrong-but-plausible type silently rewrites
+    # the tool AND the cutting-data class feeds/speeds resolves from it. Canonicalize here,
+    # before the name is derived from it, so the record and its label agree.
+    t["type"] = _resolve_tool_type(t.get("type") or "endmill_flat")
     t.setdefault("diameter", 6.0)
     t.setdefault("flutes", 2)
     t.setdefault("corner_radius", 0.0)
@@ -141,6 +146,159 @@ def existing_tool_numbers() -> list[int]:
         except (TypeError, ValueError, AttributeError):
             continue
     return sorted(set(nums))
+
+
+# ───────────────── tool `type` value guard (silent-fall-through class) ────────────────────
+#
+# core/cam/model.cpp:100 resolves the string with
+#     ToolType tool_type_from_string(const std::string& s)
+#         { return lookup_rev(kTool, s, ToolType::EndmillFlat); }
+# — an unknown value falls back to a FLAT ENDMILL, silently. Nothing downstream ever sees
+# the string the caller wrote, so the tool record, the cutting-data class the feeds/speeds
+# calculator resolves, and every rpm/feed derived from it are all wrong while the call
+# reports success. Measured against this engine (2026-07-29), stored `type` in cam_tree:
+#     "drill"     -> drill          (correct)
+#     "ball"      -> endmill_flat   (a ball nose became a flat endmill)
+#     "DRILL"     -> endmill_flat   (case alone silently changed the tool)
+#     "driller"   -> endmill_flat   name kept "T5 driller", type did not
+# `cutter_type='drill'` reconciles onto this parameter, so the plausible-but-wrong value is
+# exactly what arrives. A rejection costs one turn; wrong feeds/speeds cost a part, so the
+# value is validated strictly here.
+#
+#: Mirror of core/cam/model.cpp's kTool table (all 24 rows, in table order). Used as the
+#: floor when the engine is unreachable; the live ``cam_tool_types`` RPC is folded in below
+#: so a type the engine gains is never rejected by a stale copy of this list.
+_TOOL_TYPES_KTOOL = (
+    "endmill_flat", "endmill_ball", "endmill_bull", "chamfer_mill", "face_mill", "vbit",
+    "slot_mill", "dovetail_mill", "thread_mill", "drill", "spot_drill", "center_drill",
+    "tap", "reamer", "boring_bar", "turning_general", "grooving_tool", "threading_tool",
+    "parting_tool", "boring_bar_id", "laser_head", "plasma_torch", "waterjet_head", "probe",
+)
+#: Equivalent spellings a caller plausibly writes for a type that exists. Every entry maps
+#: to the tool the words plainly mean — never a near-miss guess (a bare "mill" or "cutter"
+#: names no specific tool and stays rejected, because picking one would be the very silent
+#: substitution this guard exists to stop).
+_TOOL_TYPE_ALIASES = {
+    "flat": "endmill_flat", "endmill": "endmill_flat", "end_mill": "endmill_flat",
+    "flat_endmill": "endmill_flat", "endmill_square": "endmill_flat",
+    "square_endmill": "endmill_flat", "flatmill": "endmill_flat",
+    "ball": "endmill_ball", "ballnose": "endmill_ball", "ball_nose": "endmill_ball",
+    "ballmill": "endmill_ball", "ball_endmill": "endmill_ball",
+    "ball_end_mill": "endmill_ball", "endmill_ballnose": "endmill_ball",
+    "bull": "endmill_bull", "bullnose": "endmill_bull", "bull_nose": "endmill_bull",
+    "torus": "endmill_bull", "toroidal": "endmill_bull", "corner_radius": "endmill_bull",
+    "chamfer": "chamfer_mill", "chamfermill": "chamfer_mill",
+    "facemill": "face_mill", "shell_mill": "face_mill",
+    "v_bit": "vbit", "vcarve": "vbit", "engraver": "vbit", "engraving_bit": "vbit",
+    "slotmill": "slot_mill", "slotting_mill": "slot_mill",
+    "dovetail": "dovetail_mill",
+    "threadmill": "thread_mill", "thread_milling_cutter": "thread_mill",
+    "drill_bit": "drill", "twist_drill": "drill", "driller": "drill", "jobber": "drill",
+    "spotdrill": "spot_drill", "spotting_drill": "spot_drill",
+    "centerdrill": "center_drill", "centre_drill": "center_drill",
+    "tapping_tool": "tap", "thread_tap": "tap",
+    "boringbar": "boring_bar", "boring": "boring_bar",
+    "id_boring_bar": "boring_bar_id", "internal_boring_bar": "boring_bar_id",
+    "turning_tool": "turning_general", "turning": "turning_general",
+    "grooving": "grooving_tool", "groover": "grooving_tool",
+    "threading": "threading_tool",
+    "parting": "parting_tool", "parting_blade": "parting_tool", "cutoff": "parting_tool",
+    "laser": "laser_head", "plasma": "plasma_torch", "waterjet": "waterjet_head",
+    "probe_tool": "probe", "touch_probe": "probe",
+}
+#: Engine-reported ids, folded in on first use (the RPC is authoritative; the mirror above
+#: only guarantees the guard still works when the engine cannot be reached).
+_TOOL_TYPES_CACHE: dict = {"ids": None}
+
+
+def _tool_type_vocabulary() -> tuple[str, ...]:
+    """Accepted ``type`` ids: the engine's own ``cam_tool_types`` list unioned with the
+    kTool mirror.
+
+    The engine's answer is cached (the enum cannot change while it runs), but ONLY when the
+    RPC actually answered — a momentarily-unreachable engine must not pin the mirror-only
+    floor for the rest of the process."""
+    ids = _TOOL_TYPES_CACHE["ids"]
+    if ids is not None:
+        return ids
+    live: list[str] = []
+    try:
+        for row in (cb.call("cam_tool_types", {}).get("tool_types") or []):
+            tid = row.get("id") if isinstance(row, dict) else row
+            if isinstance(tid, str) and tid:
+                live.append(tid)
+    except Exception:  # noqa: BLE001 — engine unreachable; the mirror alone is the floor
+        return tuple(_TOOL_TYPES_KTOOL)
+    ids = tuple(_TOOL_TYPES_KTOOL) + tuple(t for t in live if t not in _TOOL_TYPES_KTOOL)
+    _TOOL_TYPES_CACHE["ids"] = ids
+    return ids
+
+
+def _resolve_tool_type(value: Any) -> str:
+    """Validate a CAM tool ``type``, case/whitespace-insensitively.
+
+    A canonical id passes through unchanged; a plain equivalent spelling is mapped. Anything
+    else raises ValueError naming the whole vocabulary, because the engine would otherwise
+    substitute a flat endmill and feed the wrong cutting-data class to feeds/speeds."""
+    raw = value if isinstance(value, str) else ("" if value is None else str(value))
+    word = raw.strip().lower()
+    vocab = _tool_type_vocabulary()
+    if word in vocab:
+        return word
+    canon = _TOOL_TYPE_ALIASES.get(word)
+    if canon in vocab:
+        return canon
+    raise ValueError(
+        f"unknown tool type {raw!r} — no tool was added. Use one of: "
+        + ", ".join(vocab)
+        + " (cam_tool_types() lists them with their cutting-data class). Short forms are "
+        "accepted too: flat|endmill -> endmill_flat; ball|ballnose -> endmill_ball; "
+        "bull|bullnose -> endmill_bull; chamfer -> chamfer_mill; facemill -> face_mill; "
+        "v_bit|vcarve -> vbit; drill_bit|twist_drill -> drill. An unrecognised type does "
+        "NOT error in the engine: it silently becomes endmill_flat, so the feeds/speeds "
+        "you get back would be a flat endmill's.")
+
+
+# ───────────────── extract `kind` value guard (same silent-fall-through) ───────────────────
+#
+# core/cam/extract.cpp:343-366 chains if/else-if on `kind` and its final ``else`` is the
+# "all" payload — so an unrecognised kind quietly returns "all" instead of what was asked
+# for. Measured (2026-07-29) on a 50x50x10 plate, response keys:
+#     kind="section"  -> [bbox, regions]                    the planar regions asked for
+#     kind="regions"  -> [bbox, holes, mesh, points, stock]  NO regions at all
+#     kind="STOCK"    -> [bbox, holes, mesh, points, stock]  case alone changed the answer
+# The consequence is milder than a wrong tool (a caller reading ["regions"] gets a KeyError
+# rather than bad geometry), but it is the same defect, so it gets the same treatment.
+_EXTRACT_KINDS = ("all", "stock", "mesh", "section", "sections", "holes", "profile")
+_EXTRACT_KIND_ALIASES = {
+    "regions": "section", "region": "section", "slice": "section",
+    "cross_section": "section", "z_section": "section",
+    "levels": "sections", "waterline": "sections", "z_levels": "sections",
+    "slices": "sections",
+    "drill_points": "holes", "drills": "holes", "hole": "holes", "points": "holes",
+    "silhouette": "profile", "turning_profile": "profile",
+    "bbox": "stock", "bounds": "stock", "stock_bounds": "stock",
+    "triangles": "mesh", "tessellation": "mesh", "tris": "mesh",
+    "everything": "all", "": "all",
+}
+
+
+def _resolve_extract_kind(value: Any) -> str:
+    """Validate a ``cam_extract`` kind, case/whitespace-insensitively."""
+    raw = value if isinstance(value, str) else ("" if value is None else str(value))
+    word = raw.strip().lower()
+    if word in _EXTRACT_KINDS:
+        return word
+    canon = _EXTRACT_KIND_ALIASES.get(word)
+    if canon:
+        return canon
+    raise ValueError(
+        f"unknown extract kind {raw!r} — nothing was extracted. Use one of: "
+        + " | ".join(_EXTRACT_KINDS)
+        + ". Also accepted: regions|slice -> section; levels|waterline -> sections; "
+        "drill_points|points -> holes; silhouette -> profile; bounds -> stock; "
+        "triangles -> mesh. An unrecognised kind does NOT error in the engine: it returns "
+        "the 'all' payload, which carries no `regions` and no `profile`.")
 
 
 def register_cam_tools(mcp: FastMCP) -> None:
@@ -208,12 +366,18 @@ def register_cam_tools(mcp: FastMCP) -> None:
                      tool_material: str = "carbide", tip_angle: float = 0.0,
                      thread_pitch: float = 0.0) -> str:
         """Add (or replace by number) a tool in the library. type: endmill_flat|endmill_ball|
-        endmill_bull|chamfer_mill|face_mill|vbit|drill|spot_drill|center_drill|tap|reamer|
-        boring_bar|thread_mill|turning_general|grooving_tool|threading_tool|parting_tool|
-        laser_head|plasma_torch|waterjet_head|probe (cam_tool_types lists all)."""
+        endmill_bull|chamfer_mill|face_mill|vbit|slot_mill|dovetail_mill|thread_mill|drill|
+        spot_drill|center_drill|tap|reamer|boring_bar|boring_bar_id|turning_general|
+        grooving_tool|threading_tool|parting_tool|laser_head|plasma_torch|waterjet_head|
+        probe (cam_tool_types lists all, with each one's cutting-data class).
+
+        An unknown type is REJECTED, naming the vocabulary: the engine would otherwise
+        substitute a flat endmill without a word, and every feed/speed derived from the
+        tool would be a flat endmill's. Plain short forms are mapped (ball|ballnose ->
+        endmill_ball, flat|endmill -> endmill_flat, chamfer -> chamfer_mill, ...)."""
         try:
             tool = {"number": number, "type": type, "diameter": diameter, "flutes": flutes,
-                    "corner_radius": corner_radius, "name": name or f"T{number} {type}",
+                    "corner_radius": corner_radius, "name": name,
                     "tool_material": tool_material, "tip_angle": tip_angle, "thread_pitch": thread_pitch}
             return _dumps(add_tool_from_dict(tool))
         except Exception as e:  # noqa: BLE001
@@ -401,9 +565,14 @@ def register_cam_tools(mcp: FastMCP) -> None:
                     deflection: float = 0.1) -> str:
         """Extract CAM geometry FROM THE CURRENT PART (or a `path` to a STEP/IGES/BREP/STL).
         kind: all | stock | mesh | section (at z) | sections (at z_levels) | holes | profile.
+        An unknown kind is REJECTED rather than silently answered with the "all" payload
+        (which carries no `regions` and no `profile`); plain equivalents are mapped
+        (regions -> section, levels|waterline -> sections, drill_points -> holes).
         Returns stock bounds, a mesh, planar Z-section regions, Z-axis drill points, and/or a
         turning profile — feed these straight into cam_add_setup/cam_add_operation geometry."""
         try:
+            # Validate BEFORE the STEP export below: a bad kind should cost nothing.
+            kind = _resolve_extract_kind(kind)
             p = path
             if not p:
                 # export the current part to a temp STEP, then extract

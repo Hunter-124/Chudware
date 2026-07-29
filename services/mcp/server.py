@@ -651,6 +651,10 @@ from mcp.server.fastmcp.exceptions import ToolError as _ToolError
 
 from services.agent.arg_reconciliation import (
     annotation_admits as _annotation_admits,
+    attach_warnings as _attach_warnings,
+    bind_value as _bind_value,
+    drop_descriptive as _drop_descriptive,
+    dropped_note as _dropped_note,
     norm_arg as _norm_arg,
     resolve_unknown as _resolve_unknown,
     synonyms_for as _synonyms_for,
@@ -844,6 +848,7 @@ def _install_arg_teaching(server) -> None:
                                   convert_result=convert_result)
         meta = _arg_meta(tool)
         notes: list[str] = []
+        dropped: list[str] = []
         if arguments and not meta["varkw"] and not meta["accepted"].issuperset(arguments):
             known, unresolved = {}, []
             for k, v in arguments.items():
@@ -858,9 +863,20 @@ def _install_arg_teaching(server) -> None:
                 target = _resolve_unknown(k, arguments[k], meta["names"], meta["ann"],
                                           taken, synonyms)
                 if target is None:
+                    if _drop_descriptive(k, arguments[k], meta["names"], taken, synonyms):
+                        # Purely-cosmetic label with no free slot: ignore it
+                        # instead of refusing an otherwise-correct call. It goes
+                        # in `warnings` here, while the built-in agent path
+                        # reports the same drop through `arg_interpretation`;
+                        # that asymmetry is deliberate (agent_turn's
+                        # _reconcile_kwargs has only its notes channel and a
+                        # 3-tuple a dozen callers unpack). Never silent, either way.
+                        dropped.append(_dropped_note(k, name))
+                        continue
                     still_unknown.append(k)
                 else:
-                    known[target] = arguments[k]
+                    known[target] = _bind_value(target, meta["ann"].get(target, ""),
+                                                arguments[k])
                     taken.add(target)
                     notes.append(f"interpreted {k!r} as {target!r}")
             if still_unknown:
@@ -872,21 +888,24 @@ def _install_arg_teaching(server) -> None:
 
         try:
             result = await original(name, arguments, context=context,
-                                    convert_result=convert_result and not notes)
+                                    convert_result=convert_result
+                                    and not notes and not dropped)
         except _ToolError as exc:
             payload = _validation_payload(tool, meta, arguments, exc)
             if payload is None:
                 raise
             return _emit_payload(tool, payload, convert_result)
 
+        if dropped:
+            result = _attach_warnings(result, dropped)
         if notes:
-            annotated = _annotate_interpreted(result, notes)
-            if not convert_result:
-                return annotated
+            result = _annotate_interpreted(result, notes)
+        if (notes or dropped) and convert_result:
             try:
-                return tool.fn_metadata.convert_result(annotated)
-            except Exception:  # noqa: BLE001 - never lose a good result over a note
                 return tool.fn_metadata.convert_result(result)
+            except Exception:  # noqa: BLE001 - never lose a good result over a note
+                return tool.fn_metadata.convert_result(await original(
+                    name, arguments, context=context, convert_result=False))
         return result
 
     manager.call_tool = call_tool

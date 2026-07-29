@@ -57,6 +57,7 @@ from mcp_server.sketch3d_tools import (  # noqa: E402
     _curves_to_entities,
     _free_narration,
     _polyline_length,
+    _resolve_pipe_mode,
     _sample_polyline,
 )
 
@@ -198,6 +199,63 @@ class TestFreeNarration:
 
     def test_empty(self):
         assert _free_narration([]) == ""
+
+
+class TestResolvePipeMode:
+    """The sweep `mode` VALUE guard, without the engine.
+
+    Vocabulary source: core/doc/document.cpp:4274-4304 — the only four values the sweep
+    compile branch tests for. Everything else used to reach the engine and become a
+    disjoint boss, so these are contract assertions, not spelling preferences."""
+
+    def test_canonical_values_pass_through_byte_identical(self):
+        for word in ("boss", "add", "cut", "new"):
+            assert _resolve_pipe_mode(word, True) == word
+
+    def test_cut_synonyms(self):
+        for word in ("cut", "subtract", "remove", "difference", "pocket", "minus",
+                     "cutout", "subtractive", "CUT", "  Remove  "):
+            assert _resolve_pipe_mode(word, True) == "cut", word
+
+    def test_boss_synonyms(self):
+        for word in ("boss", "union", "join", "fuse", "merge", "weld", "pad",
+                     "protrusion", "BOSS", " Union "):
+            assert _resolve_pipe_mode(word, True) == "boss", word
+
+    def test_new_body_synonyms(self):
+        for word in ("new", "new_body", "newbody", "separate", "standalone", "none"):
+            assert _resolve_pipe_mode(word, True) == "new", word
+
+    def test_unknown_value_raises_naming_the_vocabulary(self):
+        with pytest.raises(ValueError) as ei:
+            _resolve_pipe_mode("obliterate", True)
+        msg = str(ei.value)
+        assert "obliterate" in msg
+        for word in ("'boss'", "'cut'", "'new'"):
+            assert word in msg, (word, msg)
+
+    def test_empty_and_non_string_are_rejected_not_defaulted(self):
+        # "" / None used to reach the engine and fall through to a disjoint body.
+        for bad in ("", "   ", None, 0, ["cut"]):
+            with pytest.raises(ValueError):
+                _resolve_pipe_mode(bad, True)
+
+    def test_cut_with_merge_false_is_a_contradiction(self):
+        with pytest.raises(ValueError) as ei:
+            _resolve_pipe_mode("cut", False)
+        assert "merge" in str(ei.value)
+        # boss/new are unaffected — merge=False is their normal "separate body" case.
+        assert _resolve_pipe_mode("boss", False) == "boss"
+        assert _resolve_pipe_mode("new", False) == "new"
+
+    def test_alias_table_agrees_with_the_primitive_boolean_table(self):
+        """cad_doc_tools maps the same words for primitives. Two tables that disagree on
+        what "remove" means is the drift this asserts against."""
+        from mcp_server.cad_doc_tools import _BOOLEAN_MODES, _BOOLEAN_NEW_BODY
+        for word, want in _BOOLEAN_MODES.items():
+            assert _resolve_pipe_mode(word, True) in (want, "add"), (word, want)
+        for word in _BOOLEAN_NEW_BODY:
+            assert _resolve_pipe_mode(word, True) == "new", word
 
 
 # ─────────────────────────────── engine-backed MCP tool tests ─────────────────
@@ -393,6 +451,99 @@ class TestSketch3dDocTools:
             "name": "p", "doc_id": d, "points": [[0, 0, 0], [0, 0, 10]]})
         r, _ = _call("sketch3d_pipe", {"sketch3d_id": r0["id"], "doc_id": d})
         assert r and r.get("ok") is False and "exactly one" in r["error"]
+
+    # ── sweep `mode` VALUE guard (silent-fall-through regression) ────────────
+    #
+    # The engine never validates a sweep's mode: core/doc/document.cpp:4274-4304 only
+    # TESTS it ("boss"|"add"|"cut"), so an unrecognised value failed every test, nothing
+    # merged, and the tube was committed as a second disjoint body — ok:true while ADDING
+    # material a 'cut' asked it to remove. Measured before the fix on this fixture:
+    #   mode="cut"    -5654.867 mm³   mode="remove"  +9047.787 mm³ (both ok:true)
+
+    def _block_and_spine(self, name: str) -> tuple:
+        """A 50 mm cube plus a Ø12-capable spine driven straight through it.
+
+        Returns (doc_id, sketch3d_id, volume_before)."""
+        d = self._new_part(name)
+        rb, _ = _call("add_features", {"doc_id": d, "ops": [
+            {"op": "add_feature", "feature": {
+                "type": "box", "name": "Block",
+                "params": {"length": 50, "width": 50, "height": 50, "centered": True}}}]})
+        assert rb and rb.get("ok"), rb
+        m = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 1.0})
+        v0 = round(m["mass_g"] * 1000.0, 3)
+        assert abs(v0 - 125000.0) < 1.0, v0
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "spine", "doc_id": d, "points": [[0, 0, -40], [0, 0, 40]]})
+        assert r0 and r0.get("ok"), r0
+        return d, r0["id"], v0
+
+    def _pipe_delta(self, name: str, **kw) -> tuple:
+        """(response, volume_delta_mm3, body_count_after) for one pipe call."""
+        d, fid, v0 = self._block_and_spine(name)
+        r, _ = _call("sketch3d_pipe", {"sketch3d_id": fid, "diameter_mm": 12,
+                                       "doc_id": d, **kw})
+        m = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 1.0})
+        return r, round(m["mass_g"] * 1000.0 - v0, 3), m.get("body_count"), d
+
+    def test_pipe_cut_removes_and_boss_adds_material(self):
+        """The two canonical modes must move the volume in OPPOSITE directions."""
+        rc, dcut, nc, _ = self._pipe_delta("s3d_pipe_mode_cut", mode="cut")
+        assert rc and rc.get("ok"), rc
+        rb, dboss, nb, _ = self._pipe_delta("s3d_pipe_mode_boss", mode="boss")
+        assert rb and rb.get("ok"), rb
+        # cut REMOVES (the Ø12 bore through a 50 cube), boss ADDS (the tube's exterior).
+        assert dcut < -5000.0, dcut
+        assert dboss > 3000.0, dboss
+        # Both fuse into ONE body — the "no merge happened" signature is 2.
+        assert nc == 1 and nb == 1, (nc, nb)
+
+    def test_pipe_cut_synonyms_still_remove_material(self):
+        """'remove'/'subtract'/'pocket' and a shouted/padded 'cut' all mean cut.
+
+        Every one of these used to ADD ~+9048 mm³ as a disjoint body."""
+        for i, word in enumerate(["remove", "subtract", "pocket", "CUT", "  cut  "]):
+            r, delta, bodies, _ = self._pipe_delta(f"s3d_pipe_syn{i}", mode=word)
+            assert r and r.get("ok"), (word, r)
+            assert delta < -5000.0, (word, delta)
+            assert bodies == 1, (word, bodies)
+
+    def test_pipe_boss_synonyms_and_new_body_mode(self):
+        r, delta, bodies, _ = self._pipe_delta("s3d_pipe_union", mode="union")
+        assert r and r.get("ok") and delta > 3000.0 and bodies == 1, (r, delta, bodies)
+        # "add" is the engine's own second spelling of boss — forwarded untouched.
+        r, delta, bodies, _ = self._pipe_delta("s3d_pipe_add", mode="add")
+        assert r and r.get("ok") and delta > 3000.0 and bodies == 1, (r, delta, bodies)
+        # "new" deliberately leaves a SEPARATE body (the whole tube's volume).
+        r, delta, bodies, _ = self._pipe_delta("s3d_pipe_newbody", mode="new")
+        assert r and r.get("ok") and delta > 8000.0 and bodies == 2, (r, delta, bodies)
+
+    def test_pipe_unknown_mode_errors_and_leaves_doc_untouched(self):
+        """The negative case: reject, name the vocabulary, and build NOTHING."""
+        d, fid, v0 = self._block_and_spine("s3d_pipe_badmode")
+        feats0 = len(cb.call("doc_tree", {"doc_id": d})["tree"]["features"])
+        r, _ = _call("sketch3d_pipe", {"sketch3d_id": fid, "diameter_mm": 12,
+                                       "mode": "obliterate", "doc_id": d})
+        assert r and r.get("ok") is False, r
+        err = r["error"]
+        assert "obliterate" in err, err
+        for word in ("boss", "cut", "new"):
+            assert f"'{word}'" in err, (word, err)
+        # No plane, no profile sketch, no sweep — and the volume is bit-for-bit the same.
+        m = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 1.0})
+        assert round(m["mass_g"] * 1000.0, 3) == v0, (m, v0)
+        assert len(cb.call("doc_tree", {"doc_id": d})["tree"]["features"]) == feats0
+
+    def test_pipe_cut_with_merge_false_is_rejected_not_silently_added(self):
+        """merge=False switches the engine's boolean off, so a 'cut' would land as a
+        +9048 mm³ separate body. The contradiction must error instead."""
+        d, fid, v0 = self._block_and_spine("s3d_pipe_cut_nomerge")
+        r, _ = _call("sketch3d_pipe", {"sketch3d_id": fid, "diameter_mm": 12,
+                                       "mode": "cut", "merge": False, "doc_id": d})
+        assert r and r.get("ok") is False, r
+        assert "merge" in r["error"] and "cut" in r["error"], r["error"]
+        m = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 1.0})
+        assert round(m["mass_g"] * 1000.0, 3) == v0, (m, v0)
 
     # ── T-3DEQ: eq_curve3d ───────────────────────────────────────────────────
 

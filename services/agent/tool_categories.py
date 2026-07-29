@@ -197,6 +197,56 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "set_view",
         "set_titleblock",
     ],
+    # Reverse engineering. There was NO reveng pack at all until 2026-07-28, so
+    # the general_agent lane — the universal entry point for every request — could
+    # not reach this discipline by any route. A live reveng sweep watched the model
+    # try reveng_start_session, reveng_status and reverse_engineer and be told
+    # "not in allowed list" for all three: a whole advertised discipline
+    # unreachable, not merely awkward.
+    #
+    # Explicit names, no family: token, because the registered names are NOT all
+    # `reveng_`-prefixed — the session/query half is verb-first
+    # (list_reveng_sessions, get_reveng_coverage, describe_reveng_result,
+    # import_scan_mesh, export_reveng_bundle). Every name below was verified to
+    # bind via agent_turn._bind_tool; the `reveng_`-prefixed spellings of the
+    # verb-first tools do NOT exist, so do not "tidy" these into a prefix.
+    "reveng": [
+        # Session lifecycle + evidence intake.
+        "reveng_status",
+        "reveng_start_session",
+        "reveng_add_images",
+        "reveng_add_video",
+        "reveng_ingest_datasheet",
+        "reveng_set_scale",
+        "reveng_print_scale_mat",
+        "list_reveng_sessions",
+        "get_reveng_session",
+        # Reconstruction gate + build.
+        "reveng_gate_status",
+        "reveng_resolve_gate",
+        "reveng_reconstruct",
+        "reveng_single_photo",
+        "reveng_fit_primitives",
+        "reveng_build_parametric",
+        "reveng_attach_result",
+        "reveng_make_part_from_library",
+        "reveng_research_source",
+        # Results, verification, export.
+        "get_reveng_coverage",
+        "get_reveng_deviation",
+        "describe_reveng_result",
+        "list_reveng_dims",
+        "export_reveng_bundle",
+        "import_scan_mesh",
+        # The recon-family entry path + the geometry checks an RE job needs.
+        "reverse_engineer",
+        "compare_parts",
+        "convert_face_to_sketch",
+        "project_into_sketch",
+        "start_capture_session",
+        "stop_capture_session",
+        "import_part",
+    ],
     "advisor": [
         "family:advisor",
         "advise",
@@ -251,6 +301,7 @@ _CATEGORY_DESCS: dict[str, str] = {
     "assembly": "Components, mates, stackup and fit calcs",
     "sourcing": "Parts catalog search/place, BOM, vendors, scrape import",
     "drawing": "2D drawings, GD&T, export PDF/DXF",
+    "reveng": "Reverse engineering: scan/photo/datasheet intake, reconstruct, verify deviation",
     "advisor": "Stage advisory checks and dispute",
     "delegate": "Subagents, ask_user, ledger/dag/buildgraph",
     "sheetmetal": "Sheet-metal flanges/bends via add_features + bend calcs",

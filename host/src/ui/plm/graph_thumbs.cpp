@@ -18,6 +18,41 @@
 #include "stb_image.h"
 
 namespace ui {
+// ---- shared PNG -> GL texture (declared in graph_thumbs.h) -------------------
+
+bool plmLoadPngTexture(const std::string &pngPath, unsigned int &tex, int &w,
+                       int &h) {
+  int iw = 0, ih = 0, n = 0;
+  unsigned char *px = stbi_load(pngPath.c_str(), &iw, &ih, &n, 4);
+  if (!px || iw <= 0 || ih <= 0) {
+    if (px)
+      stbi_image_free(px);
+    return false;
+  }
+  GLuint id = 0;
+  glGenTextures(1, &id);
+  glBindTexture(GL_TEXTURE_2D, id);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, iw, ih, 0, GL_RGBA,
+               GL_UNSIGNED_BYTE, px);
+  stbi_image_free(px);
+  tex = (unsigned int)id;
+  w = iw;
+  h = ih;
+  return true;
+}
+
+void plmFreePngTexture(unsigned int &tex) {
+  if (!tex)
+    return;
+  GLuint id = (GLuint)tex;
+  glDeleteTextures(1, &id);
+  tex = 0;
+}
+
 namespace {
 
 struct TexSlot {
@@ -74,24 +109,11 @@ std::string fnvKey(const std::string &s) {
 }
 
 bool loadTextureFromFile(const std::string &pngPath, TexSlot &slot) {
-  int w = 0, h = 0, n = 0;
-  unsigned char *px = stbi_load(pngPath.c_str(), &w, &h, &n, 4);
-  if (!px || w <= 0 || h <= 0) {
-    if (px)
-      stbi_image_free(px);
+  unsigned int tex = 0;
+  int w = 0, h = 0;
+  if (!plmLoadPngTexture(pngPath, tex, w, h))
     return false;
-  }
-  GLuint tex = 0;
-  glGenTextures(1, &tex);
-  glBindTexture(GL_TEXTURE_2D, tex);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-               px);
-  stbi_image_free(px);
-  slot.tex = tex;
+  slot.tex = (GLuint)tex;
   slot.w = w;
   slot.h = h;
   return true;

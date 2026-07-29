@@ -556,3 +556,69 @@ integration).** All additive; schema string stays `aicad.plm/1`.
 | tool | request | response |
 |---|---|---|
 | `plm_record_outside` | `{path}` | `{ok, committed}` (+`commit, entry` when committed) — cut ONE `auto` entry capturing on-disk changes made outside the editor; no-op (`committed:false`) when the working tree already matches history |
+
+**B.5 Graphical diffs + the recipe/solved storage line (2026-07).** All additive;
+schema string stays `aicad.plm/1`. No new shadow-tree path, no new lifecycle state.
+
+*The line itself, stated once and normatively.* The **recipe is the source code**
+and the **solved model is the build artifact**. `document.json` (canonical, §0) is
+the sole tracked source of truth: reverting it and rebuilding reproduces the model
+exactly, so nothing derived from it earns vault disk. Concretely, at the vault
+boundary `explode_container` drops:
+
+| dropped | why |
+|---|---|
+| `cache.json`, `cache.aicm`, `cache.brep` | tessellation + B-rep cold-open caches (B.4) |
+| `studies/<id>/results.*` | **solved** FEA/CFD result sets — capped at 20 MB *each* in the live container, and regenerable by re-running the study |
+
+and keeps `studies/<id>.json` — a study **definition** (material, fixtures, loads,
+mesh density) is recipe, not result. `geometry.step` stays the single deliberate
+exception (§5.4): frozen into **release commits only**, so a released rev is
+byte-exact forever even if the rebuild engine later evolves. `plm_release` now
+actually produces those bytes (`services/plm/release.py:freeze_geometry_step`
+rebuilds the recipe and calls the engine's `doc_export_step`); the freeze is
+**best-effort** — no engine, or an unbuildable recipe, means the release still
+succeeds and reports `geometry_frozen: false`.
+
+*Graphical diffs.* `plm_compare` still orchestrates rather than re-specifies (§7),
+but its OPTIONAL `visual` half now returns **rendered images of the difference**,
+not merely two renders side by side. Added is always what exists in **B** (newer)
+only; removed is what existed in **A** (older) only. Colours are fixed so every
+surface — engine render, Python vector differ, GUI legend — agrees:
+
+| meaning | RGB | hex |
+|---|---|---|
+| added | `41, 184, 82` | `#29B852` |
+| removed | `219, 61, 61` | `#DB3D3D` |
+| unchanged | `158, 163, 171` | `#9EA3AB` |
+
+- **Parts / assemblies** route through the new engine RPC `doc_render_diff`
+  (`core/doc/session.cpp`), which reuses `eval_compare`'s shape resolution and the
+  same OCCT booleans `compare_shapes` already computes — `Common(a,b)` unchanged,
+  `Cut(a,b)` removed, `Cut(b,a)` added — and then *renders* them instead of
+  discarding the shapes. Unchanged material is drawn **ghosted** so an interior
+  change (a new bore, a deepened pocket) is still visible; `mode:"changes_only"`
+  drops it entirely. Every view and both modes share ONE camera framing, computed
+  from `A ∪ B`, so the images register and can be flipped between without shift.
+- **Drawings and ECAD layouts** route through the pure-Python vector differ
+  (`services/plm/visual_diff.py`), which set-diffs quantized strokes and paints
+  them in a shared frame. ECAD needs **no engine at all** — the stored document
+  carries the whole layout — so a board diff works on a machine without
+  `libchudware`. A moved element correctly shows as removed-red *plus* added-green.
+- A registered pixel diff is the universal fallback and replaces the former 50%
+  alpha blend, which was an overlay, not a diff.
+
+`eval_compare` remains the response key (§7). Its additive OPTIONAL fields:
+`identical`, `added_volume_mm3`, `removed_volume_mm3`, `diff_3d`,
+`diff_3d_changes_only`, `diff_3d_views` (`{ISO,FRONT,TOP}`), `diff_2d`,
+`diff_pixel`, `counts`. Every path is an absolute PNG that exists on disk; a
+render that failed yields `null`, never a broken path. The block still degrades to
+`{degraded: true, reason, hint}` — with the semantic `doc_diff` half unaffected —
+when the engine is absent, and an engine predating `doc_render_diff` degrades to
+`match_pct` + `diff_pixel` rather than failing.
+
+**Diff renders are themselves solved state and are NEVER committed.** They are
+written to a caller-supplied `out_dir` (a temp dir by default) and are disposable.
+
+**B.5 additive tool slot** — none. `plm_compare` gains an OPTIONAL `views`
+(subset of `ISO`/`FRONT`/`TOP`) and an OPTIONAL `out_dir`; both default sensibly.

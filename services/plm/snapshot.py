@@ -44,12 +44,39 @@ _META = "meta.json"  # container-level meta (NOT the PLM meta.json — kept unde
 # so the PLM meta.json (history metadata) never collides with it.
 _KNOWN_CONTAINER_ENTRIES = {_DOCUMENT, _THUMBNAIL}
 
-# Derived / recomputable caches embedded in the live .step+ by the engine
-# (core/doc/session.cpp: cache.brep, cache.aicm, and the cache.json header).
-# Like build artifacts, they are stripped at the VAULT BOUNDARY — never committed
-# to history — and the engine rebuilds them on the next open (the cold-open fast
-# path is a property of the live working file, not of the vault).
+# Derived / solved state stripped at the VAULT BOUNDARY — the "compiled binary"
+# half of the recipe/build-artifact split. Two rules:
+#
+#   1. ``cache.*``  — display/build acceleration embedded in the live .step+ by
+#      the engine (cache.brep, cache.aicm and the cache.json header, see
+#      core/doc/session.cpp). The engine rebuilds them on the next open; the
+#      cold-open fast path is a property of the live working file, not of the
+#      vault.
+#   2. ``studies/<id>/results.*`` — cached FEA/CFD solve payloads (AICRES1 npz,
+#      capped at 20 MB *per study*, see contracts/stepplus.md §1 and
+#      docs/design/native_format.md §2.4). These are solved state: the study
+#      DEFINITION (material, fixtures, loads, mesh density) lives in
+#      document.json — the recipe — so a restored revision can simply re-run the
+#      study. That is already the documented behaviour ("cached — re-run to
+#      refresh"): a missing results cache means "re-run the study", never data
+#      loss. Study DEFINITIONS (``studies/<id>.json``) are recipe and stay
+#      tracked, as does every other ``studies/`` entry.
+#
+# Committing either would put an O(geometry) build artifact in every revision of
+# history, which is exactly what the recipe-is-the-source-code rule forbids.
 _DERIVED_CACHE_PREFIX = "cache."
+_STUDIES_PREFIX = "studies/"
+_STUDY_RESULT_BASENAME_PREFIX = "results."
+
+
+def is_derived_entry(name: str) -> bool:
+    """True when a container entry is solved state, not recipe — stripped at the
+    vault boundary and never committed to history."""
+    if name.startswith(_DERIVED_CACHE_PREFIX):
+        return True
+    if name.startswith(_STUDIES_PREFIX):
+        return name.rsplit("/", 1)[-1].startswith(_STUDY_RESULT_BASENAME_PREFIX)
+    return False
 
 
 @dataclass
@@ -74,8 +101,8 @@ def explode_container(raw: bytes) -> ExplodedItem:
 
     with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
         for name in zf.namelist():
-            if name.startswith(_DERIVED_CACHE_PREFIX):
-                continue  # derived cache — never committed to history (rebuilds)
+            if is_derived_entry(name):
+                continue  # solved state — never committed to history (rebuilds)
             data = zf.read(name)
             if name == _DOCUMENT:
                 doc_bytes = data

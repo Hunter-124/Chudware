@@ -25,6 +25,14 @@ struct GraphGridThumb {
   bool pending = false; // queued or rendering right now
 };
 
+// PNG file -> GL_RGBA8 texture (stb_image, 4 channels forced, linear filter,
+// clamp-to-edge). Returns false and leaves `tex` untouched when the file is
+// missing or undecodable. Shared with the PLM Compare page, which loads the
+// diff renders the plm_compare RPC writes to disk.
+bool plmLoadPngTexture(const std::string& path, unsigned int& tex, int& w, int& h);
+// Delete a texture created by plmLoadPngTexture and zero the handle. No-op on 0.
+void plmFreePngTexture(unsigned int& tex);
+
 // Content key for one doc node. Empty only when there is no dh AND no path
 // (nothing to render from).
 std::string graphThumbKey(const std::string& dh, double mt,

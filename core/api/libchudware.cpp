@@ -193,10 +193,11 @@ bool prof_is_modeling_method(const std::string& m) {
     // INTERACTIVE read paths (open a doc, resolve a viewport pick, expand a face into its edges,
     // push-pull-probe a face) also do real kernel work — they were the slow paths reported when
     // clicking a surface / opening a big assembly — so sample them too by default.
-    static const std::array<const char*, 21> kModeling = {{
+    static const std::array<const char*, 22> kModeling = {{
         "doc_compile_cpp", "doc_apply_ops", "doc_dry_run_ops", "doc_rebuild", "doc_activate",
         "doc_solve_mates", "doc_tree", "doc_new", "doc_checkpoint", "doc_undo",
         "doc_redo", "doc_render_png", "doc_render_view", "doc_render_contact_sheet",
+        "doc_render_diff",
         "doc_export", "doc_import", "asm_world_bodies",
         "doc_open", "doc_resolve_pick", "doc_face_edges", "doc_push_pull"}};
     for (const char* k : kModeling)
@@ -3332,6 +3333,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("out_path", std::string()),
                                 params.contains("view") ? params.at("view") : json(nullptr)),
                             out_json, 0);
+            // PLM graphical revision diff — the whole params object goes through (doc_a/doc_b,
+            // body_a/body_b, out_path, view, width/height, mode).
+            if (m == "doc_render_diff")
+                return emit(chudware::doc::doc_render_diff(params), out_json, 0);
             if (m == "doc_render_contact_sheet")
                 return emit(chudware::doc::doc_render_contact_sheet(
                                 params.value("doc_id", std::string()),

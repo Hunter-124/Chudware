@@ -13,6 +13,7 @@
 #include "plm_workspace.h"
 #include "plm_hub.h"
 #include "graph_tab.h"
+#include "plm_compare.h"
 
 #include <algorithm>
 #include <cstring>
@@ -155,6 +156,9 @@ struct RailItem { PlmPage page; const char* label; const char* icon; };
 static const RailItem kRail[] = {
     {PlmPage::Overview, "Overview", "app"},
     {PlmPage::Files,    "Files",    "body_folder"},
+    // Compare is a history operation (diff two revisions); History itself is
+    // folded into the Files page, so Compare sits directly after it.
+    {PlmPage::Compare,  "Compare",  "split"},
     {PlmPage::Planning, "Planning", "plan_board"},
     {PlmPage::Graph,    "Graph",    "mesh"},
     {PlmPage::Git,      "Git",      "git"},
@@ -346,6 +350,7 @@ void drawPlmWorkspace(AppState& st) {
         case PlmPage::Overview: plmDrawOverviewPage(st); break;
         case PlmPage::Files:    plmDrawFilesPage(st);    break;
         case PlmPage::History:  plmDrawHistoryPage(st);  break;
+        case PlmPage::Compare:  plmDrawComparePage(st);  break;
         case PlmPage::Releases: plmDrawReleasesPage(st); break;
         case PlmPage::Planning: plmDrawPlanningPage(st); break;
         case PlmPage::Issues:   plmDrawIssuesPage(st);   break;

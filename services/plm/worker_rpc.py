@@ -186,6 +186,7 @@ def _plm_release(params: dict, _emit: Callable) -> dict:
         return {"ok": True, "commit": res["commit"], "rev": res["rev"],
                 "entry": res["entry"], "preflight": res["preflight"],
                 "bom_freeze": res.get("bom_freeze"),
+                "geometry_frozen": bool(res.get("geometry_frozen")),
                 "stamp_orders": res["stamp_orders"]}
     return _with_vault(params, run)
 
@@ -478,10 +479,15 @@ def _plm_compare(params: dict, _emit: Callable) -> dict:
 
             od = str((params or {}).get("out_dir", "") or "")
             od = od or tempfile.mkdtemp(prefix="chudware_plm_compare_")
+            raw_views = (params or {}).get("views")
+            views = ([str(x) for x in raw_views]
+                     if isinstance(raw_views, (list, tuple)) and raw_views else None)
             try:
-                out["eval_compare"] = compare_mod.visual_compare(doc_a, doc_b, od)
+                out["eval_compare"] = compare_mod.visual_compare(
+                    doc_a, doc_b, od, views)
             except Exception as e:  # noqa: BLE001 — visual half degrades gracefully
                 out["visual_unavailable"] = f"{type(e).__name__}: {e}"
+            out["out_dir"] = od
         return out
     return _with_vault(params, run)
 

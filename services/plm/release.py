@@ -162,6 +162,71 @@ def frozen_bom(vault: Any, assembly_item_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# geometry freeze (contract §5 step 4 — a released rev is byte-exact forever)
+# ---------------------------------------------------------------------------
+
+def freeze_geometry_step(doc: dict[str, Any]) -> bytes | None:
+    """The frozen B-rep (AP214 STEP bytes) for a document's recipe, or ``None``.
+
+    Rebuilds *doc*'s recipe into a throwaway engine document (the same doc-load
+    contract :func:`services.plm.compare._load_doc` uses) and exports it with
+    ``doc_export_step``, which works for parts and assemblies alike.
+
+    STRICTLY best-effort: no engine, an unbuildable recipe, an export failure or
+    any exception yields ``None``. A release must never fail because the frozen
+    interchange geometry could not be produced.
+    """
+    if not isinstance(doc, dict):
+        return None
+    schema = str(doc.get("schema", "") or "")
+    kind = schema.split("/", 1)[0].rsplit(".", 1)[-1]
+    if kind not in ("part", "asm", "assembly"):
+        return None  # only parts/assemblies have a B-rep to freeze
+    try:
+        from mcp_server import core_bridge as cb
+    except Exception:
+        return None
+    try:
+        if not cb.available():
+            return None
+    except Exception:
+        return None
+
+    import tempfile
+    from pathlib import Path as _Path
+
+    from services.plm import compare as compare_mod
+
+    doc_id = compare_mod._load_doc(cb, doc, kind)  # noqa: SLF001 — same package
+    if doc_id is None:
+        return None
+    tmp = _Path(tempfile.mkdtemp(prefix="chudware_plm_freeze_")) / "geometry.step"
+    try:
+        r = cb.call("doc_export_step", {"doc_id": doc_id, "path": str(tmp)})
+        if isinstance(r, dict) and (r.get("ok") is False or r.get("degraded")):
+            return None
+        if not tmp.is_file():
+            return None
+        data = tmp.read_bytes()
+        return data or None
+    except Exception:
+        return None
+    finally:
+        try:
+            cb.call("doc_close", {"doc_id": doc_id})
+        except Exception:
+            pass
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        try:
+            tmp.parent.rmdir()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # the full release flow
 # ---------------------------------------------------------------------------
 
@@ -201,8 +266,16 @@ def release(vault: Any, item_id: str, message: str, *,
     if isinstance(doc, dict) and (doc.get("components") or item["kind"] == "assembly"):
         pins = component_pins(m, doc)
 
+    # geometry freeze (§5 step 4). Best-effort: a caller may hand us the bytes;
+    # otherwise we rebuild the recipe through the engine. No engine / no
+    # buildable recipe simply means this rev carries no frozen interchange
+    # geometry — the release itself must never fail for it.
+    if geometry_step is None and isinstance(doc, dict):
+        geometry_step = freeze_geometry_step(doc)
+
     res = vault.release(item_id, message, geometry_step=geometry_step,
                         bom_pins=pins)
+    res["geometry_frozen"] = geometry_step is not None
     res["preflight"] = pf
     if pins is not None:
         fz = latest_freeze(vault.manifest(), item_id)

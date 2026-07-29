@@ -1874,6 +1874,22 @@ if(CHUDWARE_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(interference PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- PLM graphical revision diff (doc_render_diff): asserts on the returned JSON AND on the
+  # decoded PNG pixels (miniz inflate of encode_png_rgb's filter-none RGB), so the red/green
+  # colour semantics and the lowered min_painted floor for a sparse changes_only render are
+  # both proven. No host AICM loader / render include path needed, like test_interference.
+  add_executable(test_render_diff
+    tests/test_render_diff.cpp)
+  target_include_directories(test_render_diff PRIVATE
+    ${doctest_SOURCE_DIR})
+  target_link_libraries(test_render_diff PRIVATE
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_miniz)
+  set_target_properties(test_render_diff PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME render_diff COMMAND test_render_diff)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(render_diff PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- A5: hole feature compiler — drill simple/cbore/csink bores into a body ---
   # core/doc/document.cpp's hole branch drills hole(s) at position(s) on a FACE-
   # SELECTOR-resolved planar face, building a cylinder/cbore/csink tool per position

@@ -36,7 +36,8 @@ bool DocRegistry::isReadOnlyMethod(const std::string& m) {
         // doc_save serializes to disk but does not modify the model — allowing
         // it means an ro viewer can still snapshot what it sees.
         // doc_clear_history empties undo stacks only (no revision bump / no model edit).
-        "doc_save", "doc_export_step", "doc_clear_history",
+        // doc_render_diff booleans two freshly-compiled docs into a PNG — no model mutation.
+        "doc_save", "doc_export_step", "doc_clear_history", "doc_render_diff",
         // misc reads
         "asm_world_bodies", "config_list", "sim_study_list", "weld_cut_list",
         "sketch_health", "sketch3d_health", "sketch_probe",

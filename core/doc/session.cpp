@@ -85,6 +85,8 @@
 #include <BRepCheck_Shell.hxx>
 #include <BRepAlgoAPI_Section.hxx>
 #include <BRepAlgoAPI_Common.hxx>
+#include <BRepAlgoAPI_Cut.hxx>       // doc_render_diff: A-B / B-A residues
+#include <BRepAlgoAPI_Fuse.hxx>      // doc_render_diff: A∪B camera frame
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepAdaptor_Surface.hxx>
@@ -6371,13 +6373,30 @@ ResolvedView resolve_view_spec(const nlohmann::json& v) {
 // (view name + units + bbox dims) so a multi-view contact sheet is self-describing. Returns false if
 // essentially nothing was drawn. This is the shared core behind render_iso_png / doc_render_view /
 // the contact sheet — one renderer, so headless and on-screen stay consistent (CLAUDE.md rule 3).
+//
+// The three trailing params exist for doc_render_diff and are inert when omitted:
+//   `body_alpha`   — per-body 0-255 opacity (parallel to `bodies`). A fragment from a body with
+//                    alpha < 255 that PASSES the depth test blends into the existing pixel
+//                    (out = (a*new + (255-a)*old)/255) instead of overwriting it, and still writes
+//                    the z-buffer. A null/short vector, or alpha 255, is byte-identical to before.
+//   `frame_from`   — frame the camera (world centre AND screen fit extents) on THIS body set rather
+//                    than on the drawn one, so two renders of DIFFERENT body sets register
+//                    pixel-for-pixel. Both fit loops honour it.
+//   `min_painted`  — override the "nothing drawn" guard (default W*H/400). A changes_only diff of a
+//                    small added boss is legitimately sparse and must not read as a failed render.
 bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         const std::vector<RenderLabel>& labels, int W, int H, RV3 viewDir,
                         const std::string& header, std::vector<unsigned char>& outImg,
-                        bool annotate = true) {
+                        bool annotate = true,
+                        const std::vector<unsigned char>* body_alpha = nullptr,
+                        const std::vector<aicm::AicmBody>* frame_from = nullptr,
+                        int min_painted = -1) {
+    // Camera framing reference: the drawn set unless the caller supplied a stable frame set.
+    const std::vector<aicm::AicmBody>& frame_bodies =
+        (frame_from && !frame_from->empty()) ? *frame_from : bodies;
     RV3 lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
     bool any = false;
-    for (const auto& b : bodies)
+    for (const auto& b : frame_bodies)
         for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
             lo.x = std::min(lo.x, (double)b.pos[i]);     hi.x = std::max(hi.x, (double)b.pos[i]);
             lo.y = std::min(lo.y, (double)b.pos[i + 1]); hi.y = std::max(hi.y, (double)b.pos[i + 1]);
@@ -6399,7 +6418,7 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
         pu = rdot(p, r); pv = rdot(p, u); pd = rdot(p, d);
     };
     double minu = 1e30, maxu = -1e30, minv = 1e30, maxv = -1e30;
-    for (const auto& b : bodies)
+    for (const auto& b : frame_bodies)
         for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
             double pu, pv, pd; proj(b.pos[i], b.pos[i + 1], b.pos[i + 2], pu, pv, pd);
             minu = std::min(minu, pu); maxu = std::max(maxu, pu);
@@ -6414,7 +6433,10 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
     std::vector<unsigned char> img((size_t)W * H * 3, 245);  // light-grey background
     std::vector<double> zbuf((size_t)W * H, -1e30);
     long painted = 0;
-    for (const auto& b : bodies) {
+    for (size_t bi = 0; bi < bodies.size(); ++bi) {
+        const aicm::AicmBody& b = bodies[bi];
+        const unsigned char balpha =
+            (body_alpha && bi < body_alpha->size()) ? (*body_alpha)[bi] : (unsigned char)255;
         double br = b.color[0], bg = b.color[1], bb = b.color[2];
         // GSL render fix — decide the orientation hue ONCE per B-REP FACE, not per triangle.
         // The old code fed each triangle's own geometric normal to orient_tint, so a single
@@ -6518,13 +6540,21 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                     size_t pi = (size_t)py * W + px;
                     if (depth > zbuf[pi]) {
                         zbuf[pi] = depth;
-                        img[pi * 3] = R; img[pi * 3 + 1] = G; img[pi * 3 + 2] = B;
+                        if (balpha >= 255) {
+                            img[pi * 3] = R; img[pi * 3 + 1] = G; img[pi * 3 + 2] = B;
+                        } else {
+                            const int a = balpha, ia = 255 - balpha;
+                            img[pi * 3] = (unsigned char)((a * R + ia * img[pi * 3]) / 255);
+                            img[pi * 3 + 1] = (unsigned char)((a * G + ia * img[pi * 3 + 1]) / 255);
+                            img[pi * 3 + 2] = (unsigned char)((a * B + ia * img[pi * 3 + 2]) / 255);
+                        }
                         ++painted;
                     }
                 }
         }
     }
-    if (painted < (long)(W * H) / 400) return false;  // ~nothing drawn — treat as failed render
+    const long paint_floor = (min_painted >= 0) ? (long)min_painted : (long)(W * H) / 400;
+    if (painted < paint_floor) return false;  // ~nothing drawn — treat as failed render
 
     // ---- annotation overlay (drawn ON TOP of the shaded mesh) ----------------------------
     // (a) named-face CALLOUTS: a coloured dot + leader + text at each visible principal face's
@@ -6652,6 +6682,27 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
         }
     }
     return bodies;
+}
+
+// doc_render_diff support: turn one boolean-result shape (A∩B / A-B / B-A) into a renderable
+// AICM body carrying an explicit diff colour. Returns false for a null/empty shape or a shape
+// that tessellated to nothing (a fuzz sliver with no triangles is not worth drawing). Never
+// throws — a boolean residue can be a degenerate compound that trips BRepMesh, and a diff
+// render must degrade rather than take the RPC down.
+static bool diff_body_from_shape(const TopoDS_Shape& shape, uint32_t body_id,
+                                 const char* name, const float color[3],
+                                 std::vector<aicm::AicmBody>& out) {
+    if (shape.IsNull()) return false;
+    try {
+        aicm::AicmBody body = ::geom::tessellate_body(shape, body_id, name, color, 0.0, 0.0);
+        if (body.idx.empty()) return false;
+        out.push_back(std::move(body));
+        return true;
+    } catch (const Standard_Failure&) {
+        return false;
+    } catch (...) {
+        return false;
+    }
 }
 
 std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id) {
@@ -9613,6 +9664,200 @@ json doc_eval_compare(const json& params) {
     TopoDS_Shape shape_a = eval_compare_pick_shape(doc_a_id, params, "body_a");
     TopoDS_Shape shape_b = eval_compare_pick_shape(doc_b_id, params, "body_b");
     return chudware::doc::compare_shapes(shape_a, shape_b);
+}
+
+// PLM graphical diff (git-diff-for-a-3D-model) — see session.h for the full param/return
+// contract. Both sides are compiled FRESH from their RECIPE via eval_compare_pick_shape (the
+// vault stores feature recipes, never solved state, so the only honest way to diff two revisions
+// is to re-solve each one and boolean the results), then three OCCT booleans split the pair into
+// the three semantic sets the image encodes:
+//   added     = B - A  -> green  (present in the NEWER revision only)
+//   removed   = A - B  -> red    (present in the OLDER revision only)
+//   unchanged = A ^ B  -> grey   (ghosted at alpha 96 in "context" mode, omitted in
+//                                 "changes_only" so an internal change is not buried in bulk)
+// Every view and BOTH modes frame the camera on the A∪B fuse, so two renders of the same pair
+// register pixel-for-pixel and can be overlaid or flipped between. Orientation tint is off
+// (annotate=false) — it blends 55% of a direction hue in and would destroy the red/green
+// semantics. Degrades to {ok:false, degraded:true, reason} (still writing a plain render of B
+// when it can) instead of throwing on a boolean failure.
+json doc_render_diff(const nlohmann::json& params) {
+    try {
+        DocLock lk;
+        const std::string doc_a_id = params.value("doc_a", std::string());
+        const std::string doc_b_id = params.value("doc_b", std::string());
+        if (doc_a_id.empty() || doc_b_id.empty())
+            throw OpError("invalid_op", "render_diff requires doc_a and doc_b",
+                          {{"reason", "missing doc id"}});
+        const std::string out_path = params.value("out_path", std::string());
+        if (out_path.empty())
+            throw OpError("invalid_op", "render_diff requires out_path",
+                          {{"reason", "missing out_path"}});
+        const std::string mode =
+            params.value("mode", std::string("context")) == "changes_only" ? "changes_only"
+                                                                          : "context";
+        int W = 640, H = 480;
+        if (params.contains("width") && params["width"].is_number())
+            W = (int)std::lround(params["width"].get<double>());
+        if (params.contains("height") && params["height"].is_number())
+            H = (int)std::lround(params["height"].get<double>());
+        W = std::max(64, std::min(4096, W));
+        H = std::max(64, std::min(4096, H));
+
+        const TopoDS_Shape shape_a = eval_compare_pick_shape(doc_a_id, params, "body_a");
+        const TopoDS_Shape shape_b = eval_compare_pick_shape(doc_b_id, params, "body_b");
+
+        // recon.cpp keeps volume_or_zero file-local; the same fail-soft |Mass()| here.
+        auto vol_of = [](const TopoDS_Shape& s) -> double {
+            if (s.IsNull()) return 0.0;
+            try {
+                GProp_GProps p;
+                BRepGProp::VolumeProperties(s, p);
+                return std::abs(p.Mass());
+            } catch (...) {
+                return 0.0;
+            }
+        };
+        // Disconnected-region count: TopExp_Explorer(TopAbs_SOLID) yields the shape itself when
+        // it already IS a solid, so this is 1 for a single solid and N for a compound of N.
+        auto n_solids = [](const TopoDS_Shape& s) -> int {
+            if (s.IsNull()) return 0;
+            int n = 0;
+            for (TopExp_Explorer ex(s, TopAbs_SOLID); ex.More(); ex.Next()) ++n;
+            return n;
+        };
+
+        const ResolvedView rv = resolve_view_spec(params.value("view", json()));
+        const float kAdded[3]     = {0.16f, 0.72f, 0.32f};
+        const float kRemoved[3]   = {0.86f, 0.24f, 0.24f};
+        const float kUnchanged[3] = {0.62f, 0.64f, 0.67f};
+
+        // Stable camera frame = A∪B. If the fuse fails, the concatenation of both sides' own
+        // tessellations bounds the same union well enough to keep the framing shared.
+        std::vector<aicm::AicmBody> frame;
+        {
+            TopoDS_Shape uni;
+            try {
+                BRepAlgoAPI_Fuse fuse_op(shape_a, shape_b);
+                fuse_op.SetFuzzyValue(1e-4);
+                fuse_op.Build();
+                if (fuse_op.IsDone()) uni = fuse_op.Shape();
+            } catch (const Standard_Failure&) {
+            }
+            if (!diff_body_from_shape(uni, 1, "frame", kUnchanged, frame)) {
+                diff_body_from_shape(shape_a, 1, "frame_a", kUnchanged, frame);
+                diff_body_from_shape(shape_b, 2, "frame_b", kUnchanged, frame);
+            }
+        }
+
+        std::vector<aicm::AicmBody> draw;
+        std::vector<unsigned char> alphas;
+        auto push_body = [&](const TopoDS_Shape& s, uint32_t id, const char* nm,
+                             const float col[3], unsigned char alpha) {
+            if (diff_body_from_shape(s, id, nm, col, draw)) alphas.resize(draw.size(), alpha);
+        };
+        // One shared render+write tail so the degraded path produces a real image too. Same
+        // encode_png_rgb + ofstream sequence doc_render_view uses.
+        auto write_png = [&]() -> bool {
+            if (draw.empty() || frame.empty()) return false;
+            const std::string dims = bbox_dims_label(frame);
+            const std::string header =
+                rv.name + "  DIFF  +added  -removed" + (dims.empty() ? "" : "  " + dims);
+            std::vector<unsigned char> img;
+            // min_painted=1: a changes_only render of one small added boss is legitimately
+            // sparse and must not trip the default W*H/400 "nothing drawn" guard.
+            if (!render_view_to_rgb(draw, {}, W, H, rv.dir, header, img, /*annotate=*/false,
+                                    &alphas, &frame, /*min_painted=*/1))
+                return false;
+            const std::string png = encode_png_rgb(W, H, img);
+            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+            return (bool)f && (f.write(png.data(), (std::streamsize)png.size()), (bool)f);
+        };
+
+        // Booleans mirror recon.cpp::compare_shapes exactly (fuzzy 1e-4 + IsDone checks).
+        TopoDS_Shape common_s, removed_s, added_s;
+        std::string bool_fail;
+        try {
+            BRepAlgoAPI_Common common_op(shape_a, shape_b);
+            common_op.SetFuzzyValue(1e-4);
+            common_op.Build();
+            if (!common_op.IsDone()) bool_fail = "A^B common did not converge";
+            else common_s = common_op.Shape();
+            if (bool_fail.empty()) {
+                BRepAlgoAPI_Cut cut_ab(shape_a, shape_b);
+                cut_ab.SetFuzzyValue(1e-4);
+                cut_ab.Build();
+                if (!cut_ab.IsDone()) bool_fail = "A-B cut did not converge";
+                else removed_s = cut_ab.Shape();
+            }
+            if (bool_fail.empty()) {
+                BRepAlgoAPI_Cut cut_ba(shape_b, shape_a);
+                cut_ba.SetFuzzyValue(1e-4);
+                cut_ba.Build();
+                if (!cut_ba.IsDone()) bool_fail = "B-A cut did not converge";
+                else added_s = cut_ba.Shape();
+            }
+        } catch (const Standard_Failure& ex) {
+            bool_fail = std::string("kernel exception: ") + ex.GetMessageString();
+        }
+
+        if (!bool_fail.empty()) {
+            // No semantic split available — still hand the caller a plain grey render of B.
+            draw.clear();
+            alphas.clear();
+            push_body(shape_b, 1, "b", kUnchanged, 255);
+            const bool wrote = write_png();
+            return json{{"ok", false},
+                        {"degraded", true},
+                        {"reason", "boolean_failed"},
+                        {"error", bool_fail},
+                        {"path", wrote ? out_path : std::string()},
+                        {"view", rv.name},
+                        {"mode", mode},
+                        {"match_pct", nullptr},
+                        {"added_volume_mm3", 0.0},
+                        {"removed_volume_mm3", 0.0},
+                        {"unchanged_volume_mm3", 0.0},
+                        {"added_regions", 0},
+                        {"removed_regions", 0},
+                        {"identical", false}};
+        }
+
+        const double vol_a = vol_of(shape_a), vol_b = vol_of(shape_b);
+        const double common_vol = vol_of(common_s);
+        const double removed_vol = vol_of(removed_s), added_vol = vol_of(added_s);
+        const int added_regions = n_solids(added_s), removed_regions = n_solids(removed_s);
+        const double denom = std::max(vol_a, vol_b);
+        const double match_pct = denom > 1e-12 ? 100.0 * common_vol / denom : 100.0;
+        const bool identical = added_regions == 0 && removed_regions == 0 &&
+                               added_vol < 1e-6 && removed_vol < 1e-6;
+
+        // Draw order per contract: added, removed, then the ghosted unchanged bulk.
+        push_body(added_s, 1, "added", kAdded, 255);
+        push_body(removed_s, 2, "removed", kRemoved, 255);
+        if (mode == "context") push_body(common_s, 3, "unchanged", kUnchanged, 96);
+        const bool wrote = write_png();
+
+        json out{{"ok", wrote},
+                 {"path", wrote ? out_path : std::string()},
+                 {"view", rv.name},
+                 {"mode", mode},
+                 {"match_pct", match_pct},
+                 {"added_volume_mm3", added_vol},
+                 {"removed_volume_mm3", removed_vol},
+                 {"unchanged_volume_mm3", common_vol},
+                 {"added_regions", added_regions},
+                 {"removed_regions", removed_regions},
+                 {"identical", identical}};
+        if (!wrote) {
+            out["degraded"] = true;
+            out["reason"] = draw.empty() ? "nothing to draw" : "render failed";
+        }
+        return out;
+    } catch (const OpError& e) {
+        return json{{"ok", false}, {"error", e.what()}, {"code", e.code}};
+    } catch (...) {
+        return json{{"ok", false}, {"reason", "render exception"}};
+    }
 }
 
 // C2 (WS-C) — resolve params.face into a live TopoDS_Face on `body`: either a stable "sid"

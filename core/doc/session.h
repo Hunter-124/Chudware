@@ -377,6 +377,27 @@ nlohmann::json doc_eval_feature_overlap(const std::string& doc_id,
 // Throws OpError on an unknown doc_id, an unknown body name, or a doc with no bodies.
 nlohmann::json doc_eval_compare(const nlohmann::json& params);
 
+// PLM graphical diff: render the geometry DIFFERENCE between two revisions of a part to a PNG.
+// `params`: `doc_a` (OLDER), `doc_b` (NEWER), `out_path` (required); `body_a`/`body_b` (optional
+// "bN" names, exactly as doc_eval_compare); `view` (any resolve_view_spec form, default ISO);
+// `width`/`height` (default 640x480, clamped to [64,4096]); `mode` — "context" (default: the
+// unchanged bulk is drawn ghosted so an internal change is still visible) or "changes_only" (the
+// unchanged bulk is omitted entirely).
+//
+// Recipe-vs-solved rationale: the PLM vault commits feature RECIPES, never solved B-rep, so a
+// revision diff cannot subtract two stored meshes. Both sides are therefore re-solved fresh via
+// eval_compare_pick_shape (same as doc_eval_compare — no ensure_compiled cache reuse) and the
+// difference is computed by OCCT booleans on the freshly solved shapes.
+//
+// Colour semantics (fixed across engine/Python/GUI): added = B-A = green (0.16,0.72,0.32),
+// removed = A-B = red (0.86,0.24,0.24), unchanged = A^B = grey (0.62,0.64,0.67) at alpha 96.
+// Every view and both modes frame the camera on the A∪B fuse so images register pixel-for-pixel.
+//
+// Returns {ok, path, view, mode, match_pct, added_volume_mm3, removed_volume_mm3,
+// unchanged_volume_mm3, added_regions, removed_regions, identical} and, on failure,
+// {ok:false, degraded:true, reason} / {ok:false, error, code}. Never throws.
+nlohmann::json doc_render_diff(const nlohmann::json& params);
+
 // C2 (WS-C reverse-engineering) — convert-entities primitive; see recon.h::face_wires for
 // the full per-edge classification + return-shape contract. `params.face` resolves against
 // the LAST surviving body of `doc_id`, either as a selector/geom-query object (the same

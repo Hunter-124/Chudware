@@ -343,19 +343,35 @@ def register_plm_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def plm_compare(path: str, commit_a: str, commit_b: str, item_id: str,
-                    visual: bool = False, out_dir: str = "") -> str:
-        """Compare an item between two history points.
+                    visual: bool = False, out_dir: str = "",
+                    views: str = "") -> str:
+        """Compare an item between two history points — including a RENDERED
+        GRAPHICAL DIFF of the geometry that changed.
 
         Generic (non-CAD) items — docs, code, links — route to a
         content/text diff (``mode:"generic"``, plain-language summary, and a
-        unified/office text diff when the item is single-file). CAD items
-        (including ECAD boards/schematics) route to the semantic ``doc_diff``
-        comparison, and — when ``visual`` is true — a side-by-side visual of
-        the two versions (match percentage + rendered images; drawings also
-        get a 2D overlay). The visual half degrades gracefully on machines
-        without the 3D engine.
+        unified/office text diff when the item is single-file). CAD items route
+        to the semantic ``doc_diff`` comparison, and — when ``visual`` is true —
+        to real diff IMAGES you can look at:
+
+        * parts/assemblies: ``diff_3d`` (added geometry green, removed red,
+          unchanged grey, ISO), ``diff_3d_changes_only`` (the changes with no
+          surrounding model), ``diff_3d_views`` (the same diff from ISO/FRONT/
+          TOP on one shared camera so the frames register), plus
+          ``match_pct`` / ``added_volume_mm3`` / ``removed_volume_mm3``.
+        * drawings and ECAD boards/schematics: ``diff_2d``, a vector overlay of
+          both sheets/layouts with per-stroke ``counts``. ECAD needs no engine.
+        * ``diff_pixel``: registered pixel diff of the two plain renders — the
+          universal fallback.
+        * ``image_a`` / ``image_b`` / ``side_by_side``: the two plain renders.
+
+        ``views`` optionally narrows the 3D view set (comma-separated, e.g.
+        ``"ISO,FRONT"``). ``out_dir`` chooses where the PNGs land (a temp dir by
+        default). Every returned path exists on disk; the visual half degrades to
+        ``{degraded: true, reason, hint}`` on machines without the 3D engine and
+        never fails the compare.
         Returns ``{ok, mode, summary, text_diff?}`` for generic items or
-        ``{ok, doc_diff, summary, eval_compare?}`` for CAD items."""
+        ``{ok, doc_diff, summary, eval_compare?, out_dir?}`` for CAD items."""
         try:
             Vault, VaultError = _vault_module()
         except ImportError:
@@ -376,7 +392,10 @@ def register_plm_tools(mcp: FastMCP) -> None:
                         import tempfile
 
                         od = out_dir or tempfile.mkdtemp(prefix="chudware_plm_compare_")
-                        fields["eval_compare"] = plm_compare_mod.visual_compare(doc_a, doc_b, od)
+                        want = [s.strip() for s in views.split(",") if s.strip()] or None
+                        fields["eval_compare"] = plm_compare_mod.visual_compare(
+                            doc_a, doc_b, od, want)
+                        fields["out_dir"] = od
             finally:
                 v.close()
         except VaultError as e:

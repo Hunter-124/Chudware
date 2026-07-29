@@ -69,6 +69,10 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Sign In', 'id="SignInEmail"', 'class="sign-in-form"')
 _TERMS_MARKERS = ('Accept the terms', 'class="cad-terms"', 'License agreement required')
+_TERMS_SUMMARY = (
+    "McMaster gates this SKU's CAD download behind a licence/terms click-through; "
+    "this adapter never accepts those terms on your behalf"
+)
 # Best-effort: McMaster catalog/product pages are keyed by part number in the URL.
 _RESULT_RE = re.compile(
     r'<a[^>]+class="[^"]*product-card[^"]*"[^>]+href="(?P<href>/[0-9A-Za-z]+/?)"[^>]*>'
@@ -103,6 +107,12 @@ _CATEGORY_TILE_RE = re.compile(
 _CATEGORY_NAME_RE = re.compile(
     r'<span[^>]*class="[^"]*category-name[^"]*"[^>]*>(?P<name>[^<]+)</span>', re.IGNORECASE)
 _SKU_RE = re.compile(r'<span[^>]*class="[^"]*part-number[^"]*"[^>]*>(?P<sku>[^<]+)</span>', re.IGNORECASE)
+# Same shape as the other catalog adapters (jlcpcb/pcbway/lcsc): a $-price in a
+# span whose class carries "price". Best-effort — the settled SPA DOM is already
+# in hand when acquire() reads the CAD sentinel, so parsing it costs nothing and
+# keeps the provenance envelope's commercial identity populated.
+_PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>',
+                       re.IGNORECASE)
 # A concrete McMaster SKU part number, e.g. 90044A203 / 91290A115 (digits, a letter,
 # digits). Used to pick the first configurable row off a family table when the caller
 # didn't name a specific part number.
@@ -250,6 +260,8 @@ class McMasterAdapter:
             content = page.get("content", "")
             if is_login_wall(content, _LOGIN_WALL_MARKERS):
                 return login_required(SITE, url)
+            if is_login_wall(content, _TERMS_MARKERS):
+                return terms_confirmation_required(SITE, url, _TERMS_SUMMARY)
             m = _PART_NUMBER_RE.search(content)
             if not m:
                 return {"ok": False, "reason": "no_sku",
@@ -269,6 +281,12 @@ class McMasterAdapter:
         html_dom = interact.get("content", "")
         if is_login_wall(html_dom, _LOGIN_WALL_MARKERS):
             return login_required(SITE, part_url)
+        # A CAD terms/licence click-through must NEVER be accepted on the user's
+        # behalf (module docstring; same guard as traceparts/jlcpcb/pcbway) — and it
+        # must be caught BEFORE the sentinel read, because a terms page publishes no
+        # FilePath and would otherwise be misreported as "no_download_link".
+        if is_login_wall(html_dom, _TERMS_MARKERS):
+            return terms_confirmation_required(SITE, part_url, _TERMS_SUMMARY)
 
         cap = _SENTINEL_RE.search(html_dom)
         status = (cap.group("status") if cap else "") or ""
@@ -295,7 +313,8 @@ class McMasterAdapter:
             artifact_path=outcome["dest"],
             title=result.get("title", "") or filename,
             sku=part_number,
-            price=None,
+            price=(f"${price_match.group('price')}"
+                   if (price_match := _PRICE_RE.search(html_dom)) else None),
         )
 
 

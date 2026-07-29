@@ -8,6 +8,7 @@ into the user's real data dir.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import gzip
 import importlib
 import os
@@ -49,9 +50,28 @@ class _CountingCef:
         return {"ok": True, "status": self._status, "html": self._html}
 
 
-def _payload(content: str = "<html>hi</html>", status: int = 200) -> dict:
+#: How far in the past the fixture payload claims to have been fetched.
+#: page_cache judges freshness from the payload's OWN ``fetched_ts`` (when the
+#: page really came off the wire), not from when the row was inserted — the
+#: right behaviour for a page cache, but it means a fixture that hardcodes a
+#: literal instant silently rots: once wall-clock passes the 6 h default TTL,
+#: every put/get round-trip in this file degrades into a miss. So anchor to now,
+#: one minute back — comfortably inside the TTL, yet distinguishably not "now",
+#: which keeps the "original instant is preserved" assertion meaningful.
+_FETCHED_AGO_S = 60.0
+
+
+def _fetched_ts(ago_s: float = _FETCHED_AGO_S) -> str:
+    """The contract's ISO-8601 ``Z`` instant, ``ago_s`` seconds before now."""
+    return _dt.datetime.fromtimestamp(time.time() - ago_s,
+                                      _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _payload(content: str = "<html>hi</html>", status: int = 200,
+             fetched_ts: str | None = None) -> dict:
     return {"ok": True, "url": "https://x/1", "status": status, "content": content,
-            "fetched_ts": "2026-07-26T12:00:00Z", "session_profile_used": "grabcad"}
+            "fetched_ts": fetched_ts or _fetched_ts(),
+            "session_profile_used": "grabcad"}
 
 
 # --- unit: get/put --------------------------------------------------------------
@@ -60,7 +80,8 @@ def test_miss_then_hit_roundtrips_the_payload(cache_mods):
     page_cache, _session, _rl = cache_mods
     assert page_cache.get("https://x/1", "grabcad") is None
 
-    page_cache.put("https://x/1", "grabcad", _payload("<html>body</html>"))
+    sent = _payload("<html>body</html>")
+    page_cache.put("https://x/1", "grabcad", sent)
     hit = page_cache.get("https://x/1", "grabcad")
 
     assert hit is not None
@@ -69,8 +90,10 @@ def test_miss_then_hit_roundtrips_the_payload(cache_mods):
     assert hit["content"] == "<html>body</html>"
     assert hit["status"] == 200
     assert hit["url"] == "https://x/1"
-    assert hit["fetched_ts"] == "2026-07-26T12:00:00Z"  # original instant, not now
-    assert hit["age_s"] >= 0.0
+    assert hit["fetched_ts"] == sent["fetched_ts"]  # original instant, not now
+    # age is measured from that original instant, not from the insert, so a
+    # payload fetched a minute ago reports ~60 s — never ~0.
+    assert hit["age_s"] >= _FETCHED_AGO_S - 1.0
 
 
 def test_key_is_scoped_by_site(cache_mods):

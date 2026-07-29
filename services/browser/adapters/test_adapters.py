@@ -121,11 +121,16 @@ MCMASTER_TERMS_HTML = """
 </body></html>
 """
 
-MCMASTER_DETAIL_HTML = """
+# The settled DOM browser_interact hands back after the in-page CAD capture ran:
+# the SPA product page plus the <div id="__aicad_capture"> sentinel carrying the
+# server-minted STEP FilePath. acquire() reads THIS, not a static href — the STEP
+# URL is minted client-side (live-verified 2026-07-11), so browser_fetch alone can
+# never reach it and the interact seam is the one these tests must drive.
+MCMASTER_CAD_SENTINEL_DOM = """
 <html><body>
 <span class="part-number">91290A115</span>
 <span class="price">$8.32</span>
-<a href="/download/91290A115.step?token=1">Download STEP</a>
+<div id="__aicad_capture" data-status="ok" data-fp="/CadFiles/91290A115.step"></div>
 </body></html>
 """
 
@@ -494,15 +499,15 @@ def test_mcmaster_search_propagates_fetch_failure(adapter_mods, monkeypatch):
 def test_mcmaster_acquire_downloads_and_returns_provenance_with_sku(adapter_mods, monkeypatch):
     _adapters_pkg, _grabcad, _traceparts, session, _amazon, mcmaster, _jlcpcb, _pcbway = adapter_mods
 
-    def fake_fetch(url, site):
-        return {"ok": True, "content": MCMASTER_DETAIL_HTML}
+    def fake_interact(url, site, script, **kw):
+        return {"ok": True, "content": MCMASTER_CAD_SENTINEL_DOM, "final_url": url}
 
-    def fake_download(url, site, dest):
+    def fake_download(url, site, dest, **kw):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"STEP-FILE-BYTES")
         return {"ok": True, "dest": str(dest), "session_profile_used": "mcmaster"}
 
-    monkeypatch.setattr(session, "browser_fetch", fake_fetch)
+    monkeypatch.setattr(session, "browser_interact", fake_interact)
     monkeypatch.setattr(session, "browser_download", fake_download)
 
     result = mcmaster.ADAPTER.acquire({"title": "Socket Head Cap Screw", "sku": "91290A115",
@@ -514,13 +519,20 @@ def test_mcmaster_acquire_downloads_and_returns_provenance_with_sku(adapter_mods
     assert "license_note" in result and result["license_note"]
     assert result["artifact_path"].endswith("91290A115.step")
     assert result["sku"] == "91290A115"
+    # The settled DOM the capture already returned carries the price — the envelope
+    # must not throw that commercial identity away (siblings jlcpcb/pcbway/lcsc all
+    # populate it, and parts_provider surfaces it downstream).
     assert result["price"] == "$8.32"
 
 
 def test_mcmaster_acquire_login_wall(adapter_mods, monkeypatch):
+    # The sign-in wall can also arrive as the *page* the capture settled on (not
+    # just as the endpoint's PromptLoginInd status), so acquire screens the
+    # interact DOM for it.
     _adapters_pkg, _grabcad, _traceparts, session, _amazon, mcmaster, _jlcpcb, _pcbway = adapter_mods
-    monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, site: {"ok": True, "content": MCMASTER_LOGIN_WALL_HTML})
+    monkeypatch.setattr(session, "browser_interact",
+                        lambda url, site, script, **kw: {
+                            "ok": True, "content": MCMASTER_LOGIN_WALL_HTML, "final_url": url})
 
     result = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
     assert result["ok"] is False
@@ -536,14 +548,29 @@ def test_mcmaster_acquire_rejects_missing_url(adapter_mods):
 
 def test_mcmaster_acquire_surfaces_terms_confirmation(adapter_mods, monkeypatch):
     _adapters_pkg, _grabcad, _traceparts, session, _amazon, mcmaster, _jlcpcb, _pcbway = adapter_mods
-    monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, site: {"ok": True, "content": MCMASTER_TERMS_HTML})
+    monkeypatch.setattr(session, "browser_interact",
+                        lambda url, site, script, **kw: {
+                            "ok": True, "content": MCMASTER_TERMS_HTML, "final_url": url})
 
     result = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
 
     assert result["ok"] is False
+    # A licence click-through is NOT "no_download_link": it is an approval the user
+    # must give, so it must be reported as one.
     assert result["reason"] == "terms_confirmation_required"
     assert result["ask_user"]["kind"] == "approval"
+
+
+def test_mcmaster_acquire_terms_wall_on_the_family_page(adapter_mods, monkeypatch):
+    # Same guard on the other entry path: no part number in hand, so acquire fetches
+    # the family page first and must screen THAT for the terms wall too.
+    _adapters_pkg, _grabcad, _traceparts, session, _amazon, mcmaster, _jlcpcb, _pcbway = adapter_mods
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda url, site: {"ok": True, "content": MCMASTER_TERMS_HTML})
+
+    result = mcmaster.ADAPTER.acquire({
+        "url": "https://www.mcmaster.com/products/socket-head-screws/steel~~/"})
+    assert result["reason"] == "terms_confirmation_required"
 
 
 def test_mcmaster_never_auto_accepts_terms(adapter_mods, monkeypatch):
@@ -551,16 +578,21 @@ def test_mcmaster_never_auto_accepts_terms(adapter_mods, monkeypatch):
     _adapters_pkg, _grabcad, _traceparts, session, _amazon, mcmaster, _jlcpcb, _pcbway = adapter_mods
     called = {"download": False}
 
-    def fake_download(url, site, dest):
+    def fake_download(url, site, dest, **kw):
         called["download"] = True
         return {"ok": True, "dest": str(dest)}
 
-    monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, site: {"ok": True, "content": MCMASTER_TERMS_HTML})
+    # Stub BOTH seams: leaving browser_interact real made this pass only because the
+    # daemon-less interact errored out before any download could be attempted — a
+    # green that proved nothing about the terms guard.
+    monkeypatch.setattr(session, "browser_interact",
+                        lambda url, site, script, **kw: {
+                            "ok": True, "content": MCMASTER_TERMS_HTML, "final_url": url})
     monkeypatch.setattr(session, "browser_download", fake_download)
 
-    mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
+    out = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
     assert called["download"] is False
+    assert out["reason"] == "terms_confirmation_required"
 
 
 # --- JLCPCB -------------------------------------------------------------------------

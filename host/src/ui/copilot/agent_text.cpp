@@ -122,7 +122,32 @@ const GlyphFold kFolds[] = {
     // Marks the harness uses for pass/fail.
     {0x2713, "ok"},  {0x2714, "ok"},  {0x2717, "x"},   {0x2718, "x"},
     {0x2705, "ok"},  {0x274C, "x"},   {0x26A0, "!"},
+    {0x2126, "ohm"},
 };
+
+// Greek letters. The shipped context packs under services/agent/advisor/context_packs/ are
+// MODEL-facing engineering prose and legitimately use them — eps strain (snap_fit.md), delta
+// deflection, theta bend angle (sheet_bend.md), rho density, alpha CTE (material_props.md), pi.
+// None are in the atlas, and dropping one silently turns "eps < 0.002" into " < 0.002", so each
+// folds to its spelled-out name instead.
+//
+// Indexed off the block base, so the tables must stay 25 wide and in codepoint order.
+const char* kGreekLower[25] = {   // U+03B1 alpha .. U+03C9 omega
+    "alpha", "beta", "gamma", "delta", "eps", "zeta", "eta", "theta", "iota", "kappa",
+    "lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "sigma", "tau",
+    "upsilon", "phi", "chi", "psi", "omega",
+};
+const char* kGreekUpper[25] = {   // U+0391 Alpha .. U+03A9 Omega; U+03A2 is unassigned
+    "Alpha", "Beta", "Gamma", "Delta", "Eps", "Zeta", "Eta", "Theta", "Iota", "Kappa",
+    "Lambda", "Mu", "Nu", "Xi", "Omicron", "Pi", "Rho", nullptr, "Sigma", "Tau",
+    "Upsilon", "Phi", "Chi", "Psi", "Omega",
+};
+
+const char* greekFold(unsigned cp) {
+    if (cp >= 0x03B1 && cp <= 0x03C9) return kGreekLower[cp - 0x03B1];
+    if (cp >= 0x0391 && cp <= 0x03A9) return kGreekUpper[cp - 0x0391];
+    return nullptr;
+}
 
 // Ranges folded wholesale after the table above misses. Order matters only in that these are
 // checked last.
@@ -198,8 +223,18 @@ std::string foldToAtlasGlyphs(const std::string& text) {
         const char* repl = nullptr;
         for (const GlyphFold& f : kFolds)
             if (f.cp == cp) { repl = f.repl; break; }
+        if (!repl) repl = greekFold(cp);
         if (!repl) repl = rangeFold(cp);
-        out += repl ? repl : "?";                                 // no mapping -> notdef stand-in
+        if (repl) { out += repl; continue; }
+        // Circled latin capitals (U+24B6..U+24CF) — drawing_standards.md marks projection and
+        // datum callouts with them. Spelling the letter out beats dropping it to notdef.
+        if (cp >= 0x24B6 && cp <= 0x24CF) {
+            out += '(';
+            out += (char)('A' + (int)(cp - 0x24B6));
+            out += ')';
+            continue;
+        }
+        out += '?';                                               // no mapping -> notdef stand-in
     }
     return out;
 }

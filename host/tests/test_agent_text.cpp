@@ -176,6 +176,37 @@ static void test_uncovered_degrades_to_question_mark() {
              "w >= 5 <= 9 != 0 ~ 4 ok x x in S => y <-> z - 1 - |");
 }
 
+// The Settings → AI → Rules tab shows context-pack bodies straight off disk
+// (services/agent/advisor/context_packs/*.md). Those are MODEL-facing engineering prose and use
+// Greek notation on purpose, so the fold — not the source — is what makes them legible.
+static void test_greek_engineering_notation() {
+    // eps U+03B5 (snap_fit.md strain limit) — the case that must not silently vanish.
+    CHECK_EQ(ui::foldToAtlasGlyphs("\xCE\xB5 < 0.002"), "eps < 0.002");
+    // delta U+03B4 deflection, theta U+03B8 bend angle, rho U+03C1 density, alpha U+03B1 CTE,
+    // pi U+03C0, sigma U+03C3, mu U+03BC, lambda U+03BB, omega U+03C9.
+    CHECK_EQ(ui::foldToAtlasGlyphs("\xCE\xB4 \xCE\xB8 \xCF\x81 \xCE\xB1 \xCF\x80 "
+                                   "\xCF\x83 \xCE\xBC \xCE\xBB \xCF\x89"),
+             "delta theta rho alpha pi sigma mu lambda omega");
+    // Final sigma U+03C2 reads as sigma too.
+    CHECK_EQ(ui::foldToAtlasGlyphs("\xCF\x82"), "sigma");
+    // Capitals: Delta U+0394 (dfm_pre_op.md / press_fit.md), Sigma U+03A3, Omega U+03A9.
+    CHECK_EQ(ui::foldToAtlasGlyphs("\xCE\x94T \xCE\xA3 \xCE\xA9"), "DeltaT Sigma Omega");
+    // U+2126 OHM SIGN is the electrical unit, not a letter.
+    CHECK_EQ(ui::foldToAtlasGlyphs("470 \xE2\x84\xA6"), "470 ohm");
+    // A real pack line: every byte ASCII afterwards, and no character was dropped to nothing.
+    const std::string line = "strain \xCE\xB5 \xE2\x89\xA4 0.02, \xCE\xB4 = 1.5 \xC3\x97 t";
+    const std::string out  = ui::foldToAtlasGlyphs(line);
+    CHECK_EQ(out, "strain eps <= 0.02, delta = 1.5 \xC3\x97 t");   // x U+00D7 IS covered
+    CHECK(out.find('?') == std::string::npos);
+}
+
+static void test_circled_capitals_spell_their_letter() {
+    // drawing_standards.md: (P) U+24C5, (F) U+24BB, (C) U+24B8.
+    CHECK_EQ(ui::foldToAtlasGlyphs("\xE2\x93\x85 \xE2\x92\xBB \xE2\x92\xB8"), "(P) (F) (C)");
+    CHECK_EQ(ui::foldToAtlasGlyphs("\xE2\x92\xB6"), "(A)");   // U+24B6, range start
+    CHECK_EQ(ui::foldToAtlasGlyphs("\xE2\x93\x8F"), "(Z)");   // U+24CF, range end
+}
+
 static void test_pure_ascii_is_byte_identical() {
     const std::string in = "{\"doc_id\": \"doc-cpp00000039\"}\n\tplain ASCII ~!@#$%^&*()";
     CHECK_EQ(ui::foldToAtlasGlyphs(in), in);
@@ -281,6 +312,8 @@ int main() {
     test_live_arrow_header_has_no_notdef();
     test_covered_glyphs_survive();
     test_uncovered_degrades_to_question_mark();
+    test_greek_engineering_notation();
+    test_circled_capitals_spell_their_letter();
     test_pure_ascii_is_byte_identical();
     test_malformed_utf8_survives();
     test_pipeline_order();

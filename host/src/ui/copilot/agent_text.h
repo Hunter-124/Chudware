@@ -57,8 +57,13 @@ std::string substituteDocIds(const std::string& text,
 // ---- 2. codepoints the font atlas has no glyph for ----------------------------------------
 
 // Replace codepoints the UI atlas has no glyph for with covered equivalents ("→" -> "->",
-// "✓" -> "ok", …). Anything uncovered with no sensible mapping becomes a plain '?' — the same
-// thing the user sees today, so never a regression and never a mangled byte.
+// "✓" -> "ok", "ε" -> "eps", …). Anything uncovered with no sensible mapping becomes a plain '?'
+// — the same thing the user sees today, so never a regression and never a mangled byte.
+//
+// Second consumer besides the chat: Settings → AI → Rules (settings_modal.cpp) renders rule
+// metadata and context-pack BODIES that come from services/agent/advisor. Those packs are
+// model-facing engineering prose and legitimately contain ε δ θ ρ α π — the source must not be
+// degraded, so the fold happens at the display boundary only, before any CalcTextSize().
 //
 // Valid UTF-8 in, valid UTF-8 out; multi-byte sequences are never split. Malformed input does not
 // crash — each bad byte becomes '?'.

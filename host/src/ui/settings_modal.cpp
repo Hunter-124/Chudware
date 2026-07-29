@@ -33,12 +33,14 @@
 #include "oauth_capture.h"  // in-app xAI multi-account CEF OAuth (Settings → Accounts)
 #include "web_capabilities.h"  // ui::webGapReason (T-RF12: sign-in is desktop-only on web)
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
-#include "widgets/interwebz.h"  // Skills/Context two-column editors
+#include "widgets/interwebz.h"  // Skills/Rules two-column editors
 #include "ui/provider_logos.h"  // ui::drawProviderLogo/providerBrandColor (Providers list badges)
 #include "provider_usage.h"  // ui::UsageAccount/UsageWindow + THE subscription_* poller
 #include "metrics.h"  // ui::metrics::px/stroke — DPI-scaled Settings gutter + usage rings
 #include "tesseract.h"  // ui::drawTesseract + TesseractAnim — Appearance > Brand mark picker
 #include "../ui_theme.h"  // ui::busyLabel — the one inline "working" indicator
+#include "ai/rules_authoring.h"  // ui::drawRulesAuthoringPopup (Settings → AI → Rules → New…)
+#include "copilot/agent_text.h"  // ui::foldToAtlasGlyphs — Rules tab renders Python-authored text
 
 
 // ---- C22b prompt editor state ----
@@ -3955,9 +3957,47 @@ static void ovDeleteSkill(AppState& st, const std::string& name) {
     });
 }
 
-// ---- Context injection triggers (Settings → Prompts → Context) ----
+// ---- Rules: context-injection triggers (Settings → AI → Rules). Wire names stay triggers_*. ----
+// A text field this tab both DISPLAYS and SAVES, where the text came from Python.
+//
+// The UI font atlas has no glyph for the Greek notation the shipped context packs use (ε strain,
+// δ deflection, θ bend angle), so everything shown must go through ui::foldToAtlasGlyphs first —
+// otherwise the pane is a wall of '?'. But those packs are MODEL-facing prose injected into the
+// prompt, so the fold must never travel back to disk. Hence: `raw` is the verbatim source,
+// `shown` is byte-for-byte what load() put in the ImGui buffer, and save() writes `raw` back for
+// any buffer the user left alone.
+struct OvRawField {
+    std::string raw;     // verbatim, as triggers_get returned it
+    std::string shown;   // folded (and buffer-truncated) — what the user is looking at
+
+    void load(const std::string& src, char* buf, size_t n) {
+        raw = src;
+        shown = ui::foldToAtlasGlyphs(src);
+        if (n == 0) { shown.clear(); return; }
+        if (shown.size() >= n) {
+            // Trim to a UTF-8 boundary: folding leaves covered multi-byte glyphs (× —) in place
+            // and half a sequence would render as the very '?' this exists to prevent.
+            size_t cut = n - 1;
+            while (cut > 0 && (static_cast<unsigned char>(shown[cut]) & 0xC0) == 0x80) --cut;
+            shown.resize(cut);
+        }
+        std::memset(buf, 0, n);
+        std::memcpy(buf, shown.data(), shown.size());
+    }
+    void load(const std::string& src, std::vector<char>& buf) {
+        load(src, buf.data(), buf.size());
+    }
+    // Reset for a field with no source behind it (the "New rule" templates are C++ ASCII).
+    void clear() { raw.clear(); shown.clear(); }
+    std::string save(const char* buf) const {
+        std::string cur(buf);
+        return cur == shown ? raw : cur;
+    }
+};
+
 struct OvTriggerRow {
     std::string id;
+    std::string label;    // human title from triggers_list ("thread_mention" -> "Thread mention")
     std::string purpose;
     std::string source;   // builtin | override | user
     std::string pack;
@@ -3990,6 +4030,12 @@ struct OvTriggersUi {
     char events[1024] = {};
     char exemplar[512] = {};
     std::vector<char> packBody{std::vector<char>(65536, 0)};
+    // Every editor buffer above shows text FOLDED for the atlas (see ui::foldToAtlasGlyphs), but
+    // the sources are model-facing: a shipped pack must not lose its Greek notation just because
+    // the user opened this tab. Each field therefore remembers both the verbatim source and the
+    // exact folded text put in the buffer — see OvRawField.
+    OvRawField purposeSrc, packNameSrc, exemplarSrc, keywordsSrc, toolsSrc, eventsSrc,
+        packBodySrc;
     bool bodyDirty = false;   // any editor field dirty
     bool packDirty = false;   // pack body specifically edited (avoid freezing shipped packs)
     nlohmann::json prerunCalcs = nlohmann::json::array();  // preserved from get/list
@@ -3997,6 +4043,8 @@ struct OvTriggersUi {
     char newId[96] = {};
 };
 static OvTriggersUi s_ovTrig;
+// Guided rule/skill/context authoring popup (opened by "New…" in the Rules tab).
+static bool s_rulesAuthorOpen = false;
 
 static bool ovTriggersAbsent(const core::RpcResult& r) {
     if (!r.ok) {
@@ -4037,17 +4085,15 @@ static std::vector<std::string> ovSplitLinesOrCommas(const char* buf) {
     }
     return out;
 }
-static void ovJoinLines(const std::vector<std::string>& xs, char* buf, size_t n) {
-    if (!buf || n == 0) return;
-    buf[0] = 0;
+// One line per entry. Returned rather than written into a buffer: the caller hands it to an
+// OvRawField, which owns the folding and the buffer truncation.
+static std::string ovJoinLines(const std::vector<std::string>& xs) {
     std::string s;
     for (size_t i = 0; i < xs.size(); ++i) {
         if (i) s.push_back('\n');
         s += xs[i];
     }
-    if (s.size() >= n) s.resize(n - 1);
-    std::memcpy(buf, s.data(), s.size());
-    buf[s.size()] = 0;
+    return s;
 }
 static void ovPollTriggers(AppState& st, bool force) {
     if (s_ovTrig.rpcMissing) return;
@@ -4078,6 +4124,9 @@ static void ovPollTriggers(AppState& st, bool force) {
                 if (!e.is_object()) continue;
                 OvTriggerRow row;
                 row.id = e.value("id", std::string());
+                // RulesEngineLive serves `label` on every row; an older user override written
+                // before that may not have it, and an empty heading is worse than the raw id.
+                row.label = e.value("label", std::string());
                 row.purpose = e.value("purpose", std::string());
                 row.source = e.value("source", std::string("builtin"));
                 row.enabled = e.value("enabled", true);
@@ -4137,9 +4186,8 @@ static void ovLoadTriggerBody(AppState& st, const std::string& id) {
         s_ovTrig.enabled = trig.value("enabled", true);
         s_ovTrig.budgetTokens = trig.value("budget_tokens", 250);
         s_ovTrig.cooldownTurns = trig.value("cooldown_turns", 8);
-        std::string purpose = trig.value("purpose", std::string());
-        std::memset(s_ovTrig.purpose, 0, sizeof(s_ovTrig.purpose));
-        std::strncpy(s_ovTrig.purpose, purpose.c_str(), sizeof(s_ovTrig.purpose) - 1);
+        s_ovTrig.purposeSrc.load(trig.value("purpose", std::string()),
+                                 s_ovTrig.purpose, sizeof(s_ovTrig.purpose));
         auto inject = trig.value("inject", nlohmann::json::object());
         std::string packName = inject.is_object()
             ? inject.value("context_pack", std::string()) : std::string();
@@ -4148,10 +4196,8 @@ static void ovLoadTriggerBody(AppState& st, const std::string& id) {
         s_ovTrig.prerunCalcs = (inject.is_object() && inject.contains("prerun_calcs")
                                 && inject["prerun_calcs"].is_array())
             ? inject["prerun_calcs"] : nlohmann::json::array();
-        std::memset(s_ovTrig.packName, 0, sizeof(s_ovTrig.packName));
-        std::strncpy(s_ovTrig.packName, packName.c_str(), sizeof(s_ovTrig.packName) - 1);
-        std::memset(s_ovTrig.exemplar, 0, sizeof(s_ovTrig.exemplar));
-        std::strncpy(s_ovTrig.exemplar, exemplar.c_str(), sizeof(s_ovTrig.exemplar) - 1);
+        s_ovTrig.packNameSrc.load(packName, s_ovTrig.packName, sizeof(s_ovTrig.packName));
+        s_ovTrig.exemplarSrc.load(exemplar, s_ovTrig.exemplar, sizeof(s_ovTrig.exemplar));
         auto match = trig.value("match", nlohmann::json::object());
         std::vector<std::string> kws, tools, evs;
         if (match.is_object()) {
@@ -4165,14 +4211,13 @@ static void ovLoadTriggerBody(AppState& st, const std::string& id) {
             if (a.is_array()) for (const auto& e : a)
                 if (e.is_string()) evs.push_back(e.get<std::string>());
         }
-        ovJoinLines(kws, s_ovTrig.keywords, sizeof(s_ovTrig.keywords));
-        ovJoinLines(tools, s_ovTrig.tools, sizeof(s_ovTrig.tools));
-        ovJoinLines(evs, s_ovTrig.events, sizeof(s_ovTrig.events));
-        std::string body = pack.is_object() ? pack.value("body", std::string()) : std::string();
-        std::fill(s_ovTrig.packBody.begin(), s_ovTrig.packBody.end(), 0);
-        if (body.size() >= s_ovTrig.packBody.size())
-            body.resize(s_ovTrig.packBody.size() - 1);
-        std::memcpy(s_ovTrig.packBody.data(), body.data(), body.size());
+        s_ovTrig.keywordsSrc.load(ovJoinLines(kws), s_ovTrig.keywords,
+                                  sizeof(s_ovTrig.keywords));
+        s_ovTrig.toolsSrc.load(ovJoinLines(tools), s_ovTrig.tools, sizeof(s_ovTrig.tools));
+        s_ovTrig.eventsSrc.load(ovJoinLines(evs), s_ovTrig.events, sizeof(s_ovTrig.events));
+        s_ovTrig.packBodySrc.load(
+            pack.is_object() ? pack.value("body", std::string()) : std::string(),
+            s_ovTrig.packBody);
         s_ovTrig.bodyDirty = false;
         s_ovTrig.packDirty = false;
         s_ovTrig.lastError.clear();
@@ -4184,19 +4229,22 @@ static void ovSaveTrigger(AppState& st) {
     nlohmann::json p;
     p["id"] = s_ovTrig.selected;
     p["enabled"] = s_ovTrig.enabled;
-    p["purpose"] = std::string(s_ovTrig.purpose);
+    // Each field: the verbatim source when the user left the (folded) buffer alone, otherwise
+    // exactly what they typed. Merely opening a shipped pack must not rewrite it as ASCII.
+    p["purpose"] = s_ovTrig.purposeSrc.save(s_ovTrig.purpose);
     p["budget_tokens"] = s_ovTrig.budgetTokens;
     p["cooldown_turns"] = s_ovTrig.cooldownTurns;
     p["match"] = nlohmann::json{
-        {"keywords", ovSplitLinesOrCommas(s_ovTrig.keywords)},
-        {"tools", ovSplitLinesOrCommas(s_ovTrig.tools)},
-        {"events", ovSplitLinesOrCommas(s_ovTrig.events)},
+        {"keywords", ovSplitLinesOrCommas(
+             s_ovTrig.keywordsSrc.save(s_ovTrig.keywords).c_str())},
+        {"tools", ovSplitLinesOrCommas(s_ovTrig.toolsSrc.save(s_ovTrig.tools).c_str())},
+        {"events", ovSplitLinesOrCommas(s_ovTrig.eventsSrc.save(s_ovTrig.events).c_str())},
     };
     p["inject"] = nlohmann::json{
-        {"context_pack", std::string(s_ovTrig.packName)},
+        {"context_pack", s_ovTrig.packNameSrc.save(s_ovTrig.packName)},
         {"prerun_calcs", s_ovTrig.prerunCalcs.is_array()
             ? s_ovTrig.prerunCalcs : nlohmann::json::array()},
-        {"exemplar", std::string(s_ovTrig.exemplar)},
+        {"exemplar", s_ovTrig.exemplarSrc.save(s_ovTrig.exemplar)},
     };
     for (const auto& row : s_ovTrig.rows) {
         if (row.id == s_ovTrig.selected) {
@@ -4208,8 +4256,8 @@ static void ovSaveTrigger(AppState& st) {
     // Only write pack body when the user actually edited it (or is creating).
     // Toggling Enabled alone must not freeze a shipped pack into the user dir.
     if (s_ovTrig.packDirty || s_ovTrig.creating) {
-        p["pack_body"] = std::string(s_ovTrig.packBody.data());
-        p["pack_name"] = std::string(s_ovTrig.packName);
+        p["pack_body"] = s_ovTrig.packBodySrc.save(s_ovTrig.packBody.data());
+        p["pack_name"] = s_ovTrig.packNameSrc.save(s_ovTrig.packName);
     }
     st.rpc.call("triggers_save", p, [](const core::RpcResult& r) {
         s_ovTrig.saveInFlight = false;
@@ -4426,13 +4474,79 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
     ui::InterwebzTwoColumnEnd();
 }
 
+// Shorten `s` so it fits `maxW` px by trimming the STRING (never a clip rect), so a label
+// can not lose its last character to a mis-tuned inset. UTF-8 boundary safe.
+static std::string ovFitText(const std::string& s, float maxW) {
+    static const char* kEll = "\xe2\x80\xa6";
+    if (s.empty() || ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    const float ellW = ImGui::CalcTextSize(kEll).x;
+    if (maxW <= ellW) return kEll;
+    size_t n = s.size();
+    while (n > 0) {
+        --n;
+        while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
+        if (n == 0) break;
+        if (ImGui::CalcTextSize(s.c_str(), s.c_str() + n).x + ellW <= maxW) break;
+    }
+    return s.substr(0, n) + kEll;
+}
+
+// Everything below renders text authored in Python (services/agent/advisor), so each helper folds
+// its finished string through ui::foldToAtlasGlyphs — once, at the end, BEFORE the caller measures
+// or clips it. Folding after ovFitText/CalcTextSize would clip against a width the paint never
+// uses ("->" is wider than the notdef box it replaces).
+
+// The rule's human title: `label` from triggers_list, falling back to the bare id so an override
+// written before labels existed still gets a heading.
+static std::string ovTriggerLabel(const OvTriggerRow& tr) {
+    return ui::foldToAtlasGlyphs(tr.label.empty() ? tr.id : tr.label);
+}
+
+// One compact line naming exactly what fires a rule: keyword regexes, tool names, events.
+static std::string ovTriggerSummary(const OvTriggerRow& tr) {
+    std::string s;
+    auto add = [&s](const char* tag, const std::vector<std::string>& v) {
+        if (v.empty()) return;
+        if (!s.empty()) s += "  \xc2\xb7  ";
+        s += tag;
+        for (size_t i = 0; i < v.size(); ++i) s += (i ? ", " : " ") + v[i];
+    };
+    add("kw", tr.keywords);
+    add("tool", tr.tools);
+    add("evt", tr.events);
+    if (s.empty()) s = "no match clause \xe2\x80\x94 never fires";
+    return ui::foldToAtlasGlyphs(s);
+}
+
+// The same trigger unclipped, plus the rate limits that explain a rule staying quiet.
+static std::string ovTriggerTooltip(const OvTriggerRow& tr) {
+    std::string t = tr.label.empty() ? tr.id : (tr.label + "  (" + tr.id + ")");
+    if (!tr.purpose.empty()) t += "\n" + tr.purpose;
+    auto block = [&t](const char* head, const std::vector<std::string>& v) {
+        if (v.empty()) return;
+        t += "\n\n";
+        t += head;
+        for (const auto& e : v) t += "\n  " + e;
+    };
+    block("Keywords (regex):", tr.keywords);
+    block("Tools:", tr.tools);
+    block("Events:", tr.events);
+    if (tr.keywords.empty() && tr.tools.empty() && tr.events.empty())
+        t += "\n\nNo match clause \xe2\x80\x94 this rule can never fire.";
+    if (!tr.pack.empty()) t += "\n\nInjects pack: " + tr.pack;
+    t += "\n" + std::to_string(tr.budgetTokens) + " token budget \xc2\xb7 "
+       + std::to_string(tr.cooldownTurns) + "-turn cooldown";
+    t += std::string("\nSource: ") + (tr.source.empty() ? "builtin" : tr.source.c_str());
+    return ui::foldToAtlasGlyphs(t);
+}
+
 static void drawSettingsContextTab(AppState& st, float S) {
     ovPollTriggers(st, /*force=*/false);
 
     if (s_ovTrig.rpcMissing) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
         ImGui::TextWrapped(
-            "triggers_* RPC not available \xe2\x80\x94 Context Injection editor hidden.");
+            "triggers_* RPC not available \xe2\x80\x94 Rules editor hidden.");
         ImGui::PopStyleColor();
         return;
     }
@@ -4442,11 +4556,16 @@ static void drawSettingsContextTab(AppState& st, float S) {
         ImGui::PopStyleColor();
     }
 
+    const ImVec4 dimCol(ui::palette.textDim[0], ui::palette.textDim[1],
+                        ui::palette.textDim[2], 1);
     const float titleBudget = ImGui::GetTextLineHeight() + 10.0f * S;
     const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - titleBudget);
     ui::InterwebzTwoColumnBegin(10.0f);
-    if (ui::InterwebzGroupBegin("##set_trig_list", "Triggers", ImVec2(0, colH))) {
-        if (ImGui::Button("New trigger", ImVec2(-1, 0))) {
+    if (ui::InterwebzGroupBegin("##set_trig_list", "Rules", ImVec2(0, colH))) {
+        const float gap = 6.0f * S;
+        const float halfW = ImMax(60.0f * S,
+                                  (ImGui::GetContentRegionAvail().x - gap) * 0.5f);
+        if (ImGui::Button("New rule", ImVec2(halfW, 0))) {
             s_ovTrig.creating = true;
             s_ovTrig.selected.clear();
             s_ovTrig.enabled = true;
@@ -4468,6 +4587,12 @@ static void drawSettingsContextTab(AppState& st, float S) {
                          "# My context pack\n\nImportant considerations:\n- ...\n",
                          s_ovTrig.packBody.size() - 1);
             s_ovTrig.prerunCalcs = nlohmann::json::array();
+            // No Python source behind these C++ templates: save() must write the buffers.
+            for (OvRawField* f : {&s_ovTrig.purposeSrc, &s_ovTrig.packNameSrc,
+                                  &s_ovTrig.exemplarSrc, &s_ovTrig.keywordsSrc,
+                                  &s_ovTrig.toolsSrc, &s_ovTrig.eventsSrc,
+                                  &s_ovTrig.packBodySrc})
+                f->clear();
             s_ovTrig.bodyDirty = true;
             s_ovTrig.packDirty = true;
             std::memset(s_ovTrig.newId, 0, sizeof(s_ovTrig.newId));
@@ -4475,16 +4600,19 @@ static void drawSettingsContextTab(AppState& st, float S) {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "Create a user-only trigger + pack (saved under context_injection/).");
+                "Blank rule + pack, edited on the right (saved under context_injection/).");
+        ImGui::SameLine(0, gap);
+        if (ImGui::Button("New\xe2\x80\xa6", ImVec2(-1, 0)))
+            s_rulesAuthorOpen = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Guided authoring for rules, skills and context injections.");
         ImGui::Dummy(ImVec2(0, 4.0f * S));
 
         if (!s_ovTrig.loaded && s_ovTrig.listInFlight) {
-            ImGui::TextUnformatted("Loading triggers\xe2\x80\xa6");
+            ImGui::TextUnformatted("Loading rules\xe2\x80\xa6");
         } else if (s_ovTrig.rows.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                       ui::palette.textDim[2], 1));
-            ImGui::TextWrapped("No triggers discovered.");
+            ImGui::PushStyleColor(ImGuiCol_Text, dimCol);
+            ImGui::TextWrapped("No rules discovered.");
             ImGui::PopStyleColor();
         } else {
             for (size_t i = 0; i < s_ovTrig.rows.size(); ++i) {
@@ -4498,12 +4626,17 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 }
                 ImGui::SameLine(0, 0);
                 ImGui::BeginGroup();
-                ompStatusDotText(tr.id.c_str(),
+                // Primary text is the human label; the id moves to the meta line below, where it
+                // stays visible because /rule and every triggers_* RPC key on it.
+                const std::string label = ovTriggerLabel(tr);
+                ompStatusDotText(label.c_str(),
                                  tr.enabled ? ui::palette.statusOk : ui::palette.textDim,
                                  tr.enabled, ui::palette.text);
                 ImGui::SameLine();
                 {
-                    const char* chip = tr.source.c_str();
+                    // builtin = shipped default, override = shipped rule the user edited,
+                    // user = rule the user created (RPC `source` field).
+                    const char* chip = tr.source.empty() ? "builtin" : tr.source.c_str();
                     ImU32 chipCol = ui::Palette::toU32(ui::palette.textDim);
                     if (tr.source == "user")
                         chipCol = ui::Palette::toU32(ui::palette.accent);
@@ -4513,27 +4646,55 @@ static void drawSettingsContextTab(AppState& st, float S) {
                     ImGui::Text("[%s]", chip);
                     ImGui::PopStyleColor();
                 }
-                if (!tr.purpose.empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                               ui::palette.textDim[2], 1));
-                    ImGui::TextWrapped("%s", tr.purpose.c_str());
+
+                // Meta line: the id (the handle everything else keys on) plus the rate limits.
+                {
+                    std::string meta = ui::foldToAtlasGlyphs(tr.id);
+                    meta += "  \xc2\xb7  " + std::to_string(tr.budgetTokens) + " tok  \xc2\xb7  cd "
+                          + std::to_string(tr.cooldownTurns);
+                    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+                    const std::string fit = ovFitText(
+                        meta, ImMax(40.0f * S, ImGui::GetContentRegionAvail().x));
+                    ImGui::PushStyleColor(ImGuiCol_Text, dimCol);
+                    ImGui::TextUnformatted(fit.c_str());
                     ImGui::PopStyleColor();
-                } else if (!tr.pack.empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                               ui::palette.textDim[2], 1));
-                    ImGui::TextWrapped("pack: %s", tr.pack.c_str());
+                    if (st.fonts.mono) ImGui::PopFont();
+                }
+
+                ImGui::PushStyleColor(ImGuiCol_Text, dimCol);
+                if (!tr.purpose.empty())
+                    ImGui::TextWrapped("%s", ui::foldToAtlasGlyphs(tr.purpose).c_str());
+                else if (!tr.pack.empty())
+                    ImGui::TextWrapped("pack: %s", ui::foldToAtlasGlyphs(tr.pack).c_str());
+                ImGui::PopStyleColor();
+
+                // What actually fires the rule. Trimmed to the column, full text on hover.
+                {
+                    const bool never = tr.keywords.empty() && tr.tools.empty()
+                                       && tr.events.empty();
+                    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+                    const std::string line = ovFitText(
+                        ovTriggerSummary(tr),
+                        ImMax(40.0f * S, ImGui::GetContentRegionAvail().x));
+                    ImGui::PushStyleColor(ImGuiCol_Text, never
+                        ? ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
+                                 ui::palette.statusWarn[2], 1)
+                        : ImVec4(ui::palette.text[0], ui::palette.text[1],
+                                 ui::palette.text[2], 1));
+                    ImGui::TextUnformatted(line.c_str());
                     ImGui::PopStyleColor();
+                    if (st.fonts.mono) ImGui::PopFont();
                 }
                 ImGui::EndGroup();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", ovTriggerTooltip(tr).c_str());
                 if (ImGui::IsItemClicked()) {
                     s_ovTrig.creating = false;
                     s_ovTrig.selected = tr.id;
                     ovLoadTriggerBody(st, tr.id);
                 }
                 ImGui::PopID();
-                ImGui::Dummy(ImVec2(0, 2.0f * S));
+                ImGui::Dummy(ImVec2(0, 3.0f * S));
             }
         }
     }
@@ -4558,11 +4719,16 @@ static void drawSettingsContextTab(AppState& st, float S) {
             ImGui::TextWrapped("Select a trigger to edit, or New trigger.");
             ImGui::PopStyleColor();
         } else {
-            ui::InterwebzKeyValueRow("Trigger", s_ovTrig.selected.c_str());
-            const char* src = "builtin";
+            // Label first (Python-authored, so folded), id kept as its own row.
+            const OvTriggerRow* selRow = nullptr;
             for (const auto& tr : s_ovTrig.rows)
-                if (tr.id == s_ovTrig.selected) { src = tr.source.c_str(); break; }
-            ui::InterwebzKeyValueRow("Source", src);
+                if (tr.id == s_ovTrig.selected) { selRow = &tr; break; }
+            const std::string selLabel = selRow ? ovTriggerLabel(*selRow) : std::string();
+            if (!selLabel.empty() && selLabel != s_ovTrig.selected)
+                ui::InterwebzKeyValueRow("Rule", selLabel.c_str());
+            ui::InterwebzKeyValueRow("Id", s_ovTrig.selected.c_str());
+            ui::InterwebzKeyValueRow(
+                "Source", selRow && !selRow->source.empty() ? selRow->source.c_str() : "builtin");
         }
 
         if (s_ovTrig.creating || !s_ovTrig.selected.empty()) {
@@ -4789,6 +4955,8 @@ const SettingsEntry kSettingsEntries[] = {
     { "System prompt override",   "AI",       2 },
     { "Skills",                   "AI",       2 },
     { "Skill editor",             "AI",       2 },
+    { "Rules",                    "AI",       2 },
+    { "Rule triggers",            "AI",       2 },
     { "Context injection",        "AI",       2 },
     { "Triggers",                 "AI",       2 },
     // Run behavior (lives on AI tab; was Agent tab 6)
@@ -4932,6 +5100,7 @@ void drawSettingsModal(AppState& st, bool busy) {
         if (jumpToTab >= 4) {
             if (jumpToTab == 4) s_aiSubJump = 5;       // Benchmarks
             else if (jumpToTab == 5) s_aiSubJump = 2;  // Prompts
+            else if (jumpToTab == 6) s_aiSubJump = 4;   // Rules (/rule in the composer)
             else if (jumpToTab == 7) s_aiSubJump = 1;  // Experimental -> Roles
             jumpToTab = 2;
         }
@@ -5371,7 +5540,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 // Benchmarks' status polling relies on that.
                 static const char* kAiSubLabels[8] = {
                     "Harness", "Roles", "Prompts", "Skills",
-                    "Context", "Benchmarks", "Tools", "Dev Preview"};
+                    "Rules", "Benchmarks", "Tools", "Dev Preview"};
                 const bool aiNarrow = ImGui::GetContentRegionAvail().x < 640.0f * sc;
                 if (aiNarrow) {
                     ImGui::SetNextItemWidth(-1);
@@ -6886,6 +7055,9 @@ void drawSettingsModal(AppState& st, bool busy) {
         }
         ImGui::Unindent(10.0f * sc);
         ImGui::EndChild();
+        // Nested modal: must be submitted every frame inside the Settings window scope or
+        // ImGui's modal stack makes it non-interactive. It clears the flag itself on close.
+        ui::drawRulesAuthoringPopup(st, &s_rulesAuthorOpen);
         }
         ImGui::End();
         ImGui::PopStyleVar();  // WindowPadding

@@ -66,10 +66,33 @@ class EcadKicadAdapter:
         return results
 
     def get(self, part_id: str) -> dict | None:
-        if not part_id or not part_id.startswith("ecad:"):
+        # A model-written id is canonicalised EXACTLY or not at all
+        # (services/ecad/library/partid.resolve): only spelling noise — a missing or
+        # doubled 'ecad:' domain prefix, case, whitespace — is forgiven. A near miss
+        # (ecad:Device:R_0603) is NEVER mapped onto a different record; it stays a
+        # refusal whose hint names the real ids instead.
+        want = str(part_id or "")
+        try:
+            from services.ecad.library.partid import resolve as _resolve_ecad_id
+            hit = _resolve_ecad_id(part_id)
+            if hit:
+                want = hit["part_id"]
+        except Exception as exc:  # noqa: BLE001
+            log.debug("EcadKicadAdapter: part-id resolver unavailable: %s", exc)
+        if not want.startswith("ecad:"):
             return None
         for rec in self.iter_records():
-            if rec.get("part_id") == part_id:
+            if rec.get("part_id") == want:
+                return rec
+        # Generated parts (ecad_make_part -> resolution tier 2) are served HERE and
+        # deliberately NOT from iter_records(): iter_records feeds the FTS index, which is
+        # snapshotted to <app data>/cache/parts_index.sqlite and revalidated against a
+        # fingerprint of static data files only (hub._fingerprint_sources). A tier that
+        # changes at runtime — and whose dir may be a tmpdir — would be baked into that
+        # cache and outlive the parts themselves. Live lookup keeps part_get/part_place
+        # able to fetch a part the agent just made, with nothing cached.
+        for rec in _load_native_dirs():
+            if rec.get("part_id") == want:
                 return rec
         return None
 
@@ -77,7 +100,12 @@ class EcadKicadAdapter:
         return sum(1 for _ in self.iter_records())
 
     def iter_records(self) -> Iterator[dict]:
-        """Enumerate starter symbols, starter footprints, then user-lib symbols."""
+        """Enumerate starter symbols, starter footprints, then user-lib symbols.
+
+        INDEXED content only — see ``get`` for why the generated native tier is excluded.
+        Keyword search still reaches it: ``search`` delegates to
+        ``services.ecad.library.search``, which scans the native dirs itself.
+        """
         # Starter symbols
         starter_syms, starter_fps = _load_starter()
         for libid, sdef in starter_syms.items():
@@ -115,6 +143,55 @@ def _lib_search(query: str) -> list[dict]:
     except Exception as exc:  # noqa: BLE001
         log.debug("EcadKicadAdapter: lib_search unavailable: %s", exc)
         return []
+
+
+def _load_native_dirs() -> Iterator[dict]:
+    """PartRecords for every generated part in the registered native library dirs.
+
+    Layout is native.Library's own: ``<dir>/symbols/<libid>.sym.json`` and
+    ``<dir>/footprints/<fpid>.fp.json`` with ':' encoded as '__'. Best-effort — a
+    malformed or unreadable file is skipped, never fatal to the whole enumeration.
+
+    Symbols are emitted first and a footprint stored under the SAME id is then skipped:
+    ecad_make_part accepts an fpid equal to the symbol's libid, which would otherwise emit
+    two PartRecords sharing one part_id. The index keeps whichever it saw last, and the
+    footprint record's geometry_ref has no ``libid`` — so part_place answered
+    "geometry_ref missing 'libid'" for a part that had just been created successfully. The
+    symbol record is the placeable one and already names its footprint.
+    """
+    try:
+        import json
+
+        from services.ecad.library.native import (_filename_to_libid,
+                                                  get_default_library)
+        dirs = list(getattr(get_default_library(), "_native_dirs", ()) or ())
+    except Exception as exc:  # noqa: BLE001
+        log.debug("EcadKicadAdapter: native tier unavailable: %s", exc)
+        return
+    seen: set = set()
+    for directory in dirs:
+        for sub, ext, build in (("symbols", ".sym.json", _symbol_record),
+                                ("footprints", ".fp.json", _footprint_record)):
+            folder = os.path.join(directory, sub)
+            try:
+                names = sorted(os.listdir(folder))
+            except OSError:
+                continue
+            for fname in names:
+                if not fname.endswith(ext):
+                    continue
+                libid = _filename_to_libid(fname, ext)
+                if libid in seen:
+                    continue
+                try:
+                    with open(os.path.join(folder, fname), encoding="utf-8") as fh:
+                        definition = json.load(fh)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("EcadKicadAdapter: bad native part %r: %s", fname, exc)
+                    continue
+                seen.add(libid)
+                yield build(libid, definition, license_="user-generated",
+                            provenance=f"Generated by ecad_make_part ({directory})")
 
 
 def _load_user_sym_lib(path: str) -> Iterator[dict]:

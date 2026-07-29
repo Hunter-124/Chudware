@@ -328,3 +328,48 @@ class TaskListPreferenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_desc_only_items_publish_instead_of_dropping_the_whole_plan():
+    """`desc` must work as a title source — the short spelling of an accepted key.
+
+    _TITLE_KEYS already accepts the LONG "description" while _DESC_KEYS owns the short
+    "desc", so an item written {"id","desc","status"} matched no title key, every item
+    was dropped, and the call failed with "no usable items — every entry lacked a title".
+    Measured live 2026-07-29 (parts sweep, claude-sonnet-4-5): the model published a
+    five-step plan that way and lost the entire planning surface, which makes the agent
+    look like it never planned at all.
+    """
+    from services.agent import task_list as store
+
+    snap = store.publish("t-desc-only", [
+        {"id": "1", "desc": "Create new assembly", "status": "done"},
+        {"id": "2", "desc": "Search for M4 hex nuts", "status": "running"},
+        {"id": "3", "desc": "Generate BOM", "status": "pending"},
+    ], title="M4 nuts")
+    assert len(snap["items"]) == 3
+    assert [i["title"] for i in snap["items"]] == [
+        "Create new assembly", "Search for M4 hex nuts", "Generate BOM"]
+    assert [i["status"] for i in snap["items"]] == ["done", "running", "pending"]
+
+
+def test_title_still_wins_and_desc_stays_a_separate_field():
+    """When BOTH are given the promotion must not fire — desc remains the detail line."""
+    from services.agent import task_list as store
+
+    snap = store.publish("t-both", [
+        {"title": "Do the thing", "desc": "with extra detail", "status": "running"}])
+    item = snap["items"][0]
+    assert item["title"] == "Do the thing"
+    assert item["desc"] == "with extra detail"
+
+
+def test_item_with_no_text_at_all_is_still_dropped():
+    """The promotion must not resurrect genuinely empty entries."""
+    from services.agent import task_list as store
+
+    snap = store.publish("t-empty", [
+        {"id": "9", "status": "pending"},          # no text anywhere
+        {"title": "real task", "status": "done"},
+    ])
+    assert [i["title"] for i in snap["items"]] == ["real task"]

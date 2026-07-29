@@ -36,6 +36,17 @@ ARG_SYNONYMS: dict[str, str] = {
     "fileformat": "fmt",
 }
 
+# The spellings of `n_modes` (a COUNT) that the affix heuristic cannot reach. Shared by the
+# three solvers that take it; see the run_fea_modal note in TOOL_ARG_SYNONYMS below.
+_N_MODES_SPELLINGS: dict[str, str] = {
+    "nummodes": "nmodes",
+    "nummode": "nmodes",
+    "modecount": "nmodes",
+    "modescount": "nmodes",
+    "numberofmodes": "nmodes",
+    "numofmodes": "nmodes",
+}
+
 # Synonyms that are only unambiguous for ONE tool. "type" is far too generic
 # to map globally, but export_part(fmt, path, doc_id) has no other parameter
 # a str `type=` could mean. Every entry below was added only after READING the
@@ -103,6 +114,86 @@ TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
     # test_ecad_simulate_still_refuses_the_s_parameter_port_arguments).
     "ecad_simulate": {"kind": "analysis", "analysistype": "analysis",
                       "simtype": "analysis", "solver": "backend"},
+    # run_shell(command: str, cwd: str = "", timeout_s: int = SHELL_DEFAULT_TIMEOUT_S)
+    # — fs_tools.py:762. Live 2026-07-29 (claude-sonnet-4-5): cmd='ls -la
+    # /tmp/sweep/work/' was refused. `cmd` is the universal abbreviation of
+    # `command`, and the affix rule cannot reach it ("cmd" is neither a prefix
+    # nor a suffix of "command"). There is exactly ONE command slot and the
+    # other two parameters are a directory and an int timeout, so no str
+    # spelling of "the thing to run" can be misrouted HERE. Tool-scoped because
+    # globally `cmd`/`script` could name a subcommand word or a file path.
+    # DELIBERATELY EXCLUDED: `shell=`. "shell" names the INTERPRETER
+    # (bash/sh/zsh), a different thing from the command line; run_shell has no
+    # interpreter slot, so binding shell='bash' would execute `bash` and report
+    # success. Same reasoning as QUANTITY_MISMATCH below: a name meaning
+    # something else is a refusal, not an alias.
+    "run_shell": {
+        "cmd": "command",
+        "cmdline": "command",
+        "commandline": "command",
+        "script": "command",
+    },
+    # run_fea_modal(fixtures, material, n_modes=6, mesh_fineness, doc_id, background) —
+    # cad_sim_tools.py:546. Live 2026-07-29 (claude-sonnet-4-5, sim suite):
+    # run_fea_modal(num_modes=3) was refused. `num_modes` is the obvious English spelling of
+    # `n_modes` and denotes the SAME quantity — a COUNT of modes, no unit and no scale to
+    # convert — so this is a spelling alias, not a QUANTITY_MISMATCH.
+    # The affix rule in resolve_unknown cannot reach it: "nummodes" is neither a prefix nor a
+    # suffix of "nmodes". It DOES already reach `modes` ("nmodes".endswith("modes")) and
+    # `n_mode` ("nmodes".startswith("nmode")), so neither is listed — an entry that duplicates
+    # the heuristic only hides which rule is doing the work.
+    # Tool-scoped for all three solvers that take n_modes; each has exactly ONE mode-count
+    # slot, so no spelling of "how many modes" can be misrouted.
+    "run_fea_modal": _N_MODES_SPELLINGS,
+    # run_fea_frequency_response(..., n_modes=6, ...) — cad_sim_tools.py:657.
+    "run_fea_frequency_response": _N_MODES_SPELLINGS,
+    # run_fea_buckling(fixtures, load, material, n_modes=4, doc_id) — cad_sim_tools.py:1327.
+    "run_fea_buckling": _N_MODES_SPELLINGS,
+    # make_drawing(doc_id, views, sections, sheet, hole_callouts, model_items, title,
+    # source_doc, template) — cad_drawing_tools.py:407, signature read 2026-07-29 AFTER
+    # DrawingArgAliases removed the **kwargs that had made this tool varkw (a varkw tool
+    # bypasses this whole layer on both paths, so entries here would have been dead code).
+    # Exactly ONE document slot and ONE paper-size slot, so every spelling below is
+    # unambiguous HERE; globally "source"/"paper" could mean almost anything, hence
+    # tool-scoped. `source_doc`/`template` are now REAL parameters and need no entry.
+    # NOT listed because the affix rule in resolve_unknown already reaches them (measured,
+    # not assumed — an entry that duplicates the heuristic only hides which rule is doing
+    # the work): source_document -> source_doc, sheet_format -> sheet.
+    # `template` is deliberately absent: a template value that is NOT a paper size must be
+    # refused, and only the tool can inspect the value to tell the two apart.
+    # `source` IS listed, and the reason is a trap worth recording: make_drawing carries
+    # BOTH `source_doc` AND `source_doc_id` as real parameters (two spellings of the one
+    # slot), so "source" affix-matches TWO free params, resolve_unknown sees len(affix)==2
+    # and correctly refuses. A working spelling silently became a refusal the moment the
+    # second alias was declared. The explicit synonym runs BEFORE the affix step and names
+    # doc_id, which is unambiguous, so it repairs the coverage without loosening the rule.
+    "make_drawing": {
+        "source": "docid",
+        "fromdoc": "docid",
+        "modeldoc": "docid",
+        "partdoc": "docid",
+        "sourcepart": "docid",
+        "papersize": "sheet",
+        "paper": "sheet",
+    },
+    # export_drawing(fmt, doc_id, path, filename) — cad_drawing_tools.py:627. One
+    # output-name slot and one format slot. NOT listed (affix already reaches them):
+    # save_path -> path, file -> filename.
+    # DELIBERATELY EXCLUDED: `output`. output="dxf" reads as the FORMAT to plenty of
+    # models, fmt and path are both str so annotation_admits cannot tell them apart, and
+    # binding it to path would silently write a file named "dxf.pdf" — a wrong-slot bind
+    # is invisible, which is the same failure class as a wrong-unit alias.
+    "export_drawing": {
+        "outfile": "path",
+        "outputfile": "path",
+        "dest": "path",
+        "destination": "path",
+        "saveas": "path",
+        "filetype": "fmt",
+        "extension": "fmt",
+        "ext": "fmt",
+        "type": "fmt",
+    },
 }
 
 # Argument names that are PURELY a human-readable label: they name the call for
@@ -119,6 +210,67 @@ DESCRIPTIVE_ARGS: frozenset[str] = frozenset({
     "studyname", "title", "label", "caption", "comment", "note", "notes",
     "description", "displayname", "friendlyname",
 })
+
+# The DELIBERATE NON-ALIASES. Each key looks like a spelling of the parameter it
+# names, but denotes a different QUANTITY — an absolute length where the real
+# parameter wants a dimensionless factor, a diameter where it wants a radius.
+# Aliasing one of these would run a different computation and report success:
+# the single worst outcome this module can produce, and strictly worse than the
+# honest refusal. So the resolver hard-refuses them, and `unknown_arg_payload`
+# spends the refusal teaching the real parameter, its scale, and an example.
+#
+# Live 2026-07-29 (claude-sonnet-4-5, general lane): run_fea_static(...,
+# mesh_size_mm=<n>) was refused as unknown_argument next to an accepted-params
+# list containing `mesh_fineness (optional)` — an invitation to alias it. But
+# cad_sim_tools.py:75-76,284-285 defines mesh_fineness as a 0..1 float (preset
+# words "coarse"=0.25 / "medium"=0.5 / "fine"=0.75 / "finest"=1.0), i.e. a
+# density factor with no millimetre in it. mesh_size_mm=2.0 bound there would
+# mesh at fineness 2.0, not at a 2 mm element edge.
+#
+# Keyed by NORMALISED supplied name -> (target parameter, what the supplied name
+# means and why it does not convert, a correct example argument). A note is only
+# emitted when *target* is genuinely a parameter of the tool being called, so
+# this table can never invent advice about a parameter that is not there.
+QUANTITY_MISMATCH: dict[str, tuple[str, str, str]] = {}
+
+_MESH_SIZE_WHY = (
+    "an ABSOLUTE element edge length in millimetres, while `mesh_fineness` is a "
+    "DIMENSIONLESS 0..1 density factor (0.25=\"coarse\", 0.5=\"medium\", "
+    "0.75=\"fine\", 1.0=\"finest\"). There is no mm-to-fineness conversion, so "
+    "the number cannot be carried across — choose a fineness instead"
+)
+for _n in ("meshsizemm", "meshsize", "meshelementsize", "meshelementsizemm",
+           "elementsize", "elementsizemm", "meshedgelengthmm", "meshedgelength",
+           "meshresolutionmm", "targetelementsizemm"):
+    QUANTITY_MISMATCH[_n] = ("mesh_fineness", _MESH_SIZE_WHY, "mesh_fineness=0.75")
+del _n
+
+
+def quantity_mismatch_notes(tool: str, params: Sequence[str],
+                            unmapped: Sequence[str]) -> list[dict]:
+    """Teaching entries for refused names that are a UNIT/QUANTITY mismatch.
+
+    One entry per name in *unmapped* that is in `QUANTITY_MISMATCH` AND whose
+    target really is a parameter of *tool* — never a guess about a parameter the
+    tool does not have.
+    """
+    out: list[dict] = []
+    by_norm = {norm_arg(p): p for p in params}
+    for name in unmapped:
+        entry = QUANTITY_MISMATCH.get(norm_arg(name))
+        if not entry:
+            continue
+        target, why, example = entry
+        real = by_norm.get(norm_arg(target))
+        if real is None:
+            continue
+        out.append({
+            "supplied": name,
+            "parameter": real,
+            "note": (f"{name!r} is {why}. {tool} has no size-based meshing knob at "
+                     f"all; re-issue with e.g. {tool}(..., {example})."),
+        })
+    return out
 
 
 def synonyms_for(tool: str) -> dict[str, str]:
@@ -216,7 +368,11 @@ def resolve_unknown(supplied: str, value: Any, params: Sequence[str],
     ONE free parameter satisfies and whose annotation admits the supplied
     value. *params* is every parameter the tool accepts; *used* is the subset
     already bound by this call (so a synonym can never steal a slot a real
-    argument already filled)."""
+    argument already filled).
+
+    Names in `QUANTITY_MISMATCH` are refused unconditionally unless the tool has
+    a parameter of exactly that name: they denote a different quantity from the
+    parameter they resemble, so no later rule may bind them."""
     free = [p for p in params if p not in used]
     ns = norm_arg(supplied)
     if not ns:
@@ -224,6 +380,8 @@ def resolve_unknown(supplied: str, value: Any, params: Sequence[str],
     exact = [p for p in free if norm_arg(p) == ns]
     if exact:
         return exact[0] if len(exact) == 1 else None
+    if ns in QUANTITY_MISMATCH:
+        return None  # different QUANTITY, never a spelling — see the table
     if synonyms:
         want = synonyms.get(ns)
         if want:
@@ -410,6 +568,13 @@ def unknown_arg_payload(tool: str, params: Sequence[str], required: Sequence[str
             f"inside the `{bag}` dict, not as top-level arguments — read the tool "
             f"description for the keys {bag} accepts before re-issuing."
         )
+    mismatch = quantity_mismatch_notes(tool, params, unmapped)
+    if mismatch:
+        # The refusal is CORRECT here; what was missing is why. Without this the
+        # accepted_params list ("mesh_fineness (optional)") reads as an
+        # invitation to rename the argument and keep the millimetre value.
+        payload["quantity_mismatch"] = mismatch
+        payload["error"] += "".join(f" NOTE: {m['note']}" for m in mismatch)
     try:
         from services.agent.tool_hints import hint_for  # noqa: PLC0415
         extra = hint_for(tool)

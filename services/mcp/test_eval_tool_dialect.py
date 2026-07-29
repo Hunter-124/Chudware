@@ -473,3 +473,232 @@ def test_canonical_calls_still_work_through_fastmcp(part):
 
     mass = asyncio.run(mgr.get_tool("measure_part").run({"doc_id": part}))
     assert json.loads(_text(mass))["ok"] is True
+
+
+# --------------------------------------------------------------------------
+# The handle round-trip: what these tools TELL the model to do must work
+# (live 2026-07-29 — all three of these failed before the fix)
+# --------------------------------------------------------------------------
+
+def test_sid_from_query_geometry_measures(part):
+    """query_geometry hands back stable sids; measure_between must accept one.
+
+    Both docstrings send the model round this exact loop ("call query_geometry(query)
+    first to see the candidates"), and feeding the sid straight back used to raise
+    "Can't read 'Fedecf8' as a geometry query". The sid IS the unambiguous handle —
+    it is strictly better than the phrase that produced it.
+    """
+    q, err = _dispatch("query_geometry", query={"of": "face", "side": "top"}, doc_id=part)
+    assert err is None and q["ok"] is True
+    sid = q["matches"][0]["sid"]
+
+    m, err = _dispatch("measure_between", a_query=sid, doc_id=part)
+    assert err is None, err
+    assert m["ok"] is True, m
+    assert m["kind"] == "area"
+    # The plate is 80x60 with a r=6 bore punched through it.
+    assert m["area"] == pytest.approx(80 * 60 - 3.14159265 * 36, rel=2e-3)
+
+
+def test_sid_measures_the_same_face_the_phrase_did(part):
+    """The sid route and the phrase route must agree — otherwise one of them is lying."""
+    by_word, err_w = _dispatch("measure_between", a_query="top", doc_id=part)
+    assert err_w is None and by_word["ok"] is True
+    q, _ = _dispatch("query_geometry", query={"of": "face", "side": "top"}, doc_id=part)
+    by_sid, err_s = _dispatch("measure_between", a_query=q["matches"][0]["sid"], doc_id=part)
+    assert err_s is None and by_sid["ok"] is True
+    assert by_sid["area"] == pytest.approx(by_word["area"], rel=1e-9)
+
+
+def test_sid_pair_measures_distance(part):
+    """Two sids -> the distance between them. The plate is 10 mm thick."""
+    top, _ = _dispatch("query_geometry", query={"of": "face", "side": "top"}, doc_id=part)
+    bot, _ = _dispatch("query_geometry", query={"of": "face", "side": "bottom"}, doc_id=part)
+    m, err = _dispatch("measure_between", a_query=top["matches"][0]["sid"],
+                       b_query=bot["matches"][0]["sid"], doc_id=part)
+    assert err is None, err
+    assert m["ok"] is True, m
+    assert m["distance"] == pytest.approx(10.0, abs=1e-6)
+
+
+def test_feature_id_names_its_faces_instead_of_teaching_grammar(part):
+    """A feature id owns MANY faces, so measuring it is a PICK, not a parse failure.
+
+    Before the fix "f1" hit the token-grammar wall ("the grammar is TOKENS, not prose"),
+    which tells a model nothing about what to do next. It must instead name the feature
+    and hand over the candidate sids. Deliberately NOT auto-picking one — silently
+    measuring one of six faces is the defect class this suite exists to prevent.
+    """
+    m, err = _dispatch("measure_between", a_query="f1", doc_id=part)
+    assert err is None, err
+    assert m["ok"] is False
+    msg = m["error"]
+    assert "Plate" in msg, msg                      # names the feature it resolved
+    assert "measuring needs exactly one" in msg, msg
+    assert msg.count("F") >= 2, msg                 # hands over real sids to choose from
+    assert "TOKENS" not in msg, msg                 # and NOT the old vocabulary wall
+
+
+def test_feature_name_resolves_like_its_id(part):
+    """"Plate" and "f1" are the same handle — both must reach the same teaching."""
+    by_id, e1 = _dispatch("measure_between", a_query="f1", doc_id=part)
+    by_name, e2 = _dispatch("measure_between", a_query="Plate", doc_id=part)
+    assert e1 is None and e2 is None
+    assert by_id["ok"] is False and by_name["ok"] is False
+    assert "measuring needs exactly one" in by_name["error"]
+
+
+def test_unknown_sid_still_fails_honestly(part):
+    """The fallback must not turn a bogus handle into a silent success.
+
+    Asserts the SID-SHAPED miss specifically: a well-formed sid that names nothing must
+    say so ("No face/edge with sid") and warn that sids move when the model changes —
+    not fall back to reciting the query grammar, which is what a caller holding a stale
+    sid would be most misled by.
+    """
+    m, err = _dispatch("measure_between", a_query="Fdeadbe", doc_id=part)
+    assert err is None, err
+    assert m["ok"] is False
+    msg = m["error"]
+    assert "sid" in msg and "Fdeadbe" in msg, msg
+    assert "describe_part" in msg, msg
+    assert "TOKENS" not in msg, msg
+
+
+# --------------------------------------------------------------------------
+# A size request is a different TOOL, and the error must say which
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("q", ["bbox", "bounding box", "overall size", "extents"])
+def test_size_request_names_describe_part_not_the_vocabulary(part, q):
+    """query_geometry cannot answer "how big is it" — it must route, not recite grammar.
+
+    measure_part is the WRONG destination (it reports volume/mass/centroid and no bbox);
+    describe_part's outline opens with `bbox WxDxH mm`. The message must name the tool
+    that actually answers and keep the two apart.
+    """
+    r, err = _dispatch("query_geometry", query=q, doc_id=part)
+    assert err is None, err
+    assert r["ok"] is False
+    msg = r["error"]
+    assert "describe_part" in msg, msg
+    assert "does NOT report a bbox" in msg, msg
+
+
+def test_describe_part_really_carries_the_bbox_we_point_at(part):
+    """Guards the redirect: if describe_part stops printing a bbox, this must fail."""
+    d, err = _dispatch("describe_part", doc_id=part)
+    assert err is None, err
+    assert "bbox" in d["outline"]
+    assert "80x60x10" in d["outline"].replace(" ", "")
+
+
+def test_a_real_query_containing_a_size_word_still_resolves(part):
+    """The redirect is a FALLBACK. "the top face dimensions" is still a query."""
+    r, err = _dispatch("query_geometry", query="the top face dimensions", doc_id=part)
+    assert err is None, err
+    assert r["ok"] is True, r
+    assert r["count"] == 1
+
+
+def test_measure_part_routes_a_what_argument_to_the_right_tool(part):
+    """measure_part has no target — say which tool does, don't just list two parameters.
+
+    Live 2026-07-29: measure_part(what="the hole diameter") was refused with
+    "it takes doc_id= and density_g_cm3= only", leaving the model to guess. A refusal
+    that names the right tool costs one call; one that doesn't costs several.
+    """
+    r, err = _dispatch("measure_part", what="the hole diameter", doc_id=part)
+    assert err is None, err
+    assert r["ok"] is False
+    msg = r["error"]
+    assert "measure_between" in msg, msg
+    assert "describe_part" in msg, msg
+    assert "mass properties" in msg, msg
+
+
+def test_measure_part_canonical_call_is_untouched(part):
+    """The routing must not disturb the ordinary call or its density alias."""
+    r, err = _dispatch("measure_part", doc_id=part)
+    assert err is None and r["ok"] is True
+    steel = r["mass"]["mass_g"]
+    r2, err2 = _dispatch("measure_part", doc_id=part, density=2.70)
+    assert err2 is None and r2["ok"] is True
+    # Aluminium is lighter than steel for the same volume — proves density really applied.
+    assert r2["mass"]["mass_g"] < steel
+    assert r2["mass"]["mass_g"] == pytest.approx(steel * 2.70 / 7.85, rel=1e-6)
+
+
+def test_measure_part_still_refuses_a_genuinely_unknown_argument(part):
+    """The router must not become a catch-all that swallows every typo."""
+    r, err = _dispatch("measure_part", frobnicate=1, doc_id=part)
+    assert err is None, err
+    assert r["ok"] is False
+    assert "unknown argument" in r["error"]
+    assert "density_g_cm3" in r["error"]
+
+
+def test_return_coords_is_accepted_because_coords_are_always_returned(part):
+    """A flag asking for what the tool already does must not fail the call.
+
+    Live 2026-07-29: query_geometry(query="all planar faces", return_coords=True) was
+    refused outright, even though every match already carries centroid/normal/axis. The
+    flag is dropped WITH a visible note, so nothing is silently ignored.
+    """
+    r, err = _dispatch("query_geometry", query={"of": "face", "surf": "flat"},
+                       return_coords=True, doc_id=part)
+    assert err is None, err
+    assert r["ok"] is True, r
+    assert r["count"] >= 1
+    # The thing the flag asked for is genuinely present.
+    assert r["matches"][0]["centroid"] is not None
+    assert "normal" in r["matches"][0]
+    # And the drop was reported, not hidden.
+    assert any("return_coords" in n for n in r.get("interpreted") or []), r.get("interpreted")
+
+
+def test_output_flag_drop_is_a_closed_list_not_a_catch_all(part):
+    """An unrelated unknown argument must still be refused."""
+    r, err = _dispatch("query_geometry", query={"of": "face", "side": "top"},
+                       return_sparkles=True, doc_id=part)
+    assert err is None, err
+    assert r["ok"] is False
+    assert "return_sparkles" in r["error"]
+
+
+@pytest.mark.parametrize("key", ["what", "measurements", "measures", "properties", "report"])
+def test_a_mass_property_ask_is_answered_not_rerouted(part, key):
+    """what="mass" is what measure_part RETURNS — routing it away costs a call for nothing.
+
+    Regression from my own first fix, caught by the live sim pass-2b re-run: the routing
+    keyed on the ARGUMENT NAME and sent measure_part(what="mass") to measure_between,
+    which cannot answer it. The VALUE has to decide.
+    """
+    r, err = _dispatch("measure_part", **{key: "mass", "doc_id": part})
+    assert err is None, err
+    assert r["ok"] is True, r
+    assert r["mass"]["mass_g"] > 0
+    assert any(key in n for n in r.get("interpreted") or []), r.get("interpreted")
+
+
+def test_a_combined_ask_answers_the_mass_half_and_says_where_bbox_lives(part):
+    """"mass and bounding_box": answer the half this tool owns, name the tool for the other.
+
+    Note the UNDERSCORE spelling — a JSON list renders as "['mass', 'bounding_box']", which
+    an earlier whitespace-only pattern missed.
+    """
+    r, err = _dispatch("measure_part", measurements=["mass", "bounding_box"], doc_id=part)
+    assert err is None, err
+    assert r["ok"] is True, r
+    assert r["mass"]["mass_g"] > 0
+    notes = " ".join(r.get("interpreted") or [])
+    assert "describe_part" in notes, notes
+    assert "bbox" in notes, notes
+
+
+def test_a_geometry_ask_under_a_plural_key_still_routes(part):
+    """The plural keys must not become a way to smuggle a geometry target past the router."""
+    r, err = _dispatch("measure_part", measurements=["the hole diameter"], doc_id=part)
+    assert err is None, err
+    assert r["ok"] is False
+    assert "measure_between" in r["error"]

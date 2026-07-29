@@ -70,7 +70,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 {"calc": "tap_drill", "inputs_from": "match",
                  "input_map": {"thread": "thread_designation"}},
             ],
-            "exemplar": "M6x1.0 → pilot 5.0 mm (Machinery’s Handbook; ISO 2306 75% engagement)",
+            "exemplar": "M6x1.0 -> pilot 5.0 mm (Machinery's Handbook; ISO 2306 75% engagement)",
         },
         "budget_tokens": 250,
         "cooldown_turns": 8,
@@ -113,7 +113,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 {"calc": "fit_calc", "inputs_from": "literal",
                  "input_map": {"nominal": None, "fit": "H7/p6"}},
             ],
-            "exemplar": "H7/p6 on Ø20: min interference 0.017 mm, max 0.042 mm (ISO 286, fit_calc)",
+            "exemplar": "H7/p6 on dia 20: min interference 0.017 mm, max 0.042 mm (ISO 286, fit_calc)",
         },
         "budget_tokens": 250,
         "cooldown_turns": 8,
@@ -132,7 +132,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "inject": {
             "context_pack": "snap_fit",
             "prerun_calcs": [],
-            "exemplar": "ABS cantilever: ε_allow ≈ 0.6×(yield/E); viable if ε_root ≤ ε_allow (snap_fit calc)",
+            "exemplar": "ABS cantilever: eps_allow ~= 0.6x(yield/E); viable if eps_root <= eps_allow (snap_fit calc)",
         },
         "budget_tokens": 250,
         "cooldown_turns": 8,
@@ -192,7 +192,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "inject": {
             "context_pack": "material_props",
             "prerun_calcs": [],
-            "exemplar": "6061-T6 Al: E=68900 MPa, yield=276 MPa, ρ=2.70 g/cm³ (materials.json)",
+            "exemplar": "6061-T6 Al: E=68900 MPa, yield=276 MPa, density=2.70 g/cm3 (materials.json)",
         },
         "budget_tokens": 250,
         "cooldown_turns": 10,
@@ -214,7 +214,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 {"calc": "fit_calc", "inputs_from": "match",
                  "input_map": {"nominal": "nominal_mm", "fit": "fit_designation"}},
             ],
-            "exemplar": "H7/g6 sliding fit on Ø20: clearance 0.007–0.041 mm (ISO 286, iso286.json)",
+            "exemplar": "H7/g6 sliding fit on dia 20: clearance 0.007-0.041 mm (ISO 286, iso286.json)",
         },
         "budget_tokens": 300,
         "cooldown_turns": 8,
@@ -233,7 +233,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "inject": {
             "context_pack": "thread_engagement",
             "prerun_calcs": [],
-            "exemplar": "Min engagement: 1.0×D steel-in-steel; 1.5×D aluminum; 2.0×D plastic (Machinery’s Handbook)",
+            "exemplar": "Min engagement: 1.0xD steel-in-steel; 1.5xD aluminum; 2.0xD plastic (Machinery's Handbook)",
         },
         "budget_tokens": 200,
         "cooldown_turns": 10,
@@ -254,7 +254,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
             "context_pack": "interference_pre_op",
             "prerun_calcs": [],
             "exemplar": (
-                "After placing bodies run check_interference; interference > 0 mm³ is a "
+                "After placing bodies run check_interference; interference > 0 mm3 is a "
                 "blocker (advisor names axis + depth)"
             ),
         },
@@ -299,7 +299,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
             "prerun_calcs": [],
             "exemplar": (
                 "interface_check catches hole-pattern offset, coaxiality error, "
-                "contact-plane gap — all pass interference but are still wrong"
+                "contact-plane gap - all pass interference but are still wrong"
             ),
         },
         "budget_tokens": 200,
@@ -323,7 +323,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 {"calc": "bend_allowance", "inputs_from": "literal",
                  "input_map": {"thickness_mm": None, "inside_radius_mm": None}},
             ],
-            "exemplar": "t=2, r=2, 90° bend: BA=4.24 mm, BD=3.76 mm, K=0.35 (bend_allowance calc; Machinery’s Handbook)",
+            "exemplar": "t=2, r=2, 90 deg bend: BA=4.24 mm, BD=3.76 mm, K=0.35 (bend_allowance calc; Machinery's Handbook)",
         },
         "budget_tokens": 250,
         "cooldown_turns": 8,
@@ -346,7 +346,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 {"calc": "draft_check", "inputs_from": "literal",
                  "input_map": {"draw_depth_mm": None}},
             ],
-            "exemplar": "Smooth molded wall: 1.0° min draft (mandatory for release); 30 mm draw → 0.52 mm taper/side (draft_check; process_profiles injection)",
+            "exemplar": "Smooth molded wall: 1.0 deg min draft (mandatory for release); 30 mm draw -> 0.52 mm taper/side (draft_check; process_profiles injection)",
         },
         "budget_tokens": 250,
         "cooldown_turns": 8,
@@ -369,7 +369,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "inject": {
             "context_pack": "drawing_standards",
             "prerun_calcs": [],
-            "exemplar": "Base → projected → section/detail; dimension from measure_part, never invent (drawing_standards pack)",
+            "exemplar": "Base -> projected -> section/detail; dimension from measure_part, never invent (drawing_standards pack)",
         },
         "budget_tokens": 300,
         "cooldown_turns": 8,
@@ -414,7 +414,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "inject": {
             "context_pack": "ecad_design",
             "prerun_calcs": [],
-            "exemplar": "Schematic → ERC → board_from_schematic → DRC; nets before SPICE (ecad_design pack)",
+            "exemplar": "Schematic -> ERC -> board_from_schematic -> DRC; nets before SPICE (ecad_design pack)",
         },
         "budget_tokens": 250,
         "cooldown_turns": 8,
@@ -437,7 +437,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "inject": {
             "context_pack": "cam_setup",
             "prerun_calcs": [],
-            "exemplar": "Stock → setup → tool → op → generate → simulate clean → post (cam_setup pack)",
+            "exemplar": "Stock -> setup -> tool -> op -> generate -> simulate clean -> post (cam_setup pack)",
         },
         "budget_tokens": 300,
         "cooldown_turns": 8,
@@ -460,7 +460,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "inject": {
             "context_pack": "sourcing",
             "prerun_calcs": [],
-            "exemplar": "part_search → part_get → part_place; never hand-model catalog hardware (sourcing pack)",
+            "exemplar": "part_search -> part_get -> part_place; never hand-model catalog hardware (sourcing pack)",
         },
         "budget_tokens": 250,
         "cooldown_turns": 10,
@@ -489,10 +489,10 @@ _BUILTIN_TRIGGERS: list[dict] = [
             "context_pack": "reveng_flow",
             "prerun_calcs": [],
             "exemplar": (
-                "Lane A (file/doc_id): reverse_engineer → compare_parts loop. "
-                "Lane B (physical part): reveng_status → reveng_start_session → capture → "
-                "reveng_reconstruct → reveng_set_scale [scale gate] → reveng_fit_primitives → "
-                "[dim gate] → reveng_build_parametric (reveng_flow pack)"
+                "Lane A (file/doc_id): reverse_engineer -> compare_parts loop. "
+                "Lane B (physical part): reveng_status -> reveng_start_session -> capture -> "
+                "reveng_reconstruct -> reveng_set_scale [scale gate] -> reveng_fit_primitives -> "
+                "[dim gate] -> reveng_build_parametric (reveng_flow pack)"
             ),
         },
         "budget_tokens": 250,
@@ -516,7 +516,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "inject": {
             "context_pack": "plm_flow",
             "prerun_calcs": [],
-            "exemplar": "Checkpoint before risk; where_used before release; history→restore for recovery (plm_flow pack)",
+            "exemplar": "Checkpoint before risk; where_used before release; history->restore for recovery (plm_flow pack)",
         },
         "budget_tokens": 200,
         "cooldown_turns": 10,
@@ -658,6 +658,21 @@ def _deep_copy_trigger(t: dict) -> dict:
     return copy.deepcopy(t)
 
 
+def _label_for(raw: dict) -> str:
+    """Human title for a rule — an explicit ``label`` when the author set one,
+    else the id read as prose (``thread_mention`` -> ``Thread mention``).
+
+    Used by the Rules settings tab and by the transcript chip the GUI draws when
+    a rule fires, so a firing is never labelled with a bare identifier.
+    """
+    label = str(raw.get("label") or "").strip()
+    if label:
+        return label[:80]
+    tid = str(raw.get("id") or "").strip()
+    words = tid.replace("_", " ").replace("-", " ").strip()
+    return (words[:1].upper() + words[1:]) if words else ""
+
+
 def _normalize_trigger(raw: dict) -> Optional[dict]:
     """Return a sanitized trigger dict, or None if unusable."""
     if not isinstance(raw, dict):
@@ -690,6 +705,7 @@ def _normalize_trigger(raw: dict) -> Optional[dict]:
     return {
         "id": tid,
         "enabled": enabled,
+        "label": _label_for(raw),
         "purpose": purpose,
         "match": {
             "keywords": keywords,
@@ -780,6 +796,7 @@ def _merge_raw_triggers() -> list[dict]:
                 "inject": u.get("inject") or base.get("inject") or {},
                 "budget_tokens": u.get("budget_tokens", base.get("budget_tokens", 250)),
                 "cooldown_turns": u.get("cooldown_turns", base.get("cooldown_turns", 8)),
+                "label": u.get("label") or base.get("label") or "",
             })
             # Mark source on the raw for list_triggers (stripped at compile time)
             base["_source"] = "override"
@@ -842,6 +859,7 @@ def load_table() -> list[dict]:
             "budget_tokens": int(t.get("budget_tokens", 250)),
             "cooldown_turns": int(t.get("cooldown_turns", 8)),
             "purpose": str(t.get("purpose") or ""),
+            "label": _label_for(t),
             "source": str(t.get("_source") or "builtin"),
         })
 
@@ -1131,6 +1149,7 @@ def match_triggers(
         # ── ledger event ───────────────────────────────────────────────────
         ledger_events.append({
             "trigger_id": tid,
+            "label": trigger.get("label") or tid,
             "matched": matched,
             "tokens": token_cost,
         })

@@ -533,3 +533,346 @@ def test_export_part_payload_has_no_settings_pointer():
     _kwargs, _notes, err = _agent_reconcile("export_part", bogus_xyz="step")
     assert err is not None
     assert "settings_param" not in err
+
+# --------------------------------------------------------------------- live 2026-07-29, pass 2
+# Two refusals from the same general-lane sweep with OPPOSITE correct answers:
+# one is a genuine spelling of a real parameter, the other is a different
+# physical quantity wearing a similar name.
+
+# --- run_shell(cmd=...) -> alias. Real signature: fs_tools.py:762
+#     run_shell(command: str, cwd: str = "", timeout_s: int = ...)
+
+def test_run_shell_cmd_resolves_to_command_and_says_so():
+    """Live: run_shell(cmd='ls -la /tmp/sweep/work/') -> unknown_argument. `cmd`
+    is the universal abbreviation of the single command slot; the affix rule
+    cannot reach it, so it needs the explicit tool-scoped synonym."""
+    kwargs, notes, err = _agent_reconcile("run_shell", cmd="ls -la /tmp/sweep/work/")
+    assert err is None, err
+    assert kwargs == {"command": "ls -la /tmp/sweep/work/"}, kwargs
+    # The echoed interpretation is the human-visible half of the fix.
+    assert "interpreted 'cmd' as 'command'" in notes, notes
+
+
+def test_run_shell_cmd_target_is_the_only_command_slot():
+    """The evidence behind the alias, asserted rather than trusted: run_shell has
+    exactly one str parameter that could take a command line."""
+    import inspect
+    fn = at._bind_tool("run_shell")
+    params = list(inspect.signature(fn).parameters)
+    assert params == ["command", "cwd", "timeout_s"], params
+
+
+def test_run_shell_script_and_cmdline_also_reach_command():
+    for spelling in ("script", "cmdline", "command_line"):
+        kwargs, notes, err = _agent_reconcile("run_shell", **{spelling: "echo hi"})
+        assert err is None, (spelling, err)
+        assert kwargs["command"] == "echo hi", (spelling, kwargs)
+
+
+def test_run_shell_refuses_shell_because_it_names_the_interpreter():
+    """Deliberate NON-alias. "shell" names bash/sh/zsh — the interpreter — not the
+    command line. run_shell has no interpreter slot, so binding shell='bash'
+    would execute `bash` and report success on a call the model never made."""
+    kwargs, notes, err = _agent_reconcile("run_shell", shell="bash")
+    assert err is not None and err["status"] == "unknown_argument", (kwargs, notes)
+    assert err["unknown_params"] == ["shell"], err
+    assert "command (required)" in err["accepted_params"], err
+
+
+def test_run_shell_still_refuses_a_genuinely_unknown_argument():
+    """The catch-all guard: the table must not have turned run_shell into a tool
+    that accepts any name at all."""
+    kwargs, notes, err = _agent_reconcile("run_shell", command="true", sudo=True)
+    assert err is not None and err["status"] == "unknown_argument", (kwargs, notes)
+    assert err["unknown_params"] == ["sudo"], err
+    assert err["accepted_params"] == [
+        "command (required)", "cwd (optional)", "timeout_s (optional)"], err
+
+
+# --- run_fea_static(mesh_size_mm=...) -> REFUSE. `mesh_fineness` is a
+#     DIMENSIONLESS 0..1 factor (cad_sim_tools.py:75-76, 284-285), so a
+#     millimetre count bound there would mesh at the wrong density and report
+#     success. Contract rule 1: a unit mismatch is never aliased.
+
+def test_mesh_fineness_really_is_dimensionless_not_a_length():
+    """The evidence for the refusal, taken from the tool itself rather than from
+    a comment: the preset WORDS map onto 0..1 numbers, so the parameter is a
+    density factor and has no millimetre reading."""
+    from services.mcp.cad_sim_tools import _norm_fineness
+    assert _norm_fineness("coarse") == 0.25
+    assert _norm_fineness("finest") == 1.0
+    import inspect
+    sig = inspect.signature(at._bind_tool("run_fea_static"))
+    assert sig.parameters["mesh_fineness"].default == 0.5
+
+
+def test_run_fea_static_mesh_size_mm_is_refused_and_the_error_teaches_the_unit():
+    kwargs, notes, err = _agent_reconcile(
+        "run_fea_static", doc_id="d1", fixtures=["bottom"],
+        loads=[{"face": "top", "pressure": 0.5}], mesh_size_mm=2.0)
+    assert err is not None and err["status"] == "unknown_argument", (kwargs, notes)
+    assert kwargs == {} and err["unknown_params"] == ["mesh_size_mm"], err
+    # It must NOT have been quietly bound to the fineness knob.
+    assert "mesh_fineness" not in kwargs
+    msg = err["error"]
+    assert "mesh_fineness" in msg, msg
+    assert "millimetre" in msg and "DIMENSIONLESS" in msg, msg
+    assert "0..1" in msg, msg
+    assert "mesh_fineness=0.75" in msg, msg          # a correct example
+    assert err["quantity_mismatch"] == [{
+        "supplied": "mesh_size_mm", "parameter": "mesh_fineness",
+        "note": err["quantity_mismatch"][0]["note"],
+    }], err["quantity_mismatch"]
+
+
+def test_run_fea_static_mesh_size_mm_teaches_the_same_thing_on_the_mcp_path():
+    payload = _server_call("run_fea_static", {
+        "fixtures": ["bottom"], "loads": [{"face": "top", "pressure": 0.5}],
+        "mesh_size_mm": 2.0})
+    assert payload["status"] == "unknown_argument", payload
+    assert "mesh_fineness" in payload["error"] and "0..1" in payload["error"], payload
+    assert payload["quantity_mismatch"][0]["parameter"] == "mesh_fineness", payload
+
+
+def test_no_synonym_or_affix_rule_can_ever_bind_a_quantity_mismatch():
+    """The resolver-level half. Even handed a synonym entry that points straight
+    at the parameter, `mesh_size_mm` must not bind — the guard runs before the
+    synonym and affix rules, so a future well-meaning table edit cannot undo the
+    refusal by accident."""
+    ann = {"mesh_fineness": "Union[float, str]"}
+    forged = {"meshsizemm": "meshfineness"}
+    assert recon.resolve_unknown("mesh_size_mm", 2.0, ["mesh_fineness"], ann,
+                                 set(), forged) is None
+    assert recon.resolve_unknown("element_size_mm", 2.0, ["element_size", "mesh_fineness"],
+                                 {}, set()) is None
+
+
+def test_a_tool_that_really_has_that_parameter_still_binds_it():
+    """The guard is a refusal to ALIAS, not a ban on the name: an exact parameter
+    of that name is still a normal, correct binding."""
+    assert recon.resolve_unknown("mesh_size_mm", 2.0, ["mesh_size_mm", "doc_id"],
+                                 {"mesh_size_mm": "float"}, set()) == "mesh_size_mm"
+
+
+def test_quantity_mismatch_note_is_silent_when_the_tool_lacks_the_parameter():
+    """It may never invent advice about a parameter the tool does not have —
+    the same rule the settings-bag pointer follows."""
+    assert recon.quantity_mismatch_notes("export_part", ["fmt", "path"],
+                                         ["mesh_size_mm"]) == []
+    assert recon.quantity_mismatch_notes("run_fea_static", ["mesh_fineness"],
+                                         ["bogus_xyz"]) == []
+
+
+def test_run_fea_static_study_name_is_dropped_but_never_silently():
+    """`study_name` was ACCEPTED in the live call. It is not a parameter of
+    run_fea_static — it is on the closed descriptive allowlist, so it is dropped
+    with a visible note. Pinned here because a silent drop would be the same
+    invisible-difference defect as a wrong-unit alias."""
+    import inspect
+    params = list(inspect.signature(at._bind_tool("run_fea_static")).parameters)
+    assert "study_name" not in params, params
+    kwargs, notes, err = _agent_reconcile(
+        "run_fea_static", fixtures=["bottom"],
+        loads=[{"face": "top", "pressure": 0.5}], study_name="bracket_static")
+    assert err is None, err
+    assert "study_name" not in kwargs
+    assert any("ignored 'study_name'" in n for n in notes), notes
+
+# --- run_fea_modal(num_modes=3) -> BIND. Live 2026-07-29 (claude-sonnet-4-5, sim suite).
+#     Same quantity as `n_modes` (a count of modes; no unit, no scale), so unlike
+#     mesh_size_mm above this IS a spelling and is aliased. Contract rule 1 cuts both ways:
+#     refuse across a quantity boundary, bind within one.
+
+def test_n_modes_is_the_only_mode_count_slot_on_every_tool_that_takes_it():
+    """The evidence for the alias, read off the real signatures rather than trusted:
+    each of the three solvers has exactly ONE parameter a mode COUNT could mean, so no
+    spelling of "how many modes" can be misrouted."""
+    import inspect
+    for tool, default in (("run_fea_modal", 6), ("run_fea_frequency_response", 6),
+                          ("run_fea_buckling", 4)):
+        params = inspect.signature(at._bind_tool(tool)).parameters
+        assert params["n_modes"].default == default, (tool, params["n_modes"])
+        counts = [p for p in params if "mode" in p.lower()]
+        assert counts == ["n_modes"], (tool, counts)
+
+
+def test_num_modes_was_genuinely_unreachable_by_the_affix_heuristic():
+    """Why a table entry was needed at all: "nummodes" is neither a prefix nor a suffix of
+    "nmodes", so resolve_unknown cannot see it WITHOUT the synonym. The same call proves
+    the entries that would have been redundant are absent — `modes` and `n_mode` already
+    bind on the affix rule alone, so neither is in the table."""
+    ann = {"n_modes": "int"}
+    assert recon.resolve_unknown("num_modes", 3, ["n_modes"], ann, set()) is None
+    assert recon.resolve_unknown("modes", 3, ["n_modes"], ann, set()) == "n_modes"
+    assert recon.resolve_unknown("n_mode", 3, ["n_modes"], ann, set()) == "n_modes"
+    table = recon.synonyms_for("run_fea_modal")
+    assert "modes" not in table and "nmode" not in table, table
+    assert table["nummodes"] == "nmodes", table
+
+
+@pytest.mark.parametrize("spelling", ["num_modes", "numModes", "mode_count",
+                                      "number_of_modes", "modes"])
+def test_every_mode_count_spelling_binds_to_n_modes_on_run_fea_modal(spelling):
+    kwargs, notes, err = _agent_reconcile("run_fea_modal", fixtures=["bottom"],
+                                          **{spelling: 3})
+    assert err is None, err
+    assert kwargs["n_modes"] == 3, (spelling, kwargs)
+
+
+def test_num_modes_binds_on_the_other_two_solvers_that_take_n_modes():
+    for tool, extra in (("run_fea_frequency_response", {}),
+                        ("run_fea_buckling", {"load": [{"face": "top",
+                                                        "force": [0, 0, -100]}]})):
+        kwargs, _notes, err = _agent_reconcile(tool, fixtures=["bottom"], num_modes=3,
+                                               **extra)
+        assert err is None, (tool, err)
+        assert kwargs["n_modes"] == 3, (tool, kwargs)
+
+
+def test_an_explicit_n_modes_is_never_outvoted_by_the_synonym():
+    """A synonym may only fill a FREE slot. When the model supplied the real name too, the
+    real name wins and the spelling is refused rather than silently overwriting it."""
+    kwargs, _notes, err = _agent_reconcile("run_fea_modal", fixtures=["bottom"],
+                                           n_modes=8, num_modes=3)
+    assert err is not None and err["status"] == "unknown_argument", (kwargs, err)
+    assert err["unknown_params"] == ["num_modes"], err
+
+
+def test_run_fea_modal_still_refuses_a_genuinely_unknown_argument():
+    """The catch-all guard: the new entries must not have turned run_fea_modal into a tool
+    that accepts any name."""
+    kwargs, notes, err = _agent_reconcile("run_fea_modal", fixtures=["bottom"],
+                                           modal_participation=True)
+    assert err is not None and err["status"] == "unknown_argument", (kwargs, notes)
+    assert err["unknown_params"] == ["modal_participation"], err
+    assert "n_modes (optional)" in err["accepted_params"], err
+
+
+def test_run_fea_modal_mesh_size_mm_is_still_a_refused_quantity_not_a_spelling():
+    """The boundary this batch must not blur: `num_modes` binds because it is the same
+    COUNT, while `mesh_size_mm` stays refused because millimetres are not a 0..1 factor.
+    Both rules live on the same tool now, so they are pinned together."""
+    kwargs, _notes, err = _agent_reconcile("run_fea_modal", fixtures=["bottom"],
+                                           num_modes=3, mesh_size_mm=2.0)
+    assert err is not None and err["status"] == "unknown_argument", kwargs
+    assert err["unknown_params"] == ["mesh_size_mm"], err
+    assert "mesh_fineness" not in kwargs and "DIMENSIONLESS" in err["error"], err
+
+
+def test_the_mode_count_spellings_are_shared_by_both_dispatch_paths():
+    """Anti-drift: the MCP path reads the same table object, so there is nothing to keep
+    in sync. Asserted on identity, not on a copied literal."""
+    assert (recon.TOOL_ARG_SYNONYMS["run_fea_modal"]
+            is recon.TOOL_ARG_SYNONYMS["run_fea_buckling"]
+            is recon.TOOL_ARG_SYNONYMS["run_fea_frequency_response"])
+    for tool in ("run_fea_modal", "run_fea_buckling", "run_fea_frequency_response"):
+        assert recon.synonyms_for(tool)["numberofmodes"] == "nmodes", tool
+
+
+# --------------------------------------------------------------------- live 2026-07-29, drawing
+# Requested by DrawingArgAliases, who owns cad_drawing_tools.py and carries the three
+# VERBATIM live names (source_doc/template/filename) as real parameters. These are the
+# remaining spellings. Added only after reading the post-revert signatures here:
+#   make_drawing(doc_id, views, sections, sheet, hole_callouts, model_items, title,
+#                source_doc, template)
+#   export_drawing(fmt, doc_id, path, filename)
+
+def test_the_drawing_tools_are_not_varkw_so_this_layer_actually_runs():
+    """The precondition for every test below, and the reason the entries were refused
+    the first time they were requested: while these tools declared **kwargs, BOTH
+    dispatch paths skipped reconciliation (agent_turn.py:4380, server.py:852) and any
+    table entry would have been dead code."""
+    mcp_server = _mcp_server()
+    for tool in ("make_drawing", "export_drawing"):
+        assert at._signature_spec(at._bind_tool(tool))["var_kw"] is False, tool
+        meta = mcp_server._arg_meta(mcp_server.mcp._tool_manager.get_tool(tool))
+        assert meta["varkw"] is False, tool
+
+
+@pytest.mark.parametrize("spelling", ["from_doc", "model_doc", "part_doc", "source_part"])
+def test_every_document_spelling_binds_to_doc_id_on_make_drawing(spelling):
+    kwargs, notes, err = _agent_reconcile("make_drawing", **{spelling: "d1"})
+    assert err is None, (spelling, err)
+    assert kwargs == {"doc_id": "d1"}, (spelling, kwargs)
+    assert f"interpreted {spelling!r} as 'doc_id'" in notes, notes
+
+
+@pytest.mark.parametrize("spelling", ["paper_size", "paper"])
+def test_paper_size_spellings_bind_to_sheet(spelling):
+    kwargs, notes, err = _agent_reconcile("make_drawing", doc_id="d1", **{spelling: "A4"})
+    assert err is None, (spelling, err)
+    assert kwargs["sheet"] == "A4", (spelling, kwargs)
+
+
+@pytest.mark.parametrize("spelling,target", [
+    ("out_file", "path"), ("output_file", "path"), ("dest", "path"),
+    ("destination", "path"), ("save_as", "path"),
+    ("file_type", "fmt"), ("extension", "fmt"), ("ext", "fmt"), ("type", "fmt"),
+])
+def test_export_drawing_output_and_format_spellings(spelling, target):
+    value = "/tmp/plate" if target == "path" else "pdf"
+    kwargs, notes, err = _agent_reconcile("export_drawing", doc_id="d1",
+                                          **{spelling: value})
+    assert err is None, (spelling, err)
+    assert kwargs[target] == value, (spelling, kwargs)
+
+
+def test_the_redundant_spellings_are_left_out_of_the_table_on_purpose():
+    """Module convention: never duplicate the affix heuristic — an entry that shadows it
+    hides which rule is doing the work. These resolve with an EMPTY synonym map, so they
+    must NOT appear in the table."""
+    for tool, cases in (
+            ("make_drawing", {"source_document": "source_doc", "sheet_format": "sheet"}),
+            ("export_drawing", {"save_path": "path", "file": "filename"})):
+        spec = at._signature_spec(at._bind_tool(tool))
+        table = recon.TOOL_ARG_SYNONYMS[tool]
+        for spelling, expected in cases.items():
+            assert recon.resolve_unknown(spelling, "x", spec["params"], spec["ann"],
+                                         set(), {}) == expected, (tool, spelling)
+            assert recon.norm_arg(spelling) not in table, (tool, spelling)
+
+
+def test_source_needs_an_explicit_entry_because_two_real_aliases_shadow_it():
+    """A trap this batch actually hit. make_drawing declares BOTH `source_doc` and
+    `source_doc_id` — two spellings of one slot — so "source" affix-matches TWO free
+    parameters and resolve_unknown refuses (len(affix) != 1). Declaring a second alias of
+    an existing slot silently converts a working spelling into a refusal. The explicit
+    synonym runs BEFORE the affix step and names the unambiguous `doc_id`, so it repairs
+    the coverage without loosening the ambiguity rule."""
+    spec = at._signature_spec(at._bind_tool("make_drawing"))
+    assert {"source_doc", "source_doc_id"} <= set(spec["params"]), spec["params"]
+    # affix alone: genuinely ambiguous, correctly refused
+    assert recon.resolve_unknown("source", "d1", spec["params"], spec["ann"],
+                                 set(), {}) is None
+    # with the table: resolved, and to doc_id rather than either alias
+    kwargs, notes, err = _agent_reconcile("make_drawing", source="d1")
+    assert err is None, err
+    assert kwargs == {"doc_id": "d1"}, kwargs
+    assert "interpreted 'source' as 'doc_id'" in notes, notes
+
+
+def test_export_drawing_refuses_output_because_it_could_mean_the_format():
+    """Deliberate NON-alias, same class as run_shell(shell=). output='dxf' reads as the
+    FORMAT to plenty of models; fmt and path are both str so no annotation guard can tell
+    them apart, and binding it to `path` would silently write a file named 'dxf.pdf'."""
+    assert "output" not in recon.TOOL_ARG_SYNONYMS["export_drawing"]
+    kwargs, notes, err = _agent_reconcile("export_drawing", doc_id="d1", output="dxf")
+    assert err is not None and err["status"] == "unknown_argument", (kwargs, notes)
+    assert err["unknown_params"] == ["output"], err
+
+
+def test_make_drawing_template_is_left_to_the_tool_to_judge_by_value():
+    """`template` is a REAL parameter of make_drawing now, so this layer passes it through
+    untouched rather than aliasing it to `sheet`: only the tool can inspect the value and
+    tell a paper size from a border-template file (which does not exist in this repo)."""
+    assert "template" not in recon.TOOL_ARG_SYNONYMS["make_drawing"]
+    kwargs, notes, err = _agent_reconcile("make_drawing", doc_id="d1", template="A4")
+    assert err is None, err
+    assert kwargs["template"] == "A4" and "sheet" not in kwargs, kwargs
+
+
+def test_drawing_synonyms_still_refuse_a_genuinely_unknown_argument():
+    for tool in ("make_drawing", "export_drawing"):
+        kwargs, notes, err = _agent_reconcile(tool, doc_id="d1", bogus_xyz=1)
+        assert err is not None and err["status"] == "unknown_argument", (tool, kwargs)
+        assert err["unknown_params"] == ["bogus_xyz"], err

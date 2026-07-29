@@ -211,7 +211,20 @@ def _unknown_args_error(tool: str, leftover: dict, params, examples: str) -> dic
 
 def _part_id_hint(part_id: str = "") -> str:
     """Teach the id VOCABULARY — 'check it with part_get' teaches nothing."""
-    return (("" if not part_id else f"{part_id!r} matched no record. ")
+    # LIVE gap (2026-07-29 sweep): 4 of the 6 measured ECAD failures were an invented
+    # KiCad-shaped id ('ecad:RF_Module:ESP32-WROOM-32'). Telling the model to "discover
+    # one with part_search" costs a whole round trip for candidate ids this hint can
+    # compute on the spot, so the ECAD resolver names real ones first. It is
+    # import-guarded and returns "" for anything that is not an ECAD id or on any
+    # failure, so the wording below is never lost and this path cannot raise.
+    ecad = ""
+    try:
+        from services.ecad.library.partid import hint as _ecad_id_hint
+        ecad = _ecad_id_hint(part_id)
+    except Exception:  # noqa: BLE001
+        ecad = ""
+    return ((ecad + " " if ecad else "")
+            + ("" if not part_id else f"{part_id!r} matched no record. ")
             + "part ids are '<domain>:<catalog_id>' — 'fastener:ISO4762:M8', "
               "'bearing:ISO 15:6205', 'mech_family:shcs:M5', 'ecad:Device:R', "
               "'section:AISC:W8x31'. Discover one with part_search(query='...') "
@@ -1293,6 +1306,11 @@ def register_parts_tools(mcp: FastMCP) -> None:
             if rec is None:
                 return _err(f"part_id not found: {part_id!r}",
                             _part_id_hint(part_id))
+            # A provider may canonicalise the id (the ECAD resolver maps a KiCad
+            # standard-library spelling onto the record we really have). Say so — an
+            # id rewrite the caller cannot see is an id rewrite it cannot learn from.
+            if str(rec.get("part_id") or "") not in ("", str(part_id)):
+                notes.append(f"read part_id {part_id!r} as {rec['part_id']!r}")
             out = {"ok": True, "part": rec}
             if notes:
                 out["interpreted"] = _interpreted_notes(notes)
@@ -1413,6 +1431,13 @@ def register_parts_tools(mcp: FastMCP) -> None:
         if record is None:
             return _err(f"unknown part_id: {part_id!r} — the parts library has no "
                         f"record with that id.", _place_id_hint(part_id))
+        # A provider may have canonicalised the id (the ECAD resolver maps a KiCad
+        # standard-library spelling onto the record we really have). Place under the
+        # record's OWN id so the dispatcher and the reply agree, and say so.
+        canonical = str(record.get("part_id") or "")
+        if canonical and canonical != part_id:
+            notes.append(f"read part_id {part_id!r} as {canonical!r}")
+            part_id = canonical
 
         if doc_id_only:
             kind = str(((record or {}).get("geometry_ref") or {}).get("kind", ""))

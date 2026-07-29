@@ -9,9 +9,11 @@ hand — all 21 triggers/context-packs were inert in a live mission. This suite 
 the real production seam: ``agent_turn.run_turn()`` end to end, with a scripted
 provider that records every ``messages`` list it is handed, proving:
 
-  a) a turn whose reply text matches a known trigger (thread_mention keyword) injects
-     the expected ``[ADVISORY ... ] ... [/ADVISORY]`` block into the NEXT completion
-     (plus a tool-name-triggered variant — bearing_seat via ``part_search``);
+  a) a turn whose signals match a known trigger injects the expected
+     ``[ADVISORY ... ] ... [/ADVISORY]`` block — on the FIRST completion when the
+     USER's request matched (thread_mention keyword), on the NEXT completion when
+     it was the model's own output/tool call that matched (bearing_seat via
+     ``part_search``);
   b) an identical second fire within ``cooldown_turns`` (triggers.yaml: 8 for
      thread_mention) does NOT re-inject a second block;
   c) the effort knob ``trigger_injection=false`` (tiers.yaml/effort.py) suppresses
@@ -92,12 +94,13 @@ def _patch_effort(monkeypatch, *, on: bool) -> None:
 # (a) production-shaped run: a matching turn injects the expected block
 # ---------------------------------------------------------------------------
 
-def test_matching_turn_injects_advisory_block(monkeypatch):
-    """A reply mentioning a tapped hole (thread_mention keyword) shows up as an
-    [ADVISORY] block in the NEXT completion's messages, not the first."""
+def test_matching_request_injects_advisory_block(monkeypatch):
+    """A request mentioning a threaded hole (thread_mention keyword) is matched
+    before the first completion — a rule exists to steer the model, so waiting
+    for the model to say it first would deliver the pack a turn too late."""
     _patch_effort(monkeypatch, on=True)
     prov = _CapturingProvider([
-        _tool_reply("measure_part", note="I'll add a tapped hole M6x1.0 through the boss"),
+        _tool_reply("measure_part", note="I'll add a tapped hole M6x1.0 through it"),
         _done_reply(),
     ])
     res = at.run_turn(
@@ -108,13 +111,12 @@ def test_matching_turn_injects_advisory_block(monkeypatch):
     )
     assert res.success is True
     assert len(prov.seen_messages) == 2
-    # First call: only the initial user request — nothing has happened yet.
-    assert "[ADVISORY" not in _messages_text(prov.seen_messages[0])
-    # Second call: iteration 1's output fired thread_mention -> injected here.
-    second_text = _messages_text(prov.seen_messages[1])
-    assert "[ADVISORY" in second_text
-    assert "[/ADVISORY]" in second_text
-    assert "thread_mention" in second_text
+    first_text = _messages_text(prov.seen_messages[0])
+    assert "[ADVISORY" in first_text
+    assert "[/ADVISORY]" in first_text
+    assert "thread_mention" in first_text
+    # Iteration 1's output repeats the keyword; cooldown_turns=8 keeps it quiet.
+    assert _messages_text(prov.seen_messages[1]).count("[ADVISORY") == 1
 
 
 def test_tool_name_match_also_injects(monkeypatch):
@@ -156,14 +158,12 @@ def test_cooldown_suppresses_second_fire_within_turn(monkeypatch):
     )
     assert res.success is True
     assert len(prov.seen_messages) == 3
-    call2_text = _messages_text(prov.seen_messages[1])
-    call3_text = _messages_text(prov.seen_messages[2])
-    assert call2_text.count("[ADVISORY") == 1  # first fire injected once
-    # thread_mention cooldown_turns=8; the second check is one loop-iteration
-    # later (delta=1 < 8) -> suppressed, so call 3 carries no NEW block (the
-    # one already injected for call 2 is still present in the accumulated
-    # message history, hence still exactly 1, not 2).
-    assert call3_text.count("[ADVISORY") == 1
+    # The request ("threaded") fired thread_mention before completion 1; the two
+    # replies repeat the keyword one and two iterations later. cooldown_turns=8
+    # -> delta < 8 both times, so no second block is ever appended. The single
+    # block stays visible in the accumulated history: exactly 1, never 2.
+    for i in (0, 1, 2):
+        assert _messages_text(prov.seen_messages[i]).count("[ADVISORY") == 1, i
 
 
 # ---------------------------------------------------------------------------

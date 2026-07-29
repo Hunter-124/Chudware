@@ -247,6 +247,73 @@ def _wire_specs(from_ref: Any, from_pin: Any, to_ref: Any, to_pin: Any) -> list[
     return out
 
 
+# --------------------------------------------------- wire endpoint-name dialect (a/b)
+# LIVE gap measured 2026-07-29 (claude-sonnet-4-5, ecad turn):
+#   ecad_wire(ref_a="U1", pin_a="3", ref_b="C1", pin_b="1", doc_id="ecadcpp0000000b")
+#   -> unknown_argument for ALL FOUR names, so the whole wiring turn connected nothing.
+# a/b is a completely standard naming for the two ends of a connection and the mapping is
+# unambiguous: `a` is the FIRST endpoint (-> from_*), `b` the SECOND (-> to_*). ORDER IS
+# PRESERVED — a never becomes `to`.
+#
+# Both word orders (`ref_a` and `a_ref`) are declared because neither is reachable from the
+# other through the shared affix reconciler: norm_arg gives "refa" vs "aref", and
+# arg_reconciliation.resolve_unknown only relates names by prefix/suffix
+# (services/agent/arg_reconciliation.py:392-400). Adding them cannot shadow a spelling that
+# already worked either — every supplied name that affix-matches one of the new parameters
+# ("ref", "pin") already matched >=2 of from_ref/from_pin/to_ref/to_pin and was therefore
+# already ambiguous.
+#
+# They are REAL DECLARED PARAMETERS, never a **kwargs bag: a var-keyword parameter turns the
+# shared reconciler OFF for this tool on both dispatch paths (agent_turn._signature_spec /
+# server._arg_meta read VAR_KEYWORD as "accepts anything") and FastMCP then DROPS the unknown
+# key silently — a loud unknown_argument would become a silent wrong call.
+#
+# start_/end_/source_/target_ are deliberately NOT declared as parameters: those words are
+# already accepted at the endpoint-DICT layer (_FROM_KEYS/_TO_KEYS above), and each extra
+# top-level parameter is schema noise a model must read past on every wire call.
+
+def _blank(v: Any) -> bool:
+    """True when an argument slot was left at its empty default."""
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def _fold_wire_aliases(canon: dict, folds: list, notes: list) -> dict | None:
+    """Fold a/b endpoint aliases onto the canonical from_*/to_* slots.
+
+    Returns None on success (``canon`` updated in place, every rewrite echoed in ``notes``),
+    or a refusal payload when a canonical name and one of its synonyms DISAGREE — two
+    spellings of the same endpoint that carry different values is a real ambiguity, and
+    picking one silently would wire the wrong pin and report success."""
+    filled: dict[str, str] = {}
+    for slot, name, value in folds:
+        if _blank(value):
+            continue
+        cur = canon[slot]
+        if _blank(cur):
+            canon[slot] = value
+            filled[slot] = name
+            notes.append(f"interpreted {name}={value!r} as {slot} "
+                         f"({'a' if slot.startswith('from') else 'b'} is the "
+                         f"{'first' if slot.startswith('from') else 'second'} endpoint)")
+            continue
+        if str(cur) == str(value):
+            continue
+        held = filled.get(slot, slot)
+        return {
+            "ok": False,
+            "error": f"{held}={cur!r} and {name}={value!r} are two spellings of the same "
+                     f"wire endpoint but disagree. {name} is accepted only as a synonym of "
+                     f"{slot} — pass one of them, not both; NO wire was made.",
+            "hint": "ecad_wire connects endpoint a (from_ref/from_pin, also spelled "
+                    "ref_a/pin_a or a_ref/a_pin) to endpoint b (to_ref/to_pin, also "
+                    "ref_b/pin_b or b_ref/b_pin).",
+            "next_actions": ["ecad_wire('U1', '3', 'C1', '1')",
+                             "ecad_status()  # list the placed refs and their pins"],
+            "warnings": [],
+        }
+    return None
+
+
 def _merge_place_spec(base: dict, e: dict) -> dict:
     """Fold ONE model-written placement dict onto the top-level defaults."""
     lib = _pick(e, _LIBID_KEYS)
@@ -326,8 +393,31 @@ def _place_specs(libid: Any, x: Any, y: Any, ref: Any, value: Any, angle: Any,
                 f"{type(entry).__name__}")
     return out
 
+# ------------------------------------------------- library-miss policy (substitute vs generate)
+# The pin count above which ecad_find_part REFUSES to substitute a generic and routes to
+# ecad_make_part instead. 3, deliberately:
+#   * 2 pins — a resistor/capacitor/diode/crystal/bead symbol has no pinout to get wrong;
+#     the part-specific information is `value`, which the caller passes.
+#   * 3 pins — a SOT-23 discrete (MOSFET/BJT). 1=G/2=S/3=D (and 1=B/2=E/3=C) is the JEDEC
+#     package convention, not this library's invention, so the generic is the real symbol.
+#   * 4+ pins — the substitute's pin NUMBERS are its own. MCU:Generic_QFP48 numbers 1..48
+#     sequentially; no real 48-pin MCU does. Wiring against it produces a netlist that
+#     looks complete and is wrong on every net, which is worse than any refusal — and since
+#     ecad_make_part can now build the real part from a caller-supplied pinout, the refusal
+#     is actionable rather than a dead end.
+_SUBSTITUTABLE_MAX_PINS = 3
+
 def register_ecad_sch_tools(mcp: FastMCP) -> None:
     """ECAD schematic MCP tools (T-RF8 split of ecad_tools.py): ecad_new_schematic, find_part, place_symbol, wire, add_power, label, status, run_erc, update_from_sch."""
+
+    # Make parts created by ecad_make_part in EARLIER sessions resolvable. store_part
+    # registers the native dir as a side effect of writing, which only covers the process
+    # that created the part — so without this call a part generated yesterday sits on disk
+    # unresolvable and ecad_make_part's "it resolves from now on" becomes false after a
+    # restart. One idempotent path append, no I/O; every consumer in this process shares
+    # the native._default singleton, so the parts-catalog adapter sees it too.
+    from services.ecad.library.generate import register_library_dir
+    register_library_dir()
 
 
     # ---------------------------------------------------------------- new doc
@@ -388,9 +478,12 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         first. Pass the exact ``libid``/``fpid`` of a hit to ecad_place_symbol / a footprint op.
 
         The library is a clean-room GENERIC set — it holds no manufacturer part numbers. Ask for
-        a real one ('TPS62840', 'ESP32-S3') and you get the closest generic by FUNCTION, flagged
-        ``substituted: true`` with a warning naming what you asked for, what you got, and how its
-        pinout differs. Never place a substituted symbol without reading that warning.
+        a real one and what happens depends on the PIN COUNT of the closest generic:
+        a 2- or 3-pin passive/discrete (a resistor, a diode, a SOT-23 MOSFET) is substituted and
+        flagged ``substituted: true``, because a generic ``Device:R`` genuinely IS the right
+        symbol for any resistor. Anything with MORE pins is REFUSED and routed to
+        ``ecad_make_part`` — a generic 48-pin QFP is not an ESP32's pinout, and a schematic
+        wired against the wrong pinout is a fabricated design, not an approximation.
 
         ``ecad_find_part('list')`` browses every library part grouped by family.
         ``category`` restricts the search to one family prefix (e.g. 'Device', 'MCU',
@@ -452,19 +545,65 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                                  "score": h.get("score", 0), "fpid": h.get("fpid", "")})
 
         if not out_hits:
-            # No literal match. Offer the closest GENERIC by inferred function rather than
-            # burning another call — but say so LOUDLY: a silent generic swap would put wrong
-            # pins in the netlist, which is far worse than a miss.
+            # No literal match. Two very different situations, and conflating them is what
+            # used to produce confidently wrong schematics:
+            #
+            #  * PASSIVES/DISCRETES (<= 3 pins). Device:R IS the resistor symbol; the only
+            #    thing that distinguishes a 10k from a 4k7 is `value`, which the caller
+            #    supplies. A 3-pin SOT-23 discrete's 1=G/2=S/2=B numbering is the JEDEC
+            #    standard, not a guess. Substituting here loses nothing, so it stays.
+            #
+            #  * MULTI-PIN ICs AND MODULES (> 3 pins). Here the substitute's pin map is
+            #    essentially guaranteed to be wrong: MCU:Generic_QFP48 numbers its pins
+            #    1..48 sequentially and an ESP32-S3 does not. Before ecad_make_part existed
+            #    the choice was "wrong pinout" vs "dead end", and wrong-pinout-with-a-warning
+            #    won. It no longer is: ecad_make_part builds the REAL part from a
+            #    caller-supplied pinout, so an honest refusal that names it is strictly
+            #    better than an ok:true answer the caller will wire up.
             sug = _sub.suggest(q)
             if sug and cat and sug["libid"].split(":", 1)[0] != cat:
                 sug = None
             if sug:
                 rec = _symbol_record(sug["libid"], lib_resolve)
+                if rec["pin_count"] > _SUBSTITUTABLE_MAX_PINS:
+                    return _err(
+                        f"no library part matches {q!r}, and the closest generic "
+                        f"{sug['libid']} is a {rec['pin_count']}-pin "
+                        f"{sug['family']} whose pin map is NOT {q}'s — refusing to "
+                        "substitute it",
+                        hint=f"A {rec['pin_count']}-pin substitute would place a symbol "
+                             f"whose pins are numbered for {sug['libid']}, so every wire "
+                             f"you then drew would be on the wrong {q} pin. Build the "
+                             "real part instead: ecad_make_part takes the pinout FROM "
+                             "YOU (one entry per pin: number, name, type) plus the "
+                             "package geometry, and generates a symbol + footprint that "
+                             "resolve immediately. Read the pinout off the datasheet — "
+                             "nothing here will invent it. (Passives and 2-3 pin "
+                             "discretes are still substituted, because a generic "
+                             "Device:R really is the right resistor symbol.)",
+                        next_actions=[
+                            f"ecad_make_part(name={q!r}, libid='Generated:{q}', "
+                            "pins=[{'number':'1','name':'GND','type':'power_in',"
+                            "'side':'left'}, ...], package='module_castellated', "
+                            "pitch=1.27, body_w=18.0, body_h=25.5, pad_len=2.0, "
+                            "pad_width=0.9)  # build the real part from its datasheet",
+                            f"ecad_find_part({sug['libid'].split(':')[-1]!r})  "
+                            f"# place {sug['libid']} deliberately, pinout and all",
+                            "ecad_find_part('list')  # browse every library part",
+                        ],
+                        query=q, requested=q, hits=[], categories=families,
+                        substituted=False, exact_match=False,
+                        closest_generic=sug["libid"],
+                        closest_generic_pin_count=rec["pin_count"],
+                        closest_generic_family=sug["family"],
+                        make_part_tool="ecad_make_part")
                 rec["substituted"] = True
                 rec["requested"] = q
                 warning = (f"SUBSTITUTED: the library has no symbol for {q!r}. Offering the "
                            f"closest generic {sug['family']}: {sug['libid']} "
-                           f"({rec['pin_count']} pins). {sug['caveat']}")
+                           f"({rec['pin_count']} pins). {sug['caveat']} If that pin map is "
+                           f"not {q}'s, build the real part with ecad_make_part instead of "
+                           "wiring this one.")
                 return _dumps({
                     "ok": True, "query": q, "requested": q, "substituted": True,
                     "exact_match": False, "substitute_libid": sug["libid"],
@@ -474,9 +613,13 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                     "hint": f"No exact part — {sug['libid']} is the generic "
                             f"{sug['family']} standing in for {q!r}. Placeable as-is; its "
                             "pin map is NOT the requested part's. "
-                            + sug["caveat"],
+                            + sug["caveat"]
+                            + " Need the real pinout? ecad_make_part builds it from a "
+                              "pinout you supply.",
                     "next_actions": [
                         f"ecad_place_symbol('{sug['libid']}', x=0, y=0, value={q!r})",
+                        f"ecad_make_part(name={q!r}, libid='Generated:{q}', pins=[...])  "
+                        "# the real part, from its datasheet pinout",
                         "ecad_find_part('list')  # browse every library part",
                     ],
                 })
@@ -486,10 +629,16 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                         hint="This is a clean-room GENERIC library — no manufacturer part "
                              f"numbers. Families: {', '.join(families)}. Search by FUNCTION "
                              "('buck regulator', 'mcu', 'opamp', 'imu', 'header', 'crystal') "
-                             "or call ecad_find_part('list') for every part with its pin count.",
+                             "or call ecad_find_part('list') for every part with its pin "
+                             "count. If the part genuinely is not here, ecad_make_part "
+                             "generates it from a pinout you supply.",
                         next_actions=["ecad_find_part('list')  # every part, grouped by family",
+                                      f"ecad_make_part(name={q!r}, libid='Generated:{q}', "
+                                      "pins=[{'number':'1','name':'GND',"
+                                      "'type':'power_in'}, ...])",
                                       "ecad_find_part('resistor')"],
-                        query=q, hits=[], categories=families, substituted=False)
+                        query=q, hits=[], categories=families, substituted=False,
+                        make_part_tool="ecad_make_part")
 
         first = out_hits[0]
         first_id = first.get("libid") or first.get("fpid")
@@ -504,6 +653,169 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
             "next_actions": [ex],
         })
 
+
+    # ---------------------------------------------------------------- make part
+
+    @mcp.tool()
+    def ecad_make_part(name: str, pins: Any = None, package: str = "",
+                       libid: str = "", fpid: str = "",
+                       pitch: float = 0.0, body_w: float = 0.0, body_h: float = 0.0,
+                       pad_len: float = 0.0, pad_width: float = 0.0,
+                       pad_offset: float = 0.0, row_span: float = 0.0,
+                       drill: float = 0.0, exposed_pad: float = 0.0,
+                       numbering: str = "", reference_prefix: str = "U",
+                       value: str = "", description: str = "", keywords: str = "",
+                       overwrite: bool = False) -> str:
+        """CREATE a real library part — symbol + footprint — from a pinout YOU supply.
+
+        This is the honest answer to "the library has no ESP32-WROOM-32". It never invents
+        an electrical fact: the pin numbers, names and electrical types come from you (read
+        them off the datasheet), and the pad geometry is computed from the pitch / body /
+        pad dimensions you pass. Calling it with a part name and NO pin list is refused —
+        a part number is not a pinout.
+
+        ``pins`` — a list (or JSON string) of one object per pin::
+
+            [{"number": "1", "name": "GND", "type": "power_in", "side": "left"},
+             {"number": "2", "name": "3V3", "type": "power_in", "side": "left"}, ...]
+
+        ``type`` takes the full KiCad electrical enum — input, output, bidirectional,
+        tri_state, passive, free, unspecified, power_in, power_out, open_collector,
+        open_emitter, no_connect. An UNKNOWN type is an error and a bare ``"power"`` is an
+        error (power_in and power_out are opposite ERC roles), because a wrong pin type
+        silences the ERC check that would have caught your mistake. Optional ``shape``
+        takes the KiCad graphic vocabulary (line/inverted/clock/inverted_clock/input_low/
+        clock_low/output_low/falling_edge_clock/non_logic); it is cosmetic, so an
+        unrenderable value is noted rather than fatal. ``side`` (left/right/top/bottom) is
+        optional for the symbol — omitted, pins split left/right in number order — but
+        REQUIRED on every pin for a castellated module, which has no fixed side layout.
+
+        ``package`` (optional; omit it for a symbol-only part): module_castellated, soic,
+        sop, ssop, tssop, qfn, dfn, lga, qfp, lqfp, sot, dip, header, 0402, 0603, 0805,
+        1206. ``pad_len`` is the pad dimension PERPENDICULAR to the body edge, ``pad_width``
+        the one ALONG it, ``pitch`` the pad-to-pad centre spacing, ``row_span`` the
+        centre-to-centre spacing of two opposing rows, ``pad_offset`` an explicit
+        origin-to-pad-centre distance. Standard families (soic/sot/dip/header/chip) fall
+        back to the IPC-7351 nominals the starter library documents; a QFN/QFP/module pad
+        ring is NOT guessed — the missing number is named in the error.
+
+        Returns the created ``libid``, ``pin_count`` and ``pad_count`` so you can verify the
+        part before wiring it, then place it with ``ecad_place_symbol(libid=...)``.
+        ``overwrite=False`` (the default) makes a name collision a clear error and leaves
+        the stored part untouched; pass ``overwrite=True`` to replace it.
+
+        Give the footprint its OWN id (``fpid='RF_Module:ESP32-WROOM-32_Module'``). Passing
+        ``fpid`` equal to ``libid`` works and both resolve, but the symbol and the footprint
+        are then two different records under one string, which a catalog keyed on a flat
+        part id (``part_get``/``part_place``) collapses into whichever it saw last — so the
+        call succeeds with a loud ID COLLISION warning. Omit ``fpid`` and a distinct one is
+        derived for you.
+        """
+        from services.ecad.library import generate as _gen  # STAYS: no ecad_library RPC
+
+        nm = str(name or "").strip()
+        if not nm:
+            return _err("name is empty",
+                        hint="Pass the part name you are building, e.g. "
+                             "name='ESP32-WROOM-32'.",
+                        next_actions=["ecad_make_part(name='ESP32-WROOM-32', "
+                                      "pins=[...], package='module_castellated')"],
+                        created=False)
+        raw_pins = coerce_json_or_repr(pins) if pins is not None else None
+        if isinstance(raw_pins, dict):
+            # A model wrapping the list: {"pins": [...]} / {"items": [...]}.
+            raw_pins = _batch_of(raw_pins) or raw_pins.get("pins") or raw_pins
+        if isinstance(raw_pins, str):
+            return _err(f"pins {raw_pins!r} is not a pin list",
+                        hint="pins must be a list of objects, one per pin: "
+                             "[{'number':'1','name':'GND','type':'power_in'}, ...]. A "
+                             "part name alone cannot produce a part — read the pinout off "
+                             "the datasheet.",
+                        next_actions=[f"ecad_make_part(name={nm!r}, "
+                                      "pins=[{'number':'1','name':'GND',"
+                                      "'type':'power_in'}, ...])"],
+                        name=nm, created=False)
+        geometry = {"pitch": pitch, "body_w": body_w, "body_h": body_h,
+                    "pad_len": pad_len, "pad_width": pad_width,
+                    "pad_offset": pad_offset, "row_span": row_span, "drill": drill,
+                    "exposed_pad": exposed_pad, "numbering": numbering}
+        try:
+            made = _gen.make_part(nm, raw_pins, libid=libid, package=package, fpid=fpid,
+                                  overwrite=bool(overwrite),
+                                  reference_prefix=reference_prefix, value=value,
+                                  description=description, keywords=keywords,
+                                  **geometry)
+        except ValueError as e:
+            # Every refusal from generate.py already names what is missing and the next
+            # call; surface it verbatim rather than flattening it into "invalid args".
+            return _err(str(e),
+                        hint="Nothing was written. This generator will not guess an "
+                             "electrical fact or a pad coordinate — supply the value it "
+                             "named and call again.",
+                        next_actions=[
+                            f"ecad_make_part(name={nm!r}, libid='Generated:{nm}', "
+                            "pins=[{'number':'1','name':'GND','type':'power_in',"
+                            "'side':'left'}, ...], package='module_castellated', "
+                            "pitch=1.27, body_w=18.0, body_h=25.5, pad_len=2.0, "
+                            "pad_width=0.9)",
+                            "ecad_find_part('list')  # what the library already has",
+                        ],
+                        name=nm, created=False)
+        except OSError as e:
+            return _err(f"could not write the generated part: {e}",
+                        hint="The native library directory is not writable. Set "
+                             "CHUDWARE_ECAD_LIB_DIR to a writable path and retry.",
+                        next_actions=["ecad_find_part('list')"], name=nm, created=False)
+
+        libid_out, fpid_out = made["libid"], made["fpid"]
+        pin_count, pad_count = made["pin_count"], made["pad_count"]
+        warnings: list[str] = []
+        if fpid_out and pad_count != pin_count:
+            warnings.append(
+                f"PAD/PIN MISMATCH: the symbol has {pin_count} pins but the footprint has "
+                f"{pad_count} pads. That is legitimate for an exposed thermal pad or a "
+                "mechanical mounting pad, and a MISTAKE otherwise — check it before you "
+                "route the board.")
+        if made.get("id_collision"):
+            # Legal at the library tier (symbols/ and footprints/ are separate namespaces,
+            # exactly like KiCad's symbol libs vs .pretty dirs) and both resolve — but the
+            # symbol and the footprint are then two DIFFERENT records under ONE string, and
+            # a consumer keyed on a flat part id keeps only one. Measured 2026-07-29: the
+            # parts index kept the FOOTPRINT record, whose geometry_ref carries no libid, so
+            # part_place reported "geometry_ref missing 'libid'" for a part that had just
+            # been created successfully. Named loudly instead of silently auto-suffixed.
+            warnings.append(
+                f"ID COLLISION: the symbol and the footprint were both stored as "
+                f"{libid_out!r}. Both resolve here, but they are two different records "
+                "under one id, so a catalog keyed on a flat part id (part_get / "
+                "part_place) can end up serving the footprint where the symbol was meant. "
+                f"Prefer a distinct footprint id, e.g. fpid='{fpid_out}_"
+                f"{(package or 'FP').strip().upper()}'.")
+        return _dumps({
+            "ok": True, "created": True, "name": nm,
+            "libid": libid_out, "fpid": fpid_out,
+            "pin_count": pin_count, "pad_count": pad_count,
+            "overwrote": bool(overwrite),
+            "pins": [f"{p['number']}:{p['name']}({p['type']})"
+                     for p in (_lib_resolve_pins(libid_out))],
+            "paths": made["paths"], "notes": made["notes"], "warnings": warnings,
+            "hint": (f"Created {libid_out} — {pin_count} pins"
+                     + (f", footprint {fpid_out} with {pad_count} pads" if fpid_out
+                        else " (symbol only — pass package= to add a footprint)")
+                     + ". It resolves from now on, so ecad_find_part finds it without "
+                       "substituting. The pinout is exactly what you supplied: nothing "
+                       "was inferred from the part name."),
+            "next_actions": [
+                f"ecad_place_symbol('{libid_out}', x=0, y=0, value={nm!r}"
+                + (f", footprint='{fpid_out}')" if fpid_out else ")"),
+                f"ecad_find_part({nm!r})  # confirm it resolves without a substitution",
+            ],
+        })
+
+    def _lib_resolve_pins(libid: str) -> list[dict]:
+        """The stored pin list of a just-generated part (read back, not echoed)."""
+        from services.ecad.library import resolve as _resolve
+        return list((_resolve(libid) or {}).get("pins", []))
 
 
     # ---------------------------------------------------------------- place symbol
@@ -776,7 +1088,11 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def ecad_wire(from_ref: Union[str, dict, list] = "", from_pin: Union[str, int] = "",
                   to_ref: Union[str, dict] = "", to_pin: Union[str, int] = "",
-                  doc_id: str = "") -> str:
+                  doc_id: str = "",
+                  ref_a: Union[str, dict] = "", pin_a: Union[str, int] = "",
+                  ref_b: Union[str, dict] = "", pin_b: Union[str, int] = "",
+                  a_ref: Union[str, dict] = "", a_pin: Union[str, int] = "",
+                  b_ref: Union[str, dict] = "", b_pin: Union[str, int] = "") -> str:
         """Auto-route an orthogonal wire from one pin to another (emits sch_connect) and return
         the RESULTING net plus the updated list of what is still unconnected.
 
@@ -793,14 +1109,35 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
           - a BATCH: ecad_wire([{'from': 'R1.1', 'to': 'R2.2'}, {'from': 'R2.2',
             'to': 'V1.-'}]) or {'ops': [...]}. The response then carries ``wires`` (one
             per-connection payload each).
+
+        The two ends may also be named a/b instead of from/to — ``ref_a``/``pin_a``/
+        ``ref_b``/``pin_b`` (or ``a_ref``/``a_pin``/``b_ref``/``b_pin``) are exact synonyms of
+        ``from_ref``/``from_pin``/``to_ref``/``to_pin``: **a is the first endpoint, b the
+        second**. Passing both spellings of one endpoint with DIFFERENT values is refused
+        rather than guessed.
         """
         try:
             session = _get_sch(doc_id or None)
         except OpError as e:
             return _err(e.message, hint="Open a schematic first.",
                         next_actions=["ecad_new_schematic('mydesign')"])
+        # LIVE-DIALECT gap (2026-07-29): ref_a/pin_a/ref_b/pin_b all died as
+        # unknown_argument — see the endpoint-name dialect block above. a -> from, b -> to.
+        notes: list = []
+        canon = {"from_ref": from_ref, "from_pin": from_pin,
+                 "to_ref": to_ref, "to_pin": to_pin}
+        bad = _fold_wire_aliases(
+            canon,
+            [("from_ref", "ref_a", ref_a), ("from_ref", "a_ref", a_ref),
+             ("from_pin", "pin_a", pin_a), ("from_pin", "a_pin", a_pin),
+             ("to_ref", "ref_b", ref_b), ("to_ref", "b_ref", b_ref),
+             ("to_pin", "pin_b", pin_b), ("to_pin", "b_pin", b_pin)],
+            notes)
+        if bad:
+            return _dumps(bad)
         try:
-            specs = _wire_specs(from_ref, from_pin, to_ref, to_pin)
+            specs = _wire_specs(canon["from_ref"], canon["from_pin"],
+                                canon["to_ref"], canon["to_pin"])
         except ValueError as e:
             return _err(
                 str(e),
@@ -812,6 +1149,8 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         single = len(specs) == 1
         results = [_wire_one(session, s, attach_readback=single) for s in specs]
         if single:
+            if notes:
+                results[0]["interpreted"] = notes
             return _dumps(results[0])
         made = [r for r in results if r.get("ok")]
         failed = [{"from": f"{s['from_ref']}.{s['from_pin']}",
@@ -832,6 +1171,8 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
             "next_actions": ["ecad_run_erc()  # verify the design electrically",
                              "ecad_status()  # see what's still unconnected"],
         }
+        if notes:
+            payload["interpreted"] = notes
         _attach_schematic_ascii_readback(payload, doc_id=session.doc_id)
         return _dumps(payload)
 

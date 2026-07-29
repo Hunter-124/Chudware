@@ -3236,6 +3236,13 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
         # One bare selector/query handed to a LIST slot says exactly one thing. Only a
         # dict that IS a selector/query is wrapped — a dict that merely nests the list one
         # level deeper ({"sections":[…]}) means something else entirely.
+        #
+        # The wrap is safe ONLY because the engine unwraps a one-element query list back to
+        # the bare query (core/doc/validate.cpp::normalize_feature_shape). Without that,
+        # {"of":"face","side":"top"} in a list reaches the topology-SELECTOR resolver instead
+        # of the QUERY resolver and dangles with "no candidates of matching kind" — which
+        # rolls the whole atomic batch back and leaves an empty document. Pinned end-to-end
+        # by test_cad_tools.py::test_one_element_query_list_still_builds_a_shell.
         if (slot in _LIST_REF_SLOTS and isinstance(v, dict)
                 and (v.get("kind") or v.get("of") or v.get("sid") or (set(v) & _QUERY_KEYS))):
             notes.append(f"{label}: wrapped refs.{slot} {_compact(v)} in a list — "
@@ -3433,6 +3440,16 @@ def _normalize_extrude_params(feat: dict, ftype: str, notes: list) -> dict:
         return feat
     out["params"] = params
     return out
+
+
+# CAD extensions save_part REPLACES rather than stacks onto (see save_part). Derived from
+# fs_tools.CAD_EXTS — the one canonical list — minus "step+" itself, which is the target.
+def _cad_exts_for_save() -> frozenset:
+    from services.mcp.fs_tools import CAD_EXTS  # noqa: PLC0415 — keep the import off module load
+    return frozenset(e.lower().lstrip(".") for e in CAD_EXTS) - {"step+"}
+
+
+_CAD_EXTS_FOR_SAVE = _cad_exts_for_save()
 
 
 # Sketching on a FACE is core CAD and the engine supports it, but a ref slot only takes a
@@ -5611,7 +5628,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         or mesh files: a plain STEP/STL has geometry only, no feature history or studies.)
 
         path : where to write. If omitted, a temp .step+ is written. A ".step+" extension is added
-               if missing. Returns the written path and bytes so you can confirm a real save.
+               when the name carries none; a DIFFERENT CAD extension (".step", ".stl", …) is
+               REPLACED, so save_part("bracket.step") writes "bracket.step+" and never
+               "bracket.step.step+". Returns the written path and bytes so you can confirm a
+               real save, plus a note whenever the extension was rewritten.
 
         Save every deliverable BEFORE your session ends: the user is never warned about your
         unsaved docs, so anything you don't save (and don't close_part(discard=True)) is only
@@ -5623,8 +5643,23 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # fully resolved before we pass them to the engine.  This means the caller sees
             # exactly where the file will be written (no hidden navigation).
             out = _sanitize_output_path(path) if path else _tmp(".step+")
+            note = None
             if not out.lower().endswith(".step+"):
-                out += ".step+"
+                # A caller who wrote "bracket.step" asked for a CAD file by name and gets the
+                # native format regardless — but blindly APPENDING produced "bracket.step.step+"
+                # (measured live 2026-07-29; the user has a lexus_f_keychain.step.step+ from a
+                # real session). A doubled extension is confusing in a file browser and makes the
+                # part look like two nested formats. So: REPLACE a recognised CAD extension,
+                # APPEND when there is none. A dotted base name that is not a known extension
+                # ("v1.2_bracket") is left intact by construction, because only CAD_EXTS match.
+                stem, dot, ext = out.rpartition(".")
+                if dot and stem and ext.lower() in _CAD_EXTS_FOR_SAVE:
+                    out = f"{stem}.step+"
+                    note = (f"requested extension '.{ext}' replaced with '.step+' — save_part "
+                            f"always writes the native editable format (use export_part for a "
+                            f"flat .{ext.lower()})")
+                else:
+                    out += ".step+"
             r = cb.call("doc_save", {"doc_id": d, "path": out})
             written = r.get("path", out)
             ok = os.path.exists(written)
@@ -5633,9 +5668,12 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 rev = _doc_revision(d)
                 if rev is not None:
                     _LAST_DELIVER_REV[d] = rev
-            return _dumps({"ok": ok, "format": "step+", "native": True, "doc_id": d,
-                           "path": written,
-                           "bytes": (os.path.getsize(written) if ok else 0)})
+            res = {"ok": ok, "format": "step+", "native": True, "doc_id": d,
+                   "path": written,
+                   "bytes": (os.path.getsize(written) if ok else 0)}
+            if note:
+                res["note"] = note
+            return _dumps(res)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

@@ -256,3 +256,104 @@ def test_fea_static_a36_steel_matches_steel_deflection():
 
 if __name__ == "__main__":  # pragma: no cover - manual convenience
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ==========================================================================
+# 3. APPEARANCE designation resolution (cad_common._resolve_appearance)
+#
+# A DIFFERENT surface from _resolve_material above: this one only picks a LOOK
+# (colour/metallic/roughness), so the correct answer for an unmodelled alloy is the
+# closest visual family, not a refusal. Measured live 2026-07-29 (claude-sonnet-4-5,
+# "build a 60 mm cube in aluminium"): set_material('6061-T6') was refused with a list
+# of eight appearance names, costing a call. Worse, 'Ti-6Al-4V' RESOLVED — to
+# ALUMINIUM, because the string contains the token "al" — so titanium grade 5
+# rendered as the wrong metal and reported success.
+# ==========================================================================
+
+from mcp_server import cad_common as _cc  # noqa: E402
+
+
+def _appearance_family(name: str) -> str:
+    """The preset NAME a spelling lands on, by matching the colour it returns."""
+    got = _cc._resolve_appearance(name)
+    for fam, preset in _cc._APPEARANCE_PRESETS.items():
+        if list(preset["color"]) == list(got["color"]):
+            return fam
+    raise AssertionError(f"{name!r} produced an off-preset colour {got}")
+
+
+@pytest.mark.parametrize("spelling,family", [
+    # aluminium — bare designations, with and without temper
+    ("6061-T6", "aluminum"), ("6061", "aluminum"), ("7075-T6", "aluminum"),
+    ("2024-T3", "aluminum"), ("5052", "aluminum"),
+    # steel — plate/bar grades and tool steel
+    ("A36", "steel"), ("A36 steel", "steel"), ("1018", "steel"), ("4140", "steel"),
+    ("12L14", "steel"), ("O1 tool steel", "steel"), ("mild steel", "steel"),
+    # stainless — must beat plain "steel" on the substring
+    ("304", "stainless"), ("316L", "stainless"), ("17-4PH", "stainless"),
+    ("440C", "stainless"), ("stainless steel", "stainless"),
+    # titanium — the silently-wrong case
+    ("Ti-6Al-4V", "titanium"), ("Ti6Al4V", "titanium"), ("titanium", "titanium"),
+    ("grade 5 titanium", "titanium"),
+    # copper alloys and polymers
+    ("C360", "brass"), ("C360 brass", "brass"), ("C110", "copper"),
+    ("PLA", "plastic"), ("ABS", "abs"), ("nylon", "nylon"), ("polyamide", "nylon"),
+])
+def test_appearance_designation_lands_on_the_right_family(spelling, family):
+    assert _appearance_family(spelling) == family
+
+
+def test_titanium_grade_5_is_not_rendered_as_aluminium():
+    """The regression that mattered: 'al' inside Ti-6Al-4V must not win.
+
+    This asserts the DISTINCTION, not just the label — a wrong metal that returns
+    ok:true is worse than a refusal, and only comparing the two colours catches it.
+    """
+    ti = _cc._resolve_appearance("Ti-6Al-4V")
+    al = _cc._resolve_appearance("aluminum")
+    assert ti["color"] != al["color"], "Ti-6Al-4V still resolves to aluminium"
+    assert _appearance_family("Ti-6Al-4V") == "titanium"
+
+
+def test_stainless_designation_is_not_plain_steel():
+    """304/316 are visually distinct from carbon steel — keep them apart."""
+    assert _cc._resolve_appearance("304")["color"] != _cc._resolve_appearance("A36")["color"]
+
+
+@pytest.mark.parametrize("bogus", ["unobtainium", "XYZ-999", "kryptonite"])
+def test_unknown_appearance_still_refuses_and_teaches(bogus):
+    """The designation table must not become a catch-all that guesses a look."""
+    with pytest.raises(ValueError) as exc:
+        _cc._resolve_appearance(bogus)
+    msg = str(exc.value)
+    assert "Unknown appearance material" in msg
+    assert "alloy designations" in msg          # points at the new capability
+    assert "'color'" in msg                     # and the explicit escape hatch
+
+
+def test_explicit_colour_dict_still_bypasses_every_table():
+    got = _cc._resolve_appearance({"color": [0.1, 0.2, 0.3], "metallic": 0.5})
+    assert got["color"] == [0.1, 0.2, 0.3]
+    assert got["metallic"] == 0.5
+
+
+def test_token_scan_is_deterministic_and_base_metal_first(monkeypatch):
+    """With the designation table gone, the LOOSE scan must still be right and stable.
+
+    The candidate pool is built from a set, so two equal-length aliases ("al", "ti") had no
+    defined order and 'Ti-6Al-4V' resolved to whichever the interpreter happened to visit
+    first. Disabling the designation table isolates the scan; earliest-match precedence must
+    pick the BASE metal (titanium) while 'Al' as the only family word still means aluminium.
+    """
+    monkeypatch.setattr(_cc, "_ALLOY_DESIGNATIONS", {})
+    assert _appearance_family("Ti-6Al-4V") == "titanium"
+    assert _appearance_family("6061-T6 Al") == "aluminum"
+    assert _appearance_family("stainless steel") == "stainless"   # longest at same position
+    assert _appearance_family("mild steel") == "steel"
+
+
+def test_family_word_needs_a_whole_word_match(monkeypatch):
+    """"al" must not fire inside an unrelated word — that is how loose scans go wrong."""
+    monkeypatch.setattr(_cc, "_ALLOY_DESIGNATIONS", {})
+    with pytest.raises(ValueError):
+        _cc._resolve_appearance("alloy of unknown type")

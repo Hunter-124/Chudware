@@ -54,7 +54,43 @@ ensure_omp_deps() {
         echo "[build] WARN: bun not on PATH; OMP bridge deps not pre-installed (self-heals at first use)"
     fi
 }
-build_core() { cmake --preset linux-core && cmake --build --preset linux-core; }
+# `--preset linux-core` writes to build/linux-core/ (CMakePresets.json binaryDir), which is NOT
+# where anything READS the engine from: scripts/gate.sh prefers core/build-occt-linux/bin then
+# core/build-linux/bin, and the GUI dlopens host/build-linux/bin. Those trees are also configured
+# differently — the preset build is ~0.8 MB smaller because CHUDWARE_WITH_NETGEN is off, so copying
+# it over a full engine would silently DELETE the FEA/CFD mesher (gate.sh:450-456 documents that
+# exact trap). So we do not stage it; we REPORT, because the silent version of this cost a full day
+# of measurements on 2026-07-29: `./build.sh core` printed DONE while every consumer kept loading a
+# two-day-old .so, and six live agent sweeps were scored against stale code before anyone noticed.
+# Uses `find -newer -print -quit` per consumer rather than sorting every source: piping find into
+# `xargs ls -t | head -1` makes xargs die of SIGPIPE, and under this script's `set -o pipefail`
+# that aborted the whole build with exit 125 (caught 2026-07-29 — `./build.sh all` silently stopped
+# after the core stage). No pipes here, and the whole thing is guarded so a diagnostic can never
+# fail a build.
+report_engine_staleness() {
+    local consumer hit
+    for consumer in "$ROOT/core/build-occt-linux/bin/libchudware.so" \
+                    "$ROOT/core/build-linux/bin/libchudware.so" \
+                    "$ROOT/host/build-linux/bin/libchudware.so"; do
+        [ -f "$consumer" ] || continue
+        hit="$(find "$ROOT/core" \( -name '*.cpp' -o -name '*.h' \) \
+                -newer "$consumer" -print -quit 2>/dev/null || true)"
+        if [ -n "$hit" ]; then
+            echo "[build] WARN: STALE ENGINE ${consumer#"$ROOT"/} is older than ${hit#"$ROOT"/}."
+            echo "[build]       Nothing that reads it (gate.sh, the GUI, CHUDWARE_LIBCHUDWARE) will"
+            echo "[build]       see your core changes. Rebuild that tree, e.g."
+            echo "[build]       ninja -C core/build-linux bin/libchudware.so   # or ./build.sh all"
+        fi
+    done
+    return 0
+}
+build_core() {
+    cmake --preset linux-core && cmake --build --preset linux-core
+    local rc=$?
+    echo "[build] core engine -> build/linux-core/bin/libchudware.so (preset tree)"
+    report_engine_staleness
+    return $rc
+}
 build_app()  {
     cmake -S "$ROOT/host" -B "$ROOT/host/build-linux" -G Ninja -DCMAKE_BUILD_TYPE=Release
     ninja -C "$ROOT/host/build-linux" Chudware

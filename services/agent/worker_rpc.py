@@ -631,6 +631,97 @@ def _packs_delete(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"packs_delete failed: {exc}", "hint": ""}
 
 
+def _rule_create(params: dict, _emit: Callable) -> dict:
+    """``rule_create {text} | {keyword, instruction} -> {ok, id, keyword, pack}``.
+
+    Backs the composer's ``/rule <trigger words> -> <context>`` command. The rule
+    is written through the existing single writer (``advisor.triggers.save_trigger``
+    / ``save_pack``) as a user-only ``aicad.trigger/1`` row, so it is immediately
+    live for ``match_triggers`` and editable in Settings -> AI -> Rules.
+
+    A rule with no trigger words could never fire, and one with nothing to inject
+    would fire to no effect, so both are refused rather than written out dead.
+    """
+    import re as _re
+
+    from services.agent.skills import RULE_SLASH_USAGE, parse_rule_slash, rule_slug
+
+    p = params or {}
+    text = str(p.get("text") or "").strip()
+    if text:
+        spec = parse_rule_slash(text if text.startswith("/") else "/rule " + text)
+        if spec is None:
+            return {"ok": False, "reason": "not a /rule command", "hint": RULE_SLASH_USAGE}
+        if not spec.get("ok"):
+            return {"ok": False, "reason": spec.get("reason", "invalid rule"),
+                    "hint": spec.get("usage", RULE_SLASH_USAGE)}
+    else:
+        keyword = " ".join(str(p.get("keyword") or "").split())
+        instruction = str(p.get("instruction") or "").strip()
+        if not keyword:
+            return {"ok": False, "reason": "trigger words required — a rule with no match "
+                                          "can never fire", "hint": RULE_SLASH_USAGE}
+        if not instruction:
+            return {"ok": False, "reason": "context to inject required",
+                    "hint": RULE_SLASH_USAGE}
+        rid = rule_slug(keyword)
+        if not rid:
+            return {"ok": False, "reason": f"cannot derive a rule id from {keyword!r}",
+                    "hint": RULE_SLASH_USAGE}
+        short = instruction if len(instruction) <= 72 else instruction[:69] + "..."
+        spec = {"ok": True, "id": rid, "keyword": keyword, "instruction": instruction,
+                "purpose": f"When {keyword!r} appears: {short}"}
+
+    tr = _triggers()
+    try:
+        taken = {str(row.get("id")) for row in tr.list_triggers()}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"rule_create failed: {exc}", "hint": ""}
+    rid = str(spec["id"])
+    if rid in taken:
+        for n in range(2, 100):
+            cand = f"{rid[:44]}_{n}"
+            if cand not in taken:
+                rid = cand
+                break
+        else:
+            return {"ok": False, "reason": f"too many rules named {rid!r}", "hint": ""}
+
+    body = "# " + spec["keyword"] + "\n\n" + spec["instruction"] + "\n"
+    try:
+        pack = tr.save_pack(rid, body)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"rule_create pack write failed: {exc}", "hint": ""}
+    if not pack.get("ok"):
+        return {"ok": False, "reason": str(pack.get("reason") or "pack write failed"), "hint": ""}
+
+    trigger = {
+        "id": rid,
+        "enabled": True,
+        "purpose": spec["purpose"],
+        "match": {"keywords": [_re.escape(spec["keyword"])], "tools": [], "events": []},
+        "inject": {"context_pack": rid, "prerun_calcs": [], "exemplar": ""},
+        "budget_tokens": 250,
+        "cooldown_turns": 8,
+    }
+    try:
+        out = tr.save_trigger(trigger)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"rule_create failed: {exc}", "hint": ""}
+    if not out.get("ok"):
+        return out
+    return {
+        "ok": True,
+        "id": rid,
+        "enabled": True,
+        "keyword": spec["keyword"],
+        "purpose": spec["purpose"],
+        "pack": rid,
+        "source": out.get("source", "user"),
+    }
+
+
+
 TRIGGERS_METHODS: dict[str, Callable] = {
     "triggers_list": _triggers_list,
     "triggers_get": _triggers_get,
@@ -640,6 +731,7 @@ TRIGGERS_METHODS: dict[str, Callable] = {
     "packs_get": _packs_get,
     "packs_save": _packs_save,
     "packs_delete": _packs_delete,
+    "rule_create": _rule_create,
 }
 
 

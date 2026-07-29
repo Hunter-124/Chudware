@@ -42,6 +42,10 @@ SCOPING (the "limited cases" the base tooling is deliberately narrowed for):
     stays inside the project it was asked to work in, not the whole filesystem.
     ``CHUDWARE_FS_ALLOW_OUTSIDE_ROOT=1`` is the explicit escape hatch for a legitimate
     cross-root need (e.g. importing a downloaded part from ~/Downloads).
+  * A write refused because it lands inside a FIRMWARE project (fw_new_project scaffolds
+    under firmware_root(), which is never inside a workspace) is still refused — the jail
+    does not widen — but the envelope is ``use_fw_sources`` and names
+    ``fw_sources(project_id, write={...})``, the tool that can author those sources.
   * Read tools (fs_read/fs_list/fs_glob/fs_grep) are never root-jailed — only the
     credential-directory block applies — since browsing/reading elsewhere on disk is the
     normal "look things up like an engineer would" case and carries far less risk than a
@@ -92,6 +96,31 @@ def _workspace_root() -> Optional[Path]:
     return Path(raw).expanduser().resolve(strict=False)
 
 
+def _firmware_project_redirect(raw_path: str) -> Optional[str]:
+    """Hint text when *raw_path* lands inside a firmware project root this process knows
+    about, else None.
+
+    A firmware project (fw_new_project) is scaffolded under firmware_root(), which is
+    outside any CHUDWARE_FS_ROOT workspace — so authoring its sources through fs_write is
+    refused. That refusal used to be a DEAD END: the agent was told "outside the active
+    project root" and nothing more, so it wrote the .c files into the workspace instead,
+    where the firmware build never sees them. The jail stays exactly as tight; the message
+    now names the tool that does work.
+    """
+    try:
+        from services.mcp.firmware_tools import project_for_path  # noqa: PLC0415 — avoid import cycle
+    except Exception:  # noqa: BLE001
+        return None
+    hit = project_for_path(raw_path)
+    if hit is None:
+        return None
+    pid, _root, rel = hit
+    target = rel or "src/main.c"
+    return (f'{raw_path} is inside firmware project {pid} — fs_write cannot reach it, but '
+            f'fw_sources(project_id="{pid}", write={{"{target}": "<file content>"}}) '
+            "writes it AND registers it so the next fw_build compiles it")
+
+
 def _root_block(raw_path: str) -> Optional[dict]:
     """Refuse if *raw_path* falls outside the active CHUDWARE_FS_ROOT jail. Only called
     from write-class tools (fs_write/fs_edit/run_shell's cwd) — see module docstring."""
@@ -106,6 +135,9 @@ def _root_block(raw_path: str) -> Optional[dict]:
         return None
     if resolved == root or root in resolved.parents:
         return None
+    firmware = _firmware_project_redirect(raw_path)
+    if firmware:
+        return _err("use_fw_sources", firmware)
     return _err("outside_workspace_root",
                 f"{raw_path} resolves outside the active project root ({root}); set "
                 "CHUDWARE_FS_ALLOW_OUTSIDE_ROOT=1 if this write is deliberately cross-root")

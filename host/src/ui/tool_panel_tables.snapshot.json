@@ -43,13 +43,16 @@
    "add_gdt",
    "add_section_view",
    "add_surface_finish",
+   "analyze_stl_geometry",
    "asm_add_component",
    "asm_mate",
    "assembly_plan_review",
+   "assess_mesh_quality",
    "cad_graph",
    "cad_graph_link",
    "cad_guide",
    "check_feature_overlap",
+   "check_geometry_health",
    "check_interference",
    "check_metadata",
    "check_sketch",
@@ -58,6 +61,7 @@
    "close_part",
    "code_check",
    "contact_sheet",
+   "design_audit",
    "design_review",
    "doc_diff_tool",
    "doc_sketch_contact_sheet",
@@ -68,11 +72,13 @@
    "export_part",
    "get_job",
    "get_part",
+   "health_check",
    "import_part",
    "inspect_feature",
    "inspect_part",
    "inspect_section",
    "interface_check",
+   "is_watertight",
    "layout_plan",
    "layout_plan_report",
    "list_artifacts",
@@ -189,11 +195,14 @@
    "ecad_find_part",
    "ecad_fpga_check",
    "ecad_label",
+   "ecad_lint_schematic",
    "ecad_make_board",
+   "ecad_make_part",
    "ecad_new_pcb",
    "ecad_new_schematic",
    "ecad_optimize_traces",
    "ecad_place_symbol",
+   "ecad_route_pad_to_pad",
    "ecad_run_dfm",
    "ecad_run_drc",
    "ecad_run_erc",
@@ -455,6 +464,11 @@
    "run_fea_modal",
    "run_fea_static",
    "run_fea_thermal",
+   "sim_cancel",
+   "sim_jobs",
+   "sim_results",
+   "sim_run",
+   "sim_status",
    "simulate_motion",
    "struct_analyze",
    "struct_check",
@@ -477,7 +491,7 @@
   "add_configuration": "Add a new configuration (a named parametric variant) to the current part.",
   "add_datum": "Add a datum feature symbol (triangle + boxed letter). doc_id = drawing_doc_id. label is the datum letter (\"A\"); a is the feature point, pos …",
   "add_detail_view": "Add a magnified DETAIL view of a circular region of a parent view. doc_id = drawing_doc_id. cx,cy,radius are in the parent view's sheet …",
-  "add_dimension": "Add a dimension to a view. doc_id = drawing_doc_id. a,b are sheet-mm points (snap to projected vertices you read from review_drawing). …",
+  "add_dimension": "Add a dimension to a view. doc_id = drawing_doc_id.",
   "add_drawing_view": "Add ONE projected view to a drawing. doc_id = the drawing_doc_id.",
   "add_features": "Apply a list of document ops to build/edit the part (the core modeling tool).",
   "add_gdt": "Add an ASME Y14.5 feature control frame. doc_id = drawing_doc_id.",
@@ -528,6 +542,7 @@
   "cam_update_operation": "Update fields on an existing operation (merge). e.g. {\"stepover\":2,\"feed\":900}.",
   "channel_send": "Send a message on a channel between departments.",
   "check_feature_overlap": "Intra-PART feature-vs-feature overlap — do two of THIS part's own features collide?",
+  "check_geometry_health": "Is this solid actually SOUND? Watertight / closed-manifold verdict + the counts that prove it.",
   "check_interference": "Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?",
   "check_metadata": "Return the full verify-battery check registry: names, cost class, platform, reward shape.",
   "check_sketch": "Check whether a sketch is well-constrained (fully defined) and report what's missing.",
@@ -577,11 +592,14 @@
   "ecad_find_part": "Search the component library and return RANKED real parts so you place an actual part instead of inventing a libid.",
   "ecad_fpga_check": "Bank-aware FPGA design checks on the active schematic (T-FIN11).",
   "ecad_label": "Place a net label ``text`` at ``(x, y)``. Two labels of the same text+scope on a sheet merge their nets; ``scope='global'`` merges across …",
+  "ecad_lint_schematic": "GEOMETRIC self-check of the active schematic — run this BEFORE ecad_run_erc.",
   "ecad_make_board": "ONE-SHOT board flow: from the active schematic, run sync -> autoroute -> fill zones -> DRC and report every step's outcome, remaining …",
+  "ecad_make_part": "CREATE a real library part — symbol + footprint — from a pinout YOU supply.",
   "ecad_new_pcb": "Start a NEW PCB (board) document and make it the active one.",
   "ecad_new_schematic": "Start a NEW schematic document and make it the active one.",
   "ecad_optimize_traces": "Post-route polish on the active board (E2): round ~90° corners to arcs, add teardrops at pad/via junctions, and retune track widths toward …",
   "ecad_place_symbol": "Place a symbol on the active schematic and return its assigned REF plus its full PIN LIST (name/number/type/world-xy) and the count of pins …",
+  "ecad_route_pad_to_pad": "Route ONE copper trace between two pads by hand — the surgical complement to ecad_autoroute, and the tool autoroute's \"failed net\" report …",
   "ecad_run_dfm": "Run the Design-For-Manufacturing (DFM) check suite on the active board and return a readable summary grouped by rule (counts + worst …",
   "ecad_run_drc": "Run the Design Rule Check on the active board and return a summary with the worst offenders (clearance, track width, via size, annular …",
   "ecad_run_erc": "Run the Electrical Rules Check on the active schematic and return the violations as readable lines plus a one-line verdict ('N errors, M …",
@@ -641,7 +659,7 @@
   "fw_serial_read": "Non-blocking read of up to ``max_bytes`` currently buffered on an open serial handle (immediate return, no wait — poll this repeatedly for …",
   "fw_serial_write": "Write to an open serial handle. Pass ``data_hex`` (hex-encoded raw bytes) for binary payloads, or ``text`` for a plain string (e.g. typing …",
   "fw_sim_run": "Run the firmware emulation loop via Renode or QEMU and return SimResult.",
-  "fw_sources": "List the project's source files, or add/remove them (paths relative to the project root). Adding a new path creates an empty stub so the …",
+  "fw_sources": "List, add/remove, or WRITE the project's source files (paths relative to the project root). Returns ``{src_paths}`` plus ``{written …",
   "fw_status": "Firmware provisioning doctor (T-FIN4) — call FIRST before any fw_* work.",
   "fw_verify_board": "Firmware↔board co-verification (T-FIN6): check the firmware BACK against the PCB before fab and return ERC/DRC-shaped findings.",
   "gear_check": "AGMA spur-gear tooth bending and contact (pitting) stress check.",
@@ -794,7 +812,7 @@
   "research_material_lookup": "Look up material properties (yield/ultimate/modulus/density/...) with provenance.",
   "research_standard_section": "Structural section properties: AISC W-shapes (`W8x31`) and ASME B36.10M pipe (`pipe 2 sch 40`). Returns area / moment of inertia / section …",
   "research_thread_spec": "Screw-thread dimensions COMPUTED from ISO 724 / ASME B1.1 (never fetched).",
-  "research_unit_convert": "Convert a value to its canonical SI unit deterministically (code converts, not the model — the ksi/MPa 6.9x error). `family` is `length` …",
+  "research_unit_convert": "Convert units deterministically — code converts, not the model (the ksi/MPa 6.9x error). Reach for this INSTEAD of doing the arithmetic in …",
   "research_web_search": "Search the web for up-to-date facts instead of recalling from memory.",
   "resolve_process": "Decide the manufacturing process from the request (FDM 3D-printing is the default).",
   "reveng_add_images": "Add still images to *session_id* for photogrammetry / multi-view reconstruction.",
@@ -841,6 +859,11 @@
   "set_titleblock": "Fill the drawing's title block. doc_id = drawing_doc_id. fields is a dict of any of: title, drawn_by, date, material, finish, scale, rev …",
   "set_view": "Move and/or rescale a view. doc_id = drawing_doc_id. x,y reposition the view on the sheet (mm); scale sets the view scale (1.0 = 1:1, 0.5 = …",
   "show_in_app": "Push the current part to the OPEN Chudware desktop app's 3D viewport so the user can see it.",
+  "sim_cancel": "Terminate a sim_run job's solver process (SIGTERM, then SIGKILL) and prove it died.",
+  "sim_jobs": "List recent sim_run jobs (newest first) with their reconciled state and elapsed time. Jobs persist across agent turns, so this also shows …",
+  "sim_results": "Collect a sim_run job's results.",
+  "sim_run": "Start an FEA solve in a SEPARATE PROCESS and return a job_id immediately.",
+  "sim_status": "State of a sim_run job: queued|running|done|failed|cancelled, elapsed, progress.",
   "simulate_motion": "Kinematic motion study: DRIVE one mate over a range, re-solve the mechanism each step, return the trajectory (every body's pose per step) + …",
   "sketch3d_add_constraints": "Add constraints to a sketch3d and return the narrated solve results.",
   "sketch3d_add_curves": "Append curve entities to a sketch3d feature (edit_feature) and report the solve.",
@@ -922,6 +945,9 @@
   "advisory_dispute": {
    "prompt_note": "Contest only with concrete evidence; kernel-sourced disputes return waiver_required=true — a human must confirm the waiver."
   },
+  "analyze_stl_geometry": {
+   "prompt_note": "Alias of check_geometry_health. Takes doc_id, not a file path — import_part the mesh first, then call this on the document."
+  },
   "apply_ascii_edits": {
    "prompt_note": "Preview with dry_run=True; pass grid_json + index_json from the last render_*_ascii reply so cell coords resolve against that raster, not a re-render."
   },
@@ -936,6 +962,9 @@
   },
   "assembly_plan_review": {
    "prompt_note": "Run at PLANNING time, before a large build — it advises subassembly grouping; deep products should be mated subassemblies, not one giant file."
+  },
+  "assess_mesh_quality": {
+   "prompt_note": "Alias of check_geometry_health. We are a B-rep kernel, so this reports SOLID topology health, not triangle quality."
   },
   "bearing_life": {
    "prompt_note": "Standalone hand-calc — no document needed. Set X/Y when Fa matters (defaults zero the axial term); C must come from a datasheet."
@@ -1056,6 +1085,9 @@
   "check_feature_overlap": {
    "prompt_note": "add_features already runs this per batch (overlap_warnings) — call to re-scan the whole tree or a features=[...] subset; bodies → check_interference."
   },
+  "check_geometry_health": {
+   "prompt_note": "Is this solid actually sound? Reports watertight/manifold plus the COUNTS AND SIDS that justify it (free edges, non-manifold edges, shells, solids, sliver faces, orientation). Run it before an expensive FEA mesh, a CAM toolpath or a STEP/STL export. `self_intersection` is always checked:false — the kernel has no single-body test; use interference_check instead. `volume_mm3` is null for a body with no solid. repair/fill_holes/fix_normals/fix_winding are REFUSED: fix the feature that made the bad body, using the sids it just listed."
+  },
   "check_interference": {
    "prompt_note": "Needs 2+ bodies — solve_mates first on an assembly so placements are real; overlap INSIDE one part's features → check_feature_overlap."
   },
@@ -1146,6 +1178,9 @@
   "describe_toolpaths": {
    "prompt_note": "Needs an active CAM job with results — cam_generate + cam_simulate first; audit=False skips the cam_audit summary for a shorter read."
   },
+  "design_audit": {
+   "prompt_note": "Alias of check_geometry_health — solid soundness only. It does NOT check DFM, tolerances or drawings; those are dfm_check, tolerance_stackup and review_drawing."
+  },
   "design_recipe": {
    "prompt_note": "Empty query lists the recipe catalog; a natural-language query returns ordered steps with params and verify hints."
   },
@@ -1214,9 +1249,15 @@
   "ecad_label": {
    "prompt_note": "Same text+scope merges nets — the clean wire-free connect across a sheet (scope='global' crosses sheets). Names feed ERC, netlist, and SPICE probes."
   },
+  "ecad_lint_schematic": {
+   "prompt_note": "Geometry self-check BEFORE ecad_run_erc, which only catches electrical faults: symbol-body overlap, dangling wire ends, wires crossing a body, labels attached to nothing. Names the offending refdes/coordinates/label text. Power rails with no drawn body are skipped and listed, not guessed."
+  },
   "ecad_make_board": {
    "prompt_note": "One-shot sync->route->fill->DRC from the active schematic (pass doc_id when several are open); hostcheck=True folds in the MCU rule pack.",
    "timeout_s": 300
+  },
+  "ecad_make_part": {
+   "prompt_note": "Creates a real symbol+footprint from a pinout YOU supply — this is what ecad_find_part routes to when it refuses to substitute a >3-pin part. Requires name + pins (each {number,name,type,side}) + package (chip/soic/qfn/qfp/sot/dip/header/module_castellated) with its pitch/body dims. It will NOT invent a pinout from a part name: no pins means refusal. Pin type must be the exact KiCad enum — 'power'/'vcc'/'gnd' are refused as ambiguous, use power_in or power_out. Then ecad_place_symbol by the returned libid."
   },
   "ecad_new_pcb": {
    "prompt_note": "Manual board path: new PCB -> footprints (fpids via ecad_find_part) -> route -> ecad_run_drc. For a schematic-driven board use board_from_schematic instead."
@@ -1230,6 +1271,9 @@
   },
   "ecad_place_symbol": {
    "prompt_note": "libid must come from ecad_find_part. Set value now ('1k', '5') for simulation, and keep the returned pin xy list — ecad_wire needs it."
+  },
+  "ecad_route_pad_to_pad": {
+   "prompt_note": "Hand-routes the nets ecad_autoroute reported as failed. Needs from_ref/from_pad/to_ref/to_pad. The net is READ off the pads — pads on different nets are refused, never shorted. Width comes from the ecad_stackup_solve net class unless you pass width. Set to_layer to change layer and it inserts a via. Real tracks, so ecad_run_drc sees them."
   },
   "ecad_run_dfm": {
    "prompt_note": "Fab-readiness pass once DRC is clean; fix courtyard_overlap first, then drill_min. Advisory — warnings never block editing."
@@ -1360,78 +1404,91 @@
    "prompt_note": "Full overwrite, no append — never use it to patch an existing file; that is fs_edit's job. Parent dirs are created for you."
   },
   "fw_avr_flash": {
-   "prompt_note": "avrdude path for AVR (programmer='arduino' pairs with the arduino-cli build); leave port empty for USB HID programmers like usbasp. Needs live hardware."
+   "prompt_note": "Flash an AVR target with avrdude — requires hex_path and mcu (programmer='arduino' pairs with the arduino-cli build; leave port empty for USB HID programmers like usbasp). Needs avrdude plus live hardware; without either, fw_emulate_simavr is the honest path.",
+   "timeout_s": 120
   },
   "fw_build": {
-   "prompt_note": "Missing toolchain returns success=false, not an error — surface the install hint. fw_status first shows what this box can build.",
-   "timeout_s": 180
+   "prompt_note": "Cross-compile the project to an ELF — requires project_id from fw_new_project; a missing toolchain returns success=false returncode=-1, not an error, so surface the install hint instead of retrying. Then fw_sim_run with the returned elf_path.",
+   "timeout_s": 300
   },
   "fw_debug_gdb_halt": {
-   "prompt_note": "OpenOCD/gdb fallback for chips probe-rs lacks; prefer fw_debug_halt when probe-rs covers the target. Needs a live SWD/JTAG probe."
+   "prompt_note": "Halt an ARM target through OpenOCD + gdb/MI — requires openocd_cfg; prefer fw_debug_halt when probe-rs covers the chip. Needs openocd and arm-none-eabi-gdb on PATH plus a live SWD/JTAG probe; then fw_debug_gdb_read_mem or fw_debug_gdb_step.",
+   "timeout_s": 120
   },
   "fw_debug_gdb_read_mem": {
-   "prompt_note": "Returns the raw MI record, NOT decoded hex — prefer fw_debug_read_mem (probe-rs) for a clean data_hex. Target must be halted first."
+   "prompt_note": "Read target memory over OpenOCD + gdb/MI — requires openocd_cfg, address and length, and a halted target (fw_debug_gdb_halt first); output is the raw MI record, NOT decoded hex, so prefer fw_debug_read_mem when probe-rs supports the chip.",
+   "timeout_s": 120
   },
   "fw_debug_gdb_reset": {
-   "prompt_note": "Fallback debug path for chips outside probe-rs's registry. Each call is a fresh attach/detach — breakpoints don't reliably persist between calls."
+   "prompt_note": "Reset an ARM target via a fresh OpenOCD + gdb/MI session — requires openocd_cfg (halt=True stops at reset). Fallback for chips outside probe-rs's registry; each call re-attaches, so breakpoints do not reliably persist. Needs openocd plus a live probe.",
+   "timeout_s": 120
   },
   "fw_debug_gdb_set_breakpoint": {
-   "prompt_note": "Raw addresses only ('0x8000100') — no symbol table is loaded, so 'main' won't resolve. May not survive the next gdb call's fresh attach."
+   "prompt_note": "Insert a breakpoint over OpenOCD + gdb/MI — requires openocd_cfg and address, raw addresses only ('0x8000100') because no symbol table is loaded, so 'main' will not resolve. May not survive the next call's fresh attach; continue with fw_debug_gdb_step.",
+   "timeout_s": 120
   },
   "fw_debug_gdb_step": {
-   "prompt_note": "Halt first (fw_debug_gdb_halt or a breakpoint hit); step_over=True steps over calls. Output is the raw *stopped MI record."
+   "prompt_note": "Single-instruction step an ARM target — requires openocd_cfg and a halted target (fw_debug_gdb_halt or a breakpoint hit first); step_over=True steps over calls. Inspect with fw_debug_gdb_read_mem.",
+   "timeout_s": 120
   },
   "fw_debug_halt": {
-   "prompt_note": "probe-rs path: halt here, then inspect with fw_debug_read_mem; fw_debug_start resumes. Needs a live DAP probe."
+   "prompt_note": "Reset-and-halt a target via probe-rs — requires chip (the probe-rs chip id); needs probe-rs on PATH plus a live DAP probe. Inspect with fw_debug_read_mem, resume with fw_debug_start.",
+   "timeout_s": 120
   },
   "fw_debug_read_mem": {
-   "prompt_note": "Call fw_debug_halt first. Decoded data_hex, unlike the gdb variant's raw MI record; addresses accept hex or decimal."
+   "prompt_note": "Read target memory via probe-rs — requires chip, address and length, and a halted target (fw_debug_halt first); returns decoded data_hex, unlike the gdb variant's raw MI record. Needs probe-rs plus a live probe.",
+   "timeout_s": 120
   },
   "fw_debug_start": {
-   "prompt_note": "Resume a halted target (probe-rs reset, no halt) after inspection; counterpart to fw_debug_halt. Needs a live DAP probe."
+   "prompt_note": "Reset and run a target via probe-rs — requires chip; the counterpart that resumes after fw_debug_halt/fw_debug_read_mem inspection. Needs probe-rs plus a live DAP probe.",
+   "timeout_s": 120
   },
   "fw_emulate_renode": {
-   "prompt_note": "Runs an EXISTING .resc (fw_sim_run generates them; hand-author for what it can't cover). The scheduled stop after run_s reports success=True."
-  },
-  "fw_emulate_simavr": {
-   "prompt_note": "The universal AVR debug path — modern UPDI debug has no open GDB exposure; gdb=True drives avr-gdb via mi_commands. Needs simavr on PATH."
-  },
-  "fw_flash": {
-   "prompt_note": "probe-rs for .elf, esptool for ESP32 .bin over serial (port= selects it); chip is the probe-rs id. Missing tools return success=false, not errors."
-  },
-  "fw_new_project": {
-   "prompt_note": "Pass board_doc_ref to link a PCB: MCU family auto-picked from the BOM and pinmap.h generated — the firmware<->board contract fw_verify_board checks."
-  },
-  "fw_power_profile": {
-   "prompt_note": "Post-processes an existing fw_sim_run trace — no live emulation. Emits per-rail schedules that feed run_fea_thermal transients and power_budget."
-  },
-  "fw_sensor_scenario": {
-   "prompt_note": "Build-only, no Renode needed: turns a flight/CFD profile into sensor stimulus; pass the returned scenario object to fw_sim_run(scenario=...)."
-  },
-  "fw_serial_close": {
-   "prompt_note": "Release handles when done; an already-closed/unknown handle returns success=false, not an error."
-  },
-  "fw_serial_open": {
-   "prompt_note": "Raw 8N1 byte pipe to a live device (no protocol); handle is process-local — it dies with the host process. Emulator UART: fw_sim_run instead."
-  },
-  "fw_serial_read": {
-   "prompt_note": "Non-blocking poll — empty data_hex means nothing buffered, not an error; decode the hex client-side."
-  },
-  "fw_serial_write": {
-   "prompt_note": "data_hex for binary payloads, text for console typing; data_hex wins when both are given."
-  },
-  "fw_sim_run": {
-   "prompt_note": "Run fw_build first for the ELF. Scenarios/assertions run on Renode only; ESP32 is build+flash. Platform gaps refuse honestly — see fw_status platforms.",
+   "prompt_note": "Run an EXISTING Renode script — requires resc_path (fw_sim_run generates .resc files; hand-author only for what it cannot cover); the scheduled stop after run_s reports success=True. Needs renode on PATH; for a project-driven run use fw_sim_run instead.",
    "timeout_s": 180
   },
+  "fw_emulate_simavr": {
+   "prompt_note": "Emulate or debug an AVR ELF with simavr — requires elf_path and mcu; gdb=True drives avr-gdb through mi_commands (the universal AVR debug path, since modern UPDI debug has no open GDB exposure). Needs simavr on PATH; real silicon is fw_avr_flash.",
+   "timeout_s": 180
+  },
+  "fw_flash": {
+   "prompt_note": "Flash a built image to real hardware — requires elf_path (probe-rs for an .elf with chip, esptool for an ESP32 .bin when port is given); missing tools return success=false, not errors. Needs probe-rs or esptool plus a connected board; prove the firmware with fw_sim_run first.",
+   "timeout_s": 180
+  },
+  "fw_new_project": {
+   "prompt_note": "Scaffold the firmware project once and keep its project_id — pass name and mcu_family (toolchain defaults to 'cmake'), plus board_doc_ref to link a PCB so mcu_family comes from the BOM and a pinmap.h of PIN_<NET> defines is generated; it returns root_dir, which is OUTSIDE the fs jail. Then author code with fw_sources(write={...}), never fs_write."
+  },
+  "fw_power_profile": {
+   "prompt_note": "Derive an aicad.powerprofile/1 duty-cycle current profile from an EXISTING trace — requires trace_path (the <elf>.trace.json fw_sim_run returned); no live emulation. Bookkeeping, not SPICE; its per-rail schedules feed power_budget and run_fea_thermal transients."
+  },
+  "fw_sensor_scenario": {
+   "prompt_note": "Turn a flight/CFD/kinematic profile into emulated sensor stimulus — pass profile (a JSON object string with t_s plus the physical series) and sensor_map [{device, address}]; pure Python, no Renode needed. Feed the returned scenario to fw_sim_run(scenario=...)."
+  },
+  "fw_serial_close": {
+   "prompt_note": "Release a live serial handle — requires handle from fw_serial_open; an already-closed or unknown handle returns success=false, not an error. Last step of the fw_serial_* monitor loop."
+  },
+  "fw_serial_open": {
+   "prompt_note": "Open a raw 8N1 byte pipe to a PHYSICAL device — requires port (baud defaults to 115200); the returned handle is process-local and dies with the host. Then fw_serial_read / fw_serial_write, and always fw_serial_close. Emulator UART is fw_sim_run instead."
+  },
+  "fw_serial_read": {
+   "prompt_note": "Non-blocking poll of a live serial handle — requires handle from fw_serial_open; empty data_hex means nothing buffered, not an error, so poll repeatedly and decode the hex yourself. Close with fw_serial_close."
+  },
+  "fw_serial_write": {
+   "prompt_note": "Write to a live serial handle — requires handle plus either data_hex (raw bytes) or text (console typing); data_hex wins when both are given. Read the reply with fw_serial_read."
+  },
+  "fw_sim_run": {
+   "prompt_note": "Emulate the built firmware and check assertions — requires project_id (plus elf_path/scenario/assertions; run_s is how long the TARGET runs, a floor not a cap, and a longer scenario timeline still extends it, while timeout_s is the wall-clock budget and wins outright; power_profile=True folds in fw_power_profile) and a successful fw_build first; scenarios and gpio assertions are Renode-only, ESP32 is build+flash. An absent emulator is an honest SKIP in uart_log, never a FAIL to invent around; then fw_power_profile on the returned trace_path.",
+   "timeout_s": 300
+  },
   "fw_sources": {
-   "prompt_note": "Paths are relative to the project root; adding a path creates an empty stub so the next fw_build picks it up."
+   "prompt_note": "The ONLY way to get firmware code on disk — requires project_id, and author with write={'src/main.c': '<code>'} (never fs_write: the project root is outside the fs jail and fs_write refuses it). write also appends compilable paths to the CMakeLists add_executable() so fw_build compiles them; bare add=['src/x.c'] only stubs an EMPTY file. Use PIN_<NET> constants from pinmap.h, never raw pin numbers. Then fw_build."
   },
   "fw_status": {
-   "prompt_note": "Call FIRST before any fw_* work — per-family can_build/can_emulate/can_flash with install hints. Never fails; offline-safe."
+   "prompt_note": "Firmware provisioning doctor — needs no arguments (a project_id is accepted and ignored) and never fails, offline-safe; read families.*.can_build/can_emulate/can_flash and the install banners before anything else. Call FIRST, then fw_new_project."
   },
   "fw_verify_board": {
-   "prompt_note": "Pre-fab firmware<->board check; pin refs come from project sources (project_id). Pass sch_doc_ref for drive-clash checks, trace_path/emulate for dynamic."
+   "prompt_note": "Pre-fab firmware<->board co-verification — requires board_doc_ref (pass project_id so pin refs come from the sources, sch_doc_ref for drive-clash checks, trace_path or emulate=True for the dynamic pass). Advisory ERC-shaped findings; run after fw_build/fw_sim_run.",
+   "timeout_s": 300
   },
   "gear_check": {
    "prompt_note": "SF fields stay null until you pass the allowable stresses — supply S_t/S_c for a pass/fail read; take J/I from AGMA 908 charts."
@@ -1451,6 +1508,9 @@
   },
   "get_reveng_session": {
    "prompt_note": "The polling read while a mission runs — session.run mirrors run progress. Find ids with list_reveng_sessions first."
+  },
+  "health_check": {
+   "prompt_note": "Alias of check_geometry_health for one body. For the whole-part review battery call design_review; for sketch state, sketch_health."
   },
   "heatsink_select": {
    "prompt_note": "Run ecad_thermal_handoff FIRST — this re-solves on its cached mesh, one solve per candidate. Impossible targets name the best achievable, never fake a win.",
@@ -1513,6 +1573,9 @@
   },
   "interface_check": {
    "prompt_note": "Catches hole-pattern/coaxiality misalignment that passes check_interference — solve_mates first, run BOTH; fastener='M6' adds a pass-through check."
+  },
+  "is_watertight": {
+   "prompt_note": "Alias of check_geometry_health (same tool, trimesh's name). Returns the full report, not a bare bool — read `watertight` plus free_edges/non_manifold_edges for why."
   },
   "layout_plan": {
    "prompt_note": "Intake-time, BEFORE add_features — records envelope/critical dims/interfaces as requirements so the layout_coverage gate can check them at sign-off."
@@ -1982,7 +2045,7 @@
    "prompt_note": "The trustworthy absolute Cd/Cl path — needs OpenFOAM and takes minutes. Always returns a job_id immediately; poll get_job. Start preset='coarse'."
   },
   "run_cfd_flow": {
-   "prompt_note": "Directional LBM for A-vs-B trends, not certified Cd (use run_cfd_accurate). Check min_feature_voxels >= ~8; background=True for cells>=120.",
+   "prompt_note": "Directional LBM for A-vs-B trends, not certified Cd (use run_cfd_accurate). No material= argument — the medium is fluid='air'|'water'. Check min_feature_voxels >= ~8; background=True for cells>=120.",
    "timeout_s": 300
   },
   "run_fea_buckling": {
@@ -2002,11 +2065,11 @@
    "timeout_s": 300
   },
   "run_fea_modal": {
-   "prompt_note": "Fix the part like it is mounted — an unconstrained part returns rigid-body modes near 0 Hz. Density drives the frequencies.",
+   "prompt_note": "Fix the part like it is mounted — an unconstrained part returns rigid-body modes near 0 Hz. Density drives the frequencies, and it comes from material= (registry name or dict), not from set_material.",
    "timeout_s": 300
   },
   "run_fea_static": {
-   "prompt_note": "Workhorse stress check; query_geometry first to confirm fixture/load faces resolve. min_fos>1 holds; background=True for fine meshes.",
+   "prompt_note": "Workhorse stress check; query_geometry first to confirm fixture/load faces resolve. Material properties enter HERE and only here: material='aluminum' (registry name) or material={'E_mpa':70000,'nu':0.33,'density_g_cm3':2.7,'yield_mpa':250}; set_material sets appearance only. min_fos>1 holds; background=True for fine meshes.",
    "timeout_s": 300
   },
   "run_fea_thermal": {
@@ -2047,7 +2110,7 @@
    "prompt_note": "Per-variant feature on/off without forking the tree; activate_configuration + render_part to confirm the variant looks right."
   },
   "set_material": {
-   "prompt_note": "VISUAL appearance only (render colour/finish) — simulation density/stiffness goes to run_fea_static / run_cfd_flow's material= instead."
+   "prompt_note": "VISUAL appearance only — set_material(material='steel' | {'color':[r,g,b],'metallic':...,'roughness':...}, body='b1'|None, doc_id=None) sets render colour/finish and NOTHING else. There is no ops=[...] form. Simulation density/stiffness goes to run_fea_static / run_fea_modal's material= instead (a registry name or an E_mpa/nu dict); run_cfd_flow takes fluid='air'|'water' and has no material argument."
   },
   "set_process": {
    "prompt_note": "Call once the process is known (FDM default) — its clearance/wall/thread numbers drive later fit-budgeted dims and dfm_check."
@@ -2060,6 +2123,21 @@
   },
   "show_in_app": {
    "prompt_note": "Force-push the doc to the open desktop viewport; modeling tools already do this per change — a silent no-op when the app isn't running."
+  },
+  "sim_cancel": {
+   "prompt_note": "job_id from sim_run. Really terminates the solver process, not a flag flip; sim_status then reports cancelled. The last partial snapshot survives, so sim_results(partial=True) may still have something."
+  },
+  "sim_jobs": {
+   "prompt_note": "Lists recent background solves with their state — use it to recover a job_id from an earlier turn before assuming a solve was lost."
+  },
+  "sim_results": {
+   "prompt_note": "job_id from sim_run, after sim_status says done. partial=True returns whatever converged so far, clearly labelled — never quote a partial as a converged answer. partial=False on an unfinished job is refused rather than returning half a result."
+  },
+  "sim_run": {
+   "prompt_note": "Starts a CANCELLABLE background solve and returns a job_id immediately — use it instead of blocking when a solve may run minutes. analysis is 'fea_static' or 'fea_modal' ONLY; anything else is refused by name. Needs the same fixtures/loads as run_fea_static. Then: sim_status(job_id) until done, sim_results(job_id). Jobs persist, so a later turn can collect one."
+  },
+  "sim_status": {
+   "prompt_note": "job_id from sim_run. Reports queued/running/done/failed/cancelled and is reconciled against the OS — it never says running for a dead worker. Poll this before sim_results; call sim_jobs() if you lost the id."
   },
   "simulate_motion": {
    "prompt_note": "Drive an angle/distance mate (revolute/concentric have no value to sweep). Per-step interference dominates runtime — False for a fast pass.",

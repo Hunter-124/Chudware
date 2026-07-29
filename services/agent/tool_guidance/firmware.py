@@ -148,7 +148,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Scaffold the firmware project once and keep its project_id — pass "
             "name and mcu_family (toolchain defaults to 'cmake'), plus "
             "board_doc_ref to link a PCB so mcu_family comes from the BOM and a "
-            "pinmap.h of PIN_<NET> defines is generated. Then fw_sources."
+            "pinmap.h of PIN_<NET> defines is generated; it returns root_dir, "
+            "which is OUTSIDE the fs jail. Then author code with fw_sources("
+            "write={...}), never fs_write."
         ),
     },
     "fw_power_profile": {
@@ -200,7 +202,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "fw_sim_run": {
         "prompt_note": (
             "Emulate the built firmware and check assertions — requires project_id "
-            "(plus elf_path/scenario/assertions as needed) and a successful "
+            "(plus elf_path/scenario/assertions; run_s is how long the TARGET runs, "
+            "a floor not a cap, and a longer scenario timeline still extends it, "
+            "while timeout_s is the wall-clock budget and wins outright; "
+            "power_profile=True folds in fw_power_profile) and a successful "
             "fw_build first; scenarios and gpio assertions are Renode-only, ESP32 "
             "is build+flash. An absent emulator is an honest SKIP in uart_log, "
             "never a FAIL to invent around; then fw_power_profile on the returned "
@@ -212,18 +217,21 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "fw_sources": {
         "prompt_note": (
-            "List or edit the project's source files — requires project_id, with "
-            "add/remove paths RELATIVE to the project root; adding a path creates "
-            "an empty stub the next build picks up. Write PIN_<NET> constants from "
-            "pinmap.h, never raw pin numbers. Then fw_build."
+            "The ONLY way to get firmware code on disk — requires project_id, and "
+            "author with write={'src/main.c': '<code>'} (never fs_write: the "
+            "project root is outside the fs jail and fs_write refuses it). write "
+            "also appends compilable paths to the CMakeLists add_executable() so "
+            "fw_build compiles them; bare add=['src/x.c'] only stubs an EMPTY "
+            "file. Use PIN_<NET> constants from pinmap.h, never raw pin numbers. "
+            "Then fw_build."
         ),
     },
     "fw_status": {
         "prompt_note": (
-            "Firmware provisioning doctor — takes no arguments and never fails "
-            "(offline-safe); read families.*.can_build/can_emulate/can_flash and "
-            "the install banners before anything else. Call FIRST, then "
-            "fw_new_project."
+            "Firmware provisioning doctor — needs no arguments (a project_id is "
+            "accepted and ignored) and never fails, offline-safe; read "
+            "families.*.can_build/can_emulate/can_flash and the install banners "
+            "before anything else. Call FIRST, then fw_new_project."
         ),
     },
     "fw_verify_board": {

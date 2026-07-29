@@ -663,12 +663,18 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                                       "ecad_find_part('resistor')"])
 
         # Resolve the configured provider (best-effort; fall back to None -> recipe path).
+        # WHY the model path did not run must never be swallowed: a canned recipe standing in
+        # for model-authored design is only honest if the caller is told it happened AND why.
+        # get_provider() returns None when nothing is configured (e.g. the hermetic test config)
+        # and raises when resolution itself fails — both used to vanish into `pass`.
         provider = None
+        provider_setup_err: Exception | None = None
         try:
             from agent import config as _cfg  # type: ignore
             provider = _cfg.get_provider()
-        except Exception:  # noqa: BLE001 -- offline / unconfigured / module absent
-            pass
+        except Exception as exc:  # noqa: BLE001 -- offline / unconfigured / module absent
+            provider_setup_err = exc
+        provider_absent = provider is None and provider_setup_err is None
 
         # Fast pre-flight: if the provider points at a LOCAL model server that is down (the most
         # common case — LM Studio/llama.cpp not started), a real provider.complete() would burn
@@ -763,6 +769,19 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
 
         design = plan_box.get("design")
         recipe_used = plan_box.get("recipe_used")
+        # plan_design() NEVER returns design=None — it falls back to the closest recipe
+        # internally and reports it via recipe_used. So when a provider DID plan and its
+        # proposal was rejected (unparseable / failed validate_design / provider error), the
+        # only record was plan_box["events"], which this tool used to discard: the caller saw
+        # a bare stop_reason='fallback' with no reason. Carry the planner's own last verdict.
+        plan_rejected: str | None = None
+        if provider is not None and recipe_used and plan_box.get("events"):
+            for _ev in reversed(plan_box["events"]):
+                _detail = (_ev.get("detail") if isinstance(_ev, dict)
+                           else getattr(_ev, "detail", None))
+                if _detail and not str(_detail).startswith("used recipe fallback"):
+                    plan_rejected = str(_detail)
+                    break
         if design is None:
             # Provider path overran, was busy, or errored — plan via the deterministic recipe.
             # This never touches a provider and is instant.
@@ -829,25 +848,52 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             elif sim.get("log"):
                 sim_line = sim["log"][-1] if sim["log"] else ""
 
+        # A fallback is honest only if it can never be read as success. Two rules here:
+        #   1. Say plainly that a CANNED built-in recipe stood in for model-authored design.
+        #   2. Never claim "still verified" when the run did not verify — ERC errors or a
+        #      simulation that missed its target mean this is not a working design.
+        verified_note = ("the schematic is still verified" if ok
+                         else "and the result did NOT verify — see below")
+        recipe_note = ("A CANNED built-in recipe was substituted for model-authored design: "
+                       f"{recipe!r}. " if recipe else "")
+        causes: list[str] = []
+        if sim and not sim.get("pass"):
+            causes.append("the simulation did not meet its target")
+        if erc and erc.get("errors", 0) > 0:
+            causes.append(f"{erc.get('errors')} ERC error(s) remain")
+        verdict = ("" if ok else
+                   " NOT VERIFIED — do not treat this as a working design: "
+                   + ("; ".join(causes) if causes else "the run did not confirm") + ".")
+
         busy_note = (
             "Another ecad_design is already using the model server — used the built-in "
-            "recipe instead (the schematic is still verified). "
+            f"recipe instead ({verified_note}). "
             if provider_busy else "")
         hint = ((f"The configured model server did not plan within {_PLAN_BUDGET_S:.0f}s — used "
-                 "the built-in recipe instead (it is loading/slow; the schematic is still verified). "
+                 f"the built-in recipe instead (it is loading/slow; {verified_note}). "
                  if provider_timed_out else "")
                 + busy_note
                 + ("The configured model server is not reachable — used the built-in recipe "
-                   "instead (the schematic is still verified). "
+                   f"instead ({verified_note}). "
                    if provider_unreachable else "")
+                + ("No model provider is configured, so the model design path never ran — "
+                   "used the built-in recipe instead. "
+                   if provider_absent else "")
+                + (f"The model provider could not be resolved "
+                   f"({type(provider_setup_err).__name__}: {provider_setup_err}) — used the "
+                   "built-in recipe instead. "
+                   if provider_setup_err is not None else "")
                 + (f"Provider plan error ({type(provider_plan_err).__name__}: {provider_plan_err}) "
                    "— used the built-in recipe instead. "
                    if provider_plan_err is not None else "")
+                + (f"The model's own plan was discarded ({plan_rejected}) — used the built-in "
+                   "recipe instead. " if plan_rejected else "")
                 + f"Design '{request}' produced with stop_reason={stop!r}. "
-                + (f"Recipe fallback used: {recipe!r}. " if recipe else "")
+                + recipe_note
                 + (f"ERC: {erc.get('errors', 0)} error(s), "
                    f"{erc.get('warnings', 0)} warning(s). " if erc else "")
                 + (f"Sim: {sim_line}." if sim_line else "")
+                + verdict
                 + (" Use ecad_status() to inspect the schematic."
                    if doc_id else " No document was produced."))
 
@@ -879,6 +925,12 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             "provider_timed_out": bool(provider_timed_out),
             "provider_busy": bool(provider_busy),
             "provider_unreachable": bool(provider_unreachable),
+            # Machine-readable companions to the hint clauses above, so a caller can branch
+            # on WHY the model path was skipped instead of parsing prose.
+            "provider_absent": bool(provider_absent),
+            "provider_setup_error": (None if provider_setup_err is None else
+                                     f"{type(provider_setup_err).__name__}: {provider_setup_err}"),
+            "plan_rejected": plan_rejected,
         })
 
 

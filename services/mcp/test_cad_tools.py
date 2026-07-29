@@ -400,6 +400,68 @@ def test_save_part_native_stepplus_roundtrips():
     os.unlink(r["path"])
 
 
+def test_save_part_replaces_a_cad_extension_instead_of_stacking_one():
+    """save_part("x.step") must write x.step+, never x.step.step+.
+
+    Measured live 2026-07-29 (parts sweep): save_part(path="m4_hex_nut_1.step") wrote
+    m4_hex_nut_1.step.step+ because the tool appended unconditionally. A real user session
+    left a lexus_f_keychain.step.step+ in the repo root the same way. A doubled extension
+    makes one part look like two nested formats in a file browser, and the caller who typed
+    ".step" has no way to predict the name they get back.
+    """
+    import os
+    import tempfile
+
+    doc = _new_plate_with_hole()
+    d = tempfile.mkdtemp()
+
+    for asked, expect in (("bracket.step", "bracket.step+"),
+                          ("bracket.stl", "bracket.step+"),
+                          ("bracket.STEP", "bracket.step+")):
+        r, _ = _call("save_part", {"path": os.path.join(d, asked), "doc_id": doc})
+        assert r["ok"], r
+        assert os.path.basename(r["path"]) == expect, (asked, r["path"])
+        # The substitution is stated, not silent — the caller asked for another format.
+        assert "note" in r and ".step+" in r["note"], r
+        os.unlink(r["path"])
+
+
+def test_save_part_appends_when_there_is_no_cad_extension_to_replace():
+    """A dotted BASE name is not an extension — "v1.2_bracket" must survive intact."""
+    import os
+    import tempfile
+
+    doc = _new_plate_with_hole()
+    d = tempfile.mkdtemp()
+
+    for asked, expect in (("bracket", "bracket.step+"),
+                          ("v1.2_bracket", "v1.2_bracket.step+"),
+                          ("bracket.step+", "bracket.step+")):
+        r, _ = _call("save_part", {"path": os.path.join(d, asked), "doc_id": doc})
+        assert r["ok"], r
+        assert os.path.basename(r["path"]) == expect, (asked, r["path"])
+        # Nothing was rewritten, so no note should be invented.
+        assert "note" not in r, r
+        os.unlink(r["path"])
+
+
+def test_save_part_written_file_reopens_after_extension_rewrite():
+    """The rewritten path must be the file that actually exists and reopens."""
+    import os
+    import tempfile
+
+    doc = _new_plate_with_hole()
+    out = os.path.join(tempfile.mkdtemp(), "rewritten.step")
+    r, _ = _call("save_part", {"path": out, "doc_id": doc})
+    assert r["ok"] and os.path.exists(r["path"]), r
+    assert not os.path.exists(out + ".step+"), "the stacked name was written after all"
+    opened = cb.call("doc_open", {"path": r["path"]})
+    tree = cb.call("doc_tree", {"doc_id": opened["doc_id"]})
+    types = {f.get("type") for f in (tree.get("tree") or {}).get("features", [])}
+    assert {"box", "hole"} <= types, types
+    os.unlink(r["path"])
+
+
 def test_close_part_warns_on_unsaved_changes():
     """close_part on a dirty doc refuses (unsaved_changes) so the AI saves deliverables —
     the user is never nagged about the AI's docs, so the discipline lives here."""
@@ -1154,18 +1216,75 @@ def test_wall_thickness_numeric_on_shell():
     # Open hollow shell, 2 mm walls: remove the top face so there is a genuine cavity with
     # real inner + outer walls. thickness+outward are the documented params (see
     # cheatsheets/shell.md); outward:false hollows inward.
-    _call("add_features", {"doc_id": doc, "ops": [
+    a, _ = _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("box", "B", {"length": cb.dim(40), "width": cb.dim(40), "height": cb.dim(40)}),
         cb.feat("shell", "Hollow", {"thickness": cb.dim(2), "outward": False},
                 {"remove": {"of": "face", "side": "top"}})]})
+    # ASSERT THE SETUP. This test used to discard the batch result, so when the shell op
+    # started dangling ("remove[0]: no candidates of matching kind" -> whole batch rolled
+    # back -> 0 features) the only symptom was wall_thickness complaining about an EMPTY
+    # document, which reads like a wall_thickness bug and is not one.
+    assert a["ok"], a
+    assert [f["ok"] for f in a["features"]] == [True, True], a
+    # HAND-CHECKED GEOMETRY. Outer block 40^3 = 64000 mm^3. Shelling inward by t = 2 with
+    # the +Z face removed leaves a cavity spanning 36 x 36 in x/y (40 - 2*2) and 38 in z
+    # (40 - 2, open at the top) = 36*36*38 = 49248 mm^3. Wall volume = 64000 - 49248
+    # = 14752 mm^3 exactly. This identity is what proves the walls really are 2 mm and the
+    # top really is open -- without it, a shrunken solid block would also "have a volume".
+    assert abs(a["volume_mm3"] - 14752.0) < 1.0, a
     w, _ = _call("wall_thickness", {"doc_id": doc})
     assert w["ok"], w
     assert w["min_thickness_mm"] is not None, w
-    # The thinnest wall is the 2 mm shell (raycast on a coarse tessellation -> tolerance band).
-    assert 1.0 < w["min_thickness_mm"] < 3.5, w
+    # Every wall of that bucket (4 sides + floor) is exactly 2 mm, so the MINIMUM is 2.0.
+    # The raycast runs on a tessellation, so allow 2% either way -- but no more: a band wide
+    # enough to also admit the 36 mm interior span would prove nothing.
+    assert abs(w["min_thickness_mm"] - 2.0) < 0.04, w
+    # The thickest ray crosses the full 40 mm outer span of the block.
+    assert abs(w["max_thickness_mm"] - 40.0) < 0.8, w
     assert w["mean_thickness_mm"] >= w["min_thickness_mm"], w
     assert w["max_thickness_mm"] >= w["mean_thickness_mm"], w
     assert "wall" in w["summary"].lower(), w
+
+
+def test_one_element_query_list_still_builds_a_shell():
+    """A geometry query in a ONE-ELEMENT LIST must build the same geometry as the bare query.
+
+    Regression pin for the cause of the failure above, which was NOT in wall_thickness. The
+    two shapes reach two different engine resolvers: a bare {"of":"face","side":"top"} goes
+    to resolve_geom_query (plain-English side/surf/nearest filters), a LIST goes to the
+    topology-selector resolver, which answers "no candidates of matching kind". cad_doc_tools'
+    ref normalizer wraps a bare selector-ish dict handed to a LIST slot (shell.remove,
+    draft.faces) into a one-element list, so every agent-authored shell arrives in the shape
+    the selector resolver rejects; add_features is atomic, so the batch rolled back and the
+    document came out with ZERO features. What makes it work is the engine unwrapping that
+    one-element query list back to the bare query in
+    core/doc/validate.cpp::normalize_feature_shape -- and that unwrap is exactly what was
+    MISSING from the staged libchudware.so while this test failed (source dated 2026-07-28,
+    library linked 2026-07-27). So this pins the Python-wrap / C++-unwrap pair end to end, in
+    the shape the normalizer actually produces, and fails loudly on a stale engine instead of
+    surfacing as "wall_thickness says the document is empty".
+    """
+    r, _ = _call("new_part", {"name": "qlist"})
+    doc = r["doc_id"]
+    a, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(40), "width": cb.dim(40), "height": cb.dim(40)}),
+        # Explicitly pre-wrapped: this is what cad_doc_tools hands the engine either way.
+        cb.feat("shell", "Hollow", {"thickness": cb.dim(2), "outward": False},
+                {"remove": [{"of": "face", "side": "top"}]})]})
+    assert a["ok"], a
+    assert [f["ok"] for f in a["features"]] == [True, True], a
+    # Same hand-checked wall volume as the bare query above: 40^3 - 36*36*38 = 14752 mm^3.
+    # An unwrap that resolved a DIFFERENT face (or none) would not land on this number.
+    assert abs(a["volume_mm3"] - 14752.0) < 1.0, a
+    # draft.faces routes through the same resolver pair, so pin it too.
+    r2, _ = _call("new_part", {"name": "qlist2"})
+    doc2 = r2["doc_id"]
+    b, _ = _call("add_features", {"doc_id": doc2, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(40), "width": cb.dim(40), "height": cb.dim(40)}),
+        cb.feat("draft", "Taper", {"angle": cb.dim(5)},
+                {"faces": [{"of": "face", "side": "front"}], "neutral": "plane.top"})]})
+    assert b["ok"], b
+    assert [f["ok"] for f in b["features"]] == [True, True], b
 
 
 def test_draft_analysis_flags_vertical_walls():

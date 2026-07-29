@@ -165,6 +165,19 @@ def _norm_item(raw: Any, pos: int) -> dict[str, Any] | None:
             title = _cap(v, MAX_TITLE_CHARS)
             break
     if not title:
+        # No title key matched. Before dropping the item, try the DESCRIPTION keys as a title
+        # source: an entry carrying only `desc` has exactly one piece of human text and that
+        # text IS the task name. _TITLE_KEYS already accepts the long spelling "description"
+        # while _DESC_KEYS owns the short "desc", so writing the SHORTER, more common form
+        # silently dropped every item and failed the whole plan with "no usable items"
+        # (measured live 2026-07-29: items=[{"id":"1","desc":"Create new assembly",...}] x5).
+        # Losing the planning surface makes the agent look like it never planned at all.
+        for key in _DESC_KEYS:
+            v = raw.get(key)
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                title = _cap(v, MAX_TITLE_CHARS)
+                break
+    if not title:
         return None
     item: dict[str, Any] = {
         "id": _cap(raw.get("id") or raw.get("item_id") or f"task:{pos}", 64),

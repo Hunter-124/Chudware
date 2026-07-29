@@ -76,7 +76,6 @@ class Observation:
     tool_names: list[str] = field(default_factory=list)   # tool calls this turn
     events: list[str] = field(default_factory=list)       # geometry events this turn
     cooldown_state: Optional[dict] = None  # {trigger_id: last_fired_seq}; None=no cooldown
-    trigger_ledger_sink: Optional[Any] = None  # callable(events) to log firings
 
 
 # ---------------------------------------------------------------------------
@@ -568,20 +567,15 @@ def build_advisory(obs: Observation) -> dict:
         except Exception:  # noqa: BLE001
             pass  # trigger layer never breaks the advisory pass
 
-    # Dispatch ledger events for trigger firings (§20: every firing is logged).
-    if trigger_events and obs.trigger_ledger_sink is not None:
-        try:
-            obs.trigger_ledger_sink(trigger_events)
-        except Exception:  # noqa: BLE001
-            pass
-
     advisory = {
         "schema": SCHEMA,
         "seq": obs.seq,
         "stage": obs.stage,
         "items": items,
         "user_override": obs.user_override,
-        "trigger_events": trigger_events,  # available for host-side ledger writes
+        # §20: every firing is logged — the turn loop writes these to the run
+        # ledger and streams one agent.context_injected event per rule.
+        "trigger_events": trigger_events,
     }
 
     # T-W8: promote blocker advisories to failure cards (harness-owned).

@@ -4,6 +4,48 @@ from __future__ import annotations
 from typing import Any
 
 ENTRIES: dict[str, dict[str, Any]] = {
+    "sim_cancel": {
+        "prompt_note": (
+            "job_id from sim_run. Really terminates the solver process, not "
+            "a flag flip; sim_status then reports cancelled. The last "
+            "partial snapshot survives, so sim_results(partial=True) may "
+            "still have something."
+        ),
+    },
+    "sim_jobs": {
+        "prompt_note": (
+            "Lists recent background solves with their state — use it to "
+            "recover a job_id from an earlier turn before assuming a solve "
+            "was lost."
+        ),
+    },
+    "sim_results": {
+        "prompt_note": (
+            "job_id from sim_run, after sim_status says done. partial=True "
+            "returns whatever converged so far, clearly labelled — never "
+            "quote a partial as a converged answer. partial=False on an "
+            "unfinished job is refused rather than returning half a result."
+        ),
+    },
+    "sim_run": {
+        "prompt_note": (
+            "Starts a CANCELLABLE background solve and returns a job_id "
+            "immediately — use it instead of blocking when a solve may run "
+            "minutes. analysis is 'fea_static' or 'fea_modal' ONLY; "
+            "anything else is refused by name. Needs the same "
+            "fixtures/loads as run_fea_static. Then: sim_status(job_id) "
+            "until done, sim_results(job_id). Jobs persist, so a later turn "
+            "can collect one."
+        ),
+    },
+    "sim_status": {
+        "prompt_note": (
+            "job_id from sim_run. Reports "
+            "queued/running/done/failed/cancelled and is reconciled against "
+            "the OS — it never says running for a dead worker. Poll this "
+            "before sim_results; call sim_jobs() if you lost the id."
+        ),
+    },
     "bearing_life": {
         "prompt_note": (
             "Standalone hand-calc — no document needed. Set X/Y when Fa "

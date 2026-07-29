@@ -4,6 +4,38 @@ from __future__ import annotations
 from typing import Any
 
 ENTRIES: dict[str, dict[str, Any]] = {
+    "ecad_lint_schematic": {
+        "prompt_note": (
+            "Geometry self-check BEFORE ecad_run_erc, which only catches "
+            "electrical faults: symbol-body overlap, dangling wire ends, "
+            "wires crossing a body, labels attached to nothing. Names the "
+            "offending refdes/coordinates/label text. Power rails with no "
+            "drawn body are skipped and listed, not guessed."
+        ),
+    },
+    "ecad_make_part": {
+        "prompt_note": (
+            "Creates a real symbol+footprint from a pinout YOU supply — "
+            "this is what ecad_find_part routes to when it refuses to "
+            "substitute a >3-pin part. Requires name + pins (each "
+            "{number,name,type,side}) + package "
+            "(chip/soic/qfn/qfp/sot/dip/header/module_castellated) with its "
+            "pitch/body dims. It will NOT invent a pinout from a part name: "
+            "no pins means refusal. Pin type must be the exact KiCad enum — "
+            "'power'/'vcc'/'gnd' are refused as ambiguous, use power_in or "
+            "power_out. Then ecad_place_symbol by the returned libid."
+        ),
+    },
+    "ecad_route_pad_to_pad": {
+        "prompt_note": (
+            "Hand-routes the nets ecad_autoroute reported as failed. Needs "
+            "from_ref/from_pad/to_ref/to_pad. The net is READ off the pads "
+            "— pads on different nets are refused, never shorted. Width "
+            "comes from the ecad_stackup_solve net class unless you pass "
+            "width. Set to_layer to change layer and it inserts a via. Real "
+            "tracks, so ecad_run_drc sees them."
+        ),
+    },
     "board_from_schematic": {
         "prompt_note": (
             "One-call layout on the active wired schematic — pass ERC first; "

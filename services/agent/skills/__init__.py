@@ -45,6 +45,9 @@ _MID_PROMPT_SKILL_RE = re.compile(
     re.IGNORECASE,
 )
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# Slash commands owned by other subsystems: never resolved as a skill even if a
+# skill of that name exists (see parse_rule_slash below).
+RESERVED_SLASH_COMMANDS: frozenset[str] = frozenset({"rule"})
 
 # Process-global session state: session_id -> set of skill names already injected.
 _session_injected: dict[str, set[str]] = {}
@@ -664,7 +667,9 @@ def resolve_slash(
     """
     if not text:
         return "", []
-    known = {s.name for s in discover_skills(project_root=project_root)}
+    known = {
+        s.name for s in discover_skills(project_root=project_root)
+    } - RESERVED_SLASH_COMMANDS
     hits: list[tuple[str, str]] = []
     lines_out: list[str] = []
 
@@ -703,6 +708,69 @@ def is_skill_slash(text: str, *, project_root: Path | str | None = None) -> bool
     """True when *text* is primarily a skill slash invocation."""
     _, hits = resolve_slash(text, project_root=project_root)
     return bool(hits)
+
+
+# --------------------------------------------------------------------------- /rule slash command
+#
+# `/rule <trigger words> -> <context to inject>` authors a Rule (aicad.trigger/1).
+# Rules are NOT skills: they live in the trigger table, so `rule` is reserved here
+# and a skill of that name can never shadow the command. Parsing lives beside the
+# skill slash parser; the write lives in worker_rpc._rule_create (single writer:
+# advisor.triggers.save_trigger / save_pack).
+
+RULE_SLASH_ARROW = "->"
+RULE_SLASH_USAGE = "/rule <trigger words> -> <context to inject>"
+
+_RULE_SLASH_RE = re.compile(r"^\s*/rule\b[ \t]*(.*)$", re.IGNORECASE | re.DOTALL)
+_RULE_ID_STRIP_RE = re.compile(r"[^a-z0-9]+")
+
+
+def rule_slug(text: str) -> str:
+    """Slug *text* into an ``aicad.trigger/1`` id (``[A-Za-z][A-Za-z0-9_-]{0,63}``)."""
+    slug = _RULE_ID_STRIP_RE.sub("_", str(text or "").lower()).strip("_")
+    while slug and not slug[0].isalpha():
+        slug = slug[1:].lstrip("_")
+    return slug[:48].rstrip("_")
+
+
+def parse_rule_slash(text: str) -> Optional[dict[str, Any]]:
+    """Parse a ``/rule`` composer command.
+
+    Returns ``None`` when *text* is not a ``/rule`` command at all. Otherwise a
+    dict: ``{ok: True, id, keyword, instruction, purpose}`` or
+    ``{ok: False, reason, usage}``.
+
+    A rule with no trigger words can never fire and a rule with nothing to
+    inject fires to no effect, so both halves are REQUIRED here rather than
+    written out as a dead row.
+    """
+    m = _RULE_SLASH_RE.match(text or "")
+    if not m:
+        return None
+    body = (m.group(1) or "").strip()
+    bad = {"ok": False, "usage": RULE_SLASH_USAGE}
+    if not body:
+        return {**bad, "reason": "a rule needs trigger words and context to inject"}
+    if RULE_SLASH_ARROW not in body:
+        return {**bad, "reason": f"missing {RULE_SLASH_ARROW!r} separator"}
+    keyword, _, instruction = body.partition(RULE_SLASH_ARROW)
+    keyword = " ".join(keyword.split())
+    instruction = instruction.strip()
+    if not keyword:
+        return {**bad, "reason": "no trigger words before the arrow — the rule could never fire"}
+    if not instruction:
+        return {**bad, "reason": "nothing to inject after the arrow"}
+    rid = rule_slug(keyword)
+    if not rid:
+        return {**bad, "reason": f"cannot derive a rule id from {keyword!r}"}
+    short = instruction if len(instruction) <= 72 else instruction[:69] + "..."
+    return {
+        "ok": True,
+        "id": rid,
+        "keyword": keyword,
+        "instruction": instruction,
+        "purpose": f"When {keyword!r} appears: {short}",
+    }
 
 
 # --------------------------------------------------------------------------- skill:// resolver

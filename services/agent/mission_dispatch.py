@@ -97,6 +97,54 @@ def _coerce_ledger_payload(payload: Any) -> dict:
 _PROVENANCE_REQUIRED_KINDS = {"dimension", "geometry_spec"}
 
 
+def _delegation_execution_verdict(node: dict) -> dict:
+    """Downgrade a delegate node that claims execution it cannot evidence.
+
+    Returns the keys to merge. `executed` is set optimistically before the child runs, so this
+    is the only place that can tell the truth about whether anything HAPPENED. Evidence, any one
+    of which is enough: tokens actually spent, an attempt actually made, a handoff/result the
+    child produced, tool calls it made, or documents it left behind.
+
+    A node with none of those and an EMPTY model descriptor never had a model bound, so it could
+    not have run — that is reported as `executed: False` with `ok: False` and a reason, so the
+    caller's own honesty gates (agent_turn._did_real_work / _unearned_finish_block) see a failed
+    call instead of silent success. Measured live 2026-07-29: firmware pass 2c closed a turn as
+    `confirmed` on one such node, claiming a simulation that never happened.
+    """
+    if not isinstance(node, dict) or node.get("executed") is not True:
+        return {}
+    budget = node.get("budget") if isinstance(node.get("budget"), dict) else {}
+    model = node.get("model") if isinstance(node.get("model"), dict) else {}
+    handoff = node.get("handoff")
+    spent = int(budget.get("tokens_spent") or 0)
+    attempts = int(budget.get("attempts") or 0)
+    calls = node.get("calls") or node.get("tool_calls") or []
+    ran = bool(
+        spent > 0
+        or attempts > 0
+        or (isinstance(handoff, dict) and handoff)
+        or calls
+        or node.get("docs")
+        or node.get("subagent_status") in ("done", "failed", "error")
+        or node.get("result") is not None
+    )
+    if ran:
+        return {}
+    bound = str(model.get("provider") or "").strip() or str(model.get("id") or "").strip()
+    why = ("no model was bound to the sub-agent role" if not bound
+           else "the sub-agent produced no attempt, no tokens, no handoff and no documents")
+    return {
+        "executed": False,
+        "ok": False,
+        "status": node.get("status") or "approved",
+        "subagent_status": "not_run",
+        "note": (f"sub-agent '{node.get('role') or '?'}' was SPAWNED but did NOT run: {why}. "
+                 f"Nothing was produced, so do not report this brief as done — either do the "
+                 f"work directly with the concrete tools, or say plainly that delegation is "
+                 f"unavailable in this run."),
+    }
+
+
 class MissionDispatch:
     """Run-scoped tool dispatcher for ONE mission.
 
@@ -748,6 +796,15 @@ class MissionDispatch:
             node["brief"] = brief
             node["brief_executed_in_full"] = len(exec_brief) == len(brief_raw)
         node.update(self._run_subagent(node, exec_brief))
+        # `executed` was set OPTIMISTICALLY above, before the child ran, and nothing used to
+        # take it back. Live 2026-07-29 (firmware pass 2c) a delegate returned
+        # executed=true with tokens_spent=0, attempts=0, docs=[] and model={provider:"",id:""}
+        # — nothing ran at all — and because `delegate` counts as real work, the parent's
+        # unearned-finish gate let the turn close as `confirmed` on the fabricated summary
+        # "STM32F4 heartbeat firmware simulated for 1 second". A dispatcher that claims
+        # execution it cannot evidence is the worst kind of lie in this harness, because every
+        # honesty gate downstream trusts it.
+        node.update(_delegation_execution_verdict(node))
         return node
 
     def _run_subagent(self, node: dict, brief: str) -> dict:

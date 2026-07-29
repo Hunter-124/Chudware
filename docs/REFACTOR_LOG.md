@@ -5541,3 +5541,366 @@ cross-suite pollution failures recorded as non-fatal (`services/browser`, `test_
 `services` into its real sub-suites is the fix. Environment gaps are closed so one venv runs
 everything: `.venv-mcp` gained langgraph, langgraph-checkpoint-sqlite, opencv-python-headless,
 pdfminer.six and open3d.
+
+## 2026-07-29 — the four deferred items, plus the stale-engine lesson that reframed the day
+
+Closes the "Still open" list from the previous entry. Read the METHOD note first: it invalidated
+half a day of measurement and is the most reusable thing here.
+
+### METHOD: a stale shared library silently invalidates every live measurement
+
+`core/build-linux/bin/libchudware.so` was linked **2026-07-27 14:26** while 16 core sources were
+newer — including `sim/netlist.cpp` (Device:LED junction params), `doc/validate.cpp` (the
+one-element-query unwrap) and `agent/run.cpp`. The `.o` files were current; only the link never
+ran. `./build.sh core` had been run at session start and printed `DONE (core)`.
+
+Why it printed DONE and changed nothing: `build_core()` runs `cmake --build --preset linux-core`,
+whose `binaryDir` is `build/linux-core/` at the REPO root. Nothing reads that tree.
+`scripts/gate.sh` prefers `core/build-occt-linux/bin` then `core/build-linux/bin`; the GUI dlopens
+`host/build-linux/bin`. There are **five** `libchudware.so` on a dev box in **three** sizes — the
+preset build is ~0.8 MB smaller because `CHUDWARE_WITH_NETGEN` is off, so copying it over a full
+engine would silently delete the FEA/CFD mesher (gate.sh:450-456 already documents that trap).
+Staging is therefore the WRONG fix; `build.sh` now calls `report_engine_staleness()` after
+`build_core` and prints a loud WARN naming each consumer path older than the newest core source.
+Verified both ways (silent on a fresh tree, fires when the `.so` is aged).
+
+What it cost: six live discipline sweeps were scored against two-day-old code, and BOTH remaining
+`services/mcp` failures were stale-artifact ghosts, not defects —
+  * `test_wall_thickness_numeric_on_shell`: `shell.remove` got a one-element query list from the
+    Python normalizer; the engine's unwrap (`validate.cpp:2298`) existed in source but not in the
+    `.so`, so the batch rolled back and the doc was EMPTY. Byte proof: `strings | grep -c 'resolves
+    queries unwrapped'` = 0 before relink, 1 after.
+  * `test_e2_led_driver_recipe`: the netlist carried the right LED params but the translator emitted
+    `params:{}`, so spice.cpp used its default diode → 0.7324 V = one silicon junction drop. Byte
+    proof: the constant `2.3e-19` absent from the `.so` before relink, present after.
+Both reproduced at HEAD **only because both trees share the same stale `.so`**. Isolation that
+actually settles this class: HEAD source + old `.so` (fails) vs HEAD source + relinked `.so`
+(passes). `services/mcp` is now **2092 passed, 0 failed** (was 1759/1 failed/4 errors two sessions
+ago). Rule going forward: before trusting any live agent measurement, check the `.so` mtime against
+the newest core source.
+
+### The four deferred items
+
+1. **`measure_between` raw refs.** `query_geometry` hands back stable sids and BOTH docstrings tell
+   the model to walk that loop, yet feeding the sid straight back raised "Can't read 'Fedecf8' as a
+   geometry query". `_resolve_one_selector` now falls back to `_resolve_inspect_target` — the SAME
+   full-precedence resolver hover/inspect use — so sids, feature ids and feature names all resolve.
+   A feature owns many faces, so that case is a PICK: it names the feature and lists its sids rather
+   than auto-choosing one.
+2. **`query_geometry("bbox")`.** The deferred note said "redirect to measure_part" and was WRONG —
+   `measure_part` reports volume/mass/centroid and no bbox. `describe_part`'s outline opens with
+   `bbox WxDxH mm`, so that is the redirect, and the message says explicitly that measure_part does
+   NOT report a bbox. Checked as a strict fallback: "the top face dimensions" still resolves as a
+   query. A live run then did exactly the intended thing — got the redirect, called `describe_part`,
+   succeeded.
+3. **Gate `services` split.** The stage ran `services/` as ONE pytest invocation (369 test files),
+   whose import-order pollution produced failures nobody could distinguish from regressions. Now 22
+   runtime-globbed units (19 subpackages + 3 root files) with a **fatal coverage guard** —
+   `22 units covering 369/369 test files`. Proven independently: hiding one suite where the
+   enumeration cannot see it gives `369/370` and `fail_fatal=1`. Collected 6986 → 7071 with **no
+   id lost** (verified by diffing `--collect-only` node-id SETS, not by comparing totals); the two
+   `test_registration_catalog` family failures were pure pollution and are gone.
+4. **Pass 2 for sim/firmware/parts/drawings.** Ran, then re-ran on a current engine (see below).
+
+### What pass 2 actually measured
+
+Overall failed-call rate 9.1% → 7.4% across 307→337 calls. That headline understates and overstates
+at once, and the honest reading matters: every signature fixed in 2a was GONE in 2b
+(`dtype="diameter"`, bare-string `title`, `source_doc`, `part_name`/`revision`, `task_list(desc)`,
+`export_drawing(filename)`, `measure_part(query=)`), and the model simply advanced to the next
+unpolished argument. Dialect hardening moves a frontier; it does not produce one big drop.
+
+One regression was self-inflicted and caught by the re-run: `measure_part(what=...)` routed
+EVERYTHING to `measure_between`, including `what="mass"` — which is exactly what measure_part
+returns. The key cannot decide this; the VALUE does. `_MASS_PROPERTY_RE` now accepts-and-notes a
+mass-property word and routes only genuine geometry.
+
+### The dominant defect class, again: silently wrong output
+
+- `set_material("Ti-6Al-4V")` rendered **aluminium** — the string contains the token "al" and the
+  loose family scan matched it. Titanium grade 5 as the wrong metal, `ok:true`. Fixed with an
+  explicit alloy-designation table consulted BEFORE the scan, and the scan itself made
+  earliest-match-then-longest (base metals lead a designation) — which also removed real
+  nondeterminism, since `"al"` and `"ti"` are equal-length keys drawn from a **set**.
+- `sheet="A6"` produced a normal-looking **A3** sheet (`drawing_make` swallowed the OpError).
+- `model_items` was typed `bool`, so `bool("none")` switched the auto-dimension pass **ON**.
+- `add_section_view(axis=<anything but "horizontal">)` cut vertically (fixed last session, same
+  class).
+
+### Traps worth carrying forward
+
+- **Never add `**kwargs` to a FastMCP tool.** Measured twice, independently: a varkw declaration
+  turns the shared arg reconciler off on BOTH dispatch paths AND makes FastMCP fold `kwargs` into
+  one ordinary field that DROPS unrecognised keys — converting a loud `unknown_argument` into a
+  silent wrong call. Use real declared parameters.
+- **Declaring a parameter can SHADOW a spelling that already worked.** Adding `source_doc` made
+  `source_doc_id` ambiguous at the affix layer and silently un-fixed it. Re-test neighbours after
+  adding any parameter.
+- **Do not assert a cause you did not check.** `_unresolved_tool_error` stated flatly that any
+  unbindable advertised tool "is a mission-scoped tool"; live, that told a run `new_part`,
+  `list_parts` and `import_part` were mission-scoped when the registry had simply failed to import.
+  It now checks `MissionDispatch`'s own handler table and otherwise reports what is observed. The
+  root cause was `_server_tools()` caching `{}` after a failed import — one transient error emptied
+  the registry for the whole process. A failed import is no longer cached.
+- **`eval` cells share one IPython kernel across subagents.** A reused variable name let one agent
+  overwrite another's file with a third file's contents, breaking the whole MCP registry mid-run.
+  Use `edit`/`write` with literal paths.
+
+### Real capability holes closed (not dialect)
+
+- **Firmware source authoring was impossible.** `fw_sources(add=)` only creates empty stubs, there
+  was no content parameter, and the project root sits outside the fs jail. Worse, the cmake template
+  hard-codes `add_executable(src/main.c src/startup.c)`, so even a stub was never compiled.
+  `fw_sources(write={relpath: content})` now writes + registers + extends `add_executable`
+  atomically; `fs_write` inside a known project root returns `use_fw_sources` naming the call.
+  Proven by a linked symbol from an authored file, not by `ok:true`.
+- **You could not dimension a feature.** `add_dimension` took sheet mm only, while the model holds
+  sids. No sid→sheet projection exists in the engine, but the RADIUS is an exact join
+  (model radius = arc.radius/scale, the engine's own arithmetic), and the engine then snaps to the
+  nearest arc and reads the value off THAT arc — so no Python-side scale factor is ever applied.
+  Pinned by a part with a ⌀10 and a ⌀6 bore asserting each sid gets its own value AND centre.
+
+### Deliberate refusals — capability gaps, not aliases
+
+`mesh_size_mm` is absolute mm and `mesh_fineness` is a dimensionless 0..1 factor, so it is REFUSED
+with a unit-naming error and a `QUANTITY_MISMATCH` guard that no future synonym rule can bypass.
+`direction:"normal"` on an FEA load is refused because normal does not state a SIGN (outward =
+tension, inward = compression). `I_mm4` is never derived from b/h — the error teaches
+`b*h**3/12` instead of assuming a section shape. `orientation` on a sheet is refused because
+`sheet_dims` stores every size landscape. `research_eng_calc` case-insensitivity turned out NOT to
+be a defect — I misread the post-rename echo in the hint; it already worked.
+
+### Still open
+
+- The MCP dispatch path silently drops extras for the whole `**kwargs`-widened tool family
+  (`query_geometry`, `measure_part`, `measure_between`, `check_interference`, …). The agent path
+  refuses correctly; the MCP path needs its own pass.
+- `services/browser` 9 failures and `tools` 4 — both pre-existing, now VISIBLE per-unit rather than
+  buried in a combined run.
+- ~2871 autosaved `.step+` files accumulate under `~/.local/share/Chudware`; a turn that calls
+  `recover_parts` reopens dozens and then cannot disambiguate "the part". Cross-process leakage was
+  checked and does NOT happen (a fresh process sees 0 open docs), so this is a within-turn footgun.
+- `build.sh core` still builds a tree nothing consumes. The staleness WARN makes it visible rather
+  than fixing the divergence; aligning the preset with the consumed paths is the real fix.
+
+## 2026-07-29 (cont.) — what to steal from the CAD/EDA MCP ecosystem
+
+Hunter asked for a survey of comparable open-source MCP servers. Three read-only passes ran:
+`'/home/hunter/.omp/agent/sessions/-Repositories-CAD/2026-07-29T03-52-01-120Z_019fac00-2f60-7000-b285-489d0ee76711/KicadMcpGapAnalysis.md'` (mixelpixx/KiCAD-MCP-Server, MIT, 137 tools),
+`'/home/hunter/.omp/agent/sessions/-Repositories-CAD/2026-07-29T03-52-01-120Z_019fac00-2f60-7000-b285-489d0ee76711/FreecadMcpGapAnalysis.md'` (neka-nat/freecad-mcp, MIT, 1.5k stars),
+`'/home/hunter/.omp/agent/sessions/-Repositories-CAD/2026-07-29T03-52-01-120Z_019fac00-2f60-7000-b285-489d0ee76711/McpEcosystemSurvey.md'` (everything else; ~11 projects kept, ~11 discarded).
+Full reports are in those artifacts; this records the conclusions and the reasoning.
+
+### The single most useful external data point
+
+build123d-mcp publishes a CADGenBench result: wrapping the SAME model in VERIFICATION tools
+(`design_audit`, `health_check`, `lint_drawing`, `analyze_printability`, `last_error`, `diff`)
+raised its score 0.360 -> 0.457 and CAD validity 88% -> 100%. That is independent evidence for the
+thing this whole effort has been doing by intuition — the leverage is in tools that let a model
+CHECK its work, not in more modelling verbs. We have no equivalent benchmark for our own surface,
+which is a real hole in our ability to claim improvement; worth building.
+
+### Confirmed real gaps (measured, not guessed)
+
+- **No ECAD symbol/footprint GENERATOR.** `generate_symbol|generate_footprint|from_datasheet` had
+  zero hits across services/ecad/library/. The starter library is ~53 hand-authored generic symbols,
+  so a live request for an ESP32-WROOM-32 got a SUBSTITUTED generic with a wrong pinout that still
+  reported success (ecad_sch_tools.py:521-533). A schematic wired against a wrong pinout is a
+  fabricated design — this was the worst-consequence defect left in the ECAD lane.
+- **No geometry/solid health check.** Zero of 404 tools matched
+  `watertight|manifold|mesh_qual|mesh_check|repair`, yet the engine already computes it
+  (`core/geom/dress.cpp:89 blend_is_watertight`, mirroring `document.cpp::dress_is_closed_solid`).
+  Pure exposure gap.
+- **Simulation is synchronous with no job contract.** Zero `async def` in cad_sim_tools.py, no
+  job_id/progress/cancel. Live sweeps hit `max_iters` at 336 s with the model blind throughout.
+- **The unit converter cannot do its own headline example.**
+  `unit_convert(value, unit, family)` supports only `length`->mm, `angle`->deg, `count`->count, in
+  the canonical direction only. So no `mm -> in`, and no stress family at all — meaning it cannot
+  perform the ksi->MPa conversion its own docstring cites as the motivating error
+  (research_tools.py:1195). Also rejects the Pint-style `from_unit`/`to_unit` shape models expect.
+- **No manual trace tool.** `ecad_autoroute` tells the agent failed nets "need manual routing"
+  (ecad_pcb_tools.py:443-444) and there was no tool to do it with — the advertised-but-impossible
+  class again.
+- **No JLCPCB/LCSC backend.** `"jlcpcb"` is a display LABEL in parts_tools.py:1484 with nothing
+  behind it; `bom_price` only walks Nexar->Digi-Key->Mouser.
+- **No schematic geometric QA.** `ecad_run_erc` catches electrical faults only, so a wire routed
+  through a symbol body or a label attached to nothing passes.
+
+### Deliberately NOT adopted
+
+- **`execute_code`** (freecad-mcp's universal escape hatch: arbitrary Python on the FreeCAD GUI
+  thread, mitigated only by localhost binding). Appropriate for a single-user app wrapper,
+  inappropriate for an engine we own. Our `add_features` closed-vocabulary batch-op array is the
+  right design and is what a model reaching for exec should be REDIRECTED to.
+- **Freerouting** as a bundled router. Our C++ router documents itself as "no push-and-shove /
+  negotiated-congestion" (core/ecad/autoroute.cpp:1551) so Freerouting is genuinely stronger, but it
+  is GPL-3.0 and needs Java 21/Docker, and most of the work is a correct Specctra DSN/SES codec for
+  our board schema. Logged as a possible optional external backend (shell out, never link), not
+  taken now.
+- **`reload_document`** and friends — they exist purely to patch the GUI/headless desync inherent to
+  driving a separate app. We have no such bug class.
+
+### Where we are genuinely ahead (worth knowing, so we stop hedging)
+
+- **Datasheet handling.** Their entire "datasheet" capability is URL string templating from an LCSC
+  id (`datasheet_manager.py`, read in full) — zero PDF parsing, zero pin extraction. Ours
+  (`research_datasheet_fetch`, `reveng_ingest_datasheet`) extracts real content with provenance. The
+  gap was never parsing; it was that nothing consumed the extraction to make an ECAD symbol.
+- **Sketching.** freecad-mcp has NO dedicated sketch tool at all — sketch authoring goes through
+  `execute_code`. We have the whole `sketch3d_*` family plus `check_sketch`/`sketch_health`.
+- **2D drawings.** They expose no TechDraw tools (verified by absence, not README silence). We have
+  make_drawing/section/detail/auto-dimension/title block/export.
+- **Parametric equations.** No Spreadsheet exposure on their side; our `{"value":N,"expr":"width/2"}`
+  is first-class in the param schema, evaluated by `core/util/expr.cpp`.
+- **Physics breadth.** PDN/SI/thermal/DFM/hostcheck, RF/antenna/EM, FPGA pin checking have no
+  counterpart in KiCAD-MCP's 137 tools at all. Stackup-driven net classes derive track width from an
+  impedance target plus a fab profile; their `create_netclass` takes literal numbers only.
+- **Architecture.** Every surveyed CAD/sim MCP server is a driver for a separate host app and carries
+  the crash/desync bug class that implies (build123d-mcp's own ADRs are titled
+  "worker-ipc-concurrency" and "worker subprocess crash containment").
+
+### Dialect steals — cheapest value, because models already expect these
+
+We have MEASURED this effect: a live run wrote KiCad's `Device:R_0603` unprompted, and the
+`ecad:<Library>:<Symbol>` shape turned out to be our own id shape already. Worth accepting:
+- **trimesh vocabulary** (`is_watertight`, `fill_holes`, `fix_normals`, `fix_winding`) — the
+  most-imported mesh library on GitHub, so its API is dense in training data.
+- **`calc_convert(value, from_unit, to_unit)`** — the Pint-shaped signature.
+- **`design_audit` / `health_check` / `lint_drawing` / `last_error`** — build123d-mcp's gate verbs.
+- **`assess_mesh_quality` / `analyze_stl_geometry`** — openfoam-mcp's pre-solve naming.
+- **freecad-mcp shapes**: `obj_properties` as the generic property-bag name, `focus_object` on a
+  render tool, the nested `{"Base":{...},"Rotation":{"Axis":{...},"Angle":deg}}` Placement dialect
+  (capitalised, degrees) which a FreeCAD-steeped model may emit against our flat `at`/`axis` lists,
+  and the `get_view` orientation enum including the less common `Dimetric`/`Trimetric`.
+- **KiCad pin-type and pin-shape enums** in full, for any symbol generator.
+- **A `source` field** on a lookup result saying which backend answered (live-api vs cached) — the
+  same honesty discipline `bom_price` already applies to null pricing.
+
+### One structural insight worth keeping
+
+freecad-mcp attaches a screenshot to EVERY mutating tool's response, gated by a single
+`--only-text-feedback` flag. Their loop is tighter than ours (feedback is forced, the model cannot
+forget to look); our render is better when it happens (colour-coded face-direction annotation with a
+gizmo, versus their raw framebuffer grab). The adoptable idea is auto-attaching a low-res thumbnail
+to `add_features` success, flag-controlled — their benefit without regressing render quality.
+
+## 2026-07-29 (cont.) — "Rules": TTSR, renamed, and finally switched on
+
+Hunter asked for OMP's TTSR ("Time Traveling Stream Rules") in Chudware under the name **Rules**,
+with the rules and their triggers visible in AI settings, a `/command` to create one, a small
+authoring popup, and context injection visible in the chat when it fires.
+
+### The finding that shaped the whole slice
+
+Chudware already HAD the rules engine: `services/agent/advisor/triggers.py`, contract
+`aicad.trigger/1` (contracts/advisor.md §20) — 21 rules, per-rule
+`{id, match:{keywords[regex], tools[], events[]}, inject:{context_pack, prerun_calcs, exemplar},
+budget_tokens, cooldown_turns, enabled}`, full CRUD RPCs (`triggers_*`/`packs_*`), and an editable
+Settings tab. So the right move was to extend and rename it, NOT to add a parallel concept — which
+also meant the sub-tab rename Context -> **Rules** needed no index renumbering at all
+(`kAiSubLabels` stays 8 entries, the `if (s_aiSubSel == N)` ladder and the legacy jump remap are
+untouched). That is why this landed small.
+
+It was, however, barely wired. My first claim — "100% dead" — was too strong and a subagent
+corrected it with evidence: commit `90651881` had landed `_maybe_inject_trigger_advisory`. What was
+genuinely missing: firing on the USER's request (so a rule arrived a turn late, after the model had
+already answered), any visibility whatsoever, cross-turn cooldown (state was rebuilt per
+`run_turn()`, so a rule re-fired on every GUI message), and `Observation.trigger_ledger_sink` —
+declared at engine.py:79, never wired, zero repo-wide references. Deleted rather than wired: a
+callback plus a return value is two paths for one fact, and `advisory["trigger_events"]` already
+carries the records.
+
+### Where the injection lives now
+
+`agent_turn.py` top of the tool-iteration loop, immediately before `provider.complete()` — the only
+point that has the completed turn's reply text AND that iteration's tool names AND can still append
+to `messages` before the next completion, with `on_event`/ledger/actor all in scope. Two details
+worth keeping:
+
+- `_trig_prev_text` is seeded with the RAW `request`, deliberately not `_req`, which by then carries
+  scaffold and reference blocks we injected ourselves. That is the feedback loop this class invites,
+  and it is also what lets a rule steer the FIRST completion instead of the second.
+- Fired records are filtered to rules whose item actually survived `render_advisory`'s 600-token
+  global budget, and a dropped rule's cooldown stamp is rolled back. So the transcript can never
+  claim an injection that did not reach the prompt, and a rule is never suppressed by a firing it
+  never got.
+
+Cooldown state is session-scoped (`_TRIG_SESSIONS`, keyed by subagent/run id, bounded at 64 with
+FIFO eviction); callers with no session identity get a private dict so tests stay isolated.
+
+### Visibility: the consumer already existed
+
+`on_event("agent.context_injected", …)` -> `feed.cpp:1582` -> `ActivityItem{rowKind=1}` ->
+`activity_timeline.cpp::drawContextChip()` was live end to end with exactly ONE producer
+(project memory). The frozen payload is now
+`{source:"rule", rule_id, label, matched, token_est}`. Verified on a real turn
+("30 mm cube with an M6 threaded hole"): 11 tool calls, four chips —
+`thread_mention/"threaded"/269tok`, `drawing_standards/"dimension"/330tok`, and each again 14 and 9
+sequence steps later, both past the 8-turn cooldown. Cooldown behaving, not noise.
+
+### The glyph trap, and the write-back trap behind it
+
+Rule display strings contained U+2192, which this font atlas does NOT cover, so they rendered as
+`?`. Note `chudware-copilot-transcript-surface` claims `\xe2\x86\x92` is usable — that is WRONG,
+measured twice today; trust `host/src/ui/copilot/agent_text.h`.
+
+Short arrow-only display strings (16 exemplars) were rewritten to ASCII in both `_BUILTIN_TRIGGERS`
+and `triggers.yaml` — and the YAML is load-bearing, not just spec: `_shipped_triggers()` prefers it
+whenever PyYAML imports, so fixing only the Python mirror would have changed nothing on this box.
+
+Context pack BODIES were deliberately NOT touched. They are model-facing engineering prose where
+ε (strain), δ (deflection), × and § are correct notation, and the model reads UTF-8 fine — degrading
+the injected context to fix a rendering bug is the wrong trade. They fold at the DISPLAY boundary via
+the existing `ui::foldToAtlasGlyphs` (GL-free, ctest-linked, written for this exact defect). ε and δ
+were falling through, so the fold table gained the Greek block, U+2126, and the circled capitals
+`drawing_standards.md` uses.
+
+That fix then exposed a second-order hazard worth recording: folding for display means the editor
+buffer holds ASCII, so merely OPENING a shipped pack and saving would have written the folded text
+back over the correct notation. `OvRawField{raw, shown}` closes it — `save()` returns the original
+bytes when the buffer is still byte-equal to what `load()` wrote, so the constraint is enforced at
+the save seam rather than by refusing to fold.
+
+### `/rule` and the authoring popup
+
+`/rule <trigger words> -> <context to inject>` creates a LIVE rule and jumps to Settings -> AI ->
+Rules. Both halves required; an incomplete command is REFUSED with no write rather than creating a
+disabled draft — a rule that cannot fire is the advertised-but-impossible class this whole effort
+removed. Trigger words are `re.escape`d so metacharacters a user types stay literal, and `rule` is a
+reserved slash name so a skill can never shadow it. It writes through the existing single writer
+(`save_pack` then `save_trigger`), never a second path.
+
+The authoring popup (`host/src/ui/ai/rules_authoring.{h,cpp}`) is a GUIDED FORM wearing a chat
+presentation, and that was a deliberate honesty call: there is no lightweight one-shot completion
+RPC on the host side (only `agent_admin_turn`, a full streaming agent turn), so a "chat" would have
+meant inventing content. It asks one scripted question at a time, shows the EXACT bytes before
+writing, and persists only through `skills_save` / `packs_save` / `triggers_save`.
+
+### Also landed from the ecosystem survey
+
+`ecad_make_part` closes the ESP32-WROOM-32 hole: a caller-supplied pinout becomes a real symbol +
+footprint through `starter.py`'s own helpers. Generated pad coordinates reproduce starter's
+hand-authored ones EXACTLY (DIP-8, QFN-48-1EP incl. exposed pad, SOIC-8, SOT-23/-5/-6, R_0603,
+Header_1x4) — and that comparison earned its keep: the JEDEC SOT family puts both rows on one 3-slot
+grid with short rows taking the OUTER slots, and a naive centred row missed starter by 0.475 mm.
+`ecad_find_part` now substitutes only at <= 3 pins and REFUSES above it: for a 2-pin passive there is
+no pinout to get wrong and for a 3-pin SOT the numbering is JEDEC, but `MCU:Generic_QFP48` numbers
+1..48 sequentially and no real 48-pin MCU does — so every wire drawn against it is on the wrong pin
+while the netlist looks complete. Before `ecad_make_part` the choice was wrong-pinout vs dead-end;
+it no longer is, so the refusal is actionable and carries a filled-in `ecad_make_part` call.
+
+`check_geometry_health` (+ aliases `is_watertight`/`assess_mesh_quality`/`analyze_stl_geometry`/
+`health_check`/`design_audit`) needed a new engine op — no composition answered it: `eval_check`
+returns an issue list with no counts or sids, `doc_adjacency` emits only 2-face manifold edges so
+free/non-manifold edges are invisible, and `blend_is_watertight` is a file-local static returning a
+bare bool. It reports the counts and SIDS that justify the verdict, always says
+`self_intersection: checked:false` with the reason (the kernel has no single-body test) hoisted so a
+skim of a PASSING report still sees it, and nulls `volume_mm3` for a body with no solid — measured:
+`BRepGProp` happily integrates a divergence over an open skin and returns a confident meaningless
+number. Whoever adds a core op next: it relinked BOTH `core/build-linux` and `core/build-occt-linux`,
+because `private_hostd.py` copies the latter for the test daemon.
+
+`sim_run/sim_status/sim_cancel/sim_results/sim_jobs` — see the commit message; the short version is
+that cancel had to be a child process because a Python thread cannot be killed mid-`ctypes`, and the
+child runs with `CHUDWARE_ENGINE_DAEMON=0` deliberately so killing it cannot leave the shared hostd
+still solving.

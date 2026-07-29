@@ -202,3 +202,82 @@ class TestClassAAdvertisedToolsBind:
         assert err["harness_bug"] is True
         assert "mission" in err["error"].lower()
         assert "could not be resolved" in err["error"]
+
+
+# ---------------------------------------------------------------------------
+# The harness must not INVENT a cause for an unbindable tool (live 2026-07-29)
+# ---------------------------------------------------------------------------
+
+def test_mission_scope_is_checked_against_the_real_dispatcher():
+    """Mission-owned names answer True; ordinary MCP tools answer False.
+
+    The claim used to be unconditional, so every unbindable tool was reported as
+    mission-scoped. This pins the two sides apart against MissionDispatch's own
+    handler table rather than a hardcoded list.
+    """
+    assert at._is_mission_scoped_tool("delegate") is True
+    assert at._is_mission_scoped_tool("ask_user") is True
+    assert at._is_mission_scoped_tool("new_part") is False
+    assert at._is_mission_scoped_tool("import_part") is False
+
+
+def test_empty_registry_names_the_import_error_not_mission_scope(monkeypatch):
+    """A poisoned registry must say so, and quote the import failure.
+
+    Live 2026-07-29 (drawing sweep): new_part, list_parts and import_part were all
+    reported as "a mission-scoped tool" while the real cause was a tool module that
+    briefly failed to import. That message sends an engineer to mission plumbing and
+    away from the actual break, which is worse than saying "cause unknown".
+    """
+    monkeypatch.setattr(at, "_server_tools", lambda: {})
+    monkeypatch.setattr(at, "_SERVER_TOOL_IMPORT_ERROR", "ImportError: boom in cad_x_tools")
+
+    err = at._unresolved_tool_error("new_part")
+    assert err["status"] == "known_but_unbound"
+    assert err["harness_bug"] is True
+    msg = err["error"]
+    assert "REGISTRY is empty" in msg, msg
+    assert "boom in cad_x_tools" in msg, msg
+    assert "not specific to 'new_part'" in msg, msg
+    assert "mission-scoped" not in msg, msg          # the fabricated cause is gone
+
+
+def test_registered_but_unadvertised_name_does_not_claim_mission_scope(monkeypatch):
+    """A non-empty registry that simply lacks the name must not blame mission scope."""
+    monkeypatch.setattr(at, "_server_tools", lambda: {"new_part": lambda **k: None})
+    monkeypatch.setattr(at, "_known_tool_names", lambda: frozenset({"new_part", "ghost_tool"}))
+
+    err = at._unresolved_tool_error("ghost_tool")
+    assert err["status"] == "known_but_unbound"
+    msg = err["error"]
+    assert "mission-scoped" not in msg, msg
+    assert "failed to import" in msg or "without ever being registered" in msg, msg
+
+
+def test_a_failed_registry_import_is_never_cached(monkeypatch):
+    """One transient import error must not empty the registry for the whole process.
+
+    The old handler cached {} on failure, so every later _bind_tool returned None
+    forever — which is how a momentary module break turned into a run-long outage.
+    """
+    monkeypatch.setattr(at, "_SERVER_TOOL_CACHE", None)
+    calls = {"n": 0}
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __import__
+
+    def flaky(name, *a, **k):
+        if name == "mcp_server.server":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ImportError("transient")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setitem(__builtins__.__dict__ if not isinstance(__builtins__, dict)
+                        else __builtins__, "__import__", flaky)
+    first = at._server_tools()
+    assert first == {}, "the failure should yield an empty mapping"
+    assert at._SERVER_TOOL_CACHE is None, "a FAILED import must not be cached"
+    assert at._SERVER_TOOL_IMPORT_ERROR and "transient" in at._SERVER_TOOL_IMPORT_ERROR
+
+    second = at._server_tools()          # import now succeeds
+    assert second, "the retry must repopulate the registry"
+    assert "new_part" in second

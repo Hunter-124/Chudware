@@ -8,12 +8,18 @@ in with a two-line block and the tools can be driven against a stub ``mcp`` in t
 whole stdio server.
 
 The compile loop these expose: create a project whose MCU target and ``pinmap.h`` come from the
-linked ECAD board → build with a real cross-toolchain → read parsed warnings/errors → fix → repeat.
+linked ECAD board → author its sources with ``fw_sources(write={...})`` (the project root sits
+outside the fs_* workspace jail, so fs_write cannot reach it) → build with a real cross-toolchain
+→ read parsed warnings/errors → fix → repeat.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 from . import core_bridge as cb
@@ -32,11 +38,153 @@ def _err(reason: str, hint: str = "", **extra) -> dict:
     return out
 
 
+# --------------------------------------------------------------------- project roots
+# A firmware project lives OUTSIDE the fs_tools workspace jail: the engine puts it under
+# firmware_root() ($CHUDWARE_FIRMWARE_DIR, else <tmp|APPDATA>/Chudware/firmware). So
+# fs_write(path="<project>/src/main.c") is refused as outside_workspace_root and, before
+# this, firmware source code could not be authored AT ALL — fw_sources could only create
+# empty stubs. fw_sources(write={relpath: content}) is the sanctioned authoring path;
+# fs_tools imports known_project_roots()/project_for_path() so its refusal NAMES that tool
+# instead of dead-ending. The jail itself is untouched.
+_PROJECT_ROOTS: dict[str, Path] = {}
+
+# Extensions the cmake_arm template's add_executable() can compile (mirrors kSrcExts in
+# core/firmware/project.cpp).
+_COMPILABLE_EXTS = frozenset({".c", ".cpp", ".cc", ".cxx", ".s"})
+
+# Emulator harness margin: the engine runs the emulated target for
+# ``timeout_s - 5s`` (core/firmware/emulator.cpp run_simulation), so a caller who asks
+# for a target run of N seconds needs timeout_s = N + 5.
+_SIM_HARNESS_MARGIN_S = 5.0
+
+
+def _firmware_root() -> Path:
+    """Mirror of ``firmware_root()`` in core/firmware/project.cpp (fallback resolver)."""
+    raw = os.environ.get("CHUDWARE_FIRMWARE_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    appdata = os.environ.get("APPDATA", "").strip()
+    base = Path(appdata) if appdata else Path(tempfile.gettempdir())
+    return base / "Chudware" / "firmware"
+
+
+def project_root(project_id: str) -> Optional[Path]:
+    """Absolute root directory of *project_id*, or None when it cannot be resolved.
+
+    Authoritative source is the engine's own ``fw_projects`` listing (it reports
+    ``root_dir`` per project, so a relocated or env-overridden root is still correct);
+    the firmware_root() mirror above is only the fallback.
+    """
+    if not project_id:
+        return None
+    cached = _PROJECT_ROOTS.get(project_id)
+    if cached is not None and cached.is_dir():
+        return cached
+    try:
+        listing = cb.call("fw_projects", {}) or {}
+        for proj in listing.get("projects") or []:
+            pid, root = proj.get("project_id"), proj.get("root_dir")
+            if pid and root:
+                _PROJECT_ROOTS[pid] = Path(root)
+    except Exception:  # noqa: BLE001 — resolution falls back to the on-disk mirror
+        pass
+    found = _PROJECT_ROOTS.get(project_id)
+    if found is not None and found.is_dir():
+        return found
+    guess = _firmware_root() / project_id
+    if (guess / "project.json").is_file():
+        _PROJECT_ROOTS[project_id] = guess
+        return guess
+    return None
+
+
+def known_project_roots() -> dict[str, Path]:
+    """``{project_id: root}`` for every firmware project THIS process has resolved
+    (via fw_new_project or fw_sources). Read by services/mcp/fs_tools.py so a write
+    refused inside a firmware project can name fw_sources(write=...)."""
+    return dict(_PROJECT_ROOTS)
+
+
+def project_for_path(raw_path) -> Optional[tuple[str, Path, str]]:
+    """``(project_id, root, relpath)`` when *raw_path* lands inside a known firmware
+    project root, else None. ``relpath`` is '' for the root itself."""
+    try:
+        resolved = Path(raw_path).expanduser().resolve(strict=False)
+    except Exception:  # noqa: BLE001
+        return None
+    for pid, root in _PROJECT_ROOTS.items():
+        try:
+            root_res = root.resolve(strict=False)
+        except Exception:  # noqa: BLE001
+            continue
+        if resolved == root_res:
+            return (pid, root, "")
+        if root_res in resolved.parents:
+            return (pid, root, resolved.relative_to(root_res).as_posix())
+    return None
+
+
+def _safe_relpath(rel, root: Path) -> tuple[Optional[str], str]:
+    """Normalise one project-relative source path. Returns ``(relpath, error)``; an
+    absolute path inside *root* is relativised, anything escaping the project refuses."""
+    text = str(rel).strip().replace("\\", "/")
+    if not text:
+        return (None, "empty source path")
+    p = Path(text)
+    if p.is_absolute() or (len(text) > 1 and text[1] == ":"):
+        try:
+            text = p.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
+        except Exception:  # noqa: BLE001
+            return (None, f"{rel} is an absolute path outside the project root ({root})")
+    parts = [seg for seg in text.split("/") if seg not in ("", ".")]
+    if not parts:
+        return (None, f"{rel} does not name a file")
+    if ".." in parts:
+        return (None, f"{rel} escapes the project root ({root})")
+    return ("/".join(parts), "")
+
+
+_ADD_EXECUTABLE_RE = re.compile(r"add_executable\s*\(([^)]*)\)", re.I)
+
+
+def _ensure_cmake_sources(root: Path, rel_paths: list[str]) -> list[str]:
+    """Append newly authored compilable sources to the project's ``add_executable()``
+    list so the next fw_build actually COMPILES them.
+
+    The cmake_arm template hard-codes ``src/main.c`` + ``src/startup.c``
+    (core/firmware/templates_embedded.cpp), so a file registered only in project.json
+    src_paths was never handed to the compiler. Idempotent; never fatal — a project with
+    a non-cmake or hand-edited CMakeLists is left alone and reports nothing added.
+    """
+    cml = root / "CMakeLists.txt"
+    try:
+        text = cml.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return []
+    m = _ADD_EXECUTABLE_RE.search(text)
+    if not m:
+        return []
+    block = m.group(1)
+    listed = set(block.split())
+    added = [r for r in rel_paths
+             if Path(r).suffix.lower() in _COMPILABLE_EXTS and r not in listed]
+    if not added:
+        return []
+    indent = "    "
+    new_block = block.rstrip() + "\n" + "".join(f"{indent}{r}\n" for r in added)
+    updated = text[:m.start(1)] + new_block + text[m.end(1):]
+    try:
+        cml.write_text(updated, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return []
+    return added
+
+
 def register_firmware_tools(mcp) -> None:
     """Register every firmware compile-loop tool on the given FastMCP instance."""
 
     @mcp.tool()
-    def fw_status() -> str:
+    def fw_status(project_id: str = "") -> str:
         """Firmware provisioning doctor (T-FIN4) — call FIRST before any fw_* work.
 
         Detects each firmware CLI (cmake, ninja, arm-none-eabi-gcc, renode,
@@ -53,15 +201,33 @@ def register_firmware_tools(mcp) -> None:
           notes}``). ESP32 is build+flash only (``emulation="none"``).
         - ``banners`` = human-readable fix-it lines; ``missing`` = absent core tools.
 
+        This doctor is GLOBAL: it reports the machine's toolchain provisioning, not any
+        one project. ``project_id`` is accepted (every sibling fw_* tool takes one, so
+        passing it here is the natural mistake) but IGNORED — the answer is identical
+        with or without it, and a ``note`` says so. For per-project state call
+        ``fw_sources(project_id=...)`` (its source list) or ``fw_build(project_id=...)``.
+
         Never fails (mirrors reveng_status / em_status): an unprovisioned machine
         still returns ``ok=true`` with everything ``found=false`` and install hints.
         Offline-safe — reads PATH + `--version` only, never the network.
         """
         try:
-            return _dumps(cb.call("fw_status", {}))
+            payload = cb.call("fw_status", {})
         except Exception as exc:  # noqa: BLE001 — the doctor itself never errors out
-            return _dumps({"ok": True, "tools": {}, "families": {}, "banners": [
-                f"fw_status probe degraded: {exc}"], "missing": []})
+            payload = {"ok": True, "tools": {}, "families": {}, "banners": [
+                f"fw_status probe degraded: {exc}"], "missing": []}
+        if project_id:
+            # Accept-and-ignore beats a hard unknown_argument refusal (which cost the
+            # agent a whole call), but the drop must be VISIBLE and must not pretend
+            # per-project provisioning exists.
+            payload = dict(payload)
+            payload["note"] = (
+                f"project_id={project_id!r} ignored: fw_status reports GLOBAL firmware "
+                "provisioning (detected CLIs + per-family capability), not per-project "
+                "state. For this project call fw_sources(project_id=...) for its source "
+                "list or fw_build(project_id=...) to compile it."
+            )
+        return _dumps(payload)
 
     @mcp.tool()
     def fw_new_project(name: str = "", mcu_family: str = "", toolchain: str = "cmake",
@@ -72,7 +238,10 @@ def register_firmware_tools(mcp) -> None:
         firmware to a PCB: the MCU family is then auto-selected from the board's BOM when
         ``mcu_family`` is left empty, and a ``build/include/pinmap.h`` header of
         ``#define PIN_<NET> <n>`` is generated from the board's net names. Returns
-        ``{project_id, project, pinmap_path?}``.
+        ``{project_id, project, root_dir, pinmap_path?}``.
+
+        The project directory lives outside the fs_* workspace jail, so author its code with
+        ``fw_sources(project_id, write={"src/main.c": "<code>"})`` — NOT fs_write.
         """
         params: dict = {"toolchain": toolchain or "cmake"}
         if name:
@@ -81,7 +250,19 @@ def register_firmware_tools(mcp) -> None:
             params["mcu_family"] = mcu_family
         if board_doc_ref:
             params["board_doc_ref"] = board_doc_ref
-        return _dumps(cb.call("fw_new_project", params))
+        result = cb.call("fw_new_project", params)
+        pid = (result or {}).get("project_id")
+        if pid:
+            root = project_root(pid)
+            if root is not None:
+                result = dict(result)
+                result["root_dir"] = str(root)
+                result["authoring"] = (
+                    'write source code with fw_sources(project_id="%s", '
+                    'write={"src/main.c": "<code>"}) — this directory is outside the '
+                    "fs_write workspace jail" % pid
+                )
+        return _dumps(result)
 
     @mcp.tool()
     def fw_build(project_id: str) -> str:
@@ -93,21 +274,105 @@ def register_firmware_tools(mcp) -> None:
         return _dumps(cb.call("fw_build", {"project_id": project_id}))
 
     @mcp.tool()
-    def fw_sources(project_id: str, add: Optional[list[str]] = None,
-                   remove: Optional[list[str]] = None) -> str:
-        """List the project's source files, or add/remove them (paths relative to the project root).
-        Adding a new path creates an empty stub so the next build sees it. Returns ``{src_paths}``.
+    def fw_sources(project_id: str, add: Optional[list] = None,
+                   remove: Optional[list[str]] = None,
+                   write: Optional[dict] = None) -> str:
+        """List, add/remove, or WRITE the project's source files (paths relative to the
+        project root). Returns ``{src_paths}`` plus ``{written, cmake_sources_added}`` when
+        content was authored.
+
+        This is the ONLY way to get firmware source code onto disk: a project root lives
+        outside the fs_* workspace jail (fs_write refuses it as ``outside_workspace_root``),
+        and ``add`` alone only materialises an EMPTY stub.
+
+        - ``write={"src/main.c": "int main(void){...}"}`` — create-or-overwrite each file
+          with that exact text, register it in the project, and (for compilable
+          ``.c/.cpp/.cc/.cxx/.s`` paths) append it to the CMakeLists ``add_executable()``
+          list so the next ``fw_build`` actually compiles it. Read it back with
+          ``fs_read`` — the file is at ``<root_dir>/<relpath>``.
+        - ``add=["src/driver.c"]`` — register + empty stub (unchanged).
+          ``add=[{"path": "src/driver.c", "content": "..."}]`` is accepted as a synonym for
+          ``write``.
+        - ``remove=["src/startup.c"]`` — deregister (the file itself is left on disk).
+
+        Paths must stay inside the project (``..`` refuses); an absolute path under the
+        project root is relativised for you.
         """
-        params: dict = {"project_id": project_id}
-        if add:
-            params["add"] = add
+        plain_add: list[str] = []
+        content_map: dict = {}
+        for entry in (add or []):
+            if isinstance(entry, dict):
+                rel = entry.get("path") or entry.get("relpath") or entry.get("file") or ""
+                if not rel:
+                    return _dumps(_err(
+                        "invalid_request",
+                        "an add[] object needs a 'path' key, e.g. "
+                        '{"path": "src/driver.c", "content": "..."}'))
+                content_map[rel] = entry.get("content", entry.get("text", ""))
+            else:
+                plain_add.append(str(entry))
+        for rel, text in (write or {}).items():
+            content_map[rel] = text
+
+        if not content_map:
+            # Unchanged legacy path: list / add-stub / remove, byte-identical.
+            params: dict = {"project_id": project_id}
+            if plain_add:
+                params["add"] = plain_add
+            if remove:
+                params["remove"] = remove
+            return _dumps(cb.call("fw_sources", params))
+
+        root = project_root(project_id)
+        if root is None:
+            return _dumps(_err(
+                "unknown_project",
+                f"no firmware project {project_id!r} on disk — call fw_new_project first "
+                "and pass the project_id it returns"))
+
+        normalised: dict = {}
+        for rel, text in content_map.items():
+            safe, problem = _safe_relpath(rel, root)
+            if safe is None:
+                return _dumps(_err("invalid_request", problem))
+            if not isinstance(text, str):
+                return _dumps(_err(
+                    "invalid_request",
+                    f"content for {safe} must be a string, got {type(text).__name__}"))
+            normalised[safe] = text
+
+        params = {"project_id": project_id,
+                  "add": plain_add + [r for r in normalised if r not in plain_add]}
         if remove:
             params["remove"] = remove
-        return _dumps(cb.call("fw_sources", params))
+        result = cb.call("fw_sources", params)
+        if not isinstance(result, dict) or "src_paths" not in result:
+            return _dumps(result)
+
+        written = []
+        for rel, text in normalised.items():
+            abs_path = root / rel
+            try:
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                data = text.encode("utf-8")
+                abs_path.write_bytes(data)
+            except OSError as exc:
+                return _dumps(_err("write_failed", f"{abs_path}: {exc}",
+                                   src_paths=result.get("src_paths")))
+            written.append({"path": rel, "abs_path": str(abs_path), "bytes": len(data)})
+
+        result = dict(result)
+        result["root_dir"] = str(root)
+        result["written"] = written
+        added = _ensure_cmake_sources(root, list(normalised))
+        if added:
+            result["cmake_sources_added"] = added
+        return _dumps(result)
 
     @mcp.tool()
     def fw_sim_run(project_id: str, elf_path: str = "", scenario: str = "",
-                   assertions: Optional[list[str]] = None) -> str:
+                   assertions: Optional[list[str]] = None, run_s: float = 0.0,
+                   timeout_s: float = 0.0, power_profile: bool = False) -> str:
         """Run the firmware emulation loop via Renode or QEMU and return SimResult.
 
         SimResult fields: ``{passed, uart_log, gpio_states, assertion_results, ms,
@@ -157,6 +422,18 @@ def register_firmware_tools(mcp) -> None:
         duty x the board's T-FIN8 ``eng.supply.rails`` currents). Bookkeeping, not
         SPICE. Use fw_power_profile to derive one from an existing trace.
 
+        ``run_s`` / ``timeout_s`` bound the run: ``timeout_s`` is the emulator wall-clock
+        budget (engine default 30 s) and the emulated machine is told to run for
+        ``timeout_s - 5 s``. Pass ``run_s`` to say how long the TARGET should run and the
+        5 s harness margin is added for you (``run_s=1.0`` → ``timeout_s=6.0``); an
+        explicit ``timeout_s`` wins. A scenario timeline longer than that still extends the
+        run — it is a floor, not a cap. Both are echoed in ``arg_notes``.
+
+        ``power_profile=True`` is not a knob here — the power profile is a SEPARATE tool,
+        ``fw_power_profile(trace_path=...)``, which post-processes the ``trace_path`` this
+        call returns. Passing it makes this call chain into fw_power_profile for you and
+        return the profile under ``power_profile``; ``arg_notes`` always names the tool.
+
         Falls back gracefully when neither Renode nor QEMU is installed (``passed=False``,
         ``uart_log`` explains what's missing). Run ``fw_build`` first to produce the ELF.
         """
@@ -167,7 +444,47 @@ def register_firmware_tools(mcp) -> None:
             p["scenario"] = scenario
         if assertions:
             p["assertions"] = assertions
-        return _dumps(cb.call("fw_sim_run", p))
+        notes: list[str] = []
+        if timeout_s > 0:
+            p["timeout_s"] = float(timeout_s)
+            if run_s > 0:
+                notes.append(
+                    f"run_s={run_s} ignored: explicit timeout_s={timeout_s} wins "
+                    f"(target runs for timeout_s-{_SIM_HARNESS_MARGIN_S:g}s)")
+        elif run_s > 0:
+            p["timeout_s"] = float(run_s) + _SIM_HARNESS_MARGIN_S
+            notes.append(
+                f"run_s={run_s} applied as timeout_s={p['timeout_s']:g} — the emulated "
+                f"target runs for {max(1.0, float(run_s)):g}s plus a "
+                f"{_SIM_HARNESS_MARGIN_S:g}s harness margin")
+        if power_profile:
+            notes.append(
+                "power_profile is not a fw_sim_run option — the profile comes from "
+                "fw_power_profile(trace_path=...), which needs the trace_path THIS call "
+                "returns; chaining it for you and returning it under 'power_profile'")
+        result = cb.call("fw_sim_run", p)
+        if not isinstance(result, dict):
+            return _dumps(result)
+        if notes or power_profile:
+            result = dict(result)
+        if power_profile:
+            trace = result.get("trace_path") or ""
+            if not trace:
+                notes.append(
+                    "no trace_path in this run (emulator absent or nothing recorded), so "
+                    "fw_power_profile could not be chained — build+emulate first, then "
+                    "call fw_power_profile(trace_path=...) yourself")
+            else:
+                try:
+                    result["power_profile"] = cb.call(
+                        "fw_power_profile", {"trace_path": trace, "project_id": project_id})
+                except Exception as exc:  # noqa: BLE001 — chaining never breaks the sim result
+                    notes.append(
+                        f"fw_power_profile(trace_path={trace!r}) failed: {exc} — call it "
+                        "directly to see the error")
+        if notes:
+            result["arg_notes"] = notes
+        return _dumps(result)
 
     @mcp.tool()
     def fw_verify_board(board_doc_ref: str, project_id: str = "",

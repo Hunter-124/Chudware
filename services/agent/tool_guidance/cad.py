@@ -4,6 +4,52 @@ from __future__ import annotations
 from typing import Any
 
 ENTRIES: dict[str, dict[str, Any]] = {
+    "analyze_stl_geometry": {
+        "prompt_note": (
+            "Alias of check_geometry_health. Takes doc_id, not a file path "
+            "— import_part the mesh first, then call this on the document."
+        ),
+    },
+    "assess_mesh_quality": {
+        "prompt_note": (
+            "Alias of check_geometry_health. We are a B-rep kernel, so this "
+            "reports SOLID topology health, not triangle quality."
+        ),
+    },
+    "check_geometry_health": {
+        "prompt_note": (
+            "Is this solid actually sound? Reports watertight/manifold plus "
+            "the COUNTS AND SIDS that justify it (free edges, non-manifold "
+            "edges, shells, solids, sliver faces, orientation). Run it "
+            "before an expensive FEA mesh, a CAM toolpath or a STEP/STL "
+            "export. `self_intersection` is always checked:false — the "
+            "kernel has no single-body test; use interference_check "
+            "instead. `volume_mm3` is null for a body with no solid. "
+            "repair/fill_holes/fix_normals/fix_winding are REFUSED: fix the "
+            "feature that made the bad body, using the sids it just listed."
+        ),
+    },
+    "design_audit": {
+        "prompt_note": (
+            "Alias of check_geometry_health — solid soundness only. It does "
+            "NOT check DFM, tolerances or drawings; those are dfm_check, "
+            "tolerance_stackup and review_drawing."
+        ),
+    },
+    "health_check": {
+        "prompt_note": (
+            "Alias of check_geometry_health for one body. For the "
+            "whole-part review battery call design_review; for sketch "
+            "state, sketch_health."
+        ),
+    },
+    "is_watertight": {
+        "prompt_note": (
+            "Alias of check_geometry_health (same tool, trimesh's name). "
+            "Returns the full report, not a bare bool — read `watertight` "
+            "plus free_edges/non_manifold_edges for why."
+        ),
+    },
     "activate_configuration": {
         "prompt_note": (
             "add_configuration does NOT switch the variant in — call this after "

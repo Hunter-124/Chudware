@@ -1,9 +1,9 @@
 // Copilot composer (T-RF6 split of legacy_chat.cpp): the auto-growing wrapping chat input,
 // file attachments + context refs, design/mission run launch, the session slash commands
-// (/compact /shake /handoff /btw /prewalk /skills /help), slash-menu autocomplete (commands +
-// skills), the submitTurn send path, and the composer chrome (runtime banner, Agent/Plan/
-// Swarm/Edit/Ask prelude + context/provider-limit gauge rings, graduated segmented toolbar,
-// in-box send/stop).
+// (/compact /shake /handoff /btw /prewalk /rule /skills /help), slash-menu autocomplete
+// (commands + skills), the submitTurn send path, and the composer chrome (runtime banner,
+// Agent/Plan/Swarm/Edit/Ask prelude + context/provider-limit gauge rings, graduated
+// segmented toolbar, in-box send/stop).
 
 #include "copilot_internal.h"
 #include "ui/provider_usage.h"   // THE subscription-usage poller behind the prelude's limit rings
@@ -772,6 +772,8 @@ static const SlashItem kSessionSlashItems[] = {
      "Side question (does not enter the transcript)", "ask"},
     {SlashKind::Session, "/prewalk", "/prewalk",
      "Arm agent prewalk for the next turn", "plan_board"},
+    {SlashKind::Session, "/rule ", "/rule",
+     "New rule: /rule <trigger words> -> <context to inject>", "plan_board"},
     {SlashKind::Meta, "/skills", "/skills",
      "List available skills", "team"},
     {SlashKind::Meta, "/help", "/help",
@@ -1079,6 +1081,45 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
         return true;
     }
 
+    // /rule <trigger words> -> <context to inject>
+    // Creates a live Rule (aicad.trigger/1) through the worker's single writer and jumps to
+    // Settings -> AI -> Rules so the user lands on the row they just made. Both halves are
+    // required server-side: a rule with no match could never fire.
+    if (cmd == "/rule") {
+        static const char* kRuleUsage =
+            "Usage: /rule <trigger words> -> <context to inject>";
+        if (rest.find("->") == std::string::npos) {
+            st.toast(ui::ToastLevel::Warn, kRuleUsage);
+            return true;
+        }
+        nlohmann::json params = nlohmann::json::object();
+        params["text"] = "/rule " + rest;
+        st.rpc.call("rule_create", params, [&st](const core::RpcResult& r) {
+            if (!r.ok || !r.result.is_object()) {
+                st.toast(ui::ToastLevel::Error,
+                         r.err.empty() ? "rule_create failed (worker missing rule_create?)"
+                                       : r.err);
+                return;
+            }
+            if (!r.result.value("ok", false)) {
+                std::string why = r.result.value("reason", std::string("rule_create failed"));
+                const std::string hint = r.result.value("hint", std::string());
+                if (!hint.empty()) why += "  \xc2\xb7  " + hint;
+                st.toast(ui::ToastLevel::Warn, why);
+                return;
+            }
+            const std::string id = r.result.value("id", std::string());
+            const std::string kw = r.result.value("keyword", std::string());
+            pushSessionNotice(st, "Rule \"" + id + "\" created \xe2\x80\x94 fires when \"" + kw +
+                                      "\" appears. Edit it in Settings \xc2\xb7 AI \xc2\xb7 Rules.");
+            st.addLog("[..] /rule: created rule '" + id + "'");
+            st.openSettings = true;
+            st.openSettingsTab = 6;  // AI tab, Rules sub-tab
+        }, 20000);
+        st.toast(ui::ToastLevel::Info, "Creating rule\xe2\x80\xa6");
+        return true;
+    }
+
     if (cmd == "/btw") {
         if (rest.empty()) {
             st.toast(ui::ToastLevel::Warn, "Usage: /btw <question>");
@@ -1318,7 +1359,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
         st.toast(ui::ToastLevel::Info,
                  "/compact [snapcompact|shake|summary]  /shake [elide|images]  "
                  "/handoff [focus]  /btw <q>  /prewalk  /skills  "
-                 "(type / for autocomplete)");
+                 "/rule <words> -> <context>  (type / for autocomplete)");
         return true;
     }
     if (cmd == "/skills") {

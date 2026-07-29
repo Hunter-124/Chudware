@@ -62,8 +62,18 @@ def _run(request, provider, **kw):
         tool_dispatch=lambda t, a: {"ok": True}, **kw)
 
 
-def _last_user(provider):
-    return provider.seen_messages[-1]
+def _request_msg(provider):
+    """The user message carrying the REQUEST and its attachments.
+
+    Deliberately not `seen_messages[-1]`. Since the Rules engine went live
+    (2026-07-29) a matching rule appends its own `role: "user"` ADVISORY message
+    before the first completion, so the request is no longer last. The request
+    message is the first user-role one; the advisory follows it and carries no
+    attachments (pinned by test_a_rule_advisory_never_contaminates_the_request).
+    """
+    users = [m for m in provider.seen_messages if m.get("role") == "user"]
+    assert users, "no user message reached the provider"
+    return users[0]
 
 
 def _images(msg):
@@ -80,7 +90,7 @@ def test_image_attachment_becomes_one_image_part(tmp_path):
     _run("what is wrong with this drawing?", provider,
          attachments=[{"path": shot, "name": "shot.png", "kind": "image",
                        "mime": "image/png"}])
-    msg = _last_user(provider)
+    msg = _request_msg(provider)
     assert msg["role"] == "user"
     assert _texts(msg) == ["what is wrong with this drawing?"]
     assert _images(msg) == [
@@ -93,7 +103,7 @@ def test_mime_is_honoured_not_forced_to_png(tmp_path):
     _run("look", provider,
          attachments=[{"path": shot, "name": "photo.jpg", "kind": "image",
                        "mime": "image/jpeg"}])
-    assert _images(_last_user(provider))[0]["mime"] == "image/jpeg"
+    assert _images(_request_msg(provider))[0]["mime"] == "image/jpeg"
 
 
 def test_slash_command_rebuild_keeps_the_image(monkeypatch, tmp_path):
@@ -116,7 +126,7 @@ def test_slash_command_rebuild_keeps_the_image(monkeypatch, tmp_path):
     _run("/vision describe this image", provider,
          attachments=[{"path": shot, "name": "shot.png", "kind": "image",
                        "mime": "image/png"}])
-    msg = _last_user(provider)
+    msg = _request_msg(provider)
     # The slash command really was stripped (we are on the rebuild path) ...
     assert _texts(msg) == ["describe this image"]
     # ... and the image survived it.
@@ -144,7 +154,7 @@ def test_malformed_attachments_are_skipped_without_raising(tmp_path):
         {"path": str(huge), "name": "huge.png", "kind": "image"},
         {"path": good, "name": "good.png", "kind": "image"},
     ])
-    msg = _last_user(provider)
+    msg = _request_msg(provider)
     assert _texts(msg) == ["check these"]
     assert [p["path"] for p in _images(msg)] == [good]
 
@@ -153,7 +163,7 @@ def test_directory_path_is_not_an_image(tmp_path):
     provider = _RecordingProvider()
     _run("hi", provider,
          attachments=[{"path": str(tmp_path), "name": "dir", "kind": "image"}])
-    assert _images(_last_user(provider)) == []
+    assert _images(_request_msg(provider)) == []
 
 
 def test_at_most_eight_images_and_they_are_the_first_eight(tmp_path):
@@ -162,7 +172,7 @@ def test_at_most_eight_images_and_they_are_the_first_eight(tmp_path):
     _run("all of them", provider, attachments=[
         {"path": p, "name": f"img{i:02d}.png", "kind": "image"}
         for i, p in enumerate(paths)])
-    got = [p["path"] for p in _images(_last_user(provider))]
+    got = [p["path"] for p in _images(_request_msg(provider))]
     assert got == paths[:8]
 
 
@@ -171,7 +181,7 @@ def test_default_mime_when_absent(tmp_path):
     provider = _RecordingProvider()
     _run("look", provider,
          attachments=[{"path": shot, "name": "shot.png", "kind": "image"}])
-    assert _images(_last_user(provider))[0]["mime"] == "image/png"
+    assert _images(_request_msg(provider))[0]["mime"] == "image/png"
 
 
 def test_no_attachments_is_byte_identical_to_before():
@@ -266,3 +276,30 @@ def test_run_linear_role_turn_forwards_attachments(monkeypatch):
         "plain turn", "general_agent", object(),
         tool_dispatch=lambda t, a: {"ok": True})
     assert captured["attachments"] is None
+
+
+def test_a_rule_advisory_never_contaminates_the_request(tmp_path):
+    """A fired rule must be its OWN message, not folded into the user's turn.
+
+    "what is wrong with this drawing?" matches the drawing_standards rule, so this
+    turn really does inject. The request message must still hold exactly the user's
+    text and their one image, and the advisory must arrive as a separate user-role
+    message with no attachments — otherwise an injected block would ride inside the
+    user's own turn and be indistinguishable from something they wrote.
+    """
+    shot = _png(tmp_path / "shot.png")
+    provider = _RecordingProvider()
+    _run("what is wrong with this drawing?", provider,
+         attachments=[{"path": shot, "name": "shot.png", "kind": "image",
+                       "mime": "image/png"}])
+    users = [m for m in provider.seen_messages if m.get("role") == "user"]
+    req = users[0]
+    assert _texts(req) == ["what is wrong with this drawing?"]
+    assert len(_images(req)) == 1
+
+    advisories = [m for m in users[1:]
+                  if any("[ADVISORY" in t for t in _texts(m))]
+    assert advisories, "the drawing_standards rule should have injected here"
+    for adv in advisories:
+        assert _images(adv) == [], "an advisory must not carry attachments"
+        assert "what is wrong with this drawing?" not in " ".join(_texts(adv))

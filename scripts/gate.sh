@@ -429,9 +429,11 @@ stage_appimage_smoke() {
 #
 # Pre-existing test failures inside the collected suites are RECORDED (non-fatal) here,
 # matching the check.py FAIL-RECORDED policy. Only a hard collection crash or a zero-
-# collected result sets fail_fatal=1. The sweep runs one pytest invocation per top-level
-# directory to avoid the ~29 cross-suite pollution failures that occur in a combined run
-# (pytest's import ordering differs per-dir vs. combined; T-V2 owns that audit).
+# collected result sets fail_fatal=1. The sweep runs one pytest invocation per unit —
+# per top-level directory, and for `services/` one per subpackage (plus its few
+# root-level test files) — to avoid the cross-suite pollution failures that occur in a
+# combined run (pytest's import ordering differs per-dir vs. combined; T-V2 owns that
+# audit).
 stage_pytest() {
     echo "=== [4/6] engine + agent pytest ==="
 
@@ -471,17 +473,83 @@ stage_pytest() {
         echo "  CHUDWARE_LIBCHUDWARE not set and no libchudware.so under core/build-{occt-,}linux/bin; core-calling tests will skip/deselect"
     fi
 
-    # --- per-directory sweep ---
-    # One invocation per top-level dir avoids cross-suite import-order pollution
+    # --- per-unit sweep ---
+    # One invocation per unit avoids cross-suite import-order pollution
     # (combined run has ~29 extra failures; T-V2 owns the cleanup).
-    local dirs=("mcp_server" "services" "tools" "training")
+    #
+    # `services/` is swept one level DEEPER than the other top-level dirs: it holds
+    # ~370 test files across ~20 subpackages. Measured 2026-07-29: as ONE invocation
+    # `pytest services` recorded 15 failures; split per-subpackage it records 13, with
+    # NO loss of collected tests (6986 -> 7071 collected; a node-id diff of combined
+    # vs. split collect-only showed zero ids only in the combined set). The 2 that
+    # vanish are services/mcp/test_registration_catalog.py's two catalog assertions:
+    # they pass alone and under `pytest services/mcp`, and fail as soon as the
+    # services/agent suite is collected first (it registers hydraulic_*/ask_user tools
+    # DEFAULT_TOOL_FAMILIES doesn't know) — i.e. pure registry/import-order pollution
+    # that was masking any genuine new regression. The remaining 13 (browser 9,
+    # services/mcp 2, sim 2) reproduce in isolation and are genuine pre-existing
+    # defects, so they are what this stage should actually be reporting.
+    #
+    # The unit list is DERIVED at runtime (glob), never hardcoded, so a new services
+    # subpackage is picked up automatically and cannot silently go unrun. The
+    # coverage guard below turns any enumeration gap into a hard failure.
+    local dirs=("mcp_server")
+    if [ -d "services" ]; then
+        local sd f
+        for sd in services/*/; do
+            sd="${sd%/}"
+            case "${sd##*/}" in __pycache__|.*) continue ;; esac
+            # Skip subpackages with no tests at all — they would only add rc=5 noise.
+            if [ -n "$(find "$sd" -name '__pycache__' -prune -o \
+                        \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)" ]; then
+                dirs+=("$sd")
+            fi
+        done
+        # Test files sitting directly in services/ (test_kernel_exec_aliases,
+        # test_paths_alias, test_worker_stream): one invocation each. They are NOT
+        # covered by any services/<subdir> unit, and `pytest services` would drag the
+        # whole tree back in, so they are passed as explicit file targets.
+        for f in services/test_*.py services/*_test.py; do
+            [ -f "$f" ] && dirs+=("$f")
+        done
+    fi
+    dirs+=("tools" "training")
+
+    # Coverage guard: every test file under services/ must be reachable from exactly
+    # one unit above. If the glob enumeration ever loses a suite (renamed subpackage,
+    # tests parked in a directory the glob skips), that suite would stop running while
+    # the stage still reported PASS — the exact masking this split exists to remove.
+    # So a mismatch is fatal, not a warning.
+    if [ -d "services" ]; then
+        local svc_total=0 svc_covered=0 svc_units=0 u n
+        svc_total="$(find services -name '__pycache__' -prune -o \
+                     \( -name 'test_*.py' -o -name '*_test.py' \) -print | wc -l)"
+        for u in "${dirs[@]}"; do
+            case "$u" in services/*) ;; *) continue ;; esac
+            svc_units=$((svc_units + 1))
+            if [ -d "$u" ]; then
+                n="$(find "$u" -name '__pycache__' -prune -o \
+                     \( -name 'test_*.py' -o -name '*_test.py' \) -print | wc -l)"
+            else
+                n=1
+            fi
+            svc_covered=$((svc_covered + n))
+        done
+        echo "  services sweep: $svc_units units covering $svc_covered/$svc_total test files"
+        if [ "$svc_covered" -ne "$svc_total" ]; then
+            record "pytest              FAIL    services sweep covers only $svc_covered of $svc_total test files — the per-subpackage enumeration lost a suite"
+            echo "  FAIL: services sweep covers $svc_covered of $svc_total test files — enumeration gap"
+            fail_fatal=1
+        fi
+    fi
+
     local total_collected=0
     local total_passed=0
     local any_hard_fail=0
 
     for dir in "${dirs[@]}"; do
-        if [ ! -d "$dir" ]; then
-            echo "  $dir: directory not found, skipping"
+        if [ ! -e "$dir" ]; then
+            echo "  $dir: path not found, skipping"
             continue
         fi
 
@@ -537,7 +605,7 @@ stage_pytest() {
         fi
     done
 
-    echo "  total collected ≈ $total_collected tests across ${#dirs[@]} dirs"
+    echo "  total collected ≈ $total_collected tests across ${#dirs[@]} units"
     record "pytest              total ≈ $total_collected collected | $total_passed passed | (T-V4: foam_case+lbm+test_aicm ignores removed — trimesh+OCP now installed; T-RF5: test_loop_mock.py deleted with the legacy loop)"
 
     # The stage header has claimed since T-V2 that "a zero-collected result sets
@@ -547,7 +615,7 @@ stage_pytest() {
     # collected tests across all of them is always a harness break, never an
     # environment SKIP.
     if [ "$total_collected" -eq 0 ]; then
-        record "pytest              FAIL    zero tests collected across ${dirs[*]} — the suite did not run (harness/cwd break, not an environment SKIP)"
+        record "pytest              FAIL    zero tests collected across ${#dirs[@]} sweep units — the suite did not run (harness/cwd break, not an environment SKIP)"
         echo "  FAIL: zero tests collected — the Python suites did not run at all"
         fail_fatal=1
     fi

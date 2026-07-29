@@ -505,3 +505,91 @@ def test_publishing_a_task_list_is_not_doing_the_work():
         request="What would it take to toggle PA5 on an STM32F4?",
         can_act=True,
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# A delegate that never ran is not work (live 2026-07-29, firmware pass 2c)
+# ---------------------------------------------------------------------------
+
+# The VERBATIM node the live run produced: approved, executed=true, and no evidence
+# whatsoever that a child ever started.
+_NOT_RUN_DELEGATE = {
+    "id": "dg_1af89bf4626a",
+    "role": "firmware_engineer",
+    "kind": "worker",
+    "depth": 1,
+    "model": {"provider": "", "id": "", "tier": ""},
+    "budget": {"tokens_granted": 50000, "tokens_spent": 0, "attempts": 0},
+    "docs": [],
+    "status": "approved",
+    "executed": True,
+}
+
+
+def test_delegation_verdict_downgrades_a_node_that_never_ran():
+    """executed=true with zero tokens, zero attempts and no model is not execution."""
+    from services.agent.mission_dispatch import _delegation_execution_verdict
+
+    v = _delegation_execution_verdict(dict(_NOT_RUN_DELEGATE))
+    assert v["executed"] is False
+    assert v["ok"] is False
+    assert v["subagent_status"] == "not_run"
+    assert "did NOT run" in v["note"]
+    assert "no model was bound" in v["note"]
+
+
+def test_delegation_verdict_leaves_a_real_run_alone():
+    """Any one piece of evidence — tokens, attempts, handoff, docs — means it ran."""
+    from services.agent.mission_dispatch import _delegation_execution_verdict
+
+    for evidence in (
+        {"budget": {"tokens_spent": 1234, "attempts": 1}},
+        {"budget": {"tokens_spent": 0, "attempts": 2}},
+        {"handoff": {"summary": "built it"}},
+        {"docs": ["doc-1"]},
+        {"subagent_status": "done"},
+    ):
+        node = {"executed": True, "model": {"provider": "", "id": ""}, **evidence}
+        assert _delegation_execution_verdict(node) == {}, evidence
+
+
+def test_a_delegate_that_never_ran_is_not_real_work():
+    """The load-bearing half: the unearned-finish gate must not accept it.
+
+    One `delegate` call and nothing else let a live turn close as `confirmed` on the
+    fabricated summary "STM32F4 heartbeat firmware simulated for 1 second".
+    """
+    from services.agent import agent_turn as at
+
+    node = dict(_NOT_RUN_DELEGATE)
+    node.update({"executed": False, "subagent_status": "not_run"})
+    assert at._did_real_work([{"tool": "delegate", "ok": True, "result": node}]) is False
+    # …and the same call as a JSON string, which is how tool results usually arrive.
+    assert at._did_real_work(
+        [{"tool": "delegate", "ok": True, "result": json.dumps(node)}]) is False
+
+
+def test_a_delegate_that_did_run_still_counts_as_work():
+    from services.agent import agent_turn as at
+
+    assert at._did_real_work([{"tool": "delegate", "ok": True, "result": {
+        "executed": True, "budget": {"tokens_spent": 900, "attempts": 1},
+        "handoff": {"summary": "done"}}}]) is True
+
+
+def test_an_unparseable_delegate_result_is_not_treated_as_a_failure():
+    """Never invent a verdict: an opaque result keeps its existing meaning."""
+    from services.agent import agent_turn as at
+
+    assert at._did_real_work(
+        [{"tool": "delegate", "ok": True, "result": "<not json>"}]) is True
+    assert at._did_real_work([{"tool": "delegate", "ok": True, "result": None}]) is True
+
+
+def test_the_delegate_check_does_not_touch_other_tools():
+    """Only `delegate` is inspected — a tool whose payload happens to say executed:false
+    must not be reclassified."""
+    from services.agent import agent_turn as at
+
+    assert at._did_real_work([{"tool": "add_features", "ok": True,
+                               "result": {"executed": False}}]) is True

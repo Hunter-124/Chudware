@@ -1955,12 +1955,52 @@ _APPEARANCE_PRESETS = {
     "brass":     {"color": [0.80, 0.62, 0.28], "metallic": 0.95, "roughness": 0.30},
     "copper":    {"color": [0.85, 0.54, 0.40], "metallic": 0.95, "roughness": 0.30},
     "gold":      {"color": [0.90, 0.74, 0.36], "metallic": 0.97, "roughness": 0.28},
+    "titanium":  {"color": [0.62, 0.61, 0.60], "metallic": 0.85, "roughness": 0.42},
+    "nylon":     {"color": [0.90, 0.89, 0.85], "metallic": 0.0,  "roughness": 0.55},
     "black":     {"color": [0.09, 0.10, 0.12], "metallic": 0.0,  "roughness": 0.50},
 }
 _APPEARANCE_ALIASES = {
     "aluminium": "aluminum", "al": "aluminum", "ss": "stainless",
     "stainless steel": "stainless", "pla": "plastic", "abs plastic": "abs",
-    "dark metal": "black",
+    "dark metal": "black", "ti": "titanium", "pa": "nylon", "nylon 6": "nylon",
+    "polyamide": "nylon", "mild steel": "steel", "carbon steel": "steel",
+    "tool steel": "steel",
+}
+
+# Engineering ALLOY DESIGNATIONS -> the appearance family they belong to. Consulted BEFORE the
+# family-word token scan in _resolve_appearance, because a designation can CONTAIN a FOREIGN
+# family token: "Ti-6Al-4V" (titanium grade 5) tokenises to {ti, al, v} and the "al" alias
+# rendered it as ALUMINIUM with no error at all (measured live 2026-07-29). A wrong metal that
+# reports success is worse than a refusal, so designations win over loose token matching.
+#
+# Only UNAMBIGUOUS designations are listed. 4-digit AISI steel (1018) and 4-digit wrought
+# aluminium (1100) share a leading digit, and "A2" is both a stainless fastener class and a tool
+# steel — so each entry is spelled out rather than derived from a series regex, and anything not
+# listed falls through to the token scan and then to a NAMED error. Never guessed.
+_ALLOY_DESIGNATIONS = {
+    # wrought aluminium
+    "1100": "aluminum", "2011": "aluminum", "2014": "aluminum", "2017": "aluminum",
+    "2024": "aluminum", "3003": "aluminum", "5052": "aluminum", "5083": "aluminum",
+    "5086": "aluminum", "6005": "aluminum", "6061": "aluminum", "6063": "aluminum",
+    "6082": "aluminum", "7050": "aluminum", "7075": "aluminum",
+    # carbon / alloy / tool steel
+    "a36": "steel", "a53": "steel", "a500": "steel", "a514": "steel", "a572": "steel",
+    "1008": "steel", "1010": "steel", "1018": "steel", "1020": "steel", "1026": "steel",
+    "1045": "steel", "1095": "steel", "12l14": "steel", "4130": "steel", "4140": "steel",
+    "4142": "steel", "4340": "steel", "8620": "steel", "o1": "steel", "d2": "steel",
+    "s7": "steel", "m2": "steel", "h13": "steel",
+    # stainless
+    "303": "stainless", "304": "stainless", "304l": "stainless", "309": "stainless",
+    "310": "stainless", "316": "stainless", "316l": "stainless", "321": "stainless",
+    "347": "stainless", "410": "stainless", "416": "stainless", "420": "stainless",
+    "430": "stainless", "440c": "stainless", "17-4": "stainless", "17-4ph": "stainless",
+    "15-5": "stainless", "2205": "stainless",
+    # brass / copper
+    "c260": "brass", "c360": "brass", "c464": "brass", "c110": "copper", "c101": "copper",
+    "c11000": "copper",
+    # titanium
+    "ti-6al-4v": "titanium", "ti6al4v": "titanium", "ti-64": "titanium", "ti64": "titanium",
+    "grade5titanium": "titanium", "grade2titanium": "titanium", "cpti": "titanium",
 }
 
 
@@ -1984,26 +2024,50 @@ def _resolve_appearance(material: Union[str, dict, list, tuple]) -> dict:
     key = str(material).strip().lower()
     key = _APPEARANCE_ALIASES.get(key, key)
     if key not in _APPEARANCE_PRESETS:
-        # Engineering designations are what a CAD model actually says: "A36
-        # steel", "6061-T6 Al", "304 stainless", "PLA filament". These are
-        # APPEARANCE presets, so the right answer is the closest visual match,
-        # not a rejection (live 2026-07-27: haiku lost a call to each of
-        # "A36 steel" and "6061-T6 Al"). Longest name first so "stainless
-        # steel" never resolves as plain "steel".
         import re as _re  # noqa: PLC0415
-        tokens = set(_re.findall(r"[a-z]+", key))
-        candidates = sorted(
-            set(_APPEARANCE_PRESETS) | set(_APPEARANCE_ALIASES),
-            key=len, reverse=True)
-        for cand in candidates:
-            hit = cand in key if " " in cand else cand in tokens
-            if hit:
-                key = _APPEARANCE_ALIASES.get(cand, cand)
+        # 1. An explicit ALLOY DESIGNATION wins outright. It must be tried before the loose
+        #    token scan below, which reads any family word ANYWHERE in the string and therefore
+        #    mis-read "Ti-6Al-4V" as aluminium. Compacted so "6061-T6" / "316L" / "A36 steel"
+        #    all reduce to a prefix of their designation; longest designation first so "316l"
+        #    is preferred over "316" and "17-4ph" over "17-4".
+        compact = _re.sub(r"[^a-z0-9]", "", key)
+        for desig in sorted(_ALLOY_DESIGNATIONS, key=len, reverse=True):
+            flat = _re.sub(r"[^a-z0-9]", "", desig)
+            if compact == flat or compact.startswith(flat):
+                key = _ALLOY_DESIGNATIONS[desig]
                 break
     if key not in _APPEARANCE_PRESETS:
+        # 2. A family WORD anywhere in the string: what a CAD model actually says —
+        #    "6061-T6 Al", "PLA filament", "mild steel" (live 2026-07-27: haiku lost a call to
+        #    each of "A36 steel" and "6061-T6 Al").
+        #
+        #    Precedence is EARLIEST-MATCH, then longest. Two reasons, both load-bearing:
+        #      * Alloy designations name the BASE metal first ("Ti-6Al-4V" is titanium with 6 %
+        #        aluminium), so the leading family word is the subject and a later one is an
+        #        ingredient. Scanning by length alone read that as aluminium.
+        #      * The candidate pool is built from a set, so equal-length aliases ("al", "ti")
+        #        had NO defined order — the answer depended on set iteration. A material that
+        #        renders differently run to run is the worst version of this bug, and sorting
+        #        by (position, -length, name) removes the nondeterminism entirely.
+        #    Longest-at-the-same-position still wins, so "stainless steel" beats "stainless".
+        import re as _re  # noqa: PLC0415
+        best: Optional[tuple] = None
+        for cand in set(_APPEARANCE_PRESETS) | set(_APPEARANCE_ALIASES):
+            # Whole-word match so "al" cannot fire inside "alloy" and "ti" not inside "tin".
+            m = _re.search(rf"(?<![a-z0-9]){_re.escape(cand)}(?![a-z0-9])", key)
+            if m is None:
+                continue
+            rank = (m.start(), -len(cand), cand)
+            if best is None or rank < best[0]:
+                best = (rank, cand)
+        if best is not None:
+            key = _APPEARANCE_ALIASES.get(best[1], best[1])
+    if key not in _APPEARANCE_PRESETS:
         raise ValueError(
-            f"Unknown appearance material {material!r}. Known: {sorted(_APPEARANCE_PRESETS)} "
-            f"(or pass {{'color':[r,g,b], 'metallic':0..1, 'roughness':0..1}})."
+            f"Unknown appearance material {material!r}. Known: {sorted(_APPEARANCE_PRESETS)}; "
+            f"common alloy designations (6061, A36, 304, 4140, Ti-6Al-4V, C360, …) resolve to "
+            f"their family. Or pass an explicit look: "
+            f"{{'color':[r,g,b], 'metallic':0..1, 'roughness':0..1}}."
         )
     return dict(_APPEARANCE_PRESETS[key])
 
@@ -2077,6 +2141,16 @@ _QVOCAB_HELP = (
     '"parallel"|"perpendicular":"x"|"y"|"z", "near":[x,y,z], "count":N}'
 )
 
+# A request for the part's OVERALL extent, which no face/edge query can answer. Kept separate
+# from the token grammar on purpose: these words must not become query keys, they must route the
+# model to the tool that reports a bbox (describe_part). "bbox"/"bounding box"/"overall
+# size"/"dimensions"/"extents"/"how big" are the spellings measured in live runs.
+# Separators are [\s_-] because models write bounding_box / bounding-box as often as two words,
+# and a JSON list renders as "['mass', 'bounding_box']" (measured live 2026-07-29).
+_BBOX_INTENT_RE = re.compile(
+    r"(?<![a-z0-9])(bbox|bounding[\s_-]*box|overall[\s_-]+(?:size|dimension|dimensions|extent|"
+    r"extents)|extents?|dimensions|how[\s_-]+big)(?![a-z0-9])")
+
 
 def _q_next_axis(toks: list[str], i: int) -> Optional[str]:
     """The axis letter qualifying toks[i] ("parallel to the -z axis" -> "z"), skipping filler.
@@ -2146,6 +2220,21 @@ def _as_face_query(q: Union[str, dict]) -> dict:
             break
 
     if not (side or surf or pick or orient or named_kind):
+        # A size/extent request is not a face/edge query at all — it is a different TOOL, and the
+        # vocabulary wall alone never says which (measured 2026-07-29: query_geometry("bbox") and
+        # ("bounding box") both dead-ended in the token grammar). describe_part's outline opens
+        # with `bbox WxDxH mm`; measure_part carries volume/mass/centroid but NO bbox — so name
+        # the tool that actually answers, and keep the two distinct. Checked ONLY here, after the
+        # grammar found nothing, so a real query that happens to contain one of these words
+        # ("the top face dimensions") still resolves as the query it is.
+        if _BBOX_INTENT_RE.search(text):
+            raise ValueError(
+                f"{q!r} asks for the part's overall SIZE, which is not a face/edge query — this "
+                f"tool resolves individual faces/edges. Call describe_part(doc_id) instead: its "
+                f"outline opens with `bbox WxDxH mm` (plus the flat-face sid roster). For volume "
+                f"/ mass / centre of mass call measure_part(doc_id) — it does NOT report a bbox. "
+                f"To measure ONE face or edge, name it (e.g. \"top\") or pass a query "
+                f"{_QVOCAB_HELP}.")
         raise ValueError(
             f"Can't read {q!r} as a geometry query — the grammar is TOKENS, not prose. "
             f"Pass a dict {_QVOCAB_HELP}, e.g. "
@@ -4759,6 +4848,34 @@ def _resolve_drawing_view_id(doc_id: str, view_id: str) -> str:
     return view_id
 
 
+def _resolve_named_one_selector(doc_id: str, target, kind: Optional[str]) -> dict:
+    """A sid / feature id / feature NAME -> the ONE resolved face-or-edge match it designates.
+
+    Shares _resolve_inspect_target's precedence (sid, then feature id, then feature name), so a
+    handle that hover() accepts is a handle measuring accepts. Measuring is stricter in one way:
+    it needs exactly ONE face/edge, while a FEATURE legitimately owns many (a hole owns its
+    barrel + both rims). That is not an error to swallow — it is a pick, so the miss names the
+    candidate sids and tells the model to pass one.
+    """
+    got = _resolve_inspect_target(doc_id, target)  # raises, teaching, on a genuine miss
+    matches = [m for m in (got.get("matches") or []) if isinstance(m, dict)]
+    if kind:
+        matches = [m for m in matches if m.get("kind") == kind]
+    label = got.get("feature_name") or got.get("feature_id") or got.get("label") or target
+    if not matches:
+        raise ValueError(
+            f"{target!r} resolved to {label!r} but carries no {kind or 'face/edge'} to measure. "
+            f"Call describe_part(doc_id) for the face/edge roster and pass one of its sids.")
+    if len(matches) > 1:
+        sids = [str(m.get("sid")) for m in matches if m.get("sid")][:8]
+        raise ValueError(
+            f"{target!r} names {label!r}, which owns {len(matches)} faces/edges — measuring "
+            f"needs exactly one. Pass one of its sids"
+            + (f" ({', '.join(sids)})" if sids else "")
+            + ", or a query that singles one out (e.g. {\"of\":\"face\",\"pick\":\"largest\"}).")
+    return matches[0]
+
+
 def _resolve_one_selector(doc_id: str, query: Union[str, dict], kind: Optional[str] = None) -> dict:
     """Resolve a plain-English face/edge query to a SINGLE unambiguous topology selector dict.
 
@@ -4772,8 +4889,23 @@ def _resolve_one_selector(doc_id: str, query: Union[str, dict], kind: Optional[s
                     (e.g. {"of":"edge","parallel":"z","pick":"largest"}) to single one out.
       * 0 match  -> raise.
     kind, when given ("face"/"edge"), filters the matches to that topology kind first.
+
+    A string that is NOT query vocabulary is not automatically a mistake: describe_part and
+    query_geometry both hand the model back stable sids ("Fedecf8"), and the feature tree hands
+    back ids/names ("f2", "Boss") — all three name ONE face/edge, and both tools' own docstrings
+    tell the model to look them up there first. Rejecting them broke that documented loop
+    (measured live 2026-07-29: feeding query_geometry's own sid into measure_between raised
+    "Can't read 'Fedecf8' as a geometry query"). Those spellings are resolved through
+    _resolve_inspect_target — the SAME full-precedence resolver hover/inspect use — rather than
+    growing a second grammar here.
     """
-    q = query if isinstance(query, dict) else _as_face_query(query)
+    if isinstance(query, dict):
+        q = query
+    else:
+        try:
+            q = _as_face_query(query)
+        except ValueError:
+            return _resolve_named_one_selector(doc_id, query, kind)
     res = cb.call("doc_query", {"doc_id": doc_id, "query": q})
     matches = res.get("matches", [])
     if kind:

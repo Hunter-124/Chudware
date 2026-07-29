@@ -661,10 +661,35 @@ _META_TOOLS_NOT_WORK = frozenset({
 })
 
 
+def _delegate_actually_ran(call: dict) -> bool:
+    """False for a `delegate` whose own envelope says nothing executed.
+
+    mission_dispatch marks such a node `executed: False` / `subagent_status: "not_run"` (it used
+    to claim `executed: True` with zero tokens and no child output). Counting that as real work
+    is what let a turn close as `confirmed` on a fabricated summary — live 2026-07-29, firmware
+    pass 2c: one `delegate` call, nothing run, reply "STM32F4 heartbeat firmware simulated for
+    1 second". Only `delegate` is inspected; every other tool keeps its existing meaning.
+    """
+    if call.get("tool") != "delegate":
+        return True
+    res = call.get("result")
+    if isinstance(res, str):
+        try:
+            res = json.loads(res)
+        except (ValueError, TypeError):
+            return True          # unparseable — do not invent a verdict
+    if not isinstance(res, dict):
+        return True
+    if res.get("executed") is False or res.get("subagent_status") == "not_run":
+        return False
+    return True
+
+
 def _did_real_work(calls: list) -> bool:
-    """True when the model voluntarily called a non-meta tool this turn."""
+    """True when the model voluntarily called a non-meta tool that actually DID something."""
     return any(
         not c.get("forced") and c.get("tool") not in _META_TOOLS_NOT_WORK
+        and _delegate_actually_ran(c)
         for c in calls
     )
 
@@ -951,46 +976,83 @@ def _catalog_due(session_key: str | None) -> bool:
     return True
 
 
+# T-W21 §20 (Rules): cooldown + sequence state must OUTLIVE one run_turn()
+# call. A GUI session sends many turns; a rule with cooldown_turns=8 that
+# re-fired on every message would re-bill its pack and re-draw a transcript
+# chip every time. Keyed by subagent_id/run_id, bounded so a long-lived worker
+# cannot grow it without limit. Calls with no session identity (tests, one-shot
+# headless callers) get a private dict, keeping per-call isolation.
+_TRIG_SESSIONS: dict[str, dict] = {}
+_TRIG_SESSIONS_MAX = 64
+
+
+def _trigger_session_state(session_key: str | None) -> dict:
+    """``{"cool": {trigger_id: last_fired_seq}, "seq": int}`` for *session_key*."""
+    if not session_key:
+        return {"cool": {}, "seq": 0}
+    st = _TRIG_SESSIONS.get(session_key)
+    if st is None:
+        st = {"cool": {}, "seq": 0}
+        _TRIG_SESSIONS[session_key] = st
+        while len(_TRIG_SESSIONS) > _TRIG_SESSIONS_MAX:
+            _TRIG_SESSIONS.pop(next(iter(_TRIG_SESSIONS)), None)
+    return st
+
+
 def _maybe_inject_trigger_advisory(
     *,
     output_text: str,
     tool_names: list[str],
     seq: int,
     cooldown_state: dict,
+    events: list[str] | None = None,
     stage: str = "agent_turn",
-) -> str | None:
-    """T-W21 §20 / mega-25: render matched trigger context packs for the
-    PREVIOUS iteration's model output + tool calls, or ``None`` when nothing
-    fires (cheap no-match path — no import, no engine call).
+) -> tuple[str | None, list[dict]]:
+    """T-W21 §20 / mega-25: render the context packs of every rule that matches
+    this turn's signals, and report which rules actually fired.
 
-    Delegates to the advisor engine (adapters.observe_build → engine.
-    build_advisory → render.render_advisory) so the effort gate
-    (``trigger_injection``), the ``[ADVISORY]`` block format, and the §3
-    candidate-fix invariant all come from the single source of truth in
-    advisor/engine.py — this wrapper only decides WHEN to call it (per turn,
-    with a run-local ``cooldown_state``) and folds the rendered block into
-    the conversation. ``res={}`` on the loop-path adapter: this call site has
-    no build123d result, only turn signals.
+    Returns ``(block, fired)``: the ``[ADVISORY]`` block to inject (``None``
+    when nothing fires — cheap no-match path) and one
+    ``{trigger_id, label, matched, tokens}`` record per rule whose pack
+    genuinely reached the block. The renderer applies a global advisory budget
+    ON TOP of each rule's ``budget_tokens``, so a matched rule can still be
+    dropped; those are filtered out of *fired* and their cooldown stamp is
+    rolled back — the transcript must never claim an injection that did not
+    happen, and a rule must not be suppressed by a firing it never got.
+
+    Delegates to the advisor engine (engine.build_advisory →
+    render.render_advisory) so the effort gate (``trigger_injection``), the
+    block format and the §3 candidate-fix invariant all come from the single
+    source of truth in advisor/engine.py. This wrapper only decides WHEN to
+    call it (per iteration, with a session-scoped ``cooldown_state``).
     """
-    if not output_text and not tool_names:
-        return None
+    if not output_text and not tool_names and not events:
+        return None, []
     try:
-        from services.agent.advisor import adapters as _adv_adapters  # noqa: PLC0415
         from services.agent.advisor import engine as _adv_engine  # noqa: PLC0415
         from services.agent.advisor import render as _adv_render  # noqa: PLC0415
     except Exception:  # noqa: BLE001
-        return None
+        return None, []
     try:
-        obs = _adv_adapters.observe_build(
-            {}, stage=stage, seq=seq,
-            output_text=output_text, tool_names=tool_names,
+        obs = _adv_engine.Observation(
+            stage=stage, seq=seq,
+            output_text=output_text,
+            tool_names=list(tool_names or []),
+            events=list(events or []),
             cooldown_state=cooldown_state,
         )
         advisory = _adv_engine.build_advisory(obs)
         block = _adv_render.render_advisory(advisory)
     except Exception:  # noqa: BLE001 — trigger layer never breaks a turn
-        return None
-    return block or None
+        return None, []
+    fired: list[dict] = []
+    for ev in advisory.get("trigger_events") or []:
+        tid = str(ev.get("trigger_id") or "")
+        if block and f"context:{tid}" in block:
+            fired.append(ev)
+        elif isinstance(cooldown_state, dict):
+            cooldown_state.pop(tid, None)
+    return (block or None), fired
 
 
 class _AssistantDeltaCoalescer:
@@ -1733,14 +1795,57 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _tasklist_pref = str(_fn_tl() or "off").strip().lower()
         except Exception:  # noqa: BLE001 — a preference read never breaks a turn
             _tasklist_pref = "off"
-    # T-W21 §20 / mega-25: trigger-injection bookkeeping scoped to THIS
-    # run_turn() call — messages/context is always fresh per call (no cross-
-    # call conversation continuity), so cooldown only needs to hold across
-    # this call's own tool-iteration loop.
-    _trig_cooldown_state: dict = {}
-    _trig_seq = 0
-    _trig_prev_text = ""
+    # T-W21 §20 (Rules): trigger-injection bookkeeping. Cooldown + sequence are
+    # SESSION-scoped (keyed by subagent_id/run_id) so a rule that fired on the
+    # user's previous message stays quiet for its cooldown_turns instead of
+    # re-injecting its pack — and re-drawing a transcript chip — every turn.
+    _trig_state = _trigger_session_state(subagent_id or run_id or None)
+    _trig_cooldown_state: dict = _trig_state["cool"]
+    # The FIRST model call matches the USER's own words (not `_req`, which by
+    # here also carries scaffold/reference blocks we injected ourselves — a rule
+    # must never fire on our own injected context). Waiting for the model to say
+    # "tapped hole" itself would deliver the pack a turn too late to steer it.
+    _trig_prev_text = request or ""
     _trig_prev_calls_idx = 0
+
+    def _emit_rule_fired(fire: dict) -> None:
+        """Stream + log ONE rule firing.
+
+        Frozen contract, shared with the GUI copilot feed::
+
+            kind: "agent.context_injected"
+            {"source": "rule", "rule_id", "label", "matched", "token_est"}
+
+        The feed turns this into the transcript context chip, so a rule
+        injection is VISIBLE to the user instead of a silent token charge. The
+        same record goes to the run ledger (§20: every firing is logged).
+        Best-effort: visibility never breaks a turn.
+        """
+        _rid = str(fire.get("trigger_id") or "")
+        _label = str(fire.get("label") or _rid)
+        _matched = str(fire.get("matched") or "")
+        _tok = int(fire.get("tokens") or 0)
+        try:
+            from services.agent import agent_events as _ae  # noqa: PLC0415
+            _kind, _payload = _ae.context_injected_event(
+                _ev_node, "rule", _label, token_est=_tok,
+                parent_id=_turn_span, actor=actor)
+            _payload["rule_id"] = _rid
+            _payload["matched"] = _matched
+            _payload["token_est"] = _tok
+            _ae.emit_event(_kind, _payload, live=on_event, journal=_ev_journal)
+        except Exception:  # noqa: BLE001
+            pass
+        if ledger is not None:
+            try:
+                ledger.append(actor or name, "agent_turn", {
+                    "event": "trigger_fired",
+                    "rule_id": _rid,
+                    "matched": _matched,
+                    "tokens": _tok,
+                })
+            except Exception:  # noqa: BLE001
+                pass
     # One trim-and-retry per turn on context overflow, then fail honestly.
     _ctx_overflow_retried = False
     # Auto-enable-on-reach budget. Bounded so a model that keeps reaching for
@@ -1827,22 +1932,26 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                          "steer_id": _steer.get("steer_id", "")})
             except Exception:  # noqa: BLE001
                 pass
-        # T-W21 §20: inject matched trigger context packs from the PREVIOUS
-        # iteration's model output + tool calls (effort-gated inside; cheap
-        # no-op on the first iteration / no signal — mega-25).
+        # T-W21 §20 (Rules): inject the context packs of every rule matching the
+        # user's request (first iteration) or the PREVIOUS iteration's model
+        # output + tool calls, and stream one context chip per firing so the
+        # injection is visible in the transcript. Effort-gated inside; cheap
+        # no-op when nothing matches (mega-25).
         _trig_tool_names = [
             c.get("tool") for c in calls[_trig_prev_calls_idx:]
             if isinstance(c, dict) and c.get("tool")
         ]
-        _trig_block = _maybe_inject_trigger_advisory(
+        _trig_block, _trig_fired = _maybe_inject_trigger_advisory(
             output_text=_trig_prev_text,
             tool_names=_trig_tool_names,
-            seq=_trig_seq,
+            seq=int(_trig_state["seq"]),
             cooldown_state=_trig_cooldown_state,
         )
-        _trig_seq += 1
+        _trig_state["seq"] = int(_trig_state["seq"]) + 1
         if _trig_block:
             messages.append({"role": "user", "content": _parts(_trig_block)})
+        for _fire in _trig_fired:
+            _emit_rule_fired(_fire)
         try:
             reply = provider.complete(system, messages, max_tokens=completion_cap)
             # mega-6: drain last-call usage into ledger so spend is auditable.
@@ -3846,6 +3955,10 @@ def resolver_for(mission_dispatch: Any | None = None) -> Callable[[str], Any]:
 _SIG_CACHE: dict[Any, dict] = {}
 # name -> callable (directly callable) | None (registered but not callable here).
 _SERVER_TOOL_CACHE: dict[str, Any] | None = None
+# Why the last _server_tools() import failed, when it did. Read by
+# _unresolved_tool_error so an unbindable tool names the REAL cause instead of
+# asserting a mission-scope theory nobody checked.
+_SERVER_TOOL_IMPORT_ERROR: str | None = None
 _KNOWN_TOOLS_CACHE: frozenset[str] | None = None
 
 
@@ -3874,8 +3987,20 @@ def _server_tools() -> dict[str, Any]:
     This is the SAME registry the tools are advertised from, so anything the
     model can be handed resolves here — no per-module allow-list to forget.
     Imported lazily (only on a resolver miss) because it builds every tool
-    module; a hit costs one dict lookup afterwards."""
-    global _SERVER_TOOL_CACHE
+    module; a hit costs one dict lookup afterwards.
+
+    A FAILED import is never cached. It used to be: the handler swallowed the
+    exception, stored ``{}`` and returned that forever, so ONE transient import
+    error (a half-deployed module, a bad optional dependency) permanently
+    emptied the registry for the whole process and every later tool call came
+    back unbindable. The reason was discarded too, so the caller could only
+    guess — and _unresolved_tool_error guessed "mission-scoped tool", which is
+    the wrong place to look entirely. Observed live 2026-07-29: new_part,
+    list_parts and import_part all reported as mission-scoped while the real
+    cause was a module that briefly failed to import. Keep the error text so
+    the diagnosis can name it.
+    """
+    global _SERVER_TOOL_CACHE, _SERVER_TOOL_IMPORT_ERROR
     if _SERVER_TOOL_CACHE is None:
         out: dict[str, Any] = {}
         try:
@@ -3883,8 +4008,10 @@ def _server_tools() -> dict[str, Any]:
             for name, entry in getattr(_srv._tool_manager, "_tools", {}).items():
                 fn = getattr(entry, "fn", None)
                 out[str(name)] = fn if _directly_callable(fn) else None
-        except Exception:  # noqa: BLE001 — registry absent → no fallback, no crash
-            out = {}
+        except Exception as exc:  # noqa: BLE001 — registry absent → no fallback, no crash
+            _SERVER_TOOL_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+            return {}  # NOT cached: a later call may well succeed
+        _SERVER_TOOL_IMPORT_ERROR = None
         _SERVER_TOOL_CACHE = out
     return _SERVER_TOOL_CACHE
 
@@ -4138,6 +4265,26 @@ def _migrate_op_tool(tool: str, args: dict) -> tuple[dict, str] | None:
     return {"doc_id": doc_id, "ops": [op]}, note
 
 
+def _is_mission_scoped_tool(tool: str) -> bool:
+    """True when *tool* really is resolved by the mission dispatcher rather than the registry.
+
+    Derived from MissionDispatch's own handler table so it cannot drift from the truth the way a
+    hardcoded list would. A tool-less MissionDispatch (no run, no tree) still EXPOSES the handler
+    names, which is exactly the question being asked: "is this name mission-owned?", not "can it
+    run right now". Any failure to introspect answers False — claiming mission scope on a guess is
+    the bug this helper exists to stop.
+    """
+    try:
+        from services.agent.mission_dispatch import MissionDispatch  # noqa: PLC0415
+        md = MissionDispatch(run_id="scope-probe", ledger=None, on_event=None)
+        handlers = getattr(md, "_handlers", None)
+        if isinstance(handlers, dict):
+            return tool in handlers
+    except Exception:  # noqa: BLE001 — an unavailable dispatcher is not evidence of scope
+        pass
+    return False
+
+
 def _unresolved_tool_error(tool: str) -> dict:
     """Teaching error for a tool nothing could bind.
 
@@ -4180,15 +4327,33 @@ def _unresolved_tool_error(tool: str) -> dict:
             "closest_tools": close,
         }
     if tool in _known_tool_names():
+        # Do NOT assert a cause. This branch used to state flatly that the tool "is a
+        # mission-scoped tool", for ANY advertised name that failed to bind — a theory nobody
+        # checked. Live 2026-07-29 it told a drawing run that new_part, list_parts and
+        # import_part were mission-scoped when the real cause was the tool registry failing to
+        # import; that message points an engineer at mission plumbing and away from the actual
+        # break. Report what is OBSERVED, in order of certainty.
+        if not server:
+            why = (
+                "the tool REGISTRY is empty in this process — no tool could be bound, so this "
+                "is not specific to '" + tool + "'"
+            )
+            if _SERVER_TOOL_IMPORT_ERROR:
+                why += f". The registry import failed with: {_SERVER_TOOL_IMPORT_ERROR}"
+        elif _is_mission_scoped_tool(tool):
+            why = ("it is a mission-scoped tool (it needs a live mission run — ledger, run_id, "
+                   "delegation tree) and this turn has no mission context")
+        else:
+            why = ("it is advertised by the catalog but the live registry has no callable under "
+                   "that name in this process — most often a tool module that failed to import, "
+                   "or a name that is advertised without ever being registered")
         return {
             "ok": False,
             "status": "known_but_unbound",
             "harness_bug": True,
             "error": (
                 f"tool '{tool}' is ADVERTISED to you but could not be resolved in "
-                f"this run: it is a mission-scoped tool (it needs a live mission "
-                f"run — ledger, run_id, delegation tree) and this turn has no "
-                f"mission context. This is a HARNESS BINDING GAP, not your "
+                f"this run: {why}. This is a HARNESS BINDING GAP, not your "
                 f"mistake — retrying the same call will fail identically. "
                 f"Continue with the tools that do bind and say so in your handoff."
             ),

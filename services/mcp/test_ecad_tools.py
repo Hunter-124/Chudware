@@ -78,6 +78,8 @@ def test_register() -> dict:
         "ecad_fpga_check",
         # pack tools that live in register_ecad_tools (pdn/si/stackup/netclass)
         "ecad_run_pdn", "ecad_run_sicheck", "ecad_stackup_solve", "ecad_set_net_class",
+        # library part GENERATION (the honest answer to a library miss)
+        "ecad_make_part",
     }
     missing = expected - set(mcp.tools)
     assert not missing, f"tools not registered: {missing}"
@@ -918,6 +920,17 @@ def test_e2_led_driver_recipe(tools: dict) -> None:
     assert d["ok"], f"LED-driver design must verify, got hint={d.get('hint')!r}"
     assert d.get("recipe_used") == "led_driver", \
         f"expected led_driver recipe, got {d.get('recipe_used')!r}"
+    # The regression this defends: with the LED's junction model missing, the red LED simulated
+    # as a plain silicon diode and the anode sat at ONE junction drop (V(LED_A)=0.7324) instead
+    # of its forward voltage. Assert the NUMBER, not just ok, so a diode substitution cannot
+    # come back silently. Hand-check: IS=2.3e-19, N=2, RS=2, R1=130 -> I=9.99 mA, Vf=2.0017 V.
+    v_anode = (d.get("sim") or {}).get("got")
+    assert v_anode is not None and abs(v_anode - 2.0) <= 0.1, \
+        (f"LED anode must sit at the red LED's forward drop (~2.0 V), got {v_anode} — "
+         f"0.73 V means it was simulated as a plain diode: {d.get('sim')!r}")
+    # A fallback must never be reported as success while its own self-check missed.
+    assert not (d["ok"] and not (d.get("sim") or {}).get("pass")), \
+        f"ok=True with a missed sim check is dishonest: {d.get('sim')!r}"
     st = _call(tools, "ecad_status", doc_id=d["doc_id"])
     libids = {c["libid"] for c in st.get("components", [])}
     assert "Device:LED" in libids, f"LED driver must contain an LED, got {libids}"
@@ -2442,13 +2455,18 @@ def test_library_exact_hit_is_not_substituted(tools: dict) -> None:
     print("  [library_exact_hit_is_not_substituted] PASS")
 
 
-def test_library_substitutes_real_part_numbers(tools: dict) -> None:
-    """The four queries measured dead in the live run must now each return a placeable symbol."""
+def test_library_substitutes_passives_and_discretes(tools: dict) -> None:
+    """<=3-pin misses are still substituted: a generic Device:D IS the diode symbol.
+
+    (Was test_library_substitutes_real_part_numbers, which asserted the SAME behaviour for
+    multi-pin ICs. That half moved to test_library_refuses_multipin_substitution below: a
+    48-pin generic's pin numbers are its own, and ecad_make_part can now build the real
+    part, so the substitution stopped being the least-bad option.)
+    """
     cases = {
-        "TPS62840": ("Regulator_Switching:Buck_3V3", 6),
-        "ESP32-S3": ("MCU:Generic_QFP48", 48),
-        "ESP32-S3-WROOM": ("MCU:Generic_QFP48", 48),
-        "ESP32": ("MCU:Generic_QFP48", 48),
+        "1N4148": ("Device:D", 2),
+        "BSS138": ("Device:NMOS", 3),
+        "MMBT3904": ("Device:Q_NPN", 3),
     }
     for query, (want_libid, want_pins) in cases.items():
         p = _call(tools, "ecad_find_part", query=query)
@@ -2468,8 +2486,42 @@ def test_library_substitutes_real_part_numbers(tools: dict) -> None:
         assert query in warn and want_libid in warn, \
             f"{query}: the warning must name what was asked AND what is offered: {warn}"
         assert query in p["hint"] and want_libid in p["hint"], p["hint"]
-    print(f"  find_part substitutes {len(cases)} real part numbers -> generic symbols")
-    print("  [library_substitutes_real_part_numbers] PASS")
+    print(f"  find_part substitutes {len(cases)} 2-3 pin part numbers -> generic symbols")
+    print("  [library_substitutes_passives_and_discretes] PASS")
+
+
+def test_library_refuses_multipin_substitution(tools: dict) -> None:
+    """The four queries from the measured live run must NOT come back as a wrong pinout.
+
+    A live general-lane run asked for a "3V3 buck regulator schematic with an ESP32-S3 and
+    a TPS62840". find_part used to answer each with the closest generic flagged
+    ``substituted: true`` and ``ok: true`` — a 6- and a 48-pin symbol whose pin NUMBERS are
+    MCU:Generic_QFP48's, not the requested part's. Wiring that produces a netlist that
+    looks complete and is wrong on every net. Now that ecad_make_part can build the real
+    part from a supplied pinout, the honest refusal is actionable, so it refuses and routes.
+    """
+    for query, closest, closest_pins in (
+            ("TPS62840", "Regulator_Switching:Buck_3V3", 6),
+            ("ESP32-S3", "MCU:Generic_QFP48", 48),
+            ("ESP32-S3-WROOM", "MCU:Generic_QFP48", 48),
+            ("ESP32", "MCU:Generic_QFP48", 48)):
+        p = _call(tools, "ecad_find_part", query=query)
+        _assert_context(p, f"ecad_find_part({query!r})")
+        assert not p["ok"], f"{query}: a {closest_pins}-pin substitute must be refused: {p}"
+        assert p.get("substituted") is False, p
+        assert not p.get("hits"), \
+            f"{query}: a refused substitute must not be offered as a hit: {p['hits']}"
+        # The refusal must be ACTIONABLE: it names the closest generic (so the caller can
+        # still choose it deliberately) AND the tool that builds the real part.
+        assert p["closest_generic"] == closest, p
+        assert p["closest_generic_pin_count"] == closest_pins, p
+        assert closest in p["error"] and str(closest_pins) in p["error"], p["error"]
+        assert "ecad_make_part" in p["hint"], p["hint"]
+        na = " ".join(p["next_actions"])
+        assert "ecad_make_part" in na, f"{query}: refusal must route to the generator: {na}"
+        assert "pins=" in na, f"{query}: the routing must show the pin list arg: {na}"
+    print("  find_part refuses 4 multi-pin substitutions and routes to ecad_make_part")
+    print("  [library_refuses_multipin_substitution] PASS")
 
 
 def test_library_substitute_is_actually_placeable(tools: dict) -> None:
@@ -2477,22 +2529,22 @@ def test_library_substitute_is_actually_placeable(tools: dict) -> None:
     _call(tools, "ecad_new_schematic", name="sub_proof")
     before = _call(tools, "ecad_status")["component_count"]
 
-    buck = _call(tools, "ecad_find_part", query="TPS62840")
-    mcu = _call(tools, "ecad_find_part", query="ESP32-S3")
-    p1 = _call(tools, "ecad_place_symbol", libid=buck["substitute_libid"],
-               x=0, y=0, value="TPS62840")
-    p2 = _call(tools, "ecad_place_symbol", libid=mcu["substitute_libid"],
-               x=40, y=0, value="ESP32-S3")
+    diode = _call(tools, "ecad_find_part", query="1N4148")
+    fet = _call(tools, "ecad_find_part", query="BSS138")
+    p1 = _call(tools, "ecad_place_symbol", libid=diode["substitute_libid"],
+               x=0, y=0, value="1N4148")
+    p2 = _call(tools, "ecad_place_symbol", libid=fet["substitute_libid"],
+               x=40, y=0, value="BSS138")
     assert p1["ok"] and p2["ok"], (p1, p2)
-    assert len(p1["pins"]) == 6, f"buck placed with {len(p1['pins'])} pins: {p1['pins']}"
-    assert len(p2["pins"]) == 48, f"mcu placed with {len(p2['pins'])} pins"
+    assert len(p1["pins"]) == 2, f"diode placed with {len(p1['pins'])} pins: {p1['pins']}"
+    assert len(p2["pins"]) == 3, f"fet placed with {len(p2['pins'])} pins: {p2['pins']}"
 
     st = _call(tools, "ecad_status")
     assert st["component_count"] == before + 2, \
         f"component_count {before} -> {st['component_count']}, expected +2"
     refs = {c.get("ref") for c in st.get("components", [])}
     assert {p1["ref"], p2["ref"]} <= refs, f"{p1['ref']}/{p2['ref']} missing from {refs}"
-    print(f"  placed {p1['ref']}(6 pins) + {p2['ref']}(48 pins); "
+    print(f"  placed {p1['ref']}(2 pins) + {p2['ref']}(3 pins); "
           f"component_count {before} -> {st['component_count']}")
     print("  [library_substitute_is_actually_placeable] PASS")
 
@@ -2627,3 +2679,507 @@ def test_place_sim_params_magnitude_rejected_informatively(tools: dict) -> None:
     assert not junk["ok"] and "sim_params" in junk["error"], junk
     assert "waveform" in junk["hint"], junk["hint"]
     print("  [place_sim_params_magnitude_rejected_informatively] PASS")
+
+
+# ------------------------------------------- wire endpoint-name dialect (a/b), 2026-07-29
+# Measured live (claude-sonnet-4-5, ecad turn):
+#   ecad_wire(ref_a="U1", pin_a="3", ref_b="C1", pin_b="1", doc_id="ecadcpp0000000b")
+#   -> unknown_argument for ALL FOUR names; the whole wiring turn connected nothing.
+# a is the FIRST endpoint (from_*), b the SECOND (to_*). These tests read the resulting NET
+# back so a crossed mapping is visible in engine state, not just in the reply text.
+
+
+def test_dialect_wire_ab_endpoint_names(tools: dict) -> None:
+    """ref_a/pin_a/ref_b/pin_b wire the SAME pins as from_ref/from_pin/to_ref/to_pin."""
+    _call(tools, "ecad_new_schematic", name="dialect_wire_ab")
+    u = _call(tools, "ecad_place_symbol", libid="MCU:Generic_QFP48", x=0, y=0, ref="U1")
+    c = _call(tools, "ecad_place_symbol", libid="Device:C", x=60, y=0, ref="C1")
+    assert u["ok"] and u["ref"] == "U1" and c["ok"] and c["ref"] == "C1", (u, c)
+
+    w = _call(tools, "ecad_wire", ref_a="U1", pin_a="3", ref_b="C1", pin_b="1")
+    _assert_context(w, "ecad_wire/ab")
+    assert w["ok"], f"ref_a/pin_a/ref_b/pin_b must wire, not fail: {w}"
+
+    # STATE READBACK: the net really carries U1.3 and C1.1 — and ONLY those two. A mapping
+    # that crossed ref/pin (pin_a -> to_pin) would have tried C1.3, which does not exist;
+    # one that dropped an alias would leave a one-pin net.
+    assert set(w["net_members"]) == {"U1.3", "C1.1"}, \
+        f"net must join exactly U1.3 and C1.1, got {w['net_members']}"
+    assert w["net_size"] == 2, w
+
+    # ORDER: a -> from, b -> to. Both the interpretation echo and the reply text must say so,
+    # so a silently swapped mapping cannot hide behind a symmetric net.
+    notes = " ".join(w.get("interpreted") or [])
+    assert "ref_a" in notes and "from_ref" in notes, f"missing interpretation echo: {notes!r}"
+    assert "ref_b" in notes and "to_ref" in notes, f"missing interpretation echo: {notes!r}"
+    assert "Connected U1.3 <-> C1.1" in w["hint"], \
+        f"a must be the FIRST endpoint and b the second: {w['hint']!r}"
+
+    # Independent STATE read: rebuild the netlist from the stored document itself rather
+    # than trusting the wire reply's own summary.
+    from mcp_server.ecad_common import _get_sch, netlist_mod
+    nl = netlist_mod.build_netlist(_get_sch(None).doc)
+    members = {f"{m['ref']}.{m['pin']}" for m in nl["nets"][w["net"]]}
+    assert members == {"U1.3", "C1.1"}, \
+        f"document netlist net {w['net']} carries {members}, not U1.3 + C1.1"
+    st = _call(tools, "ecad_status")
+    named = [n for n in st["nets"] if n["name"] == w["net"]]
+    assert named and named[0]["size"] == 2, f"{w['net']} is not a 2-pin net: {named}"
+
+    # The a_ref/a_pin word order is the same idea and must behave identically.
+    w2 = _call(tools, "ecad_wire", a_ref="U1", a_pin="5", b_ref="C1", b_pin="2")
+    assert w2["ok"] and set(w2["net_members"]) == {"U1.5", "C1.2"}, w2
+    print(f"  a/b endpoints -> {w['net']} {sorted(w['net_members'])}, "
+          f"{w2['net']} {sorted(w2['net_members'])}")
+    print("  [dialect_wire_ab_endpoint_names] PASS")
+
+
+def test_dialect_wire_canonical_spelling_still_works(tools: dict) -> None:
+    """Declaring the a/b parameters must not shadow the canonical from_*/to_* names."""
+    _call(tools, "ecad_new_schematic", name="dialect_wire_canon")
+    _call(tools, "ecad_place_symbol", libid="MCU:Generic_QFP48", x=0, y=0, ref="U1")
+    _call(tools, "ecad_place_symbol", libid="Device:C", x=60, y=0, ref="C1")
+    w = _call(tools, "ecad_wire", from_ref="U1", from_pin="3", to_ref="C1", to_pin="1")
+    assert w["ok"] and set(w["net_members"]) == {"U1.3", "C1.1"}, w
+    assert "interpreted" not in w, f"a canonical call must not claim a rewrite: {w}"
+    # ...and so must the other shapes that already worked (dotted + connection dict).
+    d = _call(tools, "ecad_wire", from_ref="U1.4", to_ref="C1.2")
+    assert d["ok"] and set(d["net_members"]) == {"U1.4", "C1.2"}, d
+    print("  [dialect_wire_canonical_spelling_still_works] PASS")
+
+
+def test_dialect_wire_conflicting_endpoint_spellings_refused(tools: dict) -> None:
+    """from_ref and ref_a naming DIFFERENT symbols is an ambiguity, never a silent pick."""
+    _call(tools, "ecad_new_schematic", name="dialect_wire_conflict")
+    _call(tools, "ecad_place_symbol", libid="MCU:Generic_QFP48", x=0, y=0, ref="U1")
+    _call(tools, "ecad_place_symbol", libid="Device:C", x=60, y=0, ref="C1")
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=30, y=30, ref="R1")
+    before = _call(tools, "ecad_status")["nets"]
+    # pin '1' exists on BOTH U1 and R1 on purpose: a "last spelling wins" implementation
+    # would happily wire R1.1 -> C1.1 and report ok:true (the silent-wrong-part class), so
+    # this case only passes because the disagreement is actually detected.
+    bad = _call(tools, "ecad_wire", from_ref="U1", ref_a="R1", from_pin="1",
+                to_ref="C1", to_pin="1")
+    assert not bad["ok"], f"two spellings that disagree must be refused: {bad}"
+    assert "from_ref" in bad["error"] and "ref_a" in bad["error"], bad["error"]
+    assert "NO wire was made" in bad["error"], bad["error"]
+    assert _call(tools, "ecad_status")["nets"] == before, \
+        "a refused wire must not mutate the schematic"
+    print("  [dialect_wire_conflicting_endpoint_spellings_refused] PASS")
+
+
+def test_wire_endpoint_aliases_resolve_and_junk_still_refused() -> None:
+    """The SHARED reconciler view: ref_a/pin_a/ref_b/pin_b are now real parameters, the
+    start_/source_ dict-layer words are honestly still refused at the top level, and a
+    genuinely unknown name maps nowhere (it must stay a loud unknown_argument).
+
+    This is the layer the live failure happened at — services/agent/agent_turn.py rejects an
+    unknown kwarg BEFORE the tool body runs — so asserting it here is what proves the fix
+    reaches the agent dispatch path and not just a direct Python call.
+    """
+    import inspect
+
+    from services.agent import arg_reconciliation as ar
+
+    stub = _StubMCP()
+    register_ecad_tools(stub)
+    sig = inspect.signature(stub.tools["ecad_wire"])
+    params = list(sig.parameters)
+    ann = {n: str(p.annotation) for n, p in sig.parameters.items()}
+    syn = ar.synonyms_for("ecad_wire")
+
+    for name, target in (("ref_a", "ref_a"), ("pin_a", "pin_a"),
+                         ("ref_b", "ref_b"), ("pin_b", "pin_b"),
+                         ("a_ref", "a_ref"), ("b_pin", "b_pin"),
+                         ("from_ref", "from_ref"), ("to_pin", "to_pin")):
+        got = ar.resolve_unknown(name, "U1", params, ann, set(), syn)
+        assert got == target, f"{name} must bind to {target}, got {got!r}"
+
+    for junk in ("frobnicate", "wire_colour", "netclass_hint"):
+        assert ar.resolve_unknown(junk, 1, params, ann, set(), syn) is None, \
+            f"{junk} must stay an unknown_argument, not be aliased onto an endpoint"
+        assert not ar.drop_descriptive(junk, 1, params, set(), syn) or junk == "frobnicate", \
+            f"{junk} must not be silently dropped"
+
+    # No **kwargs: a var-keyword parameter would switch the reconciler off for this tool
+    # and make FastMCP drop unknown keys silently (contract rule 2).
+    assert not any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in sig.parameters.values()), \
+        "ecad_wire must never declare **kwargs"
+    print("  [wire_endpoint_aliases_resolve_and_junk_still_refused] PASS")
+
+
+# --------------------------------------------------------------------------- ecad_make_part
+# Appended EOF (shared-file hygiene). THE headline library gap: before this tool there was
+# no way to create an ECAD part the starter library does not have — grep confirmed zero
+# generate_symbol / generate_footprint / from_datasheet hits across
+# services/ecad/library/{starter,native,partid,substitute}.py. A live ESP32-WROOM-32
+# request therefore came back as MCU:Generic_QFP48 with a pin-count-mismatch warning and
+# ok:true, i.e. a WRONG PINOUT that reported success.
+#
+# Every test below proves a VALUE (a pin count, a pad coordinate, a pin name map), never
+# ok:true, and the last three prove the tool refuses to invent: no pin list -> no part.
+
+import os as _mp_os
+import tempfile as _mp_tempfile
+
+_MP_LIB_DIR: list[str] = []
+
+
+def _mp_lib_dir() -> str:
+    """Point the generated-part library at a tmpdir (never the developer's real one).
+
+    Set through the env var generate.library_dir() reads, so it works identically under
+    pytest and under the main() harness — no fixture, which this module's older tests
+    cannot use anyway.
+    """
+    if not _MP_LIB_DIR:
+        d = _mp_tempfile.mkdtemp(prefix="chudware_ecad_gen_lib_")
+        _mp_os.environ["CHUDWARE_ECAD_LIB_DIR"] = d
+        _MP_LIB_DIR.append(d)
+    return _MP_LIB_DIR[0]
+
+
+#: An ESP32-WROOM-32-SHAPED pinout: 15 castellations on the left edge, 8 across the
+#: bottom, 15 on the right. Espressif's own module geometry (18.00 x 25.50 mm body,
+#: 1.27 mm castellation pitch). It is supplied HERE, by the caller, on purpose — the
+#: generator must never derive a pin count or a pin function from the string
+#: "ESP32-WROOM-32".
+def _esp32_pins() -> list[dict]:
+    left = ["GND", "3V3", "EN", "SENSOR_VP", "SENSOR_VN", "IO34", "IO35", "IO32",
+            "IO33", "IO25", "IO26", "IO27", "IO14", "IO12", "GND2"]
+    bottom = ["IO13", "SD2", "SD3", "CMD", "CLK", "SD0", "SD1", "IO15"]
+    right = ["IO2", "IO0", "IO4", "IO16", "IO17", "IO5", "IO18", "IO19", "NC1", "IO21",
+             "RXD0", "TXD0", "IO22", "IO23", "GND3"]
+    pins: list[dict] = []
+    n = 1
+    for side, names in (("left", left), ("bottom", bottom), ("right", right)):
+        for nm in names:
+            if nm.startswith("GND") or nm == "3V3":
+                ptype = "power_in"
+            elif nm.startswith("NC"):
+                ptype = "no_connect"
+            elif nm in ("EN", "SENSOR_VP", "SENSOR_VN", "IO34", "IO35"):
+                ptype = "input"          # input-only pins on a real ESP32
+            else:
+                ptype = "bidirectional"
+            pins.append({"number": str(n), "name": nm, "type": ptype, "side": side})
+            n += 1
+    return pins
+
+
+_ESP32_GEOM = {"package": "module_castellated", "pitch": 1.27,
+               "body_w": 18.0, "body_h": 25.5, "pad_len": 2.0, "pad_width": 0.9}
+
+
+#: A DISTINCT footprint id on purpose. fpid == libid is legal (symbols/ and footprints/ are
+#: separate namespaces) but stores two different records under one string, which a catalog
+#: keyed on a flat part id then collapses — measured 2026-07-29: the parts index kept the
+#: footprint record and part_place answered "geometry_ref missing 'libid'" for a part that
+#: had just been created. ecad_make_part warns about it (asserted below); the shipped
+#: example must not model the hazard.
+def _make_esp32(tools: dict, libid: str, **over) -> dict:
+    _mp_lib_dir()
+    kw = dict(_ESP32_GEOM)
+    kw.setdefault("fpid", libid + "_Module")
+    kw.update(over)
+    return _call(tools, "ecad_make_part", name="ESP32-WROOM-32", libid=libid,
+                 pins=_esp32_pins(), **kw)
+
+
+def test_make_part_castellated_module_geometry(tools: dict) -> None:
+    """38-pin ESP32-WROOM-shaped module: 38 pins, 38 pads, the SUPPLIED pin names on the
+    placed symbol, and pad coordinates matching hand-computation from the passed geometry.
+
+    Hand-computed from pitch=1.27, body 18.00 x 25.50, pad_len=2.0 (perpendicular to the
+    edge, so the castellation pad sits flush INSIDE the body outline):
+      left  pad centre |x| = 18.0/2 - 2.0/2       = 8.000
+      pin 1  (first of 15 on the left, top-down)  y = 14/2 * 1.27 = +8.890
+      pin 15 (last of the left column)            y = -8.890
+      bottom pad centre y = -(25.5/2 - 2.0/2)     = -11.750
+      pin 16 (first of 8 across the bottom, L->R) x = -7/2 * 1.27 = -4.445
+      pin 24 (first of 15 on the right, bottom-up)  (+8.000, -8.890)
+    A placeholder or a mis-derived ring cannot hit these numbers.
+    """
+    libid = "RF_Module:ESP32-WROOM-32"
+    r = _make_esp32(tools, libid, overwrite=True)
+    _assert_context(r, "ecad_make_part")
+    assert r["ok"] and r["created"], r
+    assert r["libid"] == libid and r["fpid"] == libid + "_Module", r
+    assert not r["warnings"], \
+        f"a distinct fpid must produce no warning: {r['warnings']}"
+    assert r["pin_count"] == 38, f"expected 38 pins, got {r['pin_count']}"
+    assert r["pad_count"] == 38, f"expected 38 pads, got {r['pad_count']}"
+
+    # Pad GEOMETRY — the proof the footprint is real and not a placeholder.
+    from services.ecad.library import resolve_footprint
+    fp = resolve_footprint(r["fpid"])
+    assert fp is not None, f"{r['fpid']} footprint did not resolve after generation"
+    at = {p["number"]: [round(p["pos"][0], 4), round(p["pos"][1], 4)] for p in fp["pads"]}
+    size = {p["number"]: [round(v, 4) for v in p["size"]] for p in fp["pads"]}
+    assert at["1"] == [-8.0, 8.89], f"pad 1 at {at['1']}, hand-computed [-8.0, 8.89]"
+    assert at["16"] == [-4.445, -11.75], \
+        f"pad 16 at {at['16']}, hand-computed [-4.445, -11.75]"
+    assert at["15"] == [-8.0, -8.89], f"pad 15 at {at['15']}"
+    assert at["24"] == [8.0, -8.89], f"pad 24 at {at['24']} — the right column must run "
+    # A castellation pad is long PERPENDICULAR to its edge: 2.0 x 0.9 on the side edges,
+    # 0.9 x 2.0 across the bottom. Swapping them would be a rotated (wrong) pad.
+    assert size["1"] == [2.0, 0.9], f"left pad size {size['1']}, expected [2.0, 0.9]"
+    assert size["16"] == [0.9, 2.0], f"bottom pad size {size['16']}, expected [0.9, 2.0]"
+
+    # Place it and read the pin NAMES back off the placed symbol: a scrambled pin map
+    # (right count, wrong assignment) fails here even though the counts still match.
+    _call(tools, "ecad_new_schematic", name="esp32_gen")
+    p = _call(tools, "ecad_place_symbol", libid=libid, x=0, y=0, value="ESP32-WROOM-32")
+    assert p["ok"], p
+    assert len(p["pins"]) == 38, f"placed with {len(p['pins'])} pins"
+    placed = {str(q["number"]): q["name"] for q in p["pins"]}
+    supplied = {q["number"]: q["name"] for q in _esp32_pins()}
+    assert placed == supplied, \
+        ("placed pin map != supplied pin map (a scrambled pinout): "
+         + repr({k: (supplied[k], placed.get(k)) for k in supplied
+                 if placed.get(k) != supplied[k]}))
+    types = {str(q["number"]): q["type"] for q in p["pins"]}
+    assert types["1"] == "power_in" and types["3"] == "input", types
+    print(f"  ecad_make_part -> {libid}: 38 pins / 38 pads, pad1={at['1']} "
+          f"pad16={at['16']}, placed pin map matches the supplied one")
+    print("  [make_part_castellated_module_geometry] PASS")
+
+
+def test_make_part_accepts_full_pin_type_enum(tools: dict) -> None:
+    """Every KiCad electrical type is accepted; a bogus one is REFUSED, not defaulted.
+
+    Pin type drives ERC (core/ecad/erc.cpp driver/power-source sets), so defaulting an
+    unrecognised word to 'passive' would silently disarm the check that catches a real
+    two-outputs-shorted mistake. The full enum is asserted rather than a sample, because a
+    model describing an IC pinout uses these words verbatim.
+    """
+    _mp_lib_dir()
+    from services.ecad.schema import PIN_TYPES
+    enum = sorted(PIN_TYPES)
+    assert len(enum) == 12, f"the KiCad electrical enum is 12 types, got {enum}"
+    pins = [{"number": str(i + 1), "name": t.upper(), "type": t, "side": "left"}
+            for i, t in enumerate(enum)]
+    r = _call(tools, "ecad_make_part", name="EnumProbe", libid="Generated:EnumProbe",
+              pins=pins, overwrite=True)
+    assert r["ok"] and r["pin_count"] == len(enum), r
+    from services.ecad.library import resolve
+    stored = {p["number"]: p["type"] for p in resolve("Generated:EnumProbe")["pins"]}
+    assert [stored[str(i + 1)] for i in range(len(enum))] == enum, stored
+
+    # Pin SHAPE is cosmetic (no ERC meaning): the whole KiCad shape vocabulary is accepted
+    # and preserved, and an unrenderable one is NOTED, not fatal.
+    from services.ecad.library.generate import PIN_SHAPES
+    shape_pins = [{"number": str(i + 1), "name": f"P{i}", "type": "input",
+                   "shape": s, "side": "left"}
+                  for i, s in enumerate(sorted(PIN_SHAPES))]
+    rs = _call(tools, "ecad_make_part", name="ShapeProbe", libid="Generated:ShapeProbe",
+               pins=shape_pins, overwrite=True)
+    assert rs["ok"] and rs["pin_count"] == len(PIN_SHAPES), rs
+    kept = {p["shape"] for p in resolve("Generated:ShapeProbe")["pins"]}
+    assert kept == set(PIN_SHAPES), f"shapes must be preserved verbatim: {kept}"
+
+    # ...and a bogus TYPE is a hard refusal naming the vocabulary.
+    bad = _call(tools, "ecad_make_part", name="BadType", libid="Generated:BadType",
+                pins=[{"number": "1", "name": "A", "type": "quantum_flux"},
+                      {"number": "2", "name": "B", "type": "passive"}])
+    assert not bad["ok"], f"a bogus pin type must be refused: {bad}"
+    assert "quantum_flux" in bad["error"], bad["error"]
+    assert "power_in" in bad["error"] and "tri_state" in bad["error"], \
+        f"the refusal must name the real enum: {bad['error']}"
+    assert resolve("Generated:BadType") is None, "a refused call must write nothing"
+
+    # An AMBIGUOUS type is refused too: power_in and power_out are opposite ERC roles, so
+    # picking one would invent an electrical fact.
+    amb = _call(tools, "ecad_make_part", name="AmbType", libid="Generated:AmbType",
+                pins=[{"number": "1", "name": "VCC", "type": "power"},
+                      {"number": "2", "name": "GND", "type": "power_in"}])
+    assert not amb["ok"], f"'power' must be refused as ambiguous: {amb}"
+    assert "power_in" in amb["error"] and "power_out" in amb["error"], amb["error"]
+    print(f"  all {len(enum)} pin types + all {len(PIN_SHAPES)} shapes accepted; "
+          "'quantum_flux' and ambiguous 'power' refused")
+    print("  [make_part_accepts_full_pin_type_enum] PASS")
+
+
+def test_make_part_is_found_without_substitution(tools: dict) -> None:
+    """After generation, find_part returns the REAL part — no substitution warning."""
+    libid = "RF_Module:ESP32-WROOM-32"
+    _make_esp32(tools, libid, overwrite=True)
+    p = _call(tools, "ecad_find_part", query="ESP32-WROOM-32")
+    _assert_context(p, "ecad_find_part('ESP32-WROOM-32')")
+    assert p["ok"], p
+    assert p.get("substituted") is False, f"a generated part must not be substituted: {p}"
+    assert p.get("exact_match") is True, p
+    assert not p["warnings"], f"no substitution warning expected: {p['warnings']}"
+    assert "substitute_libid" not in p, p
+    hit = next((h for h in p["hits"] if h.get("libid") == libid), None)
+    assert hit is not None, f"{libid} missing from hits: {[h.get('libid') for h in p['hits']]}"
+    assert hit["pin_count"] == 38, hit
+    print(f"  find_part('ESP32-WROOM-32') -> {libid} exact, 38 pins, 0 warnings")
+    print("  [make_part_is_found_without_substitution] PASS")
+
+
+def test_make_part_overwrite_guard(tools: dict) -> None:
+    """overwrite=False on an existing libid errors AND leaves the stored part untouched."""
+    _mp_lib_dir()
+    libid = "Generated:OverwriteProbe"
+    pins = [{"number": "1", "name": "IN", "type": "input", "side": "left"},
+            {"number": "2", "name": "OUT", "type": "output", "side": "right"}]
+    first = _call(tools, "ecad_make_part", name="OverwriteProbe", libid=libid,
+                  pins=pins, overwrite=True)
+    assert first["ok"] and first["pin_count"] == 2, first
+
+    from services.ecad.library import resolve
+    before = resolve(libid)
+    assert before is not None and len(before["pins"]) == 2, before
+
+    clash = _call(tools, "ecad_make_part", name="OverwriteProbe", libid=libid,
+                  pins=pins + [{"number": "3", "name": "EN", "type": "input",
+                                "side": "left"}])
+    assert not clash["ok"], f"a name collision must error, not clobber: {clash}"
+    assert libid in clash["error"] and "overwrite" in clash["error"].lower(), clash["error"]
+    after = resolve(libid)
+    assert len(after["pins"]) == 2, \
+        f"the refused call mutated the stored part: {len(after['pins'])} pins"
+    assert after == before, "the refused call changed the stored symbol"
+
+    # ...and overwrite=True really does replace it.
+    ok = _call(tools, "ecad_make_part", name="OverwriteProbe", libid=libid,
+               pins=pins + [{"number": "3", "name": "EN", "type": "input",
+                             "side": "left"}], overwrite=True)
+    assert ok["ok"] and ok["pin_count"] == 3, ok
+    assert len(resolve(libid)["pins"]) == 3, resolve(libid)
+    print("  overwrite=False errors and preserves the 2-pin part; overwrite=True -> 3 pins")
+    print("  [make_part_overwrite_guard] PASS")
+
+
+def test_make_part_never_invents_a_part_from_a_name(tools: dict) -> None:
+    """A part number is NOT a pinout: name-only generation is refused, naming what it needs.
+
+    This is the whole point of the tool. If it ever produced 38 pins from the string
+    "ESP32-WROOM-32" it would be the same fabrication as the substitution it replaces,
+    just with a more convincing libid.
+    """
+    _mp_lib_dir()
+    from services.ecad.library import resolve
+    for kw in ({}, {"pins": []}, {"pins": "ESP32-WROOM-32"},
+               {"package": "module_castellated", "pitch": 1.27, "body_w": 18.0,
+                "body_h": 25.5, "pad_len": 2.0, "pad_width": 0.9}):
+        r = _call(tools, "ecad_make_part", name="ESP32-WROOM-32",
+                  libid="Generated:PhantomESP32", **kw)
+        assert not r["ok"], f"name-only generation must be refused, got: {r}"
+        assert r.get("created") is False, r
+        err = r["error"].lower()
+        assert "pin" in err, f"the refusal must name the missing pin list: {r['error']}"
+        assert "pins=" in " ".join(r["next_actions"]) or "pins" in r["hint"], r
+        assert resolve("Generated:PhantomESP32") is None, \
+            "a refused name-only call wrote a part anyway"
+
+    # A castellated module additionally cannot have its side layout guessed.
+    sideless = [{"number": str(i), "name": f"P{i}", "type": "bidirectional"}
+                for i in range(1, 39)]
+    r = _call(tools, "ecad_make_part", name="ESP32-WROOM-32",
+              libid="Generated:SidelessESP32", fpid="Generated:SidelessESP32",
+              pins=sideless, **_ESP32_GEOM)
+    assert not r["ok"], f"a module with no declared sides must be refused: {r}"
+    assert "side" in r["error"].lower(), r["error"]
+    assert resolve("Generated:SidelessESP32") is None, "refused call wrote a symbol"
+    print("  name-only / empty / string / sideless generation all refused, nothing written")
+    print("  [make_part_never_invents_a_part_from_a_name] PASS")
+
+
+def test_make_part_survives_a_process_restart(tools: dict) -> None:
+    """A part generated in one session must still resolve in the NEXT process.
+
+    store_part registers the native dir as a side effect of writing, which only covers the
+    process that created the part. Reported by EcadRefPinDialect while wiring part_get to
+    the same tier: nothing imports services.ecad.library.generate at startup, so a part
+    generated yesterday sat on disk unresolvable and ecad_make_part's "it resolves from now
+    on" was false after a restart. register_ecad_sch_tools now calls
+    generate.register_library_dir() once, so every consumer in the process (find_part,
+    place_symbol, and the parts-catalog adapter, which shares the native._default
+    singleton) sees it.
+
+    Proved in a genuinely FRESH interpreter — an in-process check cannot distinguish the
+    startup registration from the write-time side effect that already happened.
+    """
+    import subprocess
+    import sys as _sys
+
+    libid = "RF_Module:ESP32-WROOM-32"
+    r = _make_esp32(tools, libid, overwrite=True)
+    assert r["ok"] and r["pin_count"] == 38, r
+    lib_dir = _mp_lib_dir()
+
+    probe = (
+        "import sys, json; sys.path.insert(0, '.');\n"
+        "from mcp_server.ecad_tools import register_ecad_tools\n"
+        "class S:\n"
+        "    def __init__(s): s.tools = {}\n"
+        "    def tool(s, *a, **k):\n"
+        "        def d(f):\n"
+        "            s.tools[f.__name__] = f\n"
+        "            return f\n"
+        "        return d\n"
+        "m = S(); register_ecad_tools(m)\n"
+        "from services.ecad.library import resolve, resolve_footprint\n"
+        "sym = resolve(%r); fp = resolve_footprint(%r)\n"
+        "found = json.loads(m.tools['ecad_find_part'](query='ESP32-WROOM-32'))\n"
+        "hits = found.get('hits') or [{}]\n"
+        "print(json.dumps({'pins': len((sym or {}).get('pins', [])),\n"
+        "                  'pads': len((fp or {}).get('pads', [])),\n"
+        "                  'ok': found.get('ok'),\n"
+        "                  'substituted': found.get('substituted'),\n"
+        "                  'hit': hits[0].get('libid')}))\n"
+    ) % (libid, r["fpid"])
+    env = dict(_mp_os.environ, CHUDWARE_ECAD_LIB_DIR=lib_dir)
+    out = subprocess.run([_sys.executable, "-c", probe], capture_output=True, text=True,
+                         env=env, timeout=180)
+    assert out.returncode == 0, f"probe process failed:\n{out.stdout}\n{out.stderr}"
+    got = json.loads(out.stdout.strip().splitlines()[-1])
+    assert got["pins"] == 38, (
+        f"a fresh process resolved {got['pins']} pins for {libid} (expected 38) — the "
+        f"generated library dir was not registered at startup: {got}")
+    assert got["pads"] == 38, f"footprint did not survive the restart: {got}"
+    assert got["substituted"] is False and got["hit"] == libid, \
+        f"a fresh process substituted instead of finding the generated part: {got}"
+    print(f"  fresh process resolves {libid}: 38 pins / 38 pads, find_part exact")
+    print("  [make_part_survives_a_process_restart] PASS")
+
+
+def test_make_part_warns_when_fpid_equals_libid(tools: dict) -> None:
+    """fpid == libid still works, but it is WARNED about — it is two records under one id.
+
+    Reported by EcadRefPinDialect 2026-07-29 from the parts side: a symbol record and a
+    footprint record sharing one part_id collapse in a catalog keyed on a flat id, and the
+    surviving footprint record's geometry_ref carries no libid, so part_place answered
+    "geometry_ref missing 'libid'" for a part that had JUST been created successfully.
+
+    Deliberately not a hard refusal: the same-name pattern is KiCad-idiomatic (separate
+    symbol libs vs .pretty dirs, mirrored by our symbols/ and footprints/ subdirs) and both
+    ids resolve correctly here. Deliberately not an auto-suffix either — silently renaming
+    the caller's id is the exact class of silent substitution this tool exists to replace.
+    So: it works, it resolves, and it says so.
+    """
+    _mp_lib_dir()
+    libid = "RF_Module:ESP32-WROOM-32-SameId"
+    r = _make_esp32(tools, libid, fpid=libid, overwrite=True)
+    assert r["ok"] and r["created"], r
+    assert r["libid"] == libid and r["fpid"] == libid, r
+    assert r["pin_count"] == 38 and r["pad_count"] == 38, r
+
+    warn = " ".join(r["warnings"])
+    assert r["warnings"], f"fpid == libid must be warned about: {r}"
+    assert "ID COLLISION" in warn, warn
+    assert libid in warn, warn
+    assert "part_place" in warn or "part_get" in warn, \
+        f"the warning must name the consumer that breaks: {warn}"
+    assert "fpid=" in warn, f"the warning must show the distinct id to use instead: {warn}"
+
+    # ...and BOTH artefacts really are stored and resolvable under that one id, in their
+    # separate namespaces. If they were not, the honest answer would be a refusal.
+    from services.ecad.library import resolve, resolve_footprint
+    assert len(resolve(libid)["pins"]) == 38, "the symbol must still resolve"
+    assert len(resolve_footprint(libid)["pads"]) == 38, "the footprint must still resolve"
+    print(f"  fpid == libid -> works, both resolve, and warns: {r['warnings'][0][:60]}...")
+    print("  [make_part_warns_when_fpid_equals_libid] PASS")

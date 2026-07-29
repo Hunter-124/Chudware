@@ -857,6 +857,74 @@ _ARITHMETIC = frozenset({
     "average", "mean", "total", "count", "max", "min", "round", "sqrt",
 })
 
+# Textbook symbols for a canonical stem, guarded by the UNIT SUFFIX the model wrote.
+# The unit is the whole safety mechanism: `P_N` is newtons, so it can only be the force
+# input, while a bare `P` (point load? pressure?) is never guessed. Every entry below is
+# (symbol, unit) -> canonical stem, and both sides carry the same physical quantity.
+_CALC_PARAM_SYMBOLS: dict = {
+    ("l", "mm"): "length",      # L = span/length in every mechanics text
+    ("p", "n"): "force",        # P = point load, in newtons
+    ("f", "n"): "force",        # F = force (the T-W4 `beam` calc spells it F_n)
+    ("m", "nmm"): "moment",     # M = bending moment
+    ("a", "mm2"): "area",       # A = cross-sectional area
+    ("t", "mm"): "thickness",   # t = wall thickness (T_nm is torque — different unit)
+}
+
+# b/h spellings that describe a rectangle, for the I_mm4 teaching error.
+_RECT_B_KEYS = ("b_mm", "b", "base_mm", "width_mm")
+_RECT_H_KEYS = ("h_mm", "h", "height_mm", "depth_mm")
+
+
+def _symbol_param(want: str, supplied, wanted) -> Optional[str]:
+    """The supplied key that is `want` written as its textbook symbol, or None.
+
+    Only fires when the unit suffixes match exactly and the supplied key is not itself
+    a canonical param of this formula (never steal `L_mm` from `beam`, which wants it).
+    """
+    if "_" not in want:
+        return None
+    wstem, wunit = want.rsplit("_", 1)
+    for key in supplied:
+        if "_" not in key or key in wanted:
+            continue
+        sym, unit = key.rsplit("_", 1)
+        if unit.lower() != wunit.lower():
+            continue
+        if _CALC_PARAM_SYMBOLS.get((sym.lower(), unit.lower())) == wstem.lower():
+            return key
+    return None
+
+
+def _rect_inertia_hint(params: dict, wanted) -> Optional[str]:
+    """Teach I = b*h^3/12 instead of assuming the caller's section is a rectangle.
+
+    `I_mm4` is a property of a section SHAPE. Computing it from b/h would silently pick
+    the shape for the caller and hand back a confident deflection for a section they
+    never described, so this returns words, never a value.
+    """
+    if "I_mm4" not in wanted or "I_mm4" in params:
+        return None
+    lower = {k.lower(): k for k in params}
+    b_key = next((lower[k] for k in _RECT_B_KEYS if k in lower), None)
+    h_key = next((lower[k] for k in _RECT_H_KEYS if k in lower), None)
+    if b_key is None and h_key is None:
+        return None
+    hint = (
+        f"I_mm4 is the second moment of area of the SECTION and cannot be derived from "
+        f"{sorted(k for k in (b_key, h_key) if k)} without assuming a section shape — "
+        f"none was assumed. For a solid rectangle of width b and height h (h measured in "
+        f"the bending direction): I_mm4 = b*h**3/12.")
+    try:
+        if b_key is not None and h_key is not None:
+            b = float(params[b_key])
+            h = float(params[h_key])
+            hint += (f" With b={b:g}, h={h:g} that is I_mm4 = {b * h ** 3 / 12.0:.6g}. "
+                     f"Re-issue the call with I_mm4 if that is your section.")
+    except (TypeError, ValueError):
+        pass
+    return hint + (" A different shape needs its own I: use the `beam` calculator, which "
+                   "takes section/b_mm/h_mm (or d_mm) and computes I itself.")
+
 
 def _all_calc_ids() -> list:
     return sorted(set(_calcs.list_calcs()) | set(_legacy_formulas()))
@@ -936,9 +1004,13 @@ def _unknown_formula(name: str, notes: list) -> dict:
 def _reconcile_calc_params(params: dict, wanted, formula: str, notes: list) -> dict:
     """Map the model's param spelling onto the formula's real names.
 
-    The rule is structural, not a synonym list: every canonical name carries its unit as
-    a suffix (``force_n``, ``area_mm2``, ``I_mm4``), and a model writes the bare stem.
-    Unit-suffixed string values ("20mm") are converted for ``*_mm`` params.
+    Mostly structural, not a synonym list: every canonical name carries its unit as a
+    suffix (``force_n``, ``area_mm2``, ``I_mm4``), matching is case-insensitive (``E_MPa``
+    is ``E_mpa``), and a model writing the bare stem is understood. On top of that a small
+    unit-guarded symbol table resolves the standard mechanics symbols (``L_mm`` ->
+    ``length_mm``, ``P_N`` -> ``force_n``). Unit-suffixed string values ("20mm") are
+    converted for ``*_mm`` params. A key that is already a canonical param of this formula
+    is never re-pointed at a different one.
     """
     out = dict(params)
     for want in wanted:
@@ -948,8 +1020,12 @@ def _reconcile_calc_params(params: dict, wanted, formula: str, notes: list) -> d
         stem = want.rsplit("_", 1)[0] if "_" in want else want
         src = lower.get(want.lower()) or lower.get(stem.lower())
         if src is None:
+            src = _symbol_param(want, list(out), wanted)
+        if src is None:
             close = difflib.get_close_matches(want.lower(), list(lower), n=1, cutoff=0.85)
             src = lower[close[0]] if close else None
+        if src in wanted and src != want:
+            src = None  # it is this formula's own param; leave it where the model put it
         if src is not None and src != want:
             out[want] = out.pop(src)
             notes.append(f"interpreted param {src!r} as {want!r}")
@@ -1115,14 +1191,35 @@ def register_research_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def research_unit_convert(value: float, unit: str, family: str = "length") -> str:
-        """Convert a value to its canonical SI unit deterministically (code converts, not
-        the model — the ksi/MPa 6.9x error). `family` is `length` (->mm), `angle` (->deg)
-        or `count`. A unit that does not belong to the family is rejected
-        (`{ok:false, reason:"bad_unit"}`), never silently coerced.
+    def research_unit_convert(value: Optional[Any] = None,
+                              unit: Optional[str] = None,
+                              family: Optional[str] = None,
+                              from_unit: Optional[str] = None,
+                              to_unit: Optional[str] = None,
+                              batch: Optional[list] = None,
+                              conversions: Optional[list] = None) -> str:
+        """Convert units deterministically — code converts, not the model (the ksi/MPa
+        6.9x error). Reach for this INSTEAD of doing the arithmetic in your head.
+
+        Three call shapes:
+        * `research_unit_convert(value=25, from_unit="ksi", to_unit="MPa")` — arbitrary
+          conversion. The family is resolved FROM THE UNITS; do not state it.
+        * `research_unit_convert(value=1, unit="in", family="length")` — canonical
+          direction only (`length`->mm, `angle`->deg, `count`).
+        * `research_unit_convert(batch=[{"value":1,"from_unit":"in","to_unit":"mm"}, ...])`
+          — one call for many; each entry reports its own result.
+
+        Families: `length`, `area`, `volume`, `angle`, `mass`, `force`, `pressure`
+        (Pa/kPa/MPa/GPa/psi/ksi/bar/atm), `torque` (N*m/N*mm/lbf*in/lbf*ft),
+        `temperature` (degC/degF/K — affine, handled correctly), `count`.
+        A cross-family pair (`mm`->`kg`) is REFUSED naming both families, never coerced;
+        an ambiguous case variant (`NM`: nanometre or newton-metre?) is refused too.
         """
         try:
-            return _dumps(research.unit_convert(value, unit, family=family))
+            items = batch if batch is not None else conversions
+            return _dumps(research.unit_convert(value, unit, family,
+                                                from_unit=from_unit, to_unit=to_unit,
+                                                batch=items))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -1149,9 +1246,18 @@ def register_research_tools(mcp: FastMCP) -> None:
 
         Param names are reconciled structurally: every canonical name carries its unit
         as a suffix, so the bare stem is accepted and echoed — `force`→`force_n`,
-        `area`→`area_mm2`, `I`→`I_mm4`, `diameter`→`diameter_mm`. `circle_area` also
+        `area`→`area_mm2`, `I`→`I_mm4`, `diameter`→`diameter_mm`. Matching ignores case,
+        so `E_MPa` is `E_mpa`. The standard mechanics symbols resolve when the unit
+        suffix agrees — `L_mm`→`length_mm`, `P_N`/`F_N`→`force_n`, `M_Nmm`→`moment_nmm`,
+        `A_mm2`→`area_mm2`, `t_mm`→`thickness_mm` — while a bare symbol with no unit
+        (`P` could be pressure or point load) is never guessed. `circle_area` also
         takes a radius (`r`/`radius`) and doubles it. Unit-suffixed strings on a `*_mm`
         param ("20mm", "0.75in") are converted. Every rewrite appears in `interpreted`.
+
+        `I_mm4` is never derived from `b_mm`/`h_mm`: the second moment of area depends on
+        the section SHAPE, so the call is refused with the rectangular substitution
+        `I_mm4 = b*h**3/12` to pass explicitly (or use the `beam` calculator, which takes
+        `section`/`b_mm`/`h_mm` and computes I itself).
 
         A misspelled or unknown `formula` returns the closest registered calculator(s)
         by edit distance plus the whole catalogue grouped by category (`known`), so the
@@ -1202,6 +1308,10 @@ def register_research_tools(mcp: FastMCP) -> None:
                     out["hint"] = (f"{out.get('hint', '')} Expected params for "
                                    f"{resolved!r}: {sorted(schema)}; you passed "
                                    f"{sorted(kw)}.").strip()
+                    rect = _rect_inertia_hint(kw, list(schema))
+                    if rect:
+                        out["hint"] = f"{out['hint']} {rect}"
+                        out["substitution"] = "I_mm4 = b*h**3/12 (solid rectangle)"
             else:
                 required = _LEGACY_FORMULAS[resolved][1]
                 kw = _reconcile_calc_params(kw, required, resolved, notes)
@@ -1215,6 +1325,10 @@ def register_research_tools(mcp: FastMCP) -> None:
                                    f"{list(required)} — {_LEGACY_FORMULAS[resolved][2]} "
                                    f"You passed {sorted(k for k in kw if k != 'raw_quote')}."
                                    ).strip()
+                    rect = _rect_inertia_hint(kw, required)
+                    if rect:
+                        out["hint"] = f"{out['hint']} {rect}"
+                        out["substitution"] = "I_mm4 = b*h**3/12 (solid rectangle)"
             if notes and isinstance(out, dict):
                 out["interpreted"] = _interpreted_notes(notes)
             return _dumps(out)

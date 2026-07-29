@@ -5,6 +5,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from typing import Optional
 from typing import Union
 import json
+import math
 import os
 
 from .cad_common import coerce_json_or_repr, require_list, require_mapping
@@ -25,6 +26,7 @@ from .ecad_common import (
     _get_pcb,
     _get_sch,
     _outline_bbox,
+    _pad_world,
     _parts_extents,
     _rpc,
     _run_with_budget,
@@ -120,6 +122,118 @@ def _board_bbox(doc: dict) -> tuple[float, float, float, float]:
         return (0.0, 0.0, 1.0, 1.0)
     pad = 2.0
     return (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+
+
+# --------------------------------------------------------------- manual-routing helpers
+#
+# Pad resolution for ecad_route_pad_to_pad. Kept module-level (not inside the register
+# closure) so the routing tool stays readable and the lookups are unit-testable.
+
+
+class _PadRefError(Exception):
+    """A pad reference that cannot be resolved. Carries the payload the tool returns."""
+
+    def __init__(self, message: str, *, hint: str = "",
+                 next_actions: Optional[list] = None, **extra) -> None:
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+        self.next_actions = next_actions or []
+        self.extra = extra
+
+
+def _fp_by_ref(doc: dict, ref: str) -> Optional[dict]:
+    """Placed footprint by ref-des ('R1') or internal id ('fp1'). Refs are how models think."""
+    token = str(ref).strip()
+    if not token:
+        return None
+    for fp in doc.get("footprints", []) or []:
+        if str(fp.get("ref") or "") == token:
+            return fp
+    for fp in doc.get("footprints", []) or []:
+        if str(fp.get("id") or "") == token:
+            return fp
+    low = token.lower()
+    for fp in doc.get("footprints", []) or []:
+        if str(fp.get("ref") or "").lower() == low:
+            return fp
+    return None
+
+
+def _pad_by_number(fp: dict, number) -> Optional[dict]:
+    """Pad of a placed footprint by its pad NUMBER ('1', 'A2', 2) or internal id ('p3')."""
+    token = str(number).strip()
+    if not token:
+        return None
+    pads = fp.get("pads", []) or []
+    for pad in pads:
+        if str(pad.get("number") or "") == token:
+            return pad
+    for pad in pads:
+        if str(pad.get("id") or "") == token:
+            return pad
+    low = token.lower()
+    for pad in pads:
+        if str(pad.get("number") or "").lower() == low:
+            return pad
+    return None
+
+
+def _resolve_pad(doc: dict, ref: str, number, role: str) -> tuple[dict, dict, tuple]:
+    """(footprint, pad, world_xy) for ``ref``.``number``, or raise _PadRefError naming the
+    concrete alternatives. NEVER falls back to a nearby pad — a wrong pad is a wrong net."""
+    fp = _fp_by_ref(doc, ref)
+    if fp is None:
+        refs = [str(f.get("ref") or f.get("id")) for f in doc.get("footprints", []) or []]
+        raise _PadRefError(
+            f"{role}: no footprint {str(ref)!r} on the board",
+            hint=("Board footprints are: " + (", ".join(sorted(refs)) or "(none)") +
+                  ". Refs come from the schematic via ecad_update_from_sch."),
+            next_actions=["ecad_update_from_sch()  # push schematic parts onto the board",
+                          "ecad_status()  # list what is actually placed"],
+            board_refs=sorted(refs))
+    pad = _pad_by_number(fp, number)
+    if pad is None:
+        nums = [str(p.get("number") or p.get("id")) for p in fp.get("pads", []) or []]
+        raise _PadRefError(
+            f"{role}: footprint {fp.get('ref') or fp.get('id')} has no pad {str(number)!r}",
+            hint=(f"{fp.get('ref') or fp.get('id')} ({fp.get('fpid')}) pads are: "
+                  + (", ".join(nums) or "(none)") + "."),
+            next_actions=["ecad_status()  # inspect the placed footprints and their pads"],
+            pads=nums)
+    return fp, pad, _pad_world(fp, pad)
+
+
+def _copper_layers(doc: dict) -> list[str]:
+    n = doc.get("stackup", {}).get("copper_layers", 2)
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 2
+    if n <= 1:
+        return ["F.Cu"]
+    return ["F.Cu", *[f"In{i}.Cu" for i in range(1, n - 1)], "B.Cu"]
+
+
+def _net_class_of(doc: dict, net: str) -> str:
+    for n in doc.get("nets", []) or []:
+        if n.get("name") == net:
+            return str(n.get("class") or "default")
+    return "default"
+
+
+def _class_track_width(doc: dict, net: str):
+    """The net-class ``track_width`` ecad_stackup_solve writes, or None when unsolved."""
+    classes = doc.get("net_classes") or {}
+    cls = classes.get(_net_class_of(doc, net))
+    if not isinstance(cls, dict):
+        cls = classes.get("default") if isinstance(classes.get("default"), dict) else {}
+    w = cls.get("track_width")
+    try:
+        return float(w) if w is not None else None
+    except (TypeError, ValueError):
+        return None
+
 
 def register_ecad_pcb_tools(mcp: FastMCP) -> None:
     """ECAD PCB MCP tools (T-RF8 split of ecad_tools.py): ecad_new_pcb, run_drc, run_hostcheck, run_dfm, autoroute, zones, export, to_3d, net classes, stackup, make_board, board_from_schematic, autoplace, optimize_traces."""
@@ -440,7 +554,11 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         if failed:
             next_actions.append(
                 f"{len(failed)} net(s) failed ({', '.join(map(str, failed[:6]))}) — "
-                "they need manual routing or more space (move parts apart / finer pitch).")
+                "route them by hand pad-by-pad, or give the router more space "
+                "(move parts apart / finer pitch).")
+            next_actions.append(
+                "ecad_route_pad_to_pad('U1', '1', 'R1', '2')  # hand-route one failed "
+                "connection; the net is detected from the pads")
             next_actions.append("ecad_autoroute(pitch=0.15)  # retry with a finer grid")
         else:
             next_actions.append("ecad_fill_zones()  # pour copper, then ecad_run_drc()")
@@ -464,6 +582,235 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                   + (" " + "; ".join(dp_reading_lines) if dp_reading_lines else "")
                   + " READ the ascii_readback before the next board edit.",
             "next_actions": next_actions,
+        }
+        _attach_board_ascii_readback(payload, doc_id=session.doc_id)
+        return _dumps(payload)
+
+
+    # ------------------------------------------------- manual (pad-to-pad) routing
+
+    @mcp.tool()
+    def ecad_route_pad_to_pad(from_ref: str = "", from_pad: Union[str, int] = "",
+                              to_ref: str = "", to_pad: Union[str, int] = "",
+                              layer: str = "F.Cu", to_layer: str = "",
+                              width: float = 0.0,
+                              via_at: Optional[Union[list, str]] = None,
+                              doc_id: str = "") -> str:
+        """Route ONE copper trace between two pads by hand — the surgical complement to
+        ecad_autoroute, and the tool autoroute's "failed net" report is telling you to use.
+
+        ``from_ref``/``to_ref`` are ref-des ('U1', 'R3') or internal footprint ids; ``from_pad``/
+        ``to_pad`` are pad NUMBERS ('1', 'A2') as printed in the footprint, or pad ids. Same
+        endpoint spelling as the schematic-side ecad_wire(from_ref, from_pin, ...).
+
+        THE NET IS DETECTED, NEVER ASSERTED. Both pads' nets are read off the board and must be
+        the SAME net; routing two different nets together would short them, so that is REFUSED,
+        not warned about. A pad with no net is refused too (run ecad_update_from_sch first).
+
+        WIDTH PRECEDENCE: explicit ``width`` (mm) > the net class's solved ``track_width``
+        (what ecad_stackup_solve writes, which autoroute and DRC already honour) > the board
+        default 0.25 mm. Omit ``width`` to inherit the solved impedance-controlled width — the
+        response reports the width actually used and where it came from (``width_source``).
+
+        LAYER CHANGE: pass ``to_layer`` to finish on a different copper layer. A through via is
+        inserted at ``via_at`` ([x, y]) or, by default, the midpoint of the two pads, and the
+        trace becomes pad -> via on ``layer`` plus via -> pad on ``to_layer``.
+
+        The segments go into the board's own ``tracks`` list (the same pcb_add_track ops
+        autoroute emits), so ecad_run_drc sees them: a hand trace that violates clearance WILL
+        be reported. Response carries per-segment layer/width/endpoints and the total length_mm.
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Manual routing needs an open board.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        doc = session.doc
+
+        missing = [n for n, v in (("from_ref", from_ref), ("from_pad", from_pad),
+                                  ("to_ref", to_ref), ("to_pad", to_pad))
+                   if not str(v).strip()]
+        if missing:
+            return _err(f"missing required endpoint argument(s): {', '.join(missing)}",
+                        hint="Name both pads: from_ref/from_pad and to_ref/to_pad, e.g. "
+                             "ecad_route_pad_to_pad('U1', '3', 'R5', '1').",
+                        next_actions=["ecad_status()  # list placed refs and their pads"])
+
+        try:
+            fp_a, pad_a, xy_a = _resolve_pad(doc, from_ref, from_pad, "from")
+            fp_b, pad_b, xy_b = _resolve_pad(doc, to_ref, to_pad, "to")
+        except _PadRefError as e:
+            return _err(e.message, hint=e.hint, next_actions=e.next_actions, **e.extra)
+
+        if pad_a is pad_b:
+            return _err("from and to name the SAME pad — a track to itself is not a connection",
+                        hint="Pick two distinct pads on the same net.",
+                        next_actions=["ecad_status()"])
+
+        net_a, net_b = pad_a.get("net"), pad_b.get("net")
+        a_name = f"{fp_a.get('ref') or fp_a.get('id')}.{pad_a.get('number')}"
+        b_name = f"{fp_b.get('ref') or fp_b.get('id')}.{pad_b.get('number')}"
+        no_net = [n for n, v in ((a_name, net_a), (b_name, net_b)) if not v]
+        if no_net:
+            return _err(f"pad(s) with no net: {', '.join(no_net)}",
+                        hint="A pad with no net has nothing to connect. Board pad nets come "
+                             "from the schematic — wire the pins with ecad_wire, then push the "
+                             "netlist onto the board with ecad_update_from_sch.",
+                        next_actions=[f"ecad_wire('{fp_a.get('ref')}', '{pad_a.get('number')}', "
+                                      f"'{fp_b.get('ref')}', '{pad_b.get('number')}')",
+                                      "ecad_update_from_sch()"],
+                        from_net=net_a, to_net=net_b)
+        if net_a != net_b:
+            return _err(f"REFUSED: {a_name} is on net {net_a!r} but {b_name} is on net "
+                        f"{net_b!r} — routing them together would SHORT two nets",
+                        hint="A copper trace between two different nets is a short circuit, so "
+                             "this tool never does it. If they really should be one net, join "
+                             "them on the SCHEMATIC first and re-sync; the board follows the "
+                             "netlist, not the other way round.",
+                        next_actions=[f"ecad_wire('{fp_a.get('ref')}', '{pad_a.get('number')}', "
+                                      f"'{fp_b.get('ref')}', '{pad_b.get('number')}')  "
+                                      "# join them on the schematic if that is the intent",
+                                      "ecad_update_from_sch()  # then re-push the netlist",
+                                      "ecad_autoroute()  # route each net to its own members"],
+                        from_net=net_a, to_net=net_b, board_changed=False)
+        net = str(net_a)
+
+        cu = _copper_layers(doc)
+        start_layer = str(layer or "F.Cu")
+        end_layer = str(to_layer or "").strip() or start_layer
+        bad = [l for l in {start_layer, end_layer} if l not in cu]
+        if bad:
+            return _err(f"layer(s) not in this board's stackup: {', '.join(sorted(bad))}",
+                        hint=f"Copper layers on this {len(cu)}-layer board are: "
+                             f"{', '.join(cu)}.",
+                        next_actions=[f"ecad_route_pad_to_pad('{from_ref}', '{from_pad}', "
+                                      f"'{to_ref}', '{to_pad}', layer='{cu[0]}')"],
+                        copper_layers=cu, board_changed=False)
+
+        # An SMD pad only has copper on the side it sits on: starting a trace on the other
+        # layer would draw a track that touches nothing. Refuse rather than "connect" thin air.
+        for pad, name, lyr, which in ((pad_a, a_name, start_layer, "from"),
+                                      (pad_b, b_name, end_layer, "to")):
+            pad_layers = [str(x) for x in (pad.get("layers") or [])]
+            cu_of_pad = [x for x in pad_layers if x in cu]
+            if pad.get("type") == "smd" and cu_of_pad and lyr not in cu_of_pad:
+                return _err(f"{which} pad {name} has copper only on {', '.join(cu_of_pad)}, "
+                            f"not on {lyr} — a trace there would connect to nothing",
+                            hint=f"Route {name} on {cu_of_pad[0]}, or move the footprint to the "
+                                 "other side of the board.",
+                            next_actions=[f"ecad_route_pad_to_pad('{from_ref}', '{from_pad}', "
+                                          f"'{to_ref}', '{to_pad}', layer='{cu_of_pad[0]}')"],
+                            board_changed=False)
+
+        # Width precedence: explicit > net-class solved track_width > board default.
+        try:
+            explicit_w = float(width or 0.0)
+        except (TypeError, ValueError):
+            return _err(f"width must be a number in mm, got {width!r}",
+                        hint="Omit width to inherit the net class's solved track_width.")
+        solved_w = _class_track_width(doc, net)
+        if explicit_w > 0.0:
+            width_source = "explicit"
+        elif solved_w is not None:
+            width_source = f"net_class:{_net_class_of(doc, net)}"
+        else:
+            width_source = "board_default"
+
+        via_pt = None
+        if start_layer != end_layer:
+            raw_via = via_at
+            if isinstance(raw_via, str) and raw_via.strip():
+                raw_via = coerce_json_or_repr(raw_via)
+            if raw_via is None:
+                via_pt = [(xy_a[0] + xy_b[0]) / 2.0, (xy_a[1] + xy_b[1]) / 2.0]
+            elif isinstance(raw_via, (list, tuple)) and len(raw_via) == 2:
+                try:
+                    via_pt = [float(raw_via[0]), float(raw_via[1])]
+                except (TypeError, ValueError):
+                    via_pt = None
+            if via_pt is None:
+                return _err(f"via_at must be [x, y] in mm, got {via_at!r}",
+                            hint="Omit via_at to drop the layer-change via at the midpoint of "
+                                 "the two pads.",
+                            board_changed=False)
+
+        def _track_op(p1, p2, lyr):
+            op = {"op": "pcb_add_track", "net": net, "layer": lyr, "kind": "segment",
+                  "p1": [float(p1[0]), float(p1[1])], "p2": [float(p2[0]), float(p2[1])]}
+            # Omitting 'width' is what makes the C++ op resolve the net class's track_width.
+            if explicit_w > 0.0:
+                op["width"] = explicit_w
+            return op
+
+        if via_pt is None:
+            ops = [_track_op(xy_a, xy_b, start_layer)]
+        else:
+            ops = [_track_op(xy_a, via_pt, start_layer),
+                   {"op": "pcb_add_via", "net": net, "at": via_pt,
+                    "layers": [start_layer, end_layer], "type": "through"},
+                   _track_op(via_pt, xy_b, end_layer)]
+
+        before_tracks = {t.get("id") for t in doc.get("tracks", []) or []}
+        before_vias = {v.get("id") for v in doc.get("vias", []) or []}
+        try:
+            _apply(session, ops)
+        except OpError as e:
+            return _err(f"manual route failed: {e.message}", hint=e.message,
+                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}),
+                        board_changed=False)
+
+        doc = session.doc
+        new_tracks = [t for t in doc.get("tracks", []) or []
+                      if t.get("id") not in before_tracks]
+        new_vias = [v for v in doc.get("vias", []) or []
+                    if v.get("id") not in before_vias]
+        segments = []
+        total_len = 0.0
+        for t in new_tracks:
+            p1, p2 = t.get("p1") or [0, 0], t.get("p2") or [0, 0]
+            seg_len = math.hypot(float(p2[0]) - float(p1[0]), float(p2[1]) - float(p1[1]))
+            total_len += seg_len
+            segments.append({"id": t.get("id"), "layer": t.get("layer"),
+                             "width_mm": round(float(t.get("width") or 0.0), 6),
+                             "p1": [round(float(p1[0]), 6), round(float(p1[1]), 6)],
+                             "p2": [round(float(p2[0]), 6), round(float(p2[1]), 6)],
+                             "length_mm": round(seg_len, 6)})
+        used_w = segments[0]["width_mm"] if segments else None
+        total_len = round(total_len, 6)
+
+        rats = (_compile_of(session).get("ratsnest") or {})
+        remaining = rats.get("airwires") if isinstance(rats, dict) else None
+        if isinstance(remaining, list):
+            remaining = len(remaining)
+
+        head = (f"routed {a_name} -> {b_name} on net {net}: {len(segments)} segment(s), "
+                f"{total_len} mm at {used_w} mm wide ({width_source})"
+                + (f", 1 via at [{via_pt[0]:.3f}, {via_pt[1]:.3f}] "
+                   f"({start_layer}->{end_layer})" if new_vias else
+                   f" on {start_layer}") + ".")
+        payload = {
+            "ok": True, "doc_id": session.doc_id, "revision": session.revision,
+            "net": net, "net_class": _net_class_of(doc, net),
+            "from": {"ref": fp_a.get("ref") or fp_a.get("id"), "pad": pad_a.get("number"),
+                     "at": [round(xy_a[0], 6), round(xy_a[1], 6)]},
+            "to": {"ref": fp_b.get("ref") or fp_b.get("id"), "pad": pad_b.get("number"),
+                   "at": [round(xy_b[0], 6), round(xy_b[1], 6)]},
+            "segments": segments,
+            "length_mm": total_len,
+            "width_mm": used_w,
+            "width_source": width_source,
+            "solved_class_width_mm": solved_w,
+            "vias": [{"id": v.get("id"), "at": v.get("at"), "layers": v.get("layers"),
+                      "drill": v.get("drill"), "diameter": v.get("diameter")}
+                     for v in new_vias],
+            "ratsnest_remaining": remaining,
+            "warnings": [],
+            "hint": head + " This trace is a normal board track — ecad_run_drc() checks its "
+                           "clearance and width like any routed copper.",
+            "next_actions": [
+                "ecad_run_drc()  # confirm the hand route keeps clearance",
+                "ecad_autoroute()  # let the router finish whatever is still an airwire",
+            ],
         }
         _attach_board_ascii_readback(payload, doc_id=session.doc_id)
         return _dumps(payload)

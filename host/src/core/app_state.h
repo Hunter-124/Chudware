@@ -1705,10 +1705,15 @@ struct AppState {
     bool chatCfdPending = false;
     double chatCfdVel = 10.0;
     double chatCfdAoa = 0.0;
-    // Live context-meter telemetry: the most recent agent call's INPUT token estimate (how full the
-    // model's context is right now) — fed from agent_output events, reset at run start. The composer
-    // shows it vs the active model's window like the Claude Code / Codex / VS Code context meters.
+    // Live context-meter telemetry. `lastContextTokens` is the most recent agent call's INPUT
+    // token count (how full the model's context is right now); `lastContextWindow` is the
+    // window the SERVER reported for the model that actually ran, which beats any client-side
+    // guess — the harness resolves it from the model catalog (services/agent/config.py sets
+    // provider.context_window), while the GUI can only pattern-match the model id. 0 means the
+    // server has not said yet, and the composer falls back to effectiveContextWindow().
+    // Both are fed from `agent.context` events and reset at run start.
     int lastContextTokens = 0;
+    int lastContextWindow = 0;
     // --- end C22b ---
 
     // ---- Stop + message queue (modern agentic composer) ----

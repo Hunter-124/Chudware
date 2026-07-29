@@ -3849,6 +3849,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // A background run still streams into its own bubble above.
       const bool isViewedDoc =
           !job.docKey.empty() && job.docKey == st.chatDocKey;
+      // The context meter is a property of the CONVERSATION, not of a document: a general-lane
+      // turn that only reads files or answers a question carries no docKey at all, so gating it
+      // on isViewedDoc pinned the meter at zero for exactly the long chats where context
+      // pressure matters most. Conversation::lastContextTokens is already per-session, which
+      // says the same thing. Scope it to the conversation the user is looking at.
+      const bool isViewedConv = runConvId == st.activeConvId();
       for (auto &e : evs) {
         // --- route orchestrator events to the Agent Workflow DAG store ---
         if (e.kind.rfind("orch_", 0) == 0) {
@@ -3870,16 +3876,59 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // doing/thinking.
             if (active)
               feedTurnActivity(*active, orchKind, data);
-            // Context meter: reset at run start; track the peak context
-            // estimate across calls. C++ agent_output always has tokens:null,
-            // so prefer agent_call.context_tokens_est (the real per-call
-            // size). Viewed doc only — the meter and the preview trackers
-            // describe the document the user is looking at.
+            // Context meter. THREE sources, one per lane — do not collapse:
+            //   * agent.context (live Python general lane): the authoritative
+            //     feed. Carries {used, window} straight from the provider's
+            //     usage record, emitted after every provider completion, so
+            //     the meter tracks the CURRENT context size live. `used` is
+            //     assigned, never max()'d: a compaction genuinely shrinks the
+            //     context and a ratcheting meter would lie afterwards.
+            //     `window` is only stored when > 0 so a provider that cannot
+            //     report one never wipes a good earlier value.
+            //   * agent_call (C++ agent lane): context_tokens_est, the real
+            //     per-call size. Peak-tracked because that lane emits an
+            //     estimate per call with no shrink semantics.
+            //   * agent_output (C++ agent lane): tokens.in fallback — C++
+            //     agent_output usually has tokens:null, so agent_call is
+            //     preferred, but honour a real number when one arrives.
+            // Viewed doc only — the meter and the preview trackers describe
+            // the document the user is looking at.
+            //
+            // TWO reset points, because the two lanes start a run with
+            // different first events: run_started fires on the C++ agent lane,
+            // task_route is the first event of every live Python general-lane
+            // run (which never emits run_started at all). Both resets are
+            // idempotent; neither is redundant — deleting either leaves that
+            // lane showing the previous run's numbers.
             if (orchKind == "run_started") {
-              if (isViewedDoc) {
+              if (isViewedConv) {
                 st.lastContextTokens = 0;
+                st.lastContextWindow = 0;
+              }
+              if (isViewedDoc) {
+                // Preview trackers ARE document state — they stay doc-scoped.
                 s_lastPreviewRev = 0;
                 s_lastPreviewDocId.clear();
+              }
+            } else if (orchKind == "task_route") {
+              // Live general lane's run start (see the two-reset note above).
+              if (isViewedConv) {
+                st.lastContextTokens = 0;
+                st.lastContextWindow = 0;
+              }
+            } else if (orchKind == "agent.context") {
+              if (isViewedConv) {
+                if (data.contains("used") && data["used"].is_number_integer()) {
+                  int used = data["used"].get<int>();
+                  if (used >= 0)
+                    st.lastContextTokens = used;
+                }
+                if (data.contains("window") &&
+                    data["window"].is_number_integer()) {
+                  int win = data["window"].get<int>();
+                  if (win > 0)
+                    st.lastContextWindow = win;
+                }
               }
             } else if (orchKind == "agent_call") {
               int est = 0;

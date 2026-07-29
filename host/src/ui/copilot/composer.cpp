@@ -2060,23 +2060,63 @@ static ImU32 gaugeTrackColor(const ui::AdaptiveSurface& surf) {
     return ImGui::ColorConvertFloat4ToU32(c);
 }
 
+// The window the context meter reports, in strict precedence:
+//   1. settings.contextWindow — the user typed a number into AI settings. An OVERRIDE means
+//      exactly that: it beats even the server, because the reason to set it is that the
+//      catalog/provider is reporting a window you do not believe (a local model behind an
+//      OpenAI-compatible shim habitually lies about its own capacity).
+//   2. st.lastContextWindow — what the server said about the model that ACTUALLY ran
+//      (agent.context). This outranks the rest of the Settings-side answer because Settings
+//      only describes what the picker currently selects: it may have been changed mid-session,
+//      and an auto-route may have run a different model entirely.
+//   3. effectiveContextWindow() — catalog metadata for the selected model, then an id estimate.
+// 0 = genuinely unknown, never a real capacity.
+static int contextMeterWindow(const AppState& st) {
+    if (st.settings.contextWindow > 0) return st.settings.contextWindow;
+    if (st.lastContextWindow > 0) return st.lastContextWindow;
+    return effectiveContextWindow(st.settings);
+}
+
+// The meter's readout string + whether a ring is meaningful, shared by drawContextMeter() and
+// measureContextMeter() so the reserved width can never disagree with the drawn one. Three honest
+// states, none of which ever prints a zero denominator or a fabricated figure:
+//   used > 0, win > 0  -> "12k/200k" with a filled fraction ring
+//   used == 0, win > 0 -> "\xe2\x80\x94/200k": nothing measured yet, so the numerator is an
+//                         em dash and the ring sits empty — a pure capacity hint
+//   win == 0           -> "ctx \xe2\x80\x94" with NO ring: the window is unknown, so there is no
+//                         fraction to show at all
+struct CtxMeterText {
+    std::string full;      // ring-adjacent readout (or the bare unknown mark)
+    bool        ringOk;    // false = window unknown; draw the compact tag only, never a ring
+};
+static CtxMeterText contextMeterText(const AppState& st) {
+    const int win  = contextMeterWindow(st);
+    const int used = st.lastContextTokens;
+    if (win <= 0) return {std::string("\xe2\x80\x94"), false};
+    std::string num = used > 0 ? fmtTokens(used) : std::string("\xe2\x80\x94");
+    return {num + "/" + fmtTokens(win), true};
+}
+
 // Context-window gauge for the composer prelude row: a fraction ring + "N/M" readout (compact
-// "ctx N/M" with no ring when the pane is too narrow). Drawn at the current cursor; advances it.
+// "ctx N/M" with no ring when the pane is too narrow, or when the window itself is unknown).
+// Drawn at the current cursor; advances it.
 // Moved here from the footer chips, where it was pinned to the pane bottom against the status bar.
 static void drawContextMeter(AppState& st, float roomForMeter) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
-    const int   win  = effectiveContextWindow(st.settings);
+    const int   win  = contextMeterWindow(st);
     const int   used = st.lastContextTokens;
-    const float frac = win > 0 ? std::min(1.0f, (float)used / (float)win) : 0.0f;
+    const float frac = (win > 0 && used > 0) ? std::min(1.0f, (float)used / (float)win) : 0.0f;
     const float gap = ui::metrics::px(5), ringAdv = gaugeRingAdvance();
-    const std::string full = fmtTokens(used) + "/" + fmtTokens(win);
+    const CtxMeterText txt = contextMeterText(st);
+    const std::string& full = txt.full;
     const std::string lean = "ctx " + full;   // standalone (no ring) keeps a "ctx" tag so it reads
     const float fh = ImGui::GetFrameHeight();
-    // Ring + readout only when there is room for both; uses the SAME roomForMeter the caller passed
-    // to measureContextMeter() so the width it reserved and the layout drawn here agree exactly.
+    // Ring + readout only when the window is known AND there is room for both; uses the SAME
+    // roomForMeter the caller passed to measureContextMeter() so the width it reserved and the
+    // layout drawn here agree exactly.
     const float fullTw = ImGui::CalcTextSize(full.c_str()).x;
-    const bool  showRing = roomForMeter >= ringAdv + gap + fullTw;
+    const bool  showRing = txt.ringOk && roomForMeter >= ringAdv + gap + fullTw;
     ImGui::BeginGroup();   // group so hovering the RING (not just the digits) raises the tooltip
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     if (showRing) {
@@ -2097,21 +2137,53 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
     ImGui::TextUnformatted(showRing ? full.c_str() : lean.c_str());
     ImGui::PopStyleColor();
     ImGui::EndGroup();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Context window usage — the last model call's input tokens vs the "
-                          "active model's window (%d / %d).\nSet the window in AI settings if "
-                          "your local model differs.", used, win);
+    if (ImGui::IsItemHovered()) {
+        // Name where the SHOWN window came from, resolved in the same precedence
+        // contextMeterWindow()/effectiveContextWindow() use, so the tooltip cannot claim a
+        // provenance the number does not have. The catalog lookup only runs on hover — the
+        // per-frame path never pays for it.
+        const char* srcTxt = nullptr;
+        if (st.settings.contextWindow > 0) {
+            srcTxt = "your explicit override in AI settings";
+        } else if (st.lastContextWindow > 0) {
+            srcTxt = "reported by the server for the model that actually ran";
+        } else {
+            const ui::BridgeModelMeta* bm = ui::bridgeModelMetaForCad(
+                st.settings.provider, st.settings.model, st.settings.baseUrl);
+            srcTxt = (bm && bm->contextWindow > 0)
+                         ? "from the model catalog entry for the selected model"
+                         : "a fallback estimate from the model id \xe2\x80\x94 no catalog entry "
+                           "for it yet";
+        }
+        std::string tip = "Context window usage \xe2\x80\x94 ";
+        if (used > 0 && win > 0)
+            tip += "the last model call's input tokens vs that model's window (" +
+                   std::to_string(used) + " / " + std::to_string(win) + ").\n";
+        else if (win > 0)
+            tip += "no model call has been measured yet this session, so only the capacity is "
+                   "shown (" + std::to_string(win) + " tokens).\n";
+        else
+            tip += "neither the usage nor the window is known yet this session.\n";
+        if (win > 0) {
+            tip += "Window ";
+            tip += srcTxt;
+            tip += ".\n";
+        }
+        tip += "Set the window in AI settings if your local model differs.";
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
 }
 
 // Width drawContextMeter() will occupy, so the caller can right-align it on its line above the
-// composer. Mirrors the showRing decision in drawContextMeter() so reserved width == drawn width.
+// composer. Shares contextMeterText() with drawContextMeter() and mirrors its showRing decision,
+// so reserved width == drawn width in EVERY state (full fraction, em-dash numerator, and the
+// ringless unknown-window tag).
 static float measureContextMeter(AppState& st, float roomForMeter) {
     const float gap = ui::metrics::px(5), ringAdv = gaugeRingAdvance();
-    const std::string full = fmtTokens(st.lastContextTokens) + "/" +
-                             fmtTokens(effectiveContextWindow(st.settings));
-    const float fullTw = ImGui::CalcTextSize(full.c_str()).x;
-    if (roomForMeter >= ringAdv + gap + fullTw) return ringAdv + gap + fullTw;
-    return ImGui::CalcTextSize(("ctx " + full).c_str()).x;
+    const CtxMeterText txt = contextMeterText(st);
+    const float fullTw = ImGui::CalcTextSize(txt.full.c_str()).x;
+    if (txt.ringOk && roomForMeter >= ringAdv + gap + fullTw) return ringAdv + gap + fullTw;
+    return ImGui::CalcTextSize(("ctx " + txt.full).c_str()).x;
 }
 
 // Provider rate-limit gauges for the prelude row: one ring per usage window the ACTIVE

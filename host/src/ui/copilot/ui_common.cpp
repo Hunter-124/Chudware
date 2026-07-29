@@ -848,10 +848,62 @@ std::string fmtTokens(int n) {
     else std::snprintf(b, sizeof(b), "%d", n);
     return b;
 }
-// The active model's total context window (mirrors core default_context_window for the meter).
+// The active model's total context window for the meter, resolved in strict precedence —
+// first hit wins:
+//   1. settings.contextWindow — the user's explicit override in AI settings. Beats everything;
+//      a local endpoint no catalog knows about is exactly why the override exists.
+//   2. The OMP bridge model catalog row for the SELECTED (provider, model): the real window the
+//      provider reports, so a probed model shows its true capacity instead of a guess.
+//   3. ui::defaultContextWindowForModel() WITH that catalog row folded into a ModelInfo probe.
+//      Its substring guess table (…"claude" -> 200k… default 8192) is now the last resort only,
+//      reached when the catalog has no usable row at all: cold cache, managed llama.cpp, or an
+//      id the sidecar never listed.
+// This is no longer a plain mirror of core default_context_window: the most authoritative value
+// of all is st.lastContextWindow (what the server reported for the model that ACTUALLY ran),
+// which outranks every branch here. The composer's context meter applies it — this function only
+// ever sees Settings, i.e. what the picker currently selects.
 int effectiveContextWindow(const Settings& s) {
     if (s.contextWindow > 0) return s.contextWindow;
-    return ui::defaultContextWindowForModel(s.provider, s.model[0] ? s.model : "");
+    const std::string model   = s.model[0] ? s.model : "";
+    const std::string baseUrl = s.baseUrl;
+    // bridgeModelMetaForCad() is a linear scan of the bridge catalog and this is called from
+    // per-frame draw code, so memoise the resolved window on (provider, model, base_url) plus the
+    // catalog's identity — refreshBridgeModelCatalog() swaps in a whole new vector, so its data
+    // pointer/size moving is what un-sticks a miss recorded while the cache was still cold.
+    struct Memo {
+        bool                   valid = false;
+        int                    provider = -1;
+        std::string            model, baseUrl;
+        const BridgeModelMeta* catBegin = nullptr;
+        size_t                 catSize = 0;
+        int                    window = 0;
+    };
+    static Memo memo;
+    const std::vector<BridgeModelMeta>& cat = bridgeModelCatalog();
+    if (!memo.valid || memo.provider != s.provider || memo.model != model ||
+        memo.baseUrl != baseUrl || memo.catBegin != cat.data() || memo.catSize != cat.size()) {
+        int              win = 0;
+        ModelInfo        probe;
+        const ModelInfo* probeP = nullptr;
+        if (const BridgeModelMeta* bm = bridgeModelMetaForCad(s.provider, model, s.baseUrl)) {
+            if (bm->contextWindow > 0) win = bm->contextWindow;
+            probe  = modelInfoFromProbe(s.provider, model, bm->name, bm->contextWindow,
+                                        bm->maxTokens, bm->vision, bm->tools,
+                                        bm->reasoningEfforts, "omp");
+            probeP = &probe;
+        }
+        // The probe carries that same catalog window, so this only differs from `win` when the
+        // row exists but reports no window (0) — then the id-pattern table answers.
+        if (win <= 0) win = defaultContextWindowForModel(s.provider, model, probeP);
+        memo.valid    = true;
+        memo.provider = s.provider;
+        memo.model    = model;
+        memo.baseUrl  = baseUrl;
+        memo.catBegin = cat.data();
+        memo.catSize  = cat.size();
+        memo.window   = win;
+    }
+    return memo.window;
 }
 
 }  // namespace ui

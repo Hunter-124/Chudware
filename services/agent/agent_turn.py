@@ -1525,6 +1525,46 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     except Exception:  # noqa: BLE001
         _tu = None  # type: ignore
 
+    def _emit_context_event() -> None:
+        """Stream one ``agent.context`` event for the completion that just ran.
+
+        The desktop context meter (host/src/app.cpp) had no live source of truth:
+        the general lane emits no ``agent_call``/``agent_output``, so the GUI's
+        token counter sat at 0/0 for every desktop turn. The numbers already
+        exist in-process (providers/token_usage records real per-call usage) —
+        they were simply never sent. Contract:
+
+            kind: "agent.context"
+            {"run_id", "used", "window", "model", "provider", "source"}
+
+        ``used`` is the INPUT tokens of the most recent provider call (how full
+        the context is right now); ``window`` is the model's total window, 0 when
+        genuinely unknown — never a guess. A call that measured nothing emits
+        NOTHING, so an unmeasured completion can never clobber a real earlier
+        reading with a zero. Best-effort like the neighbouring blocks: this must
+        never break a turn.
+        """
+        try:
+            if _tu is None:
+                return
+            last_u = _tu.get_last_usage() or {}
+            used = int(last_u.get("prompt_tokens") or 0)
+            if used <= 0:
+                return
+            from services.agent import agent_events as _ae  # noqa: PLC0415
+            _ae.emit_event("agent.context", {
+                "run_id": run_id or "",
+                "used": used,
+                "window": int(getattr(provider, "context_window", 0) or 0),
+                "model": str(last_u.get("model")
+                             or getattr(provider, "model", "") or ""),
+                "provider": str(last_u.get("provider")
+                                or getattr(provider, "name", "") or ""),
+                "source": str(last_u.get("source") or "estimate"),
+            }, live=on_event, journal=_ev_journal)
+        except Exception:  # noqa: BLE001 — the meter never blocks the turn
+            pass
+
     # AI-VC v2: checkpoint BEFORE the user prompt turn (kind=prompt).
     # msg_idx is the GUI chat message ordinal; optional, default None.
     try:
@@ -1874,6 +1914,15 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                    "stop_reason": stop,
                                    "usage": (_tu.get_turn_usage()
                                              if _tu else None)})
+
+        # Single chokepoint for the context meter: EVERY provider completion in
+        # this loop (the normal call, the context-overflow trim retry, and the
+        # degraded alt-provider call) either falls through to here with a `reply`
+        # or returns above, so one emit here covers all of them — and it runs on
+        # every loop iteration, so the meter tracks live instead of once a turn.
+        # `provider` is read fresh: a degrade rebound it, and the window must be
+        # the model that actually ran.
+        _emit_context_event()
 
         # An empty assistant turn is not just useless context — Moonshot/kimi
         # (and other OpenAI-compatible endpoints) REJECT the next request with

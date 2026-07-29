@@ -5442,3 +5442,102 @@ checkpointed via the restored `plm_checkpoint`. Pre-existing and NOT caused by t
 `firmware` fails under `-j6` and passes in isolation (reproduced identically with the
 `run.cpp` change stashed); `scripts/gate.sh` looks for a `Chudware/mcp-venv` that does not
 exist on this box, so its pytest stage SKIPs — the real venv is `AI-CAD/mcp-venv`.
+
+## 2026-07-28/29 — live-driven agent-harness sweep across every advertised discipline (`4180cd9e`, `69ca9789`)
+
+Method, because it is the reusable part: every defect below was found by driving the REAL
+general lane (`worker_rpc._agent_admin_turn`, the exact RPC `core/agent/run.cpp` pre-flight
+calls) through 5 realistic prompts per discipline against a live model, then reading the
+`ok=False` tool calls with their verbatim args. The suites were green the entire time. The
+throwaway drivers lived in `scratch/` (`probe.py` single prompt, `sweep.py` a whole suite plus
+a de-duplicated defect queue) and are deleted; recreate them from the recipe rather than
+trusting a unit test to tell you whether a discipline works. Cheap models are fine and
+preferred for this — `PROBE_MODEL=claude-sonnet-4-5`, `PROBE_EFFORT=low`.
+
+Three false-green gates were fixed FIRST, since nothing downstream is trustworthy without
+them. `scripts/gate.sh` hardcoded a `Chudware/mcp-venv` path that does not exist on this box,
+so the pytest stage printed SKIP and the gate reported PASS having run **zero** Python tests
+(0 collected before, 9037 after) — there is now one `resolve_gate_python()` ladder shared by
+all five stages, with `CHUDWARE_GATE_PYTHON` to pin. The same stage's header had claimed since
+T-V2 that zero-collected is fatal; that check had never been written. And the `firmware` ctest
+"trace race" is not a race: renode's cold start is CPU-bound, the Netgen meshers saturate
+every core, and the live legs budgeted 15/20 s. Measured over 3× `ctest -j6` each: 90 s
+budgets alone still failed 1 of 3; 90 s + `RUN_SERIAL` passed 3 of 3 at ~90 s extra wall time.
+Keep both.
+
+The dominant defect class was **silently wrong output** — an unvalidated string discriminator
+falls through to a default instead of erroring, so the result is plausible, wrong, and
+unremarkable. `sketch3d_pipe(mode='remove')` ADDED 9047 mm³ where the caller asked to remove
+5654 mm³; `cam_add_tool(type='DRILL')` differed from `'drill'` only in case and stored a flat
+endmill while the label still read "DRILL", so feeds/speeds silently resolved the wrong cutting
+class; `add_section_view(axis)` was `[horizontal] if axis == "horizontal" else [vertical]`, so
+every other value cut vertically; and a `refs` block nested inside `params` was not rejected —
+`_normalize_sketch_ops` simply defaulted to `plane.top`, building geometry on the wrong plane.
+When you touch a tool that selects a mode/axis/type, validate the VALUE and name the
+vocabulary (`ecad_sim_tools.py:213` is the model to copy). Neither `annotation_admits` nor the
+alias table can help: these are str-into-str.
+
+Second class: **the harness deadlocking or lying about itself.** The ECAD chain gate demanded
+a wire between two DISTINCT refs and then denied `ecad_place_symbol` after the first
+placement, so the second ref could never exist — a 5-part regulator prompt burned four calls
+per run on an unsatisfiable requirement, and it also denied `ecad_find_part`, the `*_status`
+reads and the antenna pair, railroading an antenna-only request onto a board. Placement and
+every pure-information tool are now in `_ECAD_GATE_NEVER_DENY`. The force-cascade could not
+stop: `_ecad_forced_tool_args` is pure in `calls`, a failed forced call only appends a failure
+record, and the dispatch result was assigned to `_ok` and never read — one
+`ecad_wire(R1→R1)` was forced 27 times, every one refused by the LOOP GUARD, whole budget
+gone, `success=False`. Identical `(tool, args)` pairs are now refused and a net stall forces
+the board once instead of abandoning the deliverable. `test_ecad_hard_gate_blocks_place_until_wire`
+asserted the deadlock as CORRECT and only passed because its stub dispatch reports every wire
+ok even when an endpoint was never placed — it is renamed and now asserts mega-13's real
+contract. Separately, `task_list` shipped without being classified meta, so a run that
+published three plans and built nothing reported `success=confirmed`.
+
+Third class: **advertised but unreachable.** There was no `reveng` category pack at all, so
+`general_agent` — the universal entry — could not reach reverse engineering by ANY route
+(measured: 7 failures → 3, and 781 s → 346 s, just from not burning calls on denials). Note
+the registered reveng names are NOT uniformly `reveng_`-prefixed; the session/query half is
+verb-first (`list_reveng_sessions`, `get_reveng_coverage`, `import_scan_mesh`) — do not
+"tidy" them. `review_drawing` was what `make_drawing`'s own docstring and four annotation
+tools' guidance told the model to read coordinates from, and `drawing_detailer` could not call
+it. Firmware guidance existed but was filed inside `tool_guidance/ecad.py` (the tools are
+registry-tagged family "ecad"), so a grep read as zero coverage — now `tool_guidance/firmware.py`
+as sole owner, deleted from ecad.py rather than shadowed.
+
+**The trap that cost the most time, twice: tool resolution has THREE independent layers and no
+single one sees everything.** `reviewer_exec._resolve_fn` (hand-maintained module keys, misses
+whole families), `agent_turn._bind_tool` (that plus the full 404-tool MCP registry), and
+`MissionDispatch.resolve` (bound methods — `delegate`, `ask_user`, the `corporate_*`/
+`coordinate_*` surface — invisible to `_bind_tool` yet live on every lane that binds a
+dispatcher, which includes the general lane). An audit using only layer 1 reported 59 dead
+pack entries when 51 were fine; a follow-up using layers 1+2 then DELETED four live
+coordination tools. Both were caught and reverted. `services/agent/test_tool_categories_reachable.py`
+now gates every pack entry against all three layers and documents the trap where the next
+auditor will read it. It genuinely found three dead entries — `edit_feature` (a
+`_CONCEPT_REDIRECTS` teaching error, so every call failed), plus `interference_check` and
+`check_sketch_d`, near-anagrams of `check_interference`/`check_sketch` sitting one line above
+them in the same pack.
+
+Deliberately NOT done, and why. No PCB-net S-parameter/impedance sweep exists anywhere in
+`services/mcp`, so `ecad_simulate(ports=…, freq_*=…)` is refused rather than aliased onto the
+SPICE analysis — that is a genuine **capability gap**, logged, not papered over. Likewise
+`run_cfd_flow(inlet_face/outlet_face)`: the voxel LBM implements no face-based boundary
+condition, and accepting the argument would run a different simulation and report success. No
+bridge from `ecad_find_part` to the parts catalog: of its 3182 rows only 96 are ECAD and those
+mirror the same starter library, the other ~3086 being mechanical records with no pins.
+`add_section_view(axis='y')` is rejected, not mapped — the cut line lives in the parent view's
+sheet frame, where sheet-y is model Y on a top view but model Z on a front view, so no reading
+of the letter can settle which plane gets cut. In general: an auto-fix that produces the wrong
+geometry is worse than the clear rejection it replaces, and every fix here is proven with a
+volume, a stress, a face count or a named record — never `ok: true`.
+
+Still open. `part_place` on a catalog record with no placeable geometry (`motor:stepper:NEMA17…`)
+fails honestly but the catalog entry has no model. `query_geometry(query='bbox')` and
+`measure_part(query=…)` want a redirect to each other. `reveng_set_scale(value_mm)` and
+`list_parts(name_filter)` are unaliased. `import_artifact` wants `artifact_path` of a done job
+and says so awkwardly. The gate's combined `pytest services` invocation still yields ~17
+cross-suite pollution failures recorded as non-fatal (`services/browser`, `test_hostd_registry`,
+`test_registration_catalog`, `services/sim`), which would mask a real regression — splitting
+`services` into its real sub-suites is the fix. Environment gaps are closed so one venv runs
+everything: `.venv-mcp` gained langgraph, langgraph-checkpoint-sqlite, opencv-python-headless,
+pdfminer.six and open3d.

@@ -234,9 +234,10 @@ static void settingsPillScrollbar() {
 // anywhere is a bug), so there is no reserved right-hand gutter to pin a ScrollbarSize to.
 // NoScrollWithMouse stays reserved for scroll=false bodies — adding it to a scrolling body
 // would silently eat the wheel.
-static void settingsTabBodyBegin(const char* id, bool scroll = true) {
+static void settingsTabBodyBegin(const char* id, bool scroll = true,
+                                 float padX = 10.0f, float padY = 8.0f) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
+                        ImVec2(ui::metrics::px(padX), ui::metrics::px(padY)));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar;
     if (!scroll) flags |= ImGuiWindowFlags_NoScrollWithMouse;
     ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding, flags);
@@ -4876,10 +4877,19 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed,
             ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
                    ui::palette.headerBg[2], 1.0f));
-        // Borderless — the window frame read as a boxed outline around an already-framed dialog.
+        // Borderless: WindowBorderSize kills the outer frame, and FrameBorderSize kills the
+        // title bar's OWN frame border — RenderFrame strokes the title rect with ImGuiCol_Border
+        // independently of the window border, which is the hairline that survived the first pass.
+        // WindowPadding is horizontally zero so each tab body reaches the modal's right edge and
+        // its pill scrollbar rides that edge; the tab row re-indents itself below.
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 8.0f * sc));
         bool settingsBegun = ImGui::Begin("Settings", &s_settingsOpen,
                          ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking);
+        // Decorations render inside Begin, so the two border vars pop immediately after it —
+        // widgets inside keep their normal frame borders.
+        ImGui::PopStyleVar(2);    // FrameBorderSize, WindowBorderSize
         ImGui::PopStyleColor(3);  // TitleBg / TitleBgActive / TitleBgCollapsed
         if (settingsBegun) {
         // C22b: if a pending prompt role was requested, load prompts and jump to the Prompts tab.
@@ -4939,6 +4949,9 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::BeginChild("##settabsarea", ImVec2(0, 0),
                           ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        // Tab row inset: the window has zero horizontal padding (so tab bodies can reach the
+        // right edge), so the row indents itself instead.
+        ImGui::Indent(10.0f * sc);
         if (ImGui::BeginTabBar("##settabs")) {
             // ---- Appearance tab (FIRST): theme + colored liquid glass (v2.1) ----
             // The canonical theme control lives here (moved from General; the View-menu item
@@ -5342,7 +5355,8 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("AI", nullptr,
                                     (jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
-                settingsTabBodyBegin("##tab_ai", /*scroll=*/false);
+                settingsTabBodyBegin("##tab_ai", /*scroll=*/false,
+                                     /*padX=*/0.0f, /*padY=*/0.0f);
 
                 // AI sub-navigation: left vertical rail + content pane, mirroring
                 // drawOmpProviderManager's split. Under 640*sc the rail collapses to a combo
@@ -5418,7 +5432,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                     ImGui::SameLine(0, 8.0f * sc);
                 }
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                                    ImVec2(4.0f * sc, 2.0f * sc));
+                                    ImVec2(10.0f * sc, 6.0f * sc));
                 ImGui::BeginChild("##ai_sub_body", ImVec2(0, 0),
                                   ImGuiChildFlags_AlwaysUseWindowPadding,
                                   ImGuiWindowFlags_NoScrollbar);
@@ -6863,10 +6877,11 @@ void drawSettingsModal(AppState& st, bool busy) {
             // --- end C22b marked block ---
             ImGui::EndTabBar();
         }
+        ImGui::Unindent(10.0f * sc);
         ImGui::EndChild();
         }
         ImGui::End();
-        ImGui::PopStyleVar();  // WindowBorderSize
+        ImGui::PopStyleVar();  // WindowPadding
     }
 
     // Modal closed (X) with the system-prompt debounce still pending: force-commit it.

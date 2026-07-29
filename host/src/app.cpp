@@ -172,6 +172,14 @@ bool guiConsumeActivationRequest();
 std::string guiTakeActivationDoc();
 #endif
 
+// ui/copilot/composer.cpp — hand the context meter the PROVENANCE of the window an agent.context
+// event just reported ("user" | "catalog" | "probe" | "heuristic" | ""; empty == heuristic).
+// Forward-declared here rather than published in a header because the meter is a single global
+// gauge and this is its only writer; see the g_ctxWindowSource note in composer.cpp.
+namespace ui {
+void setContextWindowSource(const std::string &src);
+}
+
 // =====================================================================================
 // Wave N: AI-ECAD GUI command wiring. Creates/routes ECAD documents through the
 // worker ecad_* RPCs (engine/ecad/rpc.py) and feeds the
@@ -3900,10 +3908,21 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // run (which never emits run_started at all). Both resets are
             // idempotent; neither is redundant — deleting either leaves that
             // lane showing the previous run's numbers.
+            //
+            // agent.context also carries `window_source` ("user" | "catalog" |
+            // "probe" | "heuristic" | ""), i.e. HOW the harness arrived at
+            // `window`. It is handed to the composer's meter because a
+            // heuristic value is a hardcoded per-provider default and must not
+            // outrank the curated model catalog the GUI already has: the
+            // harness reports 200000 for claude-opus-5 with source
+            // "heuristic" while the catalog row for that same id says
+            // 1000000. An absent/empty key is treated as heuristic, so an
+            // older worker degrades safely.
             if (orchKind == "run_started") {
               if (isViewedConv) {
                 st.lastContextTokens = 0;
                 st.lastContextWindow = 0;
+                ui::setContextWindowSource(std::string());
               }
               if (isViewedDoc) {
                 // Preview trackers ARE document state — they stay doc-scoped.
@@ -3915,6 +3934,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               if (isViewedConv) {
                 st.lastContextTokens = 0;
                 st.lastContextWindow = 0;
+                ui::setContextWindowSource(std::string());
               }
             } else if (orchKind == "agent.context") {
               if (isViewedConv) {
@@ -3926,8 +3946,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 if (data.contains("window") &&
                     data["window"].is_number_integer()) {
                   int win = data["window"].get<int>();
-                  if (win > 0)
+                  if (win > 0) {
                     st.lastContextWindow = win;
+                    // Provenance travels WITH the window it describes, so the
+                    // meter can never pair a new number with a stale source.
+                    ui::setContextWindowSource(
+                        data.value("window_source", std::string()));
+                  }
                 }
               }
             } else if (orchKind == "agent_call") {

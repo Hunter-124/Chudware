@@ -1414,6 +1414,45 @@ def _catalog_caps(provider: str, model: str, cfg: dict) -> dict:
         }
 
 
+# model_catalog's `auto_source` vocabulary, verified by reading model_catalog.py:
+#   "user"        — a user config override supplied the number (resolve_capabilities:711-739)
+#   "live"        — a live /models (or Gemini) endpoint probe reported it (:262-276, :328)
+#   "models.dev"  — the curated models.dev catalog row (:414)
+#   "heuristic"   — a hardcoded per-provider / static-allowlist constant (:345, :653)
+#   "+"-joined composites — _merge_row (:453-482) and merge_catalog (:531) build e.g.
+#                   "live+models.dev", "live+heuristic", "models.dev+heuristic".
+# The GUI trust order is user > catalog > probe > heuristic, so a composite must be
+# reported as its LEAST-trusted component: "live+heuristic" is only as good as the
+# heuristic part. Anything unrecognised also degrades to "heuristic" rather than
+# guessing upward — a fabricated provenance is worse than an honest "unknown".
+_WINDOW_SOURCE_MAP = {
+    "user": "user",
+    "models.dev": "catalog",
+    "live": "probe",
+    "heuristic": "heuristic",
+}
+# Least-trusted first: the first rank present in a composite wins.
+_WINDOW_SOURCE_RANK = ("heuristic", "probe", "catalog", "user")
+
+
+def _window_source_from_caps(caps: dict) -> str:
+    """Map ``caps["auto_source"]`` onto the frozen GUI set {user,catalog,probe,heuristic}.
+
+    Composites collapse to their least-trusted component; unknown or missing values
+    collapse to "heuristic" so the meter can never present a guess as a measurement.
+    """
+    raw = str(caps.get("auto_source") or "")
+    mapped = {
+        _WINDOW_SOURCE_MAP[part]
+        for part in (p.strip().lower() for p in raw.split("+"))
+        if part in _WINDOW_SOURCE_MAP
+    }
+    for rank in _WINDOW_SOURCE_RANK:
+        if rank in mapped:
+            return rank
+    return "heuristic"
+
+
 def _attach_catalog_meta(provider: Provider, caps: dict) -> Provider:
     """Stamp resolved catalog fields onto the provider for downstream consumers."""
     try:
@@ -1421,6 +1460,9 @@ def _attach_catalog_meta(provider: Provider, caps: dict) -> Provider:
         provider.max_output_tokens = int(caps.get("max_output") or 0) or None  # type: ignore[attr-defined]
         provider.reasoning_efforts = list(caps.get("reasoning_efforts") or [])  # type: ignore[attr-defined]
         provider.catalog_auto_source = str(caps.get("auto_source") or "")  # type: ignore[attr-defined]
+        # Provenance of context_window, mapped onto the frozen GUI vocabulary: a
+        # heuristic per-provider constant must not outrank a curated per-model row.
+        provider.context_window_source = _window_source_from_caps(caps)  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001
         pass
     return provider

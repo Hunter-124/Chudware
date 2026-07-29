@@ -1535,11 +1535,19 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         they were simply never sent. Contract:
 
             kind: "agent.context"
-            {"run_id", "used", "window", "model", "provider", "source"}
+            {"run_id", "used", "window", "model", "provider", "source",
+             "window_source"}
 
         ``used`` is the INPUT tokens of the most recent provider call (how full
         the context is right now); ``window`` is the model's total window, 0 when
-        genuinely unknown — never a guess. A call that measured nothing emits
+        genuinely unknown — never a guess. ``window_source`` says where that
+        window came from ("user"/"catalog"/"probe"/"heuristic", "" when the
+        provider object predates the field), because the numbers are NOT equally
+        trustworthy: config resolution falls back to a hardcoded per-PROVIDER
+        constant (e.g. 200000 for anthropic) that must never outrank a curated
+        per-model catalog row (claude-opus-5 really is 1,000,000). Without the
+        provenance the GUI cannot tell them apart and downgrades a correct window
+        to a wrong guess. A call that measured nothing emits
         NOTHING, so an unmeasured completion can never clobber a real earlier
         reading with a zero. Best-effort like the neighbouring blocks: this must
         never break a turn.
@@ -1561,6 +1569,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 "provider": str(last_u.get("provider")
                                 or getattr(provider, "name", "") or ""),
                 "source": str(last_u.get("source") or "estimate"),
+                "window_source": str(getattr(provider, "context_window_source", "") or ""),
             }, live=on_event, journal=_ev_journal)
         except Exception:  # noqa: BLE001 — the meter never blocks the turn
             pass

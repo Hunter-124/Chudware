@@ -11,6 +11,8 @@
 #include "ui/copilot/text_wrap.h"   // hard-break bookkeeping the rewrapper must not eat
 #include "ui/clipboard_image.h"          // image-kind probe / mime / clipboard->PNG capture
 #include "ui/copilot/image_lightbox.h"   // attachment thumbnail tile + full-size viewer
+#include "ui/copilot/context_estimate.h"  // transcript-size estimate behind the context meter
+#include <climits>                        // INT_MAX saturation in activityCharsOf()
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
 // ImGui's InputTextMultiline does NOT word-wrap (it renders with wrap_width=0, so long lines
@@ -2060,29 +2062,133 @@ static ImU32 gaugeTrackColor(const ui::AdaptiveSurface& surf) {
     return ImGui::ColorConvertFloat4ToU32(c);
 }
 
+// Provenance of st.lastContextWindow — the `window_source` key the harness now stamps on every
+// agent.context event ("user" | "catalog" | "probe" | "heuristic" | ""). Deliberately a
+// file-scoped global instead of a new AppState field: st.lastContextWindow is itself ONE global
+// value feeding ONE global gauge, so an annotation of it is exactly as scoped as the thing it
+// annotates and app_state.h stays untouched. Written by the event drain in host/src/app.cpp
+// through ui::setContextWindowSource() (forward-declared at that call site). This whole file is
+// already inside `namespace ui` (opened above), so the definition needs no wrapper.
+static std::string g_ctxWindowSource;
+void setContextWindowSource(const std::string& src) { g_ctxWindowSource = src; }
+// "" and "heuristic" both mean "a rough per-provider default the harness fell back to" — the
+// least trusted answer there is, and NOT something that may outrank curated catalog data.
+static bool ctxWindowSourceTrusted() {
+    return !g_ctxWindowSource.empty() && g_ctxWindowSource != "heuristic";
+}
+
 // The window the context meter reports, in strict precedence:
 //   1. settings.contextWindow — the user typed a number into AI settings. An OVERRIDE means
 //      exactly that: it beats even the server, because the reason to set it is that the
 //      catalog/provider is reporting a window you do not believe (a local model behind an
 //      OpenAI-compatible shim habitually lies about its own capacity).
-//   2. st.lastContextWindow — what the server said about the model that ACTUALLY ran
-//      (agent.context). This outranks the rest of the Settings-side answer because Settings
-//      only describes what the picker currently selects: it may have been changed mid-session,
-//      and an auto-route may have run a different model entirely.
-//   3. effectiveContextWindow() — catalog metadata for the selected model, then an id estimate.
+//   2. st.lastContextWindow, but ONLY when agent.context said where it came from and that source
+//      is a real answer ("user"/"catalog"/"probe"). A sourced server value describes the model
+//      that ACTUALLY ran, which Settings cannot know: the picker may have been changed
+//      mid-session, and an auto-route may have run a different model entirely.
+//   3. effectiveContextWindow() — the curated OMP catalog row for the SELECTED model, then an id
+//      estimate (ui_common.cpp).
+//   4. st.lastContextWindow even when its source is heuristic/unstated — better than nothing,
+//      but only once 3 has produced nothing at all.
+//
+// Why a heuristic server value must LOSE to the catalog, measured on this box 2026-07-28 and not
+// to be "simplified" back: services/agent/model_catalog.resolve_capabilities("anthropic",
+// "claude-opus-5") returns context=200000 with auto_source="heuristic" — a hardcoded
+// per-PROVIDER default, not a fact about that model — while the live OMP catalog row for the
+// same id reports contextWindow=1000000. Ranking the server unconditionally above the catalog
+// (as this function did before) made the first provider call DOWNGRADE a correct 1.0M readout to
+// a wrong 200k, i.e. the meter got worse the moment it had data.
 // 0 = genuinely unknown, never a real capacity.
 static int contextMeterWindow(const AppState& st) {
     if (st.settings.contextWindow > 0) return st.settings.contextWindow;
-    if (st.lastContextWindow > 0) return st.lastContextWindow;
-    return effectiveContextWindow(st.settings);
+    if (st.lastContextWindow > 0 && ctxWindowSourceTrusted()) return st.lastContextWindow;
+    if (const int eff = effectiveContextWindow(st.settings); eff > 0) return eff;
+    return st.lastContextWindow > 0 ? st.lastContextWindow : 0;
+}
+
+// Model-visible payload carried by one message's activity timeline, in characters.
+//
+// INCLUDED: `detail` (the model's own raw output/reasoning for the step, and the tool
+// result/thought body — by far the bulk of it), `title` (rowKind 3 stores the tool NAME here) and
+// `reason` (rowKind 3 stores the tool's target, rowKind 1 the injected-context source). Those
+// three are the strings that correspond to something the provider actually saw.
+// EXCLUDED: `stage` (a raw internal key like "intake"/"review" used only for row matching) and
+// `status` ("running"/"pass"/"fail" — a GUI verdict token the model never receives). Both are
+// bounded by a handful of characters anyway, so including them would add noise, not accuracy.
+static int activityCharsOf(const ChatMsg& m) {
+    size_t n = 0;
+    for (const ActivityItem& a : m.activity)
+        n += a.detail.size() + a.title.size() + a.reason.size();
+    return n > (size_t)INT_MAX ? INT_MAX : (int)n;
+}
+
+// The estimated size of the transcript the user is LOOKING AT, i.e. what continuing this session
+// would cost to resend. st.chat is the active conversation's live message vector (every other
+// resident conversation parks its msgs; see conversations.cpp) — the same source
+// chatHistoryForAgent() sends — so this needs no second accessor.
+//
+// Error cards are skipped for the same reason chatHistoryForAgent() skips them: they are GUI
+// failure notices, not conversation content, and are not resent.
+//
+// Memoised on (message count, length of the last message's text, active conversation id) so a
+// streaming turn and a switched session both recompute, but an idle frame over a long transcript
+// does NOT rescan it. Called from the per-frame draw path, so a full scan every frame is the
+// thing being avoided here.
+static const ui::ContextEstimate& viewedTranscriptEstimate(const AppState& st) {
+    struct Memo {
+        bool                valid = false;
+        size_t              count = 0, lastLen = 0;
+        std::string         convId;
+        ui::ContextEstimate est;
+    };
+    static Memo memo;
+    const std::string convId =
+        (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
+            ? st.conversations[st.activeConv].id
+            : std::string();
+    const size_t count   = st.chat.size();
+    const size_t lastLen = count ? st.chat.back().text.size() : 0;
+    if (memo.valid && memo.count == count && memo.lastLen == lastLen && memo.convId == convId)
+        return memo.est;
+    std::vector<ui::TranscriptEntry> entries;
+    entries.reserve(count);
+    for (const ChatMsg& m : st.chat) {
+        if (m.errKind != ERR_NONE) continue;
+        const int actChars = activityCharsOf(m);
+        if (m.text.empty() && actChars == 0) continue;
+        entries.push_back(ui::TranscriptEntry{m.fromUser, m.text, actChars});
+    }
+    memo.valid   = true;
+    memo.count   = count;
+    memo.lastLen = lastLen;
+    memo.convId  = convId;
+    memo.est     = ui::estimateEntries(entries);
+    return memo.est;
+}
+
+// The numerator the meter shows, and what kind of number it is. A MEASURED call always wins; the
+// transcript estimate exists precisely for the case there has been no call this process (a
+// session restored from disk), which is the state that used to render a bare em dash.
+struct CtxMeterUsage {
+    int  tokens   = 0;      // 0 = nothing to show
+    bool estimate = false;  // true = derived from the transcript, MUST be marked on screen
+    int  messages = 0;      // estimate only: how many messages it counted
+    bool clipped  = false;  // estimate only: a per-message cap bit, so `tokens` is a lower bound
+};
+static CtxMeterUsage contextMeterUsage(const AppState& st) {
+    if (st.lastContextTokens > 0) return {st.lastContextTokens, false, 0, false};
+    const ui::ContextEstimate& e = viewedTranscriptEstimate(st);
+    return {e.tokens, e.tokens > 0, e.messages, e.truncated};
 }
 
 // The meter's readout string + whether a ring is meaningful, shared by drawContextMeter() and
-// measureContextMeter() so the reserved width can never disagree with the drawn one. Three honest
+// measureContextMeter() so the reserved width can never disagree with the drawn one. Four honest
 // states, none of which ever prints a zero denominator or a fabricated figure:
-//   used > 0, win > 0  -> "12k/200k" with a filled fraction ring
-//   used == 0, win > 0 -> "\xe2\x80\x94/200k": nothing measured yet, so the numerator is an
-//                         em dash and the ring sits empty — a pure capacity hint
+//   measured, win > 0  -> "12k/200k" with a filled fraction ring
+//   estimated, win > 0 -> "\xe2\x89\x88" "8k/200k" — the almost-equal sign is the on-screen mark
+//                         that this came from counting the transcript, not from the provider
+//   empty transcript   -> "\xe2\x80\x94/200k": nothing measured AND nothing to count, so the
+//                         numerator is an em dash and the ring sits empty — a pure capacity hint
 //   win == 0           -> "ctx \xe2\x80\x94" with NO ring: the window is unknown, so there is no
 //                         fraction to show at all
 struct CtxMeterText {
@@ -2090,10 +2196,12 @@ struct CtxMeterText {
     bool        ringOk;    // false = window unknown; draw the compact tag only, never a ring
 };
 static CtxMeterText contextMeterText(const AppState& st) {
-    const int win  = contextMeterWindow(st);
-    const int used = st.lastContextTokens;
+    const int win = contextMeterWindow(st);
     if (win <= 0) return {std::string("\xe2\x80\x94"), false};
-    std::string num = used > 0 ? fmtTokens(used) : std::string("\xe2\x80\x94");
+    const CtxMeterUsage u = contextMeterUsage(st);
+    std::string num = u.tokens <= 0  ? std::string("\xe2\x80\x94")
+                      : u.estimate   ? "\xe2\x89\x88" + fmtTokens(u.tokens)
+                                     : fmtTokens(u.tokens);
     return {num + "/" + fmtTokens(win), true};
 }
 
@@ -2105,7 +2213,8 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     const int   win  = contextMeterWindow(st);
-    const int   used = st.lastContextTokens;
+    const CtxMeterUsage usage = contextMeterUsage(st);
+    const int   used = usage.tokens;   // measured OR estimated; the ring follows what is SHOWN
     const float frac = (win > 0 && used > 0) ? std::min(1.0f, (float)used / (float)win) : 0.0f;
     const float gap = ui::metrics::px(5), ringAdv = gaugeRingAdvance();
     const CtxMeterText txt = contextMeterText(st);
@@ -2138,37 +2247,75 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
     ImGui::PopStyleColor();
     ImGui::EndGroup();
     if (ImGui::IsItemHovered()) {
-        // Name where the SHOWN window came from, resolved in the same precedence
-        // contextMeterWindow()/effectiveContextWindow() use, so the tooltip cannot claim a
-        // provenance the number does not have. The catalog lookup only runs on hover — the
-        // per-frame path never pays for it.
+        // Answer the question the meter exists for: how much context this session already holds,
+        // and what continuing it costs. Every line is OMITTED when its input is unknown rather
+        // than printed as a zero. The catalog lookup and the cost math run ONLY here, on hover —
+        // the per-frame path never pays for either.
+        //
+        // Provenance is resolved in the SAME precedence contextMeterWindow() uses, so the tooltip
+        // can never claim a provenance the number does not have.
         const char* srcTxt = nullptr;
         if (st.settings.contextWindow > 0) {
             srcTxt = "your explicit override in AI settings";
-        } else if (st.lastContextWindow > 0) {
-            srcTxt = "reported by the server for the model that actually ran";
-        } else {
+        } else if (st.lastContextWindow > 0 && ctxWindowSourceTrusted()) {
+            srcTxt = g_ctxWindowSource == "user"
+                         ? "the override the harness was configured with"
+                         : g_ctxWindowSource == "catalog"
+                               ? "the harness's curated catalog entry for the model that "
+                                 "actually ran"
+                               : "probed from the provider for the model that actually ran";
+        } else if (effectiveContextWindow(st.settings) > 0) {
             const ui::BridgeModelMeta* bm = ui::bridgeModelMetaForCad(
                 st.settings.provider, st.settings.model, st.settings.baseUrl);
             srcTxt = (bm && bm->contextWindow > 0)
                          ? "from the model catalog entry for the selected model"
                          : "a fallback estimate from the model id \xe2\x80\x94 no catalog entry "
                            "for it yet";
+        } else if (st.lastContextWindow > 0) {
+            // Only reachable once the catalog answered nothing at all: a heuristic is the last
+            // thing left, and it says so instead of posing as a probe.
+            srcTxt = "reported by the harness (rough per-provider default)";
         }
         std::string tip = "Context window usage \xe2\x80\x94 ";
-        if (used > 0 && win > 0)
-            tip += "the last model call's input tokens vs that model's window (" +
-                   std::to_string(used) + " / " + std::to_string(win) + ").\n";
+        if (used > 0 && !usage.estimate)
+            tip += "the last model call's input tokens (" + std::to_string(used) + ").\n";
+        else if (used > 0)
+            tip += "no call measured yet this session, so this is an ESTIMATE of the "
+                   + std::to_string(usage.messages) + "-message transcript on screen ("
+                   + std::to_string(used) + " tokens"
+                   + (usage.clipped ? ", clipped by a per-message cap \xe2\x80\x94 the real "
+                                      "figure is larger" : "") + ").\n";
         else if (win > 0)
-            tip += "no model call has been measured yet this session, so only the capacity is "
+            tip += "nothing measured and nothing in this transcript yet, so only the capacity is "
                    "shown (" + std::to_string(win) + " tokens).\n";
         else
             tip += "neither the usage nor the window is known yet this session.\n";
-        if (win > 0) {
-            tip += "Window ";
+        if (win > 0 && srcTxt) {
+            tip += "Window " + std::to_string(win) + " tokens, ";
             tip += srcTxt;
             tip += ".\n";
         }
+        if (win > 0 && used > 0) {
+            char pct[48];
+            std::snprintf(pct, sizeof(pct), "%.1f%% of the window used.\n",
+                          100.0 * (double)used / (double)win);
+            tip += pct;
+            // Cost to continue: resending this context on the next call. Emitted ONLY when the
+            // catalog row actually carries pricing — the live Anthropic rows report costIn as
+            // null (hasCost == false), and a "$0.00" there would be a fabricated number.
+            const ui::BridgeModelMeta* pm = ui::bridgeModelMetaForCad(
+                st.settings.provider, st.settings.model, st.settings.baseUrl);
+            if (pm && pm->hasCost && pm->costIn > 0.0) {
+                char cost[80];
+                std::snprintf(cost, sizeof(cost),
+                              "Continuing costs about $%.4f in input tokens per call.\n",
+                              (double)used / 1.0e6 * pm->costIn);
+                tip += cost;
+            }
+        }
+        if (usage.estimate)
+            tip += "The estimate counts only this transcript \xe2\x80\x94 it excludes the system "
+                   "prompt and tool schemas, so the real prompt will be larger.\n";
         tip += "Set the window in AI settings if your local model differs.";
         ImGui::SetTooltip("%s", tip.c_str());
     }
@@ -2176,8 +2323,8 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
 
 // Width drawContextMeter() will occupy, so the caller can right-align it on its line above the
 // composer. Shares contextMeterText() with drawContextMeter() and mirrors its showRing decision,
-// so reserved width == drawn width in EVERY state (full fraction, em-dash numerator, and the
-// ringless unknown-window tag).
+// so reserved width == drawn width in EVERY state (measured fraction, the wider
+// "\xe2\x89\x88"-prefixed estimate, em-dash numerator, and the ringless unknown-window tag).
 static float measureContextMeter(AppState& st, float roomForMeter) {
     const float gap = ui::metrics::px(5), ringAdv = gaugeRingAdvance();
     const CtxMeterText txt = contextMeterText(st);

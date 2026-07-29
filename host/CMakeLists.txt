@@ -103,6 +103,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/tool_phrase.cpp        # tool-call human phrasing + grouping keys (GL-free; unit-tested)
   src/ui/clipboard_image.cpp            # system clipboard -> PNG on disk (paste-an-image)
   src/ui/copilot/image_lightbox.cpp     # attachment thumbnails + full-size image viewer
+  src/ui/copilot/context_estimate.cpp   # transcript token/cost estimate (GL-free; unit-tested)
   src/ui/copilot/settings.cpp           # AI settings sections + model dropdown
   src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
@@ -595,6 +596,23 @@ add_test(NAME test_clipboard_image
   COMMAND test_clipboard_image
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end pasted-image attachment naming ---
+
+# --- transcript context estimate (GL-free) ---
+# The context meter has to answer "what will continuing this session cost me?" for a transcript
+# that has not been sent yet (a restored session, or a fresh app start), where no provider has
+# reported a token count. That is an ESTIMATE, and an estimate that silently drifts from reality
+# is worse than none — so the counting rules are pinned here rather than eyeballed in the GUI.
+add_executable(test_context_estimate
+  src/ui/copilot/context_estimate.cpp
+  tests/test_context_estimate.cpp)
+target_include_directories(test_context_estimate PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_context_estimate PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_context_estimate
+  COMMAND test_context_estimate
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end transcript context estimate ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD

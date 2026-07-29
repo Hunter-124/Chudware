@@ -76,9 +76,10 @@ static std::string jtab(const nlohmann::json& o, const char* k) {
 // doc_activate) against the CURRENT docTabs vector. The bug this guards: switchToTabCore's
 // async-activation branch closes over a raw index (rebuildTabIdx / pendingActivateTab) when
 // it dispatches doc_activate, but any closeDocTab() that runs before the RPC completes —
-// switchToTab's own auto-close of a finished, un-adopted AI mirror the user just left, OR an
-// unrelated doc.closed(last_writer_detached) auto-close for a DIFFERENT background mirror
-// (engine_events.cpp) — erases a tab and shifts every LATER index down by one. closeDocTab
+// switchToTab's own sweep of an EMPTY AI mirror the user just left, a real
+// doc.closed(closed/gc/discarded/daemon) for a DIFFERENT background mirror (engine_events.cpp),
+// or the user closing another tab — erases a tab and shifts every LATER index down by one.
+// (A doc.closed(last_writer_detached) no longer closes anything: see engine_events.cpp.) closeDocTab
 // keeps AppState::activeTab itself correct across that shift (its `if (idx < activeTab)
 // --activeTab` fixup), but a value already captured in an in-flight lambda has no way to see
 // the later erase and goes stale. Treating a stale index as "tab closed" silently drops the
@@ -239,13 +240,17 @@ void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_
 
 void AppState::switchToTab(int idx) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
-    // Before leaving the current tab, note whether it's an AI mirror whose agent has FINISHED and
-    // that the user never adopted or dirtied — such a tab is kept alive only while it's the one the
-    // user is looking at, so switching away is its cue to auto-close (detach-only → recoverable).
+    // Before leaving the current tab, note whether it's an EMPTY AI mirror — one the agent opened
+    // and finished without ever writing to (lastAgentEditAt still default), which the user never
+    // adopted or dirtied. Only such a never-touched shell is swept on switch-away (detach-only →
+    // recoverable). A mirror the agent actually BUILT into is real work and the user's only handle
+    // on it, so it stays in the tab strip until the user closes it themselves — an agent turn
+    // ending, or the user glancing at another tab, is not consent to throw the part away.
     std::string leavingAutoCloseId;
     if (activeTab >= 0 && activeTab < (int)docTabs.size() && activeTab != idx) {
         const DocTab& lv = docTabs[activeTab];
         if (lv.aiHandoff && lv.agentDone && !lv.userAdopted && !lv.dirty &&
+            lv.lastAgentEditAt == std::chrono::steady_clock::time_point{} &&
             lv.docId != docTabs[idx].docId)
             leavingAutoCloseId = lv.docId;
     }
@@ -255,7 +260,7 @@ void AppState::switchToTab(int idx) {
     if (!leavingAutoCloseId.empty()) {
         for (int i = 0; i < (int)docTabs.size(); ++i)
             if (docTabs[i].docId == leavingAutoCloseId && i != activeTab) {
-                addLog("[tabs] auto-closing finished AI tab on switch-away: " + leavingAutoCloseId);
+                addLog("[tabs] auto-closing empty AI mirror on switch-away: " + leavingAutoCloseId);
                 closeDocTab(i, /*detachOnly=*/true);
                 break;
             }
@@ -622,9 +627,9 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                  loadingToastInFlight.erase(docId);
                  // tabIdx was captured at dispatch time; re-resolve by docId (see
                  // reresolveTabIndex above) instead of trusting it directly — a closeDocTab for
-                 // an EARLIER tab (switchToTab's own leaving-mirror auto-close, or an unrelated
-                 // doc.closed(last_writer_detached) for a different background mirror) can have
-                 // shifted this tab's real index down since the RPC was sent.
+                 // an EARLIER tab (switchToTab's empty-mirror sweep, a real doc.closed for a
+                 // different background mirror, or a user close) can have shifted this tab's real
+                 // index down since the RPC was sent.
                  const int idx = reresolveTabIndex(*this, tabIdx, docId);
                  if (idx < 0) {
                      addLog("[tabs] async activation for " + docId +

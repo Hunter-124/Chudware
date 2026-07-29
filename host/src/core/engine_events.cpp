@@ -526,23 +526,26 @@ void handleEvent(AppState& st, const json& evt) {
         if (!st.docTabs[idx].aiHandoff || st.docTabs[idx].userAdopted) {
             // A tab the user opened themselves, or an AI mirror the user ADOPTED by editing:
             // it's user-owned now. Never auto-close it — the user decides its fate (and the
-            // quit warning covers it). last_writer_detached just means the agent stepped away.
+            // quit warning covers it).
             st.docTabs[idx].aiPulse = false;
             st.docTabs[idx].agentDone = true;
             st.addLog("[daemon] doc.closed for user-owned tab " + docId + " (reason " + reason + ")");
             return;
         }
         if (reason == "last_writer_detached") {
-            // The agent finished this un-adopted mirror. If the user is actively looking at it
-            // (active tab), keep it on screen — it auto-closes when they switch away
-            // (switchToTab). Otherwise close the live view now; detach-only, so if the doc was
-            // dirty the daemon's GC/retire tier preserves it for recovery (never a silent purge).
+            // NOT a close. hostd emits this the moment the last read-write ATTACH drops, and the
+            // general lane spawns a fresh `python -m services.worker_main` per turn, so it fires at
+            // the END OF EVERY TURN — the doc is still live and still returned by doc_list right
+            // after. So keep the tab: it is the user's ONLY handle on the part the agent just built
+            // (the viewport view, and the aiHandoff flag every agent-document surface keys off —
+            // Artifacts "Agent Documents", the AI-tab Documents view, Active Work). Destroying it
+            // here is what made the finished part vanish from the tab strip and those panels fall
+            // back to the user's own documents. Mark the agent idle and leave the tab standing;
+            // only a real close/gc/discard (below) removes it.
             st.docTabs[idx].aiPulse = false;
             st.docTabs[idx].agentDone = true;
-            if (idx == st.activeTab) return;  // keep while viewed
-            st.toast(ui::ToastLevel::Info,
-                     "AI finished '" + st.docTabs[idx].displayTitle() + "' — closed (recoverable if unsaved)");
-            st.closeDocTab(idx, /*detachOnly=*/true);
+            st.addLog("[daemon] last writer detached from AI mirror " + docId +
+                      " — keeping the tab (doc is still live daemon-side)");
             return;
         }
         st.closeDocTab(idx);  // closed/gc/discarded/daemon — the doc is gone; drop the mirror

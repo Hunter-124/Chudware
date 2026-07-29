@@ -32,6 +32,9 @@ namespace {
 
 chudware_ipc::EngineClient* g_client = nullptr;  // non-null iff daemon mode won
 bool g_daemon = false;
+// True only when daemon mode was WANTED (no explicit CHUDWARE_ENGINE_DAEMON=0)
+// yet every connect attempt failed and we fell back to the in-process core.
+bool g_daemonUnavailable = false;
 std::once_flag g_once;
 
 chudware_ipc::EngineClient* g_runClient = nullptr;  // dedicated conn for long streaming runs
@@ -168,12 +171,58 @@ void initOnce() {
     opts.hostdBin = hostdBinHint();
     opts.clientKind = "gui";
     std::string err;
-    if (!c->connectOrSpawn(opts, err)) {
-        // core_bridge.py-style loud warning + legacy fallback.
+
+    // Transient-outage retry. hostd may be booting, restarting under systemd,
+    // or draining a version mismatch at the exact moment the GUI starts. This
+    // function runs under std::call_once, so its verdict is PERMANENT for the
+    // process: maintainConnection() only reconnects once daemon mode has
+    // already WON, and cannot rearm a legacy fallback. Giving up on the first
+    // refused connect therefore stranded entire multi-hour sessions on a
+    // private in-process engine — invisible to (and unable to see) every doc
+    // living in the shared daemon. So retry with bounded backoff before
+    // falling back.
+    //
+    // CHUDWARE_ENGINE_DAEMON_RETRY_MS (integer, total milliseconds) overrides
+    // the retry budget; 0 disables retrying entirely and restores the old
+    // single-attempt behaviour, which is what tests and the CHUDWARE_SHOT
+    // harness want so startup stays instant when no hostd is expected.
+    static const int kBackoffMs[] = {100, 250, 500, 1000, 1000};
+    const size_t kBackoffN = sizeof(kBackoffMs) / sizeof(kBackoffMs[0]);
+    int budgetMs = 0;
+    for (size_t i = 0; i < kBackoffN; ++i) budgetMs += kBackoffMs[i];
+    if (const char* rm = std::getenv("CHUDWARE_ENGINE_DAEMON_RETRY_MS")) {
+        char* end = nullptr;
+        const long v = std::strtol(rm, &end, 10);
+        if (end != rm && v >= 0) budgetMs = static_cast<int>(v);
+    }
+
+    bool connected = false;
+    int spentMs = 0;
+    for (size_t attempt = 0;; ++attempt) {
+        if (c->connectOrSpawn(opts, err)) { connected = true; break; }
+        if (attempt >= kBackoffN) break;
+        const int waitMs = kBackoffMs[attempt];
+        if (spentMs + waitMs > budgetMs) break;
         std::fprintf(stderr,
-                     "[engine] WARNING: daemon mode (default) but hostd connect failed (%s) "
-                     "— falling back to in-process libchudware\n",
-                     err.c_str());
+                     "[engine] hostd connect failed (%s) — retrying in %d ms "
+                     "(attempt %zu)\n",
+                     err.c_str(), waitMs, attempt + 2);
+        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+        spentMs += waitMs;
+    }
+    if (!connected) {
+        // core_bridge.py-style loud warning + legacy fallback. Spell out the
+        // consequence: this process now owns a PRIVATE engine, so anything the
+        // agent (or another client) creates in the shared daemon simply does
+        // not exist from here — no tab, no viewport, nothing in Artifacts.
+        g_daemonUnavailable = true;
+        std::fprintf(stderr,
+                     "[engine] WARNING: daemon mode (default) but hostd connect failed "
+                     "after %d ms of retries (%s) — falling back to in-process "
+                     "libchudware. This process is now on a PRIVATE in-process engine: "
+                     "documents created by a shared chudware-hostd (including any agent "
+                     "worker attached to it) will NOT be visible here.\n",
+                     spentMs, err.c_str());
         delete c;
         return;
     }
@@ -208,6 +257,11 @@ bool waitEngineReady(chudware_ipc::EngineClient& c, std::string& err) {
 bool daemonMode() {
     std::call_once(g_once, initOnce);
     return g_daemon;
+}
+
+bool daemonUnavailable() {
+    std::call_once(g_once, initOnce);  // same guard: safe to call at any time
+    return g_daemonUnavailable;
 }
 
 chudware_ipc::EngineClient* client() {

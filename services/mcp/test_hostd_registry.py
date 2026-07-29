@@ -259,8 +259,11 @@ def test_origin_kind_in_doc_list(scratch_daemon):
 
 def test_disconnect_emits_last_writer_detached(scratch_daemon):
     """An agent (last rw writer) disconnecting tells ro viewers their mirror is
-    final via doc.closed last_writer_detached — the signal the GUI auto-closes on.
-    Without it a crashed agent's mirror tab would live forever."""
+    final via doc.closed last_writer_detached. The GUI no longer DESTROYS the
+    mirror tab on this reason (see the last_writer_detached suite at the end of
+    this file and host/src/core/engine_events.cpp): the doc survives the detach,
+    so the tab is marked final/agent-done instead. The event must still fire —
+    without it a crashed agent's mirror stays 'agent still working' forever."""
     a, b = DaemonClient(), DaemonClient()
     a.connect()
     scratch_daemon.append(_pid(a))
@@ -720,3 +723,111 @@ def test_instance_key_parity_with_cpp(tmp_path, monkeypatch):
         os.kill(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, UnboundLocalError):
         pass
+
+
+# ------------------------------------- last-writer detach: the doc SURVIVES
+#
+# The general lane spawns a FRESH `python -m services.worker_main` per turn, so
+# the agent's last rw attach drops at the END OF EVERY TURN and hostd announces
+# doc.closed{reason:"last_writer_detached"} every single time. host/src/core/
+# engine_events.cpp's doc.closed branch therefore KEEPS the mirror tab on that
+# reason (marking it agent-done) instead of destroying it — which is only safe
+# because the document genuinely stays alive in the daemon. These tests pin that
+# invariant: if hostd ever starts really deleting the doc on last-writer detach,
+# the GUI would show a tab for a document that no longer exists, the part would
+# vanish from the viewport, and the Artifacts panel would lose it. Deleting
+# these tests removes the only guard against that.
+
+
+def _gui_client(pids: list) -> DaemonClient:
+    """A connection that hostd sees as the GUI (kind "gui"), not as an agent.
+
+    DaemonClient.connect() hardcodes {"client": "mcp"} in its hello; re-sending
+    hello re-stamps the kind (core/hostd/server.cpp: c.kind = params["client"]),
+    which is how the other tests here register kind "test". Kind matters: only a
+    non-rw viewer keeps this connection out of the writer count whose emptying
+    triggers last_writer_detached."""
+    c = DaemonClient()
+    c.connect()
+    pids.append(_pid(c))
+    c.call("hello", {"client": "gui", "pid": os.getpid(), "proto": 1})
+    return c
+
+
+def _abandoned_agent_doc(gui: DaemonClient, name: str) -> str:
+    """Mint a doc from a separate `mcp` client, edit it, mirror it read-only from
+    `gui`, then CLOSE the agent's socket — exactly one general-lane turn ending.
+    Returns the doc id; the doc must outlive the agent."""
+    agent = DaemonClient()
+    agent.connect()
+    doc = agent.call("doc_new", {"name": name})["doc_id"]
+    assert agent.call("doc_apply_ops",
+                      {"doc_id": doc, "ops": _box_ops(name)}).get("_is_error") is None
+    # The GUI mirror is a read-only viewer, so the agent's rw is the last writer.
+    assert gui.call("attach_doc", {"doc_id": doc, "mode": "ro"}).get("ok") is True
+    agent.close()
+    time.sleep(0.4)
+    return doc
+
+
+def test_abandoned_agent_doc_stays_in_doc_list(scratch_daemon):
+    """Protects host/src/core/engine_events.cpp's doc.closed branch keeping the
+    mirror tab on last_writer_detached: the tab is only legitimate while the doc
+    is still in the registry, with its name and revision intact."""
+    gui = _gui_client(scratch_daemon)
+    doc = _abandoned_agent_doc(gui, "survives-detach")
+
+    entry = next((e for e in gui.call("doc_list", {})["docs"]
+                  if e.get("doc_id") == doc), None)
+    assert entry is not None, "hostd deleted an agent doc on last-writer detach"
+    assert entry.get("name") == "survives-detach", entry
+    assert entry.get("revision") == 1, entry
+    assert entry.get("origin_kind") == "mcp", entry
+
+
+def test_abandoned_agent_doc_announces_last_writer_detached(scratch_daemon):
+    """The announcement still happens — it just does not mean deletion. The GUI
+    branches on this exact string in host/src/core/engine_events.cpp's doc.closed
+    handler (keep the tab, mark it agent-done) and falls through to the real
+    close path for every other reason, so the spelling is load-bearing."""
+    gui = _gui_client(scratch_daemon)
+    gui.call("subscribe", {"doc_ids": "*"})
+    doc = _abandoned_agent_doc(gui, "announced-detach")
+
+    closed = [e for e in _events(gui, "doc.closed") if e["data"].get("doc_id") == doc]
+    assert closed, "no doc.closed for the abandoned agent doc"
+    assert closed[-1]["data"].get("reason") == "last_writer_detached", closed[-1]
+
+
+def test_abandoned_agent_doc_still_queryable(scratch_daemon):
+    """Not a tombstone: the kept mirror tab must be able to render. doc_tree is
+    what the GUI pulls for a tab it keeps alive after the doc.closed branch in
+    host/src/core/engine_events.cpp declines to destroy it."""
+    gui = _gui_client(scratch_daemon)
+    doc = _abandoned_agent_doc(gui, "queryable-detach")
+
+    tree = gui.call("doc_tree", {"doc_id": doc})
+    assert tree.get("_is_error") is None, tree
+    assert tree.get("revision") == 1, tree
+
+
+def test_explicit_doc_close_really_removes_the_doc(scratch_daemon):
+    """Contrast case that keeps the GUI's REMAINING close path honest: an explicit
+    doc_close does destroy the doc, and announces a reason OTHER than
+    last_writer_detached. host/src/core/engine_events.cpp must still tear the tab
+    down here — if this reason ever collapsed into last_writer_detached the GUI
+    would leak tabs for genuinely dead documents."""
+    gui = _gui_client(scratch_daemon)
+    gui.call("subscribe", {"doc_ids": "*"})
+    agent = DaemonClient()
+    agent.connect()
+    doc = agent.call("doc_new", {"name": "really-closed"})["doc_id"]
+    assert gui.call("attach_doc", {"doc_id": doc, "mode": "ro"}).get("ok") is True
+    assert agent.call("doc_close", {"doc_id": doc}).get("_is_error") is None
+    time.sleep(0.3)
+
+    closed = [e for e in _events(gui, "doc.closed") if e["data"].get("doc_id") == doc]
+    assert closed, "no doc.closed for an explicit close"
+    assert closed[-1]["data"].get("reason") != "last_writer_detached", closed[-1]
+    assert all(e.get("doc_id") != doc for e in gui.call("doc_list", {})["docs"]), \
+        "explicitly closed doc must be gone"

@@ -21,7 +21,9 @@
 #include <cstdio> // T-G9 parity trace (CHUDWARE_RPC_TRACE) file append
 #include <cstdlib>
 #include <functional> // T-G9 parity trace secret redaction
+#include <cwchar> // _wcsnicmp for the Win32 child env block
 #include <string>
+#include <vector>
 
 #include "bootstrap.h"
 #include "cpp_core.h" // P16: legacy in-process libchudware (InProcCore backend)
@@ -531,6 +533,37 @@ std::string win32Error(DWORD code) {
     s.pop_back();
   return s;
 }
+
+// CreateProcessW only reads a *wide* environment block when it is also given
+// CREATE_UNICODE_ENVIRONMENT — the two go together or the child sees garbage.
+// Copy the parent block, overriding (or inserting) one NAME=VALUE, and return a
+// double-NUL-terminated wchar_t buffer suitable for lpEnvironment.
+std::vector<wchar_t> childEnvBlockWith(const std::wstring &name,
+                                       const std::wstring &value) {
+  std::vector<wchar_t> out;
+  const std::wstring prefix = name + L"=";
+  wchar_t *parent = GetEnvironmentStringsW();
+  if (parent) {
+    for (wchar_t *p = parent; *p;) {
+      const std::wstring entry(p);
+      p += entry.size() + 1;
+      // Drop any existing binding for `name` (Windows env names are
+      // case-insensitive) so ours is the only one. Everything else, including
+      // cmd's "=C:=..." per-drive entries, is copied verbatim.
+      if (entry.size() >= prefix.size() &&
+          _wcsnicmp(entry.c_str(), prefix.c_str(), prefix.size()) == 0)
+        continue;
+      out.insert(out.end(), entry.begin(), entry.end());
+      out.push_back(0);
+    }
+    FreeEnvironmentStringsW(parent);
+  }
+  const std::wstring ours = prefix + value;
+  out.insert(out.end(), ours.begin(), ours.end());
+  out.push_back(0);
+  out.push_back(0); // block terminator
+  return out;
+}
 #else
 bool fileExists(const std::string &p) {
   std::error_code ec;
@@ -562,6 +595,17 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
     return false;
   }
 
+  // Pin the child to the SAME engine backend this process resolved, always
+  // explicitly. The two sides default DIFFERENTLY: engine_backend falls back to
+  // the in-process libchudware when hostd is unreachable, while the Python
+  // core_bridge treats an unset CHUDWARE_ENGINE_DAEMON as daemon mode
+  // unconditionally. Leaving it unset is exactly how the GUI ended up on its
+  // private in-process core while the agent worker it had just spawned talked to
+  // hostd: every document the agent built then lived in an engine the GUI could
+  // not see — no doc tab, no viewport geometry, nothing in the AI chat's
+  // Artifacts, which instead showed only what the user had opened locally.
+  const char *enginePin = engine::daemonMode() ? "1" : "0";
+
 #ifdef _WIN32
   SECURITY_ATTRIBUTES sa{};
   sa.nLength = sizeof(sa);
@@ -590,9 +634,16 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
   std::vector<wchar_t> cmdbuf(cmd.begin(), cmd.end());
   cmdbuf.push_back(0);
 
+  // Explicit wide env block (see childEnvBlockWith): lpEnvironment must be
+  // paired with CREATE_UNICODE_ENVIRONMENT, otherwise CreateProcessW reads the
+  // wide bytes as ANSI.
+  std::vector<wchar_t> envBlock =
+      childEnvBlockWith(L"CHUDWARE_ENGINE_DAEMON", widen(enginePin));
+
   PROCESS_INFORMATION pi{};
   BOOL ok = CreateProcessW(nullptr, cmdbuf.data(), nullptr, nullptr, TRUE,
-                           CREATE_NO_WINDOW, nullptr,
+                           CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                           envBlock.data(),
                            cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
   DWORD gle = GetLastError();
   CloseHandle(outWr);
@@ -638,6 +689,10 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
     if (!repo.empty() &&
         chdir(repo.c_str()) != 0) { /* fall through; exec from cwd */
     }
+    // Single-threaded child, post-fork: safe to mutate the environment here,
+    // and doing it here (rather than in the parent) keeps the override out of
+    // the parent's own later getenv() decisions.
+    setenv("CHUDWARE_ENGINE_DAEMON", enginePin, 1);
     execlp(python.c_str(), python.c_str(), "-m", module.c_str(),
            (char *)nullptr);
     _exit(127); // exec failed

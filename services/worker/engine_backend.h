@@ -8,9 +8,14 @@
 //   * InProcCore  — legacy: core::cpp_core() dlopens libchudware into the GUI
 //                   process. Selected ONCE at startup by an explicit
 //                   CHUDWARE_ENGINE_DAEMON=0 (kept >= one release; N+1 removes
-//                   it). On daemon connect/spawn failure we log
-//                   loudly and fall back to InProcCore (same pattern as
-//                   services/mcp/core_bridge.py), so the GUI never hard-breaks.
+//                   it). On daemon connect/spawn failure we retry with bounded
+//                   backoff (~2.85 s total; CHUDWARE_ENGINE_DAEMON_RETRY_MS
+//                   overrides that budget in milliseconds, 0 = single attempt)
+//                   and only then log loudly and fall back to InProcCore (same
+//                   pattern as services/mcp/core_bridge.py), so the GUI never
+//                   hard-breaks. The retry exists because this decision is
+//                   latched for the whole process: a hostd that was merely
+//                   restarting at launch used to cost the entire session.
 //
 // Threading: engine::call() runs on the async_rpc worker thread (EngineClient
 // serializes internally). engine::client()->drainEvents() is called from the
@@ -31,6 +36,13 @@ namespace engine {
 // True iff the daemon backend was selected AND connected at startup (resolved
 // once, thread-safe). False = legacy in-process libchudware.
 bool daemonMode();
+
+// True only when daemon mode was WANTED (no explicit CHUDWARE_ENGINE_DAEMON=0)
+// but every connect attempt failed and we fell back to the in-process core.
+// Distinguishes "legacy on purpose" from "legacy because the daemon was
+// unreachable" — the latter means this process cannot see documents owned by a
+// shared hostd, which is a user-visible defect worth surfacing.
+bool daemonUnavailable();
 
 // The live daemon connection (nullptr unless daemonMode()). GUI-thread event
 // drain + daemon-only methods (attach_doc / edit_hold / subscribe) go here.

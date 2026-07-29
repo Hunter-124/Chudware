@@ -67,28 +67,67 @@ ensure_omp_deps() {
 # that aborted the whole build with exit 125 (caught 2026-07-29 — `./build.sh all` silently stopped
 # after the core stage). No pipes here, and the whole thing is guarded so a diagnostic can never
 # fail a build.
+# `strict` (any non-empty first arg) turns the diagnostic into a GATE: used after build_core has
+# actually tried to rebuild, where a still-stale consumer is a real failure rather than a notice.
 report_engine_staleness() {
-    local consumer hit
+    local strict="${1:-}" consumer hit stale=0
     for consumer in "$ROOT/core/build-occt-linux/bin/libchudware.so" \
                     "$ROOT/core/build-linux/bin/libchudware.so" \
                     "$ROOT/host/build-linux/bin/libchudware.so"; do
         [ -f "$consumer" ] || continue
-        hit="$(find "$ROOT/core" \( -name '*.cpp' -o -name '*.h' \) \
-                -newer "$consumer" -print -quit 2>/dev/null || true)"
+        # Prune build trees. They contain GENERATED headers — notably
+        # core/build-linux/hostd_gen/version_info.h, refreshed by the "git describe" build-id step
+        # on EVERY build — which are newer than any sibling tree's .so by construction. Scanning
+        # them made this report stale immediately after a successful build (found 2026-07-29 by
+        # actually running ./build.sh core: it flagged core/build-occt-linux against
+        # build-linux/hostd_gen/version_info.h). Only AUTHORED sources may mark an engine stale.
+        hit="$(find "$ROOT/core" -type d -name 'build*' -prune -o \
+                \( -name '*.cpp' -o -name '*.h' \) -newer "$consumer" -print -quit \
+                2>/dev/null || true)"
         if [ -n "$hit" ]; then
+            stale=1
             echo "[build] WARN: STALE ENGINE ${consumer#"$ROOT"/} is older than ${hit#"$ROOT"/}."
             echo "[build]       Nothing that reads it (gate.sh, the GUI, CHUDWARE_LIBCHUDWARE) will"
             echo "[build]       see your core changes. Rebuild that tree, e.g."
             echo "[build]       ninja -C core/build-linux bin/libchudware.so   # or ./build.sh all"
         fi
     done
+    if [ -n "$strict" ] && [ "$stale" -eq 1 ]; then
+        echo "[build] ERROR: a consumed engine is STILL stale after building. Refusing to report"
+        echo "[build]        success — this is the exact failure that scored six live agent sweeps"
+        echo "[build]        against two-day-old code on 2026-07-29."
+        return 1
+    fi
     return 0
 }
+# `./build.sh core` must mean "the engine everything READS is now current". It used to mean
+# "configure and build build/linux-core", a tree no consumer opens — so it printed DONE (core) and
+# changed nothing observable. Repointing the preset's binaryDir at a consumed tree is NOT the fix:
+# the preset configures CHUDWARE_WITH_NETGEN=OFF, so reconfiguring core/build-linux with it would
+# silently DELETE the FEA/CFD mesher from a full engine (the ~0.8 MB difference gate.sh:450-456
+# documents). Instead we rebuild each consumed tree IN PLACE with its own cache, which preserves
+# whatever options that tree was configured with, and then gate on the staleness check so a future
+# rename cannot quietly reintroduce the split.
 build_core() {
-    cmake --preset linux-core && cmake --build --preset linux-core
-    local rc=$?
-    echo "[build] core engine -> build/linux-core/bin/libchudware.so (preset tree)"
-    report_engine_staleness
+    local rc=0 built=0 tree
+    for tree in core/build-occt-linux core/build-linux; do
+        [ -f "$ROOT/$tree/build.ninja" ] || continue
+        echo "[build] core engine -> $tree/bin/libchudware.so (consumed tree)"
+        ninja -C "$ROOT/$tree" bin/libchudware.so || rc=$?
+        built=1
+    done
+    if [ "$built" -eq 0 ]; then
+        echo "[build] no configured core tree found — configuring the linux-core preset."
+        echo "[build] NOTE: build/linux-core is NOT read by gate.sh, the GUI, or"
+        echo "[build]       CHUDWARE_LIBCHUDWARE. Run ./build.sh all for a tree they load."
+        cmake --preset linux-core && cmake --build --preset linux-core || rc=$?
+        report_engine_staleness
+        return $rc
+    fi
+    # Keep the GUI's dlopen copy in step: without this, a core fix reaches the tests but never
+    # the desktop app the user is looking at.
+    stage_libchudware_next_to_host
+    report_engine_staleness strict || rc=1
     return $rc
 }
 build_app()  {

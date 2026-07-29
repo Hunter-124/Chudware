@@ -1,0 +1,142 @@
+"""Every ``CATEGORY_PACKS`` entry must be reachable by SOME live dispatch layer.
+
+An ``enable_tools(['<pack>'])` call hands the model a list of tool names it is now
+supposed to be able to call. A name in that list that no layer can resolve is worse
+than a missing tool: the model spends a call, gets an unknown-tool error, and has no
+way to tell "I typed it wrong" from "this capability does not exist". Two real bugs
+of that shape shipped in this file and were only found by a manual audit:
+
+  * ``interference_check`` sat one line below the real ``check_interference``;
+  * ``check_sketch_d`` sat one line below the real ``check_sketch``.
+
+Both are near-anagram typos of a tool that was already in the same pack.
+
+THE TRAP THIS TEST ALSO GUARDS AGAINST — read before "fixing" a failure here.
+Tool resolution is THREE independent layers, and no single one of them sees
+everything:
+
+  1. ``reviewer_exec._resolve_fn``   — a hand-maintained module_key list. Misses
+     whole families (it has no ``reveng`` or ``delegation`` key), so a probe using
+     only this layer reports a large false-positive "unresolved" set.
+  2. ``agent_turn._bind_tool``      — layer 1, then the FULL MCP server registry,
+     then the in-process ask_user/design_recipe pair. Sees every ``@mcp.tool()``.
+  3. ``MissionDispatch.resolve``    — bound METHODS on the dispatcher
+     (``mission_dispatch._handlers``): ``delegate``, ``ask_user``, the
+     ``corporate_*`` / ``coordinate_*`` coordination surface, the parts
+     passthroughs. These are NOT MCP-registered and layer 2 cannot see them, yet
+     they run on every lane that binds a dispatcher — which includes the general
+     lane, since ``run_linear_role_turn`` always constructs one.
+
+An audit that consulted only layer 1 once reported 59 dead entries when 51 were
+fine. An audit that consulted only layers 1+2 then deleted four LIVE coordination
+tools from the ``delegate`` pack. So: a name is dead only when ALL THREE layers
+miss it. If this test fails, the entry is genuinely unreachable — fix the NAME or
+delete it; do not relax the union.
+"""
+from __future__ import annotations
+
+import pytest
+
+from services.agent import tool_categories as tcat
+
+
+def _mission_dispatch_handlers() -> set[str]:
+    """Names resolvable as MissionDispatch bound methods (layer 3)."""
+    from services.agent.mission_dispatch import MissionDispatch
+
+    try:
+        from services.agent.delegation import DelegationTree
+
+        tree = DelegationTree(run_id="cat-test", ledger=None, on_event=None)
+    except Exception:  # pragma: no cover - delegation import is best-effort
+        tree = None
+    md = MissionDispatch(
+        run_id="cat-test", ledger=None, provider=None, on_event=None,
+        delegation_tree=tree,
+    )
+    return {n for n in _all_pack_names() if md.resolve(n) is not None}
+
+
+def _all_pack_names() -> set[str]:
+    """Every concrete tool name any pack advertises, family tokens expanded."""
+    names: set[str] = set()
+    for pack in tcat.CATEGORY_PACKS:
+        # resolve_categories applies CATEGORY_EXPAND_CAP; expand uncapped so a
+        # pack bigger than the cap still gets every entry checked.
+        names |= tcat.resolve_categories([pack], cap=10_000)
+    return names
+
+
+@pytest.fixture(scope="module")
+def resolvable() -> set[str]:
+    """Union of all three live resolution layers."""
+    import services.agent.agent_turn as at
+
+    names = _all_pack_names()
+    out: set[str] = set()
+    for n in names:
+        try:
+            if at._bind_tool(n) is not None:
+                out.add(n)
+                continue
+        except Exception:  # noqa: BLE001 — a raising binder is a miss, not a crash
+            pass
+    out |= _mission_dispatch_handlers()
+    return out
+
+
+class TestEveryPackEntryResolves:
+    def test_no_pack_advertises_an_unreachable_tool(self, resolvable):
+        dead = sorted(_all_pack_names() - resolvable)
+        assert dead == [], (
+            "these CATEGORY_PACKS entries resolve on NO dispatch layer, so "
+            "enable_tools() hands the model names it cannot call: "
+            f"{dead}. Check for a near-anagram typo of a real tool already in "
+            "the same pack before assuming the capability is missing."
+        )
+
+    def test_pack_names_have_descriptions(self):
+        missing = sorted(set(tcat.CATEGORY_PACKS) - set(tcat._CATEGORY_DESCS))
+        assert missing == [], (
+            f"packs with no description in _CATEGORY_DESCS: {missing} — "
+            "category_catalog() is what the model reads to choose a pack."
+        )
+
+    def test_no_description_without_a_pack(self):
+        orphan = sorted(set(tcat._CATEGORY_DESCS) - set(tcat.CATEGORY_PACKS))
+        assert orphan == [], f"descriptions for packs that do not exist: {orphan}"
+
+
+class TestCoordinationSurfaceIsNotMcpVisible:
+    """Pin the layer-3-only class so a future audit cannot mistake it for dead.
+
+    These four are MissionDispatch bound methods. ``_bind_tool`` CANNOT see them.
+    If this test starts failing because they became MCP-registered, that is fine —
+    update it. If it fails because they vanished from the dispatcher, the
+    ``delegate`` pack is advertising dead names again.
+    """
+
+    NAMES = (
+        "corporate_channel_read",
+        "corporate_chart",
+        "coordinate_board",
+        "coordinate_progress",
+    )
+
+    def test_invisible_to_bind_tool_but_live_on_the_dispatcher(self):
+        import services.agent.agent_turn as at
+
+        handlers = _mission_dispatch_handlers()
+        for name in self.NAMES:
+            assert name in handlers, (
+                f"{name} no longer resolves via MissionDispatch.resolve — the "
+                "delegate category pack now advertises a dead tool."
+            )
+            try:
+                bound = at._bind_tool(name)
+            except Exception:  # noqa: BLE001
+                bound = None
+            assert bound is None, (
+                f"{name} is now MCP-visible; this test's premise changed. "
+                "Update the docstring in tool_categories.py's delegate pack too."
+            )

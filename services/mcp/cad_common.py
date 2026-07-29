@@ -1718,6 +1718,201 @@ def _ensure_materials() -> None:
     _MATERIAL_ALIASES.update(cb.call("material_fea_aliases", {}).get("result") or {})
 
 
+# --- engineering-designation resolution -------------------------------------------------
+# Measured live 2026-07-29 (claude-sonnet-4-5, structural FEA): the model asked for
+# material='A36 steel' and was rejected with the 7-name listing, then retried with plain
+# 'steel'. A36 IS the registry's steel row ("Mild steel (A36)", alias "a36") — only the
+# two-word spelling missed. Two structural facts drive the fix below:
+#   1. `material_fea_table` exposes only the 7 `fea_canonical` rows, but the registry itself
+#      carries full first-party mechanical data for ~28 alloys/plastics (7075-T6, 1018, 4130,
+#      2024-T3, cast iron, PEEK, ...). `material_get` resolves any registry key/name/alias, so
+#      a designation outside the canonical 7 is answered with its OWN properties — 7075-T6
+#      gets its real 503 MPa yield instead of generic aluminum's 276.
+#   2. What the registry lacks is spelling variants, so normalize (case, whitespace, hyphens,
+#      underscores, redundant category words, word order) rather than table another name.
+# Anything we recognise but that the registry does NOT model is REFUSED with paste-ready
+# properties (see _MATERIAL_NOT_MODELLED) — a quietly wrong yield is worse than a clear error.
+
+# Category words that carry no designation information once a grade number is present:
+# "a36 steel" -> "a36", "6061-T6 aluminium" -> "6061-t6", "304 stainless steel" -> "304".
+# "grade" is deliberately NOT generic ("grade 2 titanium" needs it).
+_MATERIAL_GENERIC_WORDS = frozenset({
+    "steel", "stainless", "aluminum", "aluminium", "alu", "al", "titanium", "ti",
+    "brass", "plastic", "metal", "alloy", "filament",
+})
+
+# Designations that name EXACTLY the same alloy as a registry row but that the registry's
+# own alias list does not spell. IDENTITY, not substitution — each value is a registry
+# name/alias, and the resolved properties are that row's own.
+#   grade 5 titanium == Ti-6Al-4V (ASTM B265 Gr5 IS the 6Al-4V alloy)
+#   18-8            == the 18Cr-8Ni austenitic grade sold as 304 (fastener trade name)
+#   free-machining brass == C360 (the registry spells it "free-cutting brass")
+#   PLA+ is a toughened PLA; nominal PLA is the conservative prior (lower yield) and the
+#   only PLA data the registry has.
+_MATERIAL_SAME_ALLOY = {
+    "grade 5 titanium": "ti-6al-4v",
+    "titanium grade 5": "ti-6al-4v",
+    "ti grade 5": "ti-6al-4v",
+    "gr5 titanium": "ti-6al-4v",
+    "ti gr5": "ti-6al-4v",
+    "ti 6al 4v": "ti-6al-4v",
+    "18 8": "304",
+    "18 8 stainless": "304",
+    "free machining brass": "c360",
+    "pla+": "pla",
+    "pla plus": "pla",
+}
+
+# Designations we RECOGNISE but refuse to resolve, because the nearest registry row has a
+# materially different yield and aliasing would silently produce a wrong safety factor.
+# value = (spelled-out label, nearest registry row, why we refuse, paste-ready properties).
+# All property values are public-handbook nominals (ASM Metals Reference / ASTM grade
+# minimums), the same provenance class as core/data/materials/registry.json.
+_MATERIAL_NOT_MODELLED = {
+    "316": ("Stainless 316", "stainless (304)", "316 yields 290 MPa vs 304's 215 MPa",
+            "{'E_mpa': 193000, 'nu': 0.30, 'density_g_cm3': 8.0, 'yield_mpa': 290, "
+            "'ultimate_mpa': 580}"),
+    "316l": ("Stainless 316L", "stainless (304)", "316L yields 170 MPa vs 304's 215 MPa",
+             "{'E_mpa': 193000, 'nu': 0.30, 'density_g_cm3': 8.0, 'yield_mpa': 170, "
+             "'ultimate_mpa': 485}"),
+    "4140": ("Chromoly steel AISI 4140 (normalized)", "steel (A36) / 4130",
+             "4140 yields 655 MPa vs 4130's 435 and A36's 250",
+             "{'E_mpa': 205000, 'nu': 0.29, 'density_g_cm3': 7.85, 'yield_mpa': 655, "
+             "'ultimate_mpa': 1020}"),
+    "a572": ("A572 Grade 50 structural steel", "steel (A36)",
+             "A572-50 yields 345 MPa vs A36's 250 MPa",
+             "{'E_mpa': 200000, 'nu': 0.29, 'density_g_cm3': 7.85, 'yield_mpa': 345, "
+             "'ultimate_mpa': 450}"),
+    "6063": ("Aluminium 6063-T6", "aluminum (6061-T6)",
+             "6063-T6 yields 214 MPa vs 6061-T6's 276 MPa — substituting would be "
+             "UNCONSERVATIVE",
+             "{'E_mpa': 68900, 'nu': 0.33, 'density_g_cm3': 2.7, 'yield_mpa': 214, "
+             "'ultimate_mpa': 241}"),
+}
+
+
+def _material_norm(name: object) -> str:
+    """Case/whitespace/hyphen/underscore-insensitive form of a material designation."""
+    s = str(name).strip().lower().replace("_", " ").replace("-", " ")
+    return " ".join(s.split())
+
+
+def _material_candidates(raw: object) -> list:
+    """Spellings to try for one designation, MOST SPECIFIC FIRST.
+
+    Never invents a material: every candidate is still looked up in the registry, so a
+    wrong guess can only fail to match, not fabricate properties."""
+    out: list = []
+
+    def add(c: str) -> None:
+        c = c.strip()
+        if c and c not in out:
+            out.append(c)
+
+    add(" ".join(str(raw).strip().lower().split()))   # exact (today's behaviour)
+    norm = _material_norm(raw)
+    add(norm)
+    add(norm.replace(" ", "-"))                        # "ti 6al 4v" -> "ti-6al-4v"
+    add(norm.replace(" ", ""))                         # "a 36" -> "a36" (hyphen INSIDE a
+                                                       # designation: "A-36 Steel")
+    toks = norm.split()
+    if len(toks) > 1:
+        generic = [t for t in toks if t in _MATERIAL_GENERIC_WORDS]
+        kept = [t for t in toks if t not in _MATERIAL_GENERIC_WORDS]
+        if kept and generic:
+            add(" ".join(kept))                        # "a36 steel" -> "a36"
+            add("-".join(kept))                        # "6061 t6 aluminium" -> "6061-t6"
+            add("".join(kept))                         # "A-36 steel" -> "a36"
+            if len(generic) == 1:                      # word order: registry spells the
+                add(" ".join(kept + generic))          # category word last
+                add(" ".join(generic + kept))          # ("grade 2 titanium")
+    return out
+
+
+def _material_registry_row(name: str) -> Optional[dict]:
+    """One designation -> the FULL registry's own properties, in flat fea_table shape.
+
+    Returns None when the name is not a registry key/name/alias, or when no engine bridge
+    is reachable (the caller then falls through to the normal unknown-material error).
+    The shape is EXACTLY the fea_table row shape — this dict is handed to the C++ solver
+    as study.material, so no extra keys are added."""
+    try:
+        rec = cb.call("material_get", {"name": name}).get("result")
+    except Exception:  # noqa: BLE001 — no engine / RPC unavailable: not a resolution
+        return None
+    if not isinstance(rec, dict):
+        return None
+    mech = rec.get("mechanical")
+    if not isinstance(mech, dict):
+        return None
+    row: dict = {"name": rec.get("name") or name}
+    for f in ("E_mpa", "nu", "density_g_cm3", "yield_mpa", "ultimate_mpa", "endurance_mpa"):
+        if f in mech:
+            row[f] = mech[f]
+    return row
+
+
+def _material_not_modelled(raw: object) -> Optional[tuple]:
+    """The (label, nearest, why, props) refusal record for a recognised-but-unmodelled grade."""
+    for cand in _material_candidates(raw):
+        norm = _material_norm(cand)
+        hit = _MATERIAL_NOT_MODELLED.get(norm)
+        if hit:
+            return hit
+        for tok in norm.split():
+            hit = _MATERIAL_NOT_MODELLED.get(tok)
+            if hit:
+                return hit
+    return None
+
+
+def _resolve_material_name(material: Optional[str]) -> dict:
+    """Name -> properties dict, via the ladder documented above. Raises ValueError when
+    the designation is unknown or deliberately not substituted."""
+    _ensure_materials()
+    raw = material if (material or "").strip() else "steel"
+    candidates = _material_candidates(raw)
+
+    # 1. the canonical FEA table + the registry's own fea_aliases (today's fast path)
+    for cand in candidates:
+        key = _MATERIAL_ALIASES.get(cand, cand)
+        if key in _MATERIALS:
+            return dict(_MATERIALS[key])  # F4: always a COPY, never the shared dict
+    # 2. designations that ARE a canonical row under another engineering name
+    for cand in candidates:
+        target = _MATERIAL_SAME_ALLOY.get(_material_norm(cand))
+        if target:
+            key = _MATERIAL_ALIASES.get(target, target)
+            if key in _MATERIALS:
+                return dict(_MATERIALS[key])
+            row = _material_registry_row(target)
+            if row:
+                return row
+    # 3. the FULL registry — the alloy's OWN first-party properties, no substitution
+    for cand in candidates:
+        row = _material_registry_row(cand)
+        if row:
+            return row
+    # 4. recognised, but we refuse to substitute a materially different alloy
+    nm = _material_not_modelled(raw)
+    if nm:
+        label, nearest, why, props = nm
+        raise ValueError(
+            f"Material {material!r} ({label}) is not in the materials registry, and it is "
+            f"NOT aliased onto {nearest} because {why} — the safety factor would be wrong. "
+            f"Pass explicit properties: {props}. "
+            f"Use {nearest!r} only if that grade is genuinely what you want."
+        )
+    raise ValueError(
+        f"Unknown material {material!r}. Known: {sorted(_MATERIALS)} "
+        f"(or pass an explicit dict with E_mpa/nu/density_g_cm3/yield_mpa). "
+        f"Registry alloy designations also resolve to their own properties, e.g. "
+        f"'A36', '1018', '1045', '4130', '6061-T6', '7075-T6', '2024-T3', 'Ti-6Al-4V', "
+        f"'grade 2 titanium', 'C360', 'cast iron', 'copper', 'inconel 718', 'magnesium', "
+        f"'PETG', 'nylon', 'polycarbonate', 'PEEK', 'acrylic', 'concrete'."
+    )
+
+
 def _resolve_material(material: Union[str, dict, None]) -> dict:
     """Resolve a material name or explicit dict to a validated properties dict.
 
@@ -1729,15 +1924,7 @@ def _resolve_material(material: Union[str, dict, None]) -> dict:
     if isinstance(material, dict):
         mat = dict(material)  # copy: caller-supplied dicts are returned as a new copy too
     else:
-        _ensure_materials()
-        key = (material or "steel").strip().lower()
-        key = _MATERIAL_ALIASES.get(key, key)
-        if key not in _MATERIALS:
-            raise ValueError(
-                f"Unknown material {material!r}. Known: {sorted(_MATERIALS)} "
-                f"(or pass an explicit dict with E_mpa/nu/density_g_cm3/yield_mpa)."
-            )
-        mat = dict(_MATERIALS[key])  # F4: always return a COPY, never the shared dict
+        mat = _resolve_material_name(material)
     # F4: validate that the resolved dict has physically plausible mechanical properties.
     # A zero or missing E_mpa means the C++ will reject the study with a cryptic error;
     # catch it here with a useful message that names the offending material.

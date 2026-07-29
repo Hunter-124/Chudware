@@ -154,7 +154,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "run_cfd_flow": {
         "prompt_note": (
             "Directional LBM for A-vs-B trends, not certified Cd (use "
-            "run_cfd_accurate). Check min_feature_voxels >= ~8; "
+            "run_cfd_accurate). No material= argument — the medium is "
+            "fluid='air'|'water'. Check min_feature_voxels >= ~8; "
             "background=True for cells>=120."
         ),
         "timeout_s": 300,
@@ -199,15 +200,19 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Fix the part like it is mounted — an unconstrained part "
             "returns rigid-body modes near 0 Hz. Density drives the "
-            "frequencies."
+            "frequencies, and it comes from material= (registry name or "
+            "dict), not from set_material."
         ),
         "timeout_s": 300,
     },
     "run_fea_static": {
         "prompt_note": (
             "Workhorse stress check; query_geometry first to confirm "
-            "fixture/load faces resolve. min_fos>1 holds; background=True "
-            "for fine meshes."
+            "fixture/load faces resolve. Material properties enter HERE and "
+            "only here: material='aluminum' (registry name) or "
+            "material={'E_mpa':70000,'nu':0.33,'density_g_cm3':2.7,"
+            "'yield_mpa':250}; set_material sets appearance only. min_fos>1 "
+            "holds; background=True for fine meshes."
         ),
         "timeout_s": 300,
     },

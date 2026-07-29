@@ -764,8 +764,24 @@ def test_ecad_zero_tool_done_not_accepted(tmp_path, monkeypatch):
         assert tools_used, "done without tools accepted"
 
 
-def test_ecad_hard_gate_blocks_place_until_wire(tmp_path, monkeypatch):
-    """mega-13 a3 residual: soft nudge ignored — hard-deny thrash place after first."""
+def test_ecad_hard_gate_does_not_block_the_second_place(tmp_path, monkeypatch):
+    """mega-13 a3 + live 2026-07-28: thrash pressure must not deadlock the chain.
+
+    This case used to assert that the SECOND ecad_place_symbol is hard-denied, on
+    the theory that one symbol is enough to start wiring. A live general-lane run
+    ("3V3 buck regulator with an ESP32-S3, TPS62840, caps and an inductor")
+    disproved it: the nets-incomplete gate demands a wire between two DISTINCT
+    refs, and denying place #2 means the second ref never exists, so the
+    requirement is unsatisfiable by construction. The old behaviour only looked
+    correct here because this test's ``_dispatch`` is a stub that reports every
+    wire as ok regardless of whether the endpoints were ever placed.
+
+    What actually matters — and what mega-13 was really about — is the OUTCOME:
+    a schematic plus placements is not product success, so the turn must still
+    reach wire -> board -> DRC. That is what is asserted now. The gate keeps its
+    pressure via ``_ECAD_MIN_PLACES_BEFORE_NET_GATE``, which lets a real
+    schematic be authored before the denials start.
+    """
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
@@ -815,11 +831,18 @@ def test_ecad_hard_gate_blocks_place_until_wire(tmp_path, monkeypatch):
     assert "ecad_wire" in tools
     assert "board_from_schematic" in tools
     assert "ecad_run_drc" in tools
-    assert any(
-        c.get("tool") == "ecad_place_symbol" and c.get("ok") is False
-        and "ECAD chain" in str(c.get("error") or "")
-        for c in calls
-    ), calls
+    # The product chain completed in order — that is mega-13's real contract.
+    assert tools.index("ecad_wire") < tools.index("board_from_schematic") < \
+        tools.index("ecad_run_drc"), tools
+    # Both placements must SUCCEED. Denying the second one is what made the
+    # gate's own "wire two distinct refs" requirement unsatisfiable live.
+    places = [c for c in calls if c.get("tool") == "ecad_place_symbol"]
+    assert len(places) == 2, places
+    assert all(c.get("ok") for c in places), places
+    # And the turn must not have burned its budget on refused forced retries:
+    # the pre-fix cascade re-dispatched one identical ecad_wire 27 times.
+    failed = [c for c in calls if c.get("ok") is False]
+    assert len(failed) <= 2, failed
 
 def test_ecad_hard_gate_force_injects_wire_after_thrash(tmp_path, monkeypatch):
     """mega-14: after denial cap, harness force-dispatches passive+wire+board."""

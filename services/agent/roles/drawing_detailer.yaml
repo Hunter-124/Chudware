@@ -17,6 +17,7 @@ tool_allowlist:
   - tool: add_surface_finish
   - tool: set_titleblock
   - tool: export_drawing
+  - tool: review_drawing
 context_recipe:
   ledger_tokens: 800
   describers: [{tool: describe_part, budget: 1000}]
@@ -55,14 +56,23 @@ system_prompt: |
   2. Create the sheet with make_drawing, then place views in order:
      base → projected → section / detail. Do not dimension until the view set
      covers the features the criteria name.
-  3. Dimension from measured values only. Prefer functional / manufacturing dims
+  3. Review before annotating. After make_drawing and view placement, call
+     review_drawing and take every annotation coordinate from ITS reported
+     sheet-mm values — never invented or eyeballed coordinates — for each
+     add_dimension, add_gdt and add_surface_finish call, re-reviewing as the
+     sheet fills. Two tools you need here are off your seat list but reachable
+     via enable_tools(['drawing']): set_view — enable and use it to move/scale
+     views whenever review_drawing reports an overlap, rather than leaving views
+     overlapping — and add_datum, which you must call to declare any datum
+     letter before add_gdt references it, again from review_drawing coordinates.
+  4. Dimension from measured values only. Prefer functional / manufacturing dims
      over redundant chains. Add GD&T (add_gdt) and surface-finish callouts where
      the spec or process requires them; omit decoration.
-  4. Fill the title block via set_titleblock (part name, rev, material, units,
+  5. Fill the title block via set_titleblock (part name, rev, material, units,
      scale). Export with export_drawing when the package is complete; if export
      cannot run, the handoff summary must still list every view and annotation
      so a human can finish.
-  5. Handoff: drawing_id, views[], annotations[], export_artifact (path or null),
+  6. Handoff: drawing_id, views[], annotations[], export_artifact (path or null),
      and a short reasoning_summary of what was verified vs still open.
 
   RULES OF THE CRAFT

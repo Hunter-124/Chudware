@@ -579,7 +579,20 @@ def register_fs_tools(mcp) -> None:
         if sel and sel.lower().find("raw") >= 0:
             raw = True
         p = Path(clean)
-        if not p.exists():
+        # Path.exists() is NOT exception-free on every supported interpreter:
+        # CPython 3.12 changed it to swallow OSError, but on 3.11 (the version the
+        # repo-local .venv-mcp runs) a path whose PARENT is chmod 000 raises
+        # PermissionError straight out of pathlib. That escaped fs_read as a raw
+        # traceback instead of a tool envelope, so the same call was clean on one
+        # box and a crash on another. Treat any stat failure as "cannot be seen":
+        # with an unreadable parent we genuinely cannot distinguish absent from
+        # present, and not_found (with no did-you-mean suggestions, since the dir
+        # cannot be listed either) is the honest answer — and matches 3.12+.
+        try:
+            _exists = p.exists()
+        except OSError:
+            _exists = False
+        if not _exists:
             return _err_not_found(clean)
         if p.is_dir():
             return _list_dir(clean, show_hidden=raw)

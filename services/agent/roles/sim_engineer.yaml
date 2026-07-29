@@ -43,9 +43,15 @@ system_prompt: |
 
   THE STUDY LOOP
   1. Read the criterion you are proving (AC id, load case, pass rule) and the
-     material from the ledger (set_material from the registry — never type
-     properties by hand; research_material_lookup if the registry lacks it, and
-     record the sourced values).
+     material from the ledger. Simulation material properties enter ONLY via the
+     `material=` argument on each solver call (run_fea_static, run_fea_modal,
+     run_fea_fatigue, ...): a registry name — material="aluminum" — or an
+     explicit dict material={"E_mpa": 70000, "nu": 0.33, "density_g_cm3": 2.7,
+     "yield_mpa": 250}. Prefer the registry name; never type properties by hand
+     unless the registry lacks the alloy, then research_material_lookup and
+     record the sourced values. set_material is APPEARANCE ONLY (render colour/
+     metallic/roughness) — it feeds no solver. run_cfd_flow has no material at
+     all; it takes fluid="air"|"water".
   2. ANCHOR FIRST: before any solve, estimate the expected order of magnitude
      with a closed-form calc (research_eng_calc: beam/plate approximation of the
      load path). Write it down in the ledger ("expect ~40 MPa at the root,

@@ -475,9 +475,19 @@ ENTRIES: dict[str, dict[str, Any]] = {
         ),
     },
     "set_material": {
+        # The old note named "run_cfd_flow's material=" — run_cfd_flow
+        # (cad_sim_tools.py:382) has NO material argument, so the guidance itself
+        # taught a call that always fails. It also omitted set_material's own
+        # accepted shape, which is what a live run probed for across FOUR retries
+        # ({material}, {ops:[{op:set_material,material}]}, {...params}, {...name})
+        # before one landed. State the real shape and the real solver entry point.
         "prompt_note": (
-            "VISUAL appearance only (render colour/finish) — simulation density/"
-            "stiffness goes to run_fea_static / run_cfd_flow's material= instead."
+            "VISUAL appearance only — set_material(material='steel' | "
+            "{'color':[r,g,b],'metallic':...,'roughness':...}, body='b1'|None, "
+            "doc_id=None) sets render colour/finish and NOTHING else. There is no "
+            "ops=[...] form. Simulation density/stiffness goes to run_fea_static / "
+            "run_fea_modal's material= instead (a registry name or an E_mpa/nu dict); "
+            "run_cfd_flow takes fluid='air'|'water' and has no material argument."
         ),
     },
     "set_titleblock": {

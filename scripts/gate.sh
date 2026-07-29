@@ -53,6 +53,45 @@ fail_fatal=0
 
 record() { SUMMARY+=("$1"); }   # arg: "STAGE  RESULT  detail"
 
+# ---- Runtime python discovery ------------------------------------------------
+# The provisioned service venv has moved with the product's rebrands (AI-CAD -> Billet ->
+# Chudware) and a repo-local .venv-mcp also exists on dev boxes. Every stage below used to
+# hardcode ONLY the Chudware path, so on a box where the venv still lives under the legacy
+# AI-CAD name the pytest stage reported SKIP and the gate went green without running a
+# single Python test — a false green. Probe the whole ladder, newest name first, and export
+# the answer once so every stage agrees on the runner.
+#
+# Override with CHUDWARE_GATE_PYTHON=/path/to/python to pin a specific interpreter.
+GATE_PY=""
+GATE_PY_LABEL=""
+resolve_gate_python() {
+    [ -n "$GATE_PY" ] && return 0
+    local cand
+    for cand in \
+        "${CHUDWARE_GATE_PYTHON:-}" \
+        "$HOME/.local/share/Chudware/mcp-venv/bin/python" \
+        "$HOME/.local/share/Billet/mcp-venv/bin/python" \
+        "$HOME/.local/share/AI-CAD/mcp-venv/bin/python" \
+        "$REPO/.venv-mcp/bin/python" \
+        runtime/venv/bin/python .venv/bin/python venv/bin/python
+    do
+        [ -n "$cand" ] || continue
+        [ -x "$cand" ] || continue
+        "$cand" -m pytest --version >/dev/null 2>&1 || continue
+        GATE_PY="$cand"
+        GATE_PY_LABEL="service venv ($cand)"
+        return 0
+    done
+    return 1
+}
+
+# Same ladder but for stages that only need an interpreter (no pytest), falling back to
+# the system python3 rather than skipping.
+gate_python_or_system() {
+    if resolve_gate_python; then printf '%s' "$GATE_PY"; return 0; fi
+    command -v python3 2>/dev/null || true
+}
+
 # ---- Stage 1: stdlib gate ---------------------------------------------------
 stage_check() {
     echo "=== [1/6] scripts/check.py (stdlib gate) ==="
@@ -371,10 +410,10 @@ stage_appimage_smoke() {
 }
 
 # ---- Stage 4: engine + agent pytest -----------------------------------------
-# Uses the mcp-venv (~/.local/share/Chudware/mcp-venv/bin/python) when present — that
-# venv has all service/oracle deps installed. Falls back to the old venv search and
-# finally bare python3, but emits a loud SKIP-DEGRADED note when the mcp-venv is
-# absent so engineers know the gate is not running real suites.
+# Uses the provisioned service venv discovered by resolve_gate_python() (Chudware, then the
+# legacy Billet/AI-CAD names, then the repo-local .venv-mcp) — those venvs have all
+# service/oracle deps installed. Emits a loud SKIP when none is found so engineers know the
+# gate is not running real suites.
 #
 # CHUDWARE_LIBCHUDWARE is set to core/build-linux/bin/libchudware.so when it exists and the
 # caller has not already set it. Without a loadable .so the oracle tests deselect (or
@@ -396,24 +435,14 @@ stage_appimage_smoke() {
 stage_pytest() {
     echo "=== [4/6] engine + agent pytest ==="
 
-    # --- locate the python runner ---
-    local mcp_venv="$HOME/.local/share/Chudware/mcp-venv/bin/python"
+    # --- locate the python runner (see resolve_gate_python above) ---
     local venv_py=""
-    if [ -x "$mcp_venv" ] && "$mcp_venv" -m pytest --version >/dev/null 2>&1; then
-        venv_py="$mcp_venv"
-        echo "  runner: mcp-venv ($mcp_venv)"
+    if resolve_gate_python; then
+        venv_py="$GATE_PY"
+        echo "  runner: $GATE_PY_LABEL"
     else
-        for cand in runtime/venv/bin/python .venv/bin/python venv/bin/python; do
-            [ -x "$cand" ] && "$cand" -m pytest --version >/dev/null 2>&1 && { venv_py="$cand"; break; }
-        done
-        if [ -n "$venv_py" ]; then
-            echo "  runner: fallback venv ($venv_py) — mcp-venv not found; real suites may not collect"
-        fi
-    fi
-
-    if [ -z "$venv_py" ]; then
-        record "pytest              SKIP    mcp-venv absent and no other venv with pytest found; set up ~/.local/share/Chudware/mcp-venv"
-        echo "  SKIP: no venv with pytest available (mcp-venv not provisioned)"
+        record "pytest              SKIP    no venv with pytest found; provision ~/.local/share/Chudware/mcp-venv or set CHUDWARE_GATE_PYTHON"
+        echo "  SKIP: no venv with pytest available (service venv not provisioned)"
         return 0
     fi
 
@@ -510,6 +539,18 @@ stage_pytest() {
 
     echo "  total collected ≈ $total_collected tests across ${#dirs[@]} dirs"
     record "pytest              total ≈ $total_collected collected | $total_passed passed | (T-V4: foam_case+lbm+test_aicm ignores removed — trimesh+OCP now installed; T-RF5: test_loop_mock.py deleted with the legacy loop)"
+
+    # The stage header has claimed since T-V2 that "a zero-collected result sets
+    # fail_fatal=1", but the check was never actually written — so a gate run that
+    # collected NOTHING (wrong cwd, a renamed services dir, a broken interpreter)
+    # reported PASS. Enforce it for real: the sweep dirs are tracked in-repo, so zero
+    # collected tests across all of them is always a harness break, never an
+    # environment SKIP.
+    if [ "$total_collected" -eq 0 ]; then
+        record "pytest              FAIL    zero tests collected across ${dirs[*]} — the suite did not run (harness/cwd break, not an environment SKIP)"
+        echo "  FAIL: zero tests collected — the Python suites did not run at all"
+        fail_fatal=1
+    fi
 
     if [ "$any_hard_fail" -ne 0 ]; then
         record "pytest              FAIL    one or more dirs had a hard collection crash (rc≥2)"
@@ -629,8 +670,8 @@ stage_perf() {
         echo "  SKIP: CHUDWARE_RUN_PERF not set"
         return 0
     fi
-    local perf_py="$HOME/.local/share/Chudware/mcp-venv/bin/python"
-    [ -x "$perf_py" ] || perf_py="$(command -v python3)"
+    local perf_py=""
+    perf_py="$(gate_python_or_system)"
     if [ -z "$perf_py" ]; then
         record "perf-regression     SKIP    no python for perf harness"
         echo "  SKIP: no python"; return 0
@@ -676,13 +717,8 @@ stage_vv() {
         return 0
     fi
 
-    local mcp_venv="$HOME/.local/share/Chudware/mcp-venv/bin/python"
     local venv_py=""
-    if [ -x "$mcp_venv" ] && "$mcp_venv" -m pytest --version >/dev/null 2>&1; then
-        venv_py="$mcp_venv"
-    else
-        venv_py="python3"
-    fi
+    venv_py="$(gate_python_or_system)"
 
     # Wire CHUDWARE_LIBCHUDWARE if not set and the .so exists (for full mode)
     local so_path="$REPO/core/build-linux/bin/libchudware.so"
@@ -741,11 +777,8 @@ stage_modeling() {
         return 0
     fi
 
-    local mcp_venv="$HOME/.local/share/Chudware/mcp-venv/bin/python"
-    local venv_py="python3"
-    if [ -x "$mcp_venv" ] && "$mcp_venv" -m pytest --version >/dev/null 2>&1; then
-        venv_py="$mcp_venv"
-    fi
+    local venv_py=""
+    venv_py="$(gate_python_or_system)"
 
     # Full mode needs the OCCT geometry .so; prefer it, else fall back to any built .so.
     if [ -z "${CHUDWARE_LIBCHUDWARE:-}" ]; then
@@ -801,13 +834,9 @@ stage_fin_content() {
         return 0
     fi
 
-    local mcp_venv="$HOME/.local/share/Chudware/mcp-venv/bin/python"
     local venv_py=""
-    if [ -x "$mcp_venv" ]; then
-        venv_py="$mcp_venv"
-    elif command -v python3 >/dev/null 2>&1; then
-        venv_py="python3"
-    else
+    venv_py="$(gate_python_or_system)"
+    if [ -z "$venv_py" ]; then
         record "fin25 golden demo   SKIP    no python3"
         echo "  SKIP: python3 not installed"
         return 0
@@ -871,10 +900,9 @@ _run_e2e_bench() {  # $1=label $2=script $3=tmp-subdir $4=gate-flag $5=script-en
     if [ ! -f "$REPO/$script" ]; then
         record "$label   SKIP    $script missing"; echo "  SKIP: $script missing"; return 0
     fi
-    local mcp_venv="$HOME/.local/share/Chudware/mcp-venv/bin/python" venv_py=""
-    if [ -x "$mcp_venv" ]; then venv_py="$mcp_venv"
-    elif command -v python3 >/dev/null 2>&1; then venv_py="python3"
-    else record "$label   SKIP    no python3"; echo "  SKIP: no python3"; return 0; fi
+    local venv_py=""
+    venv_py="$(gate_python_or_system)"
+    if [ -z "$venv_py" ]; then record "$label   SKIP    no python3"; echo "  SKIP: no python3"; return 0; fi
     if [ -z "${CHUDWARE_LIBCHUDWARE:-}" ]; then
         for cand in "$REPO/core/build-occt-linux/bin/libchudware.so" \
                     "$REPO/core/build-linux/bin/libchudware.so"; do

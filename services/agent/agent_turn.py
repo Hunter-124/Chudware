@@ -2591,8 +2591,9 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             # cross-ref wire. Self-loop alone is not enough (mega-17 residual).
             if (
                 _has_sch_so_far
-                and _n_place_so_far >= 1
+                and _n_place_so_far >= _ECAD_MIN_PLACES_BEFORE_NET_GATE
                 and not _nets_ready
+                and tool not in _ECAD_GATE_NEVER_DENY
                 and ({"ecad_wire", "ecad_add_power"} & _allow_now)
                 and tool in (
                     "ecad_place_symbol", "ecad_find_part", "part_search",
@@ -2635,6 +2636,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 and _nets_ready
                 and not _has_board_so_far
                 and (_ECAD_PRODUCT_TOOLS & _allow_now)
+                and tool not in _ECAD_GATE_NEVER_DENY
                 and tool in (
                     "ecad_place_symbol", "ecad_find_part", "part_search",
                     "ledger_get", "ledger_note", "ecad_run_erc",
@@ -2666,6 +2668,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 and not _has_drc_so_far
                 and "ecad_run_drc" in _allow_now
                 and tool != "ecad_run_drc"
+                and tool not in _ECAD_GATE_NEVER_DENY
                 and tool in (
                     "ecad_place_symbol", "ecad_find_part", "part_search",
                     "ledger_get", "ledger_note", "ecad_run_erc",
@@ -4245,6 +4248,9 @@ def _signature_spec(fn: Any) -> dict:
 
 
 from services.agent.arg_reconciliation import (
+    bind_value as _bind_value,
+    drop_descriptive as _drop_descriptive,
+    dropped_note as _dropped_note,
     resolve_unknown as _resolve_unknown,
     synonyms_for as _synonyms_for,
     unknown_arg_payload as _unknown_arg_payload,
@@ -4317,9 +4323,20 @@ def _reconcile_kwargs(tool: str, fn: Any, supplied: dict,
             continue
         target = _resolve_unknown(name, value, params, spec["ann"], used, synonyms)
         if target is None:
+            if _drop_descriptive(name, value, params, used, synonyms):
+                # Purely-cosmetic label, no free slot it could belong to. Ignore
+                # it rather than refuse an otherwise-correct call — but say so.
+                # This path reports through `notes` -> `arg_interpretation`
+                # rather than a `warnings` key (which is what the MCP wrapper
+                # uses) DELIBERATELY: _reconcile_kwargs returns a 3-tuple that
+                # a dozen callers unpack, and "I ignored your label" is an
+                # argument-interpretation note in the first place.
+                notes.append(_dropped_note(name, tool))
+                continue
             unmapped.append(name)
             continue
-        kwargs[target] = value
+        at = spec["ann"].get(target, "")
+        kwargs[target] = _bind_value(target, at, value)
         used.add(target)
         notes.append(f"interpreted {name!r} as {target!r}")
     if unmapped:
@@ -4888,6 +4905,57 @@ _ECAD_THRASH_TOOLS = frozenset({
     "em_status", "fw_status", "ecad_status",
     "ecad_wire", "ecad_add_power", "ecad_label",
 })
+
+# ECAD chain-gate exemptions (live 2026-07-28). The three chain gates below deny
+# a tool and nudge the model onto the next chain step. Their denial sets had grown
+# to include tools that make progress TOWARD the gate's own requirement, which
+# deadlocks the gate against itself:
+#
+#   Live ecad-p1 run, "3V3 buck regulator with an ESP32-S3, TPS62840, caps and an
+#   inductor": after the FIRST ecad_place_symbol the nets-incomplete gate denied
+#   ecad_place_symbol and ecad_find_part. But the gate wants a cross-reference
+#   wire between two DISTINCT symbols — which cannot exist until symbol #2 is
+#   placed, which the gate just denied. Four calls burned per run on a
+#   requirement the gate made unsatisfiable.
+#
+# Three independent corrections:
+#  1. NEVER deny a pure-information or unrelated-discipline tool. Denying
+#     ecad_find_part teaches nothing (it mutates nothing) and it is the only way
+#     to learn what to place. Antenna/research/calc/status tools have no
+#     relationship to schematic nets at all — an antenna-only request was being
+#     railroaded onto a board it never asked for.
+#  2. A real schematic needs SEVERAL symbols before any wire is meaningful, so
+#     the nets gate must not fire at the first placement.
+#  3. Placement is exempt OUTRIGHT. Raising the floor to 4 was not enough: live
+#     ecad-p2 (a 5-part buck regulator) still lost 3 calls, because a realistic
+#     regulator/MCU schematic needs more symbols than any floor worth setting.
+#     Placement is how the gate's own "two DISTINCT refs" requirement gets met.
+#
+# The gates still deny the genuinely premature product/verification steps, so the
+# denial counter still reaches _ECAD_GATE_FORCE_AFTER and the mega-14/18/19
+# force-cascade still runs. The anti-thrash intent is served on better terms: the
+# finish gate still refuses a schematic-only "done" (a schematic without a board
+# is not product success — mega-11/13), and the cascade still drives
+# power -> wire -> board when the model stalls. Do NOT re-add an authoring or
+# read-only tool here.
+_ECAD_GATE_NEVER_DENY = frozenset({
+    # Pure information — mutate nothing, and are how the model learns what to do.
+    "ecad_find_part", "part_search",
+    "ecad_status", "em_status", "fw_status",
+    "resolve_process", "research_material_lookup", "research_eng_calc",
+    "fit_calc", "recommend_fit",
+    # A different deliverable entirely: an antenna is board copper geometry and
+    # has no schematic nets to complete.
+    "ecad_antenna_design", "ecad_antenna_analyze",
+    # Authoring the schematic is progress, never thrash (correction 3 above).
+    "ecad_place_symbol",
+})
+
+#: Symbols the model may place before the nets-incomplete gate starts denying.
+#: A cross-reference wire needs two distinct symbols, and a realistic regulator /
+#: MCU schematic is 5-10 symbols; at 1 the gate was unsatisfiable by construction.
+#: Above this a model that still has not started wiring really is thrashing.
+_ECAD_MIN_PLACES_BEFORE_NET_GATE = 4
 
 
 def _ecad_last_place_refs(calls: list) -> list[str]:
@@ -7390,6 +7458,9 @@ def _ecad_force_chain_cascade(
     # Guarantee cascade can run even when model already near budget.
     cascade_budget = max(int(budget or 0), int(tool_calls_made) + int(max_steps) + 2)
     steps = 0
+    #: (need, canonical-args) pairs already force-dispatched in THIS cascade.
+    #: Guards the identical-redispatch loop documented at the dispatch site below.
+    _forced_seen: set[tuple[str, str]] = set()
     while steps < max_steps and tool_calls_made < cascade_budget:
         need = _ecad_chain_need(calls, allow)
         if not need:
@@ -7560,6 +7631,67 @@ def _ecad_force_chain_cascade(
                 if need == "ecad_optimize_traces":
                     continue
         args = _ecad_forced_tool_args(need, calls)
+
+        # Repeat guard (live 2026-07-28). `_ecad_forced_tool_args` is a pure
+        # function of `calls`, and a FAILED forced call adds only a failure
+        # record — so if a forced step fails, the next iteration recomputes the
+        # SAME need with the SAME args and fails identically. The `_ok` result of
+        # this dispatch was captured and then never read, so nothing broke the
+        # loop: an ECAD turn was observed force-dispatching one
+        # ecad_wire(from_ref='R1', to_ref='R1') twenty-seven times, every one
+        # rejected by the LOOP GUARD, consuming the entire turn budget and ending
+        # success=False. Refuse to re-dispatch an identical (tool, args) pair.
+        _sig = (need, json.dumps(args, sort_keys=True, default=str))
+        if _sig in _forced_seen:
+            _log(ledger, actor or "agent_turn", {
+                "event": "ecad_cascade_repeat_break",
+                "need": need,
+                "steps": steps,
+                "reason": reason,
+            })
+            # Net progress has stalled, but "stop wiring" must not mean "abandon
+            # the deliverable" — mega-11's whole point is that a schematic without
+            # a board is not product success. When the stalled need was a
+            # schematic-authoring step, force the BOARD once and let the loop
+            # carry on to DRC; only give up if the board is unavailable or was
+            # already forced.
+            if need in ("ecad_wire", "ecad_add_power", "ecad_place_symbol"):
+                _brd = next(
+                    (t for t in ("board_from_schematic", "ecad_make_board")
+                     if t in allow_set),
+                    None,
+                )
+                if _brd is not None:
+                    _brd_args = _ecad_forced_tool_args(_brd, calls)
+                    _brd_sig = (
+                        _brd,
+                        json.dumps(_brd_args, sort_keys=True, default=str),
+                    )
+                    if _brd_sig not in _forced_seen:
+                        _forced_seen.add(_brd_sig)
+                        calls, tool_calls_made, _rec, _ok = (
+                            _ecad_dispatch_forced_step(
+                                tool=_brd,
+                                args=_brd_args,
+                                calls=calls,
+                                dispatch=dispatch,
+                                ledger=ledger,
+                                actor=actor,
+                                messages=messages,
+                                reason=f"{reason}:net_stall_board",
+                                tool_calls_made=tool_calls_made,
+                                budget=cascade_budget,
+                            )
+                        )
+                        steps += 1
+                        if (
+                            tool_calls_made < cascade_budget
+                            and steps < max_steps
+                        ):
+                            continue
+            break
+        _forced_seen.add(_sig)
+
         calls, tool_calls_made, _rec, _ok = _ecad_dispatch_forced_step(
             tool=need,
             args=args,

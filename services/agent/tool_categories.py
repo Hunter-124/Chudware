@@ -25,7 +25,6 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     "modeling": [
         "family:cad",
         "add_features",
-        "edit_feature",
         "new_part",
         "new_assembly",
         "save_part",
@@ -43,7 +42,6 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "family:gsl",
         "describe_sketch",
         "check_sketch",
-        "check_sketch_d",
         "sketch_health",
         "sketch_auto_constrain",
         "sketch_preview_text",
@@ -76,7 +74,6 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "check_symmetry",
         "check_feature_overlap",
         "check_metadata",
-        "interference_check",
         "interface_check",
         "compare_parts",
         "design_review",
@@ -142,6 +139,24 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "board_from_schematic",
         "describe_board",
     ],
+    "firmware": [
+        "fw_status",
+        "fw_new_project",
+        "fw_sources",
+        "fw_build",
+        "fw_sim_run",
+        "fw_sensor_scenario",
+        "fw_verify_board",
+        "fw_power_profile",
+        "fw_flash",
+        "fw_emulate_renode",
+        "fw_emulate_simavr",
+        "fw_avr_flash",
+        "fw_serial_open",
+        "fw_serial_read",
+        "fw_serial_write",
+        "fw_serial_close",
+    ],
     "assembly": [
         "new_assembly",
         "asm_add_component",
@@ -149,7 +164,6 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "solve_mates",
         "describe_assembly",
         "check_interference",
-        "interference_check",
         "stackup_analyze",
         "fit_calc",
         "fit_report",
@@ -167,8 +181,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "scrape_enqueue",
         "scrape_queue_status",
         "import_artifact",
-        "list_parts",
-        "get_part",
+        "part_place",
     ],
     "drawing": [
         "make_drawing",
@@ -179,6 +192,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "add_detail_view",
         "add_dimension",
         "add_gdt",
+        "add_datum",
         "add_surface_finish",
         "set_view",
         "set_titleblock",
@@ -198,6 +212,16 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "ledger_note",
         "buildgraph_plan",
         "buildgraph_status",
+        # Corporate/coordination surface. These are NOT MCP-registered tools —
+        # they are MissionDispatch bound methods resolved through
+        # MissionDispatch.resolve (mission_dispatch.py `_handlers`), which is a
+        # dispatch layer agent_turn._bind_tool never consults. A `_bind_tool`
+        # probe therefore reports them unbindable and they are NOT: on any lane
+        # that binds a dispatcher (including the general lane, which
+        # run_linear_role_turn always gives one — mission_dispatch.py:2189-2210)
+        # they resolve and run. They were briefly deleted from this pack on that
+        # false-negative reading; if you are auditing pack entries, probe
+        # MissionDispatch.resolve AND _bind_tool before calling anything dead.
         "corporate_channel_read",
         "corporate_chart",
         "coordinate_board",
@@ -205,7 +229,6 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     ],
     "sheetmetal": [
         "add_features",  # sm_base_flange / sm_edge_flange / sm_flat_pattern via ops
-        "edit_feature",
         "set_process",
         "research_eng_calc",  # bend_allowance
         "dfm_check",
@@ -216,7 +239,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
 }
 
 _CATEGORY_DESCS: dict[str, str] = {
-    "modeling": "Part/assembly geometry: add_features, edit, new/save/export docs",
+    "modeling": "Part/assembly geometry: add_features ops, new/save/export docs",
     "sketch": "2D sketch health, constraints, project/convert faces",
     "measure": "Mass props, distances, geometry queries, hover",
     "inspect": "Visual inspect/render, DFM, interference, design review",
@@ -224,8 +247,9 @@ _CATEGORY_DESCS: dict[str, str] = {
     "sim": "FEA/CFD/motion and EM analysis jobs",
     "cam": "CAM jobs, ops, generate/post, feeds & speeds",
     "ecad": "Schematic/PCB place-wire-board and ERC/DRC/sim",
+    "firmware": "Embedded firmware: scaffold/build/emulate, board co-verify, flash & serial",
     "assembly": "Components, mates, stackup and fit calcs",
-    "sourcing": "Parts library search, BOM, vendors, scrape import",
+    "sourcing": "Parts catalog search/place, BOM, vendors, scrape import",
     "drawing": "2D drawings, GD&T, export PDF/DXF",
     "advisor": "Stage advisory checks and dispute",
     "delegate": "Subagents, ask_user, ledger/dag/buildgraph",

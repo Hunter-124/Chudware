@@ -678,9 +678,16 @@ TEST_CASE("fw_sim_run LIVE: QEMU semihosting path (honest skip without tools)") 
     // cortex-m4 → canonical cortex-m (generic platform). With NO assertions
     // the T-FIN2 gate has nothing to refuse, so the run takes the preferred
     // Renode backend even on the generic platform (same as the oracle).
+    // Budget note (ctest -j6 flake, fixed 2026-07-28): renode is a .NET emulator whose
+    // COLD START dominates this leg (~10-20 s on an idle box). Under parallel ctest the
+    // Netgen mesher suites saturate every core and a 15 s budget expired, so run_renode
+    // returned passed=false with a null trace_path and this case failed ~1 run in 1 —
+    // a machine-load artifact, not a firmware defect. The budget is now generous enough
+    // to absorb heavy contention while still failing a genuinely hung emulator, and the
+    // ctest target carries RUN_SERIAL (core/CMakeLists.txt) so it no longer competes.
     json r = call("fw_sim_run", {{"project_id", pid},
                                  {"elf_path", elf},
-                                 {"timeout_s", 15.0}});
+                                 {"timeout_s", 90.0}});
     CHECK(r.value("passed", false) == true);
     CHECK(r.value("ms", 0.0) > 0.0);
     REQUIRE_FALSE(r["trace_path"].is_null());
@@ -698,7 +705,7 @@ TEST_CASE("fw_sim_run LIVE: QEMU semihosting path (honest skip without tools)") 
     r = call("fw_sim_run", {{"project_id", pid},
                             {"elf_path", elf},
                             {"assertions", json::array({"uart:hello world"})},
-                            {"timeout_s", 15.0}});
+                            {"timeout_s", 90.0}});
     CHECK(r.value("passed", true) == false);
     CHECK(r["assertion_results"][0]["detail"].get<std::string>() ==
           "'hello world' not found in uart_log");
@@ -727,10 +734,11 @@ TEST_CASE("fw_sim_run LIVE: Renode UART path on stm32f4 (honest skip without too
     // UART-only assertion → no AddStateChangedHook lines in the .resc (the
     // hook command errors on Renode 1.16.1 and aborts the script — same in
     // the Python oracle). The live run captures "hello renode" from USART1.
+    // 90 s for the same cold-start-under-load reason as the QEMU leg above.
     json r = call("fw_sim_run", {{"project_id", pid},
                                  {"elf_path", elf},
                                  {"assertions", json::array({"uart:hello renode"})},
-                                 {"timeout_s", 20.0}});
+                                 {"timeout_s", 90.0}});
     INFO("uart_log: ", r["uart_log"].get<std::string>().substr(0, 600));
     CHECK(r.value("passed", false) == true);
     CHECK(r["uart_log"].get<std::string>().find("hello renode") != std::string::npos);
@@ -856,7 +864,7 @@ TEST_CASE("fw_verify_board: emulate=true takes the live path") {
         {"sources", json{{"src/main.c", "void f(void) { digitalWrite(PIN_PA5, 1); }\n"}}},
         {"project_id", pid},
         {"emulate", true},
-        {"timeout_s", 15.0},
+        {"timeout_s", 90.0},
     });
     REQUIRE(r.value("ok", false) == true);
     INFO("dynamic: ", r["dynamic"].dump());

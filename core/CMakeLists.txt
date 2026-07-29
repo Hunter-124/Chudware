@@ -385,6 +385,19 @@ target_compile_definitions(test_firmware PRIVATE
 set_target_properties(test_firmware PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME firmware COMMAND test_firmware)
+# RUN_SERIAL + a generous TIMEOUT. The live legs launch real renode/qemu processes whose
+# cold start is CPU-bound (~10-20 s on an idle box). Under `ctest -j6` the Netgen mesher
+# suites (mesher_autopick alone is ~100 s of saturated cores) starved renode past its
+# 15/20 s per-run budget, so `firmware` failed only in PARALLEL runs and passed in
+# isolation — a pure machine-load artifact, not a firmware defect.
+#
+# Both halves were measured over 3 consecutive `ctest -j6` runs each:
+#   90 s budgets only (no RUN_SERIAL) -> 1 of 3 runs still FAILED, ~178 s per run.
+#   90 s budgets + RUN_SERIAL         -> 3 of 3 PASSED, ~268 s per run.
+# So serialization is load-bearing, not belt-and-braces. The ~90 s of extra wall time
+# buys a deterministic gate; a gate that fails a third of the time is worth nothing.
+# Do not drop RUN_SERIAL without re-running that 3x comparison.
+set_tests_properties(firmware PROPERTIES RUN_SERIAL TRUE TIMEOUT 600)
 
 # fw_cli: differential-harness driver (same role as sketch_cli) — reads
 # {"method","params"} and prints the firmware::call result as one JSON line.

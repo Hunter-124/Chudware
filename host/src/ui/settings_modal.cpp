@@ -3246,15 +3246,15 @@ static void drawEngFirmModelAssignments(AppState& st, float sc) {
 }
 
 static void drawHarnessOrganizationSection(AppState& st, float sc) {
-    // Two-column mode chips: active mode accented, others secondary. Saves vertical
-    // space vs the old 6-line stack (screenshot ask).
+    // Mode chips in 2 columns (3 on wide panes): active mode accented, others secondary.
     dimText("Composer mode picks the org structure. Switch mode from the copilot composer.");
     int active = st.settings.copilotMode;
     if (active < 0 || active >= kHarnessModeCount) active = 0;
 
     ImGui::Dummy(ImVec2(0, 2.0f * sc));
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
-    if (ImGui::BeginTable("##harness_modes", 2,
+    const int modeCols = ImGui::GetContentRegionAvail().x >= 780.0f * sc ? 3 : 2;
+    if (ImGui::BeginTable("##harness_modes", modeCols,
                           ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX)) {
         for (int i = 0; i < kHarnessModeCount; ++i) {
             const auto& m = kHarnessModes[i];
@@ -3294,12 +3294,14 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
     static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
 
     auto prefCombo = [&](const char* label, const char* id, int* pref, const char* help) {
+        // Caption inline-left of the widget: one row per knob instead of caption+widget rows.
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(label);
         if (help && help[0]) {
             ImGui::SameLine();
             helpMarker(help);
         }
+        ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0f);
         int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
         if (ImGui::Combo(id, &v, kPrefLabels, 4)) {
@@ -3345,6 +3347,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                 "(switch tools+prompt). Subagents may still delegate() children "
                 "with other roles, but must request_role_change to adopt themselves. "
                 "Free: subagents may adopt_role too.");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             int ra = (settings.roleAdoption != 0) ? 1 : 0;
             const char* kAdopt[] = {"Supervised", "Free"};
@@ -3358,8 +3361,9 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
 
     ImGui::Dummy(ImVec2(0, 6.0f * sc));
 
-    // ---- Checkboxes in 2 columns (mirrors quick-settings flags) ----
-    if (ImGui::BeginTable("##harness_flags", 2,
+    // ---- Checkboxes in 2 columns (3 on wide panes) — mirrors quick-settings flags ----
+    const int flagCols = ImGui::GetContentRegionAvail().x >= 780.0f * sc ? 3 : 2;
+    if (ImGui::BeginTable("##harness_flags", flagCols,
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
@@ -3453,7 +3457,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0, 2.0f * sc));
 
-    if (ImGui::BeginTable("##harness_chat_display", 2,
+    if (ImGui::BeginTable("##harness_chat_display", flagCols,
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
@@ -3463,6 +3467,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             helpMarker("Simplified: plain sentences only. Normal: sentences with an "
                        "expandable raw drawer. Diagnostic: raw arguments, engine document "
                        "ids and timings, drawers open by default.");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             static const char* kChatDetail[] = {"Simplified", "Normal", "Diagnostic"};
             int detail = ui::chatToolDetail();
@@ -3520,6 +3525,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::TextUnformatted("Refine-pass cap");
         ImGui::SameLine();
         helpMarker("0 = automatic (stops once the render matches).");
+        ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0f);
         if (ImGui::SliderInt("##h_miters", &settings.maxIters, 0, 64,
                              settings.maxIters == 0 ? "automatic" : "%d passes"))
@@ -3534,6 +3540,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::SameLine();
             helpMarker("Nesting levels of subagent-spawning-subagent (not concurrency). "
                        "Root chat = depth 0. Saved to config.json agent.max_subagent_depth.");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             int depth = s_maxDepth;
             if (ImGui::SliderInt("##h_depth", &depth, 0, 4, "%d")) {
@@ -3548,6 +3555,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         if (settings.memoryEnabled) {
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted("Memory token budget");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::SliderInt("##h_membudget", &settings.memoryTokenBudget, 100, 2000,
                                  "%d tokens"))
@@ -3561,6 +3569,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::TextUnformatted("Eng. Firm budget (USD)");
         ImGui::SameLine();
         helpMarker("Used when the composer is in Eng. Firm mode.");
+        ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0f);
         double b = settings.companyBudgetUsd;
         if (ImGui::InputDouble("##h_engfirmbudget", &b, 5.0, 25.0, "$%.2f")) {
@@ -3612,7 +3621,6 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
     if (!settings.expVisionReview) return;
 
     ImGui::Dummy(ImVec2(0, 2 * sc));
-    ImGui::TextUnformatted("Vision / spatial model");
     // Vision-capable presets: cloud (Qwen-VL / Kimi) + local.
     std::vector<const char*> vlabels;
     std::vector<const ui::LocalPreset*> vps;
@@ -3625,6 +3633,9 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
     int vsel = 0;
     for (int i = 1; i < (int)vps.size(); ++i)
         if (vps[i] && vps[i]->id == settings.expVisionModel) vsel = i;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Vision / spatial model");
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(-1);
     if (ImGui::Combo("##expvispreset", &vsel, vlabels.data(), (int)vlabels.size()) && vsel > 0 &&
         vps[vsel]) {
@@ -3645,18 +3656,35 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
         std::memset(settings.expVisionKey, 0, sizeof(settings.expVisionKey));
         std::strncpy(settings.expVisionKey, src, sizeof(settings.expVisionKey) - 1);
     }
-    ImGui::TextUnformatted("Model id");
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputText("##expvismodel", settings.expVisionModel, sizeof(settings.expVisionModel));
-    ImGui::TextUnformatted("Endpoint (base URL)");
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputText("##expvisbase", settings.expVisionBaseUrl, sizeof(settings.expVisionBaseUrl));
+    // Model id + endpoint side by side (inline labels); API key inline on its own row.
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
+    if (ImGui::BeginTable("##expvis_fields", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Model id");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##expvismodel", settings.expVisionModel, sizeof(settings.expVisionModel));
+        ImGui::TableNextColumn();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Endpoint (base URL)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##expvisbase", settings.expVisionBaseUrl, sizeof(settings.expVisionBaseUrl));
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar();  // CellPadding
+    ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("API key (blank for a local endpoint)");
+    ImGui::SameLine();
+    helpMarker("Local: LM Studio / Ollama / vLLM (loopback, no key needed). Cloud: a vision "
+               "model endpoint + its API key (refused under Offline mode).");
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("##expviskey", settings.expVisionKey, sizeof(settings.expVisionKey),
                      ImGuiInputTextFlags_Password);
-    helpMarker("Local: LM Studio / Ollama / vLLM (loopback, no key needed). Cloud: a vision "
-               "model endpoint + its API key (refused under Offline mode).");
     // A remote endpoint with no key can only 401, and the core then SKIPS the split silently
     // (review falls back to the command model). Say so here instead of letting it look enabled.
     if (!settings.expVisionKey[0] && !ui::baseUrlIsLoopback(settings.expVisionBaseUrl)) {
@@ -3828,6 +3856,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
             helpMarker("Where project memory (decisions, notes, recall) is stored. "
                        "SQLite = local .plm/memory.db (default). Mnemopi = OMP bridge "
                        "memory. Saved to config.json agent.memory_backend.");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::Combo("##mem_backend", &s_memBackend, kMemBackends, 2))
                 saveAgentConfigValue("memory_backend", s_memBackend == 1 ? "mnemopi" : "sqlite");
@@ -3841,6 +3870,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                        "Snapcompact = snapshot-style archive (builtin Python or OMP "
                        "bridge). Shake = drop low-value turns. Summary = model-written "
                        "recap. Writes agent.compaction_strategy + agent.compaction_backend.");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::Combo("##comp_mode", &s_compMode, kCompModes, 5))
                 saveCompMode(s_compMode);
@@ -3861,6 +3891,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         if (settings.memoryEnabled) {
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted("Memory token budget");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::SliderInt("##mem_budget_ml", &settings.memoryTokenBudget, 100, 2000,
                              "%d tokens");
@@ -3914,6 +3945,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                        "enables it: Online (default) or Local on-device. Persisted as "
                        "agent.memory_model. Bridge currently runs keyword/FTS-degraded "
                        "when LLM/embeddings are off.");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             if (s_memBackend != 1) ImGui::BeginDisabled();
             if (ImGui::Combo("##mem_model", &s_memModel, kMemModels, 2))
@@ -3938,6 +3970,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
             helpMarker("How much the Agent Workflow / Active Work / Session Plan views "
                        "render. Quiet = titles + status. Normal = last op. "
                        "Full = op tickers, counts, token/latency detail (default).");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::Combo("##ws_verbosity", &s_verbosity, kVerbosity, 3))
                 ui::setAiUiVerbosity(s_verbosity);

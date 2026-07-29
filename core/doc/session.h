@@ -302,6 +302,18 @@ nlohmann::json doc_bbox(const std::string& doc_id);
 // 1-based; <= 0 selects the LAST body. Throws OpError on no bodies / a bad body_id.
 nlohmann::json doc_eval_check(const std::string& doc_id, int body_id);
 
+// Evaluate — SOLID HEALTH census of one or every body: the counts that justify a watertight
+// verdict, with the stable sid of every offender. Returns {bodies:[{body_id, watertight,
+// is_watertight, sound, faces, edges, vertices, shells, solids, free_edges:{count,sids},
+// non_manifold_edges:{count,sids}, tiny_edges:{count,sids}, sliver_faces:{count,sids},
+// seam_edges, degenerate_edges, orientation:{checked,consistent,…}, brep_valid, volume_mm3,
+// volume_positive, area_mm2, self_intersection:{checked:false,reason}}], body_count,
+// all_watertight, all_sound}. Free-edge counting is seam/degenerate-aware (same rule as
+// dress_is_closed_solid), so a cylinder's seam is NOT reported as a hole. Checks the kernel
+// cannot perform report checked:false with a reason — never a passing verdict. body_id is
+// 1-based; <= 0 reports EVERY body. Throws OpError on no bodies / a bad body_id.
+nlohmann::json doc_eval_solid_health(const std::string& doc_id, int body_id);
+
 // Evaluate — cross-section properties of the LAST body at `plane` (port of
 // evaluate.py::section_props via worker.py::_eval_section_props). `plane` is a reserved
 // planar datum id ("plane.top/front/right"), a {"kind":"datum","feature":<id>} selector,

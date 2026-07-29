@@ -82,6 +82,7 @@
 #include <BRepCheck_Result.hxx>
 #include <BRepCheck_ListOfStatus.hxx>
 #include <BRepCheck_Status.hxx>
+#include <BRepCheck_Shell.hxx>
 #include <BRepAlgoAPI_Section.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
@@ -8592,6 +8593,215 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
     }
 
     return json{{"issues", issues}};
+}
+
+// ── eval_solid_health (T-GH1) ────────────────────────────────────────────────────────────
+// "Is this body actually a sound closed solid?" — the question every downstream consumer
+// (an FEA mesher, a CAM toolpath, a STEP/STL export) silently assumes the answer to, and
+// which nothing in the API could answer. doc_eval_check returns a bare issue LIST: no
+// counts, no offending sids, no shell/solid census, no volume. This returns the census that
+// JUSTIFIES the verdict, per body, naming every offender by its stable sid so the agent can
+// hover/measure it instead of being handed an unactionable number.
+//
+// The watertight rule is the seam-aware one the kernel already trusts internally
+// (geom/dress.cpp::blend_is_watertight, doc/document.cpp::dress_is_closed_solid): every edge
+// of a closed solid is shared by >= 2 faces; the only legitimate single-face exceptions are
+// SEAM edges (the 0/2pi closure of a cylinder/sphere/revolve skin) and DEGENERATE edges (a
+// cone apex / sphere pole). Both of those are file-local statics elsewhere, and neither
+// yields the offending edge, so the walk is reimplemented here rather than called.
+//
+// body_id is 1-based; <= 0 reports EVERY surviving body (deliberately unlike eval_*'s
+// "last body" default — a health sweep that silently skipped bodies 1..n-1 would be exactly
+// the confidently-incomplete answer this op exists to kill).
+static const char* health_status_text(BRepCheck_Status st) {
+    switch (st) {
+        case BRepCheck_NoError:                    return "no_error";
+        case BRepCheck_NotClosed:                  return "not_closed";
+        case BRepCheck_RedundantEdge:              return "redundant_edge";
+        case BRepCheck_InvalidMultiConnexity:      return "invalid_multi_connexity";
+        case BRepCheck_BadOrientation:             return "bad_orientation";
+        case BRepCheck_BadOrientationOfSubshape:   return "bad_orientation_of_subshape";
+        case BRepCheck_UnorientableShape:          return "unorientable_shape";
+        default:                                   return nullptr;
+    }
+}
+
+json doc_eval_solid_health(const std::string& doc_id, int body_id) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_session(s);
+    if (r.shapes.empty())
+        throw_no_bodies(doc_id, r, "solid health check");
+
+    const int nbodies = static_cast<int>(r.shapes.size());
+    std::vector<int> want;
+    if (body_id > 0) {
+        if (body_id > nbodies)
+            throw OpError("invalid_op",
+                          "body_id " + std::to_string(body_id) + " is out of range: the "
+                          "document has " + std::to_string(nbodies) + " body(ies)");
+        want.push_back(body_id);
+    } else {
+        for (int i = 1; i <= nbodies; ++i) want.push_back(i);
+    }
+
+    constexpr double TINY_EDGE_MM = 0.01;
+    constexpr double SLIVER_AREA_MM2 = 0.01;
+    auto round6 = [](double x) { return std::abs(x) < 1e-9 ? 0.0 : std::round(x * 1e6) / 1e6; };
+
+    json bodies = json::array();
+    bool all_watertight = true;
+    bool all_sound = true;
+    for (int bid : want) {
+        const TopoDS_Shape& shape = r.shapes[bid - 1];
+        json b = json::object();
+        b["body_id"] = bid;
+
+        TopTools_IndexedMapOfShape emap, fmap, vmap, shmap, somap;
+        TopExp::MapShapes(shape, TopAbs_EDGE, emap);
+        TopExp::MapShapes(shape, TopAbs_FACE, fmap);
+        TopExp::MapShapes(shape, TopAbs_VERTEX, vmap);
+        TopExp::MapShapes(shape, TopAbs_SHELL, shmap);
+        TopExp::MapShapes(shape, TopAbs_SOLID, somap);
+        b["faces"] = fmap.Extent();
+        b["edges"] = emap.Extent();
+        b["vertices"] = vmap.Extent();
+        b["shells"] = shmap.Extent();
+        b["solids"] = somap.Extent();
+
+        TopTools_IndexedDataMapOfShapeListOfShape anc;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc);
+
+        json free_sids = json::array();
+        json nm_sids = json::array();
+        json tiny_sids = json::array();
+        int seam_edges = 0, degenerate_edges = 0;
+        for (int ei = 1; ei <= emap.Extent(); ++ei) {
+            const TopoDS_Shape& esh = emap.FindKey(ei);
+            const TopoDS_Edge& edge = TopoDS::Edge(esh);
+            const int n_faces = anc.Contains(esh) ? anc.FindFromKey(esh).Extent() : 0;
+            std::string sid;
+            try {
+                sid = make_selector(chudware::doc::edge_info(edge, ei - 1))
+                          .value("sid", std::string());
+            } catch (const Standard_Failure&) {}
+            const bool degenerate = BRep_Tool::Degenerated(edge);
+            // Seam-ness is a property of the EDGE, not of how many times the ancestor map
+            // happened to list its parent face (OCCT lists a seam's face twice as often as
+            // not), so classify it BEFORE the incidence branches — otherwise a cylinder
+            // reports "0 seam edges" while relying on the seam exception.
+            bool is_seam = false;
+            if (anc.Contains(esh)) {
+                const TopTools_ListOfShape& fl = anc.FindFromKey(esh);
+                for (TopTools_ListIteratorOfListOfShape it(fl); it.More(); it.Next()) {
+                    if (BRep_Tool::IsClosed(edge, TopoDS::Face(it.Value()))) { is_seam = true; break; }
+                }
+            }
+            if (is_seam) ++seam_edges;
+            if (degenerate) ++degenerate_edges;
+            if (!degenerate && eval_edge_length(edge) < TINY_EDGE_MM) tiny_sids.push_back(sid);
+            if (n_faces > 2) { nm_sids.push_back(sid); continue; }
+            if (n_faces >= 2 || degenerate || is_seam) continue;
+            free_sids.push_back(sid);
+        }
+        b["free_edges"] = json{{"count", (int)free_sids.size()}, {"sids", free_sids}};
+        b["non_manifold_edges"] = json{{"count", (int)nm_sids.size()}, {"sids", nm_sids}};
+        b["tiny_edges"] = json{{"count", (int)tiny_sids.size()}, {"sids", tiny_sids}};
+        b["seam_edges"] = seam_edges;
+        b["degenerate_edges"] = degenerate_edges;
+
+        json sliver_sids = json::array();
+        try {
+            for (const TopoInfo& fi : describe_faces(shape)) {
+                if (fi.measure && *fi.measure < SLIVER_AREA_MM2)
+                    sliver_sids.push_back(make_selector(fi).value("sid", std::string()));
+            }
+        } catch (const Standard_Failure&) {}
+        b["sliver_faces"] = json{{"count", (int)sliver_sids.size()}, {"sids", sliver_sids}};
+
+        // Face-normal / shell-orientation consistency. Only a SHELL can be oriented, so a
+        // body that produced none is reported as not-checked rather than as consistent.
+        bool orient_checked = false, orient_ok = true;
+        json orient_problems = json::array();
+        for (int si = 1; si <= shmap.Extent(); ++si) {
+            try {
+                BRepCheck_Shell chk(TopoDS::Shell(shmap.FindKey(si)));
+                const BRepCheck_Status st = chk.Orientation(Standard_False);
+                orient_checked = true;
+                if (st != BRepCheck_NoError) {
+                    orient_ok = false;
+                    const char* t = health_status_text(st);
+                    orient_problems.push_back(
+                        json{{"shell", si},
+                             {"status", t ? std::string(t)
+                                          : ("brep_check_status_" + std::to_string((int)st))}});
+                }
+            } catch (const Standard_Failure&) {}
+        }
+        b["orientation"] = orient_checked
+            ? json{{"checked", true}, {"consistent", orient_ok}, {"problems", orient_problems}}
+            : json{{"checked", false}, {"consistent", nullptr},
+                   {"reason", "not checked — this body produced no SHELL, and shell "
+                              "orientation is the only normal-consistency test the kernel "
+                              "exposes"}};
+
+        bool brep_valid = true;
+        bool brep_checked = true;
+        try { brep_valid = BRepCheck_Analyzer(shape).IsValid() == Standard_True; }
+        catch (const Standard_Failure&) { brep_checked = false; brep_valid = false; }
+        b["brep_valid"] = brep_checked ? json(brep_valid) : json(nullptr);
+        if (!brep_checked)
+            b["brep_valid_reason"] = "not checked — BRepCheck_Analyzer raised on this shape";
+
+        // Volume is only meaningful for a body that HAS an inside. Reporting a number for a
+        // bare shell/face would be worse than useless: BRepGProp happily integrates the
+        // divergence over an open skin and returns a confident, meaningless figure.
+        double vol = 0.0, area = 0.0;
+        const bool has_solid = somap.Extent() >= 1;
+        try {
+            if (has_solid) {
+                GProp_GProps vp;
+                BRepGProp::VolumeProperties(shape, vp);
+                vol = vp.Mass();
+            }
+            GProp_GProps sp;
+            BRepGProp::SurfaceProperties(shape, sp);
+            area = sp.Mass();
+        } catch (const Standard_Failure&) {}
+        b["volume_mm3"] = has_solid ? json(round6(vol)) : json(nullptr);
+        b["volume_positive"] = has_solid && vol > 1e-9;
+        if (!has_solid)
+            b["volume_reason"] = "not computed — this body contains no SOLID, so it encloses "
+                                 "no volume; an open shell has no inside to measure";
+        b["area_mm2"] = round6(area);
+
+        // The kernel exposes no single-body self-intersection test, so this is REPORTED as
+        // not run. A watertight verdict is a TOPOLOGY verdict and says nothing about a
+        // self-piercing skin.
+        b["self_intersection"] = json{
+            {"checked", false},
+            {"reason", "not checked — this engine exposes no self-intersection test for a "
+                       "single body. The watertight verdict above is topological and does "
+                       "NOT clear this body of self-intersection. For body-vs-body overlap "
+                       "use interference_check; for feature-vs-feature use "
+                       "feature_overlap_check."}};
+
+        const bool watertight =
+            somap.Extent() >= 1 && free_sids.empty() && nm_sids.empty();
+        const bool sound = watertight && vol > 1e-9 && brep_checked && brep_valid &&
+                           (!orient_checked || orient_ok);
+        b["watertight"] = watertight;
+        b["is_watertight"] = watertight;  // trimesh spelling — the one models actually write
+        b["sound"] = sound;
+        all_watertight = all_watertight && watertight;
+        all_sound = all_sound && sound;
+        bodies.push_back(std::move(b));
+    }
+
+    return json{{"bodies", bodies},
+                {"body_count", nbodies},
+                {"all_watertight", all_watertight},
+                {"all_sound", all_sound}};
 }
 
 // engine/doc/evaluate.py::section_props via worker.py::_eval_section_props. Cut the body by

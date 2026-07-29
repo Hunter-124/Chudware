@@ -10,9 +10,11 @@ from typing import Optional
 from typing import Union
 import json
 import os
+import re
 
 from .cad_common import (
     CoreError,
+    _BBOX_INTENT_RE,
     _EMPHASIS_PALETTE,
     _QVOCAB_HELP,
     _apply_emphasis_overlay,
@@ -95,6 +97,15 @@ def _one_alias(tool: str, canonical: str, kwargs: dict, spellings: tuple,
     if notes is not None:
         notes.append(f"{found[0][0]}={found[0][1]!r} read as {canonical}=")
     return found[0][1]
+
+
+# What measure_part ALREADY reports. A `what=`/`measure=` naming one of these is a description of
+# this tool's own output, not a geometry target, so it is dropped with a note instead of routed
+# elsewhere (live 2026-07-29: measure_part(what="mass") was wrongly sent to measure_between, which
+# has no way to answer it). Anything NOT matched here is treated as geometry and routed.
+_MASS_PROPERTY_RE = re.compile(
+    r"\b(mass|weigh\w*|volume|density|inerti\w+|centre\s+of\s+mass|center\s+of\s+mass|"
+    r"centroid|com|cog|mass\s+propert\w+|properties)\b")
 
 
 def _reject_unknown(tool: str, kwargs: dict, accepted: str) -> None:
@@ -483,6 +494,20 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             extra = _extra_kwargs(dict(kwargs))
             notes: list = []
             q, subjects = _read_query("query_geometry", query, extra, notes)
+            # Output-shape flags asking for something this tool ALREADY does. Every match carries
+            # centroid/normal/axis unconditionally, so return_coords=True is a request that is
+            # already satisfied — refusing the whole call over it costs the model a round trip and
+            # teaches it nothing it can act on (measured live 2026-07-29:
+            # query_geometry(query="all planar faces", return_coords=True)). Drop them WITH a note
+            # so the answer still says what happened; this is a closed list, never a catch-all.
+            for flag in ("return_coords", "return_coordinates", "include_coords",
+                         "include_coordinates", "with_coords", "with_coordinates",
+                         "include_centroid", "return_centroid", "measure", "measures",
+                         "include_area", "return_area", "include_size"):
+                if flag in extra:
+                    extra.pop(flag)
+                    notes.append(f"ignored {flag}= — every match already carries centroid, "
+                                 f"normal, axis, area_or_len and sid")
             _reject_unknown(
                 "query_geometry", extra,
                 'it takes query=, doc_id=, the query spellings (target/q/face/edge/selector/'
@@ -887,6 +912,37 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         f"measure_part(density_g_cm3={density!r}): density is a NUMBER in g/cm^3 "
                         "(steel 7.85, aluminium 2.70, ABS 1.04). To pick a material by name use "
                         "set_material instead.") from None
+            # A "what should I measure" argument is ambiguous, and the two readings need OPPOSITE
+            # answers, so the VALUE decides — not the key.
+            #  * what="mass" / "volume" / "centre of mass" names something measure_part ALREADY
+            #    returns. Routing that away is wrong: measured live 2026-07-29 (sim pass 2b) the
+            #    first version of this block sent measure_part(what="mass") to measure_between,
+            #    which cannot answer it, and cost two calls.
+            #  * what="the hole diameter" names GEOMETRY, which measure_part genuinely cannot do
+            #    (measured live 2026-07-29, drawing pass 2) — that one must route.
+            asked = next((k for k in ("what", "target", "feature", "of", "query", "measure",
+                                      "measures", "measurements", "properties", "props",
+                                      "report", "values", "queries", "dimension", "element")
+                          if k in extra), None)
+            if asked is not None:
+                wanted = " ".join(str(extra[asked]).lower().split())
+                if _MASS_PROPERTY_RE.search(wanted):
+                    extra.pop(asked)
+                    notes.append(f"ignored {asked}={wanted!r} — measure_part always reports "
+                                 f"volume, mass, centre of mass and inertia together")
+                    # A combined ask ("mass and bounding box") gets its mass half answered here;
+                    # say where the other half lives rather than leaving it unmentioned.
+                    if _BBOX_INTENT_RE.search(wanted):
+                        notes.append("the bounding box is NOT part of mass properties — "
+                                     "describe_part(doc_id) reports it as `bbox WxDxH mm`")
+                else:
+                    raise ValueError(
+                        f"measure_part({asked}={extra[asked]!r}) — measure_part reports the WHOLE "
+                        f"part's mass properties (volume, mass, centre of mass, inertia) and takes "
+                        f"no geometry target. To measure one face/edge or the distance between "
+                        f"two, call measure_between(a_query=…[, b_query=…]); query_geometry(query) "
+                        f"first lists the candidates and their sids, and describe_part(doc_id) "
+                        f"gives the part's bbox plus the named face/edge roster.")
             _reject_unknown("measure_part", extra,
                             "it takes doc_id= and density_g_cm3= only.")
             d = _doc(doc_id)
@@ -1313,3 +1369,241 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                                         "summary": summary, **res}, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "draft_analysis()"))
+
+
+    # ---------------------------------------------------------------- solid health
+    # The verification gap: nothing answered "is this body actually a sound closed
+    # solid?", so an agent committed to an FEA mesh / a CAM toolpath / a STEP-STL export
+    # and only learned the body was open from a confusing downstream failure — or, worse,
+    # not at all. eval_solid_health (core/doc/session.cpp) computes the census; this tool
+    # turns it into findings that name the offending sid, and REFUSES to pretend it ran a
+    # check the kernel does not have.
+
+    _REPAIR_KNOBS = ("repair", "fill_holes", "fix_normals", "fix_winding")
+
+    def _health_report(doc_id, body, body_id, repair, fill_holes, fix_normals,
+                       fix_winding, called_as: str) -> str:
+        d = None
+        try:
+            asked_repair = [n for n, v in zip(
+                _REPAIR_KNOBS, (repair, fill_holes, fix_normals, fix_winding)) if v]
+            which = body if body is not None else body_id
+            if which is not None:
+                try:
+                    which = int(which)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"{called_as}(body={which!r}): body is a 1-BASED body number "
+                        "(body=1 is the first solid). Omit it to check every body.") from None
+            d = _doc(doc_id)
+            res = cb.call("eval_solid_health",
+                          {"doc_id": d, "body": int(which) if which is not None else 0})
+
+            bodies = res.get("bodies") or []
+            for b in bodies:
+                bid = b.get("body_id")
+                findings: list = []
+                free = b.get("free_edges") or {}
+                nonman = b.get("non_manifold_edges") or {}
+                tiny = b.get("tiny_edges") or {}
+                sliver = b.get("sliver_faces") or {}
+                if b.get("solids", 0) < 1:
+                    findings.append(
+                        "no SOLID was produced — this body is a loose face/shell, so it has "
+                        "no inside. Nothing downstream (FEA mesh, CAM stock removal, STEP "
+                        "solid export) can consume it. Fix the feature that produced it: an "
+                        "extrude/revolve of an OPEN profile makes a surface, not a solid.")
+                if free.get("count"):
+                    findings.append(
+                        f"{free['count']} FREE (boundary) edge(s) — each bounds exactly one "
+                        f"face, so the skin has a hole there. Offending edges: "
+                        f"{', '.join(free.get('sids') or [])}. Hover/measure them to see "
+                        f"where the skin opens, then fix the feature that left the gap "
+                        f"(a shell that removed a face it should not have, a loft/sweep "
+                        f"that failed to cap, an imported surface that was never sewn). "
+                        f"Seam edges of a cylinder/sphere are NOT counted here.")
+                if nonman.get("count"):
+                    findings.append(
+                        f"{nonman['count']} NON-MANIFOLD edge(s) — shared by MORE than two "
+                        f"faces, so the body pinches to a knife at that edge and is not a "
+                        f"valid manifold solid. Offending edges: "
+                        f"{', '.join(nonman.get('sids') or [])}. This is almost always two "
+                        f"features meeting exactly tangentially or a boolean of touching "
+                        f"bodies — nudge one of them so they overlap or clear properly.")
+                orient = b.get("orientation") or {}
+                if orient.get("checked") and orient.get("consistent") is False:
+                    findings.append(
+                        f"face NORMALS are inconsistently oriented: {orient.get('problems')}. "
+                        f"An inside-out patch makes exports and meshers disagree about which "
+                        f"side is material.")
+                if b.get("brep_valid") is False:
+                    findings.append(
+                        "BRepCheck reports the B-rep itself as INVALID (bad geometry/topology "
+                        "on some sub-shape) — run check_geometry (eval_check) for the "
+                        "per-status list.")
+                if b.get("volume_mm3") is None:
+                    findings.append(
+                        f"volume was NOT computed — {b.get('volume_reason')}. Any mass, CG or "
+                        f"inertia number you were about to quote for this body does not exist "
+                        f"yet; make it a solid first (surf_thicken / surf_knit a closed set of "
+                        f"panels).")
+                elif not b.get("volume_positive"):
+                    findings.append(
+                        f"volume is {b.get('volume_mm3')} mm^3 — not positive. A zero volume "
+                        f"means no enclosed material; a NEGATIVE volume is the classic "
+                        f"inverted/inside-out solid tell. Do not mesh or export this body.")
+                if tiny.get("count"):
+                    findings.append(
+                        f"{tiny['count']} tiny edge(s) < 0.01 mm ({', '.join(tiny.get('sids') or [])})"
+                        f" — legal topology, but they blow up mesh element counts and often "
+                        f"mark a near-degenerate fillet/boolean.")
+                if sliver.get("count"):
+                    findings.append(
+                        f"{sliver['count']} sliver face(s) < 0.01 mm^2 "
+                        f"({', '.join(sliver.get('sids') or [])}) — same story: meshers choke "
+                        f"on them.")
+                b["findings"] = findings
+                b["verdict"] = (
+                    f"body {bid}: CLOSED MANIFOLD SOLID — {b.get('shells')} shell, "
+                    f"{b.get('faces')} faces, {b.get('edges')} edges, 0 free, 0 non-manifold, "
+                    f"volume {b.get('volume_mm3')} mm^3"
+                    if b.get("sound") else
+                    f"body {bid}: NOT SOUND — " + "; ".join(f.split(" —")[0] for f in findings))
+
+            # Never imply a check we did not run. The engine marks these checked:false;
+            # surface them at the TOP level so a model skimming the answer cannot read
+            # "watertight" as "verified free of self-intersection".
+            not_checked: list = []
+            for b in bodies:
+                si = b.get("self_intersection") or {}
+                if si.get("checked") is False and not any(
+                        x.startswith("self_intersection") for x in not_checked):
+                    not_checked.append(f"self_intersection: {si.get('reason')}")
+                orient = b.get("orientation") or {}
+                if orient.get("checked") is False:
+                    not_checked.append(
+                        f"orientation (body {b.get('body_id')}): {orient.get('reason')}")
+                if b.get("brep_valid") is None:
+                    not_checked.append(
+                        f"brep_valid (body {b.get('body_id')}): "
+                        f"{b.get('brep_valid_reason')}")
+                if b.get("volume_mm3") is None:
+                    not_checked.append(
+                        f"volume (body {b.get('body_id')}): {b.get('volume_reason')}")
+
+            out = {"ok": True, "doc_id": d,
+                   "watertight": bool(res.get("all_watertight")),
+                   "is_watertight": bool(res.get("all_watertight")),
+                   "sound": bool(res.get("all_sound")),
+                   "body_count": res.get("body_count"),
+                   "bodies": bodies,
+                   "not_checked": not_checked}
+
+            if asked_repair:
+                out["repair"] = {
+                    "performed": False,
+                    "refused": (
+                        f"{called_as}({'=True, '.join(asked_repair)}=True) — NOT done, and "
+                        "nothing was changed. This is a parametric B-rep kernel, not a mesh "
+                        "repairer: there is no hole-filling / normal-flipping pass to run, "
+                        "and bolting one on would hide the real defect in your feature tree. "
+                        "Fix the FEATURE that produced the bad body — the findings above name "
+                        "the offending edge/face sids; hover(sid) or measure them, then edit "
+                        "(add_features op=edit_feature) or delete the feature responsible and "
+                        "re-run this check.")}
+
+            heads = []
+            if asked_repair:
+                heads.append("repair REFUSED (nothing was modified) — see repair.refused")
+            bad = [b for b in bodies if not b.get("sound")]
+            if not bodies:
+                heads.append("no bodies to check")
+            elif not bad:
+                heads.append(
+                    f"{len(bodies)} body(ies): every one is a closed manifold solid with "
+                    f"positive volume "
+                    f"({', '.join(str(b.get('volume_mm3')) + ' mm^3' for b in bodies)})")
+            else:
+                heads.append(f"{len(bad)} of {len(bodies)} body(ies) UNSOUND: " +
+                             " | ".join(b["verdict"] for b in bad))
+            if not_checked:
+                heads.append("NOT CHECKED: " + " | ".join(
+                    x.split(":", 1)[0] for x in not_checked))
+            out["summary"] = ". ".join(heads)
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(_teach_no_bodies(e, d, f"{called_as}()"))
+
+    @mcp.tool()
+    def check_geometry_health(doc_id: Optional[str] = None,
+                              body: Optional[int] = None,
+                              body_id: Optional[int] = None,
+                              repair: bool = False,
+                              fill_holes: bool = False,
+                              fix_normals: bool = False,
+                              fix_winding: bool = False) -> str:
+        """Is this solid actually SOUND? Watertight / closed-manifold verdict + the counts that prove it.
+
+        Run this BEFORE you commit to anything expensive or irreversible — an FEA mesh, a CAM
+        toolpath, a STEP/STL/3MF export, a mass/CG number you will quote. All of those assume a
+        closed manifold solid and none of them check; the first symptom of a bad body is a
+        confusing downstream failure or a silently wrong export.
+
+        Per body it reports:
+          watertight / is_watertight   closed manifold solid? (seam edges of a cylinder/sphere
+                                       are legitimate B-rep topology and are NOT counted as holes)
+          free_edges                   {count, sids} — boundary edges bounding ONE face: holes
+          non_manifold_edges           {count, sids} — edges shared by MORE than two faces
+          shells / solids / faces / edges / vertices, seam_edges, degenerate_edges
+          tiny_edges / sliver_faces    {count, sids} — legal, but they wreck meshes
+          orientation                  face-normal consistency per shell (checked:false + a
+                                       reason when the body has no shell to orient)
+          brep_valid                   BRepCheck_Analyzer verdict
+          volume_mm3 / volume_positive a zero or NEGATIVE volume is the inverted-solid tell
+          self_intersection            ALWAYS {checked:false, reason} — this kernel exposes no
+                                       single-body self-intersection test. A watertight verdict
+                                       is topological and does NOT clear a body of self-
+                                       intersection. Use check_interference for body-vs-body.
+          findings                     one actionable sentence per defect, naming the sids
+          verdict                      the one-line answer
+        `not_checked` at the top level lists every check that did NOT run, so a passing
+        `watertight` can never be mistaken for a clean bill of health.
+
+        doc_id : the part (defaults to the active document).
+        body   : 1-based body number; omit to check EVERY body (also spelled body_id=).
+        repair / fill_holes / fix_normals / fix_winding : accepted so the trimesh-style call
+          you were about to write does not die on an unknown argument — but they are REFUSED,
+          not performed. This is a parametric B-rep kernel: the fix for a bad body is to fix
+          the FEATURE that produced it, which the findings point you at.
+
+        Aliases (same tool): is_watertight, assess_mesh_quality, analyze_stl_geometry,
+        health_check, design_audit.
+        """
+        return _health_report(doc_id, body, body_id, repair, fill_holes, fix_normals,
+                              fix_winding, "check_geometry_health")
+
+    # The spellings models already write for this question, resolved to the ONE
+    # implementation above rather than reimplemented. `is_watertight` is the trimesh verb;
+    # the rest are the namings observed across the CAD/mesh MCP ecosystem.
+    for _alias_name in ("is_watertight", "assess_mesh_quality", "analyze_stl_geometry",
+                        "health_check", "design_audit"):
+
+        def _make_alias(alias: str):
+            def _health_alias(doc_id: Optional[str] = None,
+                              body: Optional[int] = None,
+                              body_id: Optional[int] = None,
+                              repair: bool = False,
+                              fill_holes: bool = False,
+                              fix_normals: bool = False,
+                              fix_winding: bool = False) -> str:
+                return _health_report(doc_id, body, body_id, repair, fill_holes,
+                                      fix_normals, fix_winding, alias)
+            _health_alias.__name__ = alias
+            return _health_alias
+
+        mcp.tool(name=_alias_name, description=(
+            f"Alias of check_geometry_health — solid health: watertight / closed-manifold "
+            f"verdict per body with the free-edge, non-manifold-edge, shell/face counts and "
+            f"offending sids that justify it, plus volume sign. Identical arguments and "
+            f"identical answer; call check_geometry_health directly if you prefer. Repair "
+            f"arguments are refused, not performed."))(_make_alias(_alias_name))

@@ -3545,6 +3545,14 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.contains("body") && params["body"].is_number()
                                     ? params["body"].get<int>() : 0),
                             out_json, 0);
+            if (m == "eval_solid_health")
+                return emit(chudware::doc::doc_eval_solid_health(
+                                params.value("doc_id", std::string()),
+                                params.contains("body") && params["body"].is_number()
+                                    ? params["body"].get<int>()
+                                    : (params.contains("body_id") && params["body_id"].is_number()
+                                           ? params["body_id"].get<int>() : 0)),
+                            out_json, 0);
             if (m == "eval_section_props")
                 return emit(chudware::doc::doc_eval_section_props(
                                 params.value("doc_id", std::string()),

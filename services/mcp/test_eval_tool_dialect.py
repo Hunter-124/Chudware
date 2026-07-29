@@ -702,3 +702,114 @@ def test_a_geometry_ask_under_a_plural_key_still_routes(part):
     assert err is None, err
     assert r["ok"] is False
     assert "measure_between" in r["error"]
+
+# --------------------------------------------------------------------------
+# Dispatch-path SYMMETRY: an unknown argument must be refused on the external
+# MCP path exactly as it already is on the built-in agent path.
+#
+# Measured baseline (2026-07-29, before mcp_server/server.py
+# _open_varkw_arg_model existed):
+#
+#   query_geometry(query="top", doc_id=<plate>, return_sparkles=True)
+#     agent path -> ok:False "query_geometry() got unknown argument(s)
+#                   return_sparkles=True — it takes query=, doc_id=, …"
+#     MCP path   -> ok:True, count:1, one matching face, `return_sparkles` GONE
+#
+# FastMCP folds a var-keyword parameter into ONE ordinary pydantic field and
+# leaves the generated arg model at pydantic's default extra="ignore", so
+# arg_model.model_validate() dropped every key the tool's own dialect
+# normaliser was supposed to judge: a loud refusal became a silently WRONG
+# call. These tests fail the moment that drop comes back.
+# --------------------------------------------------------------------------
+
+# Otherwise-valid arguments for each widened tool, so the ONLY thing wrong with
+# the call under test is the invented key.
+VALID_BASE = {
+    "query_geometry": {"query": "top"},
+    "check_sketch": {"sketch": "s1"},
+    "measure": {"targets": ["top"]},
+    "measure_part": {},
+    "measure_between": {"a_query": "top"},
+    "check_interference": {},
+    "check_feature_overlap": {},
+    "check_symmetry": {"plane": "top"},
+    "inspect_section": {"plane": "top"},
+    "draft_analysis": {},
+}
+
+
+def _mcp_text(name: str, args: dict) -> str:
+    """Drive the EXTERNAL-MCP dispatch path and return everything it said.
+
+    ``server.mcp.call_tool`` -> ``ToolManager.call_tool`` is the seam the
+    arg-teaching wrapper owns and the one the wire protocol uses; the fresh
+    registry ``_fastmcp_tools()`` builds deliberately does NOT have it.
+    ``measure`` raises rather than returning ok:False, so a refusal can arrive
+    as a ToolError too — both shapes are loud, and both are read here.
+    """
+    from mcp_server import server
+
+    try:
+        res = asyncio.run(server.mcp.call_tool(name, args))
+    except Exception as exc:  # noqa: BLE001 - a raised refusal is still a refusal
+        return f"{type(exc).__name__}: {exc}"
+    if isinstance(res, tuple):
+        content, structured = res
+        if isinstance(structured, dict) and isinstance(structured.get("result"), str):
+            return structured["result"]
+        res = content
+    if isinstance(res, list):
+        return " ".join(getattr(b, "text", str(b)) for b in res)
+    return res if isinstance(res, str) else str(res)
+
+
+@pytest.mark.parametrize("tool", WIDENED_TOOLS)
+def test_mcp_path_refuses_what_the_agent_path_refuses(part, tool):
+    """One invented key, both dispatch paths, same verdict."""
+    args = dict(VALID_BASE[tool], doc_id=part, return_sparkles=True)
+
+    # The agent path refuses either in the reconciler, in a returned ok:False
+    # payload, or by raising (`measure` has no try/except) — all three are loud.
+    try:
+        payload, agent_err = _dispatch(tool, **args)
+    except ValueError as exc:
+        agent_err = str(exc)
+    else:
+        agent_err = agent_err or json.dumps(payload or {})
+    assert "return_sparkles" in agent_err, f"agent path did not refuse: {agent_err}"
+
+    said = _mcp_text(tool, args)
+    assert "return_sparkles" in said, (
+        f"{tool}: the MCP path DROPPED return_sparkles instead of refusing it — {said[:400]}")
+    assert '"ok": true' not in said.lower(), f"{tool} reported success anyway: {said[:400]}"
+
+
+@pytest.mark.parametrize("tool,args", [
+    # Every one of these spellings is a KNOWN synonym the tool bodies adopt. They
+    # travel the same extras channel as `return_sparkles`, so a guard built on
+    # extra="forbid" would refuse them — which is why the fix forwards the keys
+    # to the tool instead of second-guessing them here.
+    ("query_geometry", {"of": "face", "side": "top"}),
+    ("query_geometry", {"target": "top"}),
+    ("query_geometry", {"face": "top"}),
+    ("query_geometry", {"query": "all planar faces", "return_coords": True}),
+    ("measure_part", {"density": 2.7}),
+    ("measure_between", {"a": "top", "b": "bottom"}),
+    ("check_interference", {"coincident": True}),
+    ("check_interference", {"clearance": 0.5}),
+    ("check_symmetry", {"about": "top"}),
+    ("inspect_section", {"at": "top"}),
+    ("check_feature_overlap", {"feature": "Plate"}),
+    ("draft_analysis", {"direction": "+Z"}),
+])
+def test_valid_synonyms_still_reach_the_tool_through_the_mcp_path(part, tool, args):
+    said = _mcp_text(tool, dict(args, doc_id=part))
+    assert '"ok": true' in said.lower(), f"{tool}({', '.join(args)}) was refused: {said[:400]}"
+
+
+def test_measure_still_renders_through_the_mcp_path(part):
+    """`measure` returns image content, not JSON — the extras channel must not
+    disturb a tool whose result never goes through an output model."""
+    said = _mcp_text("measure", {"selectors": ["top"], "doc_id": part})
+    assert "unknown argument" not in said, said[:400]
+    assert "Error" not in said, said[:400]

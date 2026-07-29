@@ -643,6 +643,14 @@ _reg.mark_warm_baseline()
 #  (b) silent drop: add_features(doc_id=..., ops=[], operation="union") returned
 #      ok:True with `operation` discarded. The model's intent vanished silently.
 #
+#  (b') the same silent drop on a ``**kwargs``-WIDENED tool, which this wrapper
+#      used to skip entirely: query_geometry(query="top", return_sparkles=True)
+#      returned ok:True with one matching face while the built-in agent path
+#      refused the identical call with a teaching error. Widened tools already
+#      own that refusal in-body (cad_eval_tools._reject_unknown); they were just
+#      never handed the key. ``_open_varkw_arg_model`` reopens their arg model
+#      so extras are FORWARDED into the real ``**kwargs`` instead of dropped.
+#
 # A correct call is untouched: no unknown key + no validation error means we hand
 # the exact same arguments to the exact same original with the same
 # ``convert_result`` flag, and return its result object unmodified.
@@ -705,7 +713,9 @@ def _arg_meta(tool) -> dict:
         ann[wire] = ptype
         listing.append(f"{wire} ({'required' if req else 'optional'}, {ptype})")
 
-    # A tool taking **kwargs genuinely accepts anything — never second-guess it.
+    # A tool taking **kwargs owns its own input dialect — never second-guess it
+    # here. But the extras it exists to receive must actually REACH it; see
+    # _open_varkw_arg_model.
     varkw = False
     try:
         for p in _inspect.signature(_inspect.unwrap(tool.fn)).parameters.values():
@@ -725,6 +735,64 @@ def _arg_meta(tool) -> dict:
     }
     _ARG_META_CACHE[tool.name] = (tool, meta)
     return meta
+
+
+def _open_varkw_arg_model(tool) -> None:
+    """Let a ``**kwargs`` tool's arg model FORWARD unrecognised keys instead of
+    eating them.
+
+    Measured asymmetry (2026-07-29, this repo, doc-cpp0000000d):
+
+        query_geometry(query="top", doc_id=..., return_sparkles=True)
+          agent path -> ok:False "query_geometry() got unknown argument(s)
+                        return_sparkles=True — it takes query=, doc_id=, …"
+          MCP path   -> ok:True, one matching face, `return_sparkles` GONE
+
+    Cause: FastMCP turns a var-keyword parameter into ONE ordinary pydantic
+    field named after it ("kwargs"/"extra") and the generated model keeps
+    pydantic's default ``extra="ignore"``, so every key the tool's own dialect
+    normaliser was supposed to see is stripped by ``arg_model.model_validate``
+    before ``fn`` runs (func_metadata.py ArgModelBase / call_fn_with_arg_validation).
+    A loud ``unknown_argument`` refusal became a silently WRONG call.
+
+    The fix is not a second guard: these tools already refuse unknown names
+    correctly (cad_eval_tools._reject_unknown and friends) — they were simply
+    never handed the evidence. So flip the model to ``extra="allow"`` and make
+    ``model_dump_one_level`` (the only thing FastMCP feeds to ``fn(**…)``)
+    include the extras, which lands them in the tool's own ``**kwargs`` FLAT —
+    byte-identical to what the built-in agent path passes. Every existing
+    in-body synonym, note and refusal therefore applies unchanged on both paths.
+
+    Deliberately NOT ``extra="forbid"``: for a widened tool the extras ARE the
+    dialect (``query_geometry(of="face", side="top")``,
+    ``measure_part(density=2.7)``), so forbidding them would refuse the very
+    calls the family was widened to accept.
+
+    Idempotent, once per tool. The advertised JSON schema (``tool.parameters``)
+    was generated at registration and is not touched, so nothing the client
+    sees changes.
+    """
+    model = tool.fn_metadata.arg_model
+    if model.__dict__.get("_chudware_varkw_open"):
+        return
+    base_dump = model.model_dump_one_level
+
+    def model_dump_one_level(self) -> dict:
+        out = base_dump(self)
+        for key, value in (self.__pydantic_extra__ or {}).items():
+            # setdefault: an alias collision must never become a duplicate
+            # keyword argument to fn().
+            out.setdefault(key, value)
+        return out
+
+    try:
+        model.model_config["extra"] = "allow"
+        model.model_rebuild(force=True)
+    except Exception:  # noqa: BLE001 - a model we cannot reopen keeps old behaviour
+        model.model_config.pop("extra", None)
+        return
+    model.model_dump_one_level = model_dump_one_level
+    model._chudware_varkw_open = True
 
 
 def _short_val(v) -> str:
@@ -852,7 +920,10 @@ def _install_arg_teaching(server) -> None:
         meta = _arg_meta(tool)
         notes: list[str] = []
         dropped: list[str] = []
-        if arguments and not meta["varkw"] and not meta["accepted"].issuperset(arguments):
+        if meta["varkw"]:
+            # The tool owns its dialect — but only if the keys reach it.
+            _open_varkw_arg_model(tool)
+        elif arguments and not meta["accepted"].issuperset(arguments):
             known, unresolved = {}, []
             for k, v in arguments.items():
                 if k in meta["accepted"]:

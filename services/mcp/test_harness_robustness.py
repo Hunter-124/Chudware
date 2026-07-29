@@ -336,8 +336,18 @@ def test_delegate_binds_a_tree_when_a_provider_is_available(monkeypatch):
 
     md = MissionDispatch(run_id="r_autobind", provider=_Provider())
     assert md.delegation_tree is None
-    monkeypatch.setattr(MissionDispatch, "_run_subagent",
-                        lambda self, node, brief: {"executed": True})
+    # The stub must represent a child that ACTUALLY RAN. `executed` is set
+    # optimistically before the child starts, and _delegation_execution_verdict now
+    # downgrades a node that cannot evidence execution — so a bare
+    # {"executed": True} is exactly the fabricated success that gate exists to catch
+    # (a firmware turn closed as `confirmed` on one, claiming a simulation that never
+    # happened). Evidence here is a spent budget and an attempt.
+    monkeypatch.setattr(
+        MissionDispatch, "_run_subagent",
+        lambda self, node, brief: {
+            "executed": True,
+            "budget": {"attempts": 1, "tokens_spent": 120},
+        })
 
     out = md.delegate(role="sketcher", brief="sketch the base plate",
                       budget_tokens=4000)
@@ -346,6 +356,34 @@ def test_delegate_binds_a_tree_when_a_provider_is_available(monkeypatch):
     assert out.get("status") == "approved"
     assert out.get("delegation_tree_autobound") is True   # observable, not silent
     assert out.get("executed") is True
+
+
+def test_delegate_refuses_to_report_execution_it_cannot_evidence(monkeypatch):
+    """The companion guard: evidence-free `executed` must NOT survive.
+
+    Without this, the test above could go green again by weakening the honesty
+    verdict rather than by delegating for real.
+    """
+    from services.agent.mission_dispatch import MissionDispatch
+
+    md = MissionDispatch(run_id="r_noevidence", provider=_Provider())
+    monkeypatch.setattr(MissionDispatch, "_run_subagent",
+                        lambda self, node, brief: {"executed": True})
+
+    out = md.delegate(role="sketcher", brief="sketch the base plate",
+                      budget_tokens=4000)
+
+    assert out.get("executed") is not True, (
+        "a node with no tokens, no attempts, no handoff, no calls and no docs "
+        "claimed execution")
+    assert out.get("ok") is False
+    assert out.get("subagent_status") == "not_run"
+    note = out.get("note") or ""
+    assert "did NOT run" in note, (
+        "a downgrade must say why, or the caller cannot act on it")
+    assert "do not report this brief as done" in note, (
+        "the note must tell the model what NOT to conclude — this is the exact "
+        "turn-closing fabrication the verdict exists to prevent")
 
 
 def test_delegate_without_provider_names_what_to_do_instead():

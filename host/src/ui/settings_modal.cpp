@@ -198,13 +198,15 @@ static void settingsSectionHeader(const char* title, bool first = false) {
 
 // Frosted glass card around a group of related fields. Auto-height; id must be unique per tab.
 // Keeps label+widget pairs inside one child so scrolling cannot detach a caption from its field.
-static void settingsGlassSectionBegin(const char* id, const char* title) {
+// width=0 fills the row (the default); an explicit width lets two sections sit side by side
+// (Settings → Providers packs Sign-in and Usage into two columns on wide panes).
+static void settingsGlassSectionBegin(const char* id, const char* title, float width = 0.0f) {
     const float sc = ui::uiScale;
     settingsSectionHeader(title);
     ui::pushGlassChildStyle(10.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 7.0f * sc));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * sc, 5.0f * sc));
-    ImGui::BeginChild(id, ImVec2(0, 0),
+    ImGui::BeginChild(id, ImVec2(width, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
 }
 
@@ -364,6 +366,25 @@ static std::string shortAccountId(const std::string& id) {
     return id.substr(0, 8) + "\xe2\x80\xa6";
 }
 
+// Truncate with a trailing ellipsis so the rendered text fits maxW. The Providers pane used
+// to let long emails / org names / model names run past the card edge and clip mid-glyph;
+// every one-line label in a fixed-width cell goes through this instead.
+static std::string ellipsizeToFit(const std::string& s, float maxW) {
+    if (maxW <= 0.0f) return {};
+    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    static const char* kEll = "\xe2\x80\xa6";
+    const float ellW = ImGui::CalcTextSize(kEll).x;
+    if (ellW > maxW) return {};
+    size_t lo = 0, hi = s.size();
+    while (lo < hi) {
+        const size_t mid = (lo + hi + 1) / 2;
+        if (ImGui::CalcTextSize(s.c_str(), s.c_str() + mid).x + ellW <= maxW) lo = mid;
+        else hi = mid - 1;
+    }
+    while (lo > 0 && (s[lo] & 0xC0) == 0x80) --lo;   // never split a UTF-8 continuation
+    return s.substr(0, lo) + kEll;
+}
+
 // Primary row label: display_name → email/label → shortened account id.
 static std::string accountPrimaryLabel(const ui::UsageAccount& row) {
     if (!row.displayName.empty()) return row.displayName;
@@ -394,25 +415,43 @@ static void drawPlanChip(const std::string& plan, float sc) {
 // One usage window: circular gauge + label over "NN%  resets in …". The ring is the shared
 // ui::drawFractionRing primitive, so this readout and the composer's usage indicators are
 // literally the same shape — the old flat rectangular bar read as an unrelated widget.
-static void drawUsageWindow(const ui::UsageWindow& w, float sc) {
-    if (!w.hasFraction) {
-        const char* detail = "usage unavailable";
-        if (w.status == "needs_login") detail = "sign in required";
-        else if (w.status == "blocked") detail = "browser verification required";
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-        ImGui::Text("%s \xe2\x80\x94 %s", w.label.c_str(), detail);
-        ImGui::PopStyleColor();
-        return;
-    }
-    const float* role = ui::usageStatusColor(w.status, w.usedFraction);
-    const ImU32 roleU = ImGui::ColorConvertFloat4ToU32(ImVec4(role[0], role[1], role[2], 1.0f));
-
+// Cells are a FIXED width (usageWindowCellWidth) so the Usage section can flow several
+// windows side by side instead of stacking one full-width row each.
+static std::string usageWindowSubText(const ui::UsageWindow& w) {
     const std::string countdown = ui::usageResetCountdown(w.resetsAt);
     char sub[96];
     if (!countdown.empty())
         std::snprintf(sub, sizeof(sub), "%.0f%%  %s", w.usedFraction * 100.0f, countdown.c_str());
     else
         std::snprintf(sub, sizeof(sub), "%.0f%%", w.usedFraction * 100.0f);
+    return sub;
+}
+static std::string usageWindowUnavailableText(const ui::UsageWindow& w) {
+    const char* detail = "usage unavailable";
+    if (w.status == "needs_login") detail = "sign in required";
+    else if (w.status == "blocked") detail = "browser verification required";
+    return w.label + " \xe2\x80\x94 " + detail;
+}
+static float usageWindowNaturalWidth(const ui::UsageWindow& w, float sc) {
+    if (!w.hasFraction) return ImGui::CalcTextSize(usageWindowUnavailableText(w).c_str()).x;
+    const float thick   = ui::metrics::stroke(3.0f);
+    const float ringBox = ImGui::GetFrameHeight() * 0.42f * 2.0f + thick;
+    const float textW = ImMax(ImGui::CalcTextSize(w.label.c_str()).x,
+                              ImGui::CalcTextSize(usageWindowSubText(w).c_str()).x);
+    return ringBox + 8.0f * sc + textW;
+}
+static void drawUsageWindow(const ui::UsageWindow& w, float sc, float cellW) {
+    if (!w.hasFraction) {
+        const std::string line = ellipsizeToFit(usageWindowUnavailableText(w), cellW);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddText(ImGui::GetCursorScreenPos(),
+                    ui::Palette::toU32(ui::palette.textDim), line.c_str());
+        ImGui::Dummy(ImVec2(cellW, ImGui::GetTextLineHeight()));
+        return;
+    }
+    const float* role = ui::usageStatusColor(w.status, w.usedFraction);
+    const ImU32 roleU = ImGui::ColorConvertFloat4ToU32(ImVec4(role[0], role[1], role[2], 1.0f));
+    const std::string sub = usageWindowSubText(w);
 
     // Ring left, two stacked lines right, both centred against the ring. Sizing the row from
     // the taller of the two keeps consecutive windows on an even rhythm whether or not a
@@ -424,6 +463,9 @@ static void drawUsageWindow(const ui::UsageWindow& w, float sc) {
     const float lineGap = 2.0f * sc;
     const float textH   = lineH * 2.0f + lineGap;
     const float rowH    = ImMax(ringBox, textH);
+    const float textMaxW = ImMax(0.0f, cellW - ringBox - 8.0f * sc);
+    const std::string label = ellipsizeToFit(w.label, textMaxW);
+    const std::string subFit = ellipsizeToFit(sub, textMaxW);
 
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -433,10 +475,10 @@ static void drawUsageWindow(const ui::UsageWindow& w, float sc) {
 
     const float textX = p.x + ringBox + 8.0f * sc;
     const float textY = p.y + (rowH - textH) * 0.5f;
-    dl->AddText(ImVec2(textX, textY), roleU, w.label.c_str());
+    dl->AddText(ImVec2(textX, textY), roleU, label.c_str());
     dl->AddText(ImVec2(textX, textY + lineH + lineGap),
-                ui::Palette::toU32(ui::palette.textDim), sub);
-    ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, rowH));
+                ui::Palette::toU32(ui::palette.textDim), subFit.c_str());
+    ImGui::Dummy(ImVec2(cellW, rowH));
 }
 
 static void drawSubscriptionAccounts(AppState& st, float sc) {
@@ -647,9 +689,18 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
             ImGui::Indent(ImGui::GetFrameHeight() + gap);
             ImGui::Dummy(ImVec2(0, 2.0f * sc));
             if (row.hasUsage && !row.usage.empty()) {
+                float cellW = 0.0f;
+                for (const auto& w : row.usage)
+                    cellW = ImMax(cellW, usageWindowNaturalWidth(w, sc));
+                const float availU = ImGui::GetContentRegionAvail().x;
+                cellW = ImMin(cellW, availU);
+                const float cellGap = 16.0f * sc;
+                int cols = (int)((availU + cellGap) / (cellW + cellGap));
+                if (cols < 1) cols = 1;
                 for (size_t wi = 0; wi < row.usage.size(); ++wi) {
                     ImGui::PushID((int)wi);
-                    drawUsageWindow(row.usage[wi], sc);
+                    if (wi % (size_t)cols != 0) ImGui::SameLine(0, cellGap);
+                    drawUsageWindow(row.usage[wi], sc, cellW);
                     ImGui::PopID();
                 }
             } else {
@@ -1206,6 +1257,11 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     const bool detailReady = s_omp.detail.loaded && s_omp.detailFor == prov.id;
     const std::string state = detailReady && !s_omp.detail.state.empty()
                                   ? s_omp.detail.state : prov.state;
+    // Measured once at the top: decides the two-column Sign-in/Usage split below.
+    const float paneW = ImGui::GetContentRegionAvail().x;
+    OmpOAuthFlow& flow = s_omp.oauth;
+    const bool flowHere = flow.active && flow.provider == prov.id;
+    const bool hasUsage = detailReady && !s_omp.detail.usage.empty();
 
     // ---- header: label + state + disable toggle (mapped CAD categories only) ----
     {
@@ -1221,17 +1277,30 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     ImGui::PopStyleColor();
     const float* scol = ompStateColor(state);
     ImGui::SameLine(0, 8.0f * sc);
+    const float stateX = ImGui::GetCursorPosX();   // on-line: valid
+    const float stateW = ImGui::CalcTextSize(ompStateLabel(prov)).x;
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(scol[0], scol[1], scol[2], 1.0f));
     ImGui::TextUnformatted(ompStateLabel(prov));
     ImGui::PopStyleColor();
     // Disable = CAD's provider-category off switch (composer picker hides the models;
     // credentials stay). Only the bridge providers with a CAD category key get the toggle.
+    // Right-aligned so the header line carries it instead of a second mostly-empty row.
     const char* catKey = nullptr;
     if (prov.id == "anthropic") catKey = "anthropic";
     else if (prov.id == "kimi-code") catKey = "kimi-code";
     else if (prov.id == "moonshot") catKey = "moonshot";
     if (catKey) {
-        ImGui::SameLine(0, 16.0f * sc);
+        const float cbW = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x
+                          + ImGui::CalcTextSize("Disable").x;
+        // Cursor has wrapped to the next line start after the state text, so line-start +
+        // avail IS the right edge — but the fit guard must compare against the measured
+        // state-text end (stateX + stateW), not the wrapped cursor.
+        const float rightEdge = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+        const float headerEnd = stateX + stateW;
+        const float rx = rightEdge - cbW;
+        if (rx >= headerEnd + 12.0f * sc) ImGui::SameLine(rx, 0);
+        else if (headerEnd + 16.0f * sc + cbW <= rightEdge) ImGui::SameLine(0, 16.0f * sc);
+        // else: too narrow even inline — the checkbox wraps to its own line.
         bool disabled = st.settings.disabledProviders.count(catKey) != 0;
         if (ImGui::Checkbox("Disable", &disabled)) {
             if (disabled) st.settings.disabledProviders.insert(catKey);
@@ -1243,8 +1312,28 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                               "Credentials are kept — re-enable restores.");
     }
 
+    // Inline "Sign in…" primary button — sits on the status line of whichever state branch
+    // is active instead of eating its own row below it.
+    auto signInSameLine = [&]() {
+        if (!prov.hasOAuth || flow.active) return;
+        ImGui::SameLine(0, 12.0f * sc);
+        if (primaryButton("Sign in\xe2\x80\xa6", ImVec2(140.0f * sc, 0)))
+            beginOmpOAuth(st, prov.id);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Browser OAuth (PKCE loopback or device code, whichever the "
+                              "provider supports). A manual code paste fallback is offered "
+                              "when the browser can't be opened.");
+    };
+
+    // ---- Sign-in + Usage sections: two columns on wide panes, stacked on narrow ones ----
+    const float secGap = 10.0f * sc;
+    const bool twoCol = hasUsage && paneW >= 560.0f * sc;
+    const float colW = twoCol ? (paneW - secGap) * 0.5f : 0.0f;
+    const float secX = ImGui::GetCursorPosX();
+    const float secY = ImGui::GetCursorPosY();
+
     // ---- Sign-in section ----
-    settingsGlassSectionBegin("##omp_signin", "Sign-in");
+    settingsGlassSectionBegin("##omp_signin", "Sign-in", colW);
     if (state == "error") {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusErr));
         ImGui::TextWrapped("%s", (detailReady && !s_omp.detail.error.empty()
@@ -1255,27 +1344,11 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     }
     if (state == "oauth_connected") {
         ompStatusDotText("OAuth connected", pal.statusOk, /*filled=*/true);
-        if (detailReady) {
-            for (const auto& ac : s_omp.detail.accounts) {
-                ImGui::PushID(ac.credentialId);
-                std::string who = !ac.email.empty() ? ac.email
-                                  : (!ac.accountId.empty() ? shortAccountId(ac.accountId)
-                                                           : "(account)");
-                ImGui::Bullet();
-                ImGui::TextUnformatted(who.c_str());
-                if (!ac.orgName.empty()) {
-                    ImGui::SameLine(0, 6.0f * sc);
-                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-                    ImGui::TextUnformatted(ac.orgName.c_str());
-                    ImGui::PopStyleColor();
-                }
-                ImGui::PopID();
-            }
-        }
-        if (prov.hasOAuth && !s_omp.oauth.active) {
+        if (prov.hasOAuth && !flow.active) {
+            ImGui::SameLine(0, 12.0f * sc);
             if (ImGui::SmallButton("Add account")) beginOmpOAuth(st, prov.id);
-            ImGui::SameLine(0, 8.0f * sc);
         }
+        ImGui::SameLine(0, 6.0f * sc);
         if (ImGui::SmallButton("Sign out")) {
             st.rpc.call("agent_provider_logout",
                         nlohmann::json{{"provider", prov.id}},
@@ -1289,11 +1362,36 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                 refreshOmpProvider(st);
             });
         }
+        if (detailReady) {
+            // One line per account: email + org, each ellipsized to the space it actually
+            // has — the old layout let "email  org" run past the card edge and clip mid-word.
+            for (const auto& ac : s_omp.detail.accounts) {
+                ImGui::PushID(ac.credentialId);
+                std::string who = !ac.email.empty() ? ac.email
+                                  : (!ac.accountId.empty() ? shortAccountId(ac.accountId)
+                                                           : "(account)");
+                ImGui::Bullet();
+                if (ac.orgName.empty()) {
+                    ImGui::TextUnformatted(
+                        ellipsizeToFit(who, ImGui::GetContentRegionAvail().x).c_str());
+                } else {
+                    ImGui::TextUnformatted(
+                        ellipsizeToFit(who, ImGui::GetContentRegionAvail().x * 0.52f).c_str());
+                    ImGui::SameLine(0, 6.0f * sc);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                    ImGui::TextUnformatted(
+                        ellipsizeToFit(ac.orgName, ImGui::GetContentRegionAvail().x).c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::PopID();
+            }
+        }
     } else if (state == "key_set") {
         ompStatusDotText(prov.origin == "env" && !prov.envVar.empty()
                              ? (std::string("key set via ") + prov.envVar).c_str()
                              : "API key set",
                          pal.statusOk, /*filled=*/true);
+        ImGui::SameLine(0, 12.0f * sc);
         if (ImGui::SmallButton("Remove key")) {
             st.rpc.call("agent_provider_remove_key",
                         nlohmann::json{{"provider", prov.id}},
@@ -1307,24 +1405,15 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Remove the stored key from the auth bridge. "
                               "Paste a new key below to replace it.");
+        signInSameLine();   // key_set providers that also support OAuth keep the entry point
     } else if (prov.keyless) {
         dimText("No credential needed — this provider serves models without a key.");
+        signInSameLine();
     } else {
         ompStatusDotText("signed out", pal.textDim, /*filled=*/false);
+        signInSameLine();
     }
 
-    // OAuth entry point + in-flight flow.
-    OmpOAuthFlow& flow = s_omp.oauth;
-    const bool flowHere = flow.active && flow.provider == prov.id;
-    if (prov.hasOAuth && state != "oauth_connected" && !flow.active) {
-        if (primaryButton("Sign in\xe2\x80\xa6", ImVec2(140.0f * sc, 0))) {
-            beginOmpOAuth(st, prov.id);
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Browser OAuth (PKCE loopback or device code, whichever the "
-                              "provider supports). A manual code paste fallback is offered "
-                              "when the browser can't be opened.");
-    }
     if (flowHere || (!flow.active && flow.provider == prov.id &&
                      (flow.status == "error" || flow.status == "cancelled"))) {
         ImGui::Dummy(ImVec2(0, 4.0f * sc));
@@ -1471,13 +1560,8 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             });
         }
         if (s_omp.keyBusy) ImGui::EndDisabled();
-        if (!s_omp.keyStatus.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ui::Palette::toU32(s_omp.keyStatusErr ? pal.statusErr : pal.statusOk));
-            ImGui::TextWrapped("%s", s_omp.keyStatus.c_str());
-            ImGui::PopStyleColor();
-        }
         if (!prov.consoleUrl.empty()) {
+            ImGui::SameLine(0, 6.0f * sc);
             if (ImGui::SmallButton("Get a key")) {
 #if defined(_WIN32)
                 std::system(("start \"\" \"" + prov.consoleUrl + "\"").c_str());
@@ -1489,15 +1573,51 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", prov.consoleUrl.c_str());
         }
+        if (!s_omp.keyStatus.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ui::Palette::toU32(s_omp.keyStatusErr ? pal.statusErr : pal.statusOk));
+            ImGui::TextWrapped("%s", s_omp.keyStatus.c_str());
+            ImGui::PopStyleColor();
+        }
     }
     settingsGlassSectionEnd();
 
     // ---- Usage section (OAuth subscription windows + observed-spend notes) ----
-    if (detailReady && !s_omp.detail.usage.empty()) {
+    // Gauges flow side by side in fixed-width cells (one full-width row each before); on wide
+    // panes the whole card sits in the right column next to Sign-in.
+    if (hasUsage) {
+        float yAfterSignin = 0.0f;
+        if (twoCol) {
+            yAfterSignin = ImGui::GetCursorPosY();
+            // The second column must be ONE item that honors the cursor position: a
+            // zero-padding wrapper child. Drawing the section straight after SetCursorPos
+            // only places the header's spacer Dummy — the title and card then wrap back to
+            // the left margin and the two cards overlap.
+            ImGui::SetCursorPos(ImVec2(secX + colW + secGap, secY));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+            ImGui::BeginChild("##omp_usage_col", ImVec2(colW, 0),
+                              ImGuiChildFlags_AutoResizeY);
+            ImGui::PopStyleVar();
+        }
         settingsGlassSectionBegin("##omp_usage", "Usage");
-        for (const auto& w : s_omp.detail.usage) drawUsageWindow(w, sc);
+        float cellW = 0.0f;
+        for (const auto& w : s_omp.detail.usage)
+            cellW = ImMax(cellW, usageWindowNaturalWidth(w, sc));
+        const float availU = ImGui::GetContentRegionAvail().x;
+        cellW = ImMin(cellW, availU);
+        const float cellGap = 16.0f * sc;
+        int usageCols = (int)((availU + cellGap) / (cellW + cellGap));
+        if (usageCols < 1) usageCols = 1;
+        for (size_t i = 0; i < s_omp.detail.usage.size(); ++i) {
+            if (i % (size_t)usageCols != 0) ImGui::SameLine(0, cellGap);
+            drawUsageWindow(s_omp.detail.usage[i], sc, cellW);
+        }
         for (const auto& n : s_omp.detail.usageNotes) dimText(n.c_str());
         settingsGlassSectionEnd();
+        if (twoCol) {
+            ImGui::EndChild();
+            ImGui::SetCursorPosY(ImMax(yAfterSignin, ImGui::GetCursorPosY()));
+        }
     }
 
     // ---- Models section (OMP catalog: capability chips + ctx + $in/$out per Mtok) ----
@@ -1510,6 +1630,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                       count > 0 ? count : prov.modelsAvailable);
         settingsGlassSectionBegin("##omp_models", modelsTitle);
 
+        static char s_modelSearchBuf[64] = "";
         if (count > 0) {
             if (ImGui::SmallButton("Select all")) {
                 for (const auto& m : ui::bridgeModelCatalog())
@@ -1528,9 +1649,8 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Hide every catalog model for this provider from the "
                                   "copilot model picker.");
+            ImGui::SameLine(0, 8.0f * sc);
         }
-
-        static char s_modelSearchBuf[64] = "";
         ImGui::SetNextItemWidth(-1);
         ImGui::InputTextWithHint("##model_search", "Search models...", s_modelSearchBuf,
                                  sizeof(s_modelSearchBuf));
@@ -1541,8 +1661,23 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                         ? "Catalog loading \xe2\x80\x94 or no bundled models for this provider."
                         : "Catalog unavailable.");
         }
+        // Wide panes lay the checkbox rows out in two columns — a 26-model catalog stops
+        // being one long single-file list. Column flow is index-based: a float fit-test on
+        // GetItemRectMax() sits exactly on the cell boundary and never fires.
+        const float listAvailW = ImGui::GetContentRegionAvail().x;
+        const float modelGap = 20.0f * sc;
+        const int modelCols = (count > 8 && listAvailW >= 640.0f * sc) ? 2 : 1;
+        const float modelCellW =
+            (listAvailW - modelGap * (float)(modelCols - 1)) / (float)modelCols;
+
         // Same checkbox+name+sublabel row for both the active list and the deprecated group.
+        // The NAME is the primary content: it claims up to half the cell first; the sublabel
+        // right-aligns into what's left. Both ellipsize instead of clipping.
+        // NOTE: ImGui items wrap the cursor to the next line start, so every horizontal
+        // position here is derived from x0 + CalcTextSize — never GetCursorPosX() after an
+        // item (that reads the NEXT line's start, which silently corrupts cell math).
         auto drawModelRow = [&](const ui::BridgeModelMeta& m) {
+            const float x0 = ImGui::GetCursorPosX();
             bool hidden = st.settings.hiddenModels.count(m.id) != 0;
             bool shown = !hidden;
             if (ImGui::Checkbox("##show", &shown)) {
@@ -1553,20 +1688,38 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Show/hide in the copilot model picker.");
             ImGui::SameLine(0, 6.0f * sc);
-            ImGui::TextUnformatted(m.name.c_str());
+            const float nameX = ImGui::GetCursorPosX();   // on-line: valid
+            const std::string nm =
+                ellipsizeToFit(m.name, (x0 + modelCellW - nameX) * 0.5f);
+            ImGui::TextUnformatted(nm.c_str());
+            const float nameEnd = nameX + ImGui::CalcTextSize(nm.c_str()).x;
             const std::string sub = ui::bridgeModelSublabel(m);
             if (!sub.empty()) {
-                const float sw = ImGui::CalcTextSize(sub.c_str()).x;
-                const float rx = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x
-                                 - sw;
-                ImGui::SameLine(rx > ImGui::GetCursorPosX() ? rx : 0, 6.0f * sc);
-                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-                ImGui::TextUnformatted(sub.c_str());
-                ImGui::PopStyleColor();
+                const std::string subFit =
+                    ellipsizeToFit(sub, x0 + modelCellW - nameEnd - 8.0f * sc);
+                if (!subFit.empty()) {
+                    const float subW = ImGui::CalcTextSize(subFit.c_str()).x;
+                    const float rx = x0 + modelCellW - subW;
+                    if (rx > nameEnd + 4.0f * sc) ImGui::SameLine(rx, 0);
+                    else ImGui::SameLine(0, 6.0f * sc);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                    ImGui::TextUnformatted(subFit.c_str());
+                    ImGui::PopStyleColor();
+                    const std::string detail = ui::bridgeModelCostDetail(m);
+                    if (!detail.empty() && ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", detail.c_str());
+                }
             }
-            const std::string detail = ui::bridgeModelCostDetail(m);
-            if (!detail.empty() && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", detail.c_str());
+            // Anchor the line's extent at the cell boundary so the index-based SameLine in
+            // flowModelCell starts the next cell exactly at x0 + cellW + gap even when this
+            // row's content ended early (no sublabel / short name).
+            ImGui::SameLine(x0 + modelCellW, 0);
+            ImGui::Dummy(ImVec2(0.0f, 1.0f));
+        };
+        int modelCellIdx = 0;
+        auto flowModelCell = [&]() {
+            if (modelCellIdx % modelCols != 0) ImGui::SameLine(0, modelGap);
+            ++modelCellIdx;
         };
 
         // Catalog is already provider-sorted newest-first; render active models inline and
@@ -1579,6 +1732,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             ++matchCount;
             if (m.deprecated) { deprecatedMatches.push_back(&m); continue; }
             ImGui::PushID(m.id.c_str());
+            flowModelCell();
             drawModelRow(m);
             ImGui::PopID();
         }
@@ -1587,8 +1741,10 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             std::snprintf(depTitle, sizeof(depTitle), "Older / deprecated (%d)",
                           (int)deprecatedMatches.size());
             if (ImGui::CollapsingHeader(depTitle)) {
+                modelCellIdx = 0;
                 for (const auto* mp : deprecatedMatches) {
                     ImGui::PushID(mp->id.c_str());
+                    flowModelCell();
                     drawModelRow(*mp);
                     ImGui::PopID();
                 }
@@ -1629,20 +1785,42 @@ static void drawOmpProviderManager(AppState& st) {
     const bool narrow = availW < 640.0f * sc;
 
     static char s_provSearchBuf[64] = "";
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("##prov_search", "Search providers...", s_provSearchBuf,
-                             sizeof(s_provSearchBuf));
-    bool logosOn = ui::providerLogosEnabled();
-    if (ImGui::Checkbox("Show provider logos", &logosOn))
-        ui::setProviderLogosEnabled(logosOn);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Fetch each provider's real brand icon (cached locally in appdata).\n"
-                          "Off = colored letter badges, no network.");
+    {
+        // Search + logos toggle share one row — they used to be two full-width rows.
+        const float logosW = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x
+                             + ImGui::CalcTextSize("Show provider logos").x;
+        ImGui::SetNextItemWidth(ImMax(140.0f * sc, availW - logosW - 8.0f * sc));
+        ImGui::InputTextWithHint("##prov_search", "Search providers...", s_provSearchBuf,
+                                 sizeof(s_provSearchBuf));
+        ImGui::SameLine(0, 8.0f * sc);
+        bool logosOn = ui::providerLogosEnabled();
+        if (ImGui::Checkbox("Show provider logos", &logosOn))
+            ui::setProviderLogosEnabled(logosOn);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Fetch each provider's real brand icon (cached locally in appdata).\n"
+                              "Off = colored letter badges, no network.");
+    }
     const std::string provNeedle = toLowerAscii(s_provSearchBuf);
     std::vector<const OmpProviderRow*> filteredRows;
     filteredRows.reserve(s_omp.rows.size());
     for (const auto& r : s_omp.rows)
         if (provMatches(r, provNeedle)) filteredRows.push_back(&r);
+
+    // List pane width follows the widest visible label/status line (badge + gutters match the
+    // row painter below), clamped so it neither truncates nor hogs the detail pane.
+    float listW = 220.0f * sc;
+    if (!narrow) {
+        const float fh = ImGui::GetFontSize();
+        float textW = 0.0f;
+        for (const auto* rp : filteredRows) {
+            const OmpProviderRow& r = *rp;
+            const float statusW = fh * 0.56f + 5.0f * sc
+                                  + ImGui::CalcTextSize(ompStateLabel(r)).x;
+            textW = ImMax(textW, ImMax(ImGui::CalcTextSize(r.label.c_str()).x, statusW));
+        }
+        const float need = 6.0f * sc + fh * 1.4f + 8.0f * sc + textW + 12.0f * sc;
+        listW = ImMin(ImMax(need, 180.0f * sc), ImMin(320.0f * sc, availW * 0.45f));
+    }
 
     if (narrow) {
         // Collapsed: provider pick as a combo, detail below.
@@ -1680,7 +1858,7 @@ static void drawOmpProviderManager(AppState& st) {
         // left and 0/0 on the right, which made the two panes read as different widgets.
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                             ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
-        ImGui::BeginChild("##omp_prov_list", ImVec2(220.0f * sc, paneH),
+        ImGui::BeginChild("##omp_prov_list", ImVec2(listW, paneH),
                           ImGuiChildFlags_Borders);
         for (const auto* rp : filteredRows) {
             const OmpProviderRow& r = *rp;
@@ -1703,8 +1881,10 @@ static void drawOmpProviderManager(AppState& st) {
             const float textTop = mn.y + (rowH - (fh * 2.0f + 2.0f * sc)) * 0.5f;
             ui::drawProviderLogo(dl, ImVec2(badgeX, badgeY), badgeSide, r.id);
             const float textX = badgeX + badgeSide + badgeGap;
+            const float textMaxW = ImGui::GetItemRectMax().x - textX - 4.0f * sc;
+            const std::string labelFit = ellipsizeToFit(r.label, textMaxW);
             dl->AddText(ImVec2(textX, textTop),
-                        ui::Palette::toU32(sel ? pal.text : pal.textDim), r.label.c_str());
+                        ui::Palette::toU32(sel ? pal.text : pal.textDim), labelFit.c_str());
             const float* c = ompStateColor(r.state);
             const bool bullet = (r.state == "oauth_connected" || r.state == "key_set");
             char statusLine[160];
@@ -5035,8 +5215,12 @@ void drawSettingsModal(AppState& st, bool busy) {
     const float margin = 28.0f * sc;
     const float maxW = std::max(360.0f * sc, vp->WorkSize.x - margin * 2.0f);
     const float maxH = std::max(420.0f * sc, vp->WorkSize.y - margin * 2.0f);
-    const float winW = std::min(920.0f * sc, maxW);
-    const float winH = std::min(820.0f * sc, maxH);
+    // Scale with the display instead of a flat 920x820: small screens keep the legacy size,
+    // big ones get a wider modal — the Providers tab's two-column layouts only have room to
+    // engage when the detail pane clears ~640*sc, which 920px never gives it.
+    const float winW = std::min(std::max(920.0f * sc, vp->WorkSize.x * 0.60f),
+                                std::min(1280.0f * sc, maxW));
+    const float winH = std::min(std::max(820.0f * sc, vp->WorkSize.y * 0.86f), maxH);
     if (s_settingsOpen) {
         ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Appearing);
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));

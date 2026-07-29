@@ -1546,21 +1546,29 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             parent_id=_turn_span, actor=actor)
         _ae.emit_event(_kind, _payload, live=on_event, journal=_ev_journal)
 
-    system = (system_prompt or "") + "\n\n" + _SYSTEM_BASE
+    # ---- system prompt assembly -------------------------------------------
+    # The static block ORDER is defined in exactly one place —
+    # services/agent/prompt_cache.static_segments — so the precomposed prompt
+    # the GUI context meter reports and the bytes this turn actually sends
+    # cannot drift apart. (They used to: prompt_preview mirrored this sequence
+    # by hand and injected a SAMPLE ledger/stage no real turn ever sends, so
+    # every number it reported was wrong.) Only project-memory recall depends
+    # on the request, so it is built here and spliced at its named slot.
+    import os as _os  # noqa: PLC0415
 
-    # Role catalog + harness (main turns only).
-    try:
-        if not subagent_id and _first_catalog_turn:
-            from services.agent.role_catalog import (  # noqa: PLC0415
-                format_role_catalog_block,
-                harness_context_block,
-            )
-            system = system.rstrip() + "\n\n" + harness_context_block()
-            system = system.rstrip() + "\n\n" + format_role_catalog_block()
-    except Exception:  # noqa: BLE001
-        pass
+    _pc_root = _os.environ.get("CHUDWARE_PROJECT_DIR") or None
+    if not _pc_root and isinstance(options, dict):
+        _pc_root = (options.get("project_dir") or options.get("project_path")
+                    or options.get("workspace_dir"))
+    if not _pc_root:
+        try:
+            from services.agent.config import workspace_dir as _ws_dir  # noqa: PLC0415
+            _pc_root = _ws_dir()
+        except Exception:  # noqa: BLE001
+            _pc_root = None
 
     # Project-scoped SQLite memory (token-budgeted recall). Auto-created under .plm/.
+    _mem_blk = ""
     try:
         from services.agent.config import (  # noqa: PLC0415
             get_memory_token_budget,
@@ -1587,7 +1595,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 )
                 _blk = _pm.format_for_context(_hits)
                 if _blk:
-                    system = system.rstrip() + "\n\n" + _blk
+                    _mem_blk = _blk
                     if on_event is not None:
                         try:
                             on_event("agent.context_injected", {
@@ -1601,42 +1609,30 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     except Exception:  # noqa: BLE001 — memory never breaks a turn
         pass
 
-    # Project-folder awareness: list the user's existing CAD files so the
-    # model opens them instead of re-creating duplicates (2026-07-27).
-    # Injected once per turn, only when a root is known and the block is
-    # non-empty. Best-effort: never breaks a turn.
+    # The skills block is NOT taken from the shared segment list: its catalog is
+    # interleaved with request-dependent skill ACTIVATION further down, and its
+    # gate differs (catalog-due only, not `not subagent_id`).
     try:
-        from services.agent.project_context import project_context_block  # noqa: PLC0415
-        import os as _os  # noqa: PLC0415
-        _pc_root = _os.environ.get("CHUDWARE_PROJECT_DIR") or None
-        if not _pc_root and isinstance(options, dict):
-            _pc_root = (options.get("project_dir") or options.get("project_path")
-                        or options.get("workspace_dir"))
-        if not _pc_root:
-            try:
-                from services.agent.config import workspace_dir as _ws_dir  # noqa: PLC0415
-                _pc_root = _ws_dir()
-            except Exception:  # noqa: BLE001
-                _pc_root = None
-        _pc_blk = project_context_block(_pc_root)
-        if _pc_blk:
-            system = system.rstrip() + "\n\n" + _pc_blk
-    except Exception:  # noqa: BLE001
-        pass
-
-    # OMP Auto-Learn standing guidance (Settings → AI → Harness). Best-effort.
-    try:
-        from services.agent.autolearn import standing_guidance  # noqa: PLC0415
-        _al = standing_guidance()
-        if _al:
-            system = system.rstrip() + "\n\n" + _al
-    except Exception:  # noqa: BLE001
-        pass
-
-    if tools_text:
-        system += "\n\n" + tools_text
-    elif allow:
-        system += "\nAllowed tools: " + ", ".join(sorted(allow))
+        from services.agent import prompt_cache as _pcache  # noqa: PLC0415
+        _segs, _ = _pcache.static_segments(
+            role=name or "general_agent",
+            capability=capability,
+            project_root=_pc_root,
+            role_system=(system_prompt or ""),
+            tools_text=tools_text or "",
+            allowed=sorted(allow),
+            include_catalog=bool(not subagent_id and _first_catalog_turn),
+            include_skills=False,
+        )
+        system = _pcache.render_segments(_segs, memory_block=_mem_blk)
+    except Exception:  # noqa: BLE001 — never lose a turn to prompt assembly
+        system = (system_prompt or "") + "\n\n" + _SYSTEM_BASE
+        if _mem_blk:
+            system = system.rstrip() + "\n\n" + _mem_blk
+        if tools_text:
+            system += "\n\n" + tools_text
+        elif allow:
+            system += "\nAllowed tools: " + ", ".join(sorted(allow))
 
     # Conversation history (GUI session transcript): sanitize + cap, then seed
     # BEFORE the current user request. Validated here too — worker_rpc applies

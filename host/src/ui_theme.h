@@ -496,6 +496,20 @@ void drawWindowPillScrollbarV(const AdaptiveSurface& surf,
 void drawFractionRing(ImDrawList* dl, const ImVec2& center, float radius, float thickness,
                       float frac, ImU32 trackCol, ImU32 arcCol);
 
+// One consecutive arc per span, laid clockwise from 12 o'clock over a single shared track.
+// Same shape and thickness as drawFractionRing, so a stacked gauge and a plain one read as the
+// same control; the point is that two DIFFERENT kinds of number (e.g. the fixed system-prompt
+// baseline vs the conversation that grew on top of it) stay visually distinguishable instead of
+// being summed into one indistinct arc. Fractions are of the WHOLE circle and are drawn in the
+// order given; the total is clamped so an over-budget sum cannot wrap past 12 o'clock and read as
+// nearly empty. PURE draw — no layout, no interaction, no ImGui item.
+struct RingSpan {
+    float frac = 0.0f;
+    ImU32 col  = 0;
+};
+void drawStackedFractionRing(ImDrawList* dl, const ImVec2& center, float radius, float thickness,
+                             const RingSpan* spans, int count, ImU32 trackCol);
+
 // Inline "working" indicator: the brand mark turning in a text-line-sized box, then `label` on the
 // same baseline. Replaces the ASCII dot / braille / |-\ cycles that used to be spliced into the
 // label string itself — those could not be styled, could not be measured apart from the text, and

@@ -1687,11 +1687,91 @@ def _ai_tool_catalog(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _ai_prompt_baseline(params: dict, _emit: Callable) -> dict:
+    """What a FRESH chat costs before the user types anything.
+
+    Backs the copilot context meter: with no provider call yet, the meter had no
+    honest source and rendered an em-dash over the window. This returns the
+    token estimate of the system prompt a real turn actually sends (the
+    ``prompt_cache`` composition, which ``run_turn`` itself renders — not the
+    ``ai_prompt_preview`` mirror, which injects a SAMPLE ledger/stage no live
+    turn sends and therefore never reported the real number), plus the
+    per-segment breakdown the meter tooltip renders so the user can see WHAT is
+    filling the window rather than only how much.
+
+    ``project_dir`` scopes the answer, because the composed prompt contains a
+    listing of that folder's CAD files.
+    """
+    try:
+        from services.agent.prompt_cache import baseline  # noqa: PLC0415
+        root = str((params or {}).get("project_dir")
+                   or (params or {}).get("project_root") or "") or None
+        role = str((params or {}).get("role") or "general_agent")
+        return baseline(project_root=root, role=role)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "tokens": 0, "chars": 0, "segments": [],
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _ai_prompt_warm(params: dict, _emit: Callable) -> dict:
+    """Compose the system prompt ahead of the user's first message.
+
+    Called at worker start and when the GUI opens a new session. Composition
+    costs ~1.9 s in a cold process (dominated by importing the tool registry),
+    and that cost used to land on the user's first request.
+    """
+    try:
+        from services.agent.prompt_cache import warm  # noqa: PLC0415
+        root = str((params or {}).get("project_dir")
+                   or (params or {}).get("project_root") or "") or None
+        blocking = bool((params or {}).get("blocking"))
+        warm(project_root=root, background=not blocking)
+        return {"ok": True, "blocking": blocking}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 PREVIEW_METHODS: dict[str, Callable] = {
     "ai_tool_preview": _ai_tool_preview,
     "ai_prompt_preview": _ai_prompt_preview,
     "ai_tool_catalog": _ai_tool_catalog,
+    "ai_prompt_baseline": _ai_prompt_baseline,
+    "ai_prompt_warm": _ai_prompt_warm,
 }
+
+
+#: RPCs that change an input to the composed system prompt. Wrapped ONCE below
+#: rather than each calling ``prompt_cache.invalidate()`` itself, so the set is
+#: auditable in one place and a new writer cannot silently forget.
+#:
+#: This is the FAST path only. The C++ GUI writes config.json directly, without
+#: any RPC, so it can never be covered here — which is why
+#: ``prompt_cache.fingerprint()`` (a stat signature over config.json, the role
+#: cards, the packs, the skills trees and the composing source) is the actual
+#: correctness backstop. This wrap merely makes a change visible immediately
+#: instead of up to the fingerprint's revalidation window later.
+PROMPT_INVALIDATING_METHODS: frozenset[str] = frozenset({
+    "skills_save", "skills_delete",
+    "triggers_save", "triggers_delete",
+    "ai_roles_set",
+})
+
+
+def _with_prompt_invalidation(name: str, fn: Callable) -> Callable:
+    """Wrap *fn* so a successful write drops the precomposed prompt."""
+
+    def _wrapped(params: dict, emit: Callable) -> dict:
+        out = fn(params, emit)
+        try:
+            from services.agent.prompt_cache import invalidate  # noqa: PLC0415
+            invalidate()
+        except Exception:  # noqa: BLE001 — invalidation never fails a write
+            pass
+        return out
+
+    _wrapped.__name__ = getattr(fn, "__name__", name)
+    _wrapped.__doc__ = getattr(fn, "__doc__", None)
+    return _wrapped
 
 
 # Merged registration table (engine_oracle/worker.py does ``_METHODS.update``).
@@ -1705,3 +1785,11 @@ WORKER_METHODS.update(BENCH_METHODS)
 WORKER_METHODS.update(OFFICE_METHODS)
 WORKER_METHODS.update(ADMIN_METHODS)
 WORKER_METHODS.update(PREVIEW_METHODS)
+
+# Apply the prompt-cache invalidation wrap. Done after the merge so it covers a
+# method regardless of which sub-table contributed it, and asserted non-empty so
+# a rename cannot silently turn the fast path off.
+for _name in PROMPT_INVALIDATING_METHODS:
+    _fn = WORKER_METHODS.get(_name)
+    if _fn is not None:
+        WORKER_METHODS[_name] = _with_prompt_invalidation(_name, _fn)

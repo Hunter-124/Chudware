@@ -2147,6 +2147,68 @@ static int contextMeterWindow(const AppState& st) {
     return st.lastContextWindow > 0 ? st.lastContextWindow : 0;
 }
 
+// ---- precomposed system-prompt baseline ------------------------------------------------------
+// A fresh session has no provider measurement AND an empty transcript, so the meter used to show
+// "\xe2\x80\x94/1.0M" and answer nothing — while the first request in fact already carries a
+// multi-thousand-token system prompt (role card, harness protocol, role catalog, project files,
+// standing guidance, tool schemas, skills catalog). services/agent/prompt_cache precomposes those
+// bytes and reports their token cost per BLOCK; `ai_prompt_baseline` returns it.
+//
+// Fetched through the async rpc queue, never synchronously: this is reached from a per-frame draw
+// path, and a synchronous worker.call there re-hits a failing worker every frame from the GL
+// thread (that pattern hard-froze the app once — see cam_panel.cpp refreshDialects). Guards: an
+// in-flight flag, a failure cooldown, and a staleness timer so a settings change that recomposes
+// the prompt is picked up without polling.
+struct PromptBaselineSeg {
+    std::string title;
+    int         tokens = 0;
+};
+struct PromptBaselineState {
+    bool                          loaded   = false;
+    bool                          inflight = false;
+    double                        nextTry  = 0.0;
+    double                        staleAt  = 0.0;
+    int                           tokens   = 0;
+    int                           toolCount = 0;
+    std::vector<PromptBaselineSeg> segments;
+};
+static PromptBaselineState g_promptBaseline;
+
+static constexpr double kPromptBaselineTtlS   = 60.0;
+static constexpr double kPromptBaselineRetryS = 15.0;
+
+static void refreshPromptBaseline(AppState& st) {
+    const double now = ImGui::GetTime();
+    if (g_promptBaseline.inflight) return;
+    if (g_promptBaseline.loaded && now < g_promptBaseline.staleAt) return;
+    if (now < g_promptBaseline.nextTry) return;
+    g_promptBaseline.inflight = true;
+    st.rpc.call("ai_prompt_baseline", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        g_promptBaseline.inflight = false;
+        const double t = ImGui::GetTime();
+        if (!r.ok || !r.result.value("ok", false)) {
+            g_promptBaseline.nextTry = t + kPromptBaselineRetryS;
+            return;
+        }
+        g_promptBaseline.tokens    = r.result.value("tokens", 0);
+        g_promptBaseline.toolCount = r.result.value("allowed_tool_count", 0);
+        g_promptBaseline.segments.clear();
+        if (r.result.contains("segments") && r.result["segments"].is_array()) {
+            for (const auto& s : r.result["segments"]) {
+                PromptBaselineSeg seg;
+                seg.title  = s.value("title", std::string());
+                seg.tokens = s.value("tokens", 0);
+                if (seg.tokens > 0 && !seg.title.empty())
+                    g_promptBaseline.segments.push_back(std::move(seg));
+            }
+        }
+        g_promptBaseline.loaded  = g_promptBaseline.tokens > 0;
+        g_promptBaseline.staleAt = t + kPromptBaselineTtlS;
+        if (!g_promptBaseline.loaded) g_promptBaseline.nextTry = t + kPromptBaselineRetryS;
+    });
+}
+
 // Model-visible payload carried by one message's activity timeline, in characters.
 //
 // INCLUDED: `detail` (the model's own raw output/reasoning for the step, and the tool
@@ -2211,15 +2273,25 @@ static const ui::ContextEstimate& viewedTranscriptEstimate(const AppState& st) {
 // transcript estimate exists precisely for the case there has been no call this process (a
 // session restored from disk), which is the state that used to render a bare em dash.
 struct CtxMeterUsage {
-    int  tokens   = 0;      // 0 = nothing to show
+    int  tokens   = 0;      // 0 = nothing to show; TOTAL (baseline + conversation)
     bool estimate = false;  // true = derived from the transcript, MUST be marked on screen
     int  messages = 0;      // estimate only: how many messages it counted
     bool clipped  = false;  // estimate only: a per-message cap bit, so `tokens` is a lower bound
+    int  baseline = 0;      // the system-prompt portion of `tokens`, 0 when not known yet
 };
 static CtxMeterUsage contextMeterUsage(const AppState& st) {
-    if (st.lastContextTokens > 0) return {st.lastContextTokens, false, 0, false};
+    // A MEASURED prompt_tokens figure ALREADY CONTAINS the system prompt, so the baseline must be
+    // shown as a portion OF it, never added to it — adding would double-count the largest single
+    // block and overstate the window every turn.
+    const int base = g_promptBaseline.loaded ? g_promptBaseline.tokens : 0;
+    if (st.lastContextTokens > 0)
+        return {st.lastContextTokens, false, 0, false,
+                std::min(base, st.lastContextTokens)};
+    // Nothing measured: the system prompt is still genuinely spent on the next call, so it is
+    // added to the transcript estimate. This is what replaces the em dash on a fresh session.
     const ui::ContextEstimate& e = viewedTranscriptEstimate(st);
-    return {e.tokens, e.tokens > 0, e.messages, e.truncated};
+    const int total = e.tokens + base;
+    return {total, total > 0, e.messages, e.truncated, base};
 }
 
 // The meter's readout string + whether a ring is meaningful, shared by drawContextMeter() and
@@ -2251,12 +2323,20 @@ static CtxMeterText contextMeterText(const AppState& st) {
 // Drawn at the current cursor; advances it.
 // Moved here from the footer chips, where it was pinned to the pane bottom against the status bar.
 static void drawContextMeter(AppState& st, float roomForMeter) {
+    refreshPromptBaseline(st);   // async, guarded; never a synchronous call on a draw path
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     const int   win  = contextMeterWindow(st);
     const CtxMeterUsage usage = contextMeterUsage(st);
     const int   used = usage.tokens;   // measured OR estimated; the ring follows what is SHOWN
     const float frac = (win > 0 && used > 0) ? std::min(1.0f, (float)used / (float)win) : 0.0f;
+    // The system-prompt baseline is a DIFFERENT kind of number from the conversation on top of it:
+    // it is fixed, it is spent before the user types anything, and it is not something continuing
+    // the chat grows. Drawing it as its own dimmed arc keeps "what I cannot avoid" visually apart
+    // from "what this conversation has cost", instead of summing both into one indistinct sweep.
+    const float baseFrac = (win > 0 && usage.baseline > 0)
+                               ? std::min(frac, (float)usage.baseline / (float)win)
+                               : 0.0f;
     const float gap = ui::metrics::px(5), ringAdv = gaugeRingAdvance();
     const CtxMeterText txt = contextMeterText(st);
     const std::string& full = txt.full;
@@ -2275,11 +2355,17 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
         const float* role = frac < 0.5f  ? pal.statusOk
                           : frac < 0.85f ? pal.statusWarn
                                          : pal.statusErr;
-        ui::drawFractionRing(ImGui::GetWindowDrawList(),
-                             ImVec2(p.x + ringAdv * 0.5f, p.y + fh * 0.5f),
-                             gaugeRingRadius(), gaugeRingThickness(), frac,
-                             gaugeTrackColor(surf),
-                             ImGui::ColorConvertFloat4ToU32(semanticOnGlass(role, surf)));
+        const ImU32 convCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(role, surf));
+        ImVec4 baseC = ImGui::ColorConvertU32ToFloat4(convCol);
+        baseC.w *= 0.42f;    // same hue, clearly recessive: one gauge, two readable layers
+        const ui::RingSpan spans[2] = {
+            {baseFrac, ImGui::ColorConvertFloat4ToU32(baseC)},
+            {std::max(0.0f, frac - baseFrac), convCol},
+        };
+        ui::drawStackedFractionRing(ImGui::GetWindowDrawList(),
+                                    ImVec2(p.x + ringAdv * 0.5f, p.y + fh * 0.5f),
+                                    gaugeRingRadius(), gaugeRingThickness(),
+                                    spans, 2, gaugeTrackColor(surf));
         ImGui::Dummy(ImVec2(ringAdv, fh));
         ImGui::SameLine(0, gap);
     }
@@ -2354,11 +2440,106 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
                 tip += cost;
             }
         }
-        if (usage.estimate)
-            tip += "The estimate counts only this transcript \xe2\x80\x94 it excludes the system "
-                   "prompt and tool schemas, so the real prompt will be larger.\n";
+        // The old wording had to admit the estimate "excludes the system prompt and tool
+        // schemas, so the real prompt will be larger". It no longer does: the precomposed
+        // baseline is IN the number, and the breakdown below itemises it.
+        if (usage.estimate && usage.baseline <= 0)
+            tip += "The estimate counts only this transcript \xe2\x80\x94 the system prompt is "
+                   "not loaded yet, so the real prompt will be larger.\n";
+        else if (usage.estimate)
+            tip += "No call measured yet, so this is the precomposed system prompt plus an "
+                   "estimate of the transcript on screen.\n";
         tip += "Set the window in AI settings if your local model differs.";
-        ImGui::SetTooltip("%s", tip.c_str());
+
+        // Graphical breakdown: a stacked bar of the window plus one row per block, so the
+        // question "what is filling my context?" is answered by SHAPE, not by reading a
+        // paragraph. Drawn with an explicit Begin/EndTooltip because SetTooltip is text-only.
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ui::metrics::px(420));
+        ImGui::TextUnformatted(tip.c_str());
+        ImGui::PopTextWrapPos();
+        if (win > 0 && used > 0) {
+            const float barW = ui::metrics::px(400), barH = ui::metrics::px(9);
+            const float* role = frac < 0.5f  ? pal.statusOk
+                              : frac < 0.85f ? pal.statusWarn
+                                             : pal.statusErr;
+            const ImU32 convCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(role, surf));
+            ImVec4 dim = ImGui::ColorConvertU32ToFloat4(convCol);
+            dim.w *= 0.42f;
+            const ImU32 baseCol = ImGui::ColorConvertFloat4ToU32(dim);
+            ImGui::Spacing();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 o = ImGui::GetCursorScreenPos();
+            const float r = barH * 0.5f;
+            dl->AddRectFilled(o, ImVec2(o.x + barW, o.y + barH),
+                              gaugeTrackColor(surf), r);
+            const float bw = barW * baseFrac;
+            const float cw = barW * std::max(0.0f, frac - baseFrac);
+            if (bw > 0.5f)
+                dl->AddRectFilled(o, ImVec2(o.x + bw, o.y + barH), baseCol, r);
+            if (cw > 0.5f)
+                dl->AddRectFilled(ImVec2(o.x + bw, o.y), ImVec2(o.x + bw + cw, o.y + barH),
+                                  convCol, r);
+            ImGui::Dummy(ImVec2(barW, barH));
+            ImGui::Spacing();
+
+            // Legend: the two layers the ring shows, named and quantified.
+            auto swatch = [&](ImU32 col) {
+                const ImVec2 s = ImGui::GetCursorScreenPos();
+                const float k = ImGui::GetTextLineHeight() * 0.62f;
+                ImGui::GetWindowDrawList()->AddRectFilled(
+                    ImVec2(s.x, s.y + (ImGui::GetTextLineHeight() - k) * 0.5f),
+                    ImVec2(s.x + k, s.y + (ImGui::GetTextLineHeight() + k) * 0.5f),
+                    col, k * 0.3f);
+                ImGui::Dummy(ImVec2(k + ui::metrics::px(6), ImGui::GetTextLineHeight()));
+                ImGui::SameLine(0, 0);
+            };
+            if (usage.baseline > 0) {
+                swatch(baseCol);
+                ImGui::Text("System prompt  %s", fmtTokens(usage.baseline).c_str());
+                swatch(convCol);
+                ImGui::Text("Conversation   %s",
+                            fmtTokens(std::max(0, used - usage.baseline)).c_str());
+                ImGui::Spacing();
+                // Per-block itemisation of the system prompt, largest first (the worker already
+                // sorts it). Tool schemas normally dominate, which is the actionable fact:
+                // trimming tool families is the lever that shrinks a fresh chat.
+                if (!g_promptBaseline.segments.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                    ImGui::TextUnformatted("System prompt blocks:");
+                    ImGui::PopStyleColor();
+                    const int top = (int)g_promptBaseline.segments.size();
+                    for (int i = 0; i < top; ++i) {
+                        const PromptBaselineSeg& sg = g_promptBaseline.segments[i];
+                        const float sf = usage.baseline > 0
+                                             ? (float)sg.tokens / (float)usage.baseline : 0.0f;
+                        const ImVec2 c = ImGui::GetCursorScreenPos();
+                        const float mw = ui::metrics::px(120), mh = ui::metrics::px(6);
+                        const float my = c.y + (ImGui::GetTextLineHeight() - mh) * 0.5f;
+                        ImGui::GetWindowDrawList()->AddRectFilled(
+                            ImVec2(c.x, my), ImVec2(c.x + mw, my + mh),
+                            gaugeTrackColor(surf), mh * 0.5f);
+                        if (sf > 0.0f)
+                            ImGui::GetWindowDrawList()->AddRectFilled(
+                                ImVec2(c.x, my),
+                                ImVec2(c.x + mw * std::min(1.0f, sf), my + mh),
+                                baseCol, mh * 0.5f);
+                        ImGui::Dummy(ImVec2(mw + ui::metrics::px(8),
+                                            ImGui::GetTextLineHeight()));
+                        ImGui::SameLine(0, 0);
+                        ImGui::Text("%-18s %6s", sg.title.c_str(),
+                                    fmtTokens(sg.tokens).c_str());
+                    }
+                    if (g_promptBaseline.toolCount > 0) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                        ImGui::Text("%d tools advertised \xe2\x80\x94 trim families in AI "
+                                    "settings to shrink this.", g_promptBaseline.toolCount);
+                        ImGui::PopStyleColor();
+                    }
+                }
+            }
+        }
+        ImGui::EndTooltip();
     }
 }
 

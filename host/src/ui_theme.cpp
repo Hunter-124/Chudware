@@ -1254,4 +1254,29 @@ void drawFractionRing(ImDrawList* dl, const ImVec2& center, float radius, float 
     dl->PathStroke(arcCol, ImDrawFlags_None, t);
 }
 
+void drawStackedFractionRing(ImDrawList* dl, const ImVec2& center, float radius, float thickness,
+                             const RingSpan* spans, int count, ImU32 trackCol) {
+    if (!dl || radius <= 0.0f) return;
+    const float t = thickness < 1.0f ? 1.0f : thickness;
+    const int segs = (int)std::clamp(radius * 2.4f, 16.0f, 64.0f);
+    dl->PathArcTo(center, radius, 0.0f, IM_PI * 2.0f, segs);
+    dl->PathStroke(trackCol, ImDrawFlags_None, t);
+    if (!spans || count <= 0) return;
+    // Clamp the TOTAL, not each span: an over-budget sum must saturate the ring rather than wrap
+    // past 12 o'clock, which would draw a nearly-empty gauge for a nearly-full window.
+    float used = 0.0f;
+    const float a0 = -IM_PI * 0.5f;   // 12 o'clock in ImGui's y-down screen space
+    for (int i = 0; i < count; ++i) {
+        float f = spans[i].frac;
+        if (f <= 0.0f) continue;
+        if (used >= 1.0f) break;
+        if (used + f > 1.0f) f = 1.0f - used;
+        const float from = a0 + IM_PI * 2.0f * used;
+        const float to   = from + IM_PI * 2.0f * f;
+        dl->PathArcTo(center, radius, from, to, std::max(3, (int)(segs * f) + 2));
+        dl->PathStroke(spans[i].col, ImDrawFlags_None, t);
+        used += f;
+    }
+}
+
 }  // namespace ui

@@ -158,8 +158,25 @@ def _emit(obj: dict) -> None:
     sys.stdout.flush()
 
 
+def _warm_prompt_cache() -> None:
+    """Pre-compose the system prompt on a background thread at worker start.
+
+    Composition costs ~1.9 s in a cold process (dominated by importing the tool
+    registry to render every allowed tool's schema), and that cost used to land
+    on the user's FIRST message in a new session. Doing it here moves it onto
+    worker startup, where nobody is waiting. Best-effort by construction: a
+    failure here must never stop the worker from serving.
+    """
+    try:
+        from services.agent.prompt_cache import warm  # noqa: PLC0415
+        warm(background=True)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("prompt cache warm skipped: %s", exc)
+
+
 def serve() -> None:
     log.info("worker ready (runtime=%s)", paths.RUNTIME)
+    _warm_prompt_cache()
     for line in sys.stdin:
         line = line.strip()
         if not line:

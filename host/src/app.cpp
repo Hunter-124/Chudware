@@ -3108,12 +3108,17 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.activeWorkspace = AppState::Workspace::PartsLibrary;
     st.wantPartsShot = true;
   }
-  // CHUDWARE_SHOT=git: open the PLM hub on the new Git page for headless
-  // verification.
-  if (shot && shotMode && std::strcmp(shotMode, "git") == 0) {
+  // CHUDWARE_SHOT=git: open the PLM hub on one of its pages for headless
+  // verification. `CHUDWARE_PLM_PAGE` picks the page, `CHUDWARE_PLM_PROJECT`
+  // the project folder.
+  const bool wantPlmShot = shot && shotMode && std::strcmp(shotMode, "git") == 0;
+  const char *plmShotPage = wantPlmShot ? std::getenv("CHUDWARE_PLM_PAGE") : nullptr;
+  const bool wantPlmGraphShot =
+      plmShotPage && std::strcmp(plmShotPage, "graph") == 0;
+  if (wantPlmShot) {
     st.showRibbon = true;
     st.activeWorkspace = AppState::Workspace::PLM;
-    const char *pg = std::getenv("CHUDWARE_PLM_PAGE");
+    const char *pg = plmShotPage;
     if (pg && std::strcmp(pg, "planning") == 0)
       ui::plmSelectPlanningPage();
     else if (pg && std::strcmp(pg, "overview") == 0)
@@ -3122,8 +3127,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       ui::plmSelectFilesPage();
     else if (pg && std::strcmp(pg, "graph") == 0)
       ui::plmSelectGraphPage();
+    else if (pg && std::strcmp(pg, "compare") == 0)
+      ui::plmSelectComparePage();
     else
       ui::plmSelectGitPage();
+    // CHUDWARE_PLM_PROJECT points the capture at a specific project folder.
+    // Without it the shot falls back to the cwd, which is fine for the pages
+    // that need no vault but useless for Compare (it needs real versions).
+    if (const char *pd = std::getenv("CHUDWARE_PLM_PROJECT"); pd && *pd)
+      st.plmProjectDir = pd;
     if (st.plmProjectDir.empty()) {
       std::error_code ec;
       auto cwd = std::filesystem::current_path(ec);
@@ -5920,6 +5932,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // for the whole run: the RE workspace is full-body and hosts no 3D part, so
     // any later activateTab would yank it back to Model mid-capture too.
     if (wantRevengShot) st.activeWorkspace = AppState::Workspace::ReverseEng;
+    // Same race, same fix, for the CHUDWARE_SHOT=git PLM shot family. A project
+    // folder with documents restores them at startup, and that activateTab pulls
+    // the full-body PLM workspace back to Model — so the capture silently showed
+    // the modelling tab and the scenario "passed" while verifying nothing.
+    if (wantPlmShot) st.activeWorkspace = AppState::Workspace::PLM;
 
     using WS = AppState::Workspace;
     const WS ws = st.activeWorkspace;
@@ -6876,13 +6893,23 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // open, then give the popup a few frames to draw before capturing.
     if (st.wantSimDisc)
       shotFrame = st.simDiscShotDone ? 30 : 99999;
-    // PLM graph shot: hold until the first cad_graph_get payload lands, then
-    // give the force layout ~2s (120 frames) to settle before capturing.
-    if (st.activeWorkspace == AppState::Workspace::PLM) {
-      static int plmGraphShotAt = -1;
-      if (plmGraphShotAt < 0 && ui::plmGraphLoaded())
-        plmGraphShotAt = st.frame + 120;
-      shotFrame = plmGraphShotAt > 0 ? plmGraphShotAt : 99999;
+    // PLM shot. The graph page needs its cad_graph_get payload plus ~2s (120
+    // frames) for the force layout to settle; every OTHER page just needs its
+    // async fetches to land. This used to key on the WORKSPACE alone, so any
+    // non-graph page sat at 99999 forever waiting for a graph that never loads
+    // — the capture never happened. (It went unnoticed because startup doc
+    // restore yanked the workspace back to Model, so the branch never ran and
+    // the scenario silently photographed the modelling tab instead.)
+    if (wantPlmShot && st.activeWorkspace == AppState::Workspace::PLM) {
+      static int plmShotAt = -1;
+      if (wantPlmGraphShot) {
+        if (plmShotAt < 0 && ui::plmGraphLoaded()) plmShotAt = st.frame + 120;
+      } else if (plmShotAt < 0 && st.frame > 20 && !ui::plmBusy()) {
+        plmShotAt = st.frame + 10;   // settled: a few frames to repaint
+      }
+      // Hard ceiling so a wedged fetch fails as a visible spinner shot rather
+      // than hanging the harness forever.
+      shotFrame = plmShotAt > 0 ? plmShotAt : (st.frame >= 1200 ? st.frame : 99999);
     }
     // T-G15 iconpipe: keep the loop alive (offscreen icon renders happen in
     // tick()) until every recipe is captured, then exit promptly — the --shot

@@ -204,50 +204,85 @@ class Vault:
         When *item_id* is omitted (hub overview / full timeline), entry views are
         built from a few path-direct blob reads per commit instead of flattening
         the whole shadow tree — ME489-scale trees are hundreds of blobs.
+
+        When *item_id* is given the answer must mean "the versions of THIS
+        file". A commit belongs in an item's timeline iff the item **exists**
+        at that commit AND its content differs from its content at that
+        commit's **parent** (the next-older commit in the scope-filtered
+        chain). The parent comparison is the load-bearing part: comparing
+        against the next *newer* commit instead credits a change to whichever
+        later commit still carries the content (dropping the commit that
+        actually made it), and treating "absent -> present" as just another
+        difference emits entries from before the item existed, which cannot be
+        diffed at all. The oldest surviving entry is therefore the item's
+        creation, and every adjacent pair is a valid compare pair.
         """
-        entries: list[dict[str, Any]] = []
-        prev_sig: object | None = None
-        first = True
         commits = self._bind.log()
-        for commit in commits:
-            if scope != "all":
-                cmeta = self._bind.commit_meta(commit)
-                if hist.scope_from_commit_message(cmeta["message"]) != scope:
-                    continue
-            if item_id is not None:
-                tree = self._bind.read_tree(commit)
-                # per-item filter: include only commits where this item's content
-                # changed. CAD items key on document.json; generic (non-container)
-                # items key on their whole content-blob set (no document.json).
-                cur = self._item_content_signature(tree, item_id)
-                if not first and cur == prev_sig:
-                    prev_sig = cur
-                    continue
-                prev_sig = cur
-                first = False
-                entries.append(self._entry_view(commit, tree, item_id))
-            else:
+        if scope != "all":
+            commits = [c for c in commits
+                       if hist.scope_from_commit_message(
+                           self._bind.commit_meta(c)["message"]) == scope]
+        if item_id is None:
+            entries: list[dict[str, Any]] = []
+            for commit in commits:
                 entries.append(self._entry_view_light(commit))
+                if limit is not None and len(entries) >= limit:
+                    break
+            return entries
+
+        # per-item pass over the scope-filtered chain. Each commit's tree is read
+        # at most once even though index i is inspected as both "this commit" and
+        # (on the next step) "the parent".
+        trees: dict[int, dict[str, bytes]] = {}
+
+        def tree_at(i: int) -> dict[str, bytes]:
+            t = trees.get(i)
+            if t is None:
+                t = self._bind.read_tree(commits[i])
+                trees[i] = t
+            return t
+
+        entries = []
+        for i, commit in enumerate(commits):
+            cur = self._item_content_signature(tree_at(i), item_id)
+            if cur is None:
+                continue  # the item does not exist yet at this point
+            if i + 1 < len(commits):
+                parent = self._item_content_signature(tree_at(i + 1), item_id)
+                if parent is not None and parent == cur:
+                    continue  # unchanged by this commit
+            entries.append(self._entry_view(commit, tree_at(i), item_id))
+            trees.pop(i - 1, None)  # the older-side tree is never needed again
             if limit is not None and len(entries) >= limit:
                 break
         return entries
 
-    def _item_content_signature(self, tree: dict[str, bytes], item_id: str) -> object:
+    def _item_content_signature(self, tree: dict[str, bytes],
+                                item_id: str) -> object | None:
         """A change signature for one item at a history point — the CAD
         document.json blob, or (for generic items) the sorted content-blob map
-        excluding the per-commit-regenerated meta.json/summary.txt."""
+        excluding the per-commit-regenerated meta.json/summary.txt.
+
+        Returns ``None`` when the item has no blobs at all under its prefix,
+        i.e. **the item does not exist at this history point** — which is
+        distinct from a present-but-empty item.
+        """
         p = snapshot.item_prefix(item_id)
         doc = tree.get(p + "document.json")
         if doc is not None:
             return doc
         sig: list[tuple[str, bytes]] = []
+        present = False
         for path, data in tree.items():
             if not path.startswith(p):
                 continue
+            present = True
             tail = path[len(p):]
             if tail in ("meta.json", "summary.txt"):
                 continue
             sig.append((path, data))
+        if not present:
+            return None
         return tuple(sorted(sig))
 
     # -- writing -----------------------------------------------------------

@@ -154,9 +154,18 @@ def test_first_entry_and_edit_summaries(tmp_path):
         v.save("auto")
         assert _newest_summary(v, iid) == "No design changes."
 
-        # the summary is surfaced on timeline entries (plm_history shape)
+        # The summary is surfaced on timeline entries (plm_history shape). Note
+        # the no-op save above is NOT in this item's timeline: a commit belongs
+        # there only when it CHANGED the item, so the newest entry is still the
+        # wall edit. (This assertion used to expect "No design changes." here,
+        # which pinned the old per-item-history bug — it credited a change to
+        # the newest commit merely CARRYING that content rather than the one
+        # that introduced it, so an unrelated save shadowed the real edit.)
         entries = v.history(iid)
-        assert entries[0]["summary"] == "No design changes."
+        s0 = entries[0]["summary"]
+        assert "wall" in s0 and "3" in s0 and "5" in s0, s0
+        assert len(entries) == 2, [e["summary"] for e in entries]
+        assert entries[1]["summary"] == "First version of Bracket."
     finally:
         v.close()
 

@@ -482,9 +482,13 @@ def _plm_compare(params: dict, _emit: Callable) -> dict:
             raw_views = (params or {}).get("views")
             views = ([str(x) for x in raw_views]
                      if isinstance(raw_views, (list, tuple)) and raw_views else None)
+            # annotate=false gives clean images for a caller that draws the view
+            # name, legend and dimensions as real widgets (the GUI). Agents keep
+            # the default so a bare PNG still describes itself.
+            annotate = bool((params or {}).get("annotate", True))
             try:
                 out["eval_compare"] = compare_mod.visual_compare(
-                    doc_a, doc_b, od, views)
+                    doc_a, doc_b, od, views, annotate)
             except Exception as e:  # noqa: BLE001 — visual half degrades gracefully
                 out["visual_unavailable"] = f"{type(e).__name__}: {e}"
             out["out_dir"] = od

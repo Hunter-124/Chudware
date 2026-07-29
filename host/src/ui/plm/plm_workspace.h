@@ -17,5 +17,11 @@ void plmSelectPlanningPage();
 void plmSelectOverviewPage();
 void plmSelectFilesPage();
 void plmSelectGraphPage();
+void plmSelectComparePage();
+
+// True while the active PLM page still has data in flight. The
+// CHUDWARE_SHOT=git capture waits on this so it photographs real content
+// instead of a spinner.
+bool plmBusy();
 
 }  // namespace ui

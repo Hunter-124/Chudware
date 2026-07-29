@@ -69,12 +69,24 @@ void plmSectionHeader(const char* label, const char* icon) {
 void plmEmptyState(const char* icon, const char* msg, const char* sub) {
     const float S = ui::uiScale;
     ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.30f));
+    // A line that FITS is centred. A line that does not must WRAP: the old code
+    // centred unconditionally, and (avail - tw) * 0.5 goes negative once the text
+    // is wider than the pane — pushing it off the left edge and clipping it at
+    // both ends. Long hint sentences read as a paragraph instead.
     auto centered = [](const char* t, ImVec4 col) {
-        float tw = ImGui::CalcTextSize(t).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (ImGui::GetContentRegionAvail().x - tw) * 0.5f);
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float tw    = ImGui::CalcTextSize(t).x;
         ImGui::PushStyleColor(ImGuiCol_Text, col);
-        ImGui::TextUnformatted(t);
+        if (tw <= avail) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - tw) * 0.5f);
+            ImGui::TextUnformatted(t);
+        } else {
+            const float inset = avail * 0.08f;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + inset);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + avail - inset * 2.0f);
+            ImGui::TextUnformatted(t);
+            ImGui::PopTextWrapPos();
+        }
         ImGui::PopStyleColor();
     };
     centered(icon, ImVec4(palette.textDisabled[0], palette.textDisabled[1],
@@ -297,6 +309,22 @@ void plmSelectPlanningPage() { g_plmHub.page = PlmPage::Planning; }
 void plmSelectOverviewPage() { g_plmHub.page = PlmPage::Overview; }
 void plmSelectFilesPage() { g_plmHub.page = PlmPage::Files; }
 void plmSelectGraphPage() { g_plmHub.page = PlmPage::Graph; }
+void plmSelectComparePage() { g_plmHub.page = PlmPage::Compare; }
+
+// Whatever page is showing, is it still waiting on data? Only the fetches that
+// gate visible content count — this is the headless capture's "settled" signal.
+bool plmBusy() {
+    const PlmHubState& H = g_plmHub;
+    if (H.itemsLoading || H.histLoading) return true;
+    switch (H.page) {
+        case PlmPage::Overview: return H.ovLoading;
+        case PlmPage::Planning:
+        case PlmPage::Issues:   return H.planLoading;
+        case PlmPage::Git:      return H.gitLoading;
+        case PlmPage::Compare:  return plmCompareBusy();
+        default:                return false;
+    }
+}
 
 void drawPlmWorkspace(AppState& st) {
     const float S = ui::uiScale;

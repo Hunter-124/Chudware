@@ -246,7 +246,8 @@ def _kind_of(doc: dict[str, Any]) -> str:
 
 def visual_compare(doc_a: dict[str, Any], doc_b: dict[str, Any],
                    out_dir: str | Path,
-                   views: list[str] | tuple[str, ...] | None = None) -> dict[str, Any]:
+                   views: list[str] | tuple[str, ...] | None = None,
+                   annotate: bool = True) -> dict[str, Any]:
     """Visual two-revision compare: rendered images of the DIFFERENCE between
     two revisions (contract §7 ``eval_compare``).
 
@@ -311,7 +312,7 @@ def visual_compare(doc_a: dict[str, Any], doc_b: dict[str, Any],
     if kind == "drawing":
         result.update(_drawing_visual(cb, ida, idb, out))
     else:
-        result.update(_geometry_visual(cb, ida, idb, out, views))
+        result.update(_geometry_visual(cb, ida, idb, out, views, annotate))
 
     # universal fallback: a registered pixel diff of the two plain renders. One
     # cheap PIL pass, and it is the only diff image available against an engine
@@ -390,9 +391,14 @@ def _drawing_visual(cb: Any, ida: str, idb: str, out: Path) -> dict[str, Any]:
 
 
 def _geometry_visual(cb: Any, ida: str, idb: str, out: Path,
-                     views: list[str] | tuple[str, ...] | None) -> dict[str, Any]:
+                     views: list[str] | tuple[str, ...] | None,
+                     annotate: bool = True) -> dict[str, Any]:
     """Rendered 3D geometry diffs via ``doc_render_diff`` (added green / removed
     red / unchanged grey, one shared camera framing).
+
+    ``annotate`` bakes the view name + legend + bbox dims into the pixels — what
+    an AI vision review needs from a bare PNG. The GUI draws those as real
+    widgets and passes False, so its images stay clean.
 
     An engine without the method degrades to ``eval_compare`` for the match
     percentage plus the pixel-diff fallback the caller adds.
@@ -408,7 +414,7 @@ def _geometry_visual(cb: Any, ida: str, idb: str, out: Path,
         try:
             r = cb.call("doc_render_diff", {"doc_a": ida, "doc_b": idb,
                                             "out_path": path, "view": view,
-                                            "mode": "context"})
+                                            "mode": "context", "annotate": annotate})
         except Exception as e:  # noqa: BLE001 — an older engine has no such method
             if _is_unknown_method(e):
                 unavailable = True
@@ -441,7 +447,8 @@ def _geometry_visual(cb: Any, ida: str, idb: str, out: Path,
         try:
             r = cb.call("doc_render_diff", {"doc_a": ida, "doc_b": idb,
                                             "out_path": co, "view": "ISO",
-                                            "mode": "changes_only"})
+                                            "mode": "changes_only",
+                                            "annotate": annotate})
             if (isinstance(r, dict) and r.get("ok") is not False
                     and not r.get("degraded") and _existing(r.get("path") or co)):
                 result["diff_3d_changes_only"] = str(r.get("path") or co)

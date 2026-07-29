@@ -9695,6 +9695,7 @@ json doc_render_diff(const nlohmann::json& params) {
         const std::string mode =
             params.value("mode", std::string("context")) == "changes_only" ? "changes_only"
                                                                           : "context";
+        const bool label = params.value("annotate", true);
         int W = 640, H = 480;
         if (params.contains("width") && params["width"].is_number())
             W = (int)std::lround(params["width"].get<double>());
@@ -9757,11 +9758,18 @@ json doc_render_diff(const nlohmann::json& params) {
         };
         // One shared render+write tail so the degraded path produces a real image too. Same
         // encode_png_rgb + ofstream sequence doc_render_view uses.
+        // `label` (params.annotate, default true) bakes the view name + legend + bbox dims
+        // into the pixels. That is what an AI vision review needs from a bare PNG, but the
+        // GUI already shows the view, the legend and the dimensions as real widgets, so it
+        // asks for annotate:false and gets a clean image instead of a pixel-font overlay.
         auto write_png = [&]() -> bool {
             if (draw.empty() || frame.empty()) return false;
-            const std::string dims = bbox_dims_label(frame);
-            const std::string header =
-                rv.name + "  DIFF  +added  -removed" + (dims.empty() ? "" : "  " + dims);
+            std::string header;
+            if (label) {
+                const std::string dims = bbox_dims_label(frame);
+                header = rv.name + "  DIFF  +added  -removed" +
+                         (dims.empty() ? "" : "  " + dims);
+            }
             std::vector<unsigned char> img;
             // min_painted=1: a changes_only render of one small added boss is legitimately
             // sparse and must not trip the default W*H/400 "nothing drawn" guard.

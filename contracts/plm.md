@@ -621,4 +621,27 @@ when the engine is absent, and an engine predating `doc_render_diff` degrades to
 written to a caller-supplied `out_dir` (a temp dir by default) and are disposable.
 
 **B.5 additive tool slot** — none. `plm_compare` gains an OPTIONAL `views`
-(subset of `ISO`/`FRONT`/`TOP`) and an OPTIONAL `out_dir`; both default sensibly.
+(subset of `ISO`/`FRONT`/`TOP`), an OPTIONAL `out_dir`, and an OPTIONAL
+`annotate` (default `true`). `annotate` bakes the view name, the legend and the
+bbox dims into the rendered pixels, which is what an agent reading a bare PNG
+needs; a caller that draws those as real widgets (the GUI) passes `false` and
+gets a clean image.
+
+**B.6 `plm_history` per-item timeline is creation-anchored (normative
+clarification, 2026-07).** No signature change. Given an `item_id`, an entry is
+returned iff **the item exists at that commit AND its content differs from the
+content at that commit's parent**. Consequences a consumer may rely on:
+
+- The oldest entry is the item's **creation**; nothing precedes it, so it is a
+  terminal step rather than a comparable one.
+- Every adjacent pair `(entries[i+1], entries[i])` is a valid
+  `plm_compare {commit_a, commit_b}` argument — the item is present at both ends.
+- No entry predates the item, and no commit that left the item untouched appears.
+
+This was previously ill-defined and the implementation walked newest-first,
+recording the newest commit still *carrying* a content rather than the one that
+*introduced* it. That credited changes to unrelated later commits (dropping the
+commit that actually made the change) and emitted pre-creation entries, so a
+consumer diffing adjacent entries could hit `invalid_item` / "that item is not
+present at one of those points". Project-wide history (no `item_id`) is
+unaffected: it still returns one entry per scope-matching commit.

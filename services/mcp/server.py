@@ -333,6 +333,9 @@ from mcp_server.ecad_sim_tools import register_ecad_sim_tools
 register_ecad_sch_tools(_reg.view(mcp, "ecad"))
 register_ecad_pcb_tools(_reg.view(mcp, "ecad"))
 register_ecad_sim_tools(_reg.view(mcp, "ecad"))
+# ECAD schematic DRAWING-quality self-check (geometric, pre-ERC): ecad_lint_schematic.
+from mcp_server.ecad_qa_tools import register_ecad_qa_tools
+register_ecad_qa_tools(_reg.view(mcp, "ecad"))
 
 # ECAD -> thermal FEA handoff (T-FIN16, aicad.simhandoff/1 coupling ecad_to_thermal_fea):
 # one call from a routed board to a solved board-level thermal study + Tj/limits verify.

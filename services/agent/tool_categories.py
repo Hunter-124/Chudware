@@ -106,6 +106,15 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "simulate_motion",
         "get_job",
         "describe_results",
+        # Background solve lifecycle (2026-07-29). The synchronous run_* calls above block for
+        # minutes and a live turn hit max_iters waiting on one; these let the model start a solve,
+        # keep working, and collect it. Registered but unreachable until listed here — a tool the
+        # dispatcher can bind is still invisible if no pack advertises it.
+        "sim_run",
+        "sim_status",
+        "sim_cancel",
+        "sim_results",
+        "sim_jobs",
         "family:em",
     ],
     "cam": [
@@ -132,6 +141,11 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "ecad_place_symbol",
         "ecad_wire",
         "ecad_find_part",
+        # Explicit, not left to `family:ecad` — that expansion is alphabetically trimmed at
+        # CATEGORY_EXPAND_CAP (40) out of 66 ecad-family tools, so this name survives only by
+        # sorting early. A curated entry keeps the pre-ERC geometry check reachable as more
+        # ecad_a*/ecad_c* tools land (flagged by EcadSchematicQA, 2026-07-29).
+        "ecad_lint_schematic",
         "ecad_status",
         "ecad_run_erc",
         "ecad_run_drc",

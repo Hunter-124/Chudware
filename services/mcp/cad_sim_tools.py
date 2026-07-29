@@ -30,6 +30,7 @@ from .cad_common import (
     _SID_RE,
     cb,
 )
+from services.sim import jobs as simjobs
 
 
 # ------------------------------------------------------- boundary-condition dialect (live fix)
@@ -69,7 +70,148 @@ _AXIS_DIRS = {
 _BC_SHAPE_HELP = ('accepted shapes: {"face": <query>, "force": [fx,fy,fz]} (N, world XYZ), '
                   '{"face": <query>, "pressure": <MPa>}, or the polar form '
                   '{"face": <query>, "magnitude": <N>, "direction": [dx,dy,dz]}. '
-                  '"faces": [<query>, ...] is accepted as the plural of "face".')
+                  '"faces": [<query>, ...] is accepted as the plural of "face", and the '
+                  'unit-suffixed spelling of the SAME quantity is read as the canonical key '
+                  '("face_query"->face, "magnitude_n"/"force_n"->magnitude, '
+                  '"pressure_mpa"->pressure, "temperature_c"->temperature).')
+
+# ------------------------------------------------------- boundary-condition ITEM KEYS (live fix)
+# Measured 2026-07-29, sim suite, claude-sonnet-4-5 (general lane). VERBATIM load entry:
+#   {"name":"tip_load","face_query":"the opposite end face","type":"force",
+#    "magnitude_n":500,"direction":[0,0,-1]}
+#       -> "each load needs a 'face' query" ... next to an accepted-shapes list that ALREADY
+#          contains the polar magnitude+direction form the model used. The SHAPE was supported
+#          (_polar_to_force); only the two KEY SPELLINGS missed.
+# Both renames are lossless and stay inside one quantity:
+#   face_query  -> face       a face QUERY is exactly what `face` holds; there is one
+#                             selection slot in a BC item, so no other reading exists.
+#   magnitude_n -> magnitude  the `_n` is the UNIT the accepted shape already documents
+#                             ('"magnitude": <N>'), i.e. the SAME scalar in the SAME newtons.
+# Aliasing across a quantity/unit BOUNDARY is deliberately NOT done anywhere in this file —
+# see services/agent/arg_reconciliation.QUANTITY_MISMATCH for why (mesh_size_mm is refused, not
+# mapped onto the dimensionless mesh_fineness). Every rename here is echoed in the tool's
+# `interpreted` channel, so the model can see what its key was read as.
+
+# Keys of a raw geometry QUERY / query-result match dict. Such a dict is passed straight to
+# the engine query grammar (core/doc/picks.h) and is NOT a BC wrapper, so it is never
+# key-checked: {"of":"face","side":"bottom"}, {"sid":...}, {"kind":"face","surf":"plane",...}.
+_QUERY_DICT_KEYS = frozenset({"of", "kind", "surf", "sid", "centroid", "hint_index",
+                              "area_or_len", "owner_feature"})
+
+# The canonical keys a fixtures/loads/hot_faces/cold_faces item may carry, i.e. exactly the
+# keys the solver payload builders below and in run_fea_thermal actually READ.
+_BC_ITEM_KEYS = frozenset({
+    "face", "faces", "type", "force", "pressure", "magnitude", "direction",
+    "temperature", "flux_w_m2", "h_w_m2k", "t_amb_c", "schedule",
+})
+
+# Purely-cosmetic item labels ("name":"tip_load" in the live payload). They name the load for
+# a reader and can never change what the solver computes, so they ride along instead of
+# turning an otherwise-correct entry into a refusal. Same closed-list discipline as
+# arg_reconciliation.DESCRIPTIVE_ARGS: nothing that could carry geometry, a quantity or a unit.
+_BC_ITEM_LABELS = frozenset({"name", "label", "comment", "note", "notes", "description",
+                             "title", "caption"})
+
+# Normalised (lower, no _ - or space) supplied key -> canonical item key.
+_ITEM_KEY_ALIASES: dict[str, str] = {
+    # --- the face-reference slot. A BC item has exactly ONE selection slot, so any spelling
+    # of "which surface this applies to" is unambiguous HERE.
+    "facequery": "face", "faceref": "face", "facesel": "face", "faceselector": "face",
+    "facesid": "face", "targetface": "face", "surface": "face", "on": "face",
+    "onface": "face", "appliedto": "face",
+    "facesquery": "faces", "facequeries": "faces", "facerefs": "faces",
+    "faceslist": "faces", "surfaces": "faces", "targetfaces": "faces",
+    # --- the scalar magnitude. `_n` / `newtons` is the unit the accepted shape already
+    # states, so these are the SAME quantity, not a conversion.
+    "magnituden": "magnitude", "magnitudenewtons": "magnitude",
+    "forcen": "magnitude", "forcenewtons": "magnitude", "forcemagnitude": "magnitude",
+    "forcemagnituden": "magnitude", "loadn": "magnitude", "loadmagnitude": "magnitude",
+    # --- pressure / temperature / flux / film coefficient: unit-suffixed spellings of the
+    # unit this tool already documents (MPa, °C, W/m², W/m²K).
+    "pressurempa": "pressure",
+    "temperaturec": "temperature", "temperaturedegc": "temperature", "tempc": "temperature",
+    "temp": "temperature",
+    "flux": "flux_w_m2", "heatflux": "flux_w_m2", "heatfluxwm2": "flux_w_m2",
+    "h": "h_w_m2k", "htc": "h_w_m2k", "htcwm2k": "h_w_m2k",
+    "filmcoefficient": "h_w_m2k", "convectioncoefficient": "h_w_m2k",
+    "tamb": "t_amb_c", "tambientc": "t_amb_c", "ambienttemperature": "t_amb_c",
+    "ambienttempc": "t_amb_c",
+    # --- direction / kind. DELIBERATELY EXCLUDED: `axis` (an axis is unsigned, a direction is
+    # signed) and `load_type` (run_fea_fatigue's top-level load_type names the cyclic SPECTRUM
+    # "reversed"/"zero_based", a different thing from a BC kind — so it stays a refusal).
+    "directionvector": "direction", "dir": "direction",
+    "forcedirection": "direction", "loaddirection": "direction",
+    "kind": "type", "bctype": "type", "fixturetype": "type", "constrainttype": "type",
+}
+
+_FACE_REF_NORMS = frozenset(
+    {"face", "faces"} | {n for n, c in _ITEM_KEY_ALIASES.items() if c in ("face", "faces")})
+
+# Face-RELATIVE direction words. See _norm_direction: these are REFUSED, not resolved.
+_FACE_RELATIVE_DIRS = frozenset({
+    "normal", "facenormal", "normaltoface", "surfacenormal", "alongnormal", "alongthenormal",
+    "perpendicular", "perpendiculartoface", "inward", "inwards", "outward", "outwards",
+    "intoface", "intotheface", "outofface",
+})
+
+
+def _norm_key(name) -> str:
+    """Fold a dict key for matching: case / underscore / dash / space are noise."""
+    return str(name).lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _canon_item_keys(e: dict, where: str, notes: Optional[list] = None) -> dict:
+    """Rename a BC item's key SPELLINGS onto the canonical ones, and refuse the rest.
+
+    Applies only to a BC WRAPPER — a dict carrying some spelling of a face reference. A raw
+    geometry query / query-result match dict is handed to the engine grammar verbatim and is
+    left completely alone.
+
+    There is no catch-all: a key that is neither canonical, a known spelling, nor a cosmetic
+    label is REFUSED naming the real vocabulary. Silently dropping it would hide a setting the
+    caller believed it had applied, which is exactly the failure mode this file exists to
+    prevent."""
+    if any(k in e for k in _QUERY_DICT_KEYS):
+        return e
+    if not any(_norm_key(k) in _FACE_REF_NORMS for k in e):
+        return e
+    out: dict = {}
+    renamed: list = []
+    for k, v in e.items():
+        if k in _BC_ITEM_KEYS or k in _BC_ITEM_LABELS:
+            out[k] = v
+            continue
+        canon = _ITEM_KEY_ALIASES.get(_norm_key(k))
+        if canon is None:
+            raise ValueError(
+                f"{where}: unknown key {k!r} in this boundary-condition entry — it is not a "
+                f"spelling of any accepted key, and guessing would run a load you did not "
+                f"ask for. Accepted keys: {sorted(_BC_ITEM_KEYS)} (plus an optional "
+                f"descriptive {sorted(_BC_ITEM_LABELS)}). " + _BC_SHAPE_HELP)
+        if canon in e or canon in out:
+            other = e[canon] if canon in e else out[canon]
+            raise ValueError(
+                f"{where}: {k!r} is another spelling of {canon!r} and BOTH were given "
+                f"({v!r} vs {other!r}) — that is ambiguous. Pass exactly one.")
+        out[canon] = v
+        renamed.append(f"{k!r} as {canon!r}")
+    if not renamed:
+        return e
+    if notes is not None:
+        notes.append(f"{where}: read " + ", ".join(renamed))
+    return out
+
+
+def _interpreted(out: dict, notes: list) -> dict:
+    """Echo BC key renames onto a SUCCESSFUL result under `interpreted`.
+
+    A rename the model cannot see is a rename it keeps re-learning: it wrote `magnitude_n`,
+    got a stress number back, and has no way to know the canonical key is `magnitude`. Only
+    attached when something was actually rewritten, so a canonical call's payload is
+    byte-identical to what it was before."""
+    if notes:
+        out["interpreted"] = list(notes)
+    return out
 
 
 def _norm_fineness(value, arg_name: str = "mesh_fineness") -> float:
@@ -96,6 +238,25 @@ def _norm_direction(d, where: str) -> list:
         s = d.strip().lower()
         if s in _AXIS_DIRS:
             return list(_AXIS_DIRS[s])
+        if _norm_key(s) in _FACE_RELATIVE_DIRS:
+            # DELIBERATE REFUSAL, not a default. Live 2026-07-29 a load arrived as
+            # {"face":"right face","force_n":1200,"direction":"normal"}. Two independent
+            # reasons this cannot be resolved into a vector here, and neither is fixable by
+            # picking an axis: (1) direction is normalized at the tool BOUNDARY, before any
+            # face query is resolved, so there is no face normal in hand yet; (2) even with
+            # the face resolved, "normal" does not say which SIGN — outward is tension,
+            # inward is compression, opposite answers from the same input. Defaulting to an
+            # axis would solve a different load and report success, so refuse and name the
+            # two shapes that DO express a normal-acting load.
+            raise ValueError(
+                f"{where}: 'direction' {raw!r} is a FACE-RELATIVE word, not a vector, and it "
+                "cannot be resolved here: directions are normalized before any face query is "
+                "resolved, and 'normal' does not say which SIGN it means (outward = tension, "
+                "inward = compression). Give an explicit vector 'direction': [dx,dy,dz] (any "
+                "length; it is normalized) — query_geometry(<your face query>) reports the "
+                'face `axis`, so you can copy it and choose the sign. For a load that acts '
+                'along the face normal BY DEFINITION, use {"face": <query>, "pressure": '
+                "<MPa>} (inward on the face) instead of a force.")
         d = coerce_json_or_repr(d)
     if isinstance(d, dict) and all(k in d for k in ("x", "y", "z")):
         d = [d["x"], d["y"], d["z"]]
@@ -200,14 +361,18 @@ def _polar_to_force(e: dict, where: str) -> dict:
     return out
 
 
-def _norm_bc_list(entries: list, arg_name: str, *, unwrap_query: bool = False) -> list:
+def _norm_bc_list(entries: list, arg_name: str, *, unwrap_query: bool = False,
+                  notes: Optional[list] = None) -> list:
     """Normalize a fixtures/loads list at the tool boundary. IDENTITY for entries already
     in the accepted shape — the payload handed to the C++ solver is unchanged for inputs
     that already worked.
 
     unwrap_query: fixtures consume only the face QUERY, so a wrapper dict
     ({"face": q, "type": "fixed"}) collapses to `q`; loads / hot_faces / cold_faces keep
-    their siblings (force, pressure, temperature, flux_w_m2, schedule, ...)."""
+    their siblings (force, pressure, temperature, flux_w_m2, schedule, ...).
+    notes: appended to with one human-readable line per entry whose KEYS were renamed, so
+    the calling tool can echo the rename back in its `interpreted` channel — a rename the
+    model cannot see is a rename it will keep re-learning."""
     out: list = []
     for i, raw in enumerate(entries):
         where = f"{arg_name}[{i}]"
@@ -217,6 +382,7 @@ def _norm_bc_list(entries: list, arg_name: str, *, unwrap_query: bool = False) -
         if not isinstance(e, dict):
             out.append(raw)          # a bare query string / already-structured query
             continue
+        e = _canon_item_keys(e, where, notes)
         for one in _split_face_list(e, where):
             one = _polar_to_force(one, where)
             if unwrap_query and "face" in one:
@@ -256,6 +422,231 @@ def _sim_face_points(doc_id: str, query) -> list:
     return _resolve_face_points(doc_id, query)
 
 
+# ------------------------------------------------------- atomised solve pipeline (async jobs)
+# Every sim tool used to be one monolithic closure: resolve the doc, build the study, call the
+# engine, persist, shape the reply. That shape can only ever run start-to-finish inside one MCP
+# call, which is why a long solve could only be waited on. Splitting it into three atomic stages
+#
+#     SETUP   (parent) — needs the live document: export STEP, resolve face queries -> a study
+#                        dict that is pure JSON and references only files on disk
+#     SOLVE   (child)  — one engine RPC on that study; killable, restartable, turn-independent
+#     COLLECT (parent) — persist the study record + shape the reply envelope
+#
+# is what lets sim_run/sim_status/sim_cancel/sim_results exist WITHOUT a second implementation
+# of the physics: the synchronous tools call the SAME setup and the SAME collect, so an async
+# answer is equal to the sync answer by construction, not by a promise in a docstring.
+
+class _StudyRefusal(Exception):
+    """A setup-time refusal carrying the EXACT reply envelope its tool already returned."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("error", "refused"))
+        self.payload = payload
+
+
+def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes: list) -> dict:
+    """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
+    d = _doc(doc_id)
+    fixtures = require_list(fixtures, "fixtures",
+                            'a list of face queries, e.g. ["bottom"] or '
+                            '[{"of":"face","side":"bottom","pick":"largest"}]')
+    loads = require_list(loads, "loads",
+                         'a list of {face query + force/pressure}, e.g. '
+                         '[{"face":"top","force":[0,0,-500]}]')
+    fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
+    loads = _norm_bc_list(loads, "loads", notes=notes)
+    mesh_fineness = _norm_fineness(mesh_fineness)
+    mat = _resolve_material(coerce_json_or_repr(material))
+    step = _tmp(".step")
+    cb.call("doc_export_step", {"doc_id": d, "path": step})
+
+    fixture_sets: list = []
+    for q in fixtures:
+        fixture_sets.extend(_sim_face_points(d, q))
+    if not fixture_sets:
+        raise _StudyRefusal({"ok": False, "error":
+                             "no fixture faces resolved — the face queries you provided "
+                             "didn't match any surface points. Static FEA requires at least "
+                             "one fixed face. Use query_geometry() to confirm the face query."})
+
+    load_specs: list = []
+    for ld in loads:
+        if not isinstance(ld, dict) or "face" not in ld:
+            raise ValueError(f"each load needs a 'face' query: {ld!r}. " + _BC_SHAPE_HELP)
+        faces = _sim_face_points(d, ld["face"])
+        # Merge multiple face-point sets for this load (keeps face_normal/surface
+        # hints exactly when they stay valid — see _merge_face_sets).
+        merged = _merge_face_sets(faces)
+        spec: dict = {"faces": merged}
+        if "pressure" in ld:
+            spec["type"] = "pressure"
+            spec["magnitude"] = float(ld["pressure"])
+        elif "force" in ld:
+            spec["type"] = "force"
+            spec["vector"] = [float(x) for x in ld["force"]]
+        else:
+            raise ValueError(f"load needs 'force':[x,y,z] or 'pressure':<MPa>: {ld!r}. "
+                             + _BC_SHAPE_HELP)
+        load_specs.append(spec)
+
+    study = {
+        "step_path": step,
+        "material": mat,
+        "fixtures": fixture_sets,
+        "loads": load_specs,
+        "mesh_order": 2,        # tet10 captures bending
+        "fineness": mesh_fineness,
+    }
+    return {"analysis": "fea_static", "doc": d, "study": study, "material": mat,
+            "material_arg": material, "fixtures": fixtures, "loads": loads,
+            "mesh_fineness": mesh_fineness, "step_path": step}
+
+
+def _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes: list) -> dict:
+    """SETUP stage for run_fea_modal / sim_run(analysis="fea_modal")."""
+    d = _doc(doc_id)
+    fixtures = require_list(fixtures, "fixtures",
+                            'a list of face queries held fixed, e.g. ["bottom"]')
+    fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
+    mesh_fineness = _norm_fineness(mesh_fineness)
+    mat = _resolve_material(coerce_json_or_repr(material))
+    step = _tmp(".step")
+    cb.call("doc_export_step", {"doc_id": d, "path": step})
+    fixture_sets: list = []
+    for q in fixtures:
+        fixture_sets.extend(_sim_face_points(d, q))
+    # F6 (free-free modal): when fixtures=[] the caller is requesting an unconstrained
+    # solve — the C++ fea_modal_solve handles empty fixed_nodes by computing the full
+    # 6 rigid-body modes near 0 Hz followed by the elastic modes. Only reject when the
+    # caller DID supply fixture queries but NONE of them resolved to real face points
+    # (which is almost certainly a geometry-query mistake, not intentional free-free).
+    if fixtures and not fixture_sets:
+        raise _StudyRefusal({"ok": False, "error": "no fixture faces resolved — "
+                             "the face queries you provided didn't match any surface points. "
+                             "Use query_geometry() to find the right face query, or pass "
+                             "fixtures=[] for a free-free (unconstrained) solve."})
+    # 2nd-order (tet10) elements: quadratic bending accuracy — no spurious split on
+    # a square section and no low-frequency bias the way tet4 had (Bug N-1).
+    study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
+             "mesh_order": 2, "fineness": mesh_fineness}
+    return {"analysis": "fea_modal", "doc": d, "study": study, "material": mat,
+            "material_arg": material, "fixtures": fixtures, "fixture_sets": fixture_sets,
+            "free_free": not fixture_sets, "mesh_fineness": mesh_fineness,
+            "step_path": step}
+
+
+def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
+    """COLLECT stage for a static solve — the ONE place the reply envelope is built."""
+    d = ctx["doc"]
+    mat = ctx.get("material") or {}
+    if not res.get("ok"):
+        return {"ok": False, "doc_id": d, "error": res.get("error", "solve failed")}
+    # Persist setup+results into the doc so they save inside the .step+.
+    sid = _persist_study(d, {
+        "type": "fea_static",
+        "name": f"Static stress ({mat.get('name', ctx.get('material_arg'))})",
+        "engine": "cpp",
+        "material": mat,
+        "fixtures": ctx.get("fixtures"),
+        "loads": ctx.get("loads"),
+        "mesh_fineness": ctx.get("mesh_fineness"),
+        "results": res.get("summary", {}),
+        "n_dof": res.get("n_dof"),
+    })
+    out = {"ok": True, "doc_id": d, "material": mat.get("name", ctx.get("material_arg")),
+           "summary": res.get("summary", {}), "n_dof": res.get("n_dof"),
+           "saved_to_study": bool(sid)}
+    if not sid:
+        # _persist_study is best-effort and swallows its own errors; reporting a flat True
+        # would be a verdict we never checked (and after a background job collected in a
+        # LATER agent turn the document is legitimately no longer open here).
+        out["study_not_saved_reason"] = (
+            f"the results could not be written into document {d} (it is not open in this "
+            "process). The numbers above are unaffected.")
+    return _interpreted(out, notes)
+
+
+def _n_rigid_modes(freqs: list) -> int:
+    return sum(1 for f in freqs if f < 0.5)  # rigid ~0 Hz, elastic >> 0.5 Hz
+
+
+def _collect_modal(ctx: dict, freqs: list, n_modes: int, notes: list,
+                   note: Optional[str] = None) -> dict:
+    """COLLECT stage for a modal solve."""
+    d = ctx["doc"]
+    mat = ctx.get("material") or {}
+    sid = _persist_study(d, {
+        "type": "fea_modal",
+        "name": f"Modal ({mat.get('name', ctx.get('material_arg'))})",
+        "engine": "cpp",
+        "material": mat,
+        "fixtures": ctx.get("fixtures"),
+        "n_modes": n_modes,
+        "mesh_fineness": ctx.get("mesh_fineness"),
+        "results": {"freqs_hz": freqs, "n_modes": len(freqs)},
+    })
+    out = {"ok": True, "doc_id": d, "material": mat.get("name", ctx.get("material_arg")),
+           "freqs_hz": freqs, "n_modes": len(freqs), "saved_to_study": bool(sid)}
+    if not sid:
+        out["study_not_saved_reason"] = (
+            f"the results could not be written into document {d} (it is not open in this "
+            "process). The frequencies above are unaffected.")
+    if note:
+        out["note"] = note
+    return _interpreted(out, notes)
+
+
+def _modal_solve_n(n_modes: int, free_free: bool) -> int:
+    """How many modes to ASK the eigensolver for. A free-free part spends its first six on
+    rigid-body motion, so over-request (and widen the Krylov subspace) to still get n_modes
+    elastic ones."""
+    return max(n_modes + 6, 14) if free_free else n_modes
+
+
+def _modal_rigid_note(freqs: list) -> Optional[str]:
+    """The free-free sanity warning, or None when all six rigid modes came back."""
+    n = _n_rigid_modes(freqs)
+    if n >= 6:
+        return None
+    return (f"warning: free-free solve resolved only {n}/6 rigid-body modes — the mode list "
+            "may be missing rigid modes (eigensolver degenerate-cluster limitation); "
+            "elastic frequencies are unaffected")
+
+
+# Analyses whose SETUP produces a self-contained study (an exported STEP path + JSON), which
+# is the precondition for solving them in a separate, killable process. run_cfd_accurate is
+# deliberately absent: it already always-backgrounds with its own live progress channel, and
+# run_fea_frequency_response / run_fea_fatigue post-process a static field with Python between
+# engine calls, so their solve is not one atomic RPC. Those keep background=True + get_job().
+_ASYNC_ANALYSES = ("fea_static", "fea_modal")
+
+
+def _collect_job(st: dict, raw: dict) -> dict:
+    """COLLECT stage for a finished async job: the job's own meta IS the setup context, so
+    this produces byte-identical envelopes to the synchronous tools."""
+    meta = st.get("meta") or {}
+    kind = meta.get("analysis") or st.get("kind")
+    notes = list(meta.get("notes") or [])
+    if kind == "fea_static":
+        return _collect_static(meta, raw, notes)
+    if kind == "fea_modal":
+        if not raw.get("ok"):
+            return {"ok": False, "doc_id": meta.get("doc"),
+                    "error": raw.get("error", "modal solve failed")}
+        n = int(meta.get("n_modes") or 6)
+        freqs = list(raw.get("freqs_hz", []))
+        note = None
+        if meta.get("free_free"):
+            note = _modal_rigid_note(freqs)
+            if note:
+                note += (". The background path does NOT re-solve with a wider subspace the "
+                         "way the synchronous tool does (that would be a second job) — re-run "
+                         "run_fea_modal synchronously if the rigid-mode count matters")
+            freqs = freqs[:n]
+        return _collect_modal(meta, freqs, n, notes, note)
+    return {"ok": False, "error": f"no result collector for job kind {kind!r}"}
+
+
 def register_cad_sim_tools(mcp: FastMCP) -> None:
     """CAD simulation MCP tools (T-RF8 split of cad_tools.py): run_fea_* + run_cfd_*."""
 
@@ -291,78 +682,14 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         Tip: query_geometry(...) first to confirm your fixture/load faces resolve.
         """
         try:
-            d = _doc(doc_id)
-            fixtures = require_list(fixtures, "fixtures",
-                                     'a list of face queries, e.g. ["bottom"] or '
-                                     '[{"of":"face","side":"bottom","pick":"largest"}]')
-            loads = require_list(loads, "loads",
-                                  'a list of {face query + force/pressure}, e.g. '
-                                  '[{"face":"top","force":[0,0,-500]}]')
-            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True)
-            loads = _norm_bc_list(loads, "loads")
-            mesh_fineness = _norm_fineness(mesh_fineness)
-            mat = _resolve_material(coerce_json_or_repr(material))
-            step = _tmp(".step")
-            cb.call("doc_export_step", {"doc_id": d, "path": step})
-
-            fixture_sets: list = []
-            for q in fixtures:
-                fixture_sets.extend(_sim_face_points(d, q))
-            if not fixture_sets:
-                return _dumps({"ok": False, "error":
-                               "no fixture faces resolved — the face queries you provided "
-                               "didn't match any surface points. Static FEA requires at least "
-                               "one fixed face. Use query_geometry() to confirm the face query."})
-
-            load_specs: list = []
-            for ld in loads:
-                if not isinstance(ld, dict) or "face" not in ld:
-                    raise ValueError(f"each load needs a 'face' query: {ld!r}. "
-                                     + _BC_SHAPE_HELP)
-                faces = _sim_face_points(d, ld["face"])
-                # Merge multiple face-point sets for this load (keeps face_normal/surface
-                # hints exactly when they stay valid — see _merge_face_sets).
-                merged = _merge_face_sets(faces)
-                spec: dict = {"faces": merged}
-                if "pressure" in ld:
-                    spec["type"] = "pressure"
-                    spec["magnitude"] = float(ld["pressure"])
-                elif "force" in ld:
-                    spec["type"] = "force"
-                    spec["vector"] = [float(x) for x in ld["force"]]
-                else:
-                    raise ValueError(f"load needs 'force':[x,y,z] or 'pressure':<MPa>: {ld!r}. "
-                                     + _BC_SHAPE_HELP)
-                load_specs.append(spec)
-
-            study = {
-                "step_path": step,
-                "material": mat,
-                "fixtures": fixture_sets,
-                "loads": load_specs,
-                "mesh_order": 2,        # tet10 captures bending
-                "fineness": mesh_fineness,
-            }
+            bc_notes: list = []
+            ctx = _build_static_study(fixtures, loads, material, mesh_fineness,
+                                      doc_id, bc_notes)
+            d = ctx["doc"]
 
             def _solve() -> dict:
-                res = cb.call("sim_run_static", {"study": study})
-                if not res.get("ok"):
-                    return {"ok": False, "doc_id": d, "error": res.get("error", "solve failed")}
-                # Persist setup+results into the doc so they save inside the .step+.
-                _persist_study(d, {
-                    "type": "fea_static",
-                    "name": f"Static stress ({mat.get('name', material)})",
-                    "engine": "cpp",
-                    "material": mat,
-                    "fixtures": fixtures,
-                    "loads": loads,
-                    "mesh_fineness": mesh_fineness,
-                    "results": res.get("summary", {}),
-                    "n_dof": res.get("n_dof"),
-                })
-                return {"ok": True, "doc_id": d, "material": mat.get("name", material),
-                        "summary": res.get("summary", {}), "n_dof": res.get("n_dof"),
-                        "saved_to_study": True}
+                res = cb.call("sim_run_static", {"study": ctx["study"]})
+                return _collect_static(ctx, res, bc_notes)
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
@@ -370,6 +697,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
                                "note": "solving on a worker thread — poll get_job(job_id)"})
             return _dumps(_solve_sync_or_handoff("fea_static", _solve))
+        except _StudyRefusal as r:
+            return _dumps(r.payload)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -391,31 +720,11 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         background : if True, return a job_id and solve on a worker thread — poll get_job(job_id).
         """
         try:
-            d = _doc(doc_id)
-            fixtures = require_list(fixtures, "fixtures",
-                                     'a list of face queries held fixed, e.g. ["bottom"]')
-            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True)
-            mesh_fineness = _norm_fineness(mesh_fineness)
-            mat = _resolve_material(coerce_json_or_repr(material))
-            step = _tmp(".step")
-            cb.call("doc_export_step", {"doc_id": d, "path": step})
-            fixture_sets: list = []
-            for q in fixtures:
-                fixture_sets.extend(_sim_face_points(d, q))
-            # F6 (free-free modal): when fixtures=[] the caller is requesting an unconstrained
-            # solve — the C++ fea_modal_solve handles empty fixed_nodes by computing the full
-            # 6 rigid-body modes near 0 Hz followed by the elastic modes. Only reject when the
-            # caller DID supply fixture queries but NONE of them resolved to real face points
-            # (which is almost certainly a geometry-query mistake, not intentional free-free).
-            if fixtures and not fixture_sets:
-                return _dumps({"ok": False, "error": "no fixture faces resolved — "
-                               "the face queries you provided didn't match any surface points. "
-                               "Use query_geometry() to find the right face query, or pass "
-                               "fixtures=[] for a free-free (unconstrained) solve."})
-            # 2nd-order (tet10) elements: quadratic bending accuracy — no spurious split on
-            # a square section and no low-frequency bias the way tet4 had (Bug N-1).
-            study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
-                     "mesh_order": 2, "fineness": mesh_fineness}
+            bc_notes: list = []
+            ctx = _build_modal_study(fixtures, material, mesh_fineness, doc_id, bc_notes)
+            d = ctx["doc"]
+            fixture_sets = ctx["fixture_sets"]
+            study = ctx["study"]
 
             def _solve() -> dict:
                 # Free-free (no fixtures): the 0 Hz rigid-body cluster is 6-fold
@@ -426,7 +735,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 # any regression into a visible warning note instead of silently
                 # wrong mode numbering.
                 free_free = not fixture_sets
-                solve_n = max(n_modes + 6, 14) if free_free else n_modes
+                solve_n = _modal_solve_n(n_modes, free_free)
                 res = cb.call("sim_run_modal", {"study": study, "n_modes": solve_n})
                 if not res.get("ok"):
                     return {"ok": False, "doc_id": d,
@@ -434,10 +743,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 freqs = list(res.get("freqs_hz", []))
                 note = None
                 if free_free:
-                    def _n_rigid(fs: list) -> int:
-                        return sum(1 for f in fs if f < 0.5)  # rigid ~0 Hz, elastic >> 0.5 Hz
                     for _ in range(2):
-                        if _n_rigid(freqs) >= 6:
+                        if _n_rigid_modes(freqs) >= 6:
                             break
                         solve_n += 6
                         retry = cb.call("sim_run_modal",
@@ -445,28 +752,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         if not retry.get("ok"):
                             break
                         res, freqs = retry, list(retry.get("freqs_hz", []))
-                    if _n_rigid(freqs) < 6:
-                        note = (f"warning: free-free solve resolved only "
-                                f"{_n_rigid(freqs)}/6 rigid-body modes — the mode list "
-                                "may be missing rigid modes (eigensolver degenerate-"
-                                "cluster limitation); elastic frequencies are unaffected")
+                    note = _modal_rigid_note(freqs)
                     freqs = freqs[:n_modes]
-                _persist_study(d, {
-                    "type": "fea_modal",
-                    "name": f"Modal ({mat.get('name', material)})",
-                    "engine": "cpp",
-                    "material": mat,
-                    "fixtures": fixtures,
-                    "n_modes": n_modes,
-                    "mesh_fineness": mesh_fineness,
-                    "results": {"freqs_hz": freqs, "n_modes": len(freqs)},
-                })
-                out = {"ok": True, "doc_id": d, "material": mat.get("name", material),
-                       "freqs_hz": freqs, "n_modes": len(freqs),
-                       "saved_to_study": True}
-                if note:
-                    out["note"] = note
-                return out
+                return _collect_modal(ctx, freqs, n_modes, bc_notes, note)
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
@@ -474,6 +762,216 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
                                "note": "solving on a worker thread — poll get_job(job_id)"})
             return _dumps(_solve_sync_or_handoff("fea_modal", _solve))
+        except _StudyRefusal as r:
+            return _dumps(r.payload)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+
+    # ------------------------------------------------ asynchronous solves (sim_* job family)
+    # The synchronous tools above are unchanged. These four are the non-blocking contract:
+    # start -> poll -> collect, with a cancel that really kills the solver, and results that
+    # are never presented as converged unless they are.
+
+    @mcp.tool()
+    def sim_run(analysis: str = "fea_static",
+                fixtures: Optional[Union[list, str]] = None,
+                loads: Optional[Union[list, str]] = None,
+                material: Union[str, dict] = "steel",
+                mesh_fineness: Union[float, str] = 0.5,
+                n_modes: int = 6,
+                doc_id: Optional[str] = None,
+                study: Optional[str] = None,
+                label: Optional[str] = None) -> str:
+        """Start an FEA solve in a SEPARATE PROCESS and return a job_id immediately.
+
+        Use this instead of run_fea_static/run_fea_modal when you do not want to sit inside
+        the solve: the call returns in milliseconds, you keep working, and you collect the
+        answer later — including in a LATER TURN, because the job registry is persisted on
+        disk (a job outlives the process that started it).
+
+        analysis : "fea_static" (fixtures + loads) or "fea_modal" (fixtures; [] = free-free).
+                   `study=` is accepted as the same argument.
+        Every other argument means exactly what it means on run_fea_static / run_fea_modal,
+        and the study is built by the SAME setup code, so the answer is identical to the
+        synchronous one.
+
+        Then: sim_status(job_id) -> queued|running|done|failed|cancelled (+ progress, elapsed)
+              sim_results(job_id) -> the full result once done (partial=True while running)
+              sim_cancel(job_id)  -> kills the solver process and PROVES it is gone
+        """
+        try:
+            kind = str(study or analysis or "").strip().lower().replace("-", "_")
+            if kind in ("static", "stress"):
+                kind = "fea_static"
+            elif kind in ("modal", "frequency", "frequencies"):
+                kind = "fea_modal"
+            if kind not in _ASYNC_ANALYSES:
+                return _dumps({"ok": False, "error":
+                               f"sim_run(analysis={analysis!r}) is not an asynchronous "
+                               f"analysis. Supported: {list(_ASYNC_ANALYSES)}. Every other "
+                               "solver keeps its own background=True + get_job(job_id) path "
+                               "(run_cfd_flow, run_cfd_accurate, run_fea_frequency_response, "
+                               "run_fea_fatigue)."})
+            if fixtures is None:
+                raise ValueError(
+                    "sim_run needs fixtures=[...] — the face queries held fixed, e.g. "
+                    '["bottom"]. For an unconstrained modal solve pass fixtures=[].')
+            notes: list = []
+            if kind == "fea_static":
+                ctx = _build_static_study(fixtures, loads, material, mesh_fineness,
+                                          doc_id, notes)
+                method = "sim_run_static"
+                params = {"study": ctx["study"]}
+            else:
+                ctx = _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes)
+                ctx["n_modes"] = int(n_modes)
+                method = "sim_run_modal"
+                params = {"study": ctx["study"],
+                          "n_modes": _modal_solve_n(int(n_modes), ctx["free_free"])}
+            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            meta = {k: v for k, v in ctx.items() if k != "study"}
+            meta["notes"] = notes
+            if label:
+                meta["label"] = label
+            job = simjobs.start(kind, "core_rpc",
+                                {"method": method, "params": params}, meta)
+            return _dumps({"ok": True, "job_id": job["job_id"], "state": "running",
+                           "analysis": kind, "doc_id": ctx["doc"], "pid": job["pid"],
+                           "note": "solving in a separate process — this call did NOT wait. "
+                                   f"Poll sim_status('{job['job_id']}'), then "
+                                   f"sim_results('{job['job_id']}'). The job is persisted, so "
+                                   "it can be collected in a later turn.",
+                           "next_actions": [f"sim_status('{job['job_id']}')"]})
+        except _StudyRefusal as r:
+            return _dumps(r.payload)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+
+
+    @mcp.tool()
+    def sim_status(job_id: str) -> str:
+        """State of a sim_run job: queued|running|done|failed|cancelled, elapsed, progress.
+
+        The state is reconciled against the OPERATING SYSTEM, not just a stored flag: a
+        worker that died without writing a result is reported as `failed` with its last
+        output, never as `running` and never as `done`.
+        """
+        try:
+            st = simjobs.status(job_id)
+            if st.get("state") == "unknown":
+                return _dumps(st)
+            st.pop("meta", None)  # the resolved study setup is bulky and not useful here
+            state = st["state"]
+            if state == "done":
+                st["next_actions"] = [f"sim_results('{job_id}')"]
+            elif state == "running":
+                st["next_actions"] = [f"sim_status('{job_id}')",
+                                      f"sim_results('{job_id}', partial=True)",
+                                      f"sim_cancel('{job_id}')"]
+                st["note"] = ("still solving — nothing has converged yet; sim_results with "
+                              "partial=True returns the last snapshot, clearly marked partial")
+            return _dumps(st)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+
+
+    @mcp.tool()
+    def sim_cancel(job_id: str) -> str:
+        """Terminate a sim_run job's solver process (SIGTERM, then SIGKILL) and prove it died.
+
+        The reply carries the evidence — `pid`, the `signals` sent, `pid_alive_after` and
+        `group_alive_after` — and only reports state "cancelled" when the process (and its
+        whole process group, which catches solver subprocesses) is actually gone. If the
+        process survives, this returns ok:false and says the solver is STILL RUNNING rather
+        than flipping a flag and letting you believe the CPU was freed.
+        """
+        try:
+            return _dumps(simjobs.cancel(job_id))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+
+
+    @mcp.tool()
+    def sim_results(job_id: str, partial: bool = False) -> str:
+        """Collect a sim_run job's results.
+
+        partial=False (default): the full converged result, in exactly the shape the
+        synchronous tool returns. On a job that has NOT finished this REFUSES — it will not
+        hand back half a solution dressed as an answer.
+
+        partial=True: the last snapshot the solver published, always tagged
+        `partial: true, converged: false`. When the stage published nothing (a direct FEA
+        solve has no meaningful intermediate state) this says so instead of inventing one.
+        """
+        try:
+            st = simjobs.status(job_id)
+            state = st.get("state")
+            if state == "unknown":
+                return _dumps(st)
+            if partial:
+                snap = simjobs.partial(job_id)
+                base = {"job_id": job_id, "state": state, "partial": True,
+                        "converged": False, "elapsed_s": st.get("elapsed_s")}
+                if not snap:
+                    base.update(ok=False, error=(
+                        f"no partial results exist for {job_id}: the {st.get('kind')} solve "
+                        "published no intermediate state (a direct FEA solve has no "
+                        "converging iterations to report). This is NOT an empty result — "
+                        "nothing has been computed to report yet."))
+                    return _dumps(base)
+                base.update(ok=True, snapshot=snap, warning=(
+                    "PARTIAL SNAPSHOT — this is the solver's last intermediate state, NOT a "
+                    "converged solution. Do not quote these numbers as results."))
+                if state == "done":
+                    base["note"] = ("the job has since FINISHED — call "
+                                    f"sim_results('{job_id}') for the converged result")
+                return _dumps(base)
+            if state != "done":
+                out = {"ok": False, "job_id": job_id, "state": state,
+                       "elapsed_s": st.get("elapsed_s"),
+                       "error": f"job {job_id} is {state} — there are no converged results to "
+                                "return. Refusing to answer with a partial or absent solution."}
+                if state in ("running", "queued"):
+                    out["hint"] = (f"poll sim_status('{job_id}'), or "
+                                   f"sim_results('{job_id}', partial=True) for the last "
+                                   "snapshot (clearly marked partial)")
+                elif st.get("error"):
+                    out["solver_error"] = st["error"]
+                return _dumps(out)
+            raw = simjobs.raw_result(job_id)
+            if raw is None:
+                return _dumps({"ok": False, "job_id": job_id, "state": state,
+                               "error": "the job is marked done but its result file could not "
+                                        "be read — nothing can be reported honestly. Re-run "
+                                        "the solve."})
+            out = _collect_job(st, raw)
+            out.update(job_id=job_id, state="done", converged=True,
+                       elapsed_s=st.get("elapsed_s"))
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+
+
+    @mcp.tool()
+    def sim_jobs(limit: int = 20) -> str:
+        """List recent sim_run jobs (newest first) with their reconciled state and elapsed
+        time. Jobs persist across agent turns, so this also shows solves an earlier turn
+        started."""
+        try:
+            rows = []
+            for j in simjobs.list_jobs(int(limit)):
+                meta = j.pop("meta", None) or {}
+                j["doc_id"] = meta.get("doc")
+                if meta.get("label"):
+                    j["label"] = meta["label"]
+                rows.append(j)
+            return _dumps({"ok": True, "jobs": rows, "count": len(rows),
+                           "registry": str(simjobs.jobs_dir())})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -518,7 +1016,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             d = _doc(doc_id)
             fixtures = require_list(fixtures, "fixtures",
                                      'face queries held fixed, e.g. ["bottom"]')
-            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True)
+            bc_notes: list = []
+            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
             if excitation_dir is not None:
                 excitation_dir = require_list(excitation_dir, "excitation_dir",
@@ -607,12 +1106,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                 "total_grms": rand.get("total_grms"),
                                 "verdict": verdict},
                 })
-                return {"ok": True, "doc_id": d, "material": mat.get("name", material),
-                        "freqs_hz": freqs, "harmonic": harm, "random": rand,
-                        "verdict": verdict,
-                        "damping_assumption": f"zeta={zeta} (Q={1.0 / (2.0 * zeta):g}) — "
-                                              "assumed modal damping, not measured",
-                        "saved_to_study": True}
+                return _interpreted(
+                    {"ok": True, "doc_id": d, "material": mat.get("name", material),
+                     "freqs_hz": freqs, "harmonic": harm, "random": rand,
+                     "verdict": verdict,
+                     "damping_assumption": f"zeta={zeta} (Q={1.0 / (2.0 * zeta):g}) — "
+                                           "assumed modal damping, not measured",
+                     "saved_to_study": True}, bc_notes)
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
@@ -854,8 +1354,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                      'SAME plain-English face queries as run_fea_static')
             loads = require_list(loads, "loads",
                                   'SAME {face + force/pressure} shape as run_fea_static')
-            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True)
-            loads = _norm_bc_list(loads, "loads")
+            bc_notes: list = []
+            fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=bc_notes)
+            loads = _norm_bc_list(loads, "loads", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
             mat = _resolve_material(coerce_json_or_repr(material))
             Sut = float(mat.get("ultimate_mpa") or 0.0)
@@ -933,7 +1434,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                 "cycles": life["cycles"], "fos_endurance": life["fos_endurance"]},
                 })
                 life["saved_to_study"] = True
-                return life
+                return _interpreted(life, bc_notes)
 
             _autosave_all_open()
             if background:
@@ -1002,6 +1503,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                             (falls back to a typical value for the named material).
         """
         try:
+            bc_notes: list = []
             hot_faces = require_list(hot_faces, "hot_faces",
                                       'a list of {"face": <query>, "temperature": <°C>}')
             cold_faces = require_list(cold_faces, "cold_faces",
@@ -1010,9 +1512,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 loads = require_list(loads, "loads",
                                       'a list of {"face": <query>, "flux_w_m2": <q>} or '
                                       '{"face": <query>, "h_w_m2k": <h>} entries')
-                loads = _norm_bc_list(loads, "loads")
-            hot_faces = _norm_bc_list(hot_faces, "hot_faces")
-            cold_faces = _norm_bc_list(cold_faces, "cold_faces")
+                loads = _norm_bc_list(loads, "loads", notes=bc_notes)
+            hot_faces = _norm_bc_list(hot_faces, "hot_faces", notes=bc_notes)
+            cold_faces = _norm_bc_list(cold_faces, "cold_faces", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
             if transient is not None:
                 transient = require_mapping(transient, "transient",
@@ -1113,7 +1615,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                    "results": {"summary": res.get("summary", {}),
                                                "frames": frames,
                                                "envelope_max": res.get("envelope_max")}})
-                return _dumps(out)
+                return _dumps(_interpreted(out, bc_notes))
 
             from . import fea_advanced as fa
             if fa.ccx_path() is None:
@@ -1142,7 +1644,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    "note": "box-proxy 1-D conduction estimate; ccx GPL-2.0 subprocess."}
             _persist_study(d, {"type": "fea_thermal", "name": f"Thermal ({mat.get('name', material)})",
                                "engine": "calculix", "results": out})
-            return _dumps(out)
+            return _dumps(_interpreted(out, bc_notes))
         except CoreError as e:
             return _err(e)
         except Exception as e:  # noqa: BLE001
@@ -1178,7 +1680,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             d = _doc(doc_id)
             load = require_list(load, "load",
                                  'a single-item list [{"face": <query>, "force": [x,y,z]}]')
-            load = _norm_bc_list(load, "load")
+            bc_notes: list = []
+            load = _norm_bc_list(load, "load", notes=bc_notes)
             mat = _resolve_material(coerce_json_or_repr(material))
             E = float(mat["E_mpa"]); nu = float(mat.get("nu", 0.3))
             # A malformed load used to fall back to a hard-coded 1000 N SILENTLY (ok:true,
@@ -1213,7 +1716,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             _persist_study(d, {"type": "fea_buckling",
                                "name": f"Buckling ({mat.get('name', material)})",
                                "engine": "calculix", "results": out})
-            return _dumps(out)
+            return _dumps(_interpreted(out, bc_notes))
         except CoreError as e:
             return _err(e)
         except Exception as e:  # noqa: BLE001

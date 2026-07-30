@@ -748,7 +748,7 @@
   "piping_verify_cfd": "DAG verify node: compare 1D pipe-network pressure drop with 3D CFD pressure drop.",
   "plm_add_remote": "Register a remote profile for team sync. ``kind`` ∈ ``folder`` | ``ssh`` | ``https`` | ``chudware-cloud`` (config-only). Folder remotes use …",
   "plm_checkpoint": "Save a named checkpoint the user can return to. ``message`` describes the change in plain language. Returns ``{ok, commit, entry}``.",
-  "plm_compare": "Compare an item between two history points.",
+  "plm_compare": "Compare an item between two history points — including a RENDERED GRAPHICAL DIFF of the geometry that changed.",
   "plm_graph_brief": "One-node dossier: identity, degree, edge-kind histogram, neighbors.",
   "plm_graph_changes": "Diff the project graph against its last cached build.",
   "plm_graph_configure": "Read or update the per-project graph configuration.",
@@ -1663,7 +1663,7 @@
    "prompt_note": "Combined mass props over ALL bodies (per-body under mass.bodies[]); pass density_g_cm3 for non-steel; also sanity-checks the solid is closed/valid."
   },
   "mission_start": {
-   "prompt_note": "Compiles but does not execute — hand the graph to dag_run. Without an intake_analyst manifest you get the intake instruction back, not a plan."
+   "prompt_note": "Compiles but does not execute — hand the graph to dag_run. Needs a deliverable manifest; you may write it yourself. Call it without `manifest` and the refusal hands you a fill-in template."
   },
   "mission_status": {
    "prompt_note": "Phase-level view (stage_log, open questions) from the run's ledger; use dag_status for raw topology. Fails if the run has no ledger."

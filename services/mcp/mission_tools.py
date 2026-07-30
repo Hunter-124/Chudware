@@ -41,10 +41,10 @@ def register_mission_tools(mcp) -> None:
         """Plan a mission: validate the deliverable manifest and compile the
         role-assigned mission DAG (does NOT execute — call dag_run to run it).
 
-        INTAKE (turning the request into a manifest) is a role call; pass the
-        ``manifest`` the intake_analyst produced (or run the in-app
-        ``run_mission(request, provider, intake_fn=...)`` which does INTAKE for you).
-        Without a manifest this returns the intake instruction rather than guessing.
+        INTAKE (turning the request into a manifest) is normally an intake_analyst
+        role call, but you may author the manifest yourself. Calling this WITHOUT
+        ``manifest`` returns a fill-in ``manifest_template`` plus the legal
+        deliverable kinds and check tools — it never guesses a manifest for you.
 
         A blocking ambiguity or an invalid manifest returns ``ok=False`` with the
         validator findings and the block reason — the mission never fabricates a graph.
@@ -61,15 +61,30 @@ def register_mission_tools(mcp) -> None:
         returned — no behaviour change.
         """
         from services.agent.pipeline import (
-            validate_manifest, manifest_valid, blocking_ambiguities)
+            validate_manifest, manifest_valid, blocking_ambiguities,
+            manifest_template)
+        from services.agent.pipeline.manifest import (
+            VALID_KINDS, KNOWN_CHECK_TOOLS)
         from services.dag.mission_template import build_mission_graph
 
         if manifest is None:
+            # The refusal has to be ACTIONABLE. It used to name
+            # `run_mission(request, provider, intake_fn=...)` — a Python API no
+            # model can call — and never said what a manifest looks like, so the
+            # only reachable path was to guess §16 from nothing. Live 2026-07-29
+            # (case bench, K3): the model reasoned "manifest shape - unknown
+            # schema", declined to risk the call, narrated its next step instead,
+            # and the turn ended no_code having built nothing. Hand back the
+            # template it needs to succeed on the very next completion.
             return {
                 "ok": False,
-                "reason": "INTAKE not run: pass the intake_analyst's manifest, or "
-                          "use the in-app run_mission(request, provider, intake_fn=...) "
-                          "which performs INTAKE and drives all 8 phases",
+                "reason": "INTAKE not run: mission_start needs a deliverable "
+                          "manifest. Fill in `manifest_template` below (or have "
+                          "intake_analyst produce one) and call mission_start "
+                          "again with it as `manifest`.",
+                "manifest_template": manifest_template(),
+                "valid_kinds": sorted(VALID_KINDS),
+                "known_check_tools": sorted(KNOWN_CHECK_TOOLS),
                 "request": request,
             }
 
@@ -77,7 +92,10 @@ def register_mission_tools(mcp) -> None:
         finding_strs = [str(f) for f in findings]
         if not manifest_valid(findings):
             return {"ok": False, "reason": "manifest invalid (§16)",
-                    "findings": finding_strs}
+                    "findings": finding_strs,
+                    # Same reasoning as above: findings alone tell the model what
+                    # is wrong, not what right looks like.
+                    "manifest_template": manifest_template()}
         blocking = blocking_ambiguities(findings)
         if blocking:
             return {"ok": False, "reason": "blocking ambiguity — route to CLARIFY",
@@ -93,8 +111,11 @@ def register_mission_tools(mcp) -> None:
             "graph": graph,
             "deliverables": [d.get("id") for d in manifest.get("deliverables", [])],
             "findings": finding_strs,
+            # Naming dag_run is only useful if the caller can REACH it: the
+            # general lane starts without it and has to pull the pack first.
             "hint": "execute with dag_run(graph_json=<graph>), then track via "
-                    "mission_status(run_id)",
+                    "mission_status(run_id). If dag_run is not in your loadout, "
+                    "call enable_tools(categories=[\"delegate\"]) first.",
         }
 
     @mcp.tool()

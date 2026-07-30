@@ -297,6 +297,47 @@ def _validate_modification_target(
                 "existing doc", refs={"id": did, "target_refs": target_refs}))
 
 
+def manifest_template() -> dict[str, Any]:
+    """A minimal manifest that passes :func:`validate_manifest` cleanly.
+
+    Exists because "pass the intake_analyst's manifest" is unactionable advice to
+    a model: the shape lives in contract §16 and in this validator, nowhere the
+    model can read at call time. Live 2026-07-29 (case bench, K3): the model's own
+    reasoning said "manifest shape - unknown schema, but likely {deliverables:
+    [...]}", it never risked the call, narrated instead, and the turn died with the
+    tool budget untouched. ``mission_start`` returns this alongside its refusal so
+    the very next completion can construct a valid manifest.
+
+    Keep it VALID: ``test_manifest`` asserts ``validate_manifest`` finds no
+    error/blocking finding here, so a new rule cannot silently make the template
+    the harness advertises unusable.
+    """
+    return {
+        "schema": SCHEMA,
+        "request_verbatim": "<the user's request, unedited>",
+        "deliverables": [
+            {
+                "id": "DL1",
+                "kind": "part",                      # one of VALID_KINDS
+                "title": "<what this deliverable is>",
+                "depends_on": [],                    # other deliverable ids
+                "acceptance_criteria": [
+                    {
+                        "id": "AC1",
+                        "text": "<objectively checkable statement>",
+                        "check": {
+                            "tool": "measure_part",  # one of KNOWN_CHECK_TOOLS
+                            "pass_rule": "<PASS/FAIL rule over that tool's output>",
+                        },
+                    },
+                ],
+            },
+        ],
+        "assumptions": [],   # [{"text": ..., "needs_confirm": bool}]
+        "ambiguities": [],   # [{"text": ..., "blocking": bool, "question_id": ...}]
+    }
+
+
 def _detect_cycles(
     deliverables: list[dict],
     del_id_set: set[str],

@@ -63,9 +63,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "mission_start": {
         "prompt_note": (
-            "Compiles but does not execute — hand the graph to dag_run. "
-            "Without an intake_analyst manifest you get the intake "
-            "instruction back, not a plan."
+            "Compiles but does not execute — hand the graph to dag_run. Needs a "
+            "deliverable manifest; you may write it yourself. Call it without "
+            "`manifest` and the refusal hands you a fill-in template."
         ),
     },
     "mission_status": {

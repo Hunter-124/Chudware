@@ -521,17 +521,50 @@ _NEXT_STEP_OPENER_RE = re.compile(
 #: it now.", "Now fixing the slide numbers." Opus 5 stopped a live job dead
 #: with exactly this shape after nine calls of real analysis, and the
 #: I'll/let-me pattern above never saw it.
+#:
+#: The planning/dispatch half of this list was added 2026-07-29 after the case
+#: bench: "Now compiling the monolithic mission DAG with a full deliverable
+#: manifest." was not recognised as a promise at all, so it fell to the
+#: fabricated-finish gate, burned that gate's one nudge, and the next narration
+#: ended the turn `no_code`. A false positive here only ever costs ONE extra
+#: nudge ("take the step") — it can never accept a finish that should be
+#: rejected — so covering the way models actually narrate is the cheap side.
 _GERUND_PROMISE_RE = re.compile(
-    r"^(?:now\s+|first,?\s+|then\s+)?"
+    r"^(?:now\s+|first,?\s+|then\s+|next,?\s+)?"
     r"(?:fixing|updating|building|creating|writing|editing|adding|making|"
     r"generating|rendering|applying|implementing|regenerating|rebuilding|"
     r"patching|correcting|renumbering|rewriting|revising|preparing|"
-    r"finishing|completing|delivering|working on|starting)\b",
+    r"finishing|completing|delivering|working on|starting|"
+    # planning / dispatch / investigation narration
+    r"compiling|planning|designing|modelling|modeling|sketching|drafting|"
+    r"laying out|setting up|spinning up|kicking off|dispatching|delegating|"
+    r"running|executing|proceeding|continuing|moving on|"
+    r"gathering|collecting|researching|looking up|pulling|fetching|reading|"
+    r"computing|calculating|measuring|verifying|checking|validating|"
+    # tool-acquisition narration: "Enabling it to get dag_run." was the live
+    # reply that ended a turn as `confirmed` right after the model discovered
+    # it needed one more pack.
+    r"enabling|loading|switching|escalating|"
+    r"assembling|exporting|importing|saving)\b",
     re.IGNORECASE,
 )
 #: Clause boundaries INCLUDING dashes/semicolons — the live miss was an em-dash
 #: ("The listing got truncated - let me get the tail end of the directory.").
 _CLAUSE_SPLIT_RE = re.compile(r"[.!?\n;]|\s[-\u2013\u2014]\s")
+
+
+#: How many times ONE turn may push a mid-thought narration into taking its own
+#: next step. A single push was not enough for models that narrate between every
+#: tool call (K3): the second narration ended the turn with the tool budget
+#: almost untouched. Nudges are cheap (one completion) and can only ever be
+#: followed by a real finish check, so a small allowance recovers turns that used
+#: to die; the identical-reply guard in run_turn stops it becoming a loop.
+_CONTINUE_NUDGE_MAX = 3
+
+
+def _norm_reply(text: str) -> str:
+    """Whitespace/case-folded reply key — identity for the continue-nudge guard."""
+    return " ".join((text or "").split()).casefold()[:400]
 
 
 def _announces_next_step(text: str) -> bool:
@@ -543,8 +576,15 @@ def _announces_next_step(text: str) -> bool:
     if not clauses:
         return False
     last = clauses[-1]
-    if ":" in last:
-        return False  # a colon introduces delivered content, not a promise
+    # A colon introduces delivered content ("I'll explain: <answer>") — but only
+    # when something FOLLOWS it. A clause that ENDS on the colon promised a
+    # payload and shipped none, which is the opposite of delivery. Live
+    # 2026-07-29 (case bench, K3): "Manifest rejected - fixing schema with
+    # `kind`, `acceptance_criteria`, and `request_verbatim`:" was accepted as a
+    # bare finish, so a turn that had just been REJECTED by mission_start
+    # reported success=True stop_reason=confirmed and built nothing.
+    if ":" in last and last.split(":", 1)[1].strip():
+        return False
     if _NEXT_STEP_OPENER_RE.match(last):
         return True
     # A gerund opener is only a PROMISE when the clause states an intention
@@ -554,6 +594,9 @@ def _announces_next_step(text: str) -> bool:
     # an explicit now/next marker or a short clause. Mis-firing costs one extra
     # nudge; missing one strands the user's job half-done, so lean to detecting.
     if _GERUND_PROMISE_RE.match(last):
+        # The trailing colon is a promised-payload marker in its own right.
+        if last.endswith(":"):
+            return True
         words = last.split()
         return bool(re.search(r"\b(?:now|next|right away|asap)\b", last, re.IGNORECASE)
                     or len(words) <= 5)
@@ -1770,9 +1813,18 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     # finish that claims completed work with zero voluntary tool calls; the
     # second such finish ends the turn honestly (no_code) instead of looping.
     _novol_nudge = [0]
-    # At most one "you described the step instead of taking it" nudge, so a
-    # chatty model is pushed once and never loops.
+    # "You described the step instead of taking it." A mid-thought narration is
+    # NOT a finish attempt, so it gets its own allowance instead of spending the
+    # fabricated-finish gate's single nudge (live 2026-07-29, case bench: after
+    # task_list, K3 replied "Now compiling the mission DAG with a full
+    # deliverable manifest." — the unearned-finish gate fired first, burned
+    # `_novol_nudge`, and the second narration ended the turn `no_code` with 28
+    # of 30 tool calls unspent). Bounded two ways so a chatty model still
+    # terminates: a hard count, AND progress — a reply identical to one already
+    # nudged proves the push is not landing, so it falls through rather than
+    # re-asking forever.
     _continue_nudge = [0]
+    _continue_nudged: set[str] = set()
     # At most one "your last message was cut off" re-emit request per turn. A
     # second truncation must end the turn honestly (no_code) rather than burn
     # the whole budget re-asking for the same oversized directive.
@@ -2252,6 +2304,36 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                             _ecad_bootstrap_nudge = 0
                             continue
                     continue
+                # A reply that announces its NEXT action is mid-thought, not a
+                # finish. Live 2026-07-27 (HERC project): after two fs_list
+                # calls the model said "The listing got truncated - let me get
+                # the tail end of the directory" and the harness returned that
+                # as the completed answer. Push it to actually do the step.
+                #
+                # This runs BEFORE the fabricated-success gate on purpose. A
+                # narration claims nothing, so letting the unearned gate answer
+                # it first spent that gate's single nudge on the wrong problem
+                # and killed the next narration outright (live 2026-07-29, case
+                # bench: `no_code` after task_list with 28/30 tool calls left).
+                # Neither branch can return success, so turn honesty is
+                # unchanged - only which nudge the model is shown, and how many
+                # times a mid-thought reply may be pushed.
+                if (
+                    _announces_next_step(reply)
+                    and tool_calls_made < budget
+                    and _continue_nudge[0] < _CONTINUE_NUDGE_MAX
+                    and _norm_reply(reply) not in _continue_nudged
+                ):
+                    _continue_nudge[0] += 1
+                    _continue_nudged.add(_norm_reply(reply))
+                    messages.append({"role": "user", "content": _parts(
+                        "[UNFINISHED] You described the next step instead of "
+                        "taking it, and the turn is not over. Do it now with a "
+                        "real tool call. Only finish when the user's request is "
+                        "actually answered - then state the ANSWER, not a plan."
+                    )})
+                    last_reason = _RETRY
+                    continue
                 # Fabricated-success gate: a finish that claims work - or says
                 # nothing at all - while the turn did no real work is not done.
                 _unearned = _unearned_finish_block(
@@ -2265,25 +2347,6 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         continue
                     last_reason = _NOCODE
                     break
-                # A reply that announces its NEXT action is mid-thought, not a
-                # finish. Live 2026-07-27 (HERC project): after two fs_list
-                # calls the model said "The listing got truncated - let me get
-                # the tail end of the directory" and the harness returned that
-                # as the completed answer. Push it to actually do the step.
-                if (
-                    _announces_next_step(reply)
-                    and tool_calls_made < budget
-                    and _continue_nudge[0] < 1
-                ):
-                    _continue_nudge[0] += 1
-                    messages.append({"role": "user", "content": _parts(
-                        "[UNFINISHED] You described the next step instead of "
-                        "taking it, and the turn is not over. Do it now with a "
-                        "real tool call. Only finish when the user's request is "
-                        "actually answered - then state the ANSWER, not a plan."
-                    )})
-                    last_reason = _RETRY
-                    continue
                 bare_handoff = {
                     "status": "done",
                     "summary": (reply or "")[:600],
@@ -2418,17 +2481,19 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 # it now." and emitted a done envelope sailed straight through
                 # and the user watched it stop mid-job. A done handoff whose
                 # text announces the next action is a promise, not a result:
-                # push once to actually perform it in THIS turn. Bounded by the
-                # same single-nudge budget as the prose path, so a model that
-                # keeps promising still terminates instead of looping.
+                # push to actually perform it in THIS turn. Shares the prose
+                # path's bounded budget (count + identical-reply guard), so a
+                # model that keeps promising the SAME thing still terminates.
                 if (
                     _announces_next_step(_ho_text)
                     and tool_calls_made < budget
-                    and _continue_nudge[0] < 1
+                    and _continue_nudge[0] < _CONTINUE_NUDGE_MAX
+                    and _norm_reply(_ho_text) not in _continue_nudged
                     and _request_wants_work(request)
                     and callable(dispatch)
                 ):
                     _continue_nudge[0] += 1
+                    _continue_nudged.add(_norm_reply(_ho_text))
                     messages.append({"role": "user", "content": _parts(
                         "[UNFINISHED] You announced the next step instead of "
                         "performing it. Carry it out NOW, in this reply, with "

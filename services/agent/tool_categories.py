@@ -272,6 +272,18 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "ask_user",
         "dag_plan",
         "dag_status",
+        # dag_run + its gate verbs. `mission_start`'s own success hint says
+        # "execute with dag_run(graph_json=<graph>)", and `dag_run`'s note says
+        # an `interrupted` result means dag_approve/dag_abort — but NO pack
+        # carried any of the three, and the general lane's base loadout has
+        # none either, so the whole mission path dead-ended at a compiled graph
+        # nobody could execute. All three bind fine (`_bind_tool` resolves
+        # them); this was purely a missing advertisement. Live 2026-07-29 (case
+        # bench): "The tool note says the graph compiles but does not execute -
+        # I need dag_run to execute it, which isn't in my current loadout."
+        "dag_run",
+        "dag_approve",
+        "dag_abort",
         "ledger_get",
         "ledger_note",
         "buildgraph_plan",

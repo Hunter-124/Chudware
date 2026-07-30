@@ -2971,6 +2971,21 @@ def test_sketch_plane_is_not_stolen_by_the_ref_migration():
     ("thread", "diameter", "major_dia", {"pitch": 1.25}),
     ("mirror", "about", "plane", {}),
     ("sweep", "spine", "path", {"mode": "boss"}),
+    # SHEET METAL — measured live 2026-07-30 by reading the unfolded blank's X extent on an
+    # 80x40x2 base + two 90 deg flanges: `height`/`flange_length` built the 20 mm DEFAULT
+    # wall (blank 124.106 mm instead of 134.106), `bend_radius` used the default radius
+    # (129.540), `kfactor`/`k` used k=0.45 (135.677). All silently, all reported ok.
+    ("sm_base_flange", "sheet_thickness", "thickness", {}),
+    ("sm_base_flange", "gauge", "thickness", {}),
+    ("sm_base_flange", "bend_radius", "default_bend_radius", {"thickness": 2}),
+    ("sm_base_flange", "kfactor", "k_factor", {"thickness": 2}),
+    ("sm_edge_flange", "height", "length", {}),
+    ("sm_edge_flange", "flange_length", "length", {}),
+    ("sm_edge_flange", "bend_radius", "radius", {}),
+    ("sm_edge_flange", "k", "k_factor", {}),
+    ("sm_edge_flange", "bend_angle", "angle", {}),
+    ("sm_hem", "hem_length", "length", {}),
+    ("sm_jog", "step", "offset", {}),
 ])
 def test_type_param_alias_reaches_the_key_the_engine_reads(ftype, alias, canon, extra):
     notes: list = []
@@ -2993,6 +3008,21 @@ def test_type_param_alias_leaves_an_unlisted_type_alone():
     ops = [{"op": "add_feature", "feature": {
         "type": "box", "name": "B", "params": {"length": 40, "width": 30, "height": 20}}}]
     assert M._normalize_type_param_aliases(ops, []) is ops
+
+
+@pytest.mark.parametrize("ftype", ["sm_flat_pattern", "asm_linear_pattern",
+                                   "asm_circular_pattern"])
+def test_a_canonical_type_containing_the_word_pattern_is_not_retyped(ftype):
+    """Measured live 2026-07-30: {"type":"sm_flat_pattern"} — the exact op the sheetmetal
+    cheatsheet tells the model to send to unfold the blank — was rewritten to a
+    `linear_pattern` because its NAME contains "pattern", then rejected with
+    «params.count1: required for linear_pattern; params.spacing1: …; refs.dir1: …;
+    refs.features: …». The sheet-metal flat pattern could not be produced at all through
+    add_features. The two assembly component patterns fall the same way."""
+    ops = [{"op": "add_feature", "feature": {"type": ftype, "name": "F", "params": {}}}]
+    notes: list = []
+    assert M._normalize_pattern_ops(ops, notes) is ops
+    assert notes == []
 
 
 def test_doc_name_refs_resolve_a_feature_an_earlier_call_built(monkeypatch):

@@ -68,8 +68,10 @@ system_prompt: |
   4. Dimension from measured values only. Prefer functional / manufacturing dims
      over redundant chains. Add GD&T (add_gdt) and surface-finish callouts where
      the spec or process requires them; omit decoration.
-  5. Fill the title block via set_titleblock (part name, rev, material, units,
-     scale). Export with export_drawing when the package is complete; if export
+  5. Fill the title block via set_titleblock (title = the part's NAME, rev,
+     material, finish, scale, part_number, drawn_by, date). There is no units
+     cell — units are a document property and units= is refused.
+     Export with export_drawing when the package is complete; if export
      cannot run, the handoff summary must still list every view and annotation
      so a human can finish.
   6. Handoff: drawing_id, views[], annotations[], export_artifact (path or null),

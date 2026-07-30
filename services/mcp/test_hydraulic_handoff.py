@@ -381,3 +381,129 @@ def test_live_solve_estimate_vs_solve_within_tolerance():
         doc=json.dumps(_circuit()), tolerance_pct=30.0))
     assert res["stage"] == "solved"
     assert res["verify"]["pass"], res["verify"]
+
+
+# ----------------------------------------- guide-verbatim dialect (measured 2026-07-30)
+# Driving cad_guide("hydraulic")'s own workflow verbatim refused half its steps: the guide
+# said "Add pump, valve, cylinder, reservoir, etc." and the schema's frozen enum rejects
+# `cylinder`, `motor`, `check_valve`, `relief_valve`; and hydraulic_fea_handoff(axis="z")
+# died in JSON parsing with "could not parse inputs" for a word every other sim tool takes.
+
+
+@pytest.mark.parametrize("supplied,canon", [
+    ("cylinder", "cylinder_linear"),
+    ("linear_cylinder", "cylinder_linear"),
+    ("actuator", "cylinder_linear"),
+    ("rotary_actuator", "cylinder_rotary"),
+    ("motor", "motor_hydraulic"),
+    ("check_valve", "valve_check"),
+    ("relief_valve", "valve_relief"),
+    ("directional_valve", "valve_directional"),
+    ("flow_control_valve", "valve_flow_control"),
+    ("tank", "reservoir"),
+    ("heat exchanger", "heat_exchanger"),
+])
+def test_component_type_spellings_fold_onto_the_frozen_enum(supplied, canon):
+    got, note = ht._resolve_component_type(supplied)
+    assert got == canon, (supplied, got)
+    assert note and supplied in note and canon in note, note
+
+
+def test_a_canonical_component_type_is_returned_unchanged_with_no_note():
+    """Identity for the shape that already worked — a note on a no-op would be noise."""
+    for t in ("pump", "cylinder_linear", "valve_relief", "reservoir"):
+        got, note = ht._resolve_component_type(t)
+        assert (got, note) == (t, None), (t, got, note)
+
+
+def test_a_bare_valve_stays_refused_because_four_valve_types_exist():
+    """Guessing which valve a circuit needs would change what the circuit DOES, so this is
+    the one generic noun that must NOT be mapped."""
+    with pytest.raises(ValueError) as exc:
+        ht._resolve_component_type("valve")
+    msg = str(exc.value)
+    assert "ambiguous" in msg
+    for member in ("valve_directional", "valve_check", "valve_relief", "valve_flow_control"):
+        assert member in msg, msg
+
+
+def test_an_unknown_component_type_is_passed_through_for_the_core_to_reject():
+    """The enum lives in the core; the normalizer only fixes SPELLINGS and must not start
+    inventing its own vocabulary errors."""
+    assert ht._resolve_component_type("flux_capacitor") == ("flux_capacitor", None)
+
+
+@pytest.mark.parametrize("word,vec", [
+    ("z", [0.0, 0.0, 1.0]), ("+z", [0.0, 0.0, 1.0]), ("-z", [0.0, 0.0, -1.0]),
+    ("x", [1.0, 0.0, 0.0]), ("-x", [-1.0, 0.0, 0.0]), ("Y", [0.0, 1.0, 0.0]),
+    ("up", [0.0, 0.0, 1.0]), ("down", [0.0, 0.0, -1.0]),
+])
+def test_axis_words_resolve_to_the_z_up_vector(word, vec):
+    assert ht._axis_arg(word) == vec
+
+
+def test_an_explicit_axis_vector_is_untouched_and_json_still_parses():
+    assert ht._axis_arg([0, 1, 0]) == [0, 1, 0]
+    assert ht._axis_arg("[0, 1, 0]") == [0, 1, 0]
+    assert ht._axis_arg(None) is None
+
+
+def test_a_word_axis_reaches_the_mount_force_math_unchanged():
+    """The point of the fix: axis="z" must give the same envelope as axis=[0,0,1], and the
+    extend force must be the hand-calc pi/4 d^2 P (50 mm bore @ 200 bar -> 39269.9 N)."""
+    def _extend(axis):
+        env = ht._fea_handoff_envelope(bore_mm=50.0, rod_mm=28.0, max_pressure_bar=200.0,
+                                       axis=axis, efficiency=1.0,
+                                       load_face="the mount", fixture_face="the base")
+        assert sh.validate_envelope(env) == []
+        return next(c for c in env["conditions"]
+                    if c.get("case") == "extend_max_pressure")["value"]
+
+    word, vec = _extend(ht._axis_arg("z")), _extend([0.0, 0.0, 1.0])
+    assert word == vec, (word, vec)
+    assert word[2] == pytest.approx(-math.pi / 4.0 * 0.05 ** 2 * 200e5, rel=1e-4)
+
+
+# ------------------------------- unaddressable piping nodes (measured 2026-07-30)
+# Node ids are DERIVED by snapping run endpoints and published only by a successful solve's
+# node_menu, so a first boundary can only guess one — and the refusal named the alternative
+# shapes without naming a single addressable node.
+
+def _one_run_doc():
+    return {"schema": "aicad.piping/1", "id": "d", "name": "skid",
+            "units": {"system": "MMGS"},
+            "runs": [{"id": "r1", "path": [[0, 0, 0], [3000, 0, 0], [3000, 2000, 0]],
+                      "nps": 2, "schedule": "40", "end_type": "BW"}],
+            "fittings": []}
+
+
+def test_a_node_resolution_refusal_now_publishes_the_run_endpoints():
+    res = pt._with_run_endpoints(
+        {"ok": False, "reason": "boundary reference {'node': 'n2'} did not resolve to a node",
+         "hint": "use {'node':'n0'}"}, _one_run_doc())
+    assert res["addressable_endpoints"] == [
+        {"run": "r1", "end": "start", "xyz": [0, 0, 0]},
+        {"run": "r1", "end": "end", "xyz": [3000, 2000, 0]}]
+    assert "Node ids only exist after a solve" in res["hint"]
+    assert "use {'node':'n0'}" in res["hint"]  # the core's own hint is kept
+
+
+def test_a_suppressed_or_degenerate_run_is_not_offered_as_addressable():
+    doc = _one_run_doc()
+    doc["runs"].append({"id": "r2", "suppressed": True, "path": [[0, 0, 0], [1, 0, 0]]})
+    doc["runs"].append({"id": "r3", "path": [[9, 9, 9]]})  # <2 points: no endpoints
+    res = pt._with_run_endpoints(
+        {"ok": False, "reason": "did not resolve to a node"}, doc)
+    assert {e["run"] for e in res["addressable_endpoints"]} == {"r1"}
+
+
+def test_a_successful_solve_and_an_unrelated_failure_are_left_alone():
+    """The enrichment must be scoped to the one refusal it explains — otherwise it becomes
+    noise on every reply."""
+    ok = {"ok": True, "links": []}
+    assert pt._with_run_endpoints(dict(ok), _one_run_doc()) == ok
+    other = {"ok": False, "reason": "piping document failed schema validation"}
+    assert pt._with_run_endpoints(dict(other), _one_run_doc()) == other
+    assert pt._with_run_endpoints({"ok": False, "reason": "did not resolve to a node"},
+                                  None) == {"ok": False,
+                                            "reason": "did not resolve to a node"}

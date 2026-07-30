@@ -2135,9 +2135,7 @@ def board_mutation_readback(board: dict, *, layer: Optional[str] = None,
         "ok": True,
         "kind": "board_readback",
         "layer": L,
-        "ascii": ascii_txt,
-        "ascii_block": f"{header}\n{ascii_txt}",
-        "ascii_ruled": annotate_ascii_with_rulers(ascii_txt),
+        "ascii_ruled": f"{header}\n{annotate_ascii_with_rulers(ascii_txt)}",
         "summary": summary,
         "findings": compact_findings,
         "findings_total": len(findings),
@@ -2236,18 +2234,21 @@ def attach_sketch_readback(response: dict, sketch: dict, **kwargs: Any) -> dict:
 
 
 def attach_board_readback(response: dict, board: dict, **kwargs: Any) -> dict:
-    """Mutate *response* in place with compact board ASCII + net_delta."""
+    """Mutate *response* in place with compact board ASCII + net_delta.
+
+    Says each thing ONCE, matching ``attach_sketch_readback``. Measured 2026-07-30 on a
+    nine-footprint ESP32 board: this used to copy ``ascii`` (1519), ``ascii_block`` (1553)
+    and ``summary`` (879) up beside an ``ascii_readback`` that already carried them plus a
+    third rendering ``ascii_ruled`` (1763) — 21.5k of readback inside a 28.1k reply, the
+    same drawing four times. Only ``ascii_ruled`` survives: it is a strict superset whose
+    col/row rulers are what ``apply_ascii_edits(kind='pcb')`` resolves cells against.
+    ``summary`` is still filled when the tool has none of its own (it is the headline).
+    """
     try:
         rb = board_mutation_readback(board, **kwargs)
         response["ascii_readback"] = rb
-        response["ascii"] = rb["ascii"]
-        response["ascii_block"] = rb["ascii_block"]
-        response["board_summary"] = rb["summary"]
-        if "summary" not in response or not response.get("summary"):
+        if not response.get("summary"):
             response["summary"] = rb["summary"]
-        response["net_delta"] = rb["net_delta"]
-        response.setdefault("findings", rb["findings"])
-        response["readback_hint"] = rb["hint"]
     except Exception as e:  # noqa: BLE001
         response["ascii_readback"] = {
             "ok": False, "error": f"board readback unavailable: {e}",
@@ -2896,8 +2897,7 @@ def schematic_mutation_readback(sch: dict, *, pitch_mm: float = 2.54,
     return {
         "ok": True,
         "kind": "schematic_readback",
-        "ascii": ascii_txt,
-        "ascii_block": f"{header}\n{ascii_txt}",
+        "ascii_ruled": f"{header}\n{annotate_ascii_with_rulers(ascii_txt)}",
         "summary": summary,
         "findings": compact,
         "findings_total": len(findings),
@@ -2915,18 +2915,19 @@ def schematic_mutation_readback(sch: dict, *, pitch_mm: float = 2.54,
 
 
 def attach_schematic_readback(response: dict, sch: dict, **kwargs: Any) -> dict:
+    """Mutate *response* in place with the schematic ``ascii_readback`` block.
+
+    Says each thing ONCE (see ``attach_sketch_readback``). Measured 2026-07-30 on a
+    nine-symbol ESP32 sheet: ``ascii`` (671) and ``ascii_block`` (698) were the same
+    drawing twice inside the block and copied AGAIN to the top level alongside a second
+    copy of the 871-char summary and of the 22k ``index``. One ruled picture remains —
+    its col/row rulers are the addressing ``apply_ascii_edits(kind='schematic')`` reads.
+    """
     try:
         rb = schematic_mutation_readback(sch, **kwargs)
         response["ascii_readback"] = rb
-        response["ascii"] = rb["ascii"]
-        response["ascii_block"] = rb["ascii_block"]
-        response["schematic_summary"] = rb["summary"]
-        if "summary" not in response or not response.get("summary"):
+        if not response.get("summary"):
             response["summary"] = rb["summary"]
-        response.setdefault("findings", rb["findings"])
-        response["grid"] = rb.get("grid")
-        response["index"] = rb.get("index")
-        response["readback_hint"] = rb["hint"]
     except Exception as e:  # noqa: BLE001
         response["ascii_readback"] = {
             "ok": False, "error": f"schematic readback unavailable: {e}",

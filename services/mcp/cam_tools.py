@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from typing import Any, Optional
 
@@ -301,6 +302,99 @@ def _resolve_extract_kind(value: Any) -> str:
         "the 'all' payload, which carries no `regions` and no `profile`.")
 
 
+#: Geometry containers `cam_add_operation` forwards to the engine. An operation whose
+#: geometry dict carries ONLY empty ones cannot generate a single move.
+_GEOMETRY_SLOTS = ("regions", "contours", "points", "profile", "mesh")
+
+
+def _current_part_step() -> Optional[str]:
+    """Export the current part to a temp STEP for the cam_extract RPC, or None when there
+    is no current part. Same export cam_extract itself performs."""
+    doc = _CUR.get("doc_id")
+    if not doc:
+        return None
+    p = os.path.join(tempfile.gettempdir(), f"chudware_cam_stock_{os.getpid()}.step")
+    cb.call("export_file", {"doc_id": doc, "path": p, "format": "step"})
+    return p
+
+
+def _materialize_offset_stock(st: dict) -> tuple[dict, Optional[str]]:
+    """Turn an OFFSET stock into a concrete box around the current part's bbox.
+
+    ``box_offset`` is the engine's default stock type AND the default this tool hands the
+    core, but core/cam/stock_sim.cpp 181-190 resolves it from ``min``/``max`` — which a
+    standalone CAM job (cam_new_job carries no model) never has. Measured live 2026-07-30:
+    a setup created with the tool's own default stock simulated as
+    ``{ok: false, error: "stock has zero extent", stock_volume_mm3: 0}`` while the SAME job
+    with an explicit box gave stock 120000.0 / removed 41936.0 / machined 0.349. So the
+    documented default ("a box-offset of the model bbox") silently produced an unsimulatable
+    setup. Resolve the bbox here, which is exactly what the docstring already promises.
+    """
+    kind = str(st.get("type") or "").strip().lower()
+    if kind not in ("box_offset", "cylinder_offset"):
+        return st, None
+    if st.get("min") is not None and st.get("max") is not None:
+        return st, None            # the caller already pinned the extent
+    try:
+        path = _current_part_step()
+        if not path:
+            return st, ("stock type 'box_offset' needs a part to offset and there is no "
+                        "current part — simulation will report 'stock has zero extent'. "
+                        "Build/open the part first, or pass an explicit "
+                        "stock={'type':'box','min':[...],'max':[...]}.")
+        box = ((cb.call("cam_extract", {"path": path, "kind": "stock"})
+                .get("stock") or {}).get("box") or {})
+        lo, hi = box.get("min"), box.get("max")
+        if not (isinstance(lo, list) and isinstance(hi, list) and len(lo) == 3 == len(hi)):
+            return st, None
+    except Exception as e:  # noqa: BLE001
+        return st, (f"could not measure the current part to resolve the '{kind}' stock "
+                    f"({type(e).__name__}: {e}); simulation may report a zero-extent stock")
+    oxy = float(st.get("off_xy") or 0.0)
+    otop = float(st.get("off_ztop") or 0.0)
+    obot = float(st.get("off_zbot") or 0.0)
+    out = dict(st)
+    out["type"] = "box"
+    out["min"] = [lo[0] - oxy, lo[1] - oxy, lo[2] - obot]
+    out["max"] = [hi[0] + oxy, hi[1] + oxy, hi[2] + otop]
+    return out, (f"stock '{kind}' resolved against the current part's bbox to "
+                 f"box min={out['min']} max={out['max']} (off_xy={oxy}, off_ztop={otop}, "
+                 f"off_zbot={obot}) — an unresolved offset stock has no extent and "
+                 f"simulates as 0 mm^3")
+
+
+def _toolpath_digest(tp: Any) -> Any:
+    """A toolpath without its per-move array.
+
+    Measured live 2026-07-30: ONE pocket2d on a 100x60x20 block returned **894,116 chars**
+    from cam_generate — 4,500 individual move objects — which is larger than most context
+    windows and carries nothing a caller can act on that the digest below does not. The
+    G-code is cam_post's job; cam_generate's job is to say whether paths exist and how big
+    they are."""
+    if not isinstance(tp, dict):
+        return tp
+    moves = tp.get("moves")
+    if not isinstance(moves, list):
+        return tp
+    kinds: dict = {}
+    for mv in moves:
+        if isinstance(mv, dict):
+            kinds[str(mv.get("kind", "?"))] = kinds.get(str(mv.get("kind", "?")), 0) + 1
+    out = {k: v for k, v in tp.items() if k != "moves"}
+    out["move_count"] = len(moves)
+    out["moves_by_kind"] = dict(sorted(kinds.items()))
+    return out
+
+
+#: A posted line that commands machine motion: a G0/G1/G2/G3 word, or a bare axis word on a
+#: modal-motion line (every dialect here emits `X1.234 Y5.678` continuation lines).
+_MOTION_RE = re.compile(r"^\s*(?:N\d+\s+)?(?:G0*[0-3](?![\d.])|[XYZABCUVW]-?[\d.])")
+
+
+def _motion_line_count(gcode: str) -> int:
+    return sum(1 for ln in str(gcode or "").splitlines() if _MOTION_RE.match(ln))
+
+
 def register_cam_tools(mcp: FastMCP) -> None:
     """Attach the CAM toolpath/post/sim tools to the FastMCP server."""
 
@@ -455,6 +549,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
                 ):
                     if src in hit and dst not in mach:
                         mach[dst] = hit[src]
+            st, stock_note = _materialize_offset_stock(st)
             setup = {"name": name, "machine": mach, "stock": st}
             if wcs:
                 # LIVE-DIALECT guard: a stringified `wcs` would otherwise pass through
@@ -464,6 +559,8 @@ def register_cam_tools(mcp: FastMCP) -> None:
             r["setup_id"] = r.get("id_map", {}).get("_s")
             if note:
                 r["material_note"] = note
+            if stock_note:
+                r["stock_note"] = stock_note
             stats = r.get("job_stats") or {}
             r["changes"] = (f"setup '{name}' added (machine={mach.get('kind')}, "
                              f"material={resolved}, stock={st.get('type')}); "
@@ -483,7 +580,10 @@ def register_cam_tools(mcp: FastMCP) -> None:
             # no attribute 'get'`): `stock.get(...)` below blows up on a stringified stock
             # dict with a bare AttributeError. Coerce/type-check first.
             stock = require_mapping(stock, "stock", "a stock dict, e.g. {'type':'box',...}")
+            stock, stock_note = _materialize_offset_stock(stock)
             r = _apply([{"op": "set_stock", "setup_id": setup_id, "stock": stock}])
+            if stock_note:
+                r["stock_note"] = stock_note
             r["changes"] = f"stock on setup {setup_id} set to type={stock.get('type', '?')}"
             return _dumps(r)
         except Exception as e:  # noqa: BLE001
@@ -509,6 +609,22 @@ def register_cam_tools(mcp: FastMCP) -> None:
             geometry = require_mapping(geometry, "geometry", "a geometry dict") if geometry else None
             heights = require_mapping(heights, "heights", "a heights dict, e.g. {'clearance':5}") if heights else None
             params = require_mapping(params, "params", "an op-params dict, e.g. {'stepover':2}") if params else None
+            # An operation whose geometry dict names its slots but leaves every one EMPTY
+            # is guaranteed to cut nothing. Measured live 2026-07-30: geometry={"regions":[]}
+            # (what cam_extract returns when the section Z misses the part) was accepted with
+            # "pocket2d operation added (tool #1)", cam_generate then warned "pocket: no
+            # regions", and cam_post still answered ok:true with a 9-line header-only
+            # program. Reject at the point the mistake is still cheap and locatable.
+            named = sorted(k for k in _GEOMETRY_SLOTS if k in geometry) if geometry else []
+            if named and not any(geometry.get(k) for k in named):
+                raise ValueError(
+                    f"{type} operation NOT added: `geometry` carries no geometry — "
+                    f"{'/'.join(named)} is empty. An operation with empty geometry generates "
+                    "zero toolpaths and posts a header-only program. Get real geometry first: "
+                    "cam_extract(kind='section', z=<a Z INSIDE the part>) for regions, "
+                    "kind='holes' for drill points, kind='profile' for a turning profile — "
+                    "cam_extract(kind='stock') reports the part's bbox so you can pick a Z "
+                    "inside it.")
             op: dict = {"type": type, "tool_number": tool_number}
             if name:
                 op["name"] = name
@@ -593,15 +709,35 @@ def register_cam_tools(mcp: FastMCP) -> None:
     # ------------------------------------------------------------------ generate / sim / post
     @mcp.tool()
     def cam_generate(setup_id: Optional[str] = None, op_id: Optional[str] = None) -> str:
-        """Generate toolpaths for the job (or one setup / one op). Returns the toolpaths +
-        any warnings (e.g. a tool too large for a pocket)."""
+        """Generate toolpaths for the job (or one setup / one op). Returns a per-toolpath
+        DIGEST — bbox, cut length, cycle time, move count and a per-kind move breakdown —
+        plus any warnings (e.g. a tool too large for a pocket). The individual moves are not
+        echoed: one pocket on a 100x60 block is ~4,500 of them. Post the job for the actual
+        motion (cam_post)."""
         try:
             params: dict = {"doc_id": _job()}
             if setup_id:
                 params["setup_id"] = setup_id
             if op_id:
                 params["op_id"] = op_id
-            return _dumps(cb.call("cam_generate", params))
+            r = cb.call("cam_generate", params)
+            paths = r.get("toolpaths") if isinstance(r, dict) else None
+            if isinstance(paths, list):
+                r["toolpaths"] = [_toolpath_digest(tp) for tp in paths]
+                moves = sum(int(tp.get("move_count") or 0) for tp in r["toolpaths"]
+                            if isinstance(tp, dict))
+                warns = r.get("warnings") or []
+                # A generate that produced NOTHING is the head of the false-green chain that
+                # ends in a header-only posted program — say so here, in the summary the
+                # caller reads, not only in a `warnings` list that is easy to skim past.
+                r["changes"] = (
+                    f"generated {len(paths)} toolpath(s), {moves} move(s)"
+                    if paths and moves else
+                    "generated NO toolpaths — nothing will be posted"
+                ) + (f"; {len(warns)} warning(s): "
+                     + "; ".join(str(w.get("error") if isinstance(w, dict) else w)
+                                 for w in warns[:5]) if warns else "")
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -627,7 +763,10 @@ def register_cam_tools(mcp: FastMCP) -> None:
                  program_name: str = "Chudware", program_number: int = 1000,
                  sequence_numbers: bool = False) -> str:
         """Post-process to controller G-code. `dialect` overrides the job default. Returns the
-        NC program text + line count, tool changes, and estimated time."""
+        NC program text + line count, MOTION line count, tool changes, and estimated time.
+
+        A program with no motion at all is reported as a FAILURE, not a success: the posted
+        text would be a header and an M30 with nothing between them."""
         try:
             params: dict = {"doc_id": _job(),
                             "options": {"program_name": program_name,
@@ -637,7 +776,30 @@ def register_cam_tools(mcp: FastMCP) -> None:
                 params["dialect"] = dialect
             if setup_id:
                 params["setup_id"] = setup_id
-            return _dumps(cb.call("cam_post", params))
+            r = cb.call("cam_post", params)
+            gcode = r.get("gcode") if isinstance(r, dict) else None
+            if isinstance(gcode, str):
+                motion = _motion_line_count(gcode)
+                r["motion_line_count"] = motion
+                if motion == 0:
+                    # THE classic false green. Measured live 2026-07-30: an operation whose
+                    # geometry produced no regions posted ok:true / line_count:9 /
+                    # warnings:[] and a program that is G21 G90 G17 G40 M5 M9 M30 — a valid
+                    # NC file that machines nothing. cam_generate DID warn ("pocket: no
+                    # regions"); the post swallowed it and answered success.
+                    r["ok"] = False
+                    r["error"] = (
+                        f"posted program has {r.get('line_count', len(gcode.splitlines()))} "
+                        "line(s) but NOT ONE motion command — it is a header and an end-of-"
+                        "program with nothing between them, and it machines nothing. The "
+                        "toolpaths are empty: run cam_generate and read its warnings (a "
+                        "pocket with no regions, a tool larger than the pocket, an operation "
+                        "with no geometry). Fix the operation, regenerate, then post again.")
+                r["changes"] = (f"posted {r.get('line_count', '?')} line(s) of "
+                                f"{dialect or 'job-default'} G-code, {motion} motion line(s), "
+                                f"{r.get('tool_changes', '?')} tool change(s), "
+                                f"est {round(float(r.get('est_time_s') or 0.0), 1)} s")
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

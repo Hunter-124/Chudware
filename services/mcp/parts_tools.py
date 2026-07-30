@@ -45,6 +45,7 @@ See contracts/parts.md for the full PartRecord envelope spec.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Annotated, Any
@@ -254,8 +255,12 @@ _PLACE_DOC_HINT = (
     'open doc: part_place("ecad:Device:R", doc=sch_doc, '
     'params={"pos": {"x": 10, "y": 20}}).')
 
-# geometry_ref kinds that CREATE their own document (core/parts/place.cpp::route).
-_MECH_KINDS = frozenset({"core_family", "generate_model", "import_file"})
+# geometry_ref kinds that CREATE their own document (core/parts/place.cpp::route
+# plus the parametric_* families place_parametric_impl builds below).
+_MECH_KINDS = frozenset({"core_family", "generate_model", "import_file",
+                         "parametric_stepper_motor", "parametric_shaft_collar",
+                         "parametric_shaft_coupler", "parametric_timing_pulley",
+                         "parametric_heatsink"})
 
 
 # Descriptive-kwarg keys whose NAME adds nothing to a free-text search — the
@@ -940,6 +945,305 @@ def reverse_engineer_product_impl(part_id: str = "", url: str = "", title: str =
                 "hint": ""}
 
 
+# ---------------------------------------------------------------------------
+# Parametric catalog placement — motor / motion / thermal families.
+#
+# LIVE GAP (measured 2026-07-30 against the shipped 3182-record index): four
+# catalog adapters mint geometry_ref kinds that NOTHING routes —
+# stepper_motors_adapter -> parametric_stepper_motor (50 records),
+# belts_pulleys_adapter -> parametric_timing_pulley (122) / parametric_timing_belt
+# (126), shaft_couplings_adapter -> parametric_shaft_coupler (44) /
+# parametric_shaft_collar (32), heatsinks_adapter -> parametric_heatsink (10).
+# core/parts/place.cpp::route knows seven kinds and none of them are these, so
+# `part_search("NEMA 17 stepper") -> part_place(...)` — the exact two-step flow
+# services/agent/skills/builtin/source-parts advertises with the keywords
+# "nema"/"stepper" — answered "Unknown geometry_ref kind
+# 'parametric_stepper_motor'" for all 384 of those records. Search found them,
+# placement refused them, and the model had nowhere to go.
+#
+# Every one of these is a prismatic/revolved envelope, so it is built HERE from
+# the record's own spec as ordinary add_feature ops through doc_apply_ops: the
+# same editable feature-tree document every other placement leg returns, no new
+# engine route, nothing to rebuild. Dimensions come from the spec — the ONE value
+# no spec carries (a motor's shaft protrusion, which is a per-SKU option and not
+# part of the NEMA frame standard) is a documented frame nominal, reported in
+# detail.assumptions and overridable through `params`, mirroring how this catalog
+# already ships its holding-torque band ("representative ... not a specific
+# vendor SKU spec" — stepper_motors_adapter provenance).
+# ---------------------------------------------------------------------------
+
+def _dim(value) -> dict:
+    """A doc-schema dimension slot ({value, expr}) from a plain number."""
+    return {"value": float(value), "expr": None}
+
+
+def _add_feature(ftype: str, name: str, params: dict) -> dict:
+    return {"op": "add_feature",
+            "feature": {"type": ftype, "name": name, "params": params}}
+
+
+def _cyl(name: str, *, r: float, h: float, at: list, cut: bool = False) -> dict:
+    return _add_feature("cylinder", name,
+                        {"radius": _dim(r), "height": _dim(h), "at": list(at),
+                         "centered": False, "merge": True,
+                         "mode": "cut" if cut else "boss"})
+
+
+def _box(name: str, *, l: float, w: float, h: float, at: list) -> dict:
+    return _add_feature("box", name,
+                        {"length": _dim(l), "width": _dim(w), "height": _dim(h),
+                         "at": list(at), "centered": False, "merge": True,
+                         "mode": "boss"})
+
+
+def _spec_num(spec: dict, key: str) -> float:
+    """A required positive spec dimension, or a teaching KeyError naming it."""
+    value = spec.get(key)
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        num = 0.0
+    if num <= 0.0:
+        raise KeyError(key)
+    return num
+
+
+# Nominal single-shaft protrusion per NEMA frame, mm. The NEMA frame standard
+# fixes the faceplate square, bolt spacing and shaft diameter — NOT the shaft
+# length, which every vendor sells as a per-SKU option (omc-stepperonline lists
+# "Shaft Length(mm)" as a selector). These are the lengths the most widely
+# stocked single-shaft SKU of each frame carries; a real design overrides with
+# params={"shaft_length_mm": ...} off its own datasheet.
+_NEMA_SHAFT_MM = {8: 12.0, 11: 20.0, 14: 21.0, 17: 24.0, 23: 21.0, 34: 31.75}
+
+# Tapped-hole nominal for a motor faceplate's mounting screw.
+_MOUNT_TAP_MM = {"M2": 2.0, "M2.5": 2.5, "M3": 3.0, "M4": 4.0, "M5": 5.0, "M6": 6.0}
+
+
+def _build_stepper_motor(spec: dict) -> tuple[str, list, dict]:
+    """Stepper-motor frame envelope: faceplate seated at z=0, shaft along +Z,
+    body extending to -Z, four tapped mounting holes on the bolt circle."""
+    square = _spec_num(spec, "body_square_mm")
+    body_l = _spec_num(spec, "body_length_mm")
+    shaft_d = _spec_num(spec, "shaft_dia_mm")
+    spacing = _spec_num(spec, "bolt_hole_spacing_mm")
+    nema = int(float(spec.get("nema_size") or 0))
+    assumptions: list[str] = []
+    shaft_l = spec.get("shaft_length_mm")
+    if shaft_l is None:
+        shaft_l = _NEMA_SHAFT_MM.get(nema, round(square * 0.57, 2))
+        assumptions.append(
+            f"shaft protrusion {shaft_l} mm is a NEMA {nema or '?'} frame nominal, not "
+            f"a spec value (shaft length is a per-SKU option) — override with "
+            f'params={{"shaft_length_mm": ...}} from the motor datasheet')
+    shaft_l = float(shaft_l)
+    tap = _MOUNT_TAP_MM.get(str(spec.get("mount_screw") or "").upper(), 3.0)
+    tap_depth = min(5.0, body_l / 2.0)
+
+    ops = [_box("Body", l=square, w=square, h=body_l,
+                at=[-square / 2.0, -square / 2.0, -body_l]),
+           _cyl("Shaft", r=shaft_d / 2.0, h=shaft_l, at=[0.0, 0.0, 0.0])]
+    half = spacing / 2.0
+    for i, (sx, sy) in enumerate(((-1, -1), (1, -1), (1, 1), (-1, 1)), start=1):
+        ops.append(_cyl(f"MountHole{i}", r=tap / 2.0, h=tap_depth,
+                        at=[sx * half, sy * half, -tap_depth], cut=True))
+    detail = {
+        "representation": "frame envelope (faceplate + shaft + tapped bolt circle); "
+                          "windings, rear boss and cable gland are not modelled",
+        "body_square_mm": square, "body_length_mm": body_l,
+        "shaft_dia_mm": shaft_d, "shaft_length_mm": shaft_l,
+        "bolt_hole_spacing_mm": spacing, "mount_tap_mm": tap,
+        "datum": {"axis": [0, 0, 1], "note": "mounting faceplate at z=0, shaft +Z, "
+                                             "body -Z; mate the faceplate to the bracket"},
+        "assumptions": assumptions,
+    }
+    name = f"Stepper NEMA{nema} {body_l:g}mm" if nema else f"Stepper {square:g}sq"
+    return name, ops, detail
+
+
+def _build_shaft_collar(spec: dict) -> tuple[str, list, dict]:
+    """Shaft collar: OD cylinder, bore cut through. Every dimension is spec'd."""
+    bore = _spec_num(spec, "bore_mm")
+    od = _spec_num(spec, "od_mm")
+    width = _spec_num(spec, "width_mm")
+    ops = [_cyl("Collar", r=od / 2.0, h=width, at=[0.0, 0.0, 0.0]),
+           _cyl("Bore", r=bore / 2.0, h=width, at=[0.0, 0.0, 0.0], cut=True)]
+    detail = {
+        "representation": "ring envelope; the set-screw / clamp-screw features and "
+                          "the split line are not modelled",
+        "bore_mm": bore, "od_mm": od, "width_mm": width,
+        "collar_type": spec.get("collar_type"),
+        "datum": {"axis": [0, 0, 1], "note": "bore axis +Z, one face at z=0"},
+        "assumptions": [],
+    }
+    return f"Shaft collar {bore:g}mm bore", ops, detail
+
+
+def _build_shaft_coupler(spec: dict) -> tuple[str, list, dict]:
+    """Rigid shaft coupler: OD cylinder with bore A from one end and bore B from
+    the other, each half the body length. Every dimension is spec'd."""
+    bore_a = _spec_num(spec, "bore_a_mm")
+    bore_b = _spec_num(spec, "bore_b_mm")
+    od = _spec_num(spec, "od_mm")
+    length = _spec_num(spec, "length_mm")
+    half = length / 2.0
+    ops = [_cyl("Body", r=od / 2.0, h=length, at=[0.0, 0.0, 0.0]),
+           _cyl("BoreA", r=bore_a / 2.0, h=half, at=[0.0, 0.0, 0.0], cut=True),
+           _cyl("BoreB", r=bore_b / 2.0, h=half, at=[0.0, 0.0, half], cut=True)]
+    detail = {
+        "representation": "sleeve envelope; set-screw / clamp-screw features and the "
+                          "split line are not modelled",
+        "bore_a_mm": bore_a, "bore_b_mm": bore_b, "od_mm": od, "length_mm": length,
+        "coupler_type": spec.get("coupler_type"),
+        "datum": {"axis": [0, 0, 1],
+                  "note": "bore A enters at z=0, bore B at z=length; axis +Z"},
+        "assumptions": [],
+    }
+    return f"Coupler {bore_a:g}x{bore_b:g}mm", ops, detail
+
+
+def _build_timing_pulley(spec: dict) -> tuple[str, list, dict]:
+    """Timing pulley: the pitch-diameter body over the belt width with the bore cut.
+    Pitch diameter is EXACT (teeth * pitch / pi) — the tooth profile is not cut, so
+    the body is the pitch cylinder, which is the surface the belt actually wraps."""
+    pitch = _spec_num(spec, "pitch_mm")
+    teeth = int(_spec_num(spec, "teeth"))
+    bore = _spec_num(spec, "bore_mm")
+    width = _spec_num(spec, "belt_width_mm")
+    pitch_dia = (pitch * teeth) / math.pi
+    ops = [_cyl("PitchBody", r=pitch_dia / 2.0, h=width, at=[0.0, 0.0, 0.0]),
+           _cyl("Bore", r=bore / 2.0, h=width, at=[0.0, 0.0, 0.0], cut=True)]
+    detail = {
+        "representation": "pitch-diameter cylinder over the belt width; the tooth "
+                          "profile, flanges and hub are not modelled",
+        "profile": spec.get("profile"), "teeth": teeth, "pitch_mm": pitch,
+        "pitch_dia_mm": round(pitch_dia, 3), "bore_mm": bore, "belt_width_mm": width,
+        "datum": {"axis": [0, 0, 1], "note": "bore axis +Z, one face at z=0"},
+        "assumptions": [],
+    }
+    return f"{spec.get('profile') or 'Timing'} pulley {teeth}T", ops, detail
+
+
+def _build_heatsink(spec: dict) -> tuple[str, list, dict]:
+    """Finned heatsink via services.mcp.heatsink.sink_ops.
+
+    heatsinks_adapter names that generator in geometry_ref but ships the spec with
+    ``l_mm``/``w_mm`` while sink_ops reads ``base_l_mm``/``base_w_mm``, so calling
+    the advertised generator with the advertised spec raised KeyError. Map the keys.
+    """
+    from services.mcp.heatsink import sink_ops  # noqa: PLC0415
+    gen_spec = {
+        "base_l_mm": _spec_num(spec, "l_mm"),
+        "base_w_mm": _spec_num(spec, "w_mm"),
+        "base_t_mm": _spec_num(spec, "base_t_mm"),
+        "n_fins": int(_spec_num(spec, "n_fins")),
+        "fin_t_mm": _spec_num(spec, "fin_t_mm"),
+        "fin_h_mm": _spec_num(spec, "fin_h_mm"),
+    }
+    # sink_ops already emits full {"op": "add_feature", ...} ops — do not re-wrap.
+    ops = list(sink_ops(gen_spec))
+    detail = {
+        "representation": "base plate + straight fin array (plain-finned extrusion)",
+        **gen_spec,
+        "datum": {"axis": [0, 0, 1],
+                  "note": "base corner at the origin, fins grow +Z"},
+        "assumptions": [],
+    }
+    return f"Heatsink {gen_spec['base_l_mm']:g}x{gen_spec['base_w_mm']:g}", ops, detail
+
+
+_PARAMETRIC_BUILDERS = {
+    "parametric_stepper_motor": _build_stepper_motor,
+    "parametric_shaft_collar": _build_shaft_collar,
+    "parametric_shaft_coupler": _build_shaft_coupler,
+    "parametric_timing_pulley": _build_timing_pulley,
+    "parametric_heatsink": _build_heatsink,
+}
+
+# A closed-loop belt has no standalone shape: its outline is set by the pulley
+# centres it is routed over, so "place the belt" is not a well-posed request.
+# Refusing with the numbers needed for the layout beats fabricating a ring whose
+# belt thickness no spec carries.
+_NO_STANDALONE_GEOMETRY = {
+    "parametric_timing_belt": (
+        "a closed-loop timing belt has no standalone geometry — its shape is set by "
+        "the pulley centres it wraps",
+        "Place the pulleys (part_search('{profile} timing pulley') -> part_place), set "
+        "their centre distance from this belt's pitch length ({length_mm} mm over "
+        "{teeth} teeth at {pitch_mm} mm pitch, {belt_width_mm} mm wide — read them off "
+        "part_get), and keep the belt as a bought BOM line."),
+}
+
+
+def place_parametric_impl(part_id: str, record: dict, params: dict | None = None) -> dict:
+    """Build a ``parametric_*`` catalog record into a new editable part document.
+
+    Returns the same PlacementResult envelope as the C++ legs
+    ({ok, domain, doc_id, entity_id, editable, detail}) so callers cannot tell
+    which side of the bridge served the placement.
+    """
+    gref = (record or {}).get("geometry_ref") or {}
+    kind = str(gref.get("kind") or "")
+    # spec first, then the record's full params for the fields the spec omits
+    # (mount_screw), then the caller's overrides.
+    spec = {**((record or {}).get("params") or {}),
+            **(gref.get("spec") or {}),
+            **(params or {})}
+
+    blocked = _NO_STANDALONE_GEOMETRY.get(kind)
+    if blocked:
+        reason, hint = blocked
+        return {"ok": False, "domain": kind, "doc_id": None, "entity_id": None,
+                "editable": False, "detail": {},
+                "reason": reason,
+                "hint": hint.format(profile=spec.get("profile") or "GT2",
+                                    length_mm=spec.get("length_mm"),
+                                    teeth=spec.get("teeth"),
+                                    pitch_mm=spec.get("pitch_mm"),
+                                    belt_width_mm=spec.get("belt_width_mm"))}
+
+    builder = _PARAMETRIC_BUILDERS.get(kind)
+    if builder is None:
+        return {}
+    try:
+        name, ops, detail = builder(spec)
+    except KeyError as exc:
+        missing = exc.args[0] if exc.args else "?"
+        return {"ok": False, "domain": kind, "doc_id": None, "entity_id": None,
+                "editable": False, "detail": {},
+                "reason": f"{part_id}: geometry_ref.spec has no usable {missing!r}",
+                "hint": f"part_get({part_id!r}) and pass the missing dimension as "
+                        f'params={{"{missing}": ...}}.'}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "domain": kind, "doc_id": None, "entity_id": None,
+                "editable": False, "detail": {},
+                "reason": f"{kind} build failed: {exc}", "hint": ""}
+
+    from . import core_bridge as cb  # noqa: PLC0415
+    try:
+        created = cb.call("doc_new", {"kind": "part", "name": name})
+        doc_id = created.get("doc_id")
+        if not doc_id:
+            raise RuntimeError("doc_new returned no doc_id")
+        cb.call("doc_apply_ops", {"doc_id": doc_id,
+                                  "base_revision": created.get("revision", 0),
+                                  "with_tess": False, "ops": ops})
+        try:
+            detail["volume_mm3"] = cb.call("eval_mass", {"doc_id": doc_id}) \
+                                     .get("volume_mm3")
+        except Exception:  # noqa: BLE001 — a mass read must not fail a placement
+            pass
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "domain": kind, "doc_id": None, "entity_id": None,
+                "editable": False, "detail": {},
+                "reason": f"{kind} placement failed: {exc}",
+                "hint": "Ensure the native core (CHUDWARE_LIBCHUDWARE) is available."}
+    detail["name"] = name
+    detail["part_id"] = part_id
+    return {"ok": True, "domain": kind, "doc_id": doc_id, "entity_id": doc_id,
+            "editable": True, "detail": detail, "reason": None, "hint": None}
+
+
 def register_parts_tools(mcp: FastMCP) -> None:
     """Register part_search, part_get, and part_place MCP tools (append-only).
 
@@ -1457,6 +1761,16 @@ def register_parts_tools(mcp: FastMCP) -> None:
                     f"doc={doc_id_only!r} looks like a document ID, but part_place "
                     f"needs the document ITSELF ({part_id!r} places into a "
                     f"{kind or 'domain'} document).", _PLACE_DOC_HINT)
+
+        # Parametric catalog families the engine has no route for (stepper motors,
+        # timing pulleys, shaft collars/couplers, heatsinks) are built here from the
+        # record's own spec — see place_parametric_impl. An empty dict means "not a
+        # parametric kind", so the C++ dispatcher below still owns everything else.
+        parametric = place_parametric_impl(part_id, record, params_dict or None)
+        if parametric:
+            if notes:
+                parametric["interpreted"] = _interpreted_notes(notes)
+            return json.dumps(parametric, ensure_ascii=False)
         try:
             result = cb.call("part_place", {"part_id": part_id, "record": record,
                                             "doc": doc_dict,

@@ -801,6 +801,292 @@ def _apply_view_scale(doc_id: str, want: float, notes: list) -> tuple[list, list
     return applied, warnings
 
 
+# ---------------------------------------------------------------- sheet layout readback
+#
+# SILENT-WRONG-OUTPUT class, measured 2026-07-30 driving the full "make a dimensioned drawing"
+# flow on a 50x30x4 plate (A3, 420x297 mm):
+#   set_view(view_id="v2", x=900, y=900)  -> {"ok":true,"position":[900,900]}
+#       the view's bbox then reads [900, 840, 1000, 900] — entirely OFF the paper.
+#   set_view(view_id="v1", scale=50)      -> {"ok":true,"scale":50.0}
+#       bbox [258, -114.8, 2758, 85.2] — 2.5 m of geometry hanging off three sides.
+#   export_drawing then still answered ok with 91 kB of PDF.
+# Nothing in any reply said the view had left the sheet, and set_view's own docstring is what
+# tells a model to "spread overlapping views apart" in the first place — so the tool invites
+# exactly the move that silently destroys the drawing.
+#
+# The rule is not new: make_drawing's rescale pass already refuses to stay quiet about it
+# (_apply_view_scale above warns "view v1 now extends past the 420x297 mm sheet"). It had
+# simply never been applied to the per-view tools. Overlap is reported the same way, because
+# "views colliding on the sheet" is the other half of what review_drawing's docstring asks the
+# model to look for — and a rectangle intersection is a NUMBER we can hand it instead of an
+# image to squint at.
+
+
+def _bbox_of(view: Any) -> Optional[list]:
+    """A view's [x0,y0,x1,y1] sheet-mm bbox, or None when it has none (an empty view)."""
+    bb = view.get("bbox") if isinstance(view, dict) else None
+    if (isinstance(bb, list) and len(bb) == 4
+            and all(isinstance(x, (int, float)) for x in bb)):
+        return [float(x) for x in bb]
+    return None
+
+
+def _sheet_size(full: dict) -> Optional[list]:
+    """The sheet's [width, height] in mm — core/doc/drawing_session.cpp:39-48 stores every
+    paper size landscape, so this is always (w >= h)."""
+    for sh in (full.get("sheets") or []):
+        size = sh.get("size_mm")
+        if (isinstance(size, list) and len(size) == 2
+                and all(isinstance(x, (int, float)) and x > 0 for x in size)):
+            return [float(size[0]), float(size[1])]
+    return None
+
+
+def _off_sheet_by(bbox: list, size: list) -> dict:
+    """How far each side of *bbox* sticks out past a 0,0..size sheet — {} when it fits."""
+    out = {}
+    for name, over in (("left", -bbox[0]), ("bottom", -bbox[1]),
+                       ("right", bbox[2] - size[0]), ("top", bbox[3] - size[1])):
+        if over > 1e-6:
+            out[name] = round(over, 3)
+    return out
+
+
+def _rect_overlap(p: list, q: list) -> Optional[list]:
+    """The [width, height] mm of the rectangle p and q share, or None when they do not."""
+    w = min(p[2], q[2]) - max(p[0], q[0])
+    h = min(p[3], q[3]) - max(p[1], q[1])
+    return [round(w, 3), round(h, 3)] if w > 1e-6 and h > 1e-6 else None
+
+
+def _layout_report(full: dict, view_id: str) -> tuple[dict, list]:
+    """(what *view_id* occupies on the sheet, the warnings that occupation earns).
+
+    Read back off the engine's own projection, never computed here: the bbox is what
+    project_one produced after the move/rescale, so the numbers are the drawing's.
+    """
+    size = _sheet_size(full)
+    me = None
+    others = []
+    for v in _views_of(full):
+        vid = v.get("view_id") or v.get("id")
+        if vid == view_id:
+            me = v
+        else:
+            others.append(v)
+    report: dict = {}
+    warnings: list = []
+    if me is None:
+        return report, warnings
+    if size:
+        report["sheet_mm"] = size
+    bbox = _bbox_of(me)
+    err = me.get("error")
+    if err:
+        # The engine already knows the view is empty (e.g. "detail circle encloses no parent
+        # geometry") and files it on the view; only the reply was hiding it.
+        warnings.append(f"view {view_id} has NO geometry: {err}")
+    if bbox is None:
+        report["entities"] = 0
+        if not err:
+            warnings.append(f"view {view_id} projected no geometry — it will render blank")
+        return report, warnings
+    report["bbox"] = [round(x, 3) for x in bbox]
+    report["entities"] = len(me.get("visible") or []) + len(me.get("arcs") or [])
+    if report["entities"] == 0 and not err:
+        warnings.append(f"view {view_id} projected no geometry — it will render blank")
+    if size:
+        off = _off_sheet_by(bbox, size)
+        report["on_sheet"] = not off
+        if off:
+            report["off_sheet_by_mm"] = off
+            warnings.append(
+                f"view {view_id} hangs off the {size[0]}x{size[1]} mm sheet by "
+                + ", ".join(f"{v} mm past the {k}" for k, v in sorted(off.items()))
+                + " — it will be missing from the render and the export")
+    hits = []
+    for v in others:
+        ob = _bbox_of(v)
+        if ob is None:
+            continue
+        lap = _rect_overlap(bbox, ob)
+        if lap:
+            vid = v.get("view_id") or v.get("id")
+            hits.append({"view_id": vid, "orientation": v.get("orientation") or v.get("type"),
+                         "overlap_mm": lap})
+    if hits:
+        report["overlaps"] = hits
+        warnings.append(
+            f"view {view_id} overlaps "
+            + ", ".join(f"{h['view_id']} ({h['orientation']}) by "
+                        f"{h['overlap_mm'][0]}x{h['overlap_mm'][1]} mm" for h in hits)
+            + " — move one with set_view(view_id, x=…, y=…)")
+    return report, warnings
+
+
+def _find_view(full: dict, handle: Any, *, derived: bool = True) -> Optional[dict]:
+    """The view *handle* names — its view_id, its id, its orientation, or its section/detail
+    label. *derived* False skips section and detail views (a section's parent must be a real
+    projected view). Returns the view row, or None."""
+    want = str(handle if handle is not None else "").strip()
+    if not want:
+        return None
+    folded = want.casefold()
+    for v in _views_of(full):
+        if not derived and v.get("type") in ("section", "detail"):
+            continue
+        if want in (v.get("view_id"), v.get("id")):
+            return v
+        for key in ("orientation", "label"):
+            got = v.get(key)
+            if isinstance(got, str) and got.casefold() == folded:
+                return v
+    return None
+
+
+def _view_handles(full: dict, *, derived: bool = True) -> str:
+    """Every handle a caller could have passed, as the teaching errors quote them back."""
+    out = []
+    for v in _views_of(full):
+        if not derived and v.get("type") in ("section", "detail"):
+            continue
+        vid = v.get("view_id") or v.get("id")
+        label = v.get("orientation") or v.get("label") or v.get("type")
+        out.append(f"{vid} ({label})" if label else str(vid))
+    return ", ".join(out) if out else "none — the drawing has no views"
+
+
+# ---------------------------------------------------------------- title-block vocabulary
+#
+# Lives at module scope because TWO tools write the title block and only one of them was
+# guarding it. set_titleblock has enforced this vocabulary since 2026-07-29; make_drawing's
+# `title={...}` handed the dict straight to drawing_make, which forwards it verbatim to
+# drawing_set_titleblock (core/doc/drawing_session.cpp:2068 -> :1759, a raw merge). Measured
+# 2026-07-30 with the same `part_name` dialect the live run wrote at the other door:
+#   make_drawing(title={"part_name":"Plate","scale":"1:1"})
+#     -> ok:true, and the sheet's title_block reads {"part_name":"Plate", ...}
+# The renderer keys its ten cells by name (core/doc/session.cpp:7106-7117) and the exporter by
+# eight (core/doc/export2d.cpp:205-207), so "part_name" is a key NOTHING draws: the part name
+# the caller asked for is simply absent from the sheet, with no error anywhere. Routing both
+# doors through one table is the fix — the same call now lands in TITLE, exactly as it does
+# through set_titleblock.
+#
+# EXPORT MIRROR. The on-screen renderer accepts {"rev","revision"} interchangeably
+# (session.cpp:7114) but export2d.cpp:205-207 reads only "revision" — and the canonical name
+# this layer folds onto is "rev". Measured 2026-07-30: set_titleblock(revision="B",
+# material="6061-T6", drawn="hg") -> exported DXF contains "6061-T6" and "hg" and NO revision
+# line at all. The revision is the one title-block cell a shop floor keys off, so it vanishing
+# from every delivered PDF/DXF while showing on screen is the worst shape this file guards
+# against. Writing BOTH spellings is exact, not a guess: the two are the same cell to the
+# renderer, and it is the only one of them the exporter can see.
+
+#: Canonical title-block field names — echoed in the docstring AND accepted flattened as
+#: top-level kwargs. Live 2026-07-27 (claude-opus, flyswatter run): the model was SHOWN these
+#: exact names in the docstring but wrote them as set_titleblock(title=…, drawn_by=…, date=…,
+#: rev=…) instead of nesting them in fields={...}, and got "unknown argument(s)" for all four.
+#: Not a synonym of `fields` (there is no single unambiguous target) — it is the same
+#: flattened-dict dialect query_geometry already accepts for its query keys.
+_TITLEBLOCK_FIELDS = ("title", "drawn_by", "date", "material", "finish",
+                      "scale", "rev", "sheet", "part_number", "company")
+
+#: _norm_arg spelling -> the canonical field ("drawnby" -> "drawn_by"), so a caller who writes
+#: drawnBy / DRAWN_BY hits the same cell the docstring names.
+_TITLEBLOCK_BY_NORM = {_norm_arg(f): f for f in _TITLEBLOCK_FIELDS}
+
+#: Field-name aliases. The RENDERER already treats each of these as the SAME cell:
+#: core/doc/session.cpp:7106-7117 keys the ten title-block cells by a pair — {"rev","revision"},
+#: {"part_number","part_no"}, {"drawn_by","drawn"}. Folding them onto the canonical name is
+#: therefore not a guess about intent; it is what the drawing does with them anyway.
+#: Keys normalised through _norm_arg.
+_TITLEBLOCK_ALIASES = {"revision": "rev", "partno": "part_number", "drawn": "drawn_by"}
+
+#: Spellings of "the part's NAME". A title block's TITLE cell is what carries a part's name
+#: ("40mm Cube"); PART NO carries its identifier. So a name maps to `title` — and NEVER to
+#: `part_number`: a name printed in the box a shop floor orders from is a wrong drawing that
+#: looks right. Only folded while `title` is still free; if the caller set both, we refuse
+#: rather than pick a winner.
+_TITLEBLOCK_NAME_ARGS = frozenset({"partname", "name", "parttitle", "drawingtitle",
+                                   "sheettitle"})
+
+#: There is no units CELL — units are a property of the DOCUMENT. See the refusal below.
+_TITLEBLOCK_UNIT_ARGS = frozenset({"units", "unit", "unitsystem", "unitssystem",
+                                   "dimensionunits", "dimunits", "measurementunits",
+                                   "unitofmeasure", "unitsofmeasure"})
+
+#: canonical -> the second spelling that must be written beside it so the EXPORTER sees the
+#: cell too. See the EXPORT MIRROR note above.
+_TITLEBLOCK_EXPORT_MIRROR = {"rev": "revision"}
+
+
+def _titleblock_units_refusal(name: str, value: Any) -> str:
+    """Why `units` has no home here — verified against the engine, not assumed."""
+    return (
+        f"set_titleblock() has no {name!r} field. The ten cells this drawing actually "
+        f"renders are {', '.join(_TITLEBLOCK_FIELDS)} (core/doc/session.cpp:7106-7117) — "
+        f"units is not one of them, and passing it as a field would store a key nothing "
+        f"draws. Units are a property of the DOCUMENT, not of the title block: the "
+        f"drawing's own units.system field is 'MMGS' (millimetres) by default and 'IPS' "
+        f"for inches, and it is what every dimension is formatted in "
+        f"(core/doc/drawing_session.cpp:539-556). It is set on the document with the "
+        f"set_units op — add_features(ops=[{{'op': 'set_units', 'units': 'mm'}}]) — not "
+        f"here. {value!r} is already the default, so nothing needed changing; the call "
+        f"was NOT made.")
+
+
+def _canon_titleblock_fields(fields: dict, where: str) -> tuple[dict, list, Optional[dict]]:
+    """(the fields as the drawing really keys them, interpretation notes, a refusal).
+
+    *where* names the calling tool in the refusals, because the same dict arrives through
+    make_drawing(title={...}) and set_titleblock(fields={...}).
+    """
+    out: dict = {}
+    notes: list = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        n = _norm_arg(key)
+        if n in _TITLEBLOCK_UNIT_ARGS:
+            return {}, [], {"ok": False, "error": _titleblock_units_refusal(key, value)}
+        target = _TITLEBLOCK_BY_NORM.get(n) or _TITLEBLOCK_ALIASES.get(n)
+        if target is None and n in _TITLEBLOCK_NAME_ARGS:
+            if "title" in out or any(_norm_arg(k) == "title" for k in fields):
+                return {}, [], {
+                    "ok": False,
+                    "error": f"{where} got {key}={value!r} alongside an explicit title. A "
+                             f"title block has no separate part-NAME cell: TITLE carries the "
+                             f"part's name and PART NO carries its identifier "
+                             f"(core/doc/session.cpp:7106-7117). {key} is NOT part_number — a "
+                             f"name in the box a shop floor orders from is a wrong drawing "
+                             f"that looks right. Pass the name as title=, or the identifier "
+                             f"as part_number=. Nothing was written."}
+            target = "title"
+        if target is None:
+            return {}, [], {
+                "ok": False,
+                "error": f"{where} got the unknown title-block field {key!r}. The cells this "
+                         f"drawing renders are {', '.join(_TITLEBLOCK_FIELDS)} "
+                         f"(core/doc/session.cpp:7106-7117); anything else is stored as a key "
+                         f"nothing draws, so the value would silently never appear on the "
+                         f"sheet. Nothing was written."}
+        if target in out:
+            return {}, [], {
+                "ok": False,
+                "error": f"{where} got {key}={value!r} and another spelling of the same "
+                         f"title-block cell {target!r}. Pass one. Nothing was written."}
+        out[target] = value
+        if target != key:
+            notes.append(f"interpreted {key!r} as the title-block field {target!r}")
+    return out, notes, None
+
+
+def _titleblock_payload(fields: dict) -> dict:
+    """*fields* plus the export-only spellings of the same cells (see EXPORT MIRROR above)."""
+    payload = dict(fields)
+    for canon, mirror in _TITLEBLOCK_EXPORT_MIRROR.items():
+        if canon in payload and mirror not in payload:
+            payload[mirror] = payload[canon]
+    return payload
+
 # ---------------------------------------------------------------- sheet orientation
 #
 # LIVE-DIALECT gap (2026-07-29): make_drawing(orientation="landscape") died as
@@ -910,6 +1196,10 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                   from_doc / part_doc are understood too.
         template: a synonym of sheet, and ONLY when its value is a paper size. There is no
                   drawing-template file in Chudware; a non-size value is refused, not guessed.
+
+        Returns `views` as {view_id: orientation} and `view_entities` as {view_id: count} —
+        how many projected polylines + circles that view really got, so a view that came back
+        blank shows in the reply (and in `warnings`) instead of only on the sheet.
 
         AFTER making it: call review_drawing(drawing_doc_id) to SEE the sheet, then refine with
         add_dimension / add_gdt / add_datum / add_surface_finish / add_section_view /
@@ -1048,7 +1338,17 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             # "<part> - Drawing". Distinct from the title BLOCK's printed title, which is `title`.
             if name is not None and str(name).strip():
                 spec["name"] = str(name).strip()
-            tb = dict(title) if isinstance(title, dict) else {}
+            # SILENT-DROP gap (2026-07-30): this dict went straight to drawing_make, which
+            # merges it into the sheet's title_block verbatim (drawing_session.cpp:2068 ->
+            # :1759), so make_drawing(title={"part_name":"Plate"}) reported ok and stored a key
+            # neither the renderer (session.cpp:7106-7117) nor the exporter
+            # (export2d.cpp:205-207) draws — the part name simply never appeared. The
+            # vocabulary set_titleblock has enforced since 2026-07-29 now guards both doors.
+            tb, tb_notes, bad = _canon_titleblock_fields(
+                dict(title) if isinstance(title, dict) else {}, "make_drawing(title=…)")
+            if bad:
+                return _dumps(bad)
+            notes.extend(tb_notes)
             if part_name and "title" not in tb:
                 tb["title"] = part_name
             # An explicit geometric scale and an explicit printed SCALE cell that disagree are a
@@ -1070,7 +1370,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                     notes.append(f"title scale {printed!r} agrees with scale={want_scale}")
                 tb["scale"] = _scale_text(want_scale)
             if tb:
-                spec["title"] = tb
+                spec["title"] = _titleblock_payload(tb)
             r = cb.call("drawing_make", {"source_doc_id": d, "spec": spec})
             drawing_doc_id = r.get("doc_id")
             # drawing_make always auto-scales to fit the sheet (drawing_session.cpp:1841-1946)
@@ -1086,7 +1386,13 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             # D7: include the view_id ↔ orientation map so callers can pass either a view_id
             # or an orientation string to add_gdt / add_datum / add_dimension without having
             # to call drawing_get first.
+            # Beside it, `view_entities` counts the projected polylines + circles each view
+            # really got: "a view that renders nothing" is the top drawing defect class, and a
+            # blank view is otherwise indistinguishable from a good one until someone looks at
+            # the sheet. A zero also earns a warning, because a count is easy to skim past.
             view_map: dict = {}
+            view_entities: dict = {}
+            blank: list = []
             sheet_size = None
             drawing_name = None
             if drawing_doc_id:
@@ -1099,8 +1405,15 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                         for v in sh.get("views", []):
                             vid = v.get("view_id") or v.get("id")
                             ori = v.get("orientation") or v.get("type", "")
-                            if vid:
-                                view_map[vid] = ori
+                            if not vid:
+                                continue
+                            view_map[vid] = ori
+                            n = len(v.get("visible") or []) + len(v.get("arcs") or [])
+                            view_entities[vid] = n
+                            if not n:
+                                blank.append(f"view {vid} ({ori}) projected no geometry and "
+                                             f"will render blank"
+                                             + (f": {v['error']}" if v.get("error") else ""))
                 except Exception:  # noqa: BLE001
                     pass
             # Report the RESOLVED sheet + auto-dimension switch + drawing name + view scale, not
@@ -1110,7 +1423,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                    "drawing_doc_id": drawing_doc_id, "name": drawing_name,
                    "part_name": part_name,
                    "sheet": sheet_size, "model_items": model_items,
-                   "views": view_map or None,
+                   "views": view_map or None, "view_entities": view_entities or None,
                    "next_actions": [
                        "review_drawing(drawing_doc_id)  # SEE the drawing, then refine",
                        "add_gdt / add_dimension / set_view / set_titleblock  # refine",
@@ -1121,6 +1434,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 out["view_scales"] = view_scales
                 if scale_warnings:
                     out["warnings"] = scale_warnings
+            if blank:
+                out.setdefault("warnings", []).extend(blank)
             if notes:
                 out["interpreted"] = notes
             return _dumps(out)
@@ -1243,12 +1558,23 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
         orientation: front|back|top|bottom|left|right|iso. view_type: base (the first/anchor
         ortho view) | projected | iso. x,y = the view centre on the sheet in millimetres.
+
+        Returns {ok, view_id, bbox, entities, sheet_mm, on_sheet} — the sheet area the new view
+        actually occupies, so a placement that lands off the paper or on top of an existing
+        view is a number in the reply rather than something only review_drawing could show.
         """
         try:
             d = _doc(doc_id)
             r = cb.call("drawing_add_view", {"doc_id": d, "type": view_type,
                                              "orientation": orientation, "position": [x, y]})
-            return _dumps({"ok": True, "view_id": r.get("view_id")})
+            vid = r.get("view_id")
+            out = {"ok": True, "view_id": vid}
+            if vid:
+                report, warnings = _layout_report(cb.call("drawing_get", {"doc_id": d}), vid)
+                out.update(report)
+                if warnings:
+                    out["warnings"] = warnings
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -1267,6 +1593,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         mode  : "full" (whole part sectioned) or "half" (half sectioned, half external view).
         reverse: flip which side of the cut is removed.
         No sheet-mm math needed — the engine places the cut line across the parent's bbox.
+
+        Returns the cut line plus the section view's own bbox / entity count / sheet fit.
         """
         try:
             # Discriminator guard: an unvalidated axis/mode produced a plausible-looking
@@ -1281,17 +1609,16 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             d = _doc(doc_id)
             # Reuse make-style auto-section via a tiny spec on the existing drawing.
             full = cb.call("drawing_get", {"doc_id": d})
-            vid, bbox = None, None
-            for sh in full.get("sheets", []):
-                for v in sh.get("views", []):
-                    if v.get("type") in ("section", "detail"):
-                        continue
-                    if parent in (v.get("view_id"), v.get("id"), v.get("orientation")):
-                        bb = v.get("bbox")
-                        if isinstance(bb, list) and len(bb) == 4:
-                            vid, bbox = (v.get("view_id") or v.get("id")), bb
-            if not vid:
-                return _dumps({"ok": False, "error": f"no parent view {parent!r} to cut"})
+            # A section's parent must be a real projected view — you cannot section a section.
+            pv = _find_view(full, parent, derived=False)
+            bbox = _bbox_of(pv) if pv else None
+            if bbox is None:
+                return _dumps({
+                    "ok": False,
+                    "error": f"add_section_view: no parent view {parent!r} to cut. This "
+                             f"drawing's views are {_view_handles(full, derived=False)} — pass "
+                             f"a view_id or an orientation. Nothing was added."})
+            vid = pv.get("view_id") or pv.get("id")
             x0, y0, x1, y1 = bbox
             cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
             pad = 0.1 * max(x1 - x0, y1 - y0) + 2.0
@@ -1302,23 +1629,83 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             if label:
                 params["label"] = label
             r = cb.call("drawing_add_section", params)
-            return _dumps({"ok": True, "view_id": r.get("view_id"),
-                           "axis": axis_c, "mode": mode_c, "cut_line": cut})
+            out = {"ok": True, "view_id": r.get("view_id"),
+                   "axis": axis_c, "mode": mode_c, "cut_line": cut}
+            if r.get("view_id"):
+                report, warnings = _layout_report(cb.call("drawing_get", {"doc_id": d}),
+                                                  r["view_id"])
+                out.update(report)
+                if warnings:
+                    out["warnings"] = warnings
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
 
 
+    # SILENT-WRONG-OUTPUT, measured 2026-07-30 on the A3 plate drawing:
+    #   add_detail_view(parent_view_id="v2", cx=50, cy=50, radius=5)
+    #     -> {"ok": true, "view_id": "v5"}
+    # while the view the engine had just created carried
+    #     "error": "detail circle encloses no parent geometry", "bbox": [], "visible": []
+    # The engine KNEW the detail was empty and filed the reason on the view; only the reply
+    # was hiding it, so a model gets a blank magnified circle on its sheet and is told the
+    # call succeeded. The empty view is rolled back (drawing_remove_view,
+    # core/doc/drawing_session.cpp:982) so a retry with a real centre does not leave debris.
+    #
+    # LIVE-DIALECT gap in the same call: parent_view_id="top" was rejected outright with
+    # "detail parent view 'top' not found", although add_dimension / add_gdt / add_datum /
+    # add_section_view all take an orientation word for the same drawing. Detail views may
+    # legitimately magnify a SECTION, so the resolver here accepts derived views (and their
+    # section label) too, which _resolve_drawing_view_id deliberately skips.
+
     @mcp.tool()
     def add_detail_view(parent_view_id: str, cx: float, cy: float, radius: float,
                         doc_id: Optional[str] = None) -> str:
         """Add a magnified DETAIL view of a circular region of a parent view. doc_id = drawing_doc_id.
-        cx,cy,radius are in the parent view's sheet millimetres (read them from review_drawing)."""
+
+        parent_view_id accepts a view_id (v1, v2, …), an orientation ("front"/"top"/…) or a
+        section label ("A"). cx,cy,radius are in the PARENT view's sheet millimetres — read
+        them off that view's bbox/arcs (drawing_get) or review_drawing.
+
+        A circle that encloses none of the parent's geometry is refused, not filed as an empty
+        view: the reply names the parent's real bbox so the next pick lands on the part.
+        """
         try:
             d = _doc(doc_id)
-            r = cb.call("drawing_add_detail", {"doc_id": d, "parent_view_id": parent_view_id,
+            full = cb.call("drawing_get", {"doc_id": d})
+            pv = _find_view(full, parent_view_id)
+            if pv is None:
+                return _dumps({
+                    "ok": False,
+                    "error": f"add_detail_view: no parent view {parent_view_id!r}. This "
+                             f"drawing's views are {_view_handles(full)} — pass a view_id, an "
+                             f"orientation or a section label. Nothing was added."})
+            pid = pv.get("view_id") or pv.get("id")
+            r = cb.call("drawing_add_detail", {"doc_id": d, "parent_view_id": pid,
                                                "center": [cx, cy], "radius": radius})
-            return _dumps({"ok": True, "view_id": r.get("view_id")})
+            vid = r.get("view_id")
+            out = {"ok": True, "view_id": vid, "parent_view_id": pid}
+            if not vid:
+                return _dumps(out)
+            report, warnings = _layout_report(cb.call("drawing_get", {"doc_id": d}), vid)
+            if not report.get("entities"):
+                cb.call("drawing_remove_view", {"doc_id": d, "view_id": vid})
+                pbb = _bbox_of(pv)
+                return _dumps({
+                    "ok": False,
+                    "error": f"add_detail_view: the circle at ({cx}, {cy}) r={radius} encloses "
+                             f"none of view {pid}'s geometry, so the detail would render "
+                             f"blank. That view occupies "
+                             + (f"{[round(v, 3) for v in pbb]} sheet mm "
+                                f"(centre {round((pbb[0] + pbb[2]) / 2, 3)}, "
+                                f"{round((pbb[1] + pbb[3]) / 2, 3)})"
+                                if pbb else "no sheet area at all")
+                             + ". The empty view was removed; re-pick inside those bounds."})
+            out.update(report)
+            if warnings:
+                out["warnings"] = warnings
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -1418,6 +1805,45 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                                  f"read them off the view's arcs), or dimension a different "
                                  f"pair. Nothing was added.",
                         "interpreted": notes})
+            # SILENT-WRONG-OUTPUT guard, measured 2026-07-30 on the A3 plate drawing whose
+            # `top` view occupies x 185..235, y 200.75..230.75 sheet mm:
+            #   add_dimension(view_id="top", a=[0,0], b=[10,0])
+            #     -> {"ok":true,"dtype":"linear_dim","value":5.0,"text":"5"}
+            # A confident "5" measured between two points that touch nothing, at the sheet
+            # origin, on a drawing that otherwise looks finished. linear_dim/aligned_dim read
+            # their VALUE straight off the two picks (drawing_session.cpp:1148-1151), so a pick
+            # that is not on the projected part reports a number about nothing.
+            # The bbox is the exact extent of this view's projected geometry, so BOTH picks
+            # outside it proves the dimension cannot be measuring this view under any pick
+            # tolerance — that is refused. ONE pick outside is a legitimate shape (a witness
+            # line extended off the silhouette), so it is reported, not refused. radial /
+            # diameter / center_mark snap to the nearest arc themselves and center_line / note
+            # are construction, so none of them are checked here.
+            if dtype in ("linear_dim", "aligned_dim") and a_pt and b_pt:
+                vbb = _bbox_of(_find_view(cb.call("drawing_get", {"doc_id": d}), view_id) or {})
+                if vbb:
+                    def _outside(p: list) -> bool:
+                        return not (vbb[0] - 1e-6 <= p[0] <= vbb[2] + 1e-6
+                                    and vbb[1] - 1e-6 <= p[1] <= vbb[3] + 1e-6)
+                    off = [s for s, p in (("a", a_pt), ("b", b_pt)) if _outside(p)]
+                    shown = [round(v, 3) for v in vbb]
+                    if len(off) == 2:
+                        return _dumps({
+                            "ok": False,
+                            "error": f"add_dimension: neither pick is on view {view_id}. Its "
+                                     f"projected geometry occupies {shown} sheet mm, but "
+                                     f"a={[round(v, 3) for v in a_pt]} and "
+                                     f"b={[round(v, 3) for v in b_pt]} are both outside it, so "
+                                     f"this {dtype} would report a distance between two points "
+                                     f"that touch nothing. Pick inside those bounds (the view's "
+                                     f"arcs and visible polylines in drawing_get are in the "
+                                     f"same sheet mm), or name the feature — a=\"F6356a7\" / "
+                                     f"a=\"Bore\" resolves it for you. Nothing was added."})
+                    if off:
+                        notes.append(
+                            f"pick {off[0]} lies outside view {view_id}'s projected geometry "
+                            f"({shown} sheet mm) — the dimension was placed as asked, but "
+                            f"check it is measuring the edge you meant")
             pos = require_list(pos, "pos", "a [x,y] sheet-mm point") if pos else None
             params = {"doc_id": d, "view_id": view_id, "type": dtype, "a": a_pt}
             if b_pt is not None:
@@ -1508,11 +1934,18 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
     def add_surface_finish(view_id: str, ra: str, a: list, pos: list, machining: str = "required",
                            all_around: bool = False, doc_id: Optional[str] = None) -> str:
         """Add a surface-finish symbol. doc_id = drawing_doc_id. ra is the roughness value ("1.6");
-        machining: any|required|prohibited. a is the surface point, pos the symbol (sheet mm)."""
+        machining: any|required|prohibited. a is the surface point, pos the symbol (sheet mm).
+
+        view_id accepts a numeric id (v1, v2, …) OR an orientation string ("front"/"top"/…)."""
         try:
             d = _doc(doc_id)
             a = require_list(a, "a", "a [x,y] sheet-mm point")
             pos = require_list(pos, "pos", "a [x,y] sheet-mm point")
+            # LIVE-DIALECT gap (2026-07-30): add_surface_finish(view_id="top") died with the
+            # engine's "no view 'top'" although its three annotation siblings (add_dimension /
+            # add_gdt / add_datum) had taken the orientation word since D7. The one tool in the
+            # set that did not resolve it.
+            view_id = _resolve_drawing_view_id(d, view_id)
             spec = {"value": ra, "machining": machining, "all_around": bool(all_around),
                     "a": a, "pos": pos}
             r = cb.call("drawing_add_surface_finish", {"doc_id": d, "view_id": view_id, "spec": spec})
@@ -1522,78 +1955,64 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
 
 
+    # SILENT-DROP, measured 2026-07-30: `if x is not None and y is not None` meant a
+    # single-axis move was thrown away without a word —
+    #   set_view(view_id="v1", x=250)  ->  {"ok":true,"position":[258.0,85.25],"scale":2.0}
+    # ok:true, and the position it reports back is the one the view already had. "Nudge this
+    # view right" is the most natural way to obey set_view's own "spread overlapping views
+    # apart" instruction, and it did nothing. The engine takes a full [x,y] (drawing_set_view,
+    # core/doc/drawing_session.cpp:1013-1014), so the missing axis is filled from the view's
+    # CURRENT position rather than defaulted to zero — which would fling the view to the sheet
+    # edge.
+
     @mcp.tool()
     def set_view(view_id: str, x: Optional[float] = None, y: Optional[float] = None,
                  scale: Optional[float] = None, doc_id: Optional[str] = None) -> str:
         """Move and/or rescale a view. doc_id = drawing_doc_id. x,y reposition the view on the
-        sheet (mm); scale sets the view scale (1.0 = 1:1, 0.5 = 1:2, 2.0 = 2:1). Use this to
-        spread overlapping views apart after review_drawing.
+        sheet (mm) — either one alone moves along that axis only; scale sets the view scale
+        (1.0 = 1:1, 0.5 = 1:2, 2.0 = 2:1). Use this to spread overlapping views apart after
+        review_drawing.
 
-        Returns {ok, view_id, position, scale, orientation} — the view's RESULTING state (not
-        just an echo of the args), so you can confirm the move landed before the next call.
+        view_id accepts a numeric id (v1, v2, …) OR an orientation string ("front"/"top"/…).
+
+        Returns {ok, view_id, position, scale, orientation} plus the sheet area the view now
+        occupies — bbox, entities, sheet_mm, on_sheet, and any overlap with another view — so a
+        move that pushes the view off the paper or onto its neighbour is a number in the reply,
+        not something only review_drawing could reveal.
         """
         try:
             d = _doc(doc_id)
+            before = cb.call("drawing_get", {"doc_id": d})
+            target = _find_view(before, view_id)
+            if target is None:
+                return _dumps({
+                    "ok": False,
+                    "error": f"set_view: no view {view_id!r}. This drawing's views are "
+                             f"{_view_handles(before)}. Nothing was changed."})
+            view_id = target.get("view_id") or target.get("id") or view_id
             params = {"doc_id": d, "view_id": view_id}
-            if x is not None and y is not None:
-                params["position"] = [x, y]
+            if x is not None or y is not None:
+                at = target.get("position")
+                at = ([float(at[0]), float(at[1])]
+                      if isinstance(at, list) and len(at) == 2 else [0.0, 0.0])
+                params["position"] = [float(x) if x is not None else at[0],
+                                      float(y) if y is not None else at[1]]
             if scale is not None:
                 params["scale"] = scale
             r = cb.call("drawing_set_view", params)
             view = r.get("view") or {}
-            return _dumps({"ok": True, "view_id": r.get("view_id", view_id),
-                           "position": view.get("position"), "scale": view.get("scale"),
-                           "orientation": view.get("orientation")})
+            out = {"ok": True, "view_id": r.get("view_id", view_id),
+                   "position": view.get("position"), "scale": view.get("scale"),
+                   "orientation": view.get("orientation")}
+            report, warnings = _layout_report(cb.call("drawing_get", {"doc_id": d}), view_id)
+            out.update(report)
+            if warnings:
+                out["warnings"] = warnings
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
 
-
-    # Canonical title-block field names — echoed in the docstring AND accepted
-    # flattened as top-level kwargs. Live 2026-07-27 (claude-opus, flyswatter
-    # run): the model was SHOWN these exact names in the docstring but wrote
-    # them as set_titleblock(title=..., drawn_by=..., date=..., rev=...)
-    # instead of nesting them in fields={...}, and got "unknown argument(s)"
-    # for all four. Not a synonym of `fields` (there is no single unambiguous
-    # target) — it's the same flattened-dict dialect query_geometry already
-    # accepts for its query keys, so set_titleblock gets the same treatment.
-    _TITLEBLOCK_FIELDS = ("title", "drawn_by", "date", "material", "finish",
-                          "scale", "rev", "sheet", "part_number", "company")
-
-    # Field-name aliases. The RENDERER already treats each of these as the SAME cell:
-    # core/doc/session.cpp:6946-6957 keys the ten title-block cells by a pair —
-    # {"rev","revision"}, {"part_number","part_no"}, {"drawn_by","drawn"} — and
-    # core/doc/export2d.cpp:206-207 writes "revision" as well. Folding them onto the canonical
-    # name is therefore not a guess about intent; it is what the drawing does with them anyway.
-    # The Python whitelist was simply narrower than the engine it guards. Keys normalised.
-    _TITLEBLOCK_ALIASES = {"revision": "rev", "partno": "part_number", "drawn": "drawn_by"}
-
-    #: Spellings of "the part's NAME". A title block's TITLE cell is what carries a part's name
-    #: ("40mm Cube"); PART NO carries its identifier. So a name maps to `title` — and NEVER to
-    #: `part_number`: a name printed in the box a shop floor orders from is a wrong drawing that
-    #: looks right. Only folded while `title` is still free; if the caller set both, we refuse
-    #: rather than pick a winner.
-    _TITLEBLOCK_NAME_ARGS = frozenset({"partname", "name", "parttitle", "drawingtitle",
-                                       "sheettitle"})
-
-    #: There is no units CELL — units are a property of the DOCUMENT. See the refusal below.
-    _TITLEBLOCK_UNIT_ARGS = frozenset({"units", "unit", "unitsystem", "unitssystem",
-                                       "dimensionunits", "dimunits", "measurementunits",
-                                       "unitofmeasure", "unitsofmeasure"})
-
-    def _titleblock_units_refusal(name: str, value: Any) -> str:
-        """Why `units` has no home here — verified against the engine, not assumed."""
-        return (
-            f"set_titleblock() has no {name!r} field. The ten cells this drawing actually "
-            f"renders are {', '.join(_TITLEBLOCK_FIELDS)} (core/doc/session.cpp:6946-6957) — "
-            f"units is not one of them, and passing it as a field would store a key nothing "
-            f"draws. Units are a property of the DOCUMENT, not of the title block: the "
-            f"drawing's own units.system field is 'MMGS' (millimetres) by default and 'IPS' "
-            f"for inches, and it is what every dimension is formatted in "
-            f"(core/doc/drawing_session.cpp:539-556). It is set on the document with the "
-            f"set_units op — add_features(ops=[{{'op': 'set_units', 'units': 'mm'}}]) — not "
-            f"here. {value!r} is already the default, so nothing needed changing; the call "
-            f"was NOT made.")
 
     @mcp.tool()
     def set_titleblock(fields: Optional[dict] = None, doc_id: Optional[str] = None,
@@ -1622,55 +2041,34 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             if isinstance(nested, dict):
                 for k, v in nested.items():
                     kwargs.setdefault(k, v)
-            flat = {k: kwargs.pop(k) for k in list(kwargs)
-                    if k in _TITLEBLOCK_FIELDS and kwargs[k] is not None}
-            kwargs = {k: v for k, v in kwargs.items() if v is not None}
-            # LIVE-DIALECT gap (2026-07-29): set_titleblock(part_name="40mm Cube",
-            # revision="A", units="mm", scale="1:1") — scale landed, the other three were
-            # refused as unknown. Two of them have a real home; `units` genuinely has none.
+            # LIVE-CRASH guard: `sorted(fields.keys())` blows up on a stringified fields dict
+            # with a bare AttributeError (identical shape to run-97813015264134).
+            fields = require_mapping(fields, "fields",
+                                     "a title-block fields dict") if fields else {}
+            flat = {k: v for k, v in kwargs.items() if v is not None}
             notes: list = []
-            taken = set(flat) | set(fields if isinstance(fields, dict) else ())
-            unknown: list = []
-            for k in list(kwargs):
-                n = _norm_arg(k)
-                if n in _TITLEBLOCK_UNIT_ARGS:
-                    raise ValueError(_titleblock_units_refusal(k, kwargs[k]))
-                target = _TITLEBLOCK_ALIASES.get(n)
-                if target is None and n in _TITLEBLOCK_NAME_ARGS:
-                    if "title" in taken:
-                        raise ValueError(
-                            f"set_titleblock() got {k}={kwargs[k]!r} alongside "
-                            f"title={(flat.get('title') or (fields or {}).get('title'))!r}. A "
-                            f"title block has no separate part-NAME cell: TITLE carries the "
-                            f"part's name and PART NO carries its identifier "
-                            f"(core/doc/session.cpp:6946-6957). {k} is NOT part_number — a "
-                            f"name in the box a shop floor orders from is a wrong drawing "
-                            f"that looks right. Pass the name as title=, or the identifier as "
-                            f"part_number=. Nothing was written.")
-                    target = "title"
-                if target is None or target in taken:
-                    unknown.append(k)
-                    continue
-                flat[target] = kwargs.pop(k)
-                taken.add(target)
-                notes.append(f"interpreted {k!r} as the title-block field {target!r}")
-            if unknown:
-                raise ValueError(
-                    f"set_titleblock() got unknown argument(s) "
-                    f"{', '.join(repr(k) for k in unknown)} — accepted title-block fields "
-                    f"are {', '.join(_TITLEBLOCK_FIELDS)} (pass as fields={{...}} or "
-                    f"flattened as kwargs), plus doc_id. The call was NOT made.")
             if flat:
                 notes.append(f"flattened kwarg(s) {', '.join(sorted(flat))} read as "
                              f"fields={{...}}")
-                fields = {**(fields or {}), **flat}
-            # LIVE-CRASH guard: `sorted(fields.keys())` blows up on a stringified fields dict
-            # with a bare AttributeError (identical shape to run-97813015264134).
-            fields = require_mapping(fields, "fields", "a title-block fields dict")
-            r = cb.call("drawing_set_titleblock", {"doc_id": d, "sheet_id": "s1", "fields": fields})
+            merged = {**fields, **flat}
+            if not merged:
+                require_mapping(None, "fields", "a title-block fields dict")
+            # BOTH doors go through ONE vocabulary now (module-level title-block block).
+            # LIVE-DIALECT gap (2026-07-29): set_titleblock(part_name="40mm Cube",
+            # revision="A", units="mm", scale="1:1") — scale landed, the other three were
+            # refused as unknown. Two of them have a real home; `units` genuinely has none.
+            # SILENT-DROP gap (2026-07-30): only the flattened-kwarg door was guarded, so
+            # set_titleblock(fields={"part_name": "Plate"}) stored a key nothing renders.
+            canon, folded, bad = _canon_titleblock_fields(merged, "set_titleblock()")
+            if bad:
+                return _dumps(bad)
+            notes.extend(folded)
+            r = cb.call("drawing_set_titleblock",
+                        {"doc_id": d, "sheet_id": "s1",
+                         "fields": _titleblock_payload(canon)})
             tb = r.get("title_block") or {}
             out = {"ok": True, "sheet_id": r.get("sheet_id", "s1"),
-                  "fields_set": sorted(fields.keys()), "title_block": tb}
+                   "fields_set": sorted(canon), "title_block": tb}
             if notes:
                 out["interpreted"] = notes
             return _dumps(out)

@@ -991,6 +991,113 @@ def _fit_hint_specs(hints: Optional[dict], claimed_cyl_axes: list) -> tuple:
     return specs, skipped
 
 
+# How far off a world axis a plane-fit normal may sit and still be treated as axis-aligned.
+# Stated as an ANGLE because that is the quantity that matters: the block's extents are read
+# as dot(plane_origin, axis), so a tilted face reports a station it does not have. The probe
+# block's six fits landed within 0.85 deg; 2 deg keeps that margin without accepting a face
+# that is visibly skew (a |dot| tolerance of 0.02, which reads tight, is 11.5 deg).
+_PLANE_HINT_AXIS_COS = math.cos(math.radians(2.0))
+
+
+def _plane_hint_block(hints: Optional[dict]) -> tuple:
+    """Pure-Python: derive a prismatic ``extrude`` base from the PLANE fits of an
+    ``aicad.reveng_fits/1`` doc, in the exact shape ``_recognize`` puts on
+    ``plan["base"]``. Engine-free and side-effect-free so it is unit-testable without
+    libchudware.
+
+    Returns ``(base, reason)`` — at most one is non-None; ``(None, None)`` means there
+    were no plane fits to reason about at all.
+
+    WHY this exists: mesh input is the ONLY input that reaches the primitive fitter, and
+    on mesh input the deterministic prismatic pass provably claims NOTHING. A sewn STL is
+    per-TRIANGLE faces, so the pass's "largest planar face + antiparallel partner +
+    laterals >= 80% of the remaining area" test measures triangles instead of faces: a
+    40x30x20 block with one 8 mm through bore scored 73% and rebuilt zero features
+    (``match_pct`` 0.0) even though ``segment_fit`` had already recovered all six bounding
+    planes to 0.02 mm and the bore to 0.01 mm. ``_fit_hint_specs`` drops plane fits on the
+    grounds that they are the deterministic pass's domain — which is true only when that
+    pass SUCCEEDS, so this runs only when ``plan["base"]`` came back None.
+
+    Deliberately narrow: all three world axes must be bounded by axis-aligned plane fits,
+    i.e. the evidence really is a closed rectangular block. A turned part (one capped
+    axis) or a scan sitting at an angle is REFUSED with the reason, never bent into a
+    block — the caller reports it rather than let the model believe a bounding box is its
+    part. What the block does explain is still measured by the caller's eval_compare
+    keep-or-revert gate, exactly like every other batch.
+    """
+    if not isinstance(hints, dict) or not hints:
+        return None, None
+    fits = hints.get("fits")
+    if not isinstance(fits, list):
+        return None, None
+    planes = [f for f in fits if isinstance(f, dict) and f.get("kind") == "plane"]
+    if not planes:
+        return None, None
+
+    spans: dict = {}
+    n_skew = 0
+    for fit in planes:
+        p = fit.get("params_mm")
+        p = p if isinstance(p, dict) else {}
+        n = _f3(p, "normal")
+        o = _f3(p, "origin")
+        if n is None or o is None or _norm(n) < 0.5:
+            continue
+        nu = _unit(n)
+        letter = next((k for k, w in _AXES.items()
+                       if abs(_dot(nu, w)) >= _PLANE_HINT_AXIS_COS), None)
+        if letter is None:
+            n_skew += 1
+            continue
+        # A RANSAC plane normal is UNORIENTED — the same patch fits +n and -n equally
+        # well (segment_fit emitted normal (0,0,+1) for both the z=0 and the z=20 face of
+        # the probe block), so the sign cannot say which side the material is on. Bound
+        # each axis by the extreme stations instead; a pocket floor or a pad top sits
+        # strictly between the bounding pair, so min/max keeps the OUTER faces.
+        t = _dot(o, _AXES[letter])
+        lo, hi = spans.get(letter, (t, t))
+        spans[letter] = (min(lo, t), max(hi, t))
+
+    unbounded = [k for k in ("x", "y", "z")
+                 if k not in spans or spans[k][1] - spans[k][0] <= 1e-3]
+    if unbounded:
+        if n_skew:
+            return None, (f"{n_skew} plane fit(s) are not world-axis-aligned and axis "
+                          f"{','.join(unbounded)} is unbounded — reverse_engineer authors "
+                          "in the source's own coordinates, so align the scan to the "
+                          "world axes (or model the base by hand)")
+        bounded = [k for k in ("x", "y", "z") if k not in unbounded]
+        return None, (f"plane fits bound only axis {','.join(bounded) or '(none)'} "
+                      "— a prismatic base needs all of x,y,z bounded, so this is not a "
+                      "block; author the base by hand")
+
+    # Extrude along +Z: plane.top carries the XY profile, which is also the frame the
+    # downstream Z-axis bore hints are authored in.
+    letter = "z"
+    res = _RESERVED[letter]
+    w = _AXES[letter]
+    t0, t1 = spans[letter]
+    # Same convention as the deterministic extrude base: the sketch sits at
+    # reserved_normal * offset and the extrude runs along +reserved_normal.
+    offset = t0 if _dot(res["n"], w) > 0 else -t1
+    ul, vl = _principal_axis(res["u"]), _principal_axis(res["v"])
+    u0, u1 = spans[ul]
+    v0, v1 = spans[vl]
+    corners = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+    ents = _reid([{"id": "e0", "type": "line", "construction": False,
+                   "p1": [round(a[0], 6), round(a[1], 6)],
+                   "p2": [round(b[0], 6), round(b[1], 6)]}
+                  for a, b in zip(corners, corners[1:] + corners[:1])])
+    return {"type": "extrude", "axis": letter, "plane": res["plane"],
+            "offset": round(offset, 6), "depth": round(t1 - t0, 6),
+            "entities": ents,
+            "region_centroid": [round(0.5 * (u0 + u1), 4), round(0.5 * (v0 + v1), 4)],
+            "source": "plane_fit_hint",
+            "extents_mm": {"x": round(spans["x"][1] - spans["x"][0], 4),
+                           "y": round(spans["y"][1] - spans["y"][0], 4),
+                           "z": round(spans["z"][1] - spans["z"][0], 4)}}, None
+
+
 # ---------------------------------------------------------------- registration
 
 def register_recon_tools(mcp: FastMCP) -> None:
@@ -1038,29 +1145,72 @@ def register_recon_tools(mcp: FastMCP) -> None:
         try:
             notes: list = []
             src = source.strip()
+            path = src
+            is_mesh_src = False
             if os.path.isfile(src) or (os.path.sep in src and
                                        os.path.isfile(os.path.abspath(src))):
                 path = os.path.abspath(src)
                 ext = os.path.splitext(path)[1].lower()
-                is_mesh = ext in (".stl", ".obj", ".ply", ".3mf", ".amf", ".off")
-                imp = cb.call("import_file", {"path": path, "as_solid": bool(is_mesh)})
+                is_mesh_src = ext in (".stl", ".obj", ".ply", ".3mf", ".amf", ".off")
+                imp = cb.call("import_file", {"path": path,
+                                              "as_solid": bool(is_mesh_src)})
                 ref_doc = imp.get("doc_id")
                 if not ref_doc:
                     return _dumps({"ok": False, "error": f"import of {path!r} produced no "
                                    "document"})
-                if is_mesh:
+                if is_mesh_src:
                     notes.append("facet geometry: expect low deterministic yield (mesh "
                                  "facets rarely satisfy the exact-surface passes)")
             else:
                 ref_doc = _doc(src)
 
-            ref_faces = _query_faces(ref_doc)
+            # doc_query RAISES "document has no bodies to query" on a bodyless document
+            # rather than returning no matches (same engine behaviour gsl_tools._empty_part_text
+            # exists for), so the refusal below was dead code and an empty STL surfaced the raw
+            # CoreError instead — `{"ok": false, "error": "document has no bodies to query",
+            # "code": "invalid_op"}`, which names neither the file nor a next step.
+            try:
+                ref_faces = _query_faces(ref_doc)
+            except Exception:  # noqa: BLE001
+                ref_faces = []
             if not ref_faces:
-                return _dumps({"ok": False, "error": f"document {ref_doc!r} has no solid "
-                               "bodies — nothing to reverse-engineer"})
+                what = (f"{path!r} imported to an empty document" if is_mesh_src
+                        else f"document {ref_doc!r} has no solid bodies")
+                extra = (" — it carries no triangles the sewer could close into a solid "
+                         "(an empty export, or a vertices-only point cloud). "
+                         "reverse_engineer VERIFIES every batch by boolean comparison "
+                         "against this solid, so there is nothing to rebuild against: "
+                         "mesh the cloud (or re-export the surface) first. "
+                         "reveng_fit_primitives DOES read a bare point cloud, so its "
+                         "primitive fits are still available"
+                         if is_mesh_src else
+                         " — open or import a part with a solid body first")
+                return _dumps({"ok": False, "error": what + extra +
+                               ". Nothing was reverse-engineered.", "doc_id": ref_doc})
 
             plan = _recognize(ref_doc)
             notes.extend(plan["notes"])
+
+            # A mesh source never satisfies the exact-surface prismatic pass (its faces
+            # are triangles), so when the deterministic passes claimed no base, fall back
+            # to the fitted PLANES for one. Without this a fully-recovered scan — six
+            # planes to 0.02 mm plus a bore to 0.01 mm — still rebuilt zero features,
+            # because the only hint the pipeline consumed was the bore and a cut needs a
+            # body to cut into.
+            if plan.get("base") is None:
+                plane_base, plane_why = _plane_hint_block(hints)
+                if plane_base is not None:
+                    plan["base"] = plane_base
+                    ex = plane_base["extents_mm"]
+                    notes.append(
+                        "no deterministic base — authored one from the fitted planes "
+                        f"instead: a {ex['x']:g} x {ex['y']:g} x {ex['z']:g} mm bounding "
+                        "block extruded along +Z. It goes through the same eval_compare "
+                        "keep-or-revert gate as every other batch; read `match_pct` and "
+                        "`unexplained` for how much of the part it actually explains")
+                elif plane_why:
+                    notes.append("plane fit hints were not usable as a base: "
+                                 + plane_why)
 
             try:
                 ref_name = (cb.call("doc_tree", {"doc_id": ref_doc}).get("tree")

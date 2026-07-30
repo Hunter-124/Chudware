@@ -247,7 +247,14 @@ def _json_balance(text: str) -> tuple[int, int, bool]:
     return depth, brack, in_str
 
 
-def _looks_truncated(reply: str) -> bool:
+#: Provider stop reasons that mean "I ran out of output budget", across the wire
+#: dialects the bridge normalises from (pi-ai "length"; Anthropic
+#: "max_tokens"; OpenAI "length"). Anything else — "stop", "end_turn",
+#: "tool_use" — means the model finished on its own terms.
+_TRUNCATED_STOPS = frozenset({"length", "max_tokens", "maxtokens", "max_output_tokens"})
+
+
+def _looks_truncated(reply: str, stop_reason: Any = None) -> bool:
     """True when *reply* is a tool directive CUT OFF mid-emission.
 
     Live 2026-07-28 (run asm-152734881473315): after three research calls the
@@ -255,13 +262,20 @@ def _looks_truncated(reply: str) -> bool:
     completion hit the 2048-token output cap mid-string. `_parse_directive`
     returned None, the bare-handoff path accepted the fragment as a
     natural-language finish, and the run reported `stop_reason=confirmed` with
-    ZERO geometry. Providers here return a bare string from `complete()` — there
-    is no finish_reason to consult — so detection has to be textual.
+    ZERO geometry.
 
-    Deliberately conservative: a false positive costs one wasted completion, so
-    an unmistakable directive OPENER is required, never unbalance alone (prose
-    discussing `{` would otherwise trip it).
+    `stop_reason` is the provider's OWN verdict when it has one
+    (providers.base.take_last_stop_reason; the omp bridge reports "length" vs
+    "stop" — measured 2026-07-30). It is authoritative and short-circuits the
+    textual test: a reply capped mid-PROSE is truncated too, and no amount of
+    brace-counting can see that. The textual path below remains the fallback for
+    every provider that reports nothing, and it stays deliberately conservative:
+    a false positive costs one wasted completion, so an unmistakable directive
+    OPENER is required, never unbalance alone (prose discussing `{` would
+    otherwise trip it).
     """
+    if isinstance(stop_reason, str) and stop_reason.strip().lower() in _TRUNCATED_STOPS:
+        return True
     text = reply or ""
     if not text.strip():
         return False
@@ -2254,7 +2268,13 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             # that built NOTHING reported status=done stop_reason=confirmed.
             # Ask ONCE for a compact re-emit; a second truncation ends the turn
             # honestly instead of looping on the same oversized directive.
-            if _looks_truncated(reply):
+            # The provider's own verdict when it reports one, consumed here (it is
+            # one-shot, so a provider that reports nothing yields None rather than
+            # a stale value from an earlier call). A reply capped mid-PROSE is
+            # truncated too, and the textual test below can never see that.
+            from services.agent.providers import base as _pb  # noqa: PLC0415
+            _stop = _pb.take_last_stop_reason()
+            if _looks_truncated(reply, _stop):
                 if tool_calls_made < budget and _trunc_nudge[0] < 1:
                     _trunc_nudge[0] += 1
                     _log(ledger, actor, {

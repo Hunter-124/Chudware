@@ -354,6 +354,35 @@ def test_points_only_reports_missing_sections(tmp_path):
     assert all(f["role"] == "unknown" for f in cyls)
 
 
+def test_a_vertices_only_ply_file_loads_as_a_cloud(tmp_path):
+    """A scan PLY with no faces must reach the fitters. ``trimesh.load(force="mesh")``
+    turns a vertices-only file into an EMPTY Trimesh instead of raising, so ``_load_mesh``
+    returned None and segment_fit refused a 30k-point scan with ``mesh_unreadable`` —
+    discarding the input the point-cloud path (``faces=None``) exists to serve."""
+    mesh_lib = _require_backends()
+    mesh = mesh_lib.creation.annulus(r_min=4.0, r_max=20.0, height=10.0, sections=96)
+    pts, _ = mesh_lib.sample.sample_surface(mesh, 30000)
+    path = tmp_path / "cloud_only.ply"
+    with open(path, "w") as fh:
+        fh.write("ply\nformat ascii 1.0\nelement vertex %d\nproperty float x\n"
+                 "property float y\nproperty float z\nend_header\n" % len(pts))
+        fh.writelines(f"{a:.6f} {b:.6f} {c:.6f}\n" for a, b, c in pts)
+
+    handle = segment_fit._load_mesh(str(path))
+    assert handle is not None, "vertices-only PLY was discarded"
+    assert len(handle["vertices"]) == 30000
+    assert handle["faces"] is None  # a cloud has none; only sectioning needs them
+
+    out = segment_fit.segment_fit(mesh_path=str(path), session_id="re_cloud",
+                                  plane_thresh_mm=0.2, cyl_thresh_mm=0.2)
+    assert out["ok"] is True, out
+    cyls = _of_kind(out, "cylinder")
+    assert cyls, out
+    assert abs(min(f["params_mm"]["radius"] for f in cyls) - 4.0) <= 0.1
+    assert all(f["role"] == "unknown" for f in cyls)  # unoriented normals: no bore/boss
+
+
+
 def test_plane_roles(tmp_path):
     """An enclosed floor reads as a pocket; a plain face carrying a boss does not."""
     mesh_lib = _require_backends()

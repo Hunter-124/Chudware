@@ -202,7 +202,17 @@ def _load_mesh(mesh_path: str) -> Optional[dict]:
         try:
             mesh = trimesh.load(mesh_path, force="mesh")
         except Exception:  # noqa: BLE001
-            return None
+            mesh = None
+        # ``force="mesh"`` turns a vertices-only file into an EMPTY Trimesh rather than
+        # raising: a 20k-point scan PLY loaded as 0 vertices / 0 faces, so segment_fit
+        # refused the whole cloud with ``mesh_unreadable`` even though a point cloud is a
+        # first-class scan input here (and the ``faces=None`` branch below exists for it).
+        # Re-read unforced and keep the cloud; only the cross-sections need real faces.
+        if mesh is None or len(np.asarray(getattr(mesh, "vertices", []), dtype=float)) == 0:
+            try:
+                mesh = trimesh.load(mesh_path)
+            except Exception:  # noqa: BLE001
+                return None
         if mesh is None or getattr(mesh, "vertices", None) is None:
             return None
         verts = np.asarray(mesh.vertices, dtype=float)

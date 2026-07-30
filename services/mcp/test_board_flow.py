@@ -337,3 +337,70 @@ if __name__ == "__main__":
     test_standalone_autoplace_and_optimize()
     test_board_from_schematic_tool_envelope()
     print("ALL PASS")
+
+
+def test_a_symbol_sync_cannot_place_is_named_never_silently_dropped() -> None:
+    """Live 2026-07-30 (ESP32 board flow): a nine-part schematic synced as FIVE
+    footprints and still reported "5 footprint(s) added ... Next: ecad_autoroute".
+
+    core/ecad/sync.cpp::placeable() rejects a component carrying no fpid and the loop
+    `continue`s BEFORE anything is written to report["unresolved"], so those parts left
+    no trace at all — not placed, not listed, not warned about. A board silently missing
+    a third of its components is the worst kind of green.
+
+    The contract this pins: every non-power, non-DNP component either lands on the board
+    or is NAMED in the reply. Never neither.
+    """
+    from mcp_server.ecad_common import ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    tools = _tools()
+    sch_id = _build_divider_schematic(tools, name="bf_nofp")
+
+    # A real starter symbol that is a PHYSICAL part yet carries no default footprint —
+    # exactly the shape that used to vanish. (The starter library has three such:
+    # Device:Switch, Device:Zener and FPGA:iCE40UP5K-SG48. Simulation_SPICE:V_source and
+    # I_source are also footprint-less but are legitimately sim-only, so they must NOT be
+    # reported — the divider above carries V1 and this test would trip on it otherwise.)
+    ghost = _call(tools, "ecad_place_symbol", libid="Device:Switch", x=60, y=5,
+                  value="SW1", ref="S1", doc_id=sch_id)
+    assert ghost.get("ok"), f"place failed: {ghost}"
+
+    _call(tools, "ecad_new_pcb", name="nofp_board")
+    pcb_id = _ECAD["current_pcb"]
+    up = _call(tools, "ecad_update_from_sch", sch_doc_id=sch_id, pcb_doc_id=pcb_id)
+    assert up.get("ok"), f"update_from_sch failed: {up}"
+
+    placed = {fp.get("ref") for fp in
+              (ecad_session.get_session(pcb_id).doc.get("footprints") or [])}
+    blob = json.dumps(up)
+    if "S1" not in placed:
+        assert "S1" in blob, (
+            "S1 was neither placed nor named anywhere in the reply — it vanished:\n"
+            f"placed={sorted(placed)}\nreply={blob[:800]}")
+
+    # The footprinted parts must still land, i.e. the guard did not cost the happy path.
+    assert {"R1", "R2"} <= placed, f"footprinted parts missing: {sorted(placed)}"
+
+
+def test_a_header_symbol_now_has_a_default_footprint_and_lands() -> None:
+    """Conn_2/Conn_3/Conn_4/Header_1x4 are starter SYMBOLS that ecad_find_part("header")
+    offers, but they had no entry in _DEFAULT_FOOTPRINTS, so every header the model added
+    was dropped off the board by the same silent path."""
+    from mcp_server.ecad_common import ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    tools = _tools()
+    sch_id = _build_divider_schematic(tools, name="bf_hdr")
+    hdr = _call(tools, "ecad_place_symbol", libid="Connector:Conn_2", x=60, y=5,
+                value="J1", ref="J1", doc_id=sch_id)
+    assert hdr.get("ok"), f"place failed: {hdr}"
+
+    _call(tools, "ecad_new_pcb", name="hdr_board")
+    pcb_id = _ECAD["current_pcb"]
+    up = _call(tools, "ecad_update_from_sch", sch_doc_id=sch_id, pcb_doc_id=pcb_id)
+    assert up.get("ok"), f"update_from_sch failed: {up}"
+
+    placed = {fp.get("ref") for fp in
+              (ecad_session.get_session(pcb_id).doc.get("footprints") or [])}
+    assert "J1" in placed, f"the header did not reach the board: {sorted(placed)}"

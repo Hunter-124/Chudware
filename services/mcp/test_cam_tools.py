@@ -851,5 +851,194 @@ def test_cam_open_changes_field(monkeypatch, tmp_path):
     assert "1 setup" in changes and "1 tool" in changes and "1 operation" in changes, changes
 
 
+def test_cam_post_refuses_a_program_with_no_motion(monkeypatch):
+    """THE classic CAM false green. Measured live 2026-07-30: a pocket2d whose geometry
+    produced no regions generated 0 toolpaths (cam_generate warned "pocket: no regions"),
+    and cam_post still answered ok:true / line_count:9 / warnings:[] with
+    "G21 G90 G17 G40 M5 M9 M30" — a syntactically valid NC file that machines nothing."""
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    header_only = "( J - S1)\n( post: GRBL )\nG21\nG90\nG17\nG40\nM5\nM9\nM30\n"
+
+    def fake_call(method, params=None):
+        if method == "cam_post":
+            return {"ok": True, "gcode": header_only, "line_count": 9,
+                    "tool_changes": 0, "est_time_s": 0.0, "warnings": [], "error": ""}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    mcp = FastMCP("test-cam-post-empty")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_post", {"dialect": "grbl"})
+    assert out.get("ok") is False, out
+    assert out.get("motion_line_count") == 0, out
+    assert "motion" in out.get("error", "") and "cam_generate" in out.get("error", ""), out
+
+
+def test_cam_post_reports_motion_on_a_real_program(monkeypatch):
+    """The gate must not fire on a program that DOES cut: modal continuation lines
+    (`X2.659 Y-25.781 Z9.994`) carry most of the motion in every dialect here."""
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    gcode = ("( J - S1)\nG21\nG90\n( T1 6mm )\nS14553 M3\n"
+             "G0 X0.000 Y0.000 Z15.000\nX2.700 Y-26.250\nG1 Z10.000 F785.9\n"
+             "X2.659 Y-25.781 Z9.994 F1309.8\nX2.537 Y-25.327 Z9.989\nM5\nM30\n")
+
+    def fake_call(method, params=None):
+        if method == "cam_post":
+            return {"ok": True, "gcode": gcode, "line_count": 12, "tool_changes": 1,
+                    "est_time_s": 250.6, "warnings": [], "error": ""}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    mcp = FastMCP("test-cam-post-real")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_post", {"dialect": "grbl"})
+    assert out.get("ok") is True, out
+    assert out.get("motion_line_count") == 5, out
+    assert "5 motion line(s)" in out.get("changes", ""), out
+
+
+def test_cam_add_operation_rejects_empty_geometry(monkeypatch):
+    """cam_extract returns `{"regions": []}` whenever the section Z misses the part, and
+    the operation used to be accepted with a cheerful "pocket2d operation added" — the
+    failure only surfaced two calls later as a header-only posted program."""
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        raise AssertionError(f"engine must not be touched, got {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    mcp = FastMCP("test-cam-empty-geo")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_add_operation",
+                      {"type": "pocket2d", "tool_number": 1, "geometry": {"regions": []}})
+    assert out.get("ok") is False, out
+    assert "regions is empty" in out.get("error", ""), out
+    assert "cam_extract" in out.get("error", ""), out
+
+
+def test_cam_generate_digests_the_moves_and_names_an_empty_result(monkeypatch):
+    """Measured live 2026-07-30: ONE pocket2d on a 100x60x20 block returned 894,116 chars
+    of per-move JSON from cam_generate — bigger than most context windows, and nothing a
+    caller can act on that the digest does not carry."""
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    moves = ([{"kind": "rapid", "to": [0, 0, 15]}]
+             + [{"kind": "cut", "to": [i, 0, 2]} for i in range(500)])
+
+    def fake_call(method, params=None):
+        if method == "cam_generate":
+            return {"stats": {"count": 1}, "warnings": [],
+                    "toolpaths": [{"op": "op1", "cut_length": 9047.6, "moves": moves}]}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    mcp = FastMCP("test-cam-generate")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_generate", {})
+    tp = out["toolpaths"][0]
+    assert "moves" not in tp, tp
+    assert tp["move_count"] == 501 and tp["moves_by_kind"] == {"cut": 500, "rapid": 1}, tp
+    assert tp["cut_length"] == 9047.6, tp
+    assert "501 move(s)" in out.get("changes", ""), out
+
+
+def test_cam_generate_says_so_when_nothing_was_generated(monkeypatch):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    def fake_call(method, params=None):
+        if method == "cam_generate":
+            return {"stats": {"count": 0}, "toolpaths": [],
+                    "warnings": [{"op": "op1", "error": "pocket: no regions"}]}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    mcp = FastMCP("test-cam-generate-empty")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_generate", {})
+    changes = out.get("changes", "")
+    assert "NO toolpaths" in changes and "pocket: no regions" in changes, changes
+
+
+def test_cam_add_setup_resolves_the_default_offset_stock_against_the_part(monkeypatch):
+    """core/cam/stock_sim.cpp 181-190 resolves box_offset from min/max, which a standalone
+    CAM job never has. Measured live 2026-07-30: a setup built with this tool's OWN default
+    stock simulated as {ok:false, error:"stock has zero extent", stock_volume_mm3:0}, while
+    the same job with an explicit box gave stock 120000.0 / removed 41936.0."""
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    seen: dict = {}
+
+    def fake_call(method, params=None):
+        if method == "export_file":
+            return {"ok": True}
+        if method == "cam_extract":
+            return {"stock": {"box": {"min": [-50.0, -30.0, -10.0],
+                                      "max": [50.0, 30.0, 10.0]}}}
+        if method == "cam_apply_ops":
+            seen["stock"] = params["ops"][0]["setup"]["stock"]
+            return {"revision": 2, "id_map": {"_s": "su1"},
+                    "tree": {"tools": [], "setups": [{"id": "su1", "operations": []}]}}
+        if method in ("material_cam_id", "material_resolve_key"):
+            return {"result": "aluminum"}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    monkeypatch.setitem(ct._CUR, "doc_id", "part-1")
+    mcp = FastMCP("test-cam-setup-stock")
+    ct.register_cam_tools(mcp)
+
+    out = _call_tool(mcp, "cam_add_setup", {"name": "S1"})
+    assert out.get("setup_id") == "su1", out
+    # off_ztop defaults to 1.0, so the blank sits 1 mm proud of the part's top face.
+    assert seen["stock"]["type"] == "box", seen
+    assert seen["stock"]["min"] == [-50.0, -30.0, -10.0], seen
+    assert seen["stock"]["max"] == [50.0, 30.0, 11.0], seen
+    assert "bbox" in out.get("stock_note", ""), out
+
+
+def test_cam_add_setup_keeps_an_explicit_box_stock_untouched(monkeypatch):
+    from mcp_server import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    seen: dict = {}
+
+    def fake_call(method, params=None):
+        if method == "cam_apply_ops":
+            seen["stock"] = params["ops"][0]["setup"]["stock"]
+            return {"revision": 2, "id_map": {"_s": "su1"},
+                    "tree": {"tools": [], "setups": [{"id": "su1", "operations": []}]}}
+        if method in ("material_cam_id", "material_resolve_key"):
+            return {"result": "aluminum"}
+        raise AssertionError(f"engine must not be measured, got {method}")
+
+    monkeypatch.setattr(ct.cb, "call", fake_call)
+    monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
+    mcp = FastMCP("test-cam-setup-explicit-stock")
+    ct.register_cam_tools(mcp)
+
+    _call_tool(mcp, "cam_add_setup",
+               {"name": "S1", "stock": {"type": "box", "min": [0, 0, 0], "max": [10, 10, 5]}})
+    assert seen["stock"]["min"] == [0, 0, 0] and seen["stock"]["max"] == [10, 10, 5], seen
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -323,6 +323,11 @@ class OmpBridgeProvider(Provider):
             raise bridge.BridgeUnavailable(
                 f"omp-bridge {self.name}: endpoint returned no completion")
         self._record_usage(result.get("usage"))
+        # The AUTHORITATIVE truncation signal. Measured 2026-07-30 against the live
+        # sidecar: maxTokens=16 -> stopReason "length", maxTokens=4000 -> "stop".
+        # agent_turn had to guess at this textually because it never arrived; see
+        # base.set_last_stop_reason for what that guess cost.
+        _base.set_last_stop_reason(result.get("stopReason"))
         return reply, thinking
 
     def _record_usage(self, usage: Any) -> None:

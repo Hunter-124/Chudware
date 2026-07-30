@@ -1918,6 +1918,23 @@ def _make_footprints() -> dict:
         "Connector_PinHeader_2.54mm:Header_1x4"
     )
 
+    # ── Header_1x2 / Header_1x3 P2.54 ────────────────────────────────────
+    # Live 2026-07-30: Connector:Conn_2 / Conn_3 are offered by ecad_find_part('connector')
+    # but had no 1xN footprint to default to, so a two-pin power inlet was dropped off the
+    # board by sync with no diagnostic. Same geometry family as the 1x4 above.
+    for _n in (2, 3):
+        _pads = [_tht_pad(f"p{i+1}", str(i + 1), 0.0, ((_n - 1) / 2.0 - i) * 2.54,
+                          1.0, 1.7, 1.7) for i in range(_n)]
+        _half = (_n - 1) * 2.54 / 2.0 + 1.27
+        fps[f"Connector_PinHeader_2.54mm:Header_1x{_n}"] = _fp(
+            f"Connector_PinHeader_2.54mm:Header_1x{_n}",
+            pads=_pads,
+            graphics=(_silk_box(-1.0, -_half, 1.0, _half)
+                      + _crtyd_box(-1.6, -_half - 0.6, 1.6, _half + 0.6)),
+            attr="tht",
+            description=f"1x{_n} pin header 2.54mm pitch",
+        )
+
     # ── LED_0805 SMD ─────────────────────────────────────────────────────
     fps["LED_SMD:LED_0805"] = _fp(
         "LED_SMD:LED_0805",

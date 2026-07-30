@@ -134,6 +134,11 @@ def _make_record(std: Standard, size: str, params: dict) -> dict:
         "domain":       domain,
         "title":        title,
         "standard":     std.id,
+        # The loader already carries the standard's alternate designations
+        # ("DIN 912" / "SHCS" for ISO 4762) — publish them so they are searchable.
+        # index._record_to_row folds `aliases` into the FTS text; without it a
+        # buyer's "DIN 912 M3" found no fastener in the library at all.
+        "aliases":      list(std.aliases),
         "designation":  size,
         "params":       dict(params),
         "geometry_ref": geometry_ref,

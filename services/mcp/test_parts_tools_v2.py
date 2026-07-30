@@ -9,6 +9,7 @@ no libchudware, no CAM job.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -504,3 +505,167 @@ class TestReverseEngineerProduct:
     def test_no_reference_is_contract_error(self):
         out = pt.reverse_engineer_product_impl(title="just a title")
         assert out["ok"] is False and "reference" in out["reason"]
+
+
+# ---------------------------------------------------------------------------
+# place_parametric_impl — the parametric_* catalog families
+# ---------------------------------------------------------------------------
+
+class TestPlaceParametric:
+    """384 records (stepper motors, timing pulleys, shaft collars/couplers,
+    heatsinks) advertise geometry_ref kinds core/parts/place.cpp::route has never
+    known, so part_place answered "Unknown geometry_ref kind
+    'parametric_stepper_motor'" for every one of them. These check the ops the
+    Python route emits — geometry, not ok:true — with the engine bridge stubbed so
+    the test needs no libchudware and no network.
+    """
+
+    @staticmethod
+    def _record(kind, spec, params=None):
+        return {"part_id": f"probe:{kind}", "domain": "probe",
+                "params": params or {},
+                "geometry_ref": {"kind": kind, "spec": spec}}
+
+    @staticmethod
+    def _stub_bridge(monkeypatch, captured):
+        def _call(method, params):
+            if method == "doc_new":
+                return {"doc_id": "doc-probe-1", "revision": 0}
+            if method == "doc_apply_ops":
+                captured.extend(params["ops"])
+                return {"ok": True}
+            if method == "eval_mass":
+                return {"volume_mm3": 1.0}
+            raise AssertionError(f"unexpected rpc {method}")
+        from services.mcp import core_bridge as cb
+        monkeypatch.setattr(cb, "call", _call)
+
+    def test_non_parametric_kind_is_left_to_the_engine(self):
+        # An empty dict is the "not mine" signal part_place keys off; anything else
+        # would hijack every core_family placement.
+        assert pt.place_parametric_impl(
+            "fastener:ISO 4762:M3",
+            self._record("core_family", {"family": "shcs", "size": "M3"})) == {}
+
+    def test_stepper_motor_builds_frame_shaft_and_bolt_circle(self, monkeypatch):
+        ops: list = []
+        self._stub_bridge(monkeypatch, ops)
+        out = pt.place_parametric_impl(
+            "motor:stepper:NEMA17-34mm-0p9deg",
+            self._record("parametric_stepper_motor",
+                         {"nema_size": 17, "body_square_mm": 42.3,
+                          "bolt_hole_spacing_mm": 31.0, "shaft_dia_mm": 5.0,
+                          "body_length_mm": 34},
+                         {"mount_screw": "M3"}))
+        assert out["ok"] is True and out["editable"] is True
+        assert out["doc_id"] == "doc-probe-1"
+        # body + shaft + four mounting holes, and the holes really are cuts.
+        names = [o["feature"]["name"] for o in ops]
+        assert names == ["Body", "Shaft", "MountHole1", "MountHole2",
+                         "MountHole3", "MountHole4"]
+        assert all(o["feature"]["params"]["mode"] == "cut"
+                   for o in ops if o["feature"]["name"].startswith("MountHole"))
+        body = ops[0]["feature"]["params"]
+        assert body["length"]["value"] == 42.3 and body["height"]["value"] == 34.0
+        # Faceplate seats at z=0 with the body behind it (the documented datum).
+        assert body["at"][2] == -34.0
+        shaft = ops[1]["feature"]["params"]
+        assert shaft["radius"]["value"] == 2.5 and shaft["at"] == [0.0, 0.0, 0.0]
+        # M3 faceplate taps on the 31 mm bolt circle.
+        holes = [o["feature"]["params"] for o in ops[2:]]
+        assert {h["radius"]["value"] for h in holes} == {1.5}
+        assert {(h["at"][0], h["at"][1]) for h in holes} == {
+            (-15.5, -15.5), (15.5, -15.5), (15.5, 15.5), (-15.5, 15.5)}
+
+    def test_stepper_shaft_length_is_flagged_and_overridable(self, monkeypatch):
+        ops: list = []
+        self._stub_bridge(monkeypatch, ops)
+        spec = {"nema_size": 17, "body_square_mm": 42.3,
+                "bolt_hole_spacing_mm": 31.0, "shaft_dia_mm": 5.0,
+                "body_length_mm": 34}
+        # Shaft protrusion is a per-SKU option, not a frame-standard dimension, so
+        # the nominal used MUST be declared rather than passed off as spec truth.
+        assumed = pt.place_parametric_impl(
+            "m", self._record("parametric_stepper_motor", spec))
+        assert assumed["detail"]["shaft_length_mm"] == 24.0
+        assert any("shaft protrusion" in a
+                   for a in assumed["detail"]["assumptions"])
+        overridden = pt.place_parametric_impl(
+            "m", self._record("parametric_stepper_motor", spec),
+            {"shaft_length_mm": 40})
+        assert overridden["detail"]["shaft_length_mm"] == 40.0
+        assert overridden["detail"]["assumptions"] == []
+
+    def test_pulley_body_is_the_exact_pitch_diameter(self, monkeypatch):
+        ops: list = []
+        self._stub_bridge(monkeypatch, ops)
+        out = pt.place_parametric_impl(
+            "motion:pulley:GT2-20T-5mm",
+            self._record("parametric_timing_pulley",
+                         {"profile": "GT2", "pitch_mm": 2.0, "teeth": 20,
+                          "bore_mm": 5.0, "belt_width_mm": 6.0}))
+        assert out["ok"] is True
+        assert out["detail"]["pitch_dia_mm"] == pytest.approx(12.732, abs=1e-3)
+        body, bore = ops[0]["feature"]["params"], ops[1]["feature"]["params"]
+        assert body["radius"]["value"] == pytest.approx(40.0 / math.pi / 2)
+        assert body["height"]["value"] == 6.0
+        assert bore["radius"]["value"] == 2.5 and bore["mode"] == "cut"
+
+    def test_collar_and_coupler_bores_come_from_the_spec(self, monkeypatch):
+        ops: list = []
+        self._stub_bridge(monkeypatch, ops)
+        pt.place_parametric_impl(
+            "motion:collar:COLLAR-setscrew-12mm",
+            self._record("parametric_shaft_collar",
+                         {"bore_mm": 12.0, "od_mm": 27.6, "width_mm": 9.0}))
+        assert [o["feature"]["params"]["radius"]["value"] for o in ops] == [13.8, 6.0]
+        ops.clear()
+        pt.place_parametric_impl(
+            "motion:coupler:COUPLER-setscrew-5mmx8mm",
+            self._record("parametric_shaft_coupler",
+                         {"bore_a_mm": 5.0, "bore_b_mm": 8.0, "od_mm": 19.0,
+                          "length_mm": 25.0}))
+        # Each bore enters from its own end and stops halfway.
+        a, b = ops[1]["feature"]["params"], ops[2]["feature"]["params"]
+        assert (a["radius"]["value"], a["at"][2], a["height"]["value"]) == (2.5, 0.0, 12.5)
+        assert (b["radius"]["value"], b["at"][2], b["height"]["value"]) == (4.0, 12.5, 12.5)
+
+    def test_heatsink_maps_the_adapter_spec_onto_the_generator(self, monkeypatch):
+        ops: list = []
+        self._stub_bridge(monkeypatch, ops)
+        # heatsinks_adapter names services.mcp.heatsink.sink_ops in geometry_ref but
+        # ships l_mm/w_mm while sink_ops reads base_l_mm/base_w_mm — calling the
+        # advertised generator with the advertised spec used to raise KeyError.
+        out = pt.place_parametric_impl(
+            "thermal:heatsink:HS-EXTR-40SQ-20",
+            self._record("parametric_heatsink",
+                         {"l_mm": 40.0, "w_mm": 40.0, "base_t_mm": 3.0,
+                          "n_fins": 10, "fin_t_mm": 1.3, "fin_h_mm": 17.0}))
+        assert out["ok"] is True
+        assert out["detail"]["base_l_mm"] == 40.0
+        assert len(ops) == 11  # base + 10 fins
+        assert ops[0]["feature"]["params"]["height"]["value"] == 3.0
+
+    def test_belt_is_refused_with_the_layout_numbers(self, monkeypatch):
+        ops: list = []
+        self._stub_bridge(monkeypatch, ops)
+        out = pt.place_parametric_impl(
+            "motion:belt:GT2-160mm-6mm",
+            self._record("parametric_timing_belt",
+                         {"profile": "GT2", "pitch_mm": 2.0, "teeth": 80,
+                          "length_mm": 160.0, "belt_width_mm": 6.0}))
+        # A closed loop has no standalone shape; refuse, but hand back everything
+        # needed to lay the drive out. Never fabricate a ring.
+        assert out["ok"] is False and not ops
+        assert "no standalone geometry" in out["reason"]
+        assert "160.0 mm" in out["hint"] and "80 teeth" in out["hint"]
+
+    def test_missing_spec_dimension_names_the_parameter(self, monkeypatch):
+        ops: list = []
+        self._stub_bridge(monkeypatch, ops)
+        out = pt.place_parametric_impl(
+            "motion:collar:broken",
+            self._record("parametric_shaft_collar",
+                         {"bore_mm": 12.0, "od_mm": 27.6}))
+        assert out["ok"] is False and not ops
+        assert "width_mm" in out["reason"] and "width_mm" in out["hint"]

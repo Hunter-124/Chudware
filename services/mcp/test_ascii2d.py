@@ -461,8 +461,11 @@ def test_board_mutation_readback_has_ascii_summary_net_delta():
     rb = board_mutation_readback(board, pitch_mm=2.0, layer="F.Cu")
     assert rb["ok"] is True
     assert rb["kind"] == "board_readback"
-    assert rb["ascii"] and isinstance(rb["ascii"], str)
-    assert rb["ascii_block"].startswith("[board_readback")
+    assert rb["ascii_ruled"].startswith("[board_readback")
+    # ONE picture only: `ascii` (bare) and `ascii_block` (header+bare) were the same
+    # drawing as `ascii_ruled` minus its col/row rulers, which are the cell addressing
+    # apply_ascii_edits(kind='pcb') resolves against.
+    assert "ascii" not in rb and "ascii_block" not in rb
     assert "summary" in rb and isinstance(rb["summary"], str)
     assert "net_delta" in rb
     nd = rb["net_delta"]
@@ -478,13 +481,13 @@ def test_board_mutation_readback_caps_and_determinism():
     board = _crossing_board()
     a = board_mutation_readback(board, pitch_mm=1.0, max_h=40, max_w=120)
     b = board_mutation_readback(board, pitch_mm=1.0, max_h=40, max_w=120)
-    assert a["ascii"] == b["ascii"]
+    assert a["ascii_ruled"] == b["ascii_ruled"]
     assert a["summary"] == b["summary"]
     assert a["findings"] == b["findings"]
     assert a["net_delta"] == b["net_delta"]
-    rows = a["ascii"].split("\n")
-    assert len(rows) <= READBACK_MAX_H
-    assert all(len(r) <= READBACK_MAX_W for r in rows)
+    rows = a["ascii_ruled"].split("\n")
+    assert len(rows) <= READBACK_MAX_H + 4  # header + col-ruler lines
+    assert all(len(r) <= READBACK_MAX_W + 8 for r in rows)  # + row-number gutter
     tiny = board_mutation_readback(board, pitch_mm=0.5, max_h=6, max_w=12)
     assert tiny["height"] <= 6
     assert tiny["width"] <= 12
@@ -506,9 +509,12 @@ def test_attach_helpers_mutate_response():
 
     resp_b: dict = {"ok": True, "doc_id": "pcb1"}
     attach_board_readback(resp_b, board, pitch_mm=2.0, layer="F.Cu")
-    assert resp_b["ascii"]
-    assert resp_b["net_delta"]["tracks"] >= 1
+    # Same single-path contract as the sketch helper above.
+    assert "ascii" not in resp_b and "ascii_block" not in resp_b
+    assert "board_summary" not in resp_b and "net_delta" not in resp_b
+    assert resp_b["ascii_readback"]["net_delta"]["tracks"] >= 1
     assert resp_b["ascii_readback"]["ok"] is True
+    assert resp_b["summary"] == resp_b["ascii_readback"]["summary"]
 
 
 def test_sketch_ids_from_ops_deterministic():
@@ -719,8 +725,14 @@ def test_attach_schematic_readback():
     sch = _divider_schematic()
     resp = {"ok": True}
     attach_schematic_readback(resp, sch)
-    assert resp["ascii_readback"]["ok"] is True
-    assert resp["ascii"]
+    rb = resp["ascii_readback"]
+    assert rb["ok"] is True
+    assert rb["ascii_ruled"].startswith("[schematic_readback")
+    # ONE picture, one summary, one grid/index — nothing cloned to the top level.
+    for k in ("ascii", "ascii_block", "schematic_summary", "grid", "index",
+              "readback_hint"):
+        assert k not in resp, f"{k} duplicated outside ascii_readback"
+    assert resp["summary"] == rb["summary"]
 
 
 

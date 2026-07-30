@@ -2058,6 +2058,17 @@ _PATTERN_KIND_WORDS = {
 _GENERIC_PATTERN_WORDS = frozenset({"pattern", "array", "repeat", "duplicate"})
 _PATTERN_KIND_KEYS = ("mode", "kind", "pattern_type", "pattern", "arrangement", "style",
                       "direction_type")
+#: Engine feature types whose OWN canonical name contains a generic pattern word, and which
+#: are therefore NOT dialect spellings of linear_pattern/circular_pattern. Live probe
+#: 2026-07-30: {"type":"sm_flat_pattern"} — the exact type the sheetmetal cheatsheet tells
+#: the model to send to unfold the blank — hit the generic branch below on the word
+#: "pattern", was rewritten to a linear_pattern, and was then rejected for
+#: count1/spacing1/dir1/features. The sheet-metal flat pattern could not be built AT ALL
+#: through add_features. The two asm_*_pattern component patterns fall the same way (their
+#: seeds live in refs.components, not refs.features), so they are guarded here too.
+_PATTERN_NAMED_NON_PATTERN_TYPES = frozenset({
+    "sm_flat_pattern", "asm_linear_pattern", "asm_circular_pattern",
+})
 #: What a model calls the thing being patterned. The engine wants refs.features, a LIST.
 _PATTERN_SOURCE_KEYS = ("source", "seed", "feature", "features", "of", "target",
                         "targets", "entities", "items")
@@ -2087,6 +2098,14 @@ def _pattern_kind(feat: dict, params: dict) -> Optional[str]:
     tword = _slug(feat.get("type"))
     if tword in ("linear_pattern", "circular_pattern"):
         return tword
+    # A canonical engine type that merely CONTAINS a pattern word is itself, not a dialect
+    # spelling of a part-level pattern. Checked against the live vocabulary too, so a future
+    # `*_pattern` feature type is safe the day it lands.
+    if tword in _PATTERN_NAMED_NON_PATTERN_TYPES:
+        return None
+    vocab, live = _feature_type_vocab()
+    if live and tword in vocab:
+        return None
     if tword in _PATTERN_KIND_WORDS:
         return _PATTERN_KIND_WORDS[tword]
     # A QUALIFIED spelling — "polar_pattern", "pattern_circular", "rectangular_array".
@@ -4258,6 +4277,47 @@ _TYPE_PARAM_ALIASES: dict = {
     # pass) can carry them into `refs`, which is where the engine reads them.
     "mirror": {"plane": ("about", "across", "mirror_plane", "symmetry_plane")},
     "sweep": {"path": ("spine", "trajectory", "rail", "along", "sweep_path")},
+    # SHEET METAL. core/doc/document.cpp reads sm_base_flange 5885-5889 (thickness /
+    # k_factor / default_bend_radius) and the shared bend branch 5966-6088 (length /
+    # angle / radius / k_factor / offset / hem_type); validate.cpp 223-227 requires NO
+    # params on any sm_* type, so every one of these is read with contains()/value() and
+    # an unrecognised spelling is silently swallowed. Measured live 2026-07-30 on a fresh
+    # engine — an 80x40x2 base + two 90 deg 25 mm flanges + sm_flat_pattern, reading the
+    # unfolded blank's X extent (analytic target 134.106 mm for r=6, k=0.20, L=25):
+    #   length   height / flange_length / wall_length -> 124.106; the flange fell back to
+    #            the 20 mm DEFAULT. The model asked for a 25 mm wall and got a 20 mm one,
+    #            10 mm short on the blank, reported ok.
+    #   radius   bend_radius / inner_radius -> 129.540; the bend used the default radius
+    #            (= thickness) instead of the 6 mm the model specified.
+    #   k_factor kfactor / k -> 135.677; the bend allowance used k=0.45, not 0.20.
+    # Every one of those is a silent wrong blank — the part looks built and the flat
+    # pattern is simply the wrong size, which is exactly what gets cut.
+    "sm_base_flange": {
+        "thickness": ("sheet_thickness", "material_thickness", "gauge", "wall_thickness", "t"),
+        "default_bend_radius": ("bend_radius", "radius", "inner_radius", "default_radius",
+                                "bend_r"),
+        "k_factor": ("kfactor", "k", "k_fac", "bend_k"),
+    },
+    "sm_edge_flange": {
+        "length": ("height", "flange_length", "flange_height", "wall_length", "wall",
+                   "leg", "leg_length"),
+        "radius": ("bend_radius", "inner_radius", "bend_r"),
+        "k_factor": ("kfactor", "k", "k_fac", "bend_k"),
+        "angle": ("bend_angle", "fold_angle", "flange_angle"),
+    },
+    "sm_hem": {
+        "length": ("height", "hem_length", "wall_length", "wall", "leg", "leg_length"),
+        "radius": ("bend_radius", "inner_radius", "bend_r"),
+        "k_factor": ("kfactor", "k", "k_fac", "bend_k"),
+        "hem_type": ("hem_style", "style"),
+    },
+    "sm_jog": {
+        "length": ("height", "flange_length", "wall_length", "wall", "leg", "leg_length"),
+        "offset": ("jog_offset", "step", "step_offset", "z_offset"),
+        "radius": ("bend_radius", "inner_radius", "bend_r"),
+        "k_factor": ("kfactor", "k", "k_fac", "bend_k"),
+        "angle": ("bend_angle", "fold_angle", "jog_angle"),
+    },
 }
 #: A surface sweep is the same feature without the boolean, so it takes the same dialect.
 _TYPE_PARAM_ALIASES["surf_sweep"] = _TYPE_PARAM_ALIASES["sweep"]

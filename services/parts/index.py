@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Iterator
 
-from services.parts.query_norm import expand_terms, normalize_query
+from services.parts.query_norm import expand_terms, normalize_query, term_tiers
 
 log = logging.getLogger(__name__)
 
@@ -516,10 +516,14 @@ def _record_to_row(rec: dict) -> tuple | None:
     title = rec.get("title") or ""
     standard = rec.get("standard") or ""
     designation = rec.get("designation") or ""
-    # Build FTS text: title + standard + designation + param values.
+    # Build FTS text: title + standard + designation + aliases + param values.
+    # `aliases` matters: a standard's alternate designations are how buyers spell it
+    # ("DIN 912" for ISO 4762, "SHCS"), and without them "DIN 912 M3" matched no
+    # fastener at all and relaxed down to an O-ring whose 0.912" ID carried the "912".
     params = rec.get("params") or {}
     param_text = " ".join(str(v) for v in params.values())
-    text = f"{title} {standard} {designation} {param_text}".strip()
+    alias_text = " ".join(str(a) for a in (rec.get("aliases") or []) if a)
+    text = f"{title} {standard} {designation} {alias_text} {param_text}".strip()
     record_json = json.dumps(rec, ensure_ascii=False)
     # (rowid, part_id, domain, record_json) for parts_meta
     # (part_id, domain, title, standard, designation, text) for fts
@@ -602,15 +606,51 @@ def _group_match_clause(group: list[str], *, prefix: bool = False) -> str:
     return "(" + " OR ".join(parts) + ")"
 
 
+def _clause_has_hit(clause: str, conn: sqlite3.Connection) -> bool:
+    """True when ``clause`` matches at least one indexed record."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM parts_fts WHERE parts_fts MATCH ? LIMIT 1", (clause,)
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def _narrowest_present_clause(core: list[str], fallback: list[str],
+                              conn: sqlite3.Connection, *, prefix: bool) -> str:
+    """The tightest clause for one term-group that still matches the corpus.
+
+    Core variants first: a hit there means the corpus carries the term as the user
+    typed it, so the broadening fallbacks (query_norm._term_tiers — the fragments of
+    a glued token, e.g. bare "3" from "m3", bare "12"/"mm" from "12mm") stay OUT of
+    the clause. Those fragments hit 753 and 318 of the 3182 shipped records against
+    46 for "m3" and 72 for "12mm", so including them let any record with a stray
+    digit satisfy the group and reach the top coverage tier — that is what ranked a
+    KiCad mounting-hole footprint and three shaft collars above
+    fastener:ISO 4762:M3 for "M3 socket head cap screw 12mm". Only a core MISS falls
+    back to the full group, which keeps a glued spelling the corpus does not carry
+    ("608zz" -> "608") findable.
+    """
+    core_clause = _group_match_clause(core, prefix=prefix)
+    if core_clause and _clause_has_hit(core_clause, conn):
+        return core_clause
+    full_clause = _group_match_clause([*core, *fallback], prefix=prefix)
+    if full_clause and full_clause != core_clause and _clause_has_hit(full_clause, conn):
+        return full_clause
+    return ""
+
+
 def _build_fts_query(query: str, conn: sqlite3.Connection) -> list[tuple[str, int]]:
     """Build a coverage-aware, quorum-relaxed FTS5 match plan for ``query``.
 
-    Splits the query into synonym term-groups (:func:`expand_terms`) and
-    quotes every literal so no bare operator ever reaches FTS5. A group with
-    ZERO corpus matches is dropped from every match expression it would
-    otherwise appear in — one rare/absent token (e.g. a bearing designation
-    like "17") must never carry an unrelated multi-term query — but it still
-    counts toward the group total (see :meth:`PartsIndex.term_coverage`).
+    Splits the query into tiered synonym term-groups (:func:`term_tiers`) and
+    quotes every literal so no bare operator ever reaches FTS5. Each group
+    contributes its NARROWEST clause that still matches something
+    (:func:`_narrowest_present_clause`); a group with ZERO corpus matches at any
+    width is dropped from every match expression it would otherwise appear in —
+    one rare/absent token (e.g. a bearing designation like "17") must never carry
+    an unrelated multi-term query — but it still counts toward the group total
+    (see :meth:`PartsIndex.term_coverage`).
 
     Returns an ordered list of ``(match_expression, quorum)`` tiers, most
     confident first:
@@ -621,30 +661,22 @@ def _build_fts_query(query: str, conn: sqlite3.Connection) -> list[tuple[str, in
     Returns ``[]`` when nothing in the query matches anything in the corpus.
     """
     try:
-        groups = expand_terms(query)
+        tiers = term_tiers(query)
     except Exception:  # noqa: BLE001
-        groups = None
+        tiers = None
 
-    if not groups:
+    if not tiers:
         tokens = [t for t in (query or "").strip().split() if t]
         if not tokens:
             return []
-        groups = [[t] for t in tokens]
+        tiers = [([t], []) for t in tokens]
 
-    n_groups = len(groups)
+    n_groups = len(tiers)
     present: list[str] = []
-    for i, group in enumerate(groups):
-        clause = _group_match_clause(group, prefix=(i == n_groups - 1))
-        if not clause:
-            continue
-        try:
-            hit = conn.execute(
-                "SELECT 1 FROM parts_fts WHERE parts_fts MATCH ? LIMIT 1",
-                (clause,),
-            ).fetchone()
-        except sqlite3.OperationalError:
-            hit = None
-        if hit is not None:
+    for i, (core, fallback) in enumerate(tiers):
+        clause = _narrowest_present_clause(core, fallback, conn,
+                                           prefix=(i == n_groups - 1))
+        if clause:
             present.append(clause)
 
     if not present:

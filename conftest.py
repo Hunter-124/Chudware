@@ -152,6 +152,33 @@ def _isolated_subagent_registry(tmp_path_factory):
     finally:
         os.environ.pop("CHUDWARE_SUBAGENTS_DIR", None)
 
+# ---------------------------------------------------------------------------
+# Generated-ECAD-part isolation. `ecad_make_part` writes symbols/footprints to
+# services/ecad/library/generate.py::library_dir() — by default the REAL user library
+# at ~/.local/share/Chudware/ecad_library — and `ecad_find_part` resolves through it.
+#
+# Two ways that bites, both observed 2026-07-30. A probe generated an 8-pin
+# "Generated:ESP32_MINI" there, and from then on `ecad_find_part("ESP32")` answered with
+# it — which silently disarmed the multi-pin substitution SAFETY refusal that
+# test_library_refuses_multipin_substitution exists to pin, on that box, permanently.
+# The mirror hazard is just as bad: a suite that writes into the real library changes
+# what the user's own copilot finds afterwards.
+#
+# So the suite gets a throwaway library and asserts against the SHIPPED one, which is
+# what those tests actually mean. An explicitly pre-set CHUDWARE_ECAD_LIB_DIR is honored
+# (a caller who aimed it somewhere has already decided).
+@_pytest.fixture(autouse=True, scope="session")
+def _isolated_ecad_generated_library(tmp_path_factory):
+    if os.environ.get("CHUDWARE_ECAD_LIB_DIR"):
+        yield
+        return
+    d = tmp_path_factory.mktemp("ecad_library")
+    os.environ["CHUDWARE_ECAD_LIB_DIR"] = str(d)
+    try:
+        yield
+    finally:
+        os.environ.pop("CHUDWARE_ECAD_LIB_DIR", None)
+
 
 # ---------------------------------------------------------------------------
 # Engine isolation for test sessions. `services/mcp/core_bridge` defaults to daemon mode

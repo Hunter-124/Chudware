@@ -444,6 +444,65 @@ class _StudyRefusal(Exception):
         self.payload = payload
 
 
+# ------------------------------------------------------- the zero-input study (live fix)
+# Measured 2026-07-30 driving the bracket flow ("will this hold 200 N?") end to end on an
+# 80x40x8 plate, left face fixed:
+#   run_fea_static(fixtures=["left"], loads=[])
+#       -> ok:true, max_von_mises_mpa 0.0, max_disp_mm 0.0, min_fos 15.0
+#   run_fea_static(fixtures=["left"], loads=[{"face":"right","force":[0,0,0]}])
+#       -> byte-identical
+#   run_fea_fatigue(fixtures=["left"], loads=[])
+#       -> ok:true, regime "infinite", fos_endurance null   ("this part never fails")
+# 15.0 is core/sim/fea_static.cpp's FoS saturation cap (yield/0 clamps to 15), so a study
+# with NO LOAD reports the single most reassuring number the surface can produce. There is
+# no body-load term anywhere in the study payload (no gravity / self-weight in
+# fea_static.cpp), so a linear-static solve with no non-zero load is identically zero BY
+# CONSTRUCTION: the reply is never an answer to the caller's question, only a well-formed
+# lie about it. Refused at SETUP, before a mesh is built, so it costs one call and teaches.
+
+def _load_is_driving(spec: dict) -> bool:
+    """Does this solver load spec put any energy into the model?"""
+    if spec.get("type") == "pressure":
+        return abs(float(spec.get("magnitude") or 0.0)) > 0.0
+    return any(abs(float(c)) > 0.0 for c in (spec.get("vector") or ()))
+
+
+def _build_load_specs(d: str, loads: list, analysis: str) -> list:
+    """Key-normalized `loads` -> the solver's load payload, refusing a study nothing drives.
+
+    Shared by run_fea_static and run_fea_fatigue (whose loops were character-identical) so
+    the zero-input guard cannot be added to one solve and forgotten in the other.
+    """
+    specs: list = []
+    for ld in loads:
+        if not isinstance(ld, dict) or "face" not in ld:
+            raise ValueError(f"each load needs a 'face' query: {ld!r}. " + _BC_SHAPE_HELP)
+        # Merge multiple face-point sets for this load (keeps face_normal/surface
+        # hints exactly when they stay valid — see _merge_face_sets).
+        merged = _merge_face_sets(_sim_face_points(d, ld["face"]))
+        spec: dict = {"faces": merged}
+        if "pressure" in ld:
+            spec["type"] = "pressure"
+            spec["magnitude"] = float(ld["pressure"])
+        elif "force" in ld:
+            spec["type"] = "force"
+            spec["vector"] = [float(x) for x in ld["force"]]
+        else:
+            raise ValueError(f"load needs 'force':[x,y,z] or 'pressure':<MPa>: {ld!r}. "
+                             + _BC_SHAPE_HELP)
+        specs.append(spec)
+    if not any(_load_is_driving(s) for s in specs):
+        raise _StudyRefusal({"ok": False, "error": (
+            f"{analysis} has no non-zero load, so the solve is identically zero — every "
+            "stress, displacement and factor of safety would come back 0 / saturated, "
+            "which reads as 'infinitely safe' rather than 'never asked'. Supply at least "
+            'one load with a non-zero magnitude, e.g. loads=[{"face":"top","force":'
+            '[0,0,-200]}] (newtons, world XYZ) or [{"face":"top","pressure":0.5}] (MPa). '
+            "This study has no self-weight/gravity term, so an unloaded part carries "
+            "nothing at all.")})
+    return specs
+
+
 def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes: list) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
     d = _doc(doc_id)
@@ -457,6 +516,17 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes:
     loads = _norm_bc_list(loads, "loads", notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
     mat = _resolve_material(coerce_json_or_repr(material))
+    # fixtures=[] and "fixtures that resolved to nothing" are DIFFERENT mistakes, and the
+    # single old message diagnosed the wrong one — it told a caller who supplied no queries
+    # at all to go check its queries with query_geometry(), buying a wasted retry.
+    if not fixtures:
+        raise _StudyRefusal({"ok": False, "error":
+                             "static FEA needs at least one fixed face — you passed "
+                             "fixtures=[]. An unconstrained part under load has nothing to "
+                             "react against (rigid-body motion), so there is no static "
+                             'solution to report. Pass the mounted face, e.g. fixtures='
+                             '["bottom"]. fixtures=[] is only meaningful for run_fea_modal, '
+                             "where it means a free-free modal solve."})
     step = _tmp(".step")
     cb.call("doc_export_step", {"doc_id": d, "path": step})
 
@@ -469,25 +539,7 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes:
                              "didn't match any surface points. Static FEA requires at least "
                              "one fixed face. Use query_geometry() to confirm the face query."})
 
-    load_specs: list = []
-    for ld in loads:
-        if not isinstance(ld, dict) or "face" not in ld:
-            raise ValueError(f"each load needs a 'face' query: {ld!r}. " + _BC_SHAPE_HELP)
-        faces = _sim_face_points(d, ld["face"])
-        # Merge multiple face-point sets for this load (keeps face_normal/surface
-        # hints exactly when they stay valid — see _merge_face_sets).
-        merged = _merge_face_sets(faces)
-        spec: dict = {"faces": merged}
-        if "pressure" in ld:
-            spec["type"] = "pressure"
-            spec["magnitude"] = float(ld["pressure"])
-        elif "force" in ld:
-            spec["type"] = "force"
-            spec["vector"] = [float(x) for x in ld["force"]]
-        else:
-            raise ValueError(f"load needs 'force':[x,y,z] or 'pressure':<MPa>: {ld!r}. "
-                             + _BC_SHAPE_HELP)
-        load_specs.append(spec)
+    load_specs = _build_load_specs(d, loads, "static FEA")
 
     study = {
         "step_path": step,
@@ -535,6 +587,11 @@ def _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes: list) -
             "step_path": step}
 
 
+# core/sim/fea_static.cpp clamps yield/stress into [0, 15]; 15 therefore means "saturated",
+# not "15x margin", and an unloaded study used to report exactly that (see _build_load_specs).
+_FOS_CAP = 15.0
+
+
 def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
     """COLLECT stage for a static solve — the ONE place the reply envelope is built."""
     d = ctx["doc"]
@@ -553,9 +610,23 @@ def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
         "results": res.get("summary", {}),
         "n_dof": res.get("n_dof"),
     })
+    # The engine's sim_run_static reply also carries n_elems / n_nodes / mesh_type_used /
+    # solver_notes; only n_dof was forwarded, so a caller could not see the mesh it just
+    # solved on (no way to judge whether a refinement is needed) and any solver WARNING
+    # was dropped on the floor. Measured 2026-07-30: engine keys n_elems/n_nodes present,
+    # reply had neither.
     out = {"ok": True, "doc_id": d, "material": mat.get("name", ctx.get("material_arg")),
            "summary": res.get("summary", {}), "n_dof": res.get("n_dof"),
+           "n_elems": res.get("n_elems"), "n_nodes": res.get("n_nodes"),
+           "mesh": res.get("mesh_type_used"),
            "saved_to_study": bool(sid)}
+    if res.get("solver_notes"):
+        out["solver_notes"] = res["solver_notes"]
+    # min_fos saturates at 15 (core/sim/fea_static.cpp clamp_fos) — say so, otherwise a cap
+    # is read as a computed margin.
+    if float((res.get("summary") or {}).get("min_fos") or 0.0) >= _FOS_CAP:
+        out["fos_note"] = (f"min_fos is reported at the solver's saturation cap ({_FOS_CAP}); "
+                           "the true margin is at least that, not exactly that.")
     if not sid:
         # _persist_study is best-effort and swallows its own errors; reporting a flat True
         # would be a verdict we never checked (and after a background job collected in a
@@ -1371,24 +1442,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             for q in fixtures:
                 fixture_sets.extend(_sim_face_points(d, q))
             if not fixture_sets:
-                return _dumps({"ok": False, "error": "no fixture faces resolved — use "
-                               "query_geometry() to confirm the face query."})
-            load_specs: list = []
-            for ld in loads:
-                if not isinstance(ld, dict) or "face" not in ld:
-                    raise ValueError(f"each load needs a 'face' query: {ld!r}. "
-                                     + _BC_SHAPE_HELP)
-                faces = _sim_face_points(d, ld["face"])
-                merged = _merge_face_sets(faces)
-                spec: dict = {"faces": merged}
-                if "pressure" in ld:
-                    spec["type"] = "pressure"; spec["magnitude"] = float(ld["pressure"])
-                elif "force" in ld:
-                    spec["type"] = "force"; spec["vector"] = [float(x) for x in ld["force"]]
-                else:
-                    raise ValueError(f"load needs 'force' or 'pressure': {ld!r}. "
-                                     + _BC_SHAPE_HELP)
-                load_specs.append(spec)
+                return _dumps({"ok": False, "error": (
+                    "fatigue FEA needs at least one fixed face — you passed fixtures=[]. "
+                    "An unconstrained part has nothing to react the cyclic load against."
+                    if not fixtures else
+                    "no fixture faces resolved — use query_geometry() to confirm the "
+                    "face query.")})
+            load_specs = _build_load_specs(d, loads, "fatigue")
 
             surf_map = {"ground": 0, "machined": 1, "hot_rolled": 2, "as_forged": 3}
             lt_map = {"reversed": {"lmin": -1.0, "lmax": 1.0},
@@ -1441,6 +1501,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 jid = _start_job("fea_fatigue", _solve)
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d})
             return _dumps(_solve_sync_or_handoff("fea_fatigue", _solve))
+        except _StudyRefusal as r:
+            return _dumps(r.payload)
         except CoreError as e:
             # C++ FEA backend absent (mesher not built) → honest degrade, same as static.
             if "unknown method" in str(e):
@@ -1482,7 +1544,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                        "capacitance": "lumped"|"consistent" (default lumped)}
           hot_faces/cold_faces : Dirichlet faces held at their temperature for the whole
                        run, e.g. [{"face": "+x", "temperature": 100}]. May be EMPTY for
-                       transient (a flux-only adiabatic heat-up is well-posed).
+                       transient (a flux-only adiabatic heat-up is well-posed) — but then
+                       `loads` must supply the flux/convection, or there is no thermal
+                       input at all and the study is refused.
           loads     : optional time-varying heat loads, each
                        {"face": <query>, "flux_w_m2": <q>, "schedule": {...}}  or
                        {"face": <query>, "h_w_m2k": <h>, "t_amb_c": <°C>}   (convection)
@@ -1573,6 +1637,21 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         raise ValueError("thermal load needs 'flux_w_m2' (+ optional "
                                          f"'schedule') or 'h_w_m2k'/'t_amb_c': {ld!r}")
                     load_specs.append(spec)
+
+                # An adiabatic heat-up with no Dirichlet face is well-posed ONLY when a
+                # flux/convection load drives it. With neither, C dT/dt + K T = 0 from a
+                # uniform t_init has the constant solution: measured 2026-07-30,
+                # transient={"t_end_s":10,"dt_s":1} with no faces and no loads returned
+                # ok:true, max_temp_c 20.0 == t_init — an "answer" that is just the input.
+                if not fixtures and not load_specs:
+                    return _dumps({"ok": False, "error": (
+                        "the transient study has no thermal input at all — no hot/cold face "
+                        "held at a temperature and no flux/convection load, so the part just "
+                        f"stays at t_init_c ({float(transient.get('t_init_c', 20.0))} °C) for "
+                        "the whole run. Give it at least one Dirichlet face "
+                        '(hot_faces=[{"face":"+x","temperature":100}]) or one load '
+                        '(loads=[{"face":"top","flux_w_m2":5000}] / '
+                        '[{"face":"top","h_w_m2k":25,"t_amb_c":20}]).')})
 
                 study = {"step_path": step,
                          "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
@@ -1694,7 +1773,17 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     f"— got {load!r}. The force magnitude is what the buckling load factor "
                     "scales; there is no safe default to assume. " + _BC_SHAPE_HELP)
             vec = load[0]["force"]
-            P = max(1.0, math.sqrt(sum(float(x) ** 2 for x in vec)))
+            P = math.sqrt(sum(float(x) ** 2 for x in vec))
+            # The surviving half of that same defect: `max(1.0, |F|)` turned force=[0,0,0]
+            # into a 1 N study and reported `applied_load_n: 1.0` plus a full
+            # critical_loads_n table (measured 2026-07-30). The clamp existed to keep the
+            # λ-scaling from dividing by zero; refusing is the honest way to do that.
+            if P <= 0.0:
+                raise ValueError(
+                    f"the buckling load is zero ({vec!r}). λ scales the APPLIED load, so a "
+                    "zero load makes every critical_loads_n zero and the answer "
+                    "meaningless. Pass the real compressive load, e.g. "
+                    "load=[{'face':'top','force':[0,0,-1000]}].")
             L, b, h = _part_bbox_dims(d)
             gen = fa.build_buckling_column_inp(L, b, h, E, nu, P, nz=4)
             run = fa.run_ccx(gen["inp"], job="buckle")

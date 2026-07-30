@@ -165,3 +165,87 @@ class TestCoverageAwareRanking:
         results = self.index.search("2-014", limit=5)
         part_ids = [r["part_id"] for r in results]
         assert "oring-2-014" in part_ids
+
+
+class TestNarrowestClauseWins:
+    """A glued designation must not be satisfiable by its own fragments.
+
+    Measured on the shipped 3182-record index: bare "3" hit 753 records and bare
+    "12" hit 318, against 46 for "m3" and 72 for "12mm". Because the coverage tier
+    dominates ranking, OR-ing those fragments into the term-group promoted anything
+    carrying a stray digit — "M3 socket head cap screw 12mm" ranked a KiCad
+    mounting-hole footprint and three shaft collars ABOVE fastener:ISO 4762:M3, and
+    "M3x12 SHCS" dropped the size group entirely and answered with the M2 screw.
+    """
+
+    def setup_method(self):
+        self.index = PartsIndex()
+        self.index.rebuild([
+            _rec("shcs-m3", "fastener",
+                 "Socket Head Cap Screw M3 socket head cap screw shcs",
+                 standard="ISO 4762", designation="M3",
+                 d=3.0, pitch=0.5, head_d=5.5),
+            _rec("shcs-m2", "fastener",
+                 "Socket Head Cap Screw M2 socket head cap screw shcs",
+                 standard="ISO 4762", designation="M2",
+                 d=2.0, pitch=0.4, head_d=3.8),
+            # The junk that used to win: a mounting hole whose text carries "M3",
+            # "screw" and a bare "mm", i.e. one fragment of every term-group.
+            _rec("mountinghole-m3", "ecad",
+                 "MountingHole_3.2mm_M3 footprint mounting hole 3.2 mm for M3 screw",
+                 designation="MountingHole_3.2mm_M3"),
+            # A collar carrying a bare "12" and the word "screw" (set screw).
+            _rec("collar-12", "motion",
+                 "set-screw shaft collar 12mm bore shaft collar set screw",
+                 designation="COLLAR-setscrew-12mm", bore=12.0, od=27.6),
+            # No glued spelling in the corpus: the fallback fragments MUST still
+            # reach this row from a "608zz" query.
+            _rec("bearing-608", "bearing", "Deep-Groove Ball Bearing 608 bearing",
+                 standard="ISO 15", designation="608", bore=8.0),
+        ])
+
+    def test_exact_family_outranks_fragment_junk(self):
+        # The mounting hole's ONLY claim on this query is fragments: "M3", the word
+        # "screw", and a bare "mm" split out of "12mm". It used to reach full
+        # coverage on that and outrank the screw itself. (The collar is a genuine
+        # partial match — it really does carry a whole "12mm" token — so it is not
+        # part of this assertion.)
+        ids = [r["part_id"] for r in
+               self.index.search("M3 socket head cap screw 12mm", limit=5)]
+        assert "shcs-m3" in ids, ids
+        assert "mountinghole-m3" not in ids[:ids.index("shcs-m3")], ids
+
+    def test_thread_x_length_keeps_the_thread_size(self):
+        # "m3x12" is absent from the corpus; the designation head "m3" must still
+        # constrain the search, or the top hit is the wrong-size screw.
+        for query in ("M3x12 SHCS", "M3 x 12 SHCS"):
+            ids = [r["part_id"] for r in self.index.search(query, limit=3)]
+            assert ids[0] == "shcs-m3", (query, ids)
+            if "shcs-m2" in ids:
+                assert ids.index("shcs-m2") > ids.index("shcs-m3"), (query, ids)
+
+    def test_absent_glued_spelling_still_falls_back_to_fragments(self):
+        ids = [r["part_id"] for r in self.index.search("608zz bearing", limit=3)]
+        assert ids[0] == "bearing-608", ids
+
+
+class TestAliasesAreSearchable:
+    """A standard's alternate designation is how buyers spell it.
+
+    ``aliases`` used to be dropped on the floor by the row builder, so "DIN 912 M3"
+    matched no fastener at all and relaxed down to an unrelated row.
+    """
+
+    def setup_method(self):
+        self.index = PartsIndex()
+        shcs = _rec("shcs-m3", "fastener", "Socket Head Cap Screw M3 shcs",
+                    standard="ISO 4762", designation="M3", d=3.0)
+        shcs["aliases"] = ["DIN 912", "SHCS"]
+        oring = _rec("oring-317", "seal",
+                     'AS568-317 O-Ring 0.912" ID x 0.210" CS Silicone oring',
+                     standard="AS568", designation="-317")
+        self.index.rebuild([shcs, oring])
+
+    def test_din_alias_finds_the_iso_standard(self):
+        ids = [r["part_id"] for r in self.index.search("DIN 912 M3", limit=3)]
+        assert ids[0] == "shcs-m3", ids

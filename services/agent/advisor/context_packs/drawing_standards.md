@@ -19,6 +19,8 @@
 - Tool: `add_gdt` only where process/fit needs control
 
 ## Title block and export
-- `set_titleblock`: part name, rev, material, units, scale, drawn-by/date
+- `set_titleblock`: title (the part's NAME), rev, material, finish, scale, part_number,
+  drawn_by, date, company. There is NO units cell — units are a DOCUMENT property (mm by
+  default, set with the set_units op); passing units= is refused and costs a turn.
 - Finish with `export_drawing` or an explicit sheet summary to the user
 - Re-measure after late solid edits before releasing the sheet

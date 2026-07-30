@@ -23,7 +23,7 @@ How to produce a manufacturing 2D drawing from a part in Chudware. Views first, 
    - Detail views (`add_detail_view`) for tight features
 4. **Dimension from truth** — `add_dimension` only with entity ids and values taken from `describe_part` / `measure_part`. No guessed numbers, no freehand sizes.
 5. **Callouts** — GD&T via `add_gdt`; surface finish via `add_surface_finish`. Apply only where the design intent needs control (mates, seals, bearing seats).
-6. **Title block** — `set_titleblock` with part name, revision, material, units, scale, and author/date as known.
+6. **Title block** — `set_titleblock` with title (the part's NAME — never `part_number`, that cell is the identifier a shop orders from), revision, material, finish, scale, and author/date as known. There is no units field: units are a document property (mm by default), so `units=` is refused.
 7. **Export / handoff** — `export_drawing` (or an explicit user-facing summary of sheet contents) before declaring done.
 
 ## Rules

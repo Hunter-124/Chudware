@@ -5,6 +5,7 @@ Imported by the ecad_*_tools family modules; re-exported through the ecad_tools 
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -490,7 +491,140 @@ _DEFAULT_FOOTPRINTS = {
     "Power_Management:LVD_Comparator": "Package_TO_SOT_SMD:SOT-23-5",
     "Device:NTC": "Resistor_SMD:R_0603",
     "Device:L_Power": "Inductor_SMD:L_Power_7x7",
+    # Live 2026-07-30 (ESP32 board flow): Conn_2/Conn_3/Conn_4/Header_1x4 are real starter
+    # SYMBOLS that ecad_find_part('header') offers, but they had no default footprint here,
+    # so `placeable()` in core/ecad/sync.cpp rejected them and update_from_sch dropped both
+    # headers off the board WITHOUT listing them in `unresolved` — an invisible loss.
+    "Connector:Conn_2": "Connector_PinHeader_2.54mm:Header_1x2",
+    "Connector:Conn_3": "Connector_PinHeader_2.54mm:Header_1x3",
+    "Connector:Conn_4": "Connector_PinHeader_2.54mm:Header_1x4",
+    "Connector:Header_1x4": "Connector_PinHeader_2.54mm:Header_1x4",
 }
+
+
+def _is_power_component(comp: dict) -> bool:
+    """Mirror of core/ecad/sync.cpp::is_power_component — power ports never take a footprint."""
+    ref = str((comp or {}).get("ref") or "")
+    libid = str((comp or {}).get("libid") or "")
+    return ref.startswith("#") or libid.startswith("power:")
+
+
+def _library():
+    """The Python ECAD library module, or None. STAYS (T-RF20): no ecad_library RPC."""
+    try:
+        from services.ecad import library as _lib
+        return _lib
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _default_footprint_for(libid: str) -> str:
+    """The fpid a symbol should land on when the schematic assigned none.
+
+    Beyond the static table: a part built by ``ecad_make_part`` generates BOTH a symbol
+    ``Generated:<name>`` and a footprint ``Generated:<name>_<package>``, but nothing links
+    them — so the part the model just authored (an ESP32 module, live 2026-07-30) was
+    dropped by sync while its own footprint sat in the library. Recover the pairing by
+    the generator's own naming convention rather than leaving the part off the board.
+    """
+    lid = str(libid or "")
+    dflt = _DEFAULT_FOOTPRINTS.get(lid, "")
+    if dflt:
+        return dflt
+    lib = _library()
+    if lib is None or ":" not in lid:
+        return ""
+    ns, name = lid.split(":", 1)
+    if ns != "Generated" or not name:
+        return ""
+    for pkg in ("qfn", "qfp", "lqfp", "soic", "sop", "ssop", "tssop", "dfn", "lga", "sot",
+                "dip", "header", "module_castellated", "0402", "0603", "0805", "1206"):
+        cand = f"Generated:{name}_{pkg}"
+        try:
+            if isinstance(lib.resolve_footprint(cand), dict):
+                return cand
+        except Exception:  # noqa: BLE001 — library lookup is best-effort
+            pass
+    return ""
+
+
+def _next_fp_id(board: dict) -> str:
+    """Next free ``fpN`` id on *board* (mirrors core/ecad/schema.cpp::next_id)."""
+    n = 0
+    for fp in board.get("footprints") or []:
+        fid = str((fp or {}).get("id") or "")
+        if fid.startswith("fp") and fid[2:].isdigit():
+            n = max(n, int(fid[2:]))
+    return f"fp{n + 1}"
+
+
+def _rescue_unresolved_footprints(board: dict, report: dict, comps_by_ref: dict) -> list[str]:
+    """Add the footprints core/ecad/sync.cpp could not resolve, using the PYTHON library.
+
+    Measured 2026-07-30: 20 of the 27 fpids ``_DEFAULT_FOOTPRINTS`` assigns are absent from
+    the C++ ``library::resolve_footprint`` table (every regulator, connector, crystal,
+    inductor, QFN/QFP/LGA package), while ``services.ecad.library`` resolves all of them.
+    Sync therefore reported ``unresolved`` and moved on, so a nine-part ESP32 schematic
+    synced to five footprints and one net and STILL answered "All multi-pad nets routed".
+    This closes the parity gap the same way ``_attach_lib_defs`` closes it for ops: resolve
+    at the seam and write the footprint into the board dict that is about to be swapped in.
+
+    Mirrors core/ecad/sync.cpp::new_footprint + bind_pads. Returns the rescued refs; the
+    ones the Python library cannot resolve either stay in ``report['unresolved']``.
+    """
+    unresolved = [u for u in (report.get("unresolved") or []) if len(u) == 2]
+    if not unresolved:
+        return []
+    lib = _library()
+    if lib is None:
+        return []
+    fps = board.setdefault("footprints", [])
+    nets = board.setdefault("nets", [])
+    known_nets = {n.get("name") for n in nets if isinstance(n, dict)}
+    origin = board.get("origin") if isinstance(board.get("origin"), list) else [0.0, 0.0]
+    ox, oy = float(origin[0]), float(origin[1])
+    grid_i = len(fps)
+    rescued: list[str] = []
+    still: list = []
+    bound = 0
+    for ref, fpid in unresolved:
+        try:
+            fpdef = lib.resolve_footprint(fpid)
+        except Exception:  # noqa: BLE001
+            fpdef = None
+        comp = comps_by_ref.get(ref)
+        if not isinstance(fpdef, dict) or not isinstance(comp, dict):
+            still.append([ref, fpid])
+            continue
+        pads = copy.deepcopy(fpdef.get("pads") or [])
+        pins = comp.get("pins") if isinstance(comp.get("pins"), dict) else {}
+        for pad in pads:
+            key = str(pad.get("pin") or pad.get("number") or "")
+            net = pins.get(key)
+            pad["net"] = net if isinstance(net, str) and net else None
+            if pad["net"]:
+                bound += 1
+                if pad["net"] not in known_nets:
+                    nets.append({"name": pad["net"], "class": "default"})
+                    known_nets.add(pad["net"])
+        # 25.4 mm grid, matching core/ecad/sync.cpp kGridPitch/kGridCols.
+        fps.append({
+            "id": _next_fp_id(board), "fpid": fpid, "ref": ref,
+            "value": str(comp.get("value") or fpdef.get("value") or ""),
+            "pos": [ox + (grid_i % 6) * 25.4, oy + (grid_i // 6) * 25.4],
+            "angle": 0.0, "side": "top", "pads": pads,
+            "graphics": copy.deepcopy(fpdef.get("graphics") or []),
+            "attr": fpdef.get("attr", "smd"),
+            "linked_symbol": str(comp.get("sym") or ""),
+            "libid": str(comp.get("libid") or ""),
+        })
+        grid_i += 1
+        rescued.append(ref)
+    report["unresolved"] = still
+    report["added"] = sorted(set(list(report.get("added") or []) + rescued))
+    report["rescued"] = rescued
+    report["nets_bound"] = int(report.get("nets_bound") or 0) + bound
+    return rescued
 
 
 def _update_from_sch(board_session, sch_session, *, prune: bool = False,
@@ -512,12 +646,20 @@ def _update_from_sch(board_session, sch_session, *, prune: bool = False,
                       "ecad_update_from_sch: sch_doc_id is not a sch document",
                       {"reason": "wrong doc kind", "doc_id": sch_session.doc_id})
     netlist = dict(netlist_mod.build_netlist(sch_session.doc))
+    no_footprint: list = []
     for comp in netlist.get("components", []) or []:
         fpid = comp.get("footprint")
         if not (isinstance(fpid, str) and fpid.strip()):
-            dflt = _DEFAULT_FOOTPRINTS.get(str(comp.get("libid", "")), "")
+            dflt = _default_footprint_for(str(comp.get("libid", "")))
             if dflt:
                 comp["footprint"] = dflt
+            elif not _is_power_component(comp) and not comp.get("dnp"):
+                # core/ecad/sync.cpp::placeable() rejects a component with no fpid and the
+                # loop `continue`s BEFORE report["unresolved"] — so these parts left no trace
+                # at all. Live 2026-07-30: a nine-part ESP32 schematic synced as five
+                # footprints and the response still read "5 footprint(s) added ... Next:
+                # ecad_autoroute". Name them.
+                no_footprint.append([str(comp.get("ref") or ""), str(comp.get("libid") or "")])
     # Carry the schematic's id so sync records board.linked_sch = the source schematic.
     netlist["id"] = sch_session.doc.get("id")
     params: dict = {"board": board_session.doc, "sch_netlist": netlist, "prune": bool(prune)}
@@ -544,10 +686,21 @@ def _update_from_sch(board_session, sch_session, *, prune: bool = False,
         if fp.get("eng_overrides") is None and isinstance(comp.get("eng_overrides"), dict):
             fp["eng_overrides"] = comp["eng_overrides"]
 
+    _rescue_unresolved_footprints(mutated, report, comps_by_ref)
+    report["no_footprint"] = no_footprint
+
     warnings: list[str] = []
     if report.get("unresolved"):
         warnings.append("unresolved footprints (no def found): "
                         + ", ".join(f"{ref}({fpid})" for ref, fpid in report["unresolved"]))
+    if no_footprint:
+        warnings.append(
+            "NOT ON THE BOARD — no footprint assigned: "
+            + ", ".join(f"{ref}({libid})" for ref, libid in no_footprint)
+            + ". These schematic parts were skipped entirely; their pads and nets do not "
+              "exist on the board, so DRC/autoroute cannot see them. Re-place each one with "
+              "an explicit footprint (ecad_place_symbol(..., footprint='<fpid>')) or pick a "
+              "library part that has one (ecad_find_part).")
     if report.get("removed") and not prune:
         warnings.append("footprints no longer in schematic (not pruned): "
                         + ", ".join(report["removed"]))

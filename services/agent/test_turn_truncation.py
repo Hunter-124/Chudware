@@ -6,10 +6,13 @@ that the 2048-token output cap CUT OFF mid-string. `_parse_directive` returned
 None, the bare-natural-language-finish path accepted the fragment, and the run
 reported `status=done stop_reason=confirmed` having built nothing at all.
 
-These tests pin the three fixes:
-  * `agent_turn._looks_truncated` detects a cut-off directive textually (there
-    is no finish_reason on this provider surface — `complete()` returns a bare
-    string), retries ONCE, then fails honestly.
+These tests pin the fixes:
+  * `agent_turn._looks_truncated` detects a cut-off directive textually, retries
+    ONCE, then fails honestly. The textual test is the FALLBACK: providers that
+    report a stop reason now hand it over out-of-band
+    (`providers.base.take_last_stop_reason`) and it is authoritative. Measured
+    2026-07-30 against the live sidecar: maxTokens=16 -> stopReason "length",
+    maxTokens=4000 -> "stop".
   * `mission_dispatch.run_linear_role_turn` passes a real output-token budget.
   * the three Settings → AI → Harness preference knobs actually shape the
     interactive lane's allow-set and system prompt.
@@ -97,6 +100,48 @@ def test_looks_truncated_ignores_complete_and_prose_replies():
     # A fenced block that closed is a parse problem, never truncation.
     assert not at._looks_truncated('```json\n{"tool": "x", "args"\n```')
 
+class TestAuthoritativeStopReason:
+    """A reply capped mid-PROSE is truncated too, and no amount of brace-counting
+    can see it. The bridge has reported the real signal all along; it just never
+    reached the harness."""
+
+    def test_length_overrides_a_reply_the_textual_test_calls_clean(self):
+        from services.agent import agent_turn as at
+
+        clean = "Done - the bracket is 40 x 20 x 5 mm with two M4 holes."
+        assert not at._looks_truncated(clean)              # textual: looks finished
+        assert at._looks_truncated(clean, "length")        # provider: it was cut off
+
+    def test_a_normal_stop_never_forces_truncation(self):
+        from services.agent import agent_turn as at
+
+        assert not at._looks_truncated("All done.", "stop")
+        assert not at._looks_truncated("All done.", "end_turn")
+        assert not at._looks_truncated("All done.", "tool_use")
+        assert not at._looks_truncated("All done.", None)
+
+    def test_the_wire_dialects_are_all_understood(self):
+        """Different vendors spell the same thing differently."""
+        from services.agent import agent_turn as at
+
+        for spelling in ("length", "LENGTH", "  Length ", "max_tokens",
+                         "max_output_tokens"):
+            assert at._looks_truncated("finished.", spelling), spelling
+
+    def test_a_truncated_directive_is_still_caught_without_any_signal(self):
+        """The textual fallback must survive: most providers report nothing."""
+        from services.agent import agent_turn as at
+
+        assert at._looks_truncated(_TRUNCATED, None)
+
+    def test_the_stop_reason_seam_is_one_shot(self):
+        """Consuming semantics are load-bearing: a provider that reports nothing
+        must yield None, not whatever an earlier call left on the thread."""
+        from services.agent.providers import base as pb
+
+        pb.set_last_stop_reason("length")
+        assert pb.take_last_stop_reason() == "length"
+        assert pb.take_last_stop_reason() is None
 
 def test_json_balance_ignores_braces_inside_strings():
     """A naive count('{') is wrong: JSON strings carry braces and escapes."""

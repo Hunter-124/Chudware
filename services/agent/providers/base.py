@@ -53,6 +53,35 @@ def provider_delta_sink() -> Any:
     """This thread's installed provider delta sink, or None."""
     return getattr(_tls, "delta_sink", None)
 
+def set_last_stop_reason(reason: Any) -> None:
+    """Record why the provider stopped generating, for the call just completed.
+
+    Out-of-band on purpose: the harness talks to providers over the bare
+    ``complete(system, messages) -> str`` seam (agent_turn's whole contract), so
+    there is nowhere in the return value to put this without changing every
+    provider's signature. Mirrors the delta-sink seam above.
+
+    Why it matters: a reply cut off at the token cap parses as a SHORTER valid
+    reply. Live 2026-07-28 a general-lane turn was truncated mid-directive, read
+    as "no directive", and reported success with ZERO geometry. Detection was
+    textual (`agent_turn._looks_truncated`) precisely because no finish reason
+    reached it — the docstring there says so. The bridge has had the real signal
+    all along: measured 2026-07-30, `complete` returns stopReason "length" when
+    the cap is hit and "stop" otherwise.
+    """
+    _tls.last_stop_reason = reason
+
+
+def take_last_stop_reason() -> Any:
+    """The stop reason for the last provider call on this thread, CONSUMING it.
+
+    One-shot by design: a provider that does not report one (every non-bridge
+    provider today) must yield None here rather than the value some earlier call
+    left behind, or the caller would act on a stale signal.
+    """
+    reason = getattr(_tls, "last_stop_reason", None)
+    _tls.last_stop_reason = None
+    return reason
 
 class ProviderDeltaGuard:
     """Install-and-restore guard mirroring C++'s ProviderDeltaGuard.

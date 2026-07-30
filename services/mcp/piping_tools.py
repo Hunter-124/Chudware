@@ -60,6 +60,42 @@ def _err(reason: str, hint: Optional[str] = None, **extra: Any) -> dict:
     return out
 
 
+# ------------------------------------------------------- unaddressable nodes (live fix)
+# Measured 2026-07-30 driving cad_guide("piping")'s numbered procedure: node ids are DERIVED
+# by snapping coincident run endpoints, and the only place they are published is a successful
+# solve's `node_menu`. Guessing {"node":"n2"} on a two-node network refuses with
+#   "boundary reference {'demand': 20.0, 'node': 'n2'} did not resolve to a node"
+# and a hint naming the alternative shapes but not a single addressable node — so the caller
+# is told to fix a name it had no way to learn. The run endpoints ARE knowable from the doc
+# the caller just passed, so publish them on the refusal instead of only on success.
+_NODE_REFUSAL_MARK = "did not resolve to a node"
+
+
+def _with_run_endpoints(res: dict, doc: Any) -> dict:
+    """Attach the doc's addressable run endpoints to a node-resolution refusal."""
+    if res.get("ok") or _NODE_REFUSAL_MARK not in str(res.get("reason", "")):
+        return res
+    if not isinstance(doc, dict):
+        return res
+    menu = []
+    for run in doc.get("runs") or []:
+        if not isinstance(run, dict) or run.get("suppressed"):
+            continue
+        path = run.get("path") or []
+        if len(path) < 2:
+            continue
+        rid = run.get("id")
+        menu.append({"run": rid, "end": "start", "xyz": list(path[0])})
+        menu.append({"run": rid, "end": "end", "xyz": list(path[-1])})
+    if menu:
+        res["addressable_endpoints"] = menu
+        res["hint"] = (str(res.get("hint") or "") +
+                       " Node ids only exist after a solve; address these run endpoints "
+                       "instead, e.g. {\"run\": \"%s\", \"end\": \"%s\", \"pressure\": <kPa>}."
+                       % (menu[0]["run"], menu[0]["end"])).strip()
+    return res
+
+
 def _load_doc(doc: Union[str, dict, None]) -> Any:
     """Accept a piping doc as a dict, a JSON string, or a path to a ``.json`` file."""
     if doc is None:
@@ -270,7 +306,7 @@ def register_piping_tools(mcp) -> None:
                 sfl = sfl if sfl is not None else hfl
             _PIPING.update({"doc": sd, "result": res, "boundary": sbc,
                             "fluid": sfl, "pumps": pp})
-        return _dumps(res)
+        return _dumps(_with_run_endpoints(res, d))
 
     @mcp.tool()
     def piping_report(doc: Union[str, dict, None] = None,
@@ -312,7 +348,7 @@ def register_piping_tools(mcp) -> None:
                 "doc": d, "boundary": bc, "fluid": fl, "pumps": pp})
         except Exception as exc:  # noqa: BLE001
             return _dumps(_err(f"core engine unavailable: {exc}"))
-        return _dumps(rep)
+        return _dumps(_with_run_endpoints(rep, d))
 
     @mcp.tool()
     def piping_operating_point(pump_curve: str,
@@ -487,9 +523,10 @@ def register_piping_tools(mcp) -> None:
                                    errors=res["errors"]))
             if res.get("reason") == "boundary conditions are required":
                 return _dumps(res)  # the core's jerr shape matches the old _err exactly
-            return _dumps({"ok": False, "stage": "1d_solve",
-                           "reason": res.get("reason", "1D solve failed"),
-                           "solve": res})
+            return _dumps(_with_run_endpoints(
+                {"ok": False, "stage": "1d_solve",
+                 "reason": res.get("reason", "1D solve failed"),
+                 "solve": res}, d))
 
         # The old handler embedded the RAW solve (no node_menu) — strip the additive
         # key the tool-shaped RPC carries so the embedded payload is byte-identical.

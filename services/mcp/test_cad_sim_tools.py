@@ -739,3 +739,145 @@ def test_a_job_started_by_another_process_is_still_collectable_here():
     assert simjobs.raw_result(jid)["steps"] == 4
     listed = json.loads(_tool("sim_jobs")(limit=50))
     assert jid in [j["job_id"] for j in listed["jobs"]], listed
+
+
+# --------------------------------------------------- the zero-input study (2026-07-30)
+# Measured driving the bracket flow ("will this hold 200 N?") end to end: a static study
+# with loads=[] or force=[0,0,0] solved happily and reported max_von_mises_mpa 0.0,
+# max_disp_mm 0.0 and min_fos 15.0 — the FoS saturation cap, i.e. the most reassuring
+# number the surface can produce, from a study that was never asked a question. Fatigue
+# reported regime "infinite" the same way, and buckling silently substituted a 1 N load.
+
+
+def test_a_static_study_with_no_load_is_refused_not_solved_as_zero(bc_doc):
+    """The core defect: loads=[] used to come back ok:true / min_fos 15.0. Refuse at setup,
+    name the missing input, and say why zero is not an answer."""
+    out = json.loads(_dispatch()("run_fea_static")(doc_id=bc_doc, fixtures=["bottom"],
+                                                   loads=[]))
+    assert out["ok"] is False, out
+    assert "no non-zero load" in out["error"], out
+    assert "summary" not in out, out
+
+
+def test_a_static_load_whose_magnitude_is_zero_is_the_same_refusal(bc_doc):
+    """force=[0,0,0] is a well-formed load entry that drives nothing — the shape check
+    passed it straight through to a solve whose every output was 0."""
+    out = json.loads(_dispatch()("run_fea_static")(
+        doc_id=bc_doc, fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, 0]}]))
+    assert out["ok"] is False and "no non-zero load" in out["error"], out
+
+
+def test_a_zero_pressure_load_is_refused_too(bc_doc):
+    """The pressure branch of the same guard — a 0 MPa pressure is not a load."""
+    out = json.loads(_dispatch()("run_fea_static")(
+        doc_id=bc_doc, fixtures=["bottom"], loads=[{"face": "top", "pressure": 0.0}]))
+    assert out["ok"] is False and "no non-zero load" in out["error"], out
+
+
+def test_one_real_load_beside_a_zero_one_still_solves(bc_doc):
+    """The guard is 'nothing drives this study', NOT 'every entry must be non-zero' — a
+    zero entry alongside a real one must not cost the caller its solve."""
+    out = _static(bc_doc, fixtures=["bottom"],
+                  loads=[{"face": "top", "force": [0, 0, 0]},
+                         {"face": "top", "force": [0, 0, -500]}])
+    assert out["ok"] is True, out
+    assert out["summary"]["max_von_mises_mpa"] > 0.0, out
+
+
+def test_empty_fixtures_is_diagnosed_as_empty_not_as_a_bad_query(bc_doc):
+    """fixtures=[] and 'the query matched nothing' are different mistakes; the single old
+    message told a caller who supplied NO queries to go check its queries."""
+    out = json.loads(_dispatch()("run_fea_static")(
+        doc_id=bc_doc, fixtures=[], loads=[{"face": "top", "force": [0, 0, -500]}]))
+    assert out["ok"] is False, out
+    assert "fixtures=[]" in out["error"] and "rigid-body" in out["error"], out
+    assert "query_geometry" not in out["error"], out
+
+
+def test_the_async_lane_refuses_the_zero_load_study_before_starting_a_job(bc_doc):
+    """sim_run shares _build_static_study, so the refusal must land at SETUP — a job_id for
+    a study that cannot mean anything is worse than a refusal."""
+    out = json.loads(_dispatch()("sim_run")(doc_id=bc_doc, analysis="fea_static",
+                                            fixtures=["bottom"], loads=[]))
+    assert out["ok"] is False and "no non-zero load" in out["error"], out
+    assert "job_id" not in out, out
+
+
+def test_fatigue_with_no_load_no_longer_reports_infinite_life(bc_doc):
+    """The most dangerous instance: ok:true, regime "infinite" == "this part never fails"."""
+    out = json.loads(_dispatch()("run_fea_fatigue")(doc_id=bc_doc, fixtures=["bottom"],
+                                                    loads=[]))
+    assert out["ok"] is False, out
+    assert "no non-zero load" in out["error"], out
+    assert out.get("regime") is None, out
+
+
+def test_a_static_reply_carries_the_mesh_it_solved_on(bc_doc):
+    """n_elems / n_nodes come back from the engine and used to be dropped, leaving the
+    caller no way to judge whether the mesh was fine enough."""
+    out = _static(bc_doc, fixtures=["bottom"],
+                  loads=[{"face": "top", "force": [0, 0, -500]}])
+    assert out["n_elems"] > 0 and out["n_nodes"] > 0, out
+    assert out["n_dof"] >= 3 * out["n_nodes"], out
+
+
+def test_a_saturated_factor_of_safety_says_it_is_a_cap(bc_doc):
+    """min_fos clamps at 15 in the solver, so 15 must not read as a computed margin."""
+    out = _static(bc_doc, fixtures=["bottom"],
+                  loads=[{"face": "top", "force": [0, 0, -0.001]}])
+    assert out["ok"] is True, out
+    if out["summary"]["min_fos"] >= 15.0:
+        assert "saturation cap" in out["fos_note"], out
+
+
+def test_buckling_refuses_a_zero_load_instead_of_substituting_one_newton(bc_doc):
+    """`P = max(1.0, |F|)` reported applied_load_n 1.0 and a full critical-load table for a
+    load the caller never supplied — the surviving half of the hard-coded-1000-N defect."""
+    out = json.loads(_dispatch()("run_fea_buckling")(
+        doc_id=bc_doc, fixtures=["bottom"], load=[{"face": "top", "force": [0, 0, 0]}]))
+    if out.get("skipped"):
+        pytest.skip(f"ccx unavailable: {out.get('reason')}")
+    assert out["ok"] is False, out
+    assert "buckling load is zero" in out["error"], out
+    assert "applied_load_n" not in out, out
+
+
+def test_a_transient_thermal_run_with_no_thermal_input_is_refused(bc_doc):
+    """No Dirichlet face and no flux/convection load: C dT/dt + K T = 0 from a uniform
+    t_init has the constant solution, so the reply was just the input handed back."""
+    out = json.loads(_dispatch()("run_fea_thermal")(
+        doc_id=bc_doc, hot_faces=[], cold_faces=[],
+        transient={"t_end_s": 10, "dt_s": 1}))
+    assert out["ok"] is False, out
+    assert "no thermal input" in out["error"], out
+
+
+def test_a_doubled_load_doubles_the_linear_static_answer(bc_doc):
+    """A result that does not respond to its input is not a solve. Linear statics is exactly
+    proportional, so 2x load must give 2x stress AND 2x deflection."""
+    one = _static(bc_doc, fixtures=["bottom"],
+                  loads=[{"face": "top", "force": [0, 0, -200]}])
+    two = _static(bc_doc, fixtures=["bottom"],
+                  loads=[{"face": "top", "force": [0, 0, -400]}])
+    assert one["summary"]["max_von_mises_mpa"] > 0.0, one
+    assert two["summary"]["max_von_mises_mpa"] == pytest.approx(
+        2.0 * one["summary"]["max_von_mises_mpa"], rel=1e-3)
+    assert two["summary"]["max_disp_mm"] == pytest.approx(
+        2.0 * one["summary"]["max_disp_mm"], rel=1e-3)
+
+
+def test_swapping_steel_for_aluminium_changes_the_stiffness_it_solved_with(bc_doc):
+    """Silent material drop is the rib/thread defect class. Same load, same mesh: deflection
+    must scale as E_steel/E_alu (~2.9), and stress must NOT move (statically determinate)."""
+    bind = _dispatch()("run_fea_static")
+    steel = json.loads(bind(doc_id=bc_doc, fixtures=["bottom"], material="steel",
+                            loads=[{"face": "top", "force": [0, 0, -200]}]))
+    alu = json.loads(bind(doc_id=bc_doc, fixtures=["bottom"], material="aluminum",
+                          loads=[{"face": "top", "force": [0, 0, -200]}]))
+    for r in (steel, alu):
+        if r.get("skipped"):
+            pytest.skip(f"FEA backend unavailable: {r.get('reason')}")
+    ratio = alu["summary"]["max_disp_mm"] / steel["summary"]["max_disp_mm"]
+    assert 2.4 < ratio < 3.4, (ratio, steel["summary"], alu["summary"])
+    assert alu["summary"]["max_von_mises_mpa"] == pytest.approx(
+        steel["summary"]["max_von_mises_mpa"], rel=0.05)

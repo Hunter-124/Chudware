@@ -11,6 +11,11 @@ Pure, dependency-free, never raises. Two entry points:
   (``aluminium``/``aluminum``) — every group carries all known spellings so a
   downstream FTS OR-query actually finds the part. Group[0] is always the
   canonical term; stopwords produce no group at all.
+- ``term_tiers(q)`` — the same groups, split into ``(core, fallback)``. Core is
+  what the user actually typed plus its true synonyms; fallback holds the
+  BROADENING decompositions of a glued token. Ranking uses core alone whenever
+  the corpus carries it, so a stray digit cannot satisfy a thread size — see
+  :func:`_term_tiers` for the measured numbers behind that split.
 
 Both functions are used by ``services/parts/index.py`` (ranking / term
 coverage) and ``services/parts/hub.py`` (recall gating) — keep the return
@@ -139,6 +144,12 @@ _BARE_NOISE_WORDS = frozenset({"head", "cap", "countersunk", "inner", "outer", "
 # alpha<->digit glue split, e.g. "nema17" -> ("nema", "17"); "608zz" -> ("608", "zz").
 _GLUE_RE = re.compile(r"^([a-z]+)(\d+[a-z0-9]*)$|^(\d+)([a-z]+)$")
 
+# A designation glued to one or more dimensions by the `x` separator
+# normalize_query preserves: "m3x12" -> ("m3", ["12"]), "8x1.25" -> ("8", ["1.25"]),
+# "20x30x5" -> ("20", ["30", "5"]).
+_DIM_GLUE_RE = re.compile(r"^(?P<head>[a-z]*[0-9][0-9.]*)x(?P<tail>[0-9.]+(?:x[0-9.]+)*)$")
+_HAS_ALPHA_RE = re.compile(r"[a-z]")
+
 _TOKEN_RE = re.compile(r"[0-9a-z][0-9a-z./_#-]*")
 
 
@@ -162,46 +173,103 @@ def _split_glued(token: str) -> list[str]:
     return [m.group(3), m.group(4)]
 
 
-def _group_for_term(term: str) -> list[str]:
-    """Build the synonym group for one already-normalized token, canonical first."""
-    variants = [term]
+def _dim_glue_parts(token: str) -> tuple[str, list[str]]:
+    """``('m3', ['12'])`` for a ``<designation>x<dim>[x<dim>]`` token, else ``("", [])``."""
+    m = _DIM_GLUE_RE.match(token)
+    if not m:
+        return "", []
+    return m.group("head"), [p for p in m.group("tail").split("x") if p]
 
-    glued_parts = _split_glued(term)
-    variants.extend(glued_parts)
 
-    # Resolve synonyms for the term itself and for its glued parts.
+def _term_tiers(term: str) -> tuple[list[str], list[str]]:
+    """``(core, fallback)`` variants for one normalized token, canonical first.
+
+    ``core`` is the token as typed, the designation head of an ``x``-glued
+    ``<thread>x<length>`` spelling, and every true synonym — a core hit means the
+    corpus really carries what the user asked for.
+
+    ``fallback`` holds the BROADENING decompositions: the fragments of a glued
+    alphanumeric (``m3`` -> ``m``/``3``, ``12mm`` -> ``12``/``mm``) and the trailing
+    dimensions of an ``x``-glued designation (``m3x12`` -> ``12``). Measured on the
+    shipped 3182-record index, bare ``3`` hits 753 records and bare ``12`` hits 318,
+    against 46 for ``m3`` and 72 for ``12mm``: OR-ing the fragments into the group
+    unconditionally let ANY record carrying a stray ``3`` satisfy the "M3" term, which
+    is how "M3 socket head cap screw 12mm" ranked a KiCad mounting-hole footprint and
+    three shaft collars above ``fastener:ISO 4762:M3``, the exact answer.
+    ``index._build_fts_query`` therefore reaches for these only when the core variants
+    match nothing — which is what keeps ``608zz`` -> ``608`` working against a corpus
+    that carries no glued spelling.
+    """
+    head, tail_dims = _dim_glue_parts(term)
+    # For "m3x12" the plain glue regex yields the useless ("m", "3x12"); split the
+    # designation head instead so the fragments are the real ("m", "3").
+    glued_parts = _split_glued(head or term)
+
+    # Resolve synonyms for the term itself, its designation head, and its fragments.
     resolved: list[str] = []
-    for v in (term, *glued_parts):
-        syn_group = _SYNONYM_LOOKUP.get(v)
+    for v in (term, head, *glued_parts):
+        syn_group = _SYNONYM_LOOKUP.get(v) if v else None
         if syn_group:
             resolved.extend(syn_group)
 
     canonical = resolved[0] if resolved else term
-    ordered = [canonical, *variants, *resolved]
-    return _dedupe(ordered)
+    core = [canonical, term]
+    # A designation head keeps its letter ("m3" of "m3x12", "w8" of "w8x31"); a bare
+    # numeric head ("8" of "8x1.25") is no more specific than the dimension beside it,
+    # so it broadens instead of narrowing.
+    if head and head != term and _HAS_ALPHA_RE.search(head):
+        core.append(head)
+    core.extend(resolved)
+    core = _dedupe(core)
+    core_set = set(core)
+    fallback = [t for t in _dedupe([*glued_parts, head, *tail_dims])
+                if t and t not in core_set]
+    return core, fallback
+
+
+def _group_for_term(term: str) -> list[str]:
+    """Build the synonym group for one already-normalized token, canonical first."""
+    core, fallback = _term_tiers(term)
+    return _dedupe([*core, *fallback])
+
+
+def _iter_query_tokens(q: str):
+    """The meaningful tokens of ``q``, phrases already folded to their abbreviation."""
+    norm = normalize_query(q)
+    if not norm:
+        return []
+
+    # Fold known multi-word phrases into their abbreviation before tokenizing,
+    # so "socket head cap screw" collapses to one group instead of four.
+    working = norm
+    for phrase, abbrev in _PHRASE_TO_ABBREV.items():
+        working = working.replace(phrase, abbrev)
+
+    out: list[str] = []
+    for tok in _TOKEN_RE.findall(working):
+        if len(out) >= _MAX_GROUPS:
+            break
+        if tok in _STOPWORDS or tok in _BARE_NOISE_WORDS:
+            continue
+        out.append(tok)
+    return out
 
 
 def expand_terms(q: str) -> list[list[str]]:
     """Split a normalized query into synonym groups, canonical term at index 0."""
     try:
-        norm = normalize_query(q)
-        if not norm:
-            return []
+        return [_group_for_term(tok) for tok in _iter_query_tokens(q)]
+    except Exception:
+        return []
 
-        # Fold known multi-word phrases into their abbreviation before tokenizing,
-        # so "socket head cap screw" collapses to one group instead of four.
-        working = norm
-        for phrase, abbrev in _PHRASE_TO_ABBREV.items():
-            working = working.replace(phrase, abbrev)
 
-        raw_tokens = _TOKEN_RE.findall(working)
-        groups: list[list[str]] = []
-        for tok in raw_tokens:
-            if len(groups) >= _MAX_GROUPS:
-                break
-            if tok in _STOPWORDS or tok in _BARE_NOISE_WORDS:
-                continue
-            groups.append(_group_for_term(tok))
-        return groups[:_MAX_GROUPS]
+def term_tiers(q: str) -> list[tuple[list[str], list[str]]]:
+    """:func:`expand_terms` with each group split into ``(core, fallback)``.
+
+    Same groups, same order, same canonical-first ordering within ``core`` — ranking
+    uses this so it can try the narrow variants before the broadening ones.
+    """
+    try:
+        return [_term_tiers(tok) for tok in _iter_query_tokens(q)]
     except Exception:
         return []

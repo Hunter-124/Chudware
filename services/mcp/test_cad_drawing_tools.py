@@ -547,15 +547,25 @@ def _tb_drawing() -> str:
     return mk["drawing_doc_id"]
 
 
-def test_revision_lands_in_rev():
-    """The engine renders rev/revision as ONE cell (session.cpp:6954), so this is the same
-    field under two spellings — read the canonical one back off the sheet."""
+def test_revision_lands_in_rev_and_survives_the_export(tmp_path):
+    """The on-screen renderer takes rev OR revision as ONE cell (session.cpp:7114), but the
+    EXPORTER reads only "revision" (export2d.cpp:205-207). Measured 2026-07-30:
+    set_titleblock(revision="B", material="6061-T6", drawn="hg") rendered fine and the
+    exported DXF carried the material and the drafter and NO revision at all — the one cell a
+    shop floor keys off, silently missing from every delivered file. Both spellings are now
+    written, so the canonical read-back AND the export must show it."""
     dwg = _tb_drawing()
-    st = _agent_call("set_titleblock", {"doc_id": dwg, "revision": "A"})
+    st = _agent_call("set_titleblock", {"doc_id": dwg, "revision": "A", "material": "6061-T6"})
     assert st["ok"], st
     tb = _title_block(dwg)
     assert tb.get("rev") == "A", tb
-    assert "revision" not in tb, tb  # canonicalised, not stored twice
+    assert tb.get("revision") == "A", tb  # the spelling export2d.cpp is able to see
+    out = str(tmp_path / "rev.dxf")
+    ex = _call("export_drawing", {"doc_id": dwg, "fmt": "dxf", "path": out})
+    assert ex["ok"], ex
+    text = Path(out).read_text(encoding="utf8", errors="replace")
+    assert "revision: A" in text, "the revision cell never reached the exported sheet"
+    assert "material: 6061-T6" in text, text[:400]
 
 
 @pytest.mark.parametrize("name,field", [("part_no", "part_number"), ("drawn", "drawn_by")])
@@ -1168,3 +1178,179 @@ def test_both_dispatch_paths_accept_a_model_target_and_the_new_parameters():
     orient = _agent_call("make_drawing", {"doc_id": doc, "views": ["front"],
                                           "model_items": False, "orientation": "landscape"})
     assert orient["ok"] is False and "no orientation to set" in orient["error"], orient
+
+
+# ------------------------------- Problem 6: the sheet is a place, and things can miss it
+#
+# Measured 2026-07-30 driving the whole "make a dimensioned 2D drawing" flow on a 50x30x4
+# plate. Five separate ways a drawing tool reported success while producing nothing, the wrong
+# thing, or something that had left the paper. Every assertion below is on a NUMBER read back
+# off the engine's own projection (bbox, entity count, measured value, exported bytes) — never
+# on ok:true, which is exactly what each of these bugs already returned.
+
+
+def _sheet_drawing() -> tuple[str, dict]:
+    """(drawing_doc_id, the make_drawing reply) for a 60x40x10 plate, front + top, A3."""
+    mk = _call("make_drawing", {"doc_id": _plate_with_hole(), "views": ["front", "top"],
+                                "sheet": "A3", "model_items": False, "hole_callouts": False})
+    assert mk["ok"], mk
+    return mk["drawing_doc_id"], mk
+
+
+def _view(dwg: str, view_id: str) -> dict:
+    return next(v for v in _views(dwg) if v.get("view_id") == view_id)
+
+
+def test_make_drawing_reports_how_much_geometry_each_view_actually_got():
+    """"A view that renders nothing" is the top drawing defect class and used to be invisible
+    in the reply. Every view of a solid plate must count real projected entities."""
+    dwg, mk = _sheet_drawing()
+    assert set(mk["view_entities"]) == set(mk["views"]), mk
+    for vid, n in mk["view_entities"].items():
+        assert n > 0, (vid, mk)
+        got = _view(dwg, vid)
+        assert n == len(got.get("visible") or []) + len(got.get("arcs") or []), (vid, mk)
+    assert not mk.get("warnings"), mk
+
+
+def test_a_single_axis_move_actually_moves_the_view():
+    """SILENT DROP: `if x is not None and y is not None` threw away set_view(x=…) and still
+    answered ok:true with the view's unchanged position."""
+    dwg, _mk = _sheet_drawing()
+    was = _view(dwg, "v1")["position"]
+    r = _call("set_view", {"doc_id": dwg, "view_id": "v1", "x": was[0] + 25.0})
+    assert r["ok"], r
+    assert abs(r["position"][0] - (was[0] + 25.0)) < 1e-6, (was, r)
+    assert abs(r["position"][1] - was[1]) < 1e-6, (was, r)   # the untouched axis is HELD
+    assert abs(_view(dwg, "v1")["position"][0] - (was[0] + 25.0)) < 1e-6, _view(dwg, "v1")
+
+
+def test_a_move_off_the_sheet_is_reported_with_the_numbers():
+    """set_view(x=900,y=900) on a 420x297 sheet answered a bare ok:true and the view was gone
+    from the render and the export with nothing saying so."""
+    dwg, _mk = _sheet_drawing()
+    r = _call("set_view", {"doc_id": dwg, "view_id": "v1", "x": 900.0, "y": 900.0})
+    assert r["ok"], r
+    assert r["sheet_mm"] == [420.0, 297.0], r
+    assert r["on_sheet"] is False, r
+    assert r["off_sheet_by_mm"]["right"] > 400.0, r
+    assert any("hangs off" in w for w in r["warnings"]), r
+    # …and a move back onto the paper clears it, so the flag tracks the state, not the history.
+    back = _call("set_view", {"doc_id": dwg, "view_id": "v1", "x": 60.0, "y": 60.0})
+    assert back["on_sheet"] is True and "off_sheet_by_mm" not in back, back
+
+
+def test_two_views_stacked_on_each_other_report_the_overlap_area():
+    dwg, _mk = _sheet_drawing()
+    at = _view(dwg, "v2")["position"]
+    r = _call("set_view", {"doc_id": dwg, "view_id": "v1", "x": at[0], "y": at[1]})
+    assert r["ok"], r
+    lap = next(o for o in r["overlaps"] if o["view_id"] == "v2")
+    assert lap["overlap_mm"][0] > 0.0 and lap["overlap_mm"][1] > 0.0, r
+    assert any("overlaps" in w for w in r["warnings"]), r
+
+
+def test_a_detail_circle_enclosing_nothing_is_refused_and_leaves_no_empty_view():
+    """The engine already filed "detail circle encloses no parent geometry" ON the view; the
+    tool answered ok:true and left a blank magnified circle on the sheet."""
+    dwg, _mk = _sheet_drawing()
+    before = [v["view_id"] for v in _views(dwg)]
+    r = _call("add_detail_view", {"doc_id": dwg, "parent_view_id": "v2",
+                                  "cx": 5.0, "cy": 5.0, "radius": 4.0})
+    assert r["ok"] is False, r
+    assert "encloses none" in r["error"] and "sheet mm" in r["error"], r
+    assert [v["view_id"] for v in _views(dwg)] == before, _views(dwg)
+
+
+def test_a_detail_view_takes_an_orientation_word_like_its_siblings_and_has_geometry():
+    """parent_view_id="top" was rejected outright ("detail parent view 'top' not found")
+    although add_dimension / add_gdt / add_datum / add_section_view all take the word."""
+    dwg, _mk = _sheet_drawing()
+    top = _view(dwg, "v2")
+    bb = top["bbox"]
+    r = _call("add_detail_view", {"doc_id": dwg, "parent_view_id": "top",
+                                  "cx": (bb[0] + bb[2]) / 2.0, "cy": (bb[1] + bb[3]) / 2.0,
+                                  "radius": max(bb[2] - bb[0], bb[3] - bb[1]) / 4.0})
+    assert r["ok"], r
+    assert r["parent_view_id"] == "v2", r
+    assert r["entities"] > 0, r
+
+
+def test_a_surface_finish_takes_an_orientation_word_like_its_siblings():
+    dwg, _mk = _sheet_drawing()
+    bb = _view(dwg, "v2")["bbox"]
+    r = _call("add_surface_finish", {"doc_id": dwg, "view_id": "top", "ra": "1.6",
+                                     "a": [bb[0], bb[1]], "pos": [bb[0], bb[1] - 10.0]})
+    assert r["ok"] and r["annotation"], r
+
+
+def test_a_dimension_between_two_picks_that_touch_nothing_is_refused():
+    """A confident "5" measured at the sheet origin, on a drawing that otherwise looks
+    finished, is the silently-wrong shape this whole file exists to prevent. The view's bbox
+    is the exact extent of its projected geometry, so BOTH picks outside it cannot be
+    measuring the part under any pick tolerance."""
+    dwg, _mk = _sheet_drawing()
+    before = len(_stored_annotations(dwg, "v2"))
+    r = _call("add_dimension", {"doc_id": dwg, "view_id": "v2", "a": [0.0, 0.0],
+                                "b": [10.0, 0.0]})
+    assert r["ok"] is False, r
+    assert "neither pick is on view v2" in r["error"], r
+    assert "sheet mm" in r["error"], r
+    assert len(_stored_annotations(dwg, "v2")) == before, _stored_annotations(dwg, "v2")
+
+
+def test_a_dimension_across_the_real_view_measures_the_real_width():
+    """The other side of the guard: picks ON the projection are untouched, and the number the
+    engine reports is the plate's true 60 mm width whatever the auto-fit scale is."""
+    dwg, _mk = _sheet_drawing()
+    bb = _view(dwg, "v2")["bbox"]
+    r = _call("add_dimension", {"doc_id": dwg, "view_id": "v2",
+                                "a": [bb[0], bb[1]], "b": [bb[2], bb[1]]})
+    assert r["ok"], r
+    assert abs(r["value"] - 60.0) < 1e-6, (r, _view(dwg, "v2")["scale"])
+    assert "interpreted" not in r, r
+
+
+def test_one_pick_off_the_projection_is_reported_but_not_refused():
+    """A witness line extended past the silhouette is legitimate, so one stray pick earns a
+    note naming the view's real bounds rather than a refusal."""
+    dwg, _mk = _sheet_drawing()
+    bb = _view(dwg, "v2")["bbox"]
+    r = _call("add_dimension", {"doc_id": dwg, "view_id": "v2",
+                                "a": [bb[0], bb[1]], "b": [bb[2] + 30.0, bb[1]]})
+    assert r["ok"], r
+    assert any("outside view v2" in n for n in r["interpreted"]), r
+
+
+def test_make_drawing_title_dict_goes_through_the_titleblock_vocabulary():
+    """SILENT DROP: title={"part_name": …} reached drawing_make untouched and was merged into
+    the sheet raw, so the part name sat in a key neither the renderer nor the exporter reads
+    and never appeared anywhere. set_titleblock has refused that spelling since 2026-07-29;
+    make_drawing must fold it onto TITLE the same way."""
+    mk = _call("make_drawing", {"doc_id": _plain_plate(), "views": ["front"],
+                                "model_items": False,
+                                "title": {"part_name": "Plate 50x30x4", "material": "6061"}})
+    assert mk["ok"], mk
+    tb = _title_block(mk["drawing_doc_id"])
+    assert tb.get("title") == "Plate 50x30x4", tb
+    assert "part_name" not in tb, tb
+    assert tb.get("material") == "6061", tb
+    assert any("title" in n for n in mk["interpreted"]), mk
+
+
+def test_make_drawing_refuses_a_title_field_nothing_renders():
+    mk = _call("make_drawing", {"doc_id": _plain_plate(), "views": ["front"],
+                                "model_items": False, "title": {"colour": "blue"}})
+    assert mk["ok"] is False, mk
+    assert "colour" in mk["error"] and "part_number" in mk["error"], mk
+
+
+def test_set_titleblock_guards_the_nested_fields_door_too():
+    """Only the flattened-kwarg door was guarded; fields={"part_name": …} stored a dead key."""
+    dwg = _tb_drawing()
+    st = _agent_call("set_titleblock", {"doc_id": dwg, "fields": {"part_name": "40mm Cube"}})
+    assert st["ok"], st
+    tb = _title_block(dwg)
+    assert tb.get("title") == "40mm Cube" and "part_name" not in tb, tb
+    bad = _agent_call("set_titleblock", {"doc_id": dwg, "fields": {"colour": "blue"}})
+    assert bad["ok"] is False and "colour" in bad["error"], bad

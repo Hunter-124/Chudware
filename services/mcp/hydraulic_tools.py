@@ -55,6 +55,89 @@ def _err(reason: str, hint: Optional[str] = None, **extra: Any) -> dict:
     return out
 
 
+# ------------------------------------------------------- component-type dialect (live fix)
+# Measured 2026-07-30 driving cad_guide("hydraulic")'s own workflow verbatim: the guide says
+# "Add pump, valve, cylinder, reservoir, etc." and the core refuses `cylinder`, `motor`,
+# `check_valve`, `relief_valve` and `linear_cylinder` outright ("unknown component type").
+# Every mapping below is a SPELLING of one member of the frozen ISO 1219 enum in
+# contracts/hydraulic_schema.md — a word-order flip (check_valve -> valve_check) or the
+# generic noun whose enum has exactly one non-degenerate member (`motor` -> motor_hydraulic;
+# `cylinder` -> cylinder_linear, since a rotary cylinder is always named as such). Nothing
+# here spans two enum members, so no reading is lost.
+#
+# Bare `valve` is DELIBERATELY absent: four valve types exist (directional / check / relief /
+# flow_control) and picking one would be inventing the circuit's function. It stays refused,
+# and _resolve_component_type says why instead of listing twelve types with no guidance.
+_TYPE_ALIASES: dict[str, str] = {
+    "cylinder": "cylinder_linear",
+    "linearcylinder": "cylinder_linear",
+    "actuator": "cylinder_linear",
+    "ram": "cylinder_linear",
+    "rotarycylinder": "cylinder_rotary",
+    "rotaryactuator": "cylinder_rotary",
+    "motor": "motor_hydraulic",
+    "hydraulicmotor": "motor_hydraulic",
+    "checkvalve": "valve_check",
+    "nonreturnvalve": "valve_check",
+    "reliefvalve": "valve_relief",
+    "pressurereliefvalve": "valve_relief",
+    "directionalvalve": "valve_directional",
+    "directionalcontrolvalve": "valve_directional",
+    "spoolvalve": "valve_directional",
+    "flowcontrolvalve": "valve_flow_control",
+    "throttlevalve": "valve_flow_control",
+    "tank": "reservoir",
+    "oiltank": "reservoir",
+    "heatexchanger": "heat_exchanger",
+    "cooler": "heat_exchanger",
+}
+
+_AMBIGUOUS_TYPES: dict[str, tuple] = {
+    "valve": ("valve_directional", "valve_check", "valve_relief", "valve_flow_control"),
+}
+
+
+def _resolve_component_type(t: str) -> tuple:
+    """A supplied component `type` -> (canonical enum member, note or None).
+
+    Raises ValueError for a generic noun that spans several enum members, because guessing
+    which valve a circuit needs would change what the circuit DOES.
+    """
+    raw = str(t or "")
+    key = raw.lower().replace("_", "").replace("-", "").replace(" ", "")
+    if key in _AMBIGUOUS_TYPES:
+        opts = _AMBIGUOUS_TYPES[key]
+        raise ValueError(
+            f"component type {raw!r} is ambiguous — {len(opts)} ISO 1219 valve types exist "
+            f"({', '.join(opts)}) and they do different things, so there is nothing safe to "
+            "assume. Name the one the circuit needs.")
+    canon = _TYPE_ALIASES.get(key)
+    if canon and canon != raw:
+        return canon, f"type {raw!r} read as {canon!r} (ISO 1219 enum spelling)"
+    return raw, None
+
+
+# Axis WORDS a model writes instead of a 3-vector, e.g. hydraulic_fea_handoff(axis="z")
+# — measured 2026-07-30: `_as_obj("z")` fails JSON parsing and the whole call is refused
+# with "could not parse inputs". Same table and Z-up convention as cad_sim_tools._AXIS_DIRS.
+_AXIS_WORDS: dict[str, list] = {
+    "x": [1.0, 0.0, 0.0], "+x": [1.0, 0.0, 0.0], "-x": [-1.0, 0.0, 0.0],
+    "y": [0.0, 1.0, 0.0], "+y": [0.0, 1.0, 0.0], "-y": [0.0, -1.0, 0.0],
+    "z": [0.0, 0.0, 1.0], "+z": [0.0, 0.0, 1.0], "-z": [0.0, 0.0, -1.0],
+    "up": [0.0, 0.0, 1.0], "down": [0.0, 0.0, -1.0],
+    "vertical": [0.0, 0.0, 1.0], "horizontal": [1.0, 0.0, 0.0],
+}
+
+
+def _axis_arg(axis):
+    """An `axis` argument -> a 3-vector, accepting the signed-axis WORDS as well as JSON."""
+    if isinstance(axis, str):
+        word = axis.strip().lower()
+        if word in _AXIS_WORDS:
+            return list(_AXIS_WORDS[word])
+    return _as_obj(axis)
+
+
 def _load_doc(doc: Union[str, dict, None]) -> Any:
     """Accept a hydraulic doc as a dict, a JSON string, or a path to a ``.json`` file."""
     if doc is None:
@@ -408,6 +491,11 @@ def register_hydraulic_tools(mcp) -> None:
         pump, cylinder_linear, cylinder_rotary, valve_directional, valve_check,
         valve_relief, valve_flow_control, accumulator, reservoir, motor_hydraulic,
         filter, heat_exchanger.
+        Common spellings of those members are accepted and echoed under ``interpreted``
+        (``cylinder``/``actuator``->cylinder_linear, ``motor``->motor_hydraulic,
+        ``check_valve``->valve_check, ``relief_valve``->valve_relief, ``tank``->reservoir,
+        ...). A bare ``valve`` is refused: four valve types exist and they do different
+        things.
 
         ``x``, ``y`` set the schematic canvas position (mm). ``params`` is a JSON object
         of type-specific parameters (bore_mm, stroke_mm, displacement_cc_rev, etc.) —
@@ -419,6 +507,12 @@ def register_hydraulic_tools(mcp) -> None:
 
         Returns the updated document with the new component appended.
         """
+        try:
+            type, type_note = _resolve_component_type(type)
+        except ValueError as exc:
+            return _dumps(_err(str(exc),
+                               hint="pick the specific ISO 1219 member — see the type list "
+                                    "in contracts/hydraulic_schema.md"))
         try:
             d = _load_doc(doc) if doc is not None else _active_doc()
             p = _as_obj(params) or {}
@@ -434,6 +528,8 @@ def register_hydraulic_tools(mcp) -> None:
             return _dumps(_err(f"core engine unavailable: {exc}"))
         if r.get("ok") and isinstance(r.get("doc"), dict):
             _HYD["doc"] = r["doc"]  # additive "doc" key: the updated active circuit
+        if r.get("ok") and type_note:
+            r["interpreted"] = [type_note]
         return _dumps(r)
 
     @mcp.tool()
@@ -671,7 +767,8 @@ def register_hydraulic_tools(mcp) -> None:
         Computes the mount reaction at ``max_pressure_bar``: extend thrust =
         π/4·bore² · P (full bore, reacts INTO the mount along −axis) and retract pull
         = π/4·(bore²−rod²) · P (annulus, +axis). ``axis`` is the cylinder axis in the
-        mount document's world frame (default [0,0,1]); ``load_face`` /
+        mount document's world frame (default [0,0,1]) as a 3-vector or a signed-axis
+        word (``"z"``/``"+z"``/``"-x"``/``"up"``/``"down"``); ``load_face`` /
         ``fixture_face`` are plain-word face queries on the mounting part;
         ``target_doc_id`` names the open FEA target document when known.
 
@@ -684,11 +781,12 @@ def register_hydraulic_tools(mcp) -> None:
         pass ``fea_args`` straight to ``run_fea_static(doc_id=target_doc_id, ...)``.
         """
         try:
-            ax = _as_obj(axis)
+            ax = _axis_arg(axis)
             d = _load_doc(doc) if doc is not None else _active_doc()
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}",
-                               hint="axis must be a non-zero [x,y,z] vector"))
+                               hint='axis must be a non-zero [x,y,z] vector or a signed-axis '
+                                    'word like "z" / "-x" / "up"'))
 
         try:
             r = cb.call("hydraulic_fea_handoff", {

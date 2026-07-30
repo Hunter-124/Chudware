@@ -29,8 +29,11 @@ Run:
 """
 from __future__ import annotations
 
-import copy
+import json
 import os
+import pathlib
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -47,12 +50,33 @@ _IMPORT_ERROR: Exception | None = None
 _TOOL_NAMES: set[str] = set()
 _CATALOG_SNAPSHOT: dict[str, dict] = {}
 
+# Take the snapshot in a CLEAN SUBPROCESS. Importing here at module scope was meant
+# to run before any other test could disturb the process-wide catalog, but pytest
+# imports every test module during COLLECTION, so "before any test runs" is not
+# early enough: if a sibling module imported services.mcp.server first and rebuilt
+# the catalog at import time, `import services.mcp.server` here is a cache hit that
+# re-registers nothing and the snapshot captures the polluted dict.
+#
+# Measured 2026-07-30: `pytest services/mcp/test_registration_catalog.py` passes,
+# while `pytest services/agent services/dag services/mcp/test_registration_catalog.py`
+# failed both consistency tests -- families 'files'/'shell'/'sim' apparently empty
+# and unknown families like 'interaction' present. A clean import registers 418
+# tools / 420 catalog entries. Verified pre-existing by re-running with that day's
+# unrelated edits stashed. A subprocess cannot be reached by in-process ordering at
+# all, which is the only way to make this file's premise actually true.
 try:
-    import services.mcp.server as _srv  # noqa: PLC0415 - side effect: registers every tool
-    _TOOL_NAMES = set(_srv.mcp._tool_manager._tools.keys())
-    _CATALOG_SNAPSHOT = copy.deepcopy(reg.catalog())
+    _snap = json.loads(subprocess.run(
+        [sys.executable, "-c",
+         "import json, services.mcp.server as s;"
+         "from services.mcp import tool_registry as r;"
+         "print(json.dumps({'tools': sorted(s.mcp._tool_manager._tools),"
+         " 'catalog': r.catalog()}))"],
+        cwd=str(pathlib.Path(__file__).resolve().parents[2]),
+        capture_output=True, text=True, timeout=300, check=True,
+    ).stdout.splitlines()[-1])
+    _TOOL_NAMES = set(_snap["tools"])
+    _CATALOG_SNAPSHOT = _snap["catalog"]
 except Exception as exc:  # pragma: no cover - environment missing mcp/anyio packages
-    _srv = None  # type: ignore[assignment]
     _IMPORT_ERROR = exc
 
 

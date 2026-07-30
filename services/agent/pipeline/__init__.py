@@ -24,6 +24,8 @@ from .manifest import (
     manifest_valid,
     blocking_ambiguities,
     manifest_template,
+    manifest_draft,
+    normalize_manifest,
     BounceTracker,
 )
 from .phases import (
@@ -49,6 +51,8 @@ __all__ = [
     "manifest_valid",
     "blocking_ambiguities",
     "manifest_template",
+    "manifest_draft",
+    "normalize_manifest",
     "BounceTracker",
     # phases
     "Phase",

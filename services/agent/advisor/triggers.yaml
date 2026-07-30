@@ -530,7 +530,13 @@ triggers:
         - "\\bcalipers\\b"
         - "\\breplacement part\\b"
         - "\\bcopy\\b.*\\b(part|bracket)\\b"
-        - "3d print"
+        # Bare "3d print" is NOT reverse engineering — printing is an OUTPUT of this
+        # flow. Live 2026-07-30 (run-4530697933837): "fabricated with a 3D printer
+        # plus Shapeoko CNC" pulled 250 tokens of scan/point-cloud/caliper guidance
+        # into a from-scratch enclosure design. Require a replicate verb alongside,
+        # like the neighbouring co-occurrence keys.
+        - "\\b(scan|copy|replicate|duplicate|replacement|reproduce)\\b.*3d print"
+        - "3d print.*\\b(scan|copy|replica|replacement|existing)\\b"
         - "\\bSTEP\\b.*\\bimport|import.*\\bSTEP\\b"
         - "\\bdatasheet\\b"
       tools:

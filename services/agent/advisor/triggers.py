@@ -474,7 +474,15 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"reverse.engineer", r"\bscan\b", r"\bscan\b.*\b(part|to cad)\b",
                 r"\bpoint cloud\b", r"\bmesh\b.*\b(part|model)", r"\bphotogrammetry\b",
                 r"\bwebcam\b", r"\bcaliper\b", r"\bcalipers\b", r"\breplacement part\b",
-                r"\bcopy\b.*\b(part|bracket)\b", r"3d print",
+                r"\bcopy\b.*\b(part|bracket)\b",
+                # Bare "3d print" is NOT reverse engineering. Live 2026-07-30
+                # (run-4530697933837): "fabricated with a 3D printer plus Shapeoko
+                # CNC" injected 250 tokens of scan/point-cloud/caliper guidance into
+                # a from-scratch enclosure design. Printing is an OUTPUT of this
+                # flow, so it only signals intent alongside a replicate verb --
+                # matching the co-occurrence idiom the neighbouring keys already use.
+                r"\b(scan|copy|replicate|duplicate|replacement|reproduce)\b.*3d print",
+                r"3d print.*\b(scan|copy|replica|replacement|existing)\b",
                 r"\bSTEP\b.*\bimport|import.*\bSTEP\b", r"\bdatasheet\b",
             ],
             "tools": [

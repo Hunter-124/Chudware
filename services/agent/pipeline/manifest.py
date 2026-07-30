@@ -29,6 +29,7 @@ user answer before Phase 2".
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
@@ -134,7 +135,19 @@ def validate_manifest(
     # Collect ids first (needed for depends_on resolution + cycle check).
     del_ids: list[str] = []
     for i, d in enumerate(deliverables):
-        did = d.get("id") if isinstance(d, dict) else None
+        if not isinstance(d, dict):
+            # Say what is actually wrong. This used to fall through to "missing an
+            # 'id'", which asks the model to add a key to a string -- unsatisfiable
+            # without restructuring -- and the per-deliverable rules below skip
+            # non-dicts, so kind/acceptance_criteria were never even reported.
+            # Live 2026-07-30 (run-4530697933837): six string deliverables produced
+            # six impossible id errors and nothing else.
+            findings.append(ManifestFinding(
+                "error", "deliverable_shape",
+                f"deliverable at index {i} is a {type(d).__name__}, not an object; "
+                "expected {'id', 'kind', 'title', 'acceptance_criteria': [...]}"))
+            continue
+        did = d.get("id")
         if not did:
             findings.append(ManifestFinding(
                 "error", "deliverable_id",
@@ -336,6 +349,136 @@ def manifest_template() -> dict[str, Any]:
         "assumptions": [],   # [{"text": ..., "needs_confirm": bool}]
         "ambiguities": [],   # [{"text": ..., "blocking": bool, "question_id": ...}]
     }
+
+
+def normalize_manifest(
+    manifest: Any,
+    *,
+    request: str | None = None,
+) -> tuple[Any, list[str]]:
+    """Fill in a manifest's MECHANICAL fields, returning ``(manifest, interpreted)``.
+
+    Bounces a model on semantics, never on boilerplate. Live 2026-07-30
+    (run-4530697933837, OptiPlex case, K3): the model authored a perfectly
+    reasonable manifest and got eight errors back, six of which the harness could
+    have filled itself --
+
+        {"request": "Design a manufacturable custom case ...",
+         "manifest": {"deliverables": ["component dimensions and clearance
+                      assumptions", "enclosure layout plan", ...],
+                      "constraints": [...]}}
+
+      * ``schema`` is a CONSTANT. Rejecting a manifest for omitting a value with
+        exactly one legal setting is pure friction.
+      * ``request_verbatim`` was sitting right there in the ``request`` argument.
+      * ids are POSITIONAL labels; "deliverable at index 0 is missing an 'id'" x6
+        is noise that crowds out the two findings that actually needed the model.
+
+    Worse, those six were the ONLY findings: a string deliverable fails the
+    ``isinstance(d, dict)`` guard in :func:`validate_manifest`, so it reports a
+    missing 'id' and then skips the kind/acceptance_criteria rules entirely. The
+    model was told to add an 'id' to a string -- impossible without restructuring,
+    and nothing said the entry had to be an object. That is the unactionable
+    refusal this module already fixed once for the no-manifest path.
+
+    Only mechanical repairs happen here. ``kind`` and ``acceptance_criteria`` carry
+    real meaning, so they are still the model's job -- but it now answers for those
+    alone, in its own structure, via ``manifest_draft``.
+    """
+    interpreted: list[str] = []
+    if not isinstance(manifest, dict):
+        return manifest, interpreted
+    m = copy.deepcopy(manifest)
+
+    if m.get("schema") != SCHEMA:
+        was = m.get("schema")
+        m["schema"] = SCHEMA
+        interpreted.append(
+            f"schema: set to {SCHEMA!r}" + (f" (was {was!r})" if was else ""))
+
+    if not str(m.get("request_verbatim") or "").strip() and str(request or "").strip():
+        m["request_verbatim"] = request
+        # Honest about the provenance: this is the `request` ARGUMENT, which is
+        # whatever the caller wrote there. §16 wants the user's unedited words, so
+        # say so rather than let a paraphrase pass as verbatim in silence.
+        interpreted.append(
+            "request_verbatim: copied from the `request` argument. If that was a "
+            "paraphrase, resend with the user's exact words.")
+
+    deliverables = m.get("deliverables")
+    if isinstance(deliverables, list) and deliverables:
+        coerced = 0
+        for i, d in enumerate(deliverables):
+            if isinstance(d, str) and d.strip():
+                deliverables[i] = {"title": d.strip()}
+                coerced += 1
+        if coerced:
+            interpreted.append(
+                f"deliverables: {coerced} plain string(s) read as a deliverable "
+                "title; each still needs a `kind` and `acceptance_criteria`.")
+
+        taken = {d["id"] for d in deliverables
+                 if isinstance(d, dict) and d.get("id")}
+        assigned = 0
+        n = 0
+        for d in deliverables:
+            if not isinstance(d, dict) or d.get("id"):
+                continue
+            while True:
+                n += 1
+                cand = f"DL{n}"
+                if cand not in taken:
+                    break
+            d["id"] = cand
+            taken.add(cand)
+            assigned += 1
+        if assigned:
+            interpreted.append(
+                f"deliverables: assigned {assigned} positional id(s) "
+                "(DL1..DLn); reference them from `depends_on`.")
+    return m, interpreted
+
+
+def manifest_draft(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The caller's own (normalized) manifest with missing required fields marked.
+
+    Answers "what does right look like?" in the caller's OWN structure. A generic
+    :func:`manifest_template` makes a model re-derive six deliverables it had
+    already written down correctly; this hands its work back with only the blanks
+    to fill, so the next completion is an edit rather than a rewrite.
+    """
+    d = copy.deepcopy(manifest)
+    for dl in d.get("deliverables") or []:
+        if not isinstance(dl, dict):
+            continue
+        if dl.get("kind") not in VALID_KINDS:
+            dl["kind"] = f"<REQUIRED: one of {sorted(VALID_KINDS)}>"
+        acs = dl.get("acceptance_criteria")
+        if not isinstance(acs, list) or not acs:
+            dl["acceptance_criteria"] = [{
+                "id": "AC1",
+                "text": "<objectively checkable statement>",
+                "check": {
+                    "tool": f"<REQUIRED: one of {sorted(KNOWN_CHECK_TOOLS)}>",
+                    "pass_rule": "<PASS/FAIL rule over that tool's output>",
+                },
+            }]
+        else:
+            # The observed SECOND bounce (run-4433662287777, same session): the
+            # model supplied criteria but wrote them as prose without a `check`,
+            # and got "DL1/AC1: criterion must name a 'check' with a tool" x4.
+            # Marking the gap in place keeps that a one-line edit per criterion.
+            for ac in acs:
+                if not isinstance(ac, dict):
+                    continue
+                chk = ac.get("check")
+                if not isinstance(chk, dict) or not chk.get("tool"):
+                    ac["check"] = {
+                        "tool": f"<REQUIRED: one of {sorted(KNOWN_CHECK_TOOLS)}>",
+                        "pass_rule": (chk or {}).get("pass_rule")
+                        or "<PASS/FAIL rule over that tool's output>",
+                    }
+    return d
 
 
 def _detect_cycles(

@@ -347,3 +347,65 @@ def test_load_table_is_cached():
 def test_load_table_has_at_least_8_triggers():
     table = triggers.load_table()
     assert len(table) >= 8, f"expected ≥8 triggers, got {len(table)}"
+
+
+# ---------------------------------------------------------------------------
+# Trigger PRECISION: a pack that fires on the wrong sense of a word is a tax.
+#
+# Live 2026-07-30 (run-4530697933837, OptiPlex case): the request said the case
+# would be "fabricated with a 3D printer plus Shapeoko 3XL CNC", and the bare
+# "3d print" keyword injected 250 tokens of reverse-engineering guidance --
+# scans, point clouds, calipers -- into a from-scratch enclosure design. Printing
+# is an OUTPUT of the reveng flow, not evidence anyone is reverse-engineering.
+# ---------------------------------------------------------------------------
+
+def _fired(text: str) -> set[str]:
+    _, events = triggers.match_triggers(output_text=text,
+                                        cooldown_state=_fresh_state())
+    return {e["trigger_id"] for e in events}
+
+
+def test_plain_3d_printing_does_not_pull_the_reveng_pack():
+    text = ("Design a custom case for a Dell OptiPlex 7040 that reuses the stock "
+            "PSU and can be fabricated with a 3D printer plus Shapeoko 3XL CNC.")
+    assert "reveng_flow" not in _fired(text), _fired(text)
+
+
+@pytest.mark.parametrize("text", [
+    "scan this bracket and 3d print a replacement",
+    "3d print a copy of the existing housing",
+    "reverse engineer this part",
+    "measure it with calipers and rebuild the model",
+])
+def test_genuine_reverse_engineering_still_fires(text):
+    """Narrowing the keyword must not cost real recall."""
+    assert "reveng_flow" in _fired(text), text
+
+
+def test_builtin_fallback_table_mirrors_the_yaml():
+    """`_BUILTIN_TRIGGERS` is the no-PyYAML fallback; drift makes it a second,
+    silently-wrong rule set.
+
+    Several rules carry a "Mirrored verbatim in advisor/triggers.py -- change one,
+    change the other" comment, but nothing enforced it: every other test in this
+    file goes through match_triggers, which reads the YAML, so the fallback was
+    exercised by no test at all. Proven while falsifying the 2026-07-30 reveng_flow
+    narrowing -- seeding the defect back into triggers.py alone changed nothing.
+    """
+    import pathlib
+    import yaml
+
+    raw = yaml.safe_load(
+        (pathlib.Path(__file__).parent / "triggers.yaml").read_text(encoding="utf-8"))
+    y_rules = raw["triggers"] if isinstance(raw, dict) and "triggers" in raw else raw
+    y = {r["id"]: r for r in y_rules}
+    b = {r["id"]: r for r in triggers._BUILTIN_TRIGGERS}
+
+    assert set(y) == set(b), (
+        f"only in yaml: {sorted(set(y) - set(b))}; "
+        f"only in builtin: {sorted(set(b) - set(y))}")
+    for tid in sorted(y):
+        for field in ("keywords", "tools"):
+            assert y[tid]["match"].get(field) == b[tid]["match"].get(field), (
+                f"{tid}.match.{field} drifted between triggers.yaml and "
+                f"_BUILTIN_TRIGGERS")

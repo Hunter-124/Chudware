@@ -62,7 +62,7 @@ def register_mission_tools(mcp) -> None:
         """
         from services.agent.pipeline import (
             validate_manifest, manifest_valid, blocking_ambiguities,
-            manifest_template)
+            manifest_template, manifest_draft, normalize_manifest)
         from services.agent.pipeline.manifest import (
             VALID_KINDS, KNOWN_CHECK_TOOLS)
         from services.dag.mission_template import build_mission_graph
@@ -88,14 +88,24 @@ def register_mission_tools(mcp) -> None:
                 "request": request,
             }
 
+        # Repair the mechanical fields (schema constant, request_verbatim already
+        # in hand as `request`, positional ids, string-shorthand deliverables)
+        # before judging, so the model is bounced on meaning and never on
+        # boilerplate. See pipeline.manifest.normalize_manifest for the live run
+        # that motivated this.
+        manifest, interpreted = normalize_manifest(manifest, request=request)
         findings = validate_manifest(manifest)
         finding_strs = [str(f) for f in findings]
         if not manifest_valid(findings):
             return {"ok": False, "reason": "manifest invalid (§16)",
                     "findings": finding_strs,
-                    # Same reasoning as above: findings alone tell the model what
-                    # is wrong, not what right looks like.
-                    "manifest_template": manifest_template()}
+                    "interpreted": interpreted,
+                    # Hand back the caller's OWN manifest with the blanks marked:
+                    # findings alone say what is wrong, not what right looks like,
+                    # and a generic template makes it re-derive work it already did.
+                    "manifest_draft": manifest_draft(manifest),
+                    "valid_kinds": sorted(VALID_KINDS),
+                    "known_check_tools": sorted(KNOWN_CHECK_TOOLS)}
         blocking = blocking_ambiguities(findings)
         if blocking:
             return {"ok": False, "reason": "blocking ambiguity — route to CLARIFY",
@@ -111,6 +121,10 @@ def register_mission_tools(mcp) -> None:
             "graph": graph,
             "deliverables": [d.get("id") for d in manifest.get("deliverables", [])],
             "findings": finding_strs,
+            # What the harness filled in for you. A mission that starts on an
+            # auto-supplied request_verbatim must SAY so -- silently accepting a
+            # paraphrase as the user's words is how a mission drifts from the ask.
+            "interpreted": interpreted,
             # Naming dag_run is only useful if the caller can REACH it: the
             # general lane starts without it and has to pull the pack first.
             "hint": "execute with dag_run(graph_json=<graph>), then track via "

@@ -85,10 +85,20 @@ def test_no_manifest_refusal_is_actionable():
     assert "run_mission(" not in out["reason"]
 
 
-def test_invalid_manifest_refusal_also_carries_the_template():
+def test_invalid_manifest_refusal_also_carries_a_worked_shape():
+    """The refusal must show what right looks like, not just what is wrong.
+
+    This used to assert a generic `manifest_template`. `manifest_draft` supersedes
+    it: same guarantee, but expressed as the CALLER'S OWN manifest with the blanks
+    marked, so the next completion edits its work instead of re-deriving it.
+    """
     out = _mission_start()(request="x", manifest={"deliverables": []})
     assert out["ok"] is False
-    assert validate_manifest(out["manifest_template"]) == []
+    draft = out["manifest_draft"]
+    assert isinstance(draft, dict) and draft["schema"] == "aicad.deliverables/1"
+    # The legal vocabularies still ride along -- a model cannot guess either set.
+    assert set(out["valid_kinds"]) == set(VALID_KINDS)
+    assert set(out["known_check_tools"]) == set(KNOWN_CHECK_TOOLS)
 
 
 def test_filled_template_actually_plans_the_mission():
@@ -317,3 +327,133 @@ def test_mission_start_hint_says_how_to_reach_dag_run():
     hint = ms(request="x", manifest=tpl)["hint"]
     assert "dag_run" in hint
     assert "enable_tools" in hint and "delegate" in hint, hint
+
+
+# ===========================================================================
+# Bounce on meaning, never on boilerplate.
+#
+# Live 2026-07-30 (run-4530697933837, OptiPlex case, K3): the model authored a
+# reasonable manifest and got eight errors back. NOT ONE named the real problem.
+# Six were "deliverable at index N is missing an 'id'" -- unsatisfiable, because
+# the entries were strings and you cannot add a key to a string -- and the
+# validator's isinstance(d, dict) guard then skipped the kind/acceptance_criteria
+# rules entirely, so the findings never mentioned them. The other two were a
+# constant and a value already passed in as `request`. The mission never started.
+# ===========================================================================
+
+_LIVE_REQUEST = (
+    "Design a manufacturable custom case for a Dell OptiPlex 7040 SFF that reuses "
+    "the stock PSU (8.5 x 2.5 x 3.25 in), fits the proprietary motherboard and a "
+    "full-profile GPU with riser."
+)
+# Verbatim from the run's args_preview.
+_LIVE_MANIFEST = {
+    "deliverables": [
+        "component dimensions and clearance assumptions",
+        "enclosure layout plan",
+        "parametric case CAD",
+        "fabrication plan for CNC and 3D printed parts",
+        "prefab BOM under $40",
+        "assembly and fit-check notes",
+    ],
+    "constraints": ["reuse stock PSU", "fit full-profile GPU"],
+}
+
+
+def test_mechanical_fields_are_repaired_not_bounced():
+    from services.agent.pipeline import normalize_manifest
+
+    m, interpreted = normalize_manifest(_LIVE_MANIFEST, request=_LIVE_REQUEST)
+    assert m["schema"] == "aicad.deliverables/1"
+    assert m["request_verbatim"] == _LIVE_REQUEST
+    assert [d["id"] for d in m["deliverables"]] == [f"DL{i}" for i in range(1, 7)]
+    assert all(isinstance(d, dict) for d in m["deliverables"])
+    assert m["deliverables"][0]["title"].startswith("component dimensions")
+    # Every repair is disclosed -- a silent fill is how a mission drifts from the ask.
+    assert len(interpreted) == 4, interpreted
+    assert any("request_verbatim" in n and "paraphrase" in n for n in interpreted)
+
+
+def test_normalizing_leaves_only_semantic_findings():
+    """The whole point: what survives normalization is work only the model can do."""
+    from services.agent.pipeline import normalize_manifest
+
+    before = validate_manifest(_LIVE_MANIFEST)
+    assert not any(f.rule in ("kind", "acceptance_criteria") for f in before), (
+        "guard: pre-normalization findings never reached the real problem")
+
+    m, _ = normalize_manifest(_LIVE_MANIFEST, request=_LIVE_REQUEST)
+    after = validate_manifest(m)
+    assert after, "still incomplete: kind/acceptance_criteria carry meaning"
+    assert {f.rule for f in after} == {"kind", "acceptance_criteria"}, \
+        [str(f) for f in after]
+
+
+def test_string_deliverable_is_reported_as_a_shape_error():
+    """Never ask a model to add a key to a string."""
+    findings = validate_manifest({
+        "schema": "aicad.deliverables/1", "request_verbatim": "x",
+        "deliverables": ["a bracket"]})
+    shape = [f for f in findings if f.rule == "deliverable_shape"]
+    assert shape, [str(f) for f in findings]
+    assert "not an object" in str(shape[0])
+    assert not [f for f in findings if f.rule == "deliverable_id"]
+
+
+def test_draft_returns_the_callers_own_deliverables_with_blanks_marked():
+    ms = _mission_start()
+    out = ms(request=_LIVE_REQUEST, manifest=_LIVE_MANIFEST)
+    assert out["ok"] is False
+    draft = out["manifest_draft"]
+    # Its OWN six deliverables, not a generic one-item template to re-derive.
+    assert len(draft["deliverables"]) == 6
+    assert draft["deliverables"][2]["title"] == "parametric case CAD"
+    dl = draft["deliverables"][0]
+    assert dl["kind"].startswith("<REQUIRED:") and "part" in dl["kind"]
+    assert dl["acceptance_criteria"][0]["check"]["tool"].startswith("<REQUIRED:")
+    assert out["interpreted"] and out["valid_kinds"]
+
+
+def test_a_manifest_needing_only_mechanical_repair_now_starts():
+    """The payoff: boilerplate-only gaps must no longer cost a round trip."""
+    ms = _mission_start()
+    tpl = manifest_template()
+    del tpl["schema"]                     # constant
+    del tpl["request_verbatim"]           # already passed as `request`
+    del tpl["deliverables"][0]["id"]      # positional
+    dl = tpl["deliverables"][0]
+    dl["title"] = "Case shell"
+    dl["acceptance_criteria"][0]["text"] = "volume positive"
+    dl["acceptance_criteria"][0]["check"]["pass_rule"] = "volume_mm3 > 0"
+
+    out = ms(request="build me a PC case", manifest=tpl)
+    assert out["ok"] is True, out.get("findings")
+    assert out["deliverables"] == ["DL1"]
+    assert out["interpreted"], "an auto-filled request_verbatim must be disclosed"
+
+
+def test_draft_marks_a_criterion_that_names_no_check_tool():
+    """The observed SECOND bounce (run-4433662287777): criteria written as prose.
+
+    "DL1/AC1: criterion must name a 'check' with a tool" x4 says what is missing but
+    not where to put it; the draft marks the gap in the model's own criterion.
+    """
+    from services.agent.pipeline import manifest_draft
+
+    d = manifest_draft({
+        "schema": "aicad.deliverables/1", "request_verbatim": "x",
+        "deliverables": [{
+            "id": "DL1", "kind": "part", "title": "Case shell",
+            "acceptance_criteria": [{"id": "AC1", "text": "fits the PSU"}]}]})
+    chk = d["deliverables"][0]["acceptance_criteria"][0]["check"]
+    assert chk["tool"].startswith("<REQUIRED:") and "measure_part" in chk["tool"]
+    assert chk["pass_rule"]
+    # The model's own criterion text survives -- this is an edit, not a rewrite.
+    assert d["deliverables"][0]["acceptance_criteria"][0]["text"] == "fits the PSU"
+
+
+def test_draft_leaves_a_complete_criterion_untouched():
+    from services.agent.pipeline import manifest_draft
+
+    good = manifest_template()
+    assert manifest_draft(good) == good

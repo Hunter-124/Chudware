@@ -245,6 +245,39 @@ def _expand_polyline(ent: dict, start_id: int) -> list:
 #: type" — a whole sketch lost to one synonym.
 _ENTITY_TYPE_ALIASES = ("kind", "shape", "entity", "entity_type", "etype", "geom_type")
 
+#: Sketch entity shapes the ENGINE can build from two opposite corners
+#: (core/doc/session.cpp ~1403: `et == "rectangle" || et == "rect"`). It reads those
+#: corners ONLY as arrays — corner1/corner2, p1/p2 or min/max — so the flat
+#: coordinate dialect the `line` branch already understands (x1/y1/x2/y2) lands one
+#: slot over and dies on "rectangle: expected center-form … or two-corner form".
+#: Live run 2026-07-29 (lexus_f_keychain): all three regions of an embossed "F" were
+#: written {"kind":"rect","x1":10,"y1":-6,"x2":16,"y2":12} and the whole sketch was
+#: rejected — the model had to guess the canonical spelling on a second call.
+_TWO_CORNER_TYPES = frozenset({"rectangle", "rect"})
+
+#: Width/height spellings the engine's center-form accepts (session.cpp ~1440).
+_RECT_W_KEYS = ("width", "w", "dx", "length")
+_RECT_H_KEYS = ("height", "h", "dy", "depth")
+
+
+def _flat_corners(e: dict) -> Optional[tuple[list, list]]:
+    """(corner1, corner2) for a rectangle that names its corners flat, else None.
+
+    Declines when either two-corner slot is already filled, and when the entity
+    carries a width AND a height — that payload already satisfies the engine's
+    center-form, so rewriting it would change a working call.
+    """
+    if any(k in e for k in ("corner1", "p1", "min")) and any(
+            k in e for k in ("corner2", "p2", "max")):
+        return None
+    if any(k in e for k in _RECT_W_KEYS) and any(k in e for k in _RECT_H_KEYS):
+        return None
+    c1 = _flat_point(e, "x1", "y1")
+    c2 = _flat_point(e, "x2", "y2")
+    if c1 is None or c2 is None:
+        return None
+    return c1, c2
+
 
 def _entity_type_alias(e: dict) -> Optional[str]:
     """The alias key carrying this entity's shape word, when `type` is missing."""
@@ -301,6 +334,11 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
         if e.get("type") in ("circle", "arc") and "radius" not in e:
             return True
         if e.get("type") == "point" and "p" not in e:
+            return True
+        # A rectangle whose corners are flat numbers: canonical in every other respect,
+        # but the engine reads corners only as arrays, so without this it never reaches
+        # the normalizer and dies on the engine's center-form/two-corner rejection.
+        if _slug(e.get("type")) in _TWO_CORNER_TYPES and _flat_corners(e) is not None:
             return True
     for c in (cons or []):
         if not isinstance(c, dict):
@@ -608,6 +646,13 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
                     if coerced != ne[k]:
                         ne[k] = coerced
                         used_shorthand.add("point_obj")
+            if _slug(etype) in _TWO_CORNER_TYPES:
+                corners = _flat_corners(ne)
+                if corners is not None:
+                    ne["corner1"], ne["corner2"] = corners
+                    for k in ("x1", "y1", "x2", "y2"):
+                        ne.pop(k, None)
+                    used_shorthand.add("corner_xy")
             if "center" not in ne:
                 flat_c = _flat_point(ne, "cx", "cy")
                 if flat_c is not None:
@@ -632,6 +677,8 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             rewrites.append('d/dia/diameter -> radius (halved)')
         if "line_xy" in used_shorthand:
             rewrites.append('x1/y1/x2/y2 -> p1/p2')
+        if "corner_xy" in used_shorthand:
+            rewrites.append('x1/y1/x2/y2 -> corner1/corner2')
         if "point_xy" in used_shorthand:
             rewrites.append('x/y -> p')
         if "point_obj" in used_shorthand:

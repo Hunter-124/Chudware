@@ -441,6 +441,44 @@ class TestSketchEntityShorthand:
         assert ents[0]["p"] == [3, 4]
         assert any("x/y -> p" in n for n in notes)
 
+    def test_rect_x1_y1_x2_y2_becomes_corner1_corner2(self):
+        """Live run 2026-07-29 (lexus_f_keychain): all three regions of an embossed "F"
+        were written {"kind":"rect","x1":10,"y1":-6,"x2":16,"y2":12}. The `line` branch
+        already understood this flat dialect; one slot over it was a batch-killing
+        rejection ("rectangle: expected center-form … or two-corner form"), and the
+        model had to guess the canonical spelling on a second call."""
+        ents, notes = self._norm([{"kind": "rect", "x1": 10, "y1": -6,
+                                   "x2": 16, "y2": 12}])
+        assert ents[0]["corner1"] == [10, -6] and ents[0]["corner2"] == [16, 12]
+        assert not any(k in ents[0] for k in ("x1", "y1", "x2", "y2"))
+        assert any("x1/y1/x2/y2 -> corner1/corner2" in n for n in notes)
+
+    def test_rect_with_width_and_height_keeps_its_center_form(self):
+        """width+height already satisfies the engine's center-form, so a stray x1/y1
+        must NOT be promoted into corners — that would move a working rectangle."""
+        ents, _ = self._norm([{"type": "rectangle", "center": [0, 0], "width": 4,
+                               "height": 2, "x1": 99, "y1": 99, "x2": 1, "y2": 1}])
+        assert "corner1" not in ents[0]
+        assert ents[0]["width"] == 4 and ents[0]["height"] == 2
+
+    def test_rect_with_existing_corners_is_not_rewritten(self):
+        ents, _ = self._norm([{"type": "rect", "corner1": [0, 0], "corner2": [5, 5],
+                               "x1": 9, "y1": 9, "x2": 8, "y2": 8}])
+        assert ents[0]["corner1"] == [0, 0] and ents[0]["corner2"] == [5, 5]
+
+    def test_a_half_written_flat_rect_is_not_guessed(self):
+        """Only x1/y1 present: no second corner to infer, so leave it for the engine."""
+        ents, _ = self._norm([{"type": "rect", "x1": 10, "y1": -6}])
+        assert "corner1" not in ents[0]
+        assert ents[0]["x1"] == 10
+
+    def test_a_polygon_is_not_given_rectangle_corners(self):
+        """_TWO_CORNER_TYPES is exactly what the ENGINE can build from two corners;
+        a polygon carrying x1/y1/x2/y2 would gain fields it never reads."""
+        ents, _ = self._norm([{"type": "polygon", "sides": 6, "x1": 0, "y1": 0,
+                               "x2": 5, "y2": 5}])
+        assert "corner1" not in ents[0]
+
     def test_29_circles_emit_one_note_not_29(self):
         entities = [{"type": "circle", "cx": float(i), "cy": 0, "r": 1.0}
                     for i in range(29)]

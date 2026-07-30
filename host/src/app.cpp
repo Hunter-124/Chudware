@@ -3506,6 +3506,66 @@ int run_gui(const char *screenshotPath, const char *openPath) {
              "filter_by(Plane.XY).group_by(Axis.Z)[-1]\n+result = chamfer(top, "
              "length=1.0)";
     a.steps.push_back(s);
+    // Typed transparency rows (M12-M14) + the per-call META trailer, so the shot
+    // exercises the chip ellipsize, the finished-thinking auto-collapse, the
+    // tool-row timestamp/cache cluster and the bubble meta-row cache suffix.
+    a.cacheReadTok = 41200;
+    {
+      ActivityItem chip;
+      chip.rowKind = 1;
+      chip.stage = "ctx";
+      chip.title = "Interference check pre op with a deliberately long rule label";
+      chip.reason = "rule";
+      chip.ctxTokens = 232;
+      chip.status = "done";
+      a.activity.push_back(chip);
+      // Finished thinking box: expanded in the seed (as the live stream leaves
+      // it) — the finished-turn clamp must collapse it to the one-line preview.
+      ActivityItem think;
+      think.rowKind = 2;
+      think.stage = "thought:stream";
+      think.title = "Thinking";
+      think.status = "done";
+      think.expanded = true;   // stream left it open; turn end must auto-close
+      think.detail = "The user wants a taller standoff with a chamfered rim. "
+                     "Plan: raise total_h, then chamfer the top edge ring.";
+      a.activity.push_back(think);
+      ActivityItem tool;
+      tool.rowKind = 3;
+      tool.stage = "tool:seed1";
+      tool.title = "add_features";
+      tool.reason = "standoff";
+      tool.status = "done";
+      tool.durationMs = 1840;
+      tool.detail = std::string("{\"height\": 30, \"chamfer\": 1.0}") +
+                    "\n\x1e" "META\x1e\n" + std::to_string((long long)chatNowEpoch()) +
+                    "\t41300";
+      a.activity.push_back(tool);
+      // A failed call with the ERR trailer + ts/cache META.
+      ActivityItem toolFail;
+      toolFail.rowKind = 3;
+      toolFail.stage = "tool:seed2";
+      toolFail.title = "chamfer";
+      toolFail.reason = "top edges";
+      toolFail.status = "fail";
+      toolFail.durationMs = 220;
+      toolFail.detail = std::string("{\"radius\": 1.0}") +
+                        "\n\x1e" "ERR\x1e\nchamfer() got an unexpected keyword "
+                        "argument 'radius'" +
+                        "\n\x1e" "META\x1e\n" +
+                        std::to_string((long long)chatNowEpoch()) + "\t1200";
+      a.activity.push_back(toolFail);
+      // Ops-JSON output box with an over-long summary: must ellipsize to the row.
+      ActivityItem ops;
+      ops.rowKind = 2;
+      ops.stage = "stream:out";
+      ops.title = "Building ops\xe2\x80\xa6";
+      ops.status = "done";
+      ops.opsCount = 2;
+      ops.reason = "1747 bytes \xc2\xb7 mission_standoff_chamfer_top_edge_ring_extra_long";
+      ops.detail = "[{\"op\":\"extrude\"},{\"op\":\"chamfer\"}]";
+      a.activity.push_back(ops);
+    }
     st.chat.push_back(a);
   }
 

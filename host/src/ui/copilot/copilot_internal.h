@@ -165,18 +165,26 @@ void        chatArtifactOpenSmart(AppState& st, const std::string& path);
 void        chatArtifactActions(AppState& st, const std::string& path);
 void        drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts);
 void        drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
-                              bool showThinking);
+                              bool showThinking, bool isLastTurn = false);
 
 // Packed tool-row detail: feedTurnActivity writes args_preview, then the capped failure text
-// after "\n\x1eERR\x1e\n" and artifact paths after "\n\x1eART\x1e\n" (ActivityItem gains no
-// fields — app_state.h is integrator-owned). chatActivityCopyText (ui_common) splits the same
-// way so a clipboard copy never carries the raw \x1e marker bytes.
+// after "\n\x1eERR\x1e\n", artifact paths after "\n\x1eART\x1e\n", and a per-call META trailer
+// after "\n\x1eMETA\x1e\n" ("<epoch-ts>\t<cache-read-tokens>" — the timestamp + prompt-cache
+// read of the completion that produced the call). ActivityItem gains no fields — app_state.h
+// is integrator-owned. chatActivityCopyText (ui_common) splits the same way so a clipboard
+// copy never carries the raw \x1e marker bytes.
 struct ToolRowDetail {
     std::string args;
     std::string err;
     std::string arts;
+    double ts = 0.0;     // META trailer: when the call ran (epoch s); 0 = unknown
+    int cacheRead = 0;   // META trailer: tokens the producing completion read from cache
 };
 ToolRowDetail splitToolRowDetail(const std::string& detail);
+
+// "12.3k" / "482" token counts — shared by the tool-row cache chip and the
+// assistant bubble's meta row (both in k-token prompt-cache readouts).
+std::string chatTokCount(int n);
 
 // ---- run launch helpers (composer; shared with the clarify/plan-approve cards) ----
 nlohmann::json agentProviderOverride(const Settings& s);

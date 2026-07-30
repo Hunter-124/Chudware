@@ -1793,9 +1793,14 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             if used <= 0:
                 return
             from services.agent import agent_events as _ae  # noqa: PLC0415
+            _pt = int(last_u.get("prompt_tokens") or 0)
             _ae.emit_event("agent.context", {
                 "run_id": run_id or "",
                 "used": used,
+                # Prompt-cache read of THIS completion (context minus billed
+                # input; 0 for cache-blind providers) — the GUI accumulates it
+                # per turn to show cache hits on the assistant bubble.
+                "cache_read": max(0, used - _pt),
                 "window": int(getattr(provider, "context_window", 0) or 0),
                 "model": str(last_u.get("model")
                              or getattr(provider, "model", "") or ""),

@@ -71,13 +71,38 @@ static std::string chatTimeTooltip(double ts) {
     return buf;
 }
 
+// Age label with the turn's prompt-cache total appended ("3m ago · 41.2k cached").
+// Shared by the in-card meta row and the above-card model label so a mutating
+// turn's cache reads are visible in the same form as a prose turn's.
+static std::string chatAgeCacheLabel(double ts, int cacheTok) {
+    std::string age = chatAgeLabel(ts);
+    if (cacheTok > 0 && !age.empty()) {
+        age += " \xc2\xb7 ";
+        age += chatTokCount(cacheTok);
+        age += " cached";
+    }
+    return age;
+}
+
+// Tooltip twin of chatAgeCacheLabel: absolute time + cache sentence.
+static std::string chatAgeCacheTip(double ts, int cacheTok) {
+    std::string tip = chatTimeTooltip(ts);
+    if (cacheTok > 0) {
+        tip += " \xc2\xb7 ";
+        tip += chatTokCount(cacheTok);
+        tip += " tokens read from the prompt cache this turn";
+    }
+    return tip;
+}
+
 // In-bubble meta row: author name (left) + relative age (right; hover = absolute
 // time). Renders as a bubble's first (assistant) or last (user) row so the author
-// lives INSIDE the message box. Name may be null (age-only row).
+// lives INSIDE the message box. Name may be null (age-only row). cacheTok > 0 appends
+// the turn's prompt-cache read total to the age ("3m ago · 41.2k cached").
 static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec4& nameCol,
-                           double ts) {
+                           double ts, int cacheTok = 0) {
     const ui::AdaptiveSurface& surf = chatSurf();
-    const std::string age = chatAgeLabel(ts);
+    const std::string age = chatAgeCacheLabel(ts, cacheTok);
     if ((!name || !name[0]) && age.empty()) return;   // legacy turn, no model — no blank row
     if (name && name[0]) {
         ImGui::PushFont(fonts.medium);
@@ -98,7 +123,7 @@ static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec
         ImGui::TextUnformatted(age.c_str());
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) {
-            const std::string tip = chatTimeTooltip(ts);
+            const std::string tip = chatAgeCacheTip(ts, cacheTok);
             if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
         }
     }
@@ -578,15 +603,16 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             ImGui::PushFont(fonts.medium);
             ImGui::TextColored(turnSurf.textSecondary, "%s", modelLabel.c_str());
             ImGui::PopFont();
-            // Inline age next to the above-card label (in-card rows right-align it).
-            const std::string age = chatAgeLabel(m.ts);
+            // Inline age (+ prompt-cache total) next to the above-card label
+            // (in-card rows right-align it via drawMsgMetaRow).
+            const std::string age = chatAgeCacheLabel(m.ts, m.cacheReadTok);
             if (!age.empty()) {
                 ImGui::SameLine(0, 6 * sc);
                 ImGui::PushStyleColor(ImGuiCol_Text, turnSurf.textTertiary);
                 ImGui::TextUnformatted(age.c_str());
                 ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered()) {
-                    const std::string tip = chatTimeTooltip(m.ts);
+                    const std::string tip = chatAgeCacheTip(m.ts, m.cacheReadTok);
                     if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
                 }
             }
@@ -629,7 +655,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     }
 
     // (2) Agent timeline — typed blocks: collapsible thinking + glass action cards.
-    drawAgentTimeline(st, m, fonts, logW, gShowThinking);
+    drawAgentTimeline(st, m, fonts, logW, gShowThinking, isLastTurn);
 
     // (3) Streaming assistant text — a Thin glass "prose" card (Liquid Glass v2 §6, host
     // contract H5) keeps body copy legible over the live viewport blur. Selectable for
@@ -646,7 +672,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         // wasn't drawn above the turn (VC-restore turns keep the top row).
         if (metaInCard && !metaDrawn) {
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
-                           turnSurf.textSecondary, m.ts);
+                           turnSurf.textSecondary, m.ts, m.cacheReadTok);
             metaDrawn = true;
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }
@@ -747,7 +773,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         const ImVec4 warnCol = semanticOnGlass(pal.statusWarn, chatSurf());
         if (metaInCard && !metaDrawn) {
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
-                           turnSurf.textSecondary, m.ts);
+                           turnSurf.textSecondary, m.ts, m.cacheReadTok);
             metaDrawn = true;
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }

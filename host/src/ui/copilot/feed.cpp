@@ -585,8 +585,10 @@ static std::string lastOpLabelInJsonPrefix(const std::string& s) {
 }
 
 // Finalize a thought/output box: stop streaming. Ops JSON stays collapsed unless
-// the user pinned it. Thinking stays OPEN by default so the user can audit plan/
-// intake reasoning live (only collapses if the user explicitly hid it).
+// the user pinned it. A finished Thinking block AUTO-COLLAPSES to its one-line
+// preview: while autoscrolling, a block that stays open after its stream ended
+// floods the tail of the transcript — the user re-opens it with one click when
+// they want the audit (userToggled always wins, both directions).
 // Prose Output keeps the user's last expanded state.
 void finalizeThoughtBox(ActivityItem& a) {
     a.streaming = false;
@@ -599,8 +601,9 @@ void finalizeThoughtBox(ActivityItem& a) {
         if (!a.userToggled) a.expanded = false;
         return;
     }
-    // Thinking / plan reasoning — stay open for audit unless user hid it.
-    if (!a.userToggled) a.expanded = true;
+    // Thinking / plan reasoning — done filling out, so close it unless the user
+    // explicitly pinned it open.
+    if (!a.userToggled) a.expanded = false;
 }
 
 // Find or create the single rowKind-10 routing card (pinned to front once revealed).
@@ -1815,6 +1818,19 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 ni.detail += arts;
             }
         }
+        // Optional per-call META trailer: wall-clock stamp (ingest time — the
+        // backend ships no clock) + the prompt-cache read of the completion that
+        // produced this call (usage.cache_read, when the provider reports cache
+        // counts). Appended LAST so splitToolRowDetail can lift it off the tail.
+        {
+            int cacheRead = 0;
+            if (data.contains("usage") && data["usage"].is_object())
+                cacheRead = jint(data["usage"], "cache_read");
+            char meta[64];
+            std::snprintf(meta, sizeof(meta), "\n\x1e" "META\x1e\n%lld\t%d",
+                          (long long)chatNowEpoch(), cacheRead);
+            ni.detail += meta;
+        }
         // Pretty Doing card lands — close any live "Building ops…" stream:out so the
         // transcript shows the card, not both actively (F1 companion).
         for (auto& existing : m.activity) {
@@ -2364,6 +2380,11 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         if (m.running && !purpose.empty()) {
             m.liveStatus = purpose + (stt.empty() ? std::string() : (" (" + stt + ")"));
         }
+    } else if (kind == "agent.context") {
+        // Per-completion usage telemetry (Python general lane). app.cpp feeds the
+        // composer meter from the same event; HERE we only accumulate the turn's
+        // prompt-cache reads so the assistant bubble's meta row can show them.
+        m.cacheReadTok += jint(data, "cache_read");
     }
     // Resume-safe: mark history dirty on activity/text/plan changes; force on terminal events.
     if (m.running || kind == "run_finished" || kind == "mission_finished" ||

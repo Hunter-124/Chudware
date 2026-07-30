@@ -507,6 +507,7 @@ void persistChatHistory(AppState& st) {
             // reload it means the app died (or was killed) mid-run — see parseChatSessionJson.
             if (!m.fromUser && m.running) entry["run"] = true;
             if (m.ts > 0.0) entry["ts"] = m.ts;   // send/receive time for the in-bubble age label
+            if (!m.fromUser && m.cacheReadTok > 0) entry["cache_tok"] = m.cacheReadTok;
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
             if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
             // Error card fields — the humanized headline and the raw failure text (capped like
@@ -798,6 +799,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             cm.errorHuman = m.value("eh", std::string());
             cm.errorFull = m.value("ef", std::string());
             cm.ts = m.value("ts", 0.0);          // 0 = legacy (constructed with now) — no age label
+            cm.cacheReadTok = m.value("cache_tok", 0);
             // Restore plan/task-list state when present (legacy sessions omit the key).
             if (m.contains("plan_state") && m["plan_state"].is_object()) {
                 cm.planState = parsePlanState(m["plan_state"]);

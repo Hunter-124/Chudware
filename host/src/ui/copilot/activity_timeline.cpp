@@ -709,7 +709,12 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     if (a.ctxTokens > 0) line += "  (~" + std::to_string(a.ctxTokens) + " tok)";
     ImGui::PushFont(fonts.body);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    ImGui::TextWrapped("%s", line.c_str());
+    // ONE line, ellipsized: these chips are inline transparency notes, and a
+    // wrapped second line ran ragged past the icon gutter (and could spill past
+    // the timeline's right edge). The full text stays on the hover tooltip.
+    const std::string clipped = chatEllipsize(line, ImGui::GetContentRegionAvail().x);
+    ImGui::TextUnformatted(clipped.c_str());
+    if (clipped != line && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", line.c_str());
     ImGui::PopStyleColor();
     ImGui::PopFont();
     {
@@ -786,7 +791,10 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         }
         ImGui::SameLine(0, 8 * sc);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::TextUnformatted(sum.c_str());
+        // Ellipsize to what the row ACTUALLY has left — an unbounded summary
+        // ("1747 bytes · mission_st…") ran straight off the card's right edge.
+        const std::string sumFit = chatEllipsize(sum, ImGui::GetContentRegionAvail().x);
+        ImGui::TextUnformatted(sumFit.c_str());
         ImGui::PopStyleColor();
     }
 
@@ -945,16 +953,39 @@ void chatArtifactActions(AppState& st, const std::string& path) {
 }
 
 // The packed tool-row detail: feedTurnActivity writes args_preview, then the capped failure
-// text after "\n\x1eERR\x1e\n" and artifact paths after "\n\x1eART\x1e\n" (ActivityItem gains
-// no fields — app_state.h is integrator-owned). Split back into its three parts.
-// ToolRowDetail / declaration shared via copilot_internal.h — chatActivityCopyText (ui_common)
-// uses the same split so a clipboard copy never carries the raw markers.
+// text after "\n\x1eERR\x1e\n", artifact paths after "\n\x1eART\x1e\n" and the ts/cache-read
+// META trailer last (ActivityItem gains no fields — app_state.h is integrator-owned). Split
+// back into its parts. ToolRowDetail / declaration shared via copilot_internal.h —
+// chatActivityCopyText (ui_common) uses the same split so a clipboard copy never carries the
+// raw markers.
 ToolRowDetail splitToolRowDetail(const std::string& detail) {
     ToolRowDetail d;
     d.args = detail;
+    // META is the LAST trailer ("<epoch-ts>\t<cache-read-tokens>") — lift it off
+    // the tail first so the ART/ERR splits below never see it. A persisted row
+    // whose detail was tail-capped can carry a truncated META; parse defensively.
+    const char* kMetaMark = "\n\x1e" "META\x1e\n";
+    const char* kMetaMarkBare = "\x1e" "META\x1e\n";
+    size_t mark = d.args.find(kMetaMark);
+    std::string meta;
+    if (mark != std::string::npos) {
+        meta = d.args.substr(mark + std::strlen(kMetaMark));
+        d.args = d.args.substr(0, mark);
+    } else if (d.args.rfind(kMetaMarkBare, 0) == 0) {
+        meta = d.args.substr(std::strlen(kMetaMarkBare));
+        d.args.clear();
+    }
+    if (!meta.empty()) {
+        const size_t tab = meta.find('\t');
+        try {
+            d.ts = std::stod(tab == std::string::npos ? meta : meta.substr(0, tab));
+            if (tab != std::string::npos) d.cacheRead = std::stoi(meta.substr(tab + 1));
+        } catch (...) { d.ts = 0.0; d.cacheRead = 0; }
+        if (d.cacheRead < 0) d.cacheRead = 0;
+    }
     const char* kArtMark = "\n\x1e" "ART\x1e\n";
     const char* kArtMarkBare = "\x1e" "ART\x1e\n";
-    size_t mark = d.args.find(kArtMark);
+    mark = d.args.find(kArtMark);
     if (mark != std::string::npos) {
         d.arts = d.args.substr(mark + std::strlen(kArtMark));
         d.args = d.args.substr(0, mark);
@@ -1000,6 +1031,34 @@ static bool isLoopGuardRefusal(const std::string& err) {
 
 static bool toolRowIsGuardRefusal(const ActivityItem& a) {
     return a.status == "fail" && isLoopGuardRefusal(splitToolRowDetail(a.detail).err);
+}
+
+// Compact wall-clock label for a tool row's META timestamp ("4:37 PM"), ""
+// when the stamp is missing/legacy. Date tooltip stays the hover's job (same
+// convention as the bubble meta rows in chat_log.cpp).
+static std::string chatRowClock(double ts) {
+    if (ts <= 0.0) return std::string();
+    const std::time_t t = (std::time_t)ts;
+    std::tm tmv;
+#ifdef _WIN32
+    if (localtime_s(&tmv, &t) != 0) return std::string();
+#else
+    if (localtime_r(&t, &tmv) == nullptr) return std::string();
+#endif
+    int h = tmv.tm_hour % 12; if (h == 0) h = 12;
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%d:%02d %s", h, tmv.tm_min,
+                  tmv.tm_hour < 12 ? "AM" : "PM");
+    return buf;
+}
+
+// "12.3k" / "482" token counts for the cache-read chip.
+std::string chatTokCount(int n) {
+    char buf[32];
+    if (n >= 10000) std::snprintf(buf, sizeof(buf), "%.1fk", n / 1000.0);
+    else if (n >= 1000) std::snprintf(buf, sizeof(buf), "%.1fk", n / 1000.0);
+    else std::snprintf(buf, sizeof(buf), "%d", n);
+    return buf;
 }
 
 // M14 — one inline row per tool call: ok/fail glyph + tool icon + a HUMAN title (tool_phrase.h
@@ -1219,6 +1278,39 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         if (!tgt.empty()) dimText(tgt.c_str());
     }
 
+    // ---- bottom meta line: call timestamp + prompt-cache read (META trailer),
+    // right-aligned like the user bubble's own meta bar. Kept OFF the header row:
+    // the title/(details)/meta/rewind chain already fills it, and a right-aligned
+    // jump there either collided or clipped under the log's scrollbar. A grouped
+    // row shows its LAST member's stamp (the most recent call in the fold).
+    double metaTs = parts.ts;
+    int metaCache = parts.cacheRead;
+    if (groupN > 1) {
+        const ToolRowDetail tailParts = splitToolRowDetail(group->back()->detail);
+        metaTs = tailParts.ts;
+        metaCache = tailParts.cacheRead;
+    }
+    if (!simple && (metaTs > 0.0 || metaCache > 0)) {
+        std::string tail;
+        if (metaTs > 0.0) tail = chatRowClock(metaTs);
+        if (metaCache > 0) {
+            if (!tail.empty()) tail += " \xc2\xb7 ";
+            tail += "cache " + chatTokCount(metaCache);
+        }
+        if (!tail.empty()) {
+            const float tailW = ImGui::CalcTextSize(tail.c_str()).x;
+            const float rx = ImGui::GetWindowContentRegionMax().x - tailW;
+            if (rx > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx);
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextUnformatted(tail.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered() && metaCache > 0)
+                ImGui::SetTooltip("%d tokens read from the prompt cache by the completion\n"
+                                  "that made this call (billed at the cached-input rate).",
+                                  metaCache);
+        }
+    }
+
     if (guard) {
         // What happened, in the user's terms — collapsed AND expanded, because it is the row's
         // label, not its payload. The model-facing guidance text appears only in the drawer, so
@@ -1321,15 +1413,18 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
 
 
 void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
-                              bool showThinking) {
+                              bool showThinking, bool isLastTurn) {
     if (m.activity.empty()) return;
     const bool turnRunning = m.running;
     if (!turnRunning) {
         // Stale live rows on a finished turn (restored history, terminal events dropped after
-        // a stop) would animate forever — clamp them once here, idempotently.
+        // a stop) would animate forever — clamp them once here, idempotently. Thinking/thought
+        // rows also collapse once the turn is done: nothing is still "filling out", and an
+        // open reasoning box per turn floods scrollback (the user re-opens with one click).
         for (auto& a : m.activity) {
             if (a.streaming) a.streaming = false;
             if (a.status == "running") a.status = "done";
+            if (!a.userToggled && (a.rowKind == 2 || isThinkingItem(a))) a.expanded = false;
         }
     }
     // Resolve opaque doc ids to part names and fold uncovered glyphs before ANY row is measured
@@ -1427,8 +1522,11 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
                 if (group.size() > 1) toolOrdinal += (int)group.size() - 1;
             }
             // A grouped card must never offer a rewind glyph pointing at an arbitrary member;
-            // the identical-failure fold still rewinds to before the FIRST attempt.
-            const int rewindIdx = group.size() > 1 ? -1 : callIdx;
+            // the identical-failure fold still rewinds to before the FIRST attempt. The most
+            // recent row of the whole chat (the live frontier of the LAST turn) offers none
+            // either: it IS the current state — there is nothing to rewind to.
+            const bool chatFrontier = isLastTurn && (frontIdx == lastVisible);
+            const int rewindIdx = (group.size() > 1 || chatFrontier) ? -1 : callIdx;
             drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount,
                                 turnRunning && (frontIdx == lastVisible), rewindIdx,
                                 group.size() > 1 ? &group : nullptr);

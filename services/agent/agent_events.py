@@ -418,6 +418,25 @@ def tool_call_event(
             arts = None
     if arts:
         payload["artifacts"] = arts[:8]
+    # Additive (2026-07-30): the token usage of the completion that PRODUCED this
+    # call, so the GUI tool row can show the prompt-cache read next to its
+    # timestamp. get_last_usage still holds that completion's record here — the
+    # next complete() only runs after the tool batch dispatches. cache_read is
+    # context_tokens minus billed prompt_tokens (0 for cache-blind providers).
+    # Best-effort: a call with no recorded usage simply omits the key.
+    try:
+        from services.agent.providers import token_usage as _tu  # noqa: PLC0415
+        _u = _tu.get_last_usage()
+        if _u:
+            _cx = int(_u.get("context_tokens") or 0)
+            _pt = int(_u.get("prompt_tokens") or 0)
+            payload["usage"] = {
+                "prompt_tokens": _pt,
+                "context_tokens": _cx,
+                "cache_read": max(0, _cx - _pt),
+            }
+    except Exception:  # noqa: BLE001 — telemetry never blocks the event
+        pass
     return "agent.tool_call", payload
 
 

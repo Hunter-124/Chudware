@@ -781,6 +781,25 @@ _PUB: dict = {"rev": None, "docs": {}, "active": None}
 
 
 def _handoff_dir() -> Path:
+    """Where the live viewport handoff is published.
+
+    ``CHUDWARE_HANDOFF_DIR`` overrides (the test suite points it at a tmpdir), matching
+    the override tier every other user-data location already offers
+    (CHUDWARE_ECAD_LIB_DIR, CHUDWARE_SUBAGENTS_DIR). Without it a test run publishes
+    `live-<session>-<doc>.step+` into the REAL user handoff dir — which the desktop GUI
+    POLLS and turns into mirror tabs, so running the suite littered a developer's app
+    with parts they never made. It also made
+    test_live_preview_events_no_handoff_files order-dependent: publishes are deferrable
+    onto a worker thread (`_publish_current(_deferred=True)` / `_start_job`), so one
+    scheduled by an earlier test lands inside that test's before/after snapshot and
+    fails it with "daemon mode must not touch the handoff dir". Observed 2026-07-30 once
+    the suite grew enough documents to make the race reliable.
+    """
+    override = os.environ.get("CHUDWARE_HANDOFF_DIR")
+    if override:
+        d = Path(override)
+        d.mkdir(parents=True, exist_ok=True)
+        return d
     base = os.environ.get("APPDATA")
     if not base:
         if os.name == "nt":

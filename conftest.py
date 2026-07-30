@@ -179,6 +179,31 @@ def _isolated_ecad_generated_library(tmp_path_factory):
     finally:
         os.environ.pop("CHUDWARE_ECAD_LIB_DIR", None)
 
+# ---------------------------------------------------------------------------
+# Live-viewport handoff isolation. cad_common._publish_current writes
+# `live-<session>-<doc>.step+` (+ docs.json) into the handoff dir on every doc mutation,
+# and the desktop GUI POLLS that dir and opens a mirror tab per entry — so an unisolated
+# suite run littered the developer's running app with parts nobody made.
+#
+# It also made test_live_preview_events_no_handoff_files order-dependent: that test
+# snapshots the dir around its own body, but publishes can be DEFERRED onto a worker
+# thread, so one scheduled by an earlier test lands inside the snapshot and trips
+# "daemon mode must not touch the handoff dir". Observed 2026-07-30 once the suite grew
+# enough documents to make the race reliable — services/mcp passed at 2399 tests and
+# failed at 2492 with no change to the publishing code.
+@_pytest.fixture(autouse=True, scope="session")
+def _isolated_handoff_dir(tmp_path_factory):
+    if os.environ.get("CHUDWARE_HANDOFF_DIR"):
+        yield
+        return
+    d = tmp_path_factory.mktemp("handoff")
+    os.environ["CHUDWARE_HANDOFF_DIR"] = str(d)
+    try:
+        yield
+    finally:
+        os.environ.pop("CHUDWARE_HANDOFF_DIR", None)
+
+
 
 # ---------------------------------------------------------------------------
 # Engine isolation for test sessions. `services/mcp/core_bridge` defaults to daemon mode

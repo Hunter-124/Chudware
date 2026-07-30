@@ -14,7 +14,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 
 from mcp.server.fastmcp import FastMCP, Image
 
@@ -197,12 +197,36 @@ def _face_hist(doc_id: str) -> dict:
     return hist
 
 
-def _write_diff(before: dict, after: dict, vol_before, vol_after) -> dict:
+# A volume change this small RELATIVE to the body is not real material: OCCT blend/boolean
+# round-off lands here, and so does a feature authored microscopically small. Measured live
+# 2026-07-30: a fillet of radius 1e-5 mm on a 60x40x20 box moved the volume by 0.0005 mm^3
+# (1.0e-8 of the body) and the write-diff printed "volume 48000.0->48000.0 mm^3 (-0.0)" — a
+# self-contradicting line the model read as a successful fillet. A real 0.5 mm fillet on the
+# same box removes ~4 mm^3 (8e-5 of the body), four orders of magnitude clear of this floor.
+_NEGLIGIBLE_VOLUME_FRACTION = 1e-7
+
+
+def _write_diff(before: dict, after: dict, vol_before, vol_after, *,
+                warnings: Sequence = (), bbox: Optional[dict] = None) -> dict:
     """GSL Stage 1a (W2) — compose a SEMANTIC confirmation of what an op actually did, so the
     return is no longer a bare ok:true + a volume number the model must diff itself. Reports the
-    net face change (by shape, and how many are bores/holes) and the volume delta with its sign;
-    a no-op (a cut/boolean that missed the body, a feature that altered nothing) reads as an
-    explicit 'no geometry change' warning instead of looking successful."""
+    net face change (by shape, and how many are bores/holes), the volume delta with its sign,
+    the part's overall size, and any per-feature warning the ENGINE raised; a no-op (a
+    cut/boolean that missed the body, a feature that altered nothing) reads as an explicit
+    'no geometry change' warning instead of looking successful.
+
+    `warnings` are the engine's own `feature_status[].warning` strings for the batch. They used
+    to travel ONLY in the `features[]` rows, one entry among a column of nulls, while this
+    summary — the line the ops cheatsheet tells the model to read — printed a generic guess
+    ("a cut/boolean may have missed") even when the engine had already named the exact cause
+    (measured live 2026-07-30: "fillet 1e-08 below tolerance; no material removed"). The
+    engine's reason always beats our guess, so it travels in the summary too.
+
+    `bbox` is a doc_bbox reply. Its `size` answers "is my part the right size" — the question
+    that otherwise costs a separate measure_part round trip (1060 chars measured) — for ~32
+    chars. It catches the class where every delta looks healthy but the part is not: a boss
+    sketched at [200,200] fuses fine ("added 6 face(s); volume 48000->49000 (+1000)") and
+    silently makes a 60 mm part 240 mm wide."""
     before = before or {}
     after = after or {}
     dface = after.get("total", 0) - before.get("total", 0)
@@ -225,21 +249,42 @@ def _write_diff(before: dict, after: dict, vol_before, vol_after) -> dict:
     if isinstance(vol_after, (int, float)):
         if isinstance(vol_before, (int, float)):
             dv = vol_after - vol_before
-            if abs(dv) >= 1e-6:
+            floor = max(1e-6, _NEGLIGIBLE_VOLUME_FRACTION * abs(vol_after))
+            if abs(dv) >= floor:
                 parts.append(f"volume {vol_before:.1f}->{vol_after:.1f} mm^3 "
                              f"({'+' if dv >= 0 else ''}{dv:.1f})")
+            elif dv:
+                # Real but negligible: never print "48000.0->48000.0 (-0.0)" and call it a change.
+                parts.append(
+                    f"volume effectively UNCHANGED ({vol_after:.1f} mm^3, delta {dv:+.3g} mm^3 "
+                    f"= {abs(dv) / max(abs(vol_after), 1e-9):.1g} of the body) - too small to be "
+                    f"real material; re-check the size you asked for")
         elif vol_before is None and abs(vol_after) >= 1e-6:
             dv = float(vol_after)
             parts.append(f"volume now {vol_after:.1f} mm^3")
+    wtexts = [t for t in (str(w).strip() for w in (warnings or ())) if t]
     if parts:
         summary = "; ".join(parts)
+    elif wtexts:
+        summary = ("no geometry change - " + "; ".join(wtexts) +
+                   ". Re-check the placement/size against the request.")
+        wtexts = []  # the engine's reason IS the summary here; don't say it twice
     else:
         summary = ("no geometry change - no faces added/removed and volume unchanged; the op "
                    "did not alter the body (a cut/boolean may have missed, or a boss/edit was a "
                    "no-op). Re-check the placement/size against the request.")
+    if wtexts:
+        summary = "ENGINE WARNING: " + "; ".join(wtexts) + " -- " + summary
     out = {"summary": summary, "faces_delta": dface, "bores_delta": dbore}
     if dv is not None:
         out["volume_delta_mm3"] = round(dv, 4)
+    size = (bbox or {}).get("size")
+    if (isinstance(size, (list, tuple)) and len(size) == 3
+            and all(isinstance(v, (int, float)) for v in size)):
+        # doc_bbox is inflated by ~1e-7 mm; 3dp rounding lands it back on the authored number.
+        out["bbox_mm"] = [round(float(v), 3) for v in size]
+        out["summary"] = (out["summary"].rstrip(". ") + "; part bbox "
+                          + "x".join(f"{v:g}" for v in out["bbox_mm"]) + " mm")
     return out
 
 def _resolve_alias(doc_id: str) -> str:

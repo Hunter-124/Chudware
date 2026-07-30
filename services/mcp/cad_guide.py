@@ -528,9 +528,12 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
 Every query_geometry/describe_part match now also carries: `side` (top/bottom/left/right/front/
 back), `normal` (SIGNED outward dir — unlike the unsigned `axis`), `concavity` (bore vs boss),
 `radius`, and a stable `sid`. add_features returns a `changes` write-diff ("added 1 cylinder; 1
-new bore; volume -3927") so you can confirm an op did what you meant instead of guessing — and,
-best-effort, `overlap_warnings` when the batch introduced a boss/cut overlap (see
-check_feature_overlap for the dedicated tool).
+new bore; volume -3927; part bbox 60x40x20 mm") so you can confirm an op did what you meant
+instead of guessing: `changes.bbox_mm` is the whole part's size (check it against what you were
+asked for rather than spending a measure_part call), a volume move too small to be real material
+says so instead of printing a delta, and anything the kernel objected to arrives as an
+"ENGINE WARNING:" prefix on the summary. Best-effort `overlap_warnings` also travels when the
+batch introduced a boss/cut overlap (see check_feature_overlap for the dedicated tool).
 """
 
 _INTAKE_GUIDE = """\

@@ -557,6 +557,55 @@ class TestSketchHealthText(unittest.TestCase):
         self.assertIn("REDUNDANT c9", t)
         self.assertIn("horizontal", t)
 
+    # ── Redundancy economy (live 2026-07-30) ─────────────────────────────────────
+
+    def test_all_identical_schedule_rows_collapse_to_one(self):
+        """Live 2026-07-30, 3-rectangle F profile (12 lines, dof 40): the schedule printed
+        12 rows whose kind, action and why were identical apart from the entity id —
+        ~1150 chars carrying one instruction and a list of 12 entities. It must collapse
+        into ONE row that names the count, the order SPAN and the entities, so a model
+        applying the schedule still knows it stands for steps 2..13."""
+        sched = [{"order": i + 2, "kind": "dimension",
+                  "action": "add driving dimension / geometric relation for e%d" % (i + 1),
+                  "why": "e%d is under-constrained in p1 x, p1 y, p2 x, p2 y" % (i + 1),
+                  "entity": "e%d" % (i + 1)}
+                 for i in range(12)]
+        t = self._text(dof=40, status="under", mat_regions=1, schedule=sched)
+        rows = [ln for ln in t.split("\n") if ln.startswith("  ") and "[dimension]" in ln]
+        self.assertEqual(len(rows), 1, t)
+        row = rows[0]
+        self.assertIn("x12", row)          # the count survives
+        self.assertIn("2-13.", row)        # the order span survives
+        self.assertIn("e1", row)
+        self.assertIn("+4", row)           # 8 named + "… +4"
+        self.assertIn("under-constrained in p1 x", row)  # the remedy survives, once
+
+    def test_distinct_schedule_remedies_are_never_merged(self):
+        """Collapsing is keyed on the remedy with the entity id factored out — two rows
+        that ask for DIFFERENT things must both survive, in order."""
+        sched = [
+            {"order": 1, "kind": "geometric", "action": "coincident",
+             "why": "close the open chain", "handles": ["e1.p2", "e2.p1"]},
+            {"order": 2, "kind": "dimension", "action": "add driving dimension for e1",
+             "why": "e1 is under-constrained in x", "entity": "e1"},
+            {"order": 3, "kind": "dimension", "action": "add radius dimension for e2",
+             "why": "e2 has a free radius", "entity": "e2"},
+        ]
+        t = self._text(dof=4, status="under", schedule=sched)
+        self.assertIn("1. [geometric] coincident", t)
+        self.assertIn("2. [dimension] add driving dimension for e1", t)
+        self.assertIn("3. [dimension] add radius dimension for e2", t)
+
+    def test_dof_narration_is_bounded_but_still_names_the_count(self):
+        """The under-constrained signal is real and must survive — the 40-slot ENUMERATION
+        is what does not. Keep dof, status and a bounded sample; say how many were elided."""
+        narration = "; ".join("line e%d p1 x, p1 y, p2 x, p2 y" % (i + 1) for i in range(12))
+        t = self._text(dof=40, status="under", mat_regions=1, dof_narration=narration)
+        self.assertIn("DOF: 40 free", t)
+        self.assertIn("line e1 p1 x", t)      # sample survives
+        self.assertIn("+8 more", t)           # elision is counted, not silent
+        self.assertNotIn("line e12", t)       # the tail is not enumerated
+
 
 if __name__ == "__main__":
     unittest.main()

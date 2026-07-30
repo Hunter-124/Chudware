@@ -3,7 +3,7 @@ name: plm-workflow
 description: PLM vault discipline — checkpoint before risk, release with where_used, restore/rollback with history.
 inject: auto
 triggers:
-  keywords: [checkpoint, release, revision, where used, where-used, rollback, change order, vault]
+  keywords: [checkpoint, release, revision, where used, where-used, rollback, change order, vault, check in, check-in]
   tools: [plm_checkpoint, plm_release, plm_where_used, plm_status, plm_history, plm_restore]
   phases: [deliver]
 ---

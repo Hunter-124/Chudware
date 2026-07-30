@@ -140,3 +140,75 @@ class TestCoordinationSurfaceIsNotMcpVisible:
                 f"{name} is now MCP-visible; this test's premise changed. "
                 "Update the docstring in tool_categories.py's delegate pack too."
             )
+
+
+class TestPreviouslyUnreachableAdvertisedTools:
+    """The forward direction: a tool the harness NAMES must be in some pack.
+
+    ``scripts/advertised_tool_audit.py`` sweeps that whole class (and is wired into
+    ``scripts/check.py``). This test pins the individual holes the 2026-07-30 sweep
+    closed, because each one had a specific instruction the model could not carry out
+    and a silent pack edit would put it straight back:
+
+      * ``submit_part_photos`` is step 1 of the numbered procedure ``intake_status``
+        returns, and the whole ``intake`` family had no pack;
+      * ``plm_timeline`` is named by the ``undo_denied`` refusal — the one place an
+        agent is told how to roll a document back — and only ``plm_rollback`` was
+        reachable;
+      * ``get_part`` is named by every ``_CONCEPT_REDIRECTS`` teaching reply, and
+        survived only as an alphabetical accident of ``family:cad`` expansion;
+      * ``hydraulic_new`` / ``sketch3d_new`` / ``layout_plan`` / ``office_edit_pdf`` /
+        ``req_verify_by_id`` each head a discipline cad_guide walks the model through
+        step by step while no pack carried any of it;
+      * ``vendor_status`` is what the parts guidance says to check before
+        ``scrape_enqueue``;
+      * ``request_raise`` is the worker half of a request protocol whose manager half
+        (``request_resolve``) was already reachable.
+    """
+
+    @pytest.mark.parametrize("tool", [
+        "submit_part_photos",
+        "request_part_photos",
+        "intake_status",
+        "make_fit_coupon",
+        "plm_timeline",
+        "get_part",
+        "recover_parts",
+        "hydraulic_new",
+        "piping_solve",
+        "sketch3d_new",
+        "sketch3d_pipe",
+        "layout_plan",
+        "req_verify_by_id",
+        "office_edit_pdf",
+        "vendor_status",
+        "request_raise",
+        "fw_debug_halt",
+        "struct_estimate",
+        "ecad_thermal_handoff",
+        "mission_status",
+    ])
+    def test_named_tool_is_advertised_by_a_pack(self, tool):
+        assert tool in _all_pack_names(), (
+            f"{tool!r} is named in a prompt_note/hint the model reads but no "
+            f"CATEGORY_PACKS pack advertises it — enable_tools cannot reach it. "
+            f"See scripts/advertised_tool_audit.py."
+        )
+
+    def test_curated_ecad_pack_survives_the_expand_cap(self):
+        """No ``family:ecad`` token, and every entry survives resolve_categories.
+
+        The ecad family is 67 tools against ``CATEGORY_EXPAND_CAP`` (40) and the trim is
+        alphabetical, so a family token made reachability depend on where the cut landed:
+        adding the thermal trio evicted ``ecad_to_3d``/``ecad_update_from_sch``, then
+        ``ecad_sweep``/``ecad_thermal_handoff``, then ``ecad_set_net_class``/
+        ``ecad_stackup_solve``. Re-introducing the token restarts that cascade.
+        """
+        pack = tcat.CATEGORY_PACKS["ecad"]
+        assert not [e for e in pack if e.startswith("family:")], (
+            "the ecad pack must stay fully curated — a family: token reintroduces the "
+            "alphabetical eviction cascade"
+        )
+        resolved = tcat.resolve_categories(["ecad"])
+        missing = [e for e in pack if e not in resolved]
+        assert missing == [], f"ecad entries trimmed by CATEGORY_EXPAND_CAP: {missing}"

@@ -3,7 +3,7 @@ name: source-parts
 description: Find and place standard parts from the library — correct search phrasing, taxonomy facets, part_source for plain-language needs, never hand-model catalog hardware.
 inject: auto
 triggers:
-  keywords: [fastener, screw, bolt, bearing, purchase, catalog, off the shelf, standard part, McMaster, MISUMI]
+  keywords: [fastener, screw, bolt, bearing, purchase, catalog, off the shelf, standard part, McMaster, MISUMI, source a, source an, source the, nema, stepper, nut, washer, standoff, dowel pin, o-ring]
   tools: [part_search, part_place, part_source, parts_taxonomy, bom_rollup]
   phases: [feature, assembly, layout]
 ---

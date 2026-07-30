@@ -3,7 +3,7 @@ name: ecad-board
 description: Schematic + PCB workflow — symbols from library first, net integrity, board outline from mechanical, ASCII place/route verify loop, then ECAD→3D and power/DFM checks before done.
 inject: auto
 triggers:
-  keywords: [schematic, pcb, ecad, board outline, footprint, netlist, kicad, ascii board]
+  keywords: [schematic, pcb, ecad, board outline, footprint, netlist, kicad, ascii board, route the board, autoroute, autoplace, ground plane, copper pour, silkscreen, solder mask]
   tools: [ecad_new_schematic, ecad_to_3d, render_board_ascii, render_schematic_ascii, render_sim_ascii, apply_ascii_edits, ecad_autoroute, ecad_autoplace]
   phases: [feature, deliver]
 ---

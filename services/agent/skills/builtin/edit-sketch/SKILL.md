@@ -14,11 +14,13 @@ triggers:
 
 1. Create/edit sketch geometry on the intended plane/face (via `add_features` sketch ops:
    `sketch_add_entity`, `sketch_add_constraint`, `sketch_set_dim`, fillet/chamfer/pattern/mirror…).
-2. **READ the auto-readback** on every mutation response — compact ASCII (`ascii` / `ascii_block`)
-   + NL summary (`sketch_summary`: entities with names/coords, dimensions with ids/values,
-   constraints, open/closed status, endpoint-coincidence notes, health flags). Do not guess the
-   next edit from memory; ground it on that block. Full render is still available via
-   `render_sketch_ascii(sketch)`.
+2. **READ the auto-readback** on every mutation response — `sketch_readbacks[i]` (or
+   `ascii_readback` on single-sketch tools) carries `ascii_ruled` (the ONE ruled ASCII
+   picture, col/row numbered so you can address cells), `summary` (entities with
+   names/coords, dimensions with ids/values, constraints, open/closed status,
+   endpoint-coincidence notes, closure + dof + ordered schedule), `grid` + `index` (the
+   cell<->world contract) and `findings`. Do not guess the next edit from memory; ground it
+   on that block. Full render is still available via `render_sketch_ascii(sketch)`.
 3. **Endpoints that touch are auto-coincident** when `sketch.auto_coincident` is on — profiles
    should close without a manual "not closed" fight. Near-coincident endpoints are called out
    in the readback findings.

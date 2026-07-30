@@ -379,3 +379,100 @@ def test_builtin_build_phrasing_injects_once_per_session(real_builtins):
     sk.reset_session("kwonce2")
     other = sk.activate_for_prompt("build me a bracket", session_id="kwonce2")
     assert any("# Edit Part" in b for b in other)
+
+
+# ------------------------------- measured coverage gaps (28-prompt matrix)
+#
+# A 28-prompt realistic-phrasing matrix scored 21/28 on the shipped keyword
+# lists. These 7 prompts fired NOTHING for the skill that owns the workflow
+# (except "check the part for problems", which reached edit-part only), so the
+# model went in without the checklist it needed. The keywords below were added
+# to close them; the overfire guard that follows is the other half of the
+# bargain — a keyword generic enough to fire on everything burns the
+# once-per-session budget on the wrong skill.
+
+
+@pytest.mark.parametrize("expected,text", [
+    # "model a" existed but English needs "an" before a vowel.
+    ("edit-part", "model an enclosure for a pi"),
+    # Plain-language strength question: no fea/stress/load-case token at all.
+    ("simulate", "will this hold 200N?"),
+    # PCB layout verbs, none of which are schematic/pcb/ecad.
+    ("ecad-board", "route the board and add a ground plane"),
+    # The verb the user actually types, plus the catalog-hardware designation.
+    ("source-parts", "source a NEMA 17 stepper"),
+    # Vault check-in phrased as English, not as "checkpoint".
+    ("plm-workflow", "check in the changes"),
+    # "model state" did not cover "state of this model".
+    ("assess-model-state", "what is the state of this model?"),
+    # Previously reached edit-part only — the health-check skill is the point.
+    ("assess-model-state", "check the part for problems"),
+])
+def test_builtin_previously_missed_phrasings_now_activate(real_builtins, expected, text):
+    assert expected in _fires(text, "kwgap")
+
+
+@pytest.mark.parametrize("text,expected_absent", [
+    # "create an"/"model an"/"design an" must not swallow the -an- prefix of a
+    # longer word; the trailing \b is what makes the widening safe.
+    ("create another revision note in the changelog", "edit-part"),
+    ("the model answers the load question", "edit-part"),
+    ("design analysis is queued", "edit-part"),
+    # Bare "hold" is not a keyword — only the strength-question phrases are.
+    ("hold the plate down with two screws", "simulate"),
+    ("the buckle strap mounts here", "simulate"),
+    # Mechanical planes and non-PCB routing stay out of ecad-board.
+    ("sketch on the front plane", "ecad-board"),
+    ("route the wire harness through the channel", "ecad-board"),
+    ("reroute the coolant tubing", "ecad-board"),
+    # "nut"/"nema"/"stepper"/"source a" inside longer tokens.
+    ("wait a minute before rebuilding", "source-parts"),
+    ("open the source assembly file", "source-parts"),
+    ("step through the feature tree", "source-parts"),
+    ("render the cinema-quality view", "source-parts"),
+    # The classic: "check in" must not fire on "check interference".
+    ("check interference between the parts", "plm-workflow"),
+    # "check the part" must not fire on the plural housekeeping phrasing.
+    ("check the parts list", "assess-model-state"),
+    ("many errors were fixed last week", "assess-model-state"),
+    ("extrude the profile 10mm", "assess-model-state"),
+])
+def test_builtin_widened_keywords_do_not_overfire(real_builtins, text, expected_absent):
+    assert expected_absent not in _fires(text, "kwgapguard")
+
+
+def test_phrase_keyword_matches_across_whitespace_runs(real_builtins):
+    """Multi-word triggers are now the bulk of the widening, so a wrapped or
+    double-spaced prompt must still match ("will this hold" over a newline)."""
+    assert "simulate" in _fires("will this\nhold 200N under that bracket?", "kwws")
+    assert "ecad-board" in _fires("please route  the  board next", "kwws2")
+
+
+def test_mid_session_turn_still_keyword_activates_while_catalog_is_suppressed(real_builtins):
+    """The static skills catalog is sent once per session (agent_turn
+    ~900-1000 tokens/turn saving), but keyword activation is a sibling branch,
+    not gated on it: a LATER user turn ("now make a drawing of it") must still
+    pull make-drawing in. Pins both halves so the saving cannot be widened to
+    swallow activation.
+    """
+    from services.agent import agent_turn as at
+
+    sid = "midsession-kw"
+    key = "midsession-catalog-key"
+    sk.reset_session(sid)
+    at._CATALOG_INJECTED_SESSIONS.discard(key)
+    try:
+        # Turn 1: catalog is due, and the build phrasing pulls edit-part.
+        assert at._catalog_due(key) is True
+        first = sk.activate_for_prompt("make me a bracket 50mm long", session_id=sid)
+        assert any("# Edit Part" in b for b in first)
+
+        # Turn 2, same session: catalog suppressed, keyword activation still live.
+        assert at._catalog_due(key) is False
+        second = sk.activate_for_prompt("now make a 2D drawing of it", session_id=sid)
+        assert any("# Make Drawing" in b for b in second)
+        # ...and the once-per-session guard keeps the earlier skill from resending.
+        assert not any("# Edit Part" in b for b in second)
+    finally:
+        at._CATALOG_INJECTED_SESSIONS.discard(key)
+        sk.reset_session(sid)

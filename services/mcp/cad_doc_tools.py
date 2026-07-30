@@ -290,6 +290,437 @@ def _entity_type_alias(e: dict) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# RELATION / DIMENSION dialect (model-robustness).
+#
+# validate.cpp::CONSTRAINT_SPECS is a CLOSED 20-word vocabulary and anything outside it
+# kills the WHOLE batch («"perp" is not a constraint type»), taking the sketch and every
+# feature that referenced it with it. Measured against the live engine 2026-07-30 over 40
+# realistic relation payloads and 29 dimension payloads: 22 relations and 17 dimensions
+# were rejected, and every single one was a pure SPELLING miss on a relation the solver
+# already implements. Map the spellings a modeler actually writes onto the engine's.
+#
+# A value is either the canonical token, or (token, extra-fields) when the dialect word
+# carries MEANING the canonical token needs a field to express — "horizontal_distance" is
+# the engine's `distance` with axis:"h" (validate.cpp:1155), not a distinct relation.
+_CONSTRAINT_TYPE_ALIASES: dict[str, Any] = {
+    "coincidence": "coincident", "coinc": "coincident", "coincide": "coincident",
+    "point_coincident": "coincident", "merge_points": "coincident", "connect": "coincident",
+    "horiz": "horizontal", "hor": "horizontal", "horizontal_relation": "horizontal",
+    "vert": "vertical", "vertical_relation": "vertical",
+    "par": "parallel", "parallel_to": "parallel", "parallelism": "parallel",
+    "perp": "perpendicular", "perpendicular_to": "perpendicular", "normal": "perpendicular",
+    "orthogonal": "perpendicular", "perpendicularity": "perpendicular",
+    "tangent_to": "tangent", "tangency": "tangent",
+    "equal_length": "equal", "equal_radius": "equal", "same_length": "equal",
+    "same_radius": "equal", "equals": "equal", "equality": "equal",
+    "coaxial": "concentric", "concentric_with": "concentric", "same_center": "concentric",
+    "colinear": "collinear", "co_linear": "collinear", "collinearity": "collinear",
+    "mid": "midpoint", "midpoint_of": "midpoint", "mid_point": "midpoint",
+    "symmetric_about": "symmetric", "symmetry": "symmetric", "mirror": "symmetric",
+    "fixed": "fix", "lock": "fix", "locked": "fix", "anchor": "fix", "pin": "fix",
+    "ground": "fix", "grounded": "fix",
+    "point_on_line": "point_on", "point_on_entity": "point_on", "point_on_curve": "point_on",
+    "on_line": "point_on", "on_curve": "point_on", "on_entity": "point_on",
+    "rad": "radius", "radial": "radius", "radius_dimension": "radius",
+    "radial_dimension": "radius", "radial_dim": "radius",
+    "dia": "diameter", "diametral": "diameter", "diameter_dimension": "diameter",
+    "dia_dimension": "diameter",
+    "angular": "angle", "angle_dimension": "angle", "angular_dimension": "angle",
+    "length_dimension": "length", "line_length": "length",
+    "distance_between": "distance", "linear_dimension": "distance",
+    "linear_dim": "distance", "distance_dimension": "distance",
+    "horizontal_distance": ("distance", {"axis": "h"}),
+    "horizontal_dimension": ("distance", {"axis": "h"}),
+    "distance_x": ("distance", {"axis": "h"}), "dist_x": ("distance", {"axis": "h"}),
+    "dx_distance": ("distance", {"axis": "h"}), "dim_horizontal": ("distance", {"axis": "h"}),
+    "vertical_distance": ("distance", {"axis": "v"}),
+    "vertical_dimension": ("distance", {"axis": "v"}),
+    "distance_y": ("distance", {"axis": "v"}), "dist_y": ("distance", {"axis": "v"}),
+    "dy_distance": ("distance", {"axis": "v"}), "dim_vertical": ("distance", {"axis": "v"}),
+}
+
+#: Type words that name "put a dimension here" without saying WHICH — SolidWorks' one
+#: Smart Dimension button. The engine has no such type, so the concrete one is resolved
+#: from the refs (a lone circle/arc -> radius, a lone line -> length, two refs ->
+#: distance) and the model is told which it got.
+_GENERIC_DIM_TYPES = frozenset({
+    "dimension", "dim", "smart_dimension", "smartdimension", "measure", "size"})
+
+#: Constraint ref-slot spellings, in the order the engine's `refs` list wants them.
+#: `entities`/`handles` were already understood; the PAIRED forms below are what a model
+#: reaches for when it thinks of a relation as "between A and B" rather than as a list,
+#: and every one of them landed on «refs: coincident takes 2..2 refs» (live probe).
+_CONSTRAINT_REF_PAIRS = (
+    ("a", "b"), ("first", "second"), ("entity1", "entity2"), ("entity_1", "entity_2"),
+    ("e1", "e2"), ("ref1", "ref2"), ("r1", "r2"), ("from", "to"),
+)
+#: Single-slot ref spellings for the 1-ref relations (fix/horizontal/radius/…).
+_CONSTRAINT_REF_SINGLES = ("entity", "ref", "target", "handle", "on", "of")
+#: List-shaped ref spellings beyond the two the normalizer already read.
+_CONSTRAINT_REF_LISTS = ("refs", "entities", "handles", "elements", "items", "targets")
+#: How many refs each relation needs (validate.cpp::CONSTRAINT_SPECS lower bound). Used
+#: only to decide whether a relation is still SHORT after the first ref slot resolved, so
+#: a payload that spread its two refs over two dialects is completed rather than lost.
+_CONSTRAINT_ARITY = {
+    "coincident": 2, "parallel": 2, "perpendicular": 2, "tangent": 2, "collinear": 2,
+    "equal": 2, "concentric": 2, "coradial": 2, "midpoint": 2, "point_on": 2, "angle": 2,
+    "symmetric": 3, "horizontal": 1, "vertical": 1, "fix": 1, "length": 1,
+    "radius": 1, "diameter": 1, "distance": 2,
+}
+
+#: What a model calls the axis a `distance` dimension projects onto. The engine takes only
+#: 'h'/'v' (validate.cpp:1155) and rejects everything else, so the world-axis and prose
+#: spellings are mapped on. Purely a rename: 'x' IS the horizontal projection here.
+_DIM_AXIS_WORDS = {
+    "x": "h", "+x": "h", "h": "h", "horizontal": "h", "horiz": "h", "u": "h", "dx": "h",
+    "y": "v", "+y": "v", "v": "v", "vertical": "v", "vert": "v", "dy": "v",
+}
+
+#: Where a `symmetric` relation's MIRROR LINE hides when it is not the third ref. The
+#: engine wants refs=[a, b, axis]; a model that writes the axis in its own slot loses the
+#: relation to «refs: symmetric takes 3..3 refs». Read only for `symmetric` — `axis` on a
+#: `distance` is the h/v projection selector and means something else entirely.
+_SYMMETRY_AXIS_KEYS = ("axis", "about", "line", "mirror_line", "symmetry_line", "centerline")
+
+#: Where a dimension's NUMBER hides when it is not under `value`. A model naming the
+#: number after the quantity ({"type":"radius","radius":7}) got «value: required for
+#: radius» and lost the batch.
+_DIM_VALUE_KEYS = ("value", "distance", "length", "radius", "diameter", "angle",
+                   "dim", "amount", "measure", "val", "size", "d")
+
+#: Truthy under these and the dimension is a REFERENCE (driven) dimension: it reports the
+#: geometry instead of forcing it. The engine spells that `driven`, and used to IGNORE
+#: every other spelling in silence — the single worst outcome measured this session. Live
+#: probe 2026-07-30: {"type":"length","refs":["e1"],"value":80,"reference":true} returned
+#: ok and STRETCHED e1 from 40.1 mm to 80 mm. The model asked for a measurement and got
+#: geometry it never requested, with nothing in the response saying so.
+_DRIVEN_TRUE_KEYS = ("driven", "reference", "is_reference", "reference_dimension",
+                     "readonly", "read_only")
+#: …and the inverse spelling: driving:true means driven:false.
+_DRIVING_KEYS = ("driving", "is_driving")
+
+#: Point-handle suffix spellings. The engine's HANDLE_RE takes e<N> optionally followed by
+#: one of its OWN sub-names (validate.cpp ENTITY_SUBS); everything else is «not a valid
+#: handle», which names no alternative.
+_HANDLE_SUB_ALIASES = {
+    "centre": "center", "centerpoint": "center", "center_point": "center", "c": "center",
+    "1": "p1", "2": "p2", "a": "p1", "b": "p2",
+    "p": "p1", "point1": "p1", "point2": "p2", "pt1": "p1", "pt2": "p2",
+    "startpoint": "start", "start_point": "start", "endpoint": "end", "end_point": "end",
+}
+#: A `line`/`slot` names its ends p1/p2, so .start/.end on one must become them (the
+#: engine already accepts .start/.end on an arc, where they ARE the sub-names).
+_LINE_END_SUBS = {"start": "p1", "end": "p2"}
+#: The modeler's own entity alias ("l0"/"l5", session.cpp::sketch_entity_aliases) and the
+#: case-shifted canonical id. `c<N>` is deliberately absent: that is a CONSTRAINT id.
+_MODELER_EID_RE = re.compile(r"^[lLeE](\d+)$")
+_DEG_NUM_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*(?:deg|degs|degree|degrees|°)\s*$",
+                         re.IGNORECASE)
+
+
+def _dim_number(v: Any, angular: bool) -> Optional[float]:
+    """The plain number a dimension carries, or None when it is not unambiguously one.
+
+    Accepts the bare number, the canonical {"value":N,"expr":null} wrapper, a mm-unit
+    literal ("50mm" -> 50) and — for an ANGLE only — a degree literal ("90deg" -> 90).
+    A real expression string ("width/2") is left alone: the engine evaluates those.
+    """
+    if _is_num(v):
+        return float(v)
+    if isinstance(v, dict) and not v.get("expr") and _is_num(v.get("value")):
+        return float(v["value"])
+    if isinstance(v, str):
+        if angular:
+            m = _DEG_NUM_RE.match(v)
+            if m:
+                return float(m.group(1))
+        mm = _dim_mm(v)
+        if mm is not None:
+            return float(mm)
+    return None
+
+
+def _norm_handle(h: Any, etypes: dict[str, str]) -> Any:
+    """One constraint ref -> the handle spelling validate.cpp's HANDLE_RE accepts.
+
+    `etypes` maps entity id -> type for THIS sketch, which is what makes `.start` on a
+    line resolvable to `.p1`. Anything not recognisably a handle is returned untouched so
+    the caller (not this function) decides whether to teach or defer.
+    """
+    if not isinstance(h, str) or not h.strip():
+        return h
+    s = h.strip().replace(":", ".")
+    base, _, sub = s.partition(".")
+    m = _MODELER_EID_RE.match(base)
+    if m:
+        # "L1"/"E1"/"l1" — the modeler's own entity alias, and the case-shifted canonical
+        # id. Both fail HANDLE_RE, which is case-sensitive on a lowercase `e`.
+        base = "e" + m.group(1)
+    if sub:
+        low = sub.lower()
+        sub = _HANDLE_SUB_ALIASES.get(low, low)
+        if etypes.get(base) in ("line", "slot"):
+            sub = _LINE_END_SUBS.get(sub, sub)
+    return base + ("." + sub if sub else "")
+
+
+def _constraint_dialect_keys(c: dict) -> bool:
+    """True when a constraint carries any spelling the normalizer must rewrite.
+
+    Read by _sketch_needs_norm so a sketch whose ENTITIES are already canonical still
+    reaches the constraint pass — without this, {"type":"perp"} beside canonical geometry
+    slipped past normalization entirely and died in validate.
+    """
+    if not isinstance(c, dict):
+        return False
+    ctype = _slug(c.get("type"))
+    if ctype in _CONSTRAINT_TYPE_ALIASES or ctype in _GENERIC_DIM_TYPES:
+        return True
+    if any(k in c for k in _DRIVEN_TRUE_KEYS[1:]) or any(k in c for k in _DRIVING_KEYS):
+        return True
+    if not isinstance(c.get("refs"), list):
+        return True
+    if ctype in _DIM_CTYPES and not _is_dim_object(c.get("value")):
+        return True
+    return False
+
+
+def _normalize_one_constraint(c: dict, remap, etypes: dict[str, str], label: str,
+                              rewrites: set) -> dict:
+    """One relation/dimension -> the engine's canonical constraint object.
+
+    `remap` rewrites an AUTHORED entity id onto the e<N> the entity pass minted; `etypes`
+    is the resulting id -> type map, which is what lets `.start` on a line resolve to
+    `.p1` and what makes a dangling ref detectable HERE, where the valid ids can be named.
+    Rewrites are accumulated in `rewrites` so a 30-constraint sketch emits one note per
+    KIND of rewrite, not one per constraint.
+    Raises ValueError for a ref that names nothing — a dangling relation is never dropped.
+    """
+    nc = dict(c)
+
+    # ---- type ---------------------------------------------------------------
+    raw_type = nc.get("type")
+    ctype = _slug(raw_type)
+    alias = _CONSTRAINT_TYPE_ALIASES.get(ctype)
+    if isinstance(alias, tuple):
+        ctype, extras = alias
+        nc.update(extras)
+        rewrites.add(f'"{raw_type}" -> {ctype} + axis:"{extras["axis"]}"')
+    elif isinstance(alias, str):
+        rewrites.add(f'"{raw_type}" -> {alias}')
+        ctype = alias
+    generic = ctype in _GENERIC_DIM_TYPES
+    if ctype:
+        nc["type"] = ctype
+
+    # ---- refs ---------------------------------------------------------------
+    refs = None
+    for key in _CONSTRAINT_REF_LISTS:
+        v = nc.get(key)
+        if isinstance(v, list):
+            refs = list(v)
+            if key != "refs":
+                rewrites.add(f"{key}[] -> refs[]")
+            break
+        if isinstance(v, str) and v.strip():
+            # A 1-ref relation written without the list ({"type":"fix","refs":"e5"}).
+            refs = [v]
+            rewrites.add(f'{key}:"…" -> refs:["…"]')
+            break
+    # Slots not yet consumed may still hold the refs the relation is short of — a model
+    # that wrote {"refs":"e1.p2","b":"e2.p1"} named both, one per dialect. Top up rather
+    # than lose the relation to «coincident takes 2..2 refs».
+    need = _CONSTRAINT_ARITY.get(ctype, 0)
+    if refs is None or len(refs) < need:
+        for a, b in _CONSTRAINT_REF_PAIRS:
+            if isinstance(nc.get(a), str) and isinstance(nc.get(b), str):
+                refs = (refs or []) + [nc[a], nc[b]]
+                rewrites.add(f"{a}/{b} -> refs[]")
+                break
+            for key in (a, b):
+                if refs and len(refs) < need and isinstance(nc.get(key), str) \
+                        and nc[key].strip() and nc[key] not in refs:
+                    refs = refs + [nc[key]]
+                    rewrites.add(f"{key} -> refs[]")
+    if refs is None or len(refs) < need:
+        for key in _CONSTRAINT_REF_SINGLES:
+            if isinstance(nc.get(key), str) and nc[key].strip():
+                refs = (refs or []) + [nc[key]]
+                rewrites.add(f"{key} -> refs[]")
+                if len(refs) >= need:
+                    break
+    if refs is not None:
+        if ctype == "symmetric" and len(refs) == 2:
+            # The mirror line in its own slot. Only `symmetric` reads these keys — `axis`
+            # on a distance is the h/v projection selector, a different thing entirely.
+            for key in _SYMMETRY_AXIS_KEYS:
+                v = nc.get(key)
+                if isinstance(v, str) and v.strip():
+                    refs.append(v)
+                    nc.pop(key, None)
+                    rewrites.add(f"symmetric {key} -> the third ref (refs=[a, b, axis])")
+                    break
+        out_refs = []
+        for h in refs:
+            h2 = _norm_handle(remap(h), etypes)
+            if isinstance(h2, str) and h2 != h:
+                rewrites.add(f'ref "{h}" -> "{h2}"')
+            out_refs.append(h2)
+        nc["refs"] = out_refs
+
+    for key in _CONSTRAINT_REF_LISTS[1:] + _CONSTRAINT_REF_SINGLES:
+        nc.pop(key, None)
+    for a, b in _CONSTRAINT_REF_PAIRS:
+        if a in nc and b in nc and a not in _DIM_VALUE_KEYS:
+            nc.pop(a, None)
+            nc.pop(b, None)
+
+    # ---- dangling refs ------------------------------------------------------
+    # A ref naming nothing is the one thing that must NEVER be quietly dropped: the sketch
+    # then solves without the relation the model believes it placed. The engine does reject
+    # it, but names no alternative («'e99' is not a valid handle»), so teach here where the
+    # id roster is in hand.
+    known = sorted(etypes)
+    for h in (nc.get("refs") or []):
+        if not isinstance(h, str):
+            raise ValueError(
+                f'{label}: constraint "{ctype or raw_type}" ref {h!r} is not an entity '
+                f"handle. A relation references sketch entities by id — "
+                f'{", ".join(known) if known else "(this sketch has no entities)"} — '
+                f'optionally with a point suffix ("e1.p2", "e3.center").')
+        base = h.partition(".")[0]
+        if base in ("origin",) or base in etypes:
+            continue
+        hint = ""
+        if _BATCH_REF_RE.match(base):
+            hint = ("  A \"$N\" placeholder names a FEATURE created earlier in this batch; "
+                    "a sketch relation references entities INSIDE this sketch instead.")
+        raise ValueError(
+            f'{label}: constraint "{ctype or raw_type}" references entity "{base}", which '
+            f"this sketch does not contain. Its entity ids are "
+            f'{", ".join(known) if known else "(none — params.entities is empty)"} '
+            f"(they are renumbered e1..eN in the order you listed them).{hint}")
+
+    # ---- generic "put a dimension here" -------------------------------------
+    if generic:
+        refs_now = nc.get("refs") or []
+        n = len(refs_now)
+        first = refs_now[0] if n else ""
+        # A 1-ref dimension measures a WHOLE entity (a line's length, a circle's radius);
+        # a lone POINT handle ("e1.p1") measures nothing on its own, so it is the one shape
+        # here that must not be guessed at.
+        whole = isinstance(first, str) and "." not in first
+        base_type = etypes.get(first, "") if whole else ""
+        if n >= 2:
+            ctype = "distance"
+        elif base_type in ("circle", "arc"):
+            ctype = "radius"
+        elif base_type in ("line", "slot"):
+            ctype = "length"
+        else:
+            raise ValueError(
+                f'{label}: "{raw_type}" does not say WHICH dimension, and refs='
+                f"{refs_now} does not settle it. The engine names them explicitly: "
+                f"distance (two refs), length (one whole line), radius/diameter (one "
+                f"circle or arc), angle (two lines). A lone point handle like "
+                f'"e1.p1" measures nothing — give the second point too.')
+        nc["type"] = ctype
+        rewrites.add(f'"{raw_type}" on {base_type or "2 refs"} -> {ctype}')
+
+    # ---- value --------------------------------------------------------------
+    if ctype in _DIM_CTYPES:
+        angular = ctype == "angle"
+        if ctype == "distance" and isinstance(nc.get("axis"), str):
+            ax = _DIM_AXIS_WORDS.get(nc["axis"].strip().lower())
+            if ax and ax != nc["axis"]:
+                rewrites.add(f'axis:"{nc["axis"]}" -> "{ax}"')
+                nc["axis"] = ax
+        num = _dim_number(nc.get("value"), angular)
+        if num is None:
+            for key in _DIM_VALUE_KEYS[1:]:
+                if key not in nc:
+                    continue
+                num = _dim_number(nc[key], angular)
+                if num is not None:
+                    nc.pop(key, None)
+                    rewrites.add(f"{ctype} value read from `{key}`")
+                    break
+        if num is not None:
+            nc["value"] = {"value": _clean_num(num), "expr": None}
+        elif isinstance(nc.get("value"), dict) and "value" in nc["value"]:
+            nc["value"] = {"value": nc["value"]["value"], "expr": nc["value"].get("expr")}
+
+        # driven / reference. Silently ignoring these made a REFERENCE dimension drive the
+        # geometry (probe 2026-07-30: reference:true stretched a 40 mm line to 80 mm and
+        # reported ok), so every spelling is resolved and echoed.
+        driven = None
+        for key in _DRIVEN_TRUE_KEYS:
+            if key in nc and isinstance(nc[key], bool):
+                driven = nc[key]
+                if key != "driven":
+                    nc.pop(key, None)
+                    rewrites.add(f"{key}:{str(driven).lower()} -> driven:"
+                                 f"{str(driven).lower()} (a reference dimension MEASURES "
+                                 f"the geometry; it does not move it)")
+                break
+        if driven is None:
+            for key in _DRIVING_KEYS:
+                if key in nc and isinstance(nc[key], bool):
+                    driven = not nc.pop(key)
+                    rewrites.add(f"{key} -> driven:{str(driven).lower()} (the engine names "
+                                 f"the INVERSE flag)")
+                    break
+        nc["driven"] = bool(driven)
+    else:
+        # A non-dimensional relation carrying a value is rejected outright
+        # («value: parallel must not carry a value»); a null one is the same as absent.
+        if nc.get("value") is None:
+            nc.pop("value", None)
+
+    return nc
+
+
+#: What a model calls "this entity is construction geometry". The engine reads only
+#: `construction`, and `bool(ne.get("construction", False))` silently swallowed every
+#: other spelling — so a centreline written {"is_construction":true} became REAL profile
+#: geometry, which is what the extrude then tries to sweep (live probe 2026-07-30: all
+#: four alternative spellings produced construction=false with no note).
+_CONSTRUCTION_ALIASES = ("is_construction", "for_construction", "construction_geometry",
+                         "construction_line", "reference", "is_reference")
+#: An entity type word that MEANS construction: SolidWorks' centreline, which every
+#: mirror/revolve workflow starts with, is a `line` with construction:true. The engine has
+#: no such entity type, so it was rejected outright as "not a sketch entity type".
+_CONSTRUCTION_TYPES = {"centerline", "centreline", "construction_line", "axis_line"}
+#: Words a model writes for a boolean it serialised as text. `bool("false")` is True, so
+#: {"construction":"false"} silently INVERTED into construction geometry (probe verified).
+_FALSE_WORDS = frozenset({"false", "no", "off", "0", "none", "null", ""})
+
+
+def _as_bool(v: Any) -> Optional[bool]:
+    """A flag however it is spelled — real bool, 0/1, or a serialised word. None = unknown."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() not in _FALSE_WORDS
+    return None
+
+
+def _construction_alias_key(e: dict) -> Optional[str]:
+    """The alias key carrying this entity's construction flag, when `construction` is not
+    already a real bool. Also fires on the string form, which `bool()` inverts."""
+    if isinstance(e.get("construction"), bool):
+        return None
+    if "construction" in e:
+        return "construction"
+    for k in _CONSTRUCTION_ALIASES:
+        if k in e:
+            return k
+    return None
+
+
 def _sketch_needs_norm(feat: dict, params: dict) -> bool:
     ents = params.get("entities") if isinstance(params.get("entities"), list) else feat.get("entities")
     cons = params.get("constraints") if isinstance(params.get("constraints"), list) else feat.get("constraints")
@@ -325,7 +756,7 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
             return True
         if not (isinstance(e.get("id"), str) and _EID_RE.match(e["id"])):
             return True
-        if not isinstance(e.get("construction"), bool):
+        if not isinstance(e.get("construction"), bool) or _construction_alias_key(e):
             return True
         if e.get("type") == "line" and ("p1" not in e or "p2" not in e):
             return True
@@ -343,7 +774,7 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
     for c in (cons or []):
         if not isinstance(c, dict):
             continue
-        if "entities" in c or "handles" in c:
+        if _constraint_dialect_keys(c):
             return True
         if not (isinstance(c.get("id"), str) and _CID_RE.match(c["id"])):
             return True
@@ -572,7 +1003,22 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             id_map[e["id"]] = new_id
         ne = dict(e)
         ne["id"] = new_id
-        ne["construction"] = bool(ne.get("construction", False))
+        if _slug(ne.get("type")) in _CONSTRUCTION_TYPES:
+            # A centreline IS a construction line — the engine has no separate type.
+            ne["type"] = "line"
+            ne["construction"] = True
+            used_shorthand.add("centerline")
+        else:
+            ck = _construction_alias_key(ne)
+            flag = _as_bool(ne.pop(ck)) if ck else None
+            for k in _CONSTRUCTION_ALIASES:
+                ne.pop(k, None)
+            ne["construction"] = bool(flag) if flag is not None else bool(
+                ne.get("construction", False))
+            if ck and ck != "construction":
+                used_shorthand.add("construction_alias")
+            elif ck:
+                used_shorthand.add("construction_word")
         etype = ne.get("type")
         if etype == "line":
             # Endpoint aliases models write: p1/p2 canonical; start/end, from/to, and
@@ -683,6 +1129,12 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             rewrites.append('x/y -> p')
         if "point_obj" in used_shorthand:
             rewrites.append('{"x":…,"y":…} -> [x,y]')
+        if "centerline" in used_shorthand:
+            rewrites.append('type:"centerline" -> line + construction:true')
+        if "construction_alias" in used_shorthand:
+            rewrites.append('is_construction/for_construction/reference -> construction')
+        if "construction_word" in used_shorthand:
+            rewrites.append('construction:"true"/"false" -> a real boolean')
         sink.append(
             f'{_feat_label(feat, "sketch")}: expanded flat entity shorthand '
             f'({"; ".join(rewrites)}) into the engine\'s canonical entity fields '
@@ -695,18 +1147,18 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
         base = id_map.get(base, base)
         return base + ("." + sub if sub else "")
 
+    etypes = {e["id"]: e.get("type") for e in norm_ents
+              if isinstance(e, dict) and isinstance(e.get("id"), str)}
     norm_cons = []
     cn = 0
+    con_rewrites: set = set()
     for c in list(cons_in) + list(dims_in):
         if not isinstance(c, dict):
             norm_cons.append(c)
             continue
-        nc = dict(c)
-        refs = nc.get("refs", nc.get("entities", nc.get("handles")))
-        if isinstance(refs, list):
-            nc["refs"] = [_remap(x) for x in refs]
-        nc.pop("entities", None)
-        nc.pop("handles", None)
+        nc = _normalize_one_constraint(c, _remap, etypes,
+                                       f'sketch "{_feat_label(feat, "sketch")}"',
+                                       con_rewrites)
         cid = nc.get("id")
         if isinstance(cid, str) and _CID_RE.match(cid):
             cn = max(cn, int(cid[1:]))
@@ -714,6 +1166,13 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             cn += 1
             nc["id"] = f"c{cn}"
         norm_cons.append(_norm_dim_value(nc))
+    if con_rewrites:
+        sink.append(
+            f'{_feat_label(feat, "sketch")}: rewrote relations/dimensions onto the engine\'s '
+            f"closed vocabulary ({'; '.join(sorted(con_rewrites))}) — one note for the whole "
+            f'sketch. Canonical: {{"id":"c1","type":"<relation>","refs":["e1","e2.p1"]}}, and '
+            f'a dimension adds {{"value":{{"value":N,"expr":null}},"driven":false}} '
+            f"(driven:true MEASURES the geometry instead of forcing it)")
 
     refs_out = dict(feat.get("refs") or {})
     plane = None
@@ -783,6 +1242,233 @@ def _normalize_sketch_ops(ops: Any, notes: Optional[list] = None) -> Any:
             # to fix it. Swallowing it here would create the empty sketch anyway and hand
             # the model an unrelated error two features later.
             raise
+        except Exception:  # noqa: BLE001 — never let normalization break a valid call
+            pass
+        out.append(op)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 2D EDITING-OP dialect (trim / extend / offset / fillet / chamfer / mirror /
+# pattern / move / rotate / toggle-construction / set-dim).
+#
+# These ops are the advanced half of the sketcher and, unlike the sketch FEATURE, they had
+# no Python normalizer at all — every payload went straight to session.cpp, whose key names
+# are not even consistent with each other (trim/extend read `entity`, offset/mirror/pattern
+# read `entities`, fillet/chamfer read `e1`/`e2`). Measured on the live engine 2026-07-30
+# over 33 realistic payloads: 19 were rejected on a key name alone, and five FLAGS were
+# accepted and then silently ignored, which is worse:
+#   * sketch_move/sketch_rotate {"duplicate":true} DESTROYED the original instead of
+#     copying it — the op reported ok and the source geometry was gone.
+#   * a circular sketch_pattern_entities with angle:360 and no `equal_spacing` stacked all
+#     four copies on top of the original (angle is PER STEP, so 360/720/1080° are each the
+#     identity rotation) — the same "seven hexagons at the origin" failure the 2026-07-28
+#     keychain run hit one layer up.
+#   * {"keep_as_construction":true} on a trim deleted the span it was asked to keep.
+#   * {"both_sides":true} on an offset produced one side.
+_SKETCH_EDIT_KEY_ALIASES: dict[str, dict[str, str]] = {
+    "sketch_trim": {"id": "entity", "target": "entity", "entity_id": "entity",
+                    "curve": "entity", "at": "point", "pick": "point",
+                    "pick_point": "point", "position": "point", "location": "point",
+                    "uv": "point", "keep_as_construction": "keep_construction",
+                    "as_construction": "keep_construction"},
+    "sketch_extend": {"id": "entity", "target": "entity", "entity_id": "entity",
+                      "curve": "entity", "which": "end", "which_end": "end", "side": "end"},
+    "sketch_offset": {"offset": "distance", "dist": "distance", "amount": "distance",
+                      "d": "distance", "direction": "side", "toward": "side",
+                      "side_point": "side", "through": "side"},
+    "sketch_fillet": {"r": "radius", "fillet_radius": "radius", "rad": "radius"},
+    "sketch_chamfer": {"d": "distance", "size": "distance", "dist": "distance",
+                       "length": "distance", "d2": "distance2", "distance_2": "distance2"},
+    "sketch_mirror_entities": {"axis": "line", "mirror_line": "line", "about": "line",
+                               "line_id": "line", "mirror_about": "line",
+                               "centerline": "line"},
+    "sketch_pattern_entities": {"type": "mode", "pattern_type": "mode", "kind": "mode",
+                                "direction": "dir", "vector": "dir", "dir_vec": "dir",
+                                "step": "spacing", "pitch": "spacing",
+                                "distance": "spacing", "instances": "count",
+                                "copies": "count", "num": "count", "total_angle": "angle",
+                                "angle_deg": "angle", "equal": "equal_spacing",
+                                "even_spacing": "equal_spacing",
+                                "equally_spaced": "equal_spacing"},
+    "sketch_move": {"duplicate": "copy", "keep_original": "copy", "as_copy": "copy"},
+    "sketch_rotate": {"duplicate": "copy", "keep_original": "copy", "as_copy": "copy",
+                      "angle_deg": "angle", "degrees": "angle", "rotation": "angle"},
+    "sketch_toggle_construction": {"entity": "id", "entity_id": "id", "target": "id"},
+    "sketch_set_dim": {"constraint": "id", "cid": "id", "dim": "id",
+                       "constraint_id": "id", "reference": "driven",
+                       "is_reference": "driven"},
+}
+#: Ops the engine reads as a LIST of entity ids, and the spellings a model puts them under.
+_EDIT_ENTITY_LIST_OPS = frozenset({
+    "sketch_offset", "sketch_mirror_entities", "sketch_pattern_entities", "sketch_move",
+    "sketch_rotate", "sketch_delete_entity"})
+_EDIT_ENTITY_LIST_ALIASES = ("entity", "ids", "entity_ids", "elements", "items",
+                             "targets", "selection")
+#: …and the two that read a SINGLE id, where a one-element list is the same intent.
+_EDIT_ENTITY_SINGLE_OPS = frozenset({"sketch_trim", "sketch_extend"})
+#: Ops whose value keys are coordinates the engine reads only as [x, y] arrays.
+_EDIT_POINT_KEYS = ("point", "side", "dir", "center")
+#: Pattern mode words -> the engine's closed pair.
+_PATTERN_MODE_WORDS = {
+    "linear": "linear", "line": "linear", "rectangular": "linear", "rect": "linear",
+    "grid": "linear", "translate": "linear", "linear_pattern": "linear",
+    "circular": "circular", "polar": "circular", "radial": "circular",
+    "circle": "circular", "round": "circular", "rotational": "circular",
+    "circular_pattern": "circular",
+}
+#: Which end of a curve `sketch_extend` grows.
+_EXTEND_END_WORDS = {
+    "start": "start", "p1": "start", "begin": "start", "beginning": "start",
+    "first": "start", "head": "start",
+    "end": "end", "p2": "end", "last": "end", "finish": "end", "tail": "end",
+}
+
+
+def _edit_op_label(op: dict) -> str:
+    sk = op.get("sketch")
+    return f'{op.get("op")} on sketch "{sk}"' if isinstance(sk, str) else str(op.get("op"))
+
+
+def _normalize_sketch_edit_op(op: dict, notes: list) -> dict:
+    """One 2D editing op -> the exact key names session.cpp reads.
+
+    Raises ValueError for a payload whose INTENT cannot be expressed in one op — those
+    would otherwise apply a different edit and report success.
+    """
+    name = op.get("op")
+    aliases = _SKETCH_EDIT_KEY_ALIASES.get(name)
+    if aliases is None:
+        return op
+    nc = dict(op)
+    label = _edit_op_label(op)
+    moved: list[str] = []
+    for alias, canon in aliases.items():
+        if alias in nc and canon not in nc:
+            nc[canon] = nc.pop(alias)
+            moved.append(f"{alias} -> {canon}")
+        elif alias in nc:
+            nc.pop(alias)
+
+    # ---- entity selection ---------------------------------------------------
+    if name in _EDIT_ENTITY_LIST_OPS and not isinstance(nc.get("entities"), list):
+        for alias in _EDIT_ENTITY_LIST_ALIASES:
+            v = nc.get(alias)
+            if isinstance(v, str) and v.strip():
+                nc["entities"] = [v]
+                nc.pop(alias, None)
+                moved.append(f'{alias}:"…" -> entities:["…"]')
+                break
+            if isinstance(v, list) and v:
+                nc["entities"] = list(v)
+                nc.pop(alias, None)
+                moved.append(f"{alias}[] -> entities[]")
+                break
+    if name in _EDIT_ENTITY_SINGLE_OPS and not isinstance(nc.get("entity"), str):
+        v = nc.get("entities")
+        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], str):
+            nc["entity"] = v[0]
+            nc.pop("entities", None)
+            moved.append("entities:[id] -> entity:id")
+        elif isinstance(v, list) and len(v) > 1:
+            raise ValueError(
+                f"{label}: {name} edits ONE entity per op (it takes `entity`, not a list) — "
+                f"emit one {name} op per entity.")
+    if name in ("sketch_fillet", "sketch_chamfer"):
+        v = nc.get("entities")
+        if isinstance(v, list) and len(v) == 2 and all(isinstance(x, str) for x in v) \
+                and not (isinstance(nc.get("e1"), str) and isinstance(nc.get("e2"), str)):
+            nc["e1"], nc["e2"] = v
+            nc.pop("entities", None)
+            moved.append("entities:[a,b] -> e1/e2")
+
+    # ---- coordinates --------------------------------------------------------
+    for key in _EDIT_POINT_KEYS:
+        if key in nc:
+            coerced = _xy(nc[key])
+            if coerced != nc[key]:
+                nc[key] = coerced
+                moved.append(f'{key}:{{"x":…,"y":…}} -> [x, y]')
+    for key, (kx, ky) in (("delta", ("dx", "dy")), ("translation", ("dx", "dy")),
+                          ("center", ("cx", "cy")), ("pivot", ("cx", "cy")),
+                          ("about", ("cx", "cy"))):
+        if name not in ("sketch_move", "sketch_rotate"):
+            break
+        if name == "sketch_move" and key not in ("delta", "translation"):
+            continue
+        if name == "sketch_rotate" and key in ("delta", "translation"):
+            continue
+        v = _xy(nc.get(key))
+        if isinstance(v, list) and len(v) == 2 and all(_is_num(x) for x in v) \
+                and kx not in nc and ky not in nc:
+            nc[kx], nc[ky] = v
+            nc.pop(key, None)
+            moved.append(f"{key}:[a, b] -> {kx}/{ky}")
+
+    # ---- enums and flags ----------------------------------------------------
+    if name == "sketch_extend" and isinstance(nc.get("end"), str):
+        e = _EXTEND_END_WORDS.get(nc["end"].strip().lower())
+        if e and e != nc["end"]:
+            moved.append(f'end:"{nc["end"]}" -> "{e}"')
+            nc["end"] = e
+    if name == "sketch_pattern_entities" and isinstance(nc.get("mode"), str):
+        m = _PATTERN_MODE_WORDS.get(_slug(nc["mode"]))
+        if m and m != nc["mode"]:
+            moved.append(f'mode:"{nc["mode"]}" -> "{m}"')
+            nc["mode"] = m
+    for key in ("copy", "keep_construction", "equal_spacing", "construction", "fix",
+                "driven"):
+        if key in nc and not isinstance(nc[key], bool):
+            b = _as_bool(nc[key])
+            if b is not None:
+                moved.append(f"{key}:{nc[key]!r} -> {str(b).lower()}")
+                nc[key] = b
+
+    # ---- semantics the engine cannot express in one op ----------------------
+    if name == "sketch_offset":
+        if _as_bool(nc.pop("both_sides", None)):
+            raise ValueError(
+                f"{label}: sketch_offset offsets ONE side per op — `side`:[u, v] is a point "
+                f"on the side you want. For a two-sided offset emit two ops with opposite "
+                f'`side` points (e.g. [0, 1] and [0, -1]).')
+        if "side" not in nc:
+            raise ValueError(
+                f"{label}: sketch_offset needs `side`:[u, v] — a sketch-plane point on the "
+                f"side the copy goes, which is what picks between the two offsets of a "
+                f"curve. `distance` is the gap; `side` is the direction.")
+    if name == "sketch_pattern_entities" and nc.get("mode") == "circular" \
+            and not nc.get("equal_spacing"):
+        ang = nc.get("angle")
+        if _is_num(ang) and abs(ang) >= 360.0 - 1e-9:
+            # `angle` is the PER-STEP rotation, so a 360° step is the identity and every
+            # copy lands exactly on the source. That is never what "arrange N of these
+            # around a full circle" means, and it fails silently — the op reports ok and
+            # produces N invisible duplicates stacked on the original.
+            nc["equal_spacing"] = True
+            moved.append(f'angle:{ang} read as the TOTAL sweep -> equal_spacing:true '
+                         f"(angle is the PER-STEP rotation; a 360° step is the identity, "
+                         f"so every copy would land on the original)")
+
+    if moved:
+        notes.append(f"{label}: {'; '.join(moved)} — the 2D editing ops name their "
+                     f"arguments exactly: trim/extend take `entity`+`point`/`end`, "
+                     f"offset/mirror/pattern/move/rotate take `entities`:[…], and "
+                     f"fillet/chamfer take `e1`/`e2`")
+    return nc
+
+
+def _normalize_sketch_edit_ops(ops: Any, notes: Optional[list] = None) -> Any:
+    """Normalize the 2D editing ops in a batch; return a new list."""
+    if not isinstance(ops, list):
+        return ops
+    sink = notes if isinstance(notes, list) else []
+    out = []
+    for op in ops:
+        try:
+            if isinstance(op, dict) and op.get("op") in _SKETCH_EDIT_KEY_ALIASES:
+                op = _normalize_sketch_edit_op(op, sink)
+        except ValueError:
+            raise   # a teachable rejection — see _normalize_sketch_ops
         except Exception:  # noqa: BLE001 — never let normalization break a valid call
             pass
         out.append(op)
@@ -3526,7 +4212,97 @@ _REFS_ONLY_SLOTS = frozenset({
     "middle_face", "face_set_a", "face_set_b", "vertices", "profile",
     "sections", "remove", "parting", "neutral", "reference_face", "surface",
     "tool", "guides", "up_to", "up_to2", "start_ref", "end_ref", "end2_ref",
+    # The second half of the same bag problem, measured live 2026-07-30 by driving each
+    # 3D feature with its selectors in `params`. Every one of these reached NO slot at
+    # all, and three of them did it SILENTLY — the feature built and reported ok while
+    # ignoring what the model asked for:
+    #   pull      draft: params.pull:"axis.x" built the DEFAULT axis.z taper (22942.038
+    #             mm^3 for all three axes); refs.pull:"axis.x" is correctly rejected.
+    #   features  mirror: params.features:["f2"] left the mirror with no seed, so it fell
+    #             through to the WHOLE-BODY branch and fused a reflection that filled the
+    #             hole the model wanted mirrored — volume went UP, 23748.673 -> 24000.0.
+    #   centerline loft: params.centerline was dropped, so the guide had no effect.
+    # …and `path`/`plane`/`bodies` were rejected for a slot the model DID supply
+    # («refs.path: required for sweep», «refs.plane: required for mirror»).
+    "path", "centerline", "pull", "features", "bodies", "plane",
 })
+
+
+#: The word a model reaches for when it names a 3D feature's ONE defining size, mapped to
+#: the key the engine actually reads (verified against the literals each compiler branch in
+#: core/doc/document.cpp consumes — rib 4424, chamfer 4562, shell 5623, draft 5764, thread
+#: 7038, mirror 5049, sweep 4380 — so no alias here shadows a key that already means
+#: something else on that type).
+#:
+#: Measured live 2026-07-30 on a fresh engine, one alias per call. Two of these were the
+#: worst possible failure, a build that reports ok and ignores the number it was given:
+#:   rib     params.width=8 built the 3 mm DEFAULT rib (7650.0 mm^3); thickness=8 builds
+#:           8400.0. The model asked for an 8 mm rib and silently got a 3 mm one.
+#:   thread  params.depth=10 threaded the WHOLE 30 mm face (1251.619 mm^3); length=10
+#:           gives 1418.832. The model asked for a 10 mm thread run and got a full one.
+#: The rest were clean rejections for a value the model DID supply — «params.thickness:
+#: required for shell», «params.length: required for chamfer», «params.angle: required for
+#: draft», «refs.plane: required for mirror», «refs.path: required for sweep».
+_TYPE_PARAM_ALIASES: dict = {
+    "shell": {"thickness": ("wall_thickness", "wall", "wall_t", "t")},
+    "rib": {"thickness": ("width", "rib_thickness", "wall_thickness", "wall", "t")},
+    # chamfer's second leg is `length2`; d1/d2 are how a model spells an ASYMMETRIC one.
+    "chamfer": {"length": ("size", "d", "d1", "width", "amount", "leg", "setback"),
+                "length2": ("d2",)},
+    "draft": {"angle": ("draft_angle", "taper", "taper_angle", "degrees", "deg")},
+    "thread": {"length": ("depth", "thread_length", "run", "engagement"),
+               "size": ("thread_size", "designation"),
+               "major_dia": ("diameter", "major_diameter", "nominal_diameter",
+                             "nominal_dia")},
+    # These two are SELECTOR slots, not sizes — renamed here so _migrate_ref_slots (next
+    # pass) can carry them into `refs`, which is where the engine reads them.
+    "mirror": {"plane": ("about", "across", "mirror_plane", "symmetry_plane")},
+    "sweep": {"path": ("spine", "trajectory", "rail", "along", "sweep_path")},
+}
+#: A surface sweep is the same feature without the boolean, so it takes the same dialect.
+_TYPE_PARAM_ALIASES["surf_sweep"] = _TYPE_PARAM_ALIASES["sweep"]
+
+
+def _normalize_type_param_aliases(ops: Any, notes: list) -> Any:
+    """Rename a feature's defining param/slot from the word the model used to the one the
+    engine reads. Identity for a canonical batch; an explicit canonical key always wins."""
+    if not isinstance(ops, list):
+        return ops
+    out, changed = [], False
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if not isinstance(feat, dict):
+            out.append(op)
+            continue
+        ftype = _slug(feat.get("type"))
+        table = _TYPE_PARAM_ALIASES.get(ftype)
+        if not table:
+            out.append(op)
+            continue
+        new, params, peek, consume = _split_two_levels(feat)
+        hit = False
+        for canon, aliases in table.items():
+            if peek(canon) is not _MISSING:
+                continue
+            for alias in aliases:
+                v = peek(alias)
+                if v is _MISSING or v is None:
+                    continue
+                consume(alias)
+                params[canon] = v
+                hit = True
+                notes.append(
+                    f"{_feat_label(feat, ftype)}: read params.{alias} as params.{canon} — "
+                    f"a {ftype} names that {'selection' if canon in _REFS_ONLY_SLOTS else 'value'}"
+                    f" `{canon}`, and an unread key is silently ignored, not rejected")
+                break
+        if not hit:
+            out.append(op)
+            continue
+        new["params"] = params
+        out.append({**op, "feature": new})
+        changed = True
+    return out if changed else ops
 
 
 #: Structural feature keys — the ONLY ones a feature dict is allowed at its top level per
@@ -3601,7 +4377,19 @@ def _hoist_feature_sibling_keys(ops: Any, notes: Optional[list] = None) -> Any:
 #: dialect ("tool":"drain_boss") names an OPERAND -> params.b, never a selector —
 #: _normalize_boolean_feature (which runs later, off the top level itself via
 #: _split_two_levels) already owns that reading, so this migration must not preempt it.
-_REFS_ONLY_SLOTS_TYPE_EXCLUDE = {"tool": frozenset({"boolean"})}
+#:
+#: `plane` is the sketch's own plane slot, but _normalize_sketch_ops reads it off
+#: params/top-level and owns the whole "which datum is this drawn on" reading (including
+#: the named-plane dialect "XZ"/"Top Plane"), so migrating it early would strand the
+#: sketch on the default plane.top — the exact silent-wrong-datum failure that pass exists
+#: to prevent. `features`/`bodies` are boolean's flat OPERAND dialect
+#: (_BOOLEAN_OPERAND_KEYS -> params.a/params.b), same reasoning as `tool`.
+_REFS_ONLY_SLOTS_TYPE_EXCLUDE = {
+    "tool": frozenset({"boolean"}),
+    "plane": frozenset({"sketch", "sketch3d"}),
+    "features": frozenset({"boolean"}),
+    "bodies": frozenset({"boolean"}),
+}
 
 
 def _migrate_ref_slots(ops: Any, notes: Optional[list] = None) -> Any:
@@ -4187,6 +4975,99 @@ def _resolve_relative_profile_refs(ops: Any, notes: list) -> Any:
     return out
 
 
+#: Where a feature reference can hide in ``params``. ``params`` holds plenty of strings that
+#: are NOT references (mode:"cut", side:"top"), so there the sweep needs an allowlist. Inside
+#: ``refs`` the opposite is true: EVERY string slot is a reference by definition, so a key
+#: allowlist there can only ever miss one. It did: refs.profile held a bare "HexPattern"
+#: (live 2026-07-28 kimi-keychain run) — `profile` was absent from the allowlist and the
+#: value was a plain string, not a list, so the batch reached the engine with a display name
+#: in a selector slot and died on the dangling-ref guardrail.
+_NAME_REF_PARAM_KEYS = ("a", "b", "sketch", "profile", "targets", "bodies", "features")
+
+
+def _sub_feature_names(v: Any, resolve, all_strings: bool = False) -> Any:
+    """Walk one refs/params value, handing every string that could NAME a feature to
+    ``resolve`` and swapping in whatever it hands back (None = leave the string alone).
+
+    Shared by the same-batch and the already-in-the-document resolvers so both see exactly
+    the same slots — a name reachable by one and not the other is the bug this shape avoids.
+    """
+    if isinstance(v, str):
+        s = v.strip()
+        if s and not _is_canon_datum(s):
+            tgt = resolve(s)
+            if tgt:
+                return tgt
+        return v
+    if isinstance(v, list):
+        return [_sub_feature_names(x, resolve, all_strings) for x in v]
+    if isinstance(v, dict):
+        # A geometry QUERY ({"of":"face","side":"top"}) is data, not a ref: its values
+        # are enum words that could collide with a feature named "top" or "face".
+        if "of" in v:
+            return v
+        ref_keys = ("feature", "owner_feature", "sketch", "a", "b", "id")
+        return {k: (_sub_feature_names(x, resolve, all_strings)
+                    if all_strings or k in ref_keys or isinstance(x, (list, dict))
+                    else x)
+                for k, x in v.items()}
+    return v
+
+
+def _rewrite_feature_name_refs(feat: dict, resolve) -> tuple:
+    """(new refs, new params) for one feature with `resolve` applied to every name slot."""
+    refs, params = feat.get("refs"), feat.get("params")
+    new_refs = (_sub_feature_names(refs, resolve, all_strings=True)
+                if isinstance(refs, dict) else refs)
+    new_params = params
+    if isinstance(params, dict):
+        new_params = {k: (_sub_feature_names(v, resolve) if k in _NAME_REF_PARAM_KEYS else v)
+                      for k, v in params.items()}
+    return new_refs, new_params
+
+
+def _apply_name_table(ops: list, table_for, hits: list) -> list:
+    """Run ``table_for(index) -> {name: target}`` over the batch, rewriting name refs."""
+    out = []
+    for i, op in enumerate(ops):
+        if not (isinstance(op, dict) and op.get("op") == "add_feature"
+                and isinstance(op.get("feature"), dict)):
+            out.append(op)
+            continue
+        feat = op["feature"]
+        table = table_for(i)
+
+        def resolve(name: str, _t=table) -> Optional[str]:
+            tgt = _t.get(name)
+            if tgt:
+                hits.append(name)
+            return tgt
+
+        refs, params = feat.get("refs"), feat.get("params")
+        new_refs, new_params = ((refs, params) if not table
+                                else _rewrite_feature_name_refs(feat, resolve))
+        if new_refs != refs or new_params != params:
+            nf = dict(feat)
+            if new_refs != refs:
+                nf["refs"] = new_refs
+            if new_params != params:
+                nf["params"] = new_params
+            op = {**op, "feature": nf}
+        out.append(op)
+    return out
+
+
+def _batch_feature_names(ops: list) -> dict:
+    """{display name: "$<index>"} for every feature this batch creates."""
+    index: dict[str, str] = {}
+    for i, op in enumerate(ops):
+        if isinstance(op, dict) and op.get("op") == "add_feature":
+            nm = (op.get("feature") or {}).get("name")
+            if isinstance(nm, str) and nm.strip():
+                index.setdefault(nm.strip(), f"${i}")
+    return index
+
+
 def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
     """Rewrite a reference to a feature this SAME batch creates, by NAME, into its "$N".
 
@@ -4196,74 +5077,81 @@ def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
     """
     if not isinstance(ops, list):
         return ops
-    index: dict[str, str] = {}
-    for i, op in enumerate(ops):
-        if isinstance(op, dict) and op.get("op") == "add_feature":
-            nm = (op.get("feature") or {}).get("name")
-            if isinstance(nm, str) and nm.strip():
-                index.setdefault(nm.strip(), f"${i}")
+    index = _batch_feature_names(ops)
     if not index:
         return ops
     hits: list = []
-    # `params` holds plenty of strings that are NOT references (mode:"cut", side:"top"),
-    # so there the substitution is limited to the slots that name a feature. Inside `refs`
-    # the opposite is true: EVERY string slot is a reference by definition, so a key
-    # allowlist there can only ever miss one. It did: refs.profile held a bare
-    # "HexPattern" (live 2026-07-28 kimi-keychain run) — `profile` was absent from the
-    # allowlist and the value was a plain string, not a list, so the batch reached the
-    # engine with a display name in a selector slot and died on the dangling-ref
-    # guardrail. Only same-batch NAMES are in `table`, so a total sweep of refs is safe.
-    param_keys = ("a", "b", "sketch", "profile", "targets", "bodies", "features")
-
-    def _sub(v: Any, table: dict, all_strings: bool = False) -> Any:
-        if isinstance(v, str):
-            tgt = table.get(v.strip())
-            if tgt and not _is_canon_datum(v.strip()):
-                hits.append(v.strip())
-                return tgt
-            return v
-        if isinstance(v, list):
-            return [_sub(x, table, all_strings) for x in v]
-        if isinstance(v, dict):
-            # A geometry QUERY ({"of":"face","side":"top"}) is data, not a ref: its values
-            # are enum words that could collide with a feature named "top" or "face".
-            if "of" in v:
-                return v
-            ref_keys = ("feature", "owner_feature", "sketch", "a", "b", "id")
-            return {k: (_sub(x, table, all_strings)
-                        if all_strings or k in ref_keys or isinstance(x, (list, dict))
-                        else x)
-                    for k, x in v.items()}
-        return v
-
-    out = []
-    for i, op in enumerate(ops):
-        if not (isinstance(op, dict) and op.get("op") == "add_feature"
-                and isinstance(op.get("feature"), dict)):
-            out.append(op)
-            continue
-        feat = op["feature"]
-        # A feature never references ITSELF, and its own `name` is not a ref.
-        table = {k: v for k, v in index.items() if v != f"${i}"}
-        refs, params = feat.get("refs"), feat.get("params")
-        new_refs = (_sub(refs, table, all_strings=True)
-                    if (table and isinstance(refs, dict)) else refs)
-        new_params = params
-        if table and isinstance(params, dict):
-            new_params = {k: (_sub(v, table) if k in param_keys else v)
-                          for k, v in params.items()}
-        if new_refs != refs or new_params != params:
-            nf = dict(feat)
-            if new_refs != refs:
-                nf["refs"] = new_refs
-            if new_params != params:
-                nf["params"] = new_params
-            op = {**op, "feature": nf}
-        out.append(op)
+    # A feature never references ITSELF, and its own `name` is not a ref.
+    out = _apply_name_table(
+        ops, lambda i: {k: v for k, v in index.items() if v != f"${i}"}, hits)
     if hits:
         notes.append("resolved same-batch feature name(s) " + ", ".join(sorted(set(hits)))
                      + ' to their "$<index>" placeholders — a ref names an f<N> id or a '
                        '"$N" position in THIS batch, never a display name')
+    return out
+
+
+def _resolve_doc_name_refs(ops: Any, doc_id: str, notes: list) -> Any:
+    """Rewrite a reference to a feature an EARLIER CALL built, by NAME, into its f<N> id.
+
+    The same-batch pass above only knows the names in the list it was handed, so the moment
+    a model spreads its work across calls — the normal shape of an agent turn: sketch now,
+    extrude next; boss now, mirror next — every reference by name died. Measured live
+    2026-07-30 against a fresh engine, one call after the other:
+
+      * a sketch named "Prof" extruded next call -> «profile 'Prof' -> 'Prof' not found»
+      * refs.features:["pin"] on a mirror/pattern -> «refs.features[0]: not a feature id»
+      * params.a:"blk" on a boolean                -> «ref 'a' -> 'blk' not found»
+
+    The document knows every one of those names. Costs one doc_tree call, and only when an
+    unresolved name is actually present — a canonical batch never touches the engine here.
+
+    A name the document carries TWICE is ambiguous, so it is left for the engine's error
+    rather than guessed at; a name THIS batch also creates belongs to the same-batch pass,
+    which already ran, so it is never re-pointed at an older namesake.
+    """
+    if not isinstance(ops, list) or not ops:
+        return ops
+    candidates: set = set()
+
+    def _collect(name: str) -> None:
+        candidates.add(name)
+        return None
+
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        if isinstance(op, dict) and op.get("op") == "add_feature" and isinstance(feat, dict):
+            _rewrite_feature_name_refs(feat, _collect)
+    # "$N" is this batch's own placeholder and a bare sid names topology, not a feature —
+    # neither is a display name, and neither can appear in the tree's name column.
+    candidates = {s for s in candidates
+                  if not _BATCH_REF_RE.match(s) and not _bare_sid(s)}
+    candidates -= set(_batch_feature_names(ops))
+    if not candidates:
+        return ops
+    try:
+        tree = (cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("tree") or {}
+    except Exception:  # noqa: BLE001 — a probe failure must never break a valid batch
+        return ops
+    seen: dict = {}
+    for f in tree.get("features") or []:
+        if not isinstance(f, dict):
+            continue
+        nm, fid = f.get("name"), f.get("id")
+        if isinstance(nm, str) and nm.strip() and isinstance(fid, str):
+            seen[nm.strip()] = None if nm.strip() in seen else fid  # None = ambiguous
+    table = {n: fid for n, fid in seen.items() if fid and n in candidates}
+    if not table:
+        return ops
+    hits: list = []
+    out = _apply_name_table(ops, lambda _i: table, hits)
+    if hits:
+        notes.append(
+            "resolved feature name(s) " + ", ".join(
+                f"{n} -> {table[n]}" for n in sorted(set(hits)))
+            + " against the document — a ref names the f<N> id an EARLIER call created "
+              '(or a "$N" position in THIS batch), never a display name; describe_part '
+              "lists the ids")
     return out
 
 
@@ -4771,10 +5659,25 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         body)" failures (docs/REFACTOR_LOG.md ~5309), so the count always travels."""
         did = entry["doc_id"]
         _CUR["doc_id"] = did
-        # Never reset a real baseline to 0.0: the part may already carry
-        # geometry, and clobbering _LAST_VOLUME would make the next
-        # add_features report "0.0 -> X" instead of the true delta.
-        _LAST_VOLUME.setdefault(did, entry.get("volume", 0.0) or 0.0)
+        # Never seed a FAKE baseline. `setdefault` alone only protected a baseline this
+        # process had already built, and neither doc_new(resume_if_open=True) nor doc_list
+        # reports a `volume` key — so every resume from a process that had not itself built
+        # the part seeded 0.0. Measured live 2026-07-30: a resumed 48000 mm^3 box, then cut
+        # by 282.3 mm^3, reported "volume 0.0->47717.7 mm^3 (+47717.7)" — sign inverted,
+        # magnitude 169x off, on the exact op the model was meant to verify. Read the real
+        # volume from the engine; if that fails leave the baseline ABSENT so _write_diff
+        # degrades to the honest "volume now X" branch instead of inventing a delta.
+        if did not in _LAST_VOLUME:
+            vol = entry.get("volume")
+            if not isinstance(vol, (int, float)):
+                try:
+                    vol = (cb.call("eval_mass", {"doc_id": did}) or {}).get("volume_mm3")
+                except Exception:  # noqa: BLE001
+                    vol = None
+            if not isinstance(vol, (int, float)) and entry.get("feature_count") == 0:
+                vol = 0.0  # an empty part's baseline really is zero
+            if isinstance(vol, (int, float)):
+                _LAST_VOLUME[did] = float(vol)
         built = entry.get("feature_count")
         carries = (f"; it ALREADY CARRIES {built} feature(s) — build on them "
                    f"(get_part first), or call new_part(fresh=True) for a "
@@ -5150,9 +6053,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         editable fix_ops + verifier verdict) — record your verdict with regen_resolve(card, action).
 
         SKETCH MUTATIONS: any batch that includes sketch_add_entity / sketch_add_constraint /
-        sketch_set_dim / sketch_fillet / … auto-appends a compact ASCII + NL readback
-        (`ascii_block`, `sketch_summary`, `findings`) for each touched sketch. READ that
-        readback before the next sketch edit. Before declaring a sketch done, call
+        sketch_set_dim / sketch_fillet / … auto-appends one readback per touched sketch under
+        `sketch_readbacks[]`: `ascii_ruled` (the ruled ASCII picture, the only copy), `summary`
+        (closure / dof / ordered schedule), `grid` + `index` (the cell<->world contract
+        apply_ascii_edits resolves cell addresses against) and `findings`. READ that readback
+        before the next sketch edit. Before declaring a sketch done, call
         render_sketch_ascii(sketch) + sketch_health(sketch) (or check_sketch) and require dof 0.
 
         HEAVY OPS: a costly op (a global fillet/chamfer/shell/boolean on a many-edged body) is
@@ -5239,6 +6144,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # alias table maps the generic word "pattern" onto linear_pattern regardless.
             ops = _normalize_pattern_ops(ops, interpreted)
             ops = _normalize_feature_types(ops, interpreted)
+            # The type is canonical only now, and the alias table is keyed by it. Runs
+            # BEFORE the ref migration so a renamed SELECTOR slot (mirror's `about` ->
+            # `plane`, sweep's `spine` -> `path`) still gets carried into refs below.
+            ops = _normalize_type_param_aliases(ops, interpreted)
             # Geometry selectors written into `params` belong in `refs` — the
             # model had the right edges, just the wrong bag. Runs before the
             # sketch/primitive passes so they see the canonical layout.
@@ -5257,6 +6166,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
             # to the engine's canonical schema before validation.
             ops = _normalize_sketch_ops(ops, interpreted)
+            # …and the 2D EDITING ops beside it (trim/extend/offset/fillet/chamfer/
+            # mirror/pattern/move/rotate), whose key names session.cpp reads verbatim and
+            # whose ignored flags silently destroyed or stacked geometry.
+            ops = _normalize_sketch_edit_ops(ops, interpreted)
             # Same, for the primitive placement/orientation dialect models emit
             # (placement:{origin,direction}, boolean:"union") — rewritten to the
             # canonical at/axis/mode/merge keys the engine actually accepts — for the
@@ -5272,6 +6185,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             ops = _resolve_batch_name_refs(ops, interpreted)
             # …and "the sketch I just made", which no name table can carry.
             ops = _resolve_relative_profile_refs(ops, interpreted)
+            # …and a name an EARLIER call created, which no batch-local table can carry.
+            ops = _resolve_doc_name_refs(ops, d, interpreted)
             # LAST: operands are canonical only now, and this reads them.
             ops = _unmerge_boolean_operands(ops, interpreted)
             # …and the same problem for operands built by an EARLIER batch, which
@@ -5394,11 +6309,21 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 # GSL Stage 1a — SEMANTIC write-confirmation (W2): say what the op actually did
                 # ("added 2 faces (+2 cylinder); 2 new bore/hole(s); volume 24000→23435") or warn
                 # "no geometry change" so the model isn't left diffing a bare volume number.
+                # The engine's per-feature warnings and the part's overall size travel with it:
+                # a warning sitting alone in features[] among a column of nulls is not something
+                # a model acts on, and without a bbox "is the part the right size" costs a
+                # separate measure_part call the agent demonstrably never made.
                 vol_after = r.get("volume")
                 if ok:
                     try:
-                        out["changes"] = _write_diff(before_hist, _face_hist(d), before_vol,
-                                                     vol_after)
+                        bbox_after = cb.call("doc_bbox", {"doc_id": d})
+                    except Exception:  # noqa: BLE001
+                        bbox_after = None
+                    try:
+                        out["changes"] = _write_diff(
+                            before_hist, _face_hist(d), before_vol, vol_after,
+                            warnings=[f["warning"] for f in feats if f.get("warning")],
+                            bbox=bbox_after)
                     except Exception:  # noqa: BLE001
                         out["changes"] = {
                             "summary": "geometry changed but write-diff unavailable",
@@ -5417,11 +6342,30 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         try:
                             ov = cb.call("eval_feature_overlap",
                                          {"doc_id": d, "features": added_ids})
-                            if ov.get("pairs") or ov.get("dead_features"):
+                            pairs = ov.get("pairs") or []
+                            # `dead_features` is "built ok but owns no surviving face", which
+                            # every feature UPSTREAM of a dress op satisfies: measured live
+                            # 2026-07-30, an r2 fillet on a plain box moves all 6 of the box's
+                            # faces onto the fillet, so the box lands in dead_features and the
+                            # model was told "1 dead feature(s)" for a textbook-correct fillet
+                            # (nine of them on a ten-feature part). A warning that fires on
+                            # every finishing op is a warning the model learns to ignore. This
+                            # auto-warning is already scoped to the features THIS batch added,
+                            # so scope the dead list the same way; a cut that really kills an
+                            # earlier feature still travels as a boss_swallowed/cut_overlap
+                            # pair, which names BOTH ends and their shared volume.
+                            dead_all = list(ov.get("dead_features") or [])
+                            dead = [f for f in dead_all if f in set(added_ids)]
+                            if pairs or dead:
+                                summary = ov.get("summary")
+                                if isinstance(summary, str) and len(dead) != len(dead_all):
+                                    summary = summary.replace(
+                                        f"; {len(dead_all)} dead feature(s)",
+                                        f"; {len(dead)} dead feature(s)", 1)
                                 out["overlap_warnings"] = {
-                                    "summary": ov.get("summary"),
-                                    "pairs": ov.get("pairs", []),
-                                    "dead_features": ov.get("dead_features", []),
+                                    "summary": summary,
+                                    "pairs": pairs,
+                                    "dead_features": dead,
                                 }
                         except Exception:  # noqa: BLE001
                             pass
@@ -5481,15 +6425,19 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                     readbacks.append(rb)
                             if readbacks:
                                 out["sketch_readbacks"] = readbacks
-                                # Flatten first for models that expect top-level ascii/summary.
-                                primary = readbacks[0]
-                                out["ascii"] = primary.get("ascii")
-                                out["ascii_block"] = primary.get("ascii_block")
-                                out["sketch_summary"] = primary.get("summary")
-                                out["ascii_readback"] = primary
-                                out["readback_hint"] = primary.get("hint")
-                                if primary.get("findings") is not None:
-                                    out.setdefault("findings", primary.get("findings"))
+                                # Say each thing ONCE. Live 2026-07-30: this block also
+                                # set out["ascii_readback"] = readbacks[0] (a full 7.6k
+                                # clone of the object already in sketch_readbacks),
+                                # out["ascii"] + out["ascii_block"] (two more copies of
+                                # the same drawing) and out["sketch_summary"] (a second
+                                # copy of the 3k summary) — 13k of a 25.9k reply was
+                                # duplicate bytes. The readback lives at exactly one
+                                # path now, and the hint names it.
+                                out["readback_hint"] = (
+                                    "sketch_readbacks[i] carries the ruled ASCII picture "
+                                    "(ascii_ruled), the constraint summary, grid/index for "
+                                    "cell-addressed edits, and findings. "
+                                    + str(readbacks[0].get("hint") or ""))
                     except Exception:  # noqa: BLE001
                         pass
                 return out

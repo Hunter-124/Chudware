@@ -3,7 +3,7 @@ name: edit-part
 description: Build or edit a single solid part with editable features, verify after every mutation, and never declare done without verify_battery.
 inject: auto
 triggers:
-  keywords: [part, solid, extrude, revolve, fillet, boss, pocket, shell, model a, design a, make a, make me a, build a, build me a, create a, create me a, model me a, design me a, 3d print a, machine a]
+  keywords: [part, solid, extrude, revolve, fillet, boss, pocket, shell, model a, model an, model me a, design a, design an, design me a, make a, make an, make me a, build a, build an, build me a, create a, create an, create me a, 3d print a, machine a]
   tools: [new_part, add_features, render_part, describe_part]
   phases: [feature, part_verify]
 ---

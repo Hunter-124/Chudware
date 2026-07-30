@@ -23,7 +23,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "edges, shells, solids, sliver faces, orientation). Run it "
             "before an expensive FEA mesh, a CAM toolpath or a STEP/STL "
             "export. `self_intersection` is always checked:false — the "
-            "kernel has no single-body test; use interference_check "
+            "kernel has no single-body test; use check_interference "
             "instead. `volume_mm3` is null for a body with no solid. "
             "repair/fill_holes/fix_normals/fix_winding are REFUSED: fix the "
             "feature that made the bad body, using the sids it just listed."
@@ -33,7 +33,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Alias of check_geometry_health — solid soundness only. It does "
             "NOT check DFM, tolerances or drawings; those are dfm_check, "
-            "tolerance_stackup and review_drawing."
+            "stackup_analyze and review_drawing."
         ),
     },
     "health_check": {
@@ -427,8 +427,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "redo": {
         "prompt_note": (
-            "Usually denied for agents (undo_denied) — prefer doc_checkpoint/doc_revert; "
-            "if it does run, render_part to confirm the restored state."
+            "Usually denied for agents (undo_denied) — roll the doc back with "
+            "plm_timeline then plm_rollback instead; if it does run, render_part "
+            "to confirm the restored state."
         ),
     },
     "regen_diagnose": {
@@ -673,8 +674,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "undo": {
         "prompt_note": (
-            "Usually denied for agents (undo_denied) — prefer doc_checkpoint/doc_revert; "
-            "if it does run, render_part to confirm the rolled-back state."
+            "Usually denied for agents (undo_denied) — roll the doc back with "
+            "plm_timeline then plm_rollback instead; if it does run, render_part "
+            "to confirm the rolled-back state."
         ),
     },
     "verify_battery": {

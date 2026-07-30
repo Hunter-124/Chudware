@@ -1086,7 +1086,7 @@
    "prompt_note": "add_features already runs this per batch (overlap_warnings) — call to re-scan the whole tree or a features=[...] subset; bodies → check_interference."
   },
   "check_geometry_health": {
-   "prompt_note": "Is this solid actually sound? Reports watertight/manifold plus the COUNTS AND SIDS that justify it (free edges, non-manifold edges, shells, solids, sliver faces, orientation). Run it before an expensive FEA mesh, a CAM toolpath or a STEP/STL export. `self_intersection` is always checked:false — the kernel has no single-body test; use interference_check instead. `volume_mm3` is null for a body with no solid. repair/fill_holes/fix_normals/fix_winding are REFUSED: fix the feature that made the bad body, using the sids it just listed."
+   "prompt_note": "Is this solid actually sound? Reports watertight/manifold plus the COUNTS AND SIDS that justify it (free edges, non-manifold edges, shells, solids, sliver faces, orientation). Run it before an expensive FEA mesh, a CAM toolpath or a STEP/STL export. `self_intersection` is always checked:false — the kernel has no single-body test; use check_interference instead. `volume_mm3` is null for a body with no solid. repair/fill_holes/fix_normals/fix_winding are REFUSED: fix the feature that made the bad body, using the sids it just listed."
   },
   "check_interference": {
    "prompt_note": "Needs 2+ bodies — solve_mates first on an assembly so placements are real; overlap INSIDE one part's features → check_feature_overlap."
@@ -1179,7 +1179,7 @@
    "prompt_note": "Needs an active CAM job with results — cam_generate + cam_simulate first; audit=False skips the cam_audit summary for a shorter read."
   },
   "design_audit": {
-   "prompt_note": "Alias of check_geometry_health — solid soundness only. It does NOT check DFM, tolerances or drawings; those are dfm_check, tolerance_stackup and review_drawing."
+   "prompt_note": "Alias of check_geometry_health — solid soundness only. It does NOT check DFM, tolerances or drawings; those are dfm_check, stackup_analyze and review_drawing."
   },
   "design_recipe": {
    "prompt_note": "Empty query lists the recipe catalog; a natural-language query returns ordered steps with params and verify hints."
@@ -1876,7 +1876,7 @@
    "prompt_note": "After a server restart reloads the LAST dropped session's autosaves with FRESH doc_ids (re-map your handles); all=True reaches the full history. BOUNDED to the newest 8 docs; `skipped` counts what stayed on disk. Raise limit= only if the part you want is not among them, because reopening a big pile leaves nothing able to resolve 'the part'."
   },
   "redo": {
-   "prompt_note": "Usually denied for agents (undo_denied) — prefer doc_checkpoint/doc_revert; if it does run, render_part to confirm the restored state."
+   "prompt_note": "Usually denied for agents (undo_denied) — roll the doc back with plm_timeline then plm_rollback instead; if it does run, render_part to confirm the restored state."
   },
   "regen_diagnose": {
    "prompt_note": "For a FAILED rebuild — pass the failed doc JSON (+ last-good reference_json for a drift check); record the verdict with regen_resolve. Needs a model provider.",
@@ -2243,7 +2243,7 @@
    "prompt_note": "Publish the FULL list every call (omitted items disappear from the panel) — same order, updated statuses, after each step."
   },
   "undo": {
-   "prompt_note": "Usually denied for agents (undo_denied) — prefer doc_checkpoint/doc_revert; if it does run, render_part to confirm the rolled-back state."
+   "prompt_note": "Usually denied for agents (undo_denied) — roll the doc back with plm_timeline then plm_rollback instead; if it does run, render_part to confirm the rolled-back state."
   },
   "vendor_login": {
    "prompt_note": "HEADED browser that blocks up to 300s while the HUMAN logs in — tell the user before calling and never retry-loop it; check vendor_status afterwards.",

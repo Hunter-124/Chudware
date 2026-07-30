@@ -1482,6 +1482,83 @@ def _describe_project_text(run: dict | None = None, notes: list | None = None) -
     return _dumps(out)
 
 
+# How many per-entity clauses of a dof narration / schedule collapse are worth printing.
+# Live 2026-07-30 (3-rectangle F profile, 12 lines, dof 40): the narration enumerated all
+# 40 free slots as "line eN p1 x, p1 y, p2 x, p2 y" x12 (~840 chars), the schedule then
+# printed 12 rows whose action and why were IDENTICAL apart from the entity id (~1150
+# chars), and the readback's findings restated both again. Nothing in that repetition is
+# a fact the first clause plus a count does not already carry, and an unbounded
+# enumeration is what pushed one sketch readback to 7.6k chars.
+_HEALTH_SAMPLE = 4
+
+
+def _bounded_clauses(text: str, limit: int = _HEALTH_SAMPLE) -> str:
+    """First ``limit`` semicolon-separated clauses of a narration + "+N more"."""
+    clauses = [c.strip() for c in (text or "").split(";") if c.strip()]
+    if len(clauses) <= limit:
+        return "; ".join(clauses)
+    return "; ".join(clauses[:limit]) + f"; … +{len(clauses) - limit} more"
+
+
+def _schedule_lines(schedule: list) -> list[str]:
+    """Schedule rows, collapsing runs that differ only by which entity they name.
+
+    A 12-row schedule whose every row says "add driving dimension / geometric relation
+    for eN — eN is under-constrained in p1 x, p1 y, p2 x, p2 y" carries exactly one
+    instruction and a list of 12 entities. Emit it that way; keep distinct remedies
+    verbatim and in order."""
+    groups: list[tuple[str, str, str, list[str], dict]] = []
+    for step in schedule:
+        if not isinstance(step, dict):
+            continue
+        kind = str(step.get("kind", "?"))
+        action = str(step.get("action", "?"))
+        why = str(step.get("why", ""))
+        entity = str(step.get("entity", "") or "")
+        # Signature of the remedy with the entity id factored out, so "…for e7 — e7 is
+        # under-constrained in p1 x…" and the e8 row hash to the same instruction.
+        if entity:
+            sig = (kind, action.replace(entity, "$E"), why.replace(entity, "$E"))
+        else:
+            sig = (kind, action, why)
+        if groups and groups[-1][:3] == sig:
+            groups[-1][3].append(entity)
+            groups[-1][5].append(step.get("order"))
+        else:
+            groups.append((sig[0], sig[1], sig[2], [entity], step,
+                           [step.get("order")]))
+
+    out: list[str] = []
+    for kind, action_sig, why_sig, ents, first, orders in groups:
+        order = first.get("order", "?")
+        action = str(first.get("action", "?"))
+        why = str(first.get("why", ""))
+        handles = first.get("handles") or []
+        named = [e for e in ents if e]
+        if len(named) > 1:
+            shown = ", ".join(named[:8])
+            more = f" … +{len(named) - 8}" if len(named) > 8 else ""
+            # Restate the remedy once with the entity slot generic, then name the set.
+            # The order SPAN is kept so a model applying the schedule still knows the
+            # collapsed row stands for steps 2..13, not for step 2 alone.
+            nums = [o for o in orders if isinstance(o, int)]
+            span = f"{min(nums)}-{max(nums)}" if len(nums) > 1 else str(order)
+            generic_action = action_sig.replace("$E", "each entity")
+            generic_why = why_sig.replace("$E", "each")
+            out.append(f"  {span}. [{kind}] x{len(named)}: {generic_action}"
+                       f" — {generic_why} — entities: {shown}{more}")
+            continue
+        if handles:
+            h_str = ", ".join(str(h) for h in handles[:6])
+            more_h = f" … +{len(handles) - 6}" if len(handles) > 6 else ""
+            out.append(f"  {order}. [{kind}] {action} at {h_str}{more_h} — {why}")
+        elif named:
+            out.append(f"  {order}. [{kind}] {action} for {named[0]} — {why}")
+        else:
+            out.append(f"  {order}. [{kind}] {action} — {why}")
+    return out
+
+
 def sketch_health_text(d: dict) -> str:
     """Render a ``doc_sketch_health`` result dict as plain English text for no-vision models.
 
@@ -1520,7 +1597,7 @@ def sketch_health_text(d: dict) -> str:
     elif dof < 0 or status == "over":
         lines.append(f"DOF: {dof} — OVER-CONSTRAINED (conflicting constraints, see below)")
     else:
-        lines.append(f"DOF: {dof} free — {narration}")
+        lines.append(f"DOF: {dof} free — {_bounded_clauses(narration)}")
 
     # ── 3. Conflicts and redundants ──────────────────────────────────────────────
     conflicting = d.get("conflicting") or []
@@ -1540,22 +1617,7 @@ def sketch_health_text(d: dict) -> str:
     schedule = d.get("schedule") or []
     if schedule:
         lines.append("Schedule (apply in order):")
-        for step in schedule:
-            order = step.get("order", "?")
-            kind = step.get("kind", "?")
-            action = step.get("action", "?")
-            why = step.get("why", "")
-            entity = step.get("entity", "")
-            handles = step.get("handles") or []
-            if handles:
-                h_str = ", ".join(str(h) for h in handles[:6])
-                more_h = f" … +{len(handles)-6}" if len(handles) > 6 else ""
-                lines.append(f"  {order}. [{kind}] {action}"
-                             f" at {h_str}{more_h} — {why}")
-            elif entity:
-                lines.append(f"  {order}. [{kind}] {action} for {entity} — {why}")
-            else:
-                lines.append(f"  {order}. [{kind}] {action} — {why}")
+        lines.extend(_schedule_lines(schedule))
     elif dof == 0 and status == "full":
         lines.append("Schedule: (nothing to do — sketch is fully constrained)")
 

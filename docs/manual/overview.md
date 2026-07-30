@@ -168,8 +168,12 @@ approximate a curved or organic body with a stack of boxes.
 Use a raw `script` feature ONLY when no combination of the features below can express the geometry.
 
 READ THE RESULT — add_feature's response carries a `changes` summary ("added 2 faces
-(+2 cylinder); 2 new bore/hole(s); volume 24000→23435") or "no geometry change". Read it
-before building the next feature on the mutation instead of assuming the op did what you meant.
+(+2 cylinder); 2 new bore/hole(s); volume 24000→23435; part bbox 60x40x20 mm"), or
+"no geometry change", or "volume effectively UNCHANGED ... too small to be real material",
+or an "ENGINE WARNING:" prefix naming exactly what the kernel objected to. `changes.bbox_mm`
+is the whole part's overall size — check it against the size you were asked for instead of
+spending a measure_part call. Read all of this before building the next feature on the
+mutation instead of assuming the op did what you meant.
 
 ----------------------------------------------------------------- ADD geometry (op "add_feature")
 

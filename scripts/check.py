@@ -19,6 +19,11 @@ Gates (all stdlib-only — they parse source/docs, so they need NO engine/OCCT d
   - tool_panel_sync       : the Settings → AI → Tools fallback catalog tables
                             (host/src/ui/tool_panel_tables.h) match their snapshot
                             (tools/gen_tool_panel_tables.py --check).
+  - advertised_tool_audit : every tool NAMED to the model in a prompt_note / hint / guidance
+                            string is actually reachable (in a CATEGORY_PACKS pack, a mode
+                            floor or a role loadout) and actually exists. Closes the
+                            run-42508173312214 class: the harness told the model to "execute
+                            with dag_run(...)" while dag_run was in no pack at all.
 
 The engine + agent pytest suites are NOT run here (they need the runtime venv); run them separately:
     <venv>/python -X utf8 -m pytest engine/doc agent -q
@@ -40,6 +45,7 @@ GATES = [
     ("agent_events_audit (event kinds + role catalog)", ["scripts/agent_events_audit.py"]),
     ("oracle_import_audit (services thin-client ratchet)", ["scripts/oracle_import_audit.py"]),
     ("tool_panel_sync (Settings → AI → Tools fallback tables)", ["tools/gen_tool_panel_tables.py", "--check"]),
+    ("advertised_tool_audit (named tools are reachable)", ["scripts/advertised_tool_audit.py"]),
 ]
 
 

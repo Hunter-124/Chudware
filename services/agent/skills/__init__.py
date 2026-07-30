@@ -26,6 +26,7 @@ import re
 import sys
 import threading
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -448,6 +449,28 @@ def _mark_injected(name: str, session_id: str | None = None) -> None:
 # --------------------------------------------------------------------------- triggers / activation
 
 
+@lru_cache(maxsize=1024)
+def _keyword_pattern(kw: str) -> re.Pattern[str]:
+    """Compiled word-boundary matcher for one trigger keyword.
+
+    Matching stays LITERAL per token — no stemming. That is deliberate: the
+    single-word nouns in the builtin lists ("part", "shell", "hole") turn into
+    false-positive machines in the plural ("archive old parts", "spare parts"),
+    which is exactly what test_bare_part_keyword_does_not_match_plural_parts
+    pins. Authors that need both forms list both (see edit-assembly's
+    "mate, mates").
+
+    The one liberty taken is whitespace: a run of spaces in the keyword matches
+    any whitespace run, so a multi-word phrase trigger ("will this hold",
+    "route the board", "check the part") still fires when the user's prompt
+    wrapped or double-spaced between those words.
+    """
+    words = kw.lower().split()
+    if not words:
+        return re.compile(r"(?!x)x")  # never matches
+    return re.compile(r"\b" + r"\s+".join(re.escape(w) for w in words) + r"\b")
+
+
 def match_keyword_triggers(
     text: str,
     *,
@@ -468,7 +491,7 @@ def match_keyword_triggers(
         if already_injected(skill.name, session_id):
             continue
         for kw in skill.triggers.keywords:
-            if kw and re.search(r"\b" + re.escape(kw.lower()) + r"\b", hay):
+            if kw and _keyword_pattern(kw).search(hay):
                 hits.append(skill)
                 break
     return hits

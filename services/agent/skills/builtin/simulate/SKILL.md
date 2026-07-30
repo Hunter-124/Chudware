@@ -3,7 +3,7 @@ name: simulate
 description: Run FEA/CFD/motion studies with honest setup checks — fixtures+loads, mesh sanity, hand-calc anchors, and narrated postcheck before claiming results.
 inject: auto
 triggers:
-  keywords: [fea, cfd, simulate, simulation, stress, modal, thermal, wind tunnel, drag, load case]
+  keywords: [fea, cfd, simulate, simulation, stress, modal, thermal, wind tunnel, drag, load case, will it hold, will this hold, strong enough, hold up under, factor of safety, safety factor, deflection, buckling, von mises, yield strength]
   tools: [run_fea_static, run_fea_modal, run_cfd_flow, simulate_motion]
   phases: [sim]
 ---

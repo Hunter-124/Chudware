@@ -2825,3 +2825,535 @@ def test_circular_pattern_origin_is_a_teaching_rejection_not_an_alias():
            "params": {"count": 6, "angle": 360}}
     assert M._normalize_feature_refs(feat, "circular_pattern", []) is feat
     assert "circular_pattern" not in M._TYPE_REF_ALIASES
+
+
+# ---------------------------------------------------------------------------
+# The 3D features BEYOND the box/extrude/fillet/hole path — loft, revolve, sweep, shell,
+# draft, rib, thread, chamfer, mirror, patterns. Every case below was measured live on
+# 2026-07-30 against a fresh engine (CHUDWARE_ENGINE_DAEMON=0 +
+# CHUDWARE_LIBCHUDWARE=core/build-occt-linux/bin/libchudware.so), driving the real
+# add_features tool on real geometry and reading the VOLUME back, not `ok`.
+
+def test_draft_pull_in_params_reaches_the_pull_slot():
+    """SILENT WRONG GEOMETRY, measured live: params.pull:"axis.x" reached no slot at all,
+    so the draft was built about the DEFAULT pull and reported ok — 22942.038 mm^3 for
+    axis.x, axis.y and axis.z alike, on a 40x30x20 block with a 10 deg taper. refs.pull:
+    "axis.x" is correctly rejected («the draft did not complete»). A pull direction the
+    engine never sees is worse than a rejection: the model gets a taper it did not ask
+    for and no way to tell."""
+    ops = M._migrate_ref_slots([{"op": "add_feature", "feature": {
+        "type": "draft", "name": "D",
+        "params": {"angle": 10, "pull": "axis.x"},
+        "refs": {"neutral": {"of": "face", "side": "bottom"},
+                 "faces": [{"of": "face", "side": "left"}]}}}], [])
+    feat = ops[0]["feature"]
+    assert feat["refs"]["pull"] == "axis.x"
+    assert "pull" not in feat["params"]
+
+
+def test_mirror_features_in_params_reaches_the_features_slot():
+    """SILENT WRONG GEOMETRY, measured live: params.features:["f2"] on a mirror reached no
+    slot, so the mirror fell through to its WHOLE-BODY branch, fused the reflection, and
+    FILLED the hole the model wanted mirrored — volume went UP, 23748.673 -> 24000.0, and
+    the call reported ok. With the slot migrated it builds 23497.345, the same number the
+    canonical refs.features form gives."""
+    ops = M._migrate_ref_slots([{"op": "add_feature", "feature": {
+        "type": "mirror", "name": "M",
+        "params": {"features": ["f2"]}, "refs": {"plane": "plane.right"}}}], [])
+    feat = ops[0]["feature"]
+    assert feat["refs"]["features"] == ["f2"]
+    assert "features" not in feat["params"]
+
+
+def test_boolean_operand_lists_are_not_stolen_by_the_ref_migration():
+    """boolean's flat dialect spells its OPERANDS features/bodies (params.a/params.b after
+    _normalize_inline_boolean), which runs AFTER the migration — so those two names must be
+    excluded for boolean exactly the way `tool` already is."""
+    feat = {"type": "boolean", "name": "B",
+            "params": {"op": "cut", "bodies": ["f1", "f2"]}}
+    ops = M._migrate_ref_slots([{"op": "add_feature", "feature": dict(feat)}], [])
+    assert ops[0]["feature"]["params"]["bodies"] == ["f1", "f2"]
+    assert not ops[0]["feature"].get("refs")
+
+
+def test_sketch_plane_is_not_stolen_by_the_ref_migration():
+    """`plane` is a ref slot on mirror, but on a SKETCH _normalize_sketch_ops owns the
+    whole "which datum is this drawn on" reading (including "XZ"/"Top Plane"). Migrating it
+    early would strand the sketch on the plane.top default — the silent-wrong-datum failure
+    that pass exists to prevent."""
+    ops = M._migrate_ref_slots([{"op": "add_feature", "feature": {
+        "type": "sketch", "name": "S",
+        "params": {"plane": "plane.front", "entities": [], "constraints": []}}}], [])
+    assert ops[0]["feature"]["params"]["plane"] == "plane.front"
+
+
+@pytest.mark.parametrize("ftype,alias,canon,extra", [
+    # rib: params.width=8 built the 3 mm DEFAULT rib (7650.0 mm^3) and reported ok;
+    # thickness=8 builds 8400.0. Silently wrong, measured live.
+    ("rib", "width", "thickness", {}),
+    ("rib", "rib_thickness", "thickness", {}),
+    # thread: params.depth=10 threaded the WHOLE 30 mm cylindrical face (1251.619 mm^3);
+    # length=10 gives 1418.832. Silently wrong, measured live.
+    ("thread", "depth", "length", {"size": "M8"}),
+    # The rest were clean rejections for a value the model DID supply.
+    ("shell", "wall_thickness", "thickness", {}),
+    ("shell", "wall", "thickness", {}),
+    ("chamfer", "size", "length", {}),
+    ("chamfer", "d1", "length", {}),
+    ("draft", "draft_angle", "angle", {}),
+    ("thread", "thread_size", "size", {}),
+    ("thread", "diameter", "major_dia", {"pitch": 1.25}),
+    ("mirror", "about", "plane", {}),
+    ("sweep", "spine", "path", {"mode": "boss"}),
+])
+def test_type_param_alias_reaches_the_key_the_engine_reads(ftype, alias, canon, extra):
+    notes: list = []
+    ops = M._normalize_type_param_aliases([{"op": "add_feature", "feature": {
+        "type": ftype, "name": "F", "params": {alias: 8, **extra}}}], notes)
+    params = ops[0]["feature"]["params"]
+    assert params[canon] == 8
+    assert alias not in params
+    assert notes
+
+
+def test_type_param_alias_never_overrides_an_explicit_canonical_key():
+    feat = {"type": "rib", "name": "R", "params": {"thickness": 3, "width": 8}}
+    ops = M._normalize_type_param_aliases([{"op": "add_feature", "feature": feat}], [])
+    assert ops[0]["feature"]["params"]["thickness"] == 3
+
+
+def test_type_param_alias_leaves_an_unlisted_type_alone():
+    """The table is per-type on purpose: `width` is a real box dimension, not a thickness."""
+    ops = [{"op": "add_feature", "feature": {
+        "type": "box", "name": "B", "params": {"length": 40, "width": 30, "height": 20}}}]
+    assert M._normalize_type_param_aliases(ops, []) is ops
+
+
+def test_doc_name_refs_resolve_a_feature_an_earlier_call_built(monkeypatch):
+    """Measured live 2026-07-30, one call after the other: a sketch named "Prof" built in
+    call 1 and extruded in call 2 died «profile 'Prof' -> 'Prof' not found»; a pattern's
+    refs.features:["pin"] died «refs.features[0]: not a feature id»; a boolean's
+    params.a:"blk" died «ref 'a' -> 'blk' not found». Splitting work across calls is the
+    normal shape of an agent turn, and the document knows every one of those names."""
+    monkeypatch.setattr(M.cb, "call", lambda *_a, **_k: {"tree": {"features": [
+        {"id": "f1", "name": "blk", "type": "box"},
+        {"id": "f2", "name": "pin", "type": "hole"}]}})
+    notes: list = []
+    ops = M._resolve_doc_name_refs([{"op": "add_feature", "feature": {
+        "type": "linear_pattern", "name": "LP",
+        "params": {"count1": 4, "spacing1": 8},
+        "refs": {"dir1": "axis.x", "features": ["pin"]}}}], "doc-1", notes)
+    assert ops[0]["feature"]["refs"]["features"] == ["f2"]
+    assert notes and "pin -> f2" in notes[0]
+
+
+def test_doc_name_refs_leave_an_ambiguous_name_for_the_engine(monkeypatch):
+    """Two features share the name — guessing one would be a silent wrong pick."""
+    monkeypatch.setattr(M.cb, "call", lambda *_a, **_k: {"tree": {"features": [
+        {"id": "f1", "name": "boss", "type": "extrude"},
+        {"id": "f4", "name": "boss", "type": "extrude"}]}})
+    ops = [{"op": "add_feature", "feature": {
+        "type": "mirror", "name": "M",
+        "refs": {"plane": "plane.right", "features": ["boss"]}}}]
+    assert M._resolve_doc_name_refs(ops, "doc-1", []) is ops
+
+
+def test_doc_name_refs_never_repoint_a_same_batch_name_at_an_older_namesake(monkeypatch):
+    """The same-batch pass runs first and owns those names; a new feature reusing an old
+    display name must not have its siblings' refs silently rewired to the OLD feature."""
+    monkeypatch.setattr(M.cb, "call", lambda *_a, **_k: {"tree": {"features": [
+        {"id": "f1", "name": "boss", "type": "extrude"}]}})
+    ops = [{"op": "add_feature", "feature": {"type": "cylinder", "name": "boss",
+                                             "params": {"radius": 3, "height": 6}}},
+           {"op": "add_feature", "feature": {"type": "mirror", "name": "M",
+                                             "refs": {"plane": "plane.right",
+                                                      "features": ["boss"]}}}]
+    assert M._resolve_doc_name_refs(ops, "doc-1", []) is ops
+
+
+def test_doc_name_refs_do_not_touch_the_engine_for_a_canonical_batch(monkeypatch):
+    """One doc_tree call, and only when an unresolved NAME is actually present — a datum,
+    an f<N> id, a "$N" placeholder and a bare sid are none of them."""
+    def _boom(*_a, **_k):
+        raise AssertionError("doc_tree called for a batch with no unresolved name")
+    monkeypatch.setattr(M.cb, "call", _boom)
+    ops = [{"op": "add_feature", "feature": {
+        "type": "mirror", "name": "M",
+        "refs": {"plane": "plane.right", "features": ["f2"]}}},
+        {"op": "add_feature", "feature": {
+            "type": "thread", "name": "T", "params": {"size": "M8"},
+            "refs": {"target_face": "Fa1b2c3"}}}]
+    assert M._resolve_doc_name_refs(ops, "doc-1", []) is ops
+
+
+# --------------------------------------------------------------------------------------
+# 2D SKETCH RELATIONS / DIMENSIONS and the 2D EDITING ops.
+#
+# Measured against the live engine 2026-07-30: of 40 realistic relation payloads and 29
+# dimension payloads, 45 were rejected outright — every one a pure SPELLING miss on a
+# relation the solver already implements — and a rejected sketch takes the whole batch,
+# including every extrude that referenced it. Two flags were worse than rejected: they
+# were ACCEPTED and then ignored.
+
+def _sketch(cons, ents=None, **extra):
+    """The canonical sketch feature the normalizer is handed, with `cons` constraints."""
+    return {"type": "sketch", "name": "S", "refs": {"plane": "plane.top"},
+            "params": {"entities": ents if ents is not None else [
+                {"type": "line", "id": "e1", "p1": [0, 0], "p2": [40, 3],
+                 "construction": False},
+                {"type": "line", "id": "e2", "p1": [41, 1], "p2": [38, 25],
+                 "construction": False},
+                {"type": "circle", "id": "e3", "center": [10, 12], "radius": 4,
+                 "construction": False}],
+                "constraints": cons}, **extra}
+
+
+def _norm_cons(cons, ents=None):
+    notes: list = []
+    feat = M._normalize_sketch_feature(_sketch(cons, ents), notes)
+    return feat["params"]["constraints"], notes
+
+
+@pytest.mark.parametrize("written,canonical", [
+    ("coincidence", "coincident"), ("coinc", "coincident"), ("connect", "coincident"),
+    ("horiz", "horizontal"), ("vert", "vertical"),
+    ("par", "parallel"), ("parallel_to", "parallel"),
+    ("perp", "perpendicular"), ("normal", "perpendicular"), ("orthogonal", "perpendicular"),
+    ("tangent_to", "tangent"), ("tangency", "tangent"),
+    ("equal_length", "equal"), ("equal_radius", "equal"), ("same_length", "equal"),
+    ("coaxial", "concentric"), ("colinear", "collinear"),
+    ("mid", "midpoint"), ("symmetric_about", "symmetric"),
+    ("point_on_line", "point_on"), ("on_curve", "point_on"),
+])
+def test_relation_synonyms_reach_the_engines_closed_vocabulary(written, canonical):
+    """Live probe 2026-07-30: every one of these died on «"perp" is not a constraint type»
+    and took the sketch — and with it every feature referencing it — down with it."""
+    cons, notes = _norm_cons([{"type": written, "refs": ["e1", "e2", "e1"][:3]}])
+    assert cons[0]["type"] == canonical
+    assert notes and written in notes[0]
+
+
+@pytest.mark.parametrize("written,axis", [
+    ("horizontal_distance", "h"), ("distance_x", "h"), ("dist_x", "h"),
+    ("vertical_distance", "v"), ("distance_y", "v"), ("dist_y", "v"),
+])
+def test_axis_distance_dialect_becomes_distance_plus_axis(written, axis):
+    """A horizontal/vertical dimension is not a distinct relation: it is the engine's
+    `distance` with axis:'h'|'v' (validate.cpp:1155). Written as its own type it was
+    rejected; the projection it MEANT is what carries the intent."""
+    cons, notes = _norm_cons([{"type": written, "refs": ["e1.p1", "e1.p2"], "value": 50}])
+    assert cons[0]["type"] == "distance"
+    assert cons[0]["axis"] == axis
+    assert cons[0]["value"] == {"value": 50, "expr": None}
+    assert notes
+
+
+@pytest.mark.parametrize("axis_word,expected", [("x", "h"), ("y", "v"),
+                                                ("horizontal", "h"), ("vertical", "v")])
+def test_distance_axis_world_words_map_onto_h_v(axis_word, expected):
+    """«axis: must be 'h', 'v', or null» — the engine's projection selector is named for
+    the SKETCH frame, not the world axes the model reaches for."""
+    cons, _ = _norm_cons([{"type": "distance", "refs": ["e1.p1", "e1.p2"],
+                           "value": 50, "axis": axis_word}])
+    assert cons[0]["axis"] == expected
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"type": "coincident", "a": "e1.p2", "b": "e2.p1"}, ["e1.p2", "e2.p1"]),
+    ({"type": "coincident", "entity1": "e1.p2", "entity2": "e2.p1"}, ["e1.p2", "e2.p1"]),
+    ({"type": "coincident", "first": "e1.p2", "second": "e2.p1"}, ["e1.p2", "e2.p1"]),
+    ({"type": "coincident", "elements": ["e1.p2", "e2.p1"]}, ["e1.p2", "e2.p1"]),
+    ({"type": "fix", "refs": "e3"}, ["e3"]),
+    ({"type": "fix", "entity": "e3"}, ["e3"]),
+])
+def test_relation_ref_slots_are_hoisted_into_refs(payload, expected):
+    """A relation thought of as "between A and B" rather than as a list lost every one of
+    these to «refs: coincident takes 2..2 refs» (live probe)."""
+    cons, notes = _norm_cons([payload])
+    assert cons[0]["refs"] == expected
+    assert notes
+
+
+def test_refs_split_across_two_dialects_is_completed_not_lost():
+    """{"refs":"e1.p2","b":"e2.p1"} names both refs, one per dialect. Taking only the
+    first left a 1-ref coincident, which the engine rejects."""
+    cons, _ = _norm_cons([{"type": "coincident", "refs": "e1.p2", "b": "e2.p1"}])
+    assert cons[0]["refs"] == ["e1.p2", "e2.p1"]
+
+
+def test_symmetry_axis_in_its_own_slot_becomes_the_third_ref():
+    """The engine wants refs=[a, b, axis]; the mirror line in `axis`/`line`/`about` lost
+    the relation to «refs: symmetric takes 3..3 refs»."""
+    for key in ("axis", "line", "about", "mirror_line"):
+        cons, _ = _norm_cons([{"type": "symmetric", "refs": ["e1", "e2"], key: "e3"}])
+        assert cons[0]["refs"] == ["e1", "e2", "e3"], key
+
+
+def test_distance_axis_key_is_not_eaten_as_a_symmetry_axis():
+    """`axis` on a distance is the h/v projection selector — a different thing entirely
+    from symmetric's mirror line, so the symmetry hoist must be type-gated."""
+    cons, _ = _norm_cons([{"type": "distance", "refs": ["e1.p1", "e1.p2"],
+                           "value": 50, "axis": "h"}])
+    assert cons[0]["refs"] == ["e1.p1", "e1.p2"]
+    assert cons[0]["axis"] == "h"
+
+
+@pytest.mark.parametrize("ctype,key,value", [
+    ("distance", "distance", 50), ("distance", "dim", 50), ("length", "length", 50),
+    ("radius", "radius", 7), ("diameter", "diameter", 14), ("angle", "angle", 90),
+])
+def test_dimension_value_named_after_the_quantity_is_read(ctype, key, value):
+    """«value: required for radius» — a model naming the number after the quantity it
+    measures ({"type":"radius","radius":7}) lost the batch to a missing `value`."""
+    refs = ["e3"] if ctype in ("radius", "diameter") else \
+        (["e1", "e2"] if ctype == "angle" else ["e1.p1", "e1.p2"])
+    cons, notes = _norm_cons([{"type": ctype, "refs": refs, key: value}])
+    assert cons[0]["value"] == {"value": value, "expr": None}
+    assert key not in cons[0]
+    assert notes
+
+
+@pytest.mark.parametrize("written,expected", [("50mm", 50.0), ("5cm", 50.0)])
+def test_unit_literal_dimension_value_converts_to_mm(written, expected):
+    """«value: dimension must be a number» — the unit-suffixed string the rest of the
+    tool already understands never reached a sketch dimension."""
+    cons, _ = _norm_cons([{"type": "length", "refs": ["e1"], "value": written}])
+    assert cons[0]["value"] == {"value": expected, "expr": None}
+
+
+def test_angle_accepts_a_degree_literal():
+    cons, _ = _norm_cons([{"type": "angle", "refs": ["e1", "e2"], "value": "90deg"}])
+    assert cons[0]["value"] == {"value": 90.0, "expr": None}
+
+
+@pytest.mark.parametrize("key", ["reference", "is_reference", "reference_dimension"])
+def test_reference_dimension_becomes_driven_instead_of_moving_the_geometry(key):
+    """THE silent drop. Live probe 2026-07-30: {"type":"length","refs":["e1"],"value":80,
+    "reference":true} returned ok and STRETCHED e1 from 40.112 mm to 80 mm — the model
+    asked for a measurement and got geometry it never requested, with nothing in the
+    response saying so. `driven` is the engine's spelling; every other one was ignored."""
+    cons, notes = _norm_cons([{"type": "length", "refs": ["e1"], "value": 80, key: True}])
+    assert cons[0]["driven"] is True
+    assert key not in cons[0]
+    assert notes
+
+
+def test_driving_is_the_inverse_flag_of_driven():
+    cons, _ = _norm_cons([{"type": "length", "refs": ["e1"], "value": 80, "driving": False}])
+    assert cons[0]["driven"] is True
+    cons, _ = _norm_cons([{"type": "length", "refs": ["e1"], "value": 80, "driving": True}])
+    assert cons[0]["driven"] is False
+
+
+@pytest.mark.parametrize("written,expected", [
+    ("e1:p2", "e1.p2"), ("E1.p2", "e1.p2"), ("l1.p2", "e1.p2"), ("e1.2", "e1.p2"),
+    ("e1.end", "e1.p2"), ("e1.start", "e1.p1"), ("e3.centre", "e3.center"),
+])
+def test_point_handle_spellings_resolve(written, expected):
+    """«'e1:p2' is not a valid handle» named no alternative. `.start`/`.end` on a LINE are
+    p1/p2 — the engine's own sub-names for a line (validate.cpp ENTITY_SUBS)."""
+    cons, _ = _norm_cons([{"type": "coincident", "refs": [written, "e2.p1"]}])
+    assert cons[0]["refs"][0] == expected
+
+
+def test_dangling_constraint_ref_names_the_valid_ids():
+    """A relation on an entity that does not exist must never be dropped — the sketch then
+    solves without the relation the model believes it placed. The engine rejects it but
+    names no alternative; the id roster is in hand HERE."""
+    with pytest.raises(ValueError) as ex:
+        _norm_cons([{"type": "horizontal", "refs": ["e99"]}])
+    assert "e99" in str(ex.value)
+    assert "e1, e2, e3" in str(ex.value)
+
+
+def test_batch_placeholder_in_a_constraint_ref_is_taught_not_guessed():
+    """"$N" names a FEATURE created earlier in the batch; a sketch relation references
+    entities INSIDE this sketch. Guessing between them would silently constrain the
+    wrong geometry."""
+    with pytest.raises(ValueError) as ex:
+        _norm_cons([{"type": "horizontal", "refs": ["$0"]}])
+    assert "$N" in str(ex.value) and "FEATURE" in str(ex.value)
+
+
+@pytest.mark.parametrize("generic,ref,expected", [
+    ("dimension", "e3", "radius"), ("smart_dimension", "e1", "length"),
+    ("dim", "e1", "length"),
+])
+def test_generic_dimension_resolves_from_the_entity_it_points_at(generic, ref, expected):
+    """SolidWorks has one Smart Dimension button; the engine names the concrete relation.
+    The entity type is the only thing that says which one was meant."""
+    cons, notes = _norm_cons([{"type": generic, "refs": [ref], "value": 7}])
+    assert cons[0]["type"] == expected
+    assert notes
+
+
+def test_generic_dimension_on_an_unresolvable_ref_teaches_the_vocabulary():
+    with pytest.raises(ValueError) as ex:
+        _norm_cons([{"type": "dimension", "refs": ["e1.p1"], "value": 7}])
+    assert "distance" in str(ex.value) and "radius/diameter" in str(ex.value)
+
+
+@pytest.mark.parametrize("key", ["is_construction", "for_construction",
+                                 "construction_geometry", "reference"])
+def test_construction_flag_synonyms_are_honoured(key):
+    """Live probe: `bool(e.get("construction", False))` silently swallowed every other
+    spelling, so a centreline written {"is_construction":true} became REAL profile
+    geometry — which is what the extrude then tries to sweep."""
+    notes: list = []
+    feat = M._normalize_sketch_feature(_sketch([], ents=[
+        {"type": "line", "p1": [0, 0], "p2": [10, 0], key: True}]), notes)
+    assert feat["params"]["entities"][0]["construction"] is True
+    assert notes
+
+
+def test_construction_false_as_a_string_is_not_inverted_into_true():
+    """`bool("false")` is True: {"construction":"false"} silently produced CONSTRUCTION
+    geometry, and the extrude then died on "profile sketch has no closed face"."""
+    feat = M._normalize_sketch_feature(_sketch([], ents=[
+        {"type": "line", "p1": [0, 0], "p2": [10, 0], "construction": "false"}]), [])
+    assert feat["params"]["entities"][0]["construction"] is False
+
+
+def test_centerline_is_a_construction_line():
+    """SolidWorks' centreline — where every mirror/revolve workflow starts — has no engine
+    entity type and was rejected as "not a sketch entity type"."""
+    feat = M._normalize_sketch_feature(_sketch([], ents=[
+        {"type": "centerline", "p1": [0, 0], "p2": [0, 40]}]), [])
+    ent = feat["params"]["entities"][0]
+    assert ent["type"] == "line" and ent["construction"] is True
+
+
+def test_canonical_sketch_with_canonical_constraints_is_untouched():
+    """Conservative contract: a byte-canonical sketch must round-trip by identity, or
+    every note this module emits would be a lie about a rewrite that never happened."""
+    feat = _sketch([{"id": "c1", "type": "horizontal", "refs": ["e1"]},
+                    {"id": "c2", "type": "radius", "refs": ["e3"],
+                     "value": {"value": 4, "expr": None}, "driven": False}])
+    assert M._normalize_sketch_feature(feat, []) is feat
+
+
+# ---- the 2D editing ops --------------------------------------------------------------
+
+def _norm_edit(op):
+    notes: list = []
+    return M._normalize_sketch_edit_ops([op], notes)[0], notes
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"op": "sketch_trim", "sketch": "S", "id": "e1", "point": [10, 0]},
+     {"entity": "e1", "point": [10, 0]}),
+    ({"op": "sketch_trim", "sketch": "S", "entities": ["e1"], "at": [10, 0]},
+     {"entity": "e1", "point": [10, 0]}),
+    ({"op": "sketch_trim", "sketch": "S", "entity": "e1", "point": {"x": 10, "y": 0}},
+     {"entity": "e1", "point": [10, 0]}),
+    ({"op": "sketch_extend", "sketch": "S", "id": "e1", "which": "p1"},
+     {"entity": "e1", "end": "start"}),
+    ({"op": "sketch_offset", "sketch": "S", "entity": "e1", "offset": 3, "side": [0, 1]},
+     {"entities": ["e1"], "distance": 3, "side": [0, 1]}),
+    ({"op": "sketch_fillet", "sketch": "S", "entities": ["e1", "e2"], "r": 2},
+     {"e1": "e1", "e2": "e2", "radius": 2}),
+    ({"op": "sketch_chamfer", "sketch": "S", "entities": ["e1", "e2"], "size": 2},
+     {"e1": "e1", "e2": "e2", "distance": 2}),
+    ({"op": "sketch_mirror_entities", "sketch": "S", "entities": ["e3"], "axis": "e1"},
+     {"entities": ["e3"], "line": "e1"}),
+    ({"op": "sketch_move", "sketch": "S", "entities": ["e3"], "delta": [5, 5]},
+     {"entities": ["e3"], "dx": 5, "dy": 5}),
+    ({"op": "sketch_rotate", "sketch": "S", "entities": ["e3"], "center": [0, 0],
+      "angle": 30}, {"entities": ["e3"], "cx": 0, "cy": 0, "angle": 30}),
+    ({"op": "sketch_toggle_construction", "sketch": "S", "entity": "e3"}, {"id": "e3"}),
+])
+def test_editing_op_key_dialect(payload, expected):
+    """session.cpp reads these key names verbatim and they are not even consistent with
+    each other (trim/extend take `entity`, offset/mirror/pattern take `entities`,
+    fillet/chamfer take `e1`/`e2`). Live probe 2026-07-30: 19 of 33 realistic payloads
+    were rejected on a key name alone."""
+    out, notes = _norm_edit(payload)
+    for k, v in expected.items():
+        assert out[k] == v, k
+    assert notes
+
+
+@pytest.mark.parametrize("key", ["duplicate", "keep_original", "as_copy"])
+@pytest.mark.parametrize("opname", ["sketch_move", "sketch_rotate"])
+def test_copy_flag_synonyms_stop_destroying_the_original(key, opname):
+    """The worst editing-op silent drop: {"duplicate":true} was IGNORED, so the op moved
+    the source geometry away instead of copying it — reporting ok while the original was
+    gone. Live probe 2026-07-30 measured 4 entities out where 5 were meant."""
+    op = {"op": opname, "sketch": "S", "entities": ["e3"], key: True,
+          **({"dx": 5, "dy": 5} if opname == "sketch_move"
+             else {"cx": 0, "cy": 0, "angle": 30})}
+    out, notes = _norm_edit(op)
+    assert out["copy"] is True
+    assert key not in out
+    assert notes
+
+
+@pytest.mark.parametrize("written,expected", [
+    ("polar", "circular"), ("radial", "circular"), ("rectangular", "linear"),
+    ("grid", "linear"),
+])
+def test_sketch_pattern_mode_words(written, expected):
+    out, _ = _norm_edit({"op": "sketch_pattern_entities", "sketch": "S",
+                         "entities": ["e3"], "mode": written, "count": 4,
+                         "center": [0, 0], "angle": 90})
+    assert out["mode"] == expected
+
+
+def test_circular_sketch_pattern_full_sweep_becomes_equal_spacing():
+    """`angle` is the PER-STEP rotation, so a 360° step is the identity and all four copies
+    landed exactly on the source — an op that reported ok and produced invisible
+    duplicates (live probe 2026-07-30, the same "seven hexagons at the origin" failure the
+    2026-07-28 keychain run hit one layer up). A 360° per-step is provably a no-op, so
+    reading it as the TOTAL sweep can never lose a legitimate intent."""
+    out, notes = _norm_edit({"op": "sketch_pattern_entities", "sketch": "S",
+                             "entities": ["e3"], "mode": "circular", "count": 4,
+                             "center": [0, 0], "angle": 360})
+    assert out["equal_spacing"] is True
+    assert notes and "PER-STEP" in notes[0]
+
+
+def test_partial_sweep_circular_pattern_is_left_alone():
+    """90° per step is a real, distinct placement for every copy — nothing to infer."""
+    out, _ = _norm_edit({"op": "sketch_pattern_entities", "sketch": "S",
+                         "entities": ["e3"], "mode": "circular", "count": 4,
+                         "center": [0, 0], "angle": 90})
+    assert "equal_spacing" not in out
+
+
+def test_offset_without_a_side_is_a_teaching_rejection():
+    """The engine's «requires 'side': [u, v]» does not say what `side` MEANS, and the
+    model's next guess is usually a word ("left") or another number."""
+    with pytest.raises(ValueError) as ex:
+        _norm_edit({"op": "sketch_offset", "sketch": "S", "entities": ["e1"],
+                    "distance": 3})
+    assert "side the copy goes" in str(ex.value)
+
+
+def test_offset_both_sides_is_rejected_rather_than_silently_halved():
+    """{"both_sides":true} was accepted and ignored — one side came out, and nothing said
+    so. The engine offsets one side per op; two ops is the honest answer."""
+    with pytest.raises(ValueError) as ex:
+        _norm_edit({"op": "sketch_offset", "sketch": "S", "entities": ["e1"],
+                    "distance": 3, "side": [0, 1], "both_sides": True})
+    assert "two ops" in str(ex.value)
+
+
+def test_trim_of_a_multi_entity_selection_is_rejected_not_silently_narrowed():
+    with pytest.raises(ValueError) as ex:
+        _norm_edit({"op": "sketch_trim", "sketch": "S", "entities": ["e1", "e2"],
+                    "point": [10, 0]})
+    assert "ONE entity per op" in str(ex.value)
+
+
+def test_canonical_editing_ops_round_trip_unchanged():
+    """A canonical op must emit NO note — a note claims a rewrite happened."""
+    for op in ({"op": "sketch_trim", "sketch": "S", "entity": "e1", "point": [10, 0]},
+               {"op": "sketch_offset", "sketch": "S", "entities": ["e1"],
+                "distance": 3, "side": [0, 1]},
+               {"op": "sketch_fillet", "sketch": "S", "e1": "e1", "e2": "e2",
+                "radius": 2},
+               {"op": "sketch_pattern_entities", "sketch": "S", "entities": ["e3"],
+                "mode": "linear", "count": 3, "dir": [1, 0], "spacing": 8}):
+        out, notes = _norm_edit(op)
+        assert out == op
+        assert notes == []

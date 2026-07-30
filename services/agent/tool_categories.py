@@ -37,6 +37,15 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "set_process",
         "make_standard_part",
         "preflight_ops",
+        # Explicit, not left to `family:cad`: that expansion is 118 tools trimmed to
+        # whatever room the 40-cap leaves, and `get_part` sorts too late to survive.
+        # It is the single most-named tool in the harness's own prose — every
+        # _CONCEPT_REDIRECTS reply ends "get_part() or describe_part() first to see the
+        # feature ids" — so an unreachable get_part makes the teaching errors unusable.
+        # `recover_parts` is the same story on the doc-lifecycle side (the daemon-restart
+        # hint names it). advertised_tool_audit, 2026-07-30.
+        "get_part",
+        "recover_parts",
     ],
     "sketch": [
         "family:gsl",
@@ -50,6 +59,28 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "convert_face_to_sketch",
         "project_into_sketch",
         "suggest_dimension_scheme",
+        # The 3D free-space sketch discipline. cad_guide's SKETCH playbook walks the
+        # whole sketch3d_new -> add_curves -> add_constraints -> preview -> pipe /
+        # as_sweep_guide chain and the cad guidance notes name sketch3d_add_curves and
+        # sketch3d_pipe directly, but no pack carried ANY of it: `family:cad` is capped
+        # and `sketch3d_*` sorts far past the cut. A whole advertised discipline
+        # unreachable, exactly like the reveng hole below. advertised_tool_audit,
+        # 2026-07-30.
+        "sketch3d_new",
+        "sketch3d_list",
+        "sketch3d_get",
+        "sketch3d_clear",
+        "sketch3d_add_curves",
+        "sketch3d_add_constraints",
+        "sketch3d_path_from_points",
+        "sketch3d_ref_vertex",
+        "sketch3d_sample_at",
+        "sketch3d_section_at",
+        "sketch3d_preview",
+        "sketch3d_pipe",
+        "sketch3d_as_sweep_guide",
+        "sketch3d_to_ledger",
+        "doc_sketch_contact_sheet",
     ],
     "measure": [
         "measure_part",
@@ -79,6 +110,12 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "design_review",
         "dfm_check",
         "verify_battery",
+        # Named in prose, previously in no pack: doc_diff_tool is what the doc-compare
+        # guidance points at, and the engine_profile pair is how a slow rebuild gets
+        # diagnosed instead of guessed at.
+        "doc_diff_tool",
+        "engine_profile",
+        "engine_profile_tree",
     ],
     "research": [
         "research_web_search",
@@ -115,6 +152,15 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "sim_cancel",
         "sim_results",
         "sim_jobs",
+        # The closed-form tier cad_guide sends the model to BEFORE meshing anything
+        # ("struct_estimate/struct_check first", bearing_life + gear_check for
+        # mechanical sizing) plus the motion->FEA bridge. All advertised in the
+        # playbooks, none of it in a pack. advertised_tool_audit, 2026-07-30.
+        "struct_estimate",
+        "struct_check",
+        "bearing_life",
+        "gear_check",
+        "motion_fea_handoff",
         "family:em",
     ],
     "cam": [
@@ -133,25 +179,60 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "cam_audit",
         "cam_job_diff",
         "describe_toolpaths",
+        "cam_cost_estimate",  # named by the parts/quoting playbook; was in no pack
     ],
+    # ECAD, fully curated: no `family:ecad` token. That expansion is 67 tools trimmed
+    # ALPHABETICALLY to whatever the 40-cap leaves after explicit entries, so which half
+    # of the board flow reached the model depended on where the cut happened to land —
+    # and every explicit name added (the thermal/reliability trio below) evicted another
+    # advertised tool off the tail. Two rounds of that cascade were watched live
+    # (ecad_to_3d/ecad_update_from_sch, then ecad_sweep/ecad_thermal_handoff, then
+    # ecad_set_net_class/ecad_stackup_solve) before the token came out. These 40 are
+    # exactly the ecad-family tools the harness NAMES to the model somewhere in
+    # services/**; the remaining 27 are internal/rarely-advertised and stay behind a
+    # deliberate future entry rather than an alphabetical accident.
+    # advertised_tool_audit, 2026-07-30.
     "ecad": [
-        "family:ecad",
-        "ecad_new_schematic",
-        "ecad_new_pcb",
-        "ecad_place_symbol",
-        "ecad_wire",
-        "ecad_find_part",
-        # Explicit, not left to `family:ecad` — that expansion is alphabetically trimmed at
-        # CATEGORY_EXPAND_CAP (40) out of 66 ecad-family tools, so this name survives only by
-        # sorting early. A curated entry keeps the pre-ERC geometry check reachable as more
-        # ecad_a*/ecad_c* tools land (flagged by EcadSchematicQA, 2026-07-29).
-        "ecad_lint_schematic",
-        "ecad_status",
-        "ecad_run_erc",
-        "ecad_run_drc",
-        "ecad_simulate",
         "board_from_schematic",
         "describe_board",
+        "ecad_add_power",
+        "ecad_add_zone",
+        "ecad_airflow_handoff",
+        "ecad_autoplace",
+        "ecad_autoroute",
+        "ecad_check_impedance",
+        "ecad_design",
+        "ecad_export",
+        "ecad_fill_zones",
+        "ecad_find_part",
+        "ecad_fpga_check",
+        "ecad_lint_schematic",
+        "ecad_make_board",
+        "ecad_make_part",
+        "ecad_new_pcb",
+        "ecad_new_schematic",
+        "ecad_optimize_traces",
+        "ecad_place_symbol",
+        "ecad_route_pad_to_pad",
+        "ecad_run_dfm",
+        "ecad_run_drc",
+        "ecad_run_erc",
+        "ecad_run_hostcheck",
+        "ecad_run_pdn",
+        "ecad_run_sicheck",
+        "ecad_set_net_class",
+        "ecad_simulate",
+        "ecad_stackup_solve",
+        "ecad_status",
+        "ecad_sweep",
+        "ecad_thermal_handoff",
+        "ecad_to_3d",
+        "ecad_update_from_sch",
+        "ecad_verify_airflow",
+        "ecad_verify_thermal",
+        "ecad_vibe_check",
+        "ecad_wire",
+        "heatsink_select",
     ],
     "firmware": [
         "fw_status",
@@ -170,6 +251,14 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "fw_serial_read",
         "fw_serial_write",
         "fw_serial_close",
+        # Live-target debug. The fw_debug_* guidance notes cross-reference each other
+        # ("halt first, then read_mem"), so advertising none of them left the whole
+        # debug loop unreachable. advertised_tool_audit, 2026-07-30.
+        "fw_debug_halt",
+        "fw_debug_read_mem",
+        "fw_debug_gdb_halt",
+        "fw_debug_gdb_step",
+        "fw_debug_gdb_read_mem",
     ],
     "assembly": [
         "new_assembly",
@@ -182,6 +271,33 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "fit_calc",
         "fit_report",
         "recommend_fit",
+    ],
+    # Photo intake / first-try fit. The `intake` registry family had no pack and no
+    # role loadout, so four of its eleven tools were reachable by NO route while the
+    # harness advertised them constantly: `submit_part_photos` alone is named in the
+    # intake_status hint ("Populate it first, in this order: 1)
+    # submit_part_photos(claims=[...])"), in measure_from_photo, in fit_report, and in
+    # the cad_guide INTAKE playbook — a numbered procedure whose step 1 the model
+    # could not execute. Same class as the run-42508173312214 dag_run defect.
+    #
+    # The whole loop is listed, not just the four holes: a model that enables this
+    # pack to record photo measurements needs the fit half in the same breath
+    # (confirm_dimensions closes the open_demands submit_part_photos returns, and
+    # fit_report is what proves the fit), and the reachable-elsewhere members cost
+    # nothing to repeat.
+    "intake": [
+        "intake_status",
+        "request_part_photos",
+        "submit_part_photos",
+        "measure_from_photo",
+        "confirm_dimensions",
+        "make_fit_coupon",
+        "resolve_process",
+        "set_process",
+        "fit_calc",
+        "fit_report",
+        "recommend_fit",
+        "dfm_check",
     ],
     "sourcing": [
         "part_search",
@@ -196,6 +312,14 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "scrape_queue_status",
         "import_artifact",
         "part_place",
+        # Vendor session + quoting. The parts guidance says "check vendor_status before
+        # scrape_enqueue to pick an already-logged-in site" and scrape_enqueue's own note
+        # points at vendor_login — an instruction the model could not carry out because
+        # neither tool was in any pack. advertised_tool_audit, 2026-07-30.
+        "vendor_status",
+        "vendor_login",
+        "request_quote",
+        "list_spec_templates",
     ],
     "drawing": [
         "make_drawing",
@@ -302,6 +426,97 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "corporate_chart",
         "coordinate_board",
         "coordinate_progress",
+        # The WORKER half of the org request protocol. `request_resolve` (the
+        # manager half) sits in department_manager.yaml, but no role card and no
+        # pack carried `request_raise` — managers could resolve requests that
+        # nothing in the harness was able to raise. Registered in the `org` family,
+        # which has no family: token anywhere, so this explicit entry is its only
+        # route (advertised_tool_audit, 2026-07-30).
+        "request_raise",
+        # Mission/ledger read surface named by the mission guidance notes
+        # (mission_status for progress, replan_request for a scope change,
+        # ledger_events for the raw stream) and carried by no pack.
+        "mission_status",
+        "replan_request",
+        "ledger_events",
+    ],
+    # PLM / item lifecycle + the product graph. `family:plm` exists and the plm role
+    # card uses it, but concrete_tools trims that role to MAX_TOOLS_PER_ROLE (14) and
+    # the plm_graph_* tools are registry-tagged `cad`, so 16 tools cad_guide's PLM
+    # playbook walks through were reachable by NO route. `plm_timeline` is the worst
+    # of them: the undo_denied refusal — the one place an agent is TOLD how to roll a
+    # document back — names plm_timeline then plm_rollback, and only the second half
+    # was reachable. advertised_tool_audit, 2026-07-30.
+    "plm": [
+        "plm_timeline",
+        "plm_checkpoint",
+        "plm_rollback",
+        "plm_rollback_check",
+        "plm_restore",
+        "plm_compare",
+        "plm_release",
+        "plm_item_set",
+        "plm_add_remote",
+        "plm_set_ai_mode",
+        "plm_graph_search",
+        "plm_graph_keyword",
+        "plm_graph_neighbors",
+        "plm_graph_links",
+        "plm_graph_changes",
+        "plm_graph_brief",
+        "plm_graph_suggest",
+        "plm_graph_watch",
+        "plm_graph_configure",
+    ],
+    # Fluid power: hydraulic circuits + piping networks. Registry-tagged `sim`, which no
+    # pack reaches by family and which the sim pack lists explicitly, so all 17 tools
+    # cad_guide's HYDRAULIC and PIPING playbooks name were unreachable — a numbered
+    # procedure ("hydraulic_new, then size_pump/size_cylinder, then verify_piping") whose
+    # every step was refused. Its own pack rather than more entries on `sim`: the sim
+    # pack is already 22 explicit names under a 40-cap ceiling, and a model asking for
+    # fluid power does not need the FEA/CFD job surface. advertised_tool_audit, 2026-07-30.
+    "fluid": [
+        "hydraulic_new",
+        "hydraulic_add_component",
+        "hydraulic_add_hose",
+        "hydraulic_size_pump",
+        "hydraulic_size_cylinder",
+        "hydraulic_bom",
+        "hydraulic_verify_piping",
+        "hydraulic_verify_fea",
+        "hydraulic_piping_handoff",
+        "hydraulic_fea_handoff",
+        "piping_fluid",
+        "piping_solve",
+        "piping_operating_point",
+        "piping_internal_volume",
+        "piping_report",
+        "piping_verify_cfd",
+        "piping_cfd_handoff",
+    ],
+    # Requirements + layout plan. cad_guide's LAYOUT playbook is an ordered chain
+    # (layout_plan -> req_update -> req_verify_by_id -> req_report) whose middle and end
+    # were unreachable while req_create/req_update were not: half a protocol.
+    # advertised_tool_audit, 2026-07-30.
+    "requirements": [
+        "layout_plan",
+        "layout_plan_report",
+        "req_create",
+        "req_update",
+        "req_status",
+        "req_report",
+        "req_verify_by_id",
+    ],
+    # Documents. The office guidance notes chain read -> extract -> edit
+    # ("office_read_pdf first, then office_edit_pdf"), and only the read half was in the
+    # SHARED floor. advertised_tool_audit, 2026-07-30.
+    "office": [
+        "office_read_pdf",
+        "office_read_docx",
+        "office_extract",
+        "office_edit_docx",
+        "office_edit_pdf",
+        "render_document",
     ],
     "sheetmetal": [
         "add_features",  # sm_base_flange / sm_edge_flange / sm_flat_pattern via ops
@@ -325,11 +540,16 @@ _CATEGORY_DESCS: dict[str, str] = {
     "ecad": "Schematic/PCB place-wire-board and ERC/DRC/sim",
     "firmware": "Embedded firmware: scaffold/build/emulate, board co-verify, flash & serial",
     "assembly": "Components, mates, stackup and fit calcs",
+    "intake": "Photo intake of real parts: measure, confirm dims, prove first-try fit",
     "sourcing": "Parts catalog search/place, BOM, vendors, scrape import",
     "drawing": "2D drawings, GD&T, export PDF/DXF",
     "reveng": "Reverse engineering: scan/photo/datasheet intake, reconstruct, verify deviation",
     "advisor": "Stage advisory checks and dispute",
-    "delegate": "Subagents, ask_user, ledger/dag/buildgraph",
+    "delegate": "Subagents, ask_user, ledger/dag/buildgraph, mission + org coordination",
+    "plm": "Item lifecycle, checkpoints/rollback, release, product-graph queries",
+    "fluid": "Hydraulic circuits and piping networks: size, solve, verify",
+    "requirements": "Layout plan, requirements capture and auto-verification",
+    "office": "PDF/DOCX read, extract, edit and render",
     "sheetmetal": "Sheet-metal flanges/bends via add_features + bend calcs",
 }
 

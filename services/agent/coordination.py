@@ -194,8 +194,14 @@ class CoordinationBoard:
                         "scope; do not hard-deadlock"
                     ),
                     "hint": (
+                        # The model-facing names, not this class's method names:
+                        # release_claim/post_progress are CoordinationBoard methods it
+                        # cannot call — the tools are the MissionDispatch verbs
+                        # (mission_dispatch._handlers). Named wrong until
+                        # advertised_tool_audit caught it, 2026-07-30.
                         "Release is not automatic. Narrow resources, wait for the "
-                        "holder to release_claim, or coordinate via post_progress."
+                        "holder to coordinate_release, or coordinate via "
+                        "coordinate_progress."
                     ),
                 }
 

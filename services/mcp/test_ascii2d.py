@@ -368,9 +368,8 @@ def test_sketch_mutation_readback_has_ascii_and_summary():
     rb = sketch_mutation_readback(sk, pitch=1.0, sketch_id="s1")
     assert rb["ok"] is True
     assert rb["kind"] == "sketch_readback"
-    assert rb["ascii"] and isinstance(rb["ascii"], str)
-    assert rb["ascii_block"].startswith("[sketch_readback")
-    assert "ascii" in rb and "summary" in rb
+    assert rb["ascii_ruled"].startswith("[sketch_readback")
+    assert "summary" in rb
     assert "Entities:" in rb["summary"] or "entit" in rb["summary"].lower()
     assert "Dimensions:" in rb["summary"]
     assert "Constraints:" in rb["summary"]
@@ -382,24 +381,79 @@ def test_sketch_mutation_readback_has_ascii_and_summary():
     assert "distance" in rb["summary"].lower() or "c3" in rb["summary"]
 
 
+def test_sketch_readback_ships_exactly_one_picture():
+    """Live 2026-07-30: one add_features batch adding a 3-rectangle profile returned
+    26k chars, and the readback shipped the SAME drawing three times — `ascii` (bare),
+    `ascii_block` (header + bare) and `ascii_ruled` (rulers). Only the ruled variant
+    carries the 0-based col/row numbers a model reads a cell address off, and cell
+    addresses are the contract apply_ascii_edits(kind='sketch') resolves against, so
+    that is the one that ships. The bare variants must NOT come back."""
+    rb = sketch_mutation_readback(_open_sketch(), pitch=1.0, sketch_id="s1")
+    pictures = [k for k in rb if k == "ascii" or k.startswith("ascii_")]
+    assert pictures == ["ascii_ruled"], pictures
+    ruled = rb["ascii_ruled"].split("\n")
+    # header, then a col ruler, then rows prefixed with their 0-based row number.
+    assert ruled[0].startswith("[sketch_readback id=s1 ")
+    assert " 0 |" in rb["ascii_ruled"]
+
+
 def test_sketch_mutation_readback_caps_and_determinism():
     sk = _open_sketch()
     a = sketch_mutation_readback(sk, pitch=0.1, max_h=40, max_w=120)
     b = sketch_mutation_readback(sk, pitch=0.1, max_h=40, max_w=120)
-    assert a["ascii"] == b["ascii"]
+    assert a["ascii_ruled"] == b["ascii_ruled"]
     assert a["summary"] == b["summary"]
     assert a["findings"] == b["findings"]
-    assert a["ascii_block"] == b["ascii_block"]
-    rows = a["ascii"].split("\n")
-    assert len(rows) <= READBACK_MAX_H
-    assert all(len(r) <= READBACK_MAX_W for r in rows)
+    assert a["grid"] == b["grid"]
     assert a["height"] <= READBACK_MAX_H
     assert a["width"] <= READBACK_MAX_W
     # force tiny cap to exercise truncation path
     tiny = sketch_mutation_readback(sk, pitch=0.05, max_h=5, max_w=10)
     assert tiny["height"] <= 5
     assert tiny["width"] <= 10
-    assert all(len(r) <= 10 for r in tiny["ascii"].split("\n"))
+
+
+def test_truncated_sketch_readback_index_never_claims_off_picture_cells():
+    """Measured 2026-07-30 on a 30x200 mm profile: the readback shipped 40 rows and said
+    `truncated: True`, while `grid.height` still said 41 and `index` still advertised
+    entities at cell "0,40" — a row the model cannot see and world_to_cell can never
+    return. grid/index describe the SHIPPED picture, and whatever fell off is named."""
+    tall = [{"id": "e1", "type": "line", "p1": [0, 0], "p2": [30, 0]},
+            {"id": "e2", "type": "line", "p1": [30, 0], "p2": [30, 200]},
+            {"id": "e3", "type": "line", "p1": [30, 200], "p2": [0, 200]},
+            {"id": "e4", "type": "line", "p1": [0, 200], "p2": [0, 0]}]
+    rb = sketch_mutation_readback({"id": "s1", "entities": tall})
+    assert rb["truncated"] is True
+    assert rb["grid"]["width"] == rb["width"]
+    assert rb["grid"]["height"] == rb["height"]
+    for key in rb["index"]:
+        col, row = (int(t) for t in key.split(","))
+        assert 0 <= col < rb["width"] and 0 <= row < rb["height"], key
+    # the entities that fell off the crop are NAMED, not silently dropped
+    assert rb["clipped_entities"] == ["e1", "e2"], rb.get("clipped_entities")
+    assert "CROPPED" in rb["hint"]
+
+
+def test_sketch_readback_grid_cell_to_world_inverts_the_rasterizer():
+    """The `index` maps a cell to the entities STARTING there, so cell_to_world applied
+    to an index key must land exactly on that entity's p1. Live 2026-07-30 it did not:
+    the raster put e1.p1=(10,-6) in cell (1,19) and the documented half-pitch formula
+    answered (10.5,-6.5), while world_to_cell(10,-6) answered (0,18) — a full cell off.
+    apply_ascii_edits resolves `to_cell` through cell_to_world."""
+    ents = [{"id": "e1", "type": "line", "p1": [10, -6], "p2": [16, -6]},
+            {"id": "e2", "type": "line", "p1": [16, -6], "p2": [16, 12]}]
+    rb = sketch_mutation_readback({"id": "s1", "entities": ents}, pitch=1.0)
+    g = rb["grid"]
+    assert g["cell_to_world"] == (
+        "x = bbox[0] + col * pitch; "
+        "y = bbox[3] - row * pitch  # y_up, row0=top; cell = lattice point, not box centre")
+    assert rb["index"], rb
+    for key, hits in rb["index"].items():
+        col, row = (int(t) for t in key.split(","))
+        x, y = cell_to_world(col, row, g)
+        for hit in hits:
+            assert (x, y) == tuple(hit["p1"]), (key, x, y, hit)
+            assert world_to_cell(hit["p1"][0], hit["p1"][1], g) == (col, row)
 
 
 def test_board_mutation_readback_has_ascii_summary_net_delta():
@@ -441,10 +495,14 @@ def test_attach_helpers_mutate_response():
     board = _crossing_board()
     resp_s: dict = {"ok": True, "doc_id": "d1"}
     attach_sketch_readback(resp_s, sk, sketch_id="s1", pitch=1.0)
-    assert resp_s["ascii"]
-    assert resp_s["ascii_block"]
-    assert resp_s["sketch_summary"]
     assert resp_s["ascii_readback"]["ok"] is True
+    assert resp_s["ascii_readback"]["ascii_ruled"]
+    # The picture and the summary live at ONE path — the helper no longer clones them
+    # onto the response as ascii / ascii_block / sketch_summary.
+    assert "ascii" not in resp_s and "ascii_block" not in resp_s
+    assert "sketch_summary" not in resp_s
+    # …but a response with no headline of its own still gets the summary as one.
+    assert resp_s["summary"] == resp_s["ascii_readback"]["summary"]
 
     resp_b: dict = {"ok": True, "doc_id": "pcb1"}
     attach_board_readback(resp_b, board, pitch_mm=2.0, layer="F.Cu")

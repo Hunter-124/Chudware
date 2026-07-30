@@ -1342,6 +1342,183 @@ def test_new_part_seeds_volume_baseline_for_write_diff():
     assert cad_tools._LAST_VOLUME[doc] == r2["volume_mm3"], "baseline updated to the new volume"
 
 
+# --- the write-diff must answer "did I build what I meant?" ------------------------------
+# Live 2026-07-30 audit of `changes` across real op types found four ways it lied or went
+# quiet. Each test below pins one of them with a geometry number.
+
+def test_a_resumed_part_carrying_geometry_keeps_a_real_volume_baseline():
+    """A RESUME must seed _LAST_VOLUME from the engine, not from a fabricated 0.0.
+
+    Measured live 2026-07-30: neither doc_new(resume_if_open=True) nor doc_list reports a
+    `volume`, so the old `setdefault(did, entry.get("volume", 0.0) or 0.0)` seeded 0.0 for
+    every resume made from a process that had not itself built the part. A resumed
+    48000 mm^3 box, then cut by 282.3 mm^3, reported "volume 0.0->47717.7 (+47717.7)" — the
+    sign inverted and the magnitude 169x off, on the exact op the model was verifying."""
+    from mcp_server import cad_tools
+    r, _ = _call("new_part", {"name": "resumebase", "fresh": True})
+    doc = r["doc_id"]
+    built, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
+    assert built["ok"], built
+    # Drop the in-process baseline: this is what a fresh MCP process / post-restart resume sees.
+    cad_tools._LAST_VOLUME.pop(doc, None)
+    again, _ = _call("new_part", {"name": "resumebase"})
+    assert again["doc_id"] == doc and again.get("resumed"), again
+    assert cad_tools._LAST_VOLUME[doc] == pytest.approx(48000.0, rel=1e-6), \
+        cad_tools._LAST_VOLUME.get(doc)
+    cut, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("sketch", "S", {"plane": "top", "entities": [
+            {"type": "circle", "center": [10, 10], "radius": 3}]}),
+        cb.feat("extrude", "Hole", {"depth": cb.dim(30), "mode": "cut",
+                                    "direction": "reverse"}, {"profile": "$0"})]})
+    assert cut["ok"], cut
+    # The cut REMOVED material: the delta must be negative and ~ -pi*9*10, not +47717.
+    assert cut["changes"]["volume_delta_mm3"] == pytest.approx(-282.27, abs=0.5), cut["changes"]
+
+
+def test_a_negligible_volume_change_is_not_reported_as_a_change():
+    """A fillet of radius 1e-5 mm moves 0.0005 mm^3 of a 48000 mm^3 box (1e-8 of the body).
+
+    That used to print "volume 48000.0->48000.0 mm^3 (-0.0)" — a line that claims a change,
+    shows identical before/after numbers and a zero delta, and reads to the model as a
+    successful fillet. It must name itself as effectively no material change instead."""
+    r, _ = _call("new_part", {"name": "negligible", "fresh": True})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
+    tiny, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("fillet", "R", {"radius": cb.dim(1e-5)},
+                {"edges": [{"of": "edge", "parallel": "z"}]})]})
+    assert tiny["ok"], tiny
+    ch = tiny["changes"]
+    assert ch["faces_delta"] == 4, ch          # the topology really did change
+    assert abs(ch["volume_delta_mm3"]) < 0.01, ch
+    assert "effectively UNCHANGED" in ch["summary"], ch["summary"]
+    assert "->" not in ch["summary"].split("part bbox")[0], ch["summary"]
+
+
+def test_a_real_fillet_still_reads_as_a_real_volume_change():
+    """The negligible-change floor is relative (1e-7 of the body), so it must not swallow a
+    fillet a user would actually see: r=0.5 on the same box removes ~4.3 mm^3 (8e-5 of the
+    body), four orders of magnitude clear of the floor."""
+    r, _ = _call("new_part", {"name": "realfillet", "fresh": True})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
+    got, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("fillet", "R", {"radius": cb.dim(0.5)},
+                {"edges": [{"of": "edge", "parallel": "z"}]})]})
+    assert got["ok"], got
+    ch = got["changes"]
+    assert ch["volume_delta_mm3"] == pytest.approx(-4.317, abs=0.05), ch
+    assert "48000.0->" in ch["summary"] and "effectively UNCHANGED" not in ch["summary"], \
+        ch["summary"]
+
+
+def test_an_engine_feature_warning_names_the_cause_in_the_changes_summary():
+    """A sub-tolerance blend (radius < 1e-7, document.cpp) passes the body through and sets
+    feature_status[].warning "fillet 1e-08 below tolerance; no material removed".
+
+    That warning used to travel ONLY in features[], one entry in a column of nulls, while
+    `changes.summary` — the line the ops cheatsheet tells the model to read — printed the
+    generic guess "a cut/boolean may have missed". The engine already knew the answer."""
+    r, _ = _call("new_part", {"name": "subtol", "fresh": True})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
+    got, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("fillet", "R", {"radius": cb.dim(1e-8)},
+                {"edges": [{"of": "edge", "parallel": "z"}]})]})
+    assert got["ok"], got
+    warned = [f["warning"] for f in got["features"] if f.get("warning")]
+    assert warned and "below tolerance" in warned[0], got["features"]
+    summary = got["changes"]["summary"]
+    assert "no geometry change" in summary, summary
+    assert "below tolerance" in summary, summary
+    # The generic guess must not be what the model reads when the engine gave a real reason.
+    assert "may have missed" not in summary, summary
+
+
+def test_a_warning_on_a_SUCCESSFUL_op_is_prefixed_onto_the_changes_summary():
+    """The dangerous case is a warning on an op that otherwise reads as a clean success.
+
+    A blind hole deeper than the stock is clamped to a THROUGH hole (document.cpp ~5460).
+    Every number in the write-diff looks right — "added 1 face(s) (+1 cylinder); 1 new
+    bore/hole(s); volume 48000.0->47435.5 (-564.5)" — and the model has no reason to look
+    at features[] for the one line saying its blind pocket is now a through hole."""
+    r, _ = _call("new_part", {"name": "clamped", "fresh": True})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
+    got, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("hole", "H", {"style": "simple", "diameter": cb.dim(6), "depth": cb.dim(999),
+                              "end": "blind", "at": [10, 10]},
+                {"face": {"of": "face", "side": "top"}})]})
+    assert got["ok"], got
+    ch = got["changes"]
+    assert ch["bores_delta"] == 1 and ch["volume_delta_mm3"] < 0, ch   # it looks like a clean win
+    assert ch["summary"].startswith("ENGINE WARNING: "), ch["summary"]
+    assert "clamped to a through hole" in ch["summary"], ch["summary"]
+    # …and the real deltas still follow the warning, not replaced by it.
+    assert "1 new bore/hole(s)" in ch["summary"], ch["summary"]
+
+
+def test_the_write_diff_carries_the_whole_part_bbox():
+    """"Is the part the right size" must not cost a separate measure_part round trip.
+
+    A boss sketched at [200,200] fuses cleanly and every delta looks healthy ("added 6
+    face(s); volume 48000->49000 (+1000)") while the 60 mm part silently becomes 240 mm
+    wide. Only the bbox says so."""
+    r, _ = _call("new_part", {"name": "runaway", "fresh": True})
+    doc = r["doc_id"]
+    base, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
+    assert base["changes"]["bbox_mm"] == [60.0, 40.0, 20.0], base["changes"]
+    assert "part bbox 60x40x20 mm" in base["changes"]["summary"], base["changes"]["summary"]
+    far, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("sketch", "S", {"plane": "top", "entities": [
+            {"type": "rectangle", "corner1": [200, 200], "corner2": [210, 210]}]}),
+        cb.feat("extrude", "Far", {"depth": cb.dim(10), "mode": "boss"}, {"profile": "$0"})]})
+    assert far["ok"], far
+    ch = far["changes"]
+    assert ch["volume_delta_mm3"] == pytest.approx(1000.0, abs=1.0), ch   # looks healthy
+    assert ch["bbox_mm"][0] == pytest.approx(240.0, abs=0.01), ch         # but it is not
+    assert ch["bbox_mm"][1] == pytest.approx(230.0, abs=0.01), ch
+
+
+def test_a_dress_op_does_not_report_the_body_it_dressed_as_a_dead_feature():
+    """add_features' auto overlap warning must not cry wolf on every finishing op.
+
+    eval_feature_overlap calls a feature dead when it "owns no surviving face", and a dress
+    op takes ownership of the whole body: measured live 2026-07-30, an r2 fillet on a plain
+    box moves all 6 of the box's faces onto the fillet, so add_features attached
+    "1 dead feature(s)" naming the box — for a textbook-correct fillet. A real kill still
+    travels as a pair, which names both ends and the shared volume."""
+    r, _ = _call("new_part", {"name": "dressnoise", "fresh": True})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
+    dressed, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("fillet", "R", {"radius": cb.dim(2)},
+                {"edges": [{"of": "edge", "parallel": "z"}]})]})
+    assert dressed["ok"], dressed
+    assert dressed["changes"]["volume_delta_mm3"] < 0, dressed["changes"]  # a real fillet
+    assert "overlap_warnings" not in dressed, dressed["overlap_warnings"]
+    # …while a cut that eats into an earlier feature still warns, naming both ends.
+    r2, _ = _call("new_part", {"name": "dressnoise_cut", "fresh": True})
+    doc2 = r2["doc_id"]
+    _call("add_features", {"doc_id": doc2, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
+    cut, _ = _call("add_features", {"doc_id": doc2, "ops": [
+        cb.feat("sketch", "S", {"plane": "top", "entities": [
+            {"type": "rectangle", "corner1": [-2, -2], "corner2": [20, 20]}]}),
+        cb.feat("extrude", "Kill", {"depth": cb.dim(20), "mode": "cut"}, {"profile": "$0"})]})
+    assert cut["ok"], cut
+    pairs = cut["overlap_warnings"]["pairs"]
+    assert pairs and pairs[0]["a_name"] == "B" and pairs[0]["b_name"] == "Kill", pairs
+    assert pairs[0]["volume_mm3"] == pytest.approx(4840.0, abs=1.0), pairs
+
+
 # --- new_part resume-or-mint is ATOMIC ---------------------------------------------------
 # Live 2026-07-29, run-42508173312214: the trace holds ONE new_part("lexus_f_keychain")
 # and the GUI grew THREE tabs (lexus_f_keychain, ...2, ...3). new_part used to decide
@@ -2882,6 +3059,126 @@ def test_hole_depth_nonsense_word_still_fails_with_the_end_condition_vocabulary(
              "params": {"diameter": {"value": 20}, "depth": {"value": "halfway"}}}, [])
     msg = str(ei.value)
     assert "halfway" in msg and "through_all" in msg and "blind hole" in msg, msg
+
+
+# --------------------------------------------------------------------------------------
+# LIVE 2D sketch relation/dimension dialect. Measured 2026-07-30 against the real solver:
+# a rejected sketch takes the whole batch (and every extrude referencing it), and a
+# SILENTLY IGNORED relation is worse — the sketch solves differently than the model
+# believes. These go through the engine so the proof is the SOLVE, not `ok: true`.
+
+_DIALECT_SKETCH = [
+    {"type": "line", "id": "e1", "p1": [0, 0], "p2": [40, 3], "construction": False},
+    {"type": "line", "id": "e2", "p1": [41, 1], "p2": [38, 25], "construction": False},
+    {"type": "circle", "id": "e3", "center": [10, 12], "radius": 4, "construction": False},
+    {"type": "circle", "id": "e4", "center": [30, 12], "radius": 3, "construction": False},
+]
+
+
+def _solve_sketch(name: str, constraints: list) -> dict:
+    """Build a one-sketch part with `constraints` and return the SOLVED entities by id."""
+    r, _ = _call("new_part", {"name": name, "fresh": True})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [{
+        "op": "add_feature",
+        "feature": {"type": "sketch", "name": "S", "refs": {"plane": "plane.top"},
+                    "params": {"entities": json.loads(json.dumps(_DIALECT_SKETCH)),
+                               "constraints": constraints}}}]})
+    assert r.get("ok"), r
+    ov = cb.call("doc_sketch_overview", {"doc_id": doc, "sketch": "f1"})
+    return {e["id"]: e for e in ov["entities"]}
+
+
+def test_equal_radius_synonym_actually_equalises_the_radii():
+    """«"equal_radius" is not a constraint type» killed the batch. Proof that the mapped
+    relation reaches the SOLVER, not just validation: r=4 and r=3 must both become 3.5."""
+    ents = _solve_sketch("eqrad", [{"type": "equal_radius", "refs": ["e3", "e4"]}])
+    assert math.isclose(ents["e3"]["radius"], 3.5, abs_tol=1e-6), ents["e3"]
+    assert math.isclose(ents["e4"]["radius"], 3.5, abs_tol=1e-6), ents["e4"]
+
+
+def test_horizontal_distance_dialect_projects_onto_the_h_axis():
+    """"horizontal_distance" is the engine's `distance` with axis:'h'. Dropping the axis
+    would apply a TRUE point-to-point distance instead — different geometry, not a near
+    miss: e1's endpoints stay 3 mm apart in y and spread to exactly 50 mm in x."""
+    ents = _solve_sketch("hdist", [{"type": "horizontal_distance",
+                                    "refs": ["e1.p1", "e1.p2"], "value": 50}])
+    p1, p2 = ents["e1"]["p1"], ents["e1"]["p2"]
+    assert math.isclose(abs(p2[0] - p1[0]), 50.0, abs_tol=1e-6), (p1, p2)
+    assert math.isclose(abs(p2[1] - p1[1]), 3.0, abs_tol=1e-6), (p1, p2)
+
+
+def test_reference_dimension_measures_instead_of_driving():
+    """THE silent drop this session. {"type":"length","value":80,"reference":true} used to
+    return ok and STRETCH e1 from 40.112 mm to 80 mm — the model asked for a measurement
+    and got geometry it never requested. `reference` must mean the same as `driven`."""
+    def _len(c):
+        e = _solve_sketch("refdim", [c])["e1"]
+        return math.dist(e["p1"], e["p2"])
+
+    assert math.isclose(_len({"type": "length", "refs": ["e1"], "value": 80}), 80.0,
+                        abs_tol=1e-3)
+    authored = math.hypot(40.0, 3.0)
+    for key in ("driven", "reference", "is_reference"):
+        got = _len({"type": "length", "refs": ["e1"], "value": 80, key: True})
+        assert math.isclose(got, authored, abs_tol=1e-6), (key, got)
+
+
+def test_dangling_constraint_ref_names_the_sketch_ids():
+    """A relation on an entity that does not exist must fail LOUDLY and say what the real
+    ids are — never be dropped, which would leave a sketch that solves differently than
+    the model believes it constrained."""
+    r, _ = _call("new_part", {"name": "dangle", "fresh": True})
+    r2, _ = _call("add_features", {"doc_id": r["doc_id"], "ops": [{
+        "op": "add_feature",
+        "feature": {"type": "sketch", "name": "S", "refs": {"plane": "plane.top"},
+                    "params": {"entities": json.loads(json.dumps(_DIALECT_SKETCH)),
+                               "constraints": [{"type": "horizontal", "refs": ["e99"]}]}}}]})
+    assert not r2.get("ok"), r2
+    msg = str(r2.get("error"))
+    assert "e99" in msg and "e1, e2, e3, e4" in msg, msg
+
+
+def test_circular_sketch_pattern_full_sweep_no_longer_stacks_every_copy():
+    """`angle` is the PER-STEP rotation, so {"mode":"circular","count":4,"angle":360} put
+    all four copies exactly on the source — an op that reported ok and produced invisible
+    duplicates. Read as the TOTAL sweep, the four centres must be four DISTINCT points."""
+    r, _ = _call("new_part", {"name": "circpat", "fresh": True})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature",
+         "feature": {"type": "sketch", "name": "S", "refs": {"plane": "plane.top"},
+                     "params": {"entities": [{"type": "circle", "id": "e1",
+                                              "center": [10, 0], "radius": 2,
+                                              "construction": False}],
+                                "constraints": []}}},
+        {"op": "sketch_pattern_entities", "sketch": "$0", "entities": ["e1"],
+         "mode": "circular", "count": 4, "center": [0, 0], "angle": 360}]})
+    assert r.get("ok"), r
+    ov = cb.call("doc_sketch_overview", {"doc_id": doc, "sketch": "f1"})
+    centres = {(round(e["center"][0], 3), round(e["center"][1], 3)) for e in ov["entities"]}
+    assert len(centres) == 4, sorted(centres)
+
+
+def test_move_duplicate_synonym_keeps_the_original():
+    """{"duplicate":true} was ignored, so sketch_move carried the source geometry away
+    instead of copying it — the op reported ok and the original was gone."""
+    r, _ = _call("new_part", {"name": "mvcopy", "fresh": True})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature",
+         "feature": {"type": "sketch", "name": "S", "refs": {"plane": "plane.top"},
+                     "params": {"entities": [{"type": "circle", "id": "e1",
+                                              "center": [0, 0], "radius": 2,
+                                              "construction": False}],
+                                "constraints": []}}},
+        {"op": "sketch_move", "sketch": "$0", "entities": ["e1"], "dx": 10, "dy": 0,
+         "duplicate": True}]})
+    assert r.get("ok"), r
+    ov = cb.call("doc_sketch_overview", {"doc_id": doc, "sketch": "f1"})
+    centres = sorted(round(e["center"][0], 3) for e in ov["entities"])
+    assert centres == [0.0, 10.0], centres
+
 
 
 if __name__ == "__main__":

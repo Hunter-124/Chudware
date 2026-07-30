@@ -81,12 +81,23 @@ def make_grid_meta(*, xmin: float, ymin: float, xmax: float, ymax: float,
                    pitch: float, width: int, height: int,
                    unit: str = "mm", y_up: bool = True,
                    kind: str = "", layer: str = "") -> dict:
-    """Stable cell↔world contract for render + apply-edit round-trips.
+    """Stable cell<->world contract for render + apply-edit round-trips.
 
-    World (x,y) with y increasing UP maps to cell (col,row) with row 0 at the
-    TOP of the printed ASCII (image coords). Cell centres are:
-        x = xmin + (col + 0.5) * pitch
-        y = ymax - (row + 0.5) * pitch   when y_up
+    Every rasterizer in this module addresses a cell as the NEAREST LATTICE POINT
+    (``_clamp_int((x - xmin) / pitch)``), and sizes the raster as
+    ``ceil(span / pitch) + 1`` — a lattice-point count, not a box count. So cell
+    (col,row) SAMPLES the world point::
+
+        x = xmin + col * pitch
+        y = ymax - row * pitch   when y_up (row 0 is the top of the printed block)
+
+    Live 2026-07-30: this pair used to be documented (and implemented) with a
+    half-pitch box-centre offset — ``xmin + (col + 0.5) * pitch`` — which does NOT
+    invert the rasterizer. Measured on the 3-rectangle F sketch: the raster placed
+    e1.p1 = (10,-6) in cell (1,19), and cell_to_world(1,19) answered (10.5,-6.5),
+    while world_to_cell(10,-6) answered (0,18) — a full cell off. apply_ascii_edits
+    resolves `to_cell` through cell_to_world, so every cell-addressed edit landed
+    half a pitch away from the cell the model was looking at.
     """
     meta = {
         "kind": kind or None,
@@ -100,12 +111,12 @@ def make_grid_meta(*, xmin: float, ymin: float, xmax: float, ymax: float,
         "y_flip": True,  # row 0 is north/top of the printed block
         "cell_addressing": "col_row_0_based",
         "cell_to_world": (
-            "x = bbox[0] + (col + 0.5) * pitch; "
-            "y = bbox[3] - (row + 0.5) * pitch  # y_up, row0=top"
+            "x = bbox[0] + col * pitch; "
+            "y = bbox[3] - row * pitch  # y_up, row0=top; cell = lattice point, not box centre"
         ),
         "world_to_cell": (
-            "col = round((x - bbox[0]) / pitch - 0.5) clamped; "
-            "row = round((bbox[3] - y) / pitch - 0.5) clamped"
+            "col = round((x - bbox[0]) / pitch) clamped 0..width-1; "
+            "row = round((bbox[3] - y) / pitch) clamped 0..height-1"
         ),
     }
     if layer:
@@ -114,24 +125,27 @@ def make_grid_meta(*, xmin: float, ymin: float, xmax: float, ymax: float,
 
 
 def cell_to_world(col: int, row: int, grid: dict) -> tuple[float, float]:
-    """Map ASCII cell (col,row) → world (x,y) using a render ``grid`` dict."""
+    """Map ASCII cell (col,row) -> world (x,y) using a render ``grid`` dict.
+
+    Exact inverse of every rasterizer's ``cell()`` in this module — see
+    :func:`make_grid_meta` for why the half-pitch variant was wrong."""
     pitch = float(grid.get("pitch") or grid.get("pitch_mm") or 1.0)
     bbox = grid.get("bbox") or grid.get("bbox_mm") or [0, 0, 10, 10]
     xmin, ymin, xmax, ymax = map(float, bbox[:4])
-    x = xmin + (float(col) + 0.5) * pitch
-    y = ymax - (float(row) + 0.5) * pitch
+    x = xmin + float(col) * pitch
+    y = ymax - float(row) * pitch
     return x, y
 
 
 def world_to_cell(x: float, y: float, grid: dict) -> tuple[int, int]:
-    """Map world (x,y) → ASCII cell (col,row) using a render ``grid`` dict."""
+    """Map world (x,y) -> ASCII cell (col,row) using a render ``grid`` dict."""
     pitch = float(grid.get("pitch") or grid.get("pitch_mm") or 1.0)
     bbox = grid.get("bbox") or grid.get("bbox_mm") or [0, 0, 10, 10]
     xmin, ymin, xmax, ymax = map(float, bbox[:4])
     w = int(grid.get("width") or 1)
     h = int(grid.get("height") or 1)
-    col = _clamp_int((float(x) - xmin) / pitch - 0.5, 0, max(0, w - 1))
-    row = _clamp_int((ymax - float(y)) / pitch - 0.5, 0, max(0, h - 1))
+    col = _clamp_int((float(x) - xmin) / pitch, 0, max(0, w - 1))
+    row = _clamp_int((ymax - float(y)) / pitch, 0, max(0, h - 1))
     return col, row
 
 
@@ -368,16 +382,16 @@ def scale_origin_lines(grid_meta: dict, *, note: str = "") -> list[str]:
                               float(bbox[2]), float(bbox[3]))
     w = int(grid_meta.get("width") or 0)
     h = int(grid_meta.get("height") or 0)
-    x0 = xmin + 0.5 * pitch
-    y0 = ymax - 0.5 * pitch
+    x0 = xmin
+    y0 = ymax
     lines = [
         f"SCALE: 1 character cell = {pitch:.4g} {unit} square "
         f"(+col = +x / east, +row = -y / south; y is flipped so north is up).",
-        f"ORIGIN: cell (col=0,row=0) centre = world "
+        f"ORIGIN: cell (col=0,row=0) = world "
         f"({x0:.4g}, {y0:.4g}) {unit}. Grid {w}x{h} cells covers world "
         f"x[{xmin:.4g},{xmax:.4g}] y[{ymin:.4g},{ymax:.4g}] {unit}.",
-        f"CONVERT: x = {xmin:.4g} + (col+0.5)*{pitch:.4g} ; "
-        f"y = {ymax:.4g} - (row+0.5)*{pitch:.4g}",
+        f"CONVERT: x = {xmin:.4g} + col*{pitch:.4g} ; "
+        f"y = {ymax:.4g} - row*{pitch:.4g}",
     ]
     if note:
         lines.append(note)
@@ -1723,28 +1737,40 @@ def check_sketch_geometry(entities: list[dict],
         })
 
     # --- under-dimensioned ---------------------------------------------------
+    # ONE finding, not two. Live 2026-07-30: `under_dimensioned` re-printed the entire
+    # dof_narration that summarize_sketch had already printed via sketch_health_text,
+    # and `under_dimensioned_entities` then listed the same 12 entity ids a third time.
+    # The structured payload (dof, status, entities[]) answers "is it under-constrained,
+    # by how much, and which entities" on its own; WHICH coordinate slots are free stays
+    # readable on the summary's DOF line (bounded sample) and in full from sketch_health.
     if health is not None:
         dof = health.get("dof")
         status = health.get("status")
+        statuses = health.get("statuses") or {}
+        under_ents = [k for k, v in statuses.items() if v == "under"]
         if dof is not None and (dof > 0 or status in ("under", "unknown")):
+            shown = ", ".join(map(str, under_ents[:8]))
+            more = f" … +{len(under_ents) - 8}" if len(under_ents) > 8 else ""
+            who = (f" {len(under_ents)} entity(ies) free: {shown}{more}."
+                   if under_ents else "")
             findings.append({
                 "code": "under_dimensioned",
                 "severity": "warning",
                 "dof": dof,
                 "status": status,
-                "message": (f"Sketch under-dimensioned: dof={dof}, status={status!r}. "
-                            f"{(health.get('dof_narration') or '')}".strip()),
+                "entities": under_ents,
+                "message": (f"Sketch under-dimensioned: dof={dof}, status={status!r}.{who}"
+                            " Add driving dimensions / relations (or sketch_auto_constrain)"
+                            " until dof is 0."),
                 "source": "sketch_health",
             })
-        # also surface per-entity under status if present
-        statuses = health.get("statuses") or {}
-        under_ents = [k for k, v in statuses.items() if v == "under"]
-        if under_ents:
+        elif under_ents:
             findings.append({
-                "code": "under_dimensioned_entities",
+                "code": "under_dimensioned",
                 "severity": "info",
                 "entities": under_ents,
-                "message": f"Under-constrained entities: {', '.join(map(str, under_ents[:12]))}",
+                "message": (f"{len(under_ents)} entity(ies) report status 'under' while "
+                            f"dof={dof}: {', '.join(map(str, under_ents[:8]))}"),
                 "source": "sketch_health",
             })
     else:
@@ -1943,6 +1969,44 @@ def _cap_ascii(ascii_block: str, max_h: int = READBACK_MAX_H,
     return "\n".join(out_rows), h, w, truncated
 
 
+def _clip_grid_index_to_picture(grid: dict, index: dict, *, w: int, h: int
+                                ) -> tuple[dict, dict, list[str]]:
+    """Re-scope a render's ``grid``/``index`` to the picture that is actually shipped.
+
+    ``_cap_ascii`` clamps the printed block to max_h x max_w, but the render's grid
+    and index describe the FULL raster. Measured 2026-07-30 on a 30x200 mm profile:
+    the readback shipped 40 rows and reported ``truncated: True``, while ``grid.height``
+    still said 41 and ``index`` still advertised entities at cell "0,40" — a row the
+    model cannot see and ``world_to_cell`` can never return. A picture whose index
+    claims coverage it does not have is worse than a smaller picture, so the index is
+    clipped to the visible lattice window and whatever fell off is NAMED (never dropped
+    silently) so the model knows to re-render instead of trusting the crop.
+    """
+    pitch = float(grid.get("pitch") or 1.0)
+    bbox = [float(v) for v in (grid.get("bbox") or [0.0, 0.0, 0.0, 0.0])[:4]]
+    out_grid = dict(grid)
+    out_grid["width"] = int(w)
+    out_grid["height"] = int(h)
+    # Cells are lattice points: col 0..w-1 spans x[xmin, xmin+(w-1)*pitch] and row 0
+    # is ymax, so clipping rows raises ymin and clipping cols lowers xmax.
+    out_grid["bbox"] = [bbox[0], bbox[3] - (h - 1) * pitch,
+                        bbox[0] + (w - 1) * pitch, bbox[3]]
+    out_grid["origin_world"] = [out_grid["bbox"][0], out_grid["bbox"][1]]
+    out_index: dict[str, list[dict]] = {}
+    clipped: list[str] = []
+    for key, hits in (index or {}).items():
+        try:
+            col, row = (int(t) for t in str(key).split(",", 1))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= col < w and 0 <= row < h:
+            out_index[key] = hits
+        else:
+            clipped += [str(hit.get("id")) for hit in hits
+                        if isinstance(hit, dict) and hit.get("id")]
+    return out_grid, out_index, clipped
+
+
 def sketch_mutation_readback(sketch: dict, *, pitch: float = 1.0,
                              health: Optional[dict] = None,
                              near_tol: float = 1e-2,
@@ -1951,8 +2015,16 @@ def sketch_mutation_readback(sketch: dict, *, pitch: float = 1.0,
                              sketch_id: str = "") -> dict:
     """Compact deterministic ASCII + NL block for sketch mutation tool responses.
 
-    Caps the grid (default 40×120) so agent context stays cheap; full render remains
+    Caps the grid (default 40x120) so agent context stays cheap; full render remains
     available via ``render_sketch_ascii``. Byte-stable for fixed inputs.
+
+    Ships exactly ONE picture, ``ascii_ruled`` (header line + 0-based col/row rulers).
+    Measured 2026-07-30 on the 3-rectangle F profile: ``ascii`` (bare grid, 567 chars),
+    ``ascii_block`` (header + the same grid, 598) and ``ascii_ruled`` (713) were the
+    same drawing three times with different chrome, and ``ascii_ruled`` is a strict
+    superset — it is the only one whose col/row numbers a model can read a cell address
+    off without counting characters, and cell addresses are the contract
+    ``apply_ascii_edits(kind='sketch')`` resolves edits against.
     """
     entities = list(sketch.get("entities") or [])
     constraints = list(sketch.get("constraints") or [])
@@ -1962,6 +2034,8 @@ def sketch_mutation_readback(sketch: dict, *, pitch: float = 1.0,
     max_dim = max(8, min(max_h, max_w))
     rendered = render_sketch_ascii(entities, pitch=pitch, max_dim=max_dim)
     ascii_txt, h, w, truncated = _cap_ascii(rendered["ascii"], max_h=max_h, max_w=max_w)
+    grid, index, clipped = _clip_grid_index_to_picture(
+        rendered.get("grid") or {}, rendered.get("index") or {}, w=w, h=h)
     findings = check_sketch_geometry(entities, near_tol=near_tol, health=health)
     summary = summarize_sketch(entities, constraints, findings, health=health)
     # compact findings payload
@@ -1974,28 +2048,34 @@ def sketch_mutation_readback(sketch: dict, *, pitch: float = 1.0,
     if truncated:
         header += " truncated=1"
     header += "]"
-    return {
+    hint = ("READ this ASCII + summary before the next sketch edit. "
+            "Use apply_ascii_edits(kind='sketch', sketch_id=..., edits=[...]) "
+            "for cell-targeted entity add/delete. Call render_sketch_ascii + "
+            "sketch_health before declaring the sketch done.")
+    out = {
         "ok": True,
         "kind": "sketch_readback",
         "sketch_id": sid or None,
-        "ascii": ascii_txt,
-        "ascii_block": f"{header}\n{ascii_txt}",
-        "ascii_ruled": annotate_ascii_with_rulers(ascii_txt),
+        "ascii_ruled": f"{header}\n{annotate_ascii_with_rulers(ascii_txt)}",
         "summary": summary,
         "findings": compact_findings,
         "findings_total": len(findings),
         "width": w,
         "height": h,
-        "pitch": rendered.get("pitch"),
-        "grid": rendered.get("grid"),
-        "index": rendered.get("index") or {},
+        "pitch": grid.get("pitch", rendered.get("pitch")),
+        "grid": grid,
+        "index": index,
         "truncated": truncated,
         "caps": {"max_h": max_h, "max_w": max_w},
-        "hint": ("READ this ASCII + summary before the next sketch edit. "
-                 "Use apply_ascii_edits(kind='sketch', sketch_id=..., edits=[...]) "
-                 "for cell-targeted entity add/delete. Call render_sketch_ascii + "
-                 "sketch_health before declaring the sketch done."),
     }
+    if clipped:
+        out["clipped_entities"] = sorted(set(clipped))
+        hint = (f"PICTURE IS CROPPED to {w}x{h} cells — grid/index describe only what "
+                f"is drawn; {len(out['clipped_entities'])} entity(ies) start outside it "
+                f"({', '.join(out['clipped_entities'][:8])}). Call render_sketch_ascii "
+                f"with a coarser pitch to see them. " + hint)
+    out["hint"] = hint
+    return out
 
 
 def board_mutation_readback(board: dict, *, layer: Optional[str] = None,
@@ -2134,18 +2214,20 @@ def _board_focus_crop(board: dict, fx: float, fy: float, radius: float) -> dict:
 
 
 def attach_sketch_readback(response: dict, sketch: dict, **kwargs: Any) -> dict:
-    """Mutate *response* in place with ``ascii_readback`` / ``ascii`` / ``summary`` keys."""
+    """Mutate *response* in place with the ``ascii_readback`` block.
+
+    Says each thing ONCE. This used to set ``ascii``, ``ascii_block``,
+    ``sketch_summary``, ``summary``, ``findings``, ``readback_hint`` AND the whole
+    ``ascii_readback`` object, so the same picture shipped three times and the same
+    3k-char summary twice in every sketch-mutation reply. ``summary`` is still filled
+    when the tool has none of its own (it is the reply's headline), and everything else
+    is one dereference away under ``ascii_readback``.
+    """
     try:
         rb = sketch_mutation_readback(sketch, **kwargs)
         response["ascii_readback"] = rb
-        response["ascii"] = rb["ascii"]
-        response["ascii_block"] = rb["ascii_block"]
-        # Prefer keeping any existing summary; surface NL under sketch_summary.
-        response["sketch_summary"] = rb["summary"]
-        if "summary" not in response or not response.get("summary"):
+        if not response.get("summary"):
             response["summary"] = rb["summary"]
-        response.setdefault("findings", rb["findings"])
-        response["readback_hint"] = rb["hint"]
     except Exception as e:  # noqa: BLE001 — never fail the mutation on readback
         response["ascii_readback"] = {
             "ok": False, "error": f"sketch readback unavailable: {e}",

@@ -546,6 +546,22 @@ add_test(NAME test_agent_text
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end agent-authored text sanitizers ---
 
+# --- composer prelude usage-ring selection (GL-free, header-only rule) ---
+# Guards the reported "cluttered" prelude row: a windowless lifetime "Total quota" ring used to
+# ride between the rolling window ring and the context gauge purely because it came first in
+# catalog order. Rolling windows are actionable and win; a total only shows when alone.
+add_executable(test_usage_rings
+  tests/test_usage_rings.cpp)
+target_include_directories(test_usage_rings PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${imgui_SOURCE_DIR})
+set_target_properties(test_usage_rings PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_usage_rings
+  COMMAND test_usage_rings
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end composer prelude usage-ring selection ---
+
 # --- composer hard-break tracking (GL-free) ---
 # Guards the bug where Alt/Shift+Enter appeared to do nothing: the composer's hand-rolled word
 # wrapper flattens every '\n' to reflow from an idempotent source, so a break the user typed

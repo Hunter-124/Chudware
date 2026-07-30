@@ -113,4 +113,38 @@ std::string  usageResetCountdown(const std::string& stamp);
 // Very short window caption for a compact ring ("5H", "7D") derived from window/label.
 std::string  usageWindowShortLabel(const UsageWindow& w);
 
+// Which windows earn a compact ring in the composer prelude row, in draw order.
+//
+// The row used to take the first `max` fraction-bearing windows in catalog order, which put a
+// windowless lifetime "Total quota" ring ("TOT") beside the rolling ones ("5H", "7D") and then
+// beside the context gauge: three cryptic 3-char captions and three rings of identical visual
+// weight, reading as one undifferentiated cluster.
+//
+// A rolling window is the ACTIONABLE number — it says when you can work again. A lifetime total
+// cannot be acted on, so it is shown only when there is no time-windowed row at all, never as
+// filler beside one. Status-only windows (`hasFraction == false`) are never rendered, because a
+// missing fraction is not 0%.
+//
+// Inline + pointer-returning so the composer's measure and draw passes can call it twice per
+// frame and be guaranteed the same set; `src` must outlive the result.
+inline std::vector<const UsageWindow*> pickUsageRings(const std::vector<UsageWindow>& src,
+                                                      std::size_t max) {
+    std::vector<const UsageWindow*> out;
+    if (max == 0) return out;
+    for (const UsageWindow& w : src) {
+        if (!w.hasFraction) continue;
+        if (w.window.empty()) continue;      // lifetime total: last resort only, below
+        out.push_back(&w);
+        if (out.size() >= max) return out;
+    }
+    if (out.empty()) {
+        for (const UsageWindow& w : src) {
+            if (!w.hasFraction) continue;
+            out.push_back(&w);
+            break;
+        }
+    }
+    return out;
+}
+
 }  // namespace ui

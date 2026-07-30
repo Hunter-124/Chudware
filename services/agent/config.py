@@ -1471,11 +1471,31 @@ def _window_source_from_caps(caps: dict) -> str:
 
 def _attach_catalog_meta(provider: Provider, caps: dict) -> Provider:
     """Stamp resolved catalog fields onto the provider for downstream consumers."""
+    # A GUESS is the one thing worth replacing. When model_catalog admits it only
+    # had a heuristic (no user override, no curated row, no live probe) and the
+    # provider is served by the OMP sidecar, the sidecar's own curated row is
+    # strictly better information and is exactly what the GUI already trusts.
+    # Live 2026-07-29: kimi-code/k3 resolved to the LOCAL default context=8192
+    # (real 1,048,576), max_output=0 (real 131,072), vision=False (k3 takes
+    # images), so the context meter measured a 1M window against an 8192 ruler.
+    # Never touches "user"/"catalog"/"probe" — an override must stay an override.
+    if _window_source_from_caps(caps) == "heuristic":
+        try:
+            from .providers import omp_bridge_provider as _obp  # noqa: PLC0415
+
+            if isinstance(provider, _obp.OmpBridgeProvider):
+                real = _obp.catalog_caps(getattr(provider, "name", ""),
+                                         getattr(provider, "model", ""))
+                if real:
+                    caps = {**caps, **real, "auto_source": "models.dev"}
+        except Exception:  # noqa: BLE001 — never break provider construction
+            pass
     try:
         provider.context_window = int(caps.get("context") or 0) or None  # type: ignore[attr-defined]
         provider.max_output_tokens = int(caps.get("max_output") or 0) or None  # type: ignore[attr-defined]
         provider.reasoning_efforts = list(caps.get("reasoning_efforts") or [])  # type: ignore[attr-defined]
         provider.catalog_auto_source = str(caps.get("auto_source") or "")  # type: ignore[attr-defined]
+        provider.vision = bool(caps.get("vision"))  # type: ignore[attr-defined]
         # Provenance of context_window, mapped onto the frozen GUI vocabulary: a
         # heuristic per-provider constant must not outrank a curated per-model row.
         provider.context_window_source = _window_source_from_caps(caps)  # type: ignore[attr-defined]

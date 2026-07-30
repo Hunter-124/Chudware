@@ -2585,6 +2585,13 @@ static float usageRingCluster(AppState& st, float budget, bool draw) {
     }
     if (!wins || wins->empty()) return 0.0f;
 
+    // Which windows earn a ring is a rule with its own test (ui::pickUsageRings in
+    // provider_usage.h, host test test_usage_rings): rolling windows win, a lifetime
+    // total only shows when there is no rolling one, and two rings is the ceiling for
+    // this column — the third only ever fit by starving the context gauge beside it.
+    const std::vector<const ui::UsageWindow*> pick = ui::pickUsageRings(*wins, 2);
+    if (pick.empty()) return 0.0f;
+
     const ui::AdaptiveSurface& surf = chatSurf();
     const float capGap  = ui::metrics::px(3);   // caption -> its ring
     const float indGap  = ui::metrics::px(7);   // between indicators
@@ -2592,9 +2599,8 @@ static float usageRingCluster(AppState& st, float budget, bool draw) {
     const float fh = ImGui::GetFrameHeight();
     float total = 0.0f;
     int   shown = 0;
-    for (const ui::UsageWindow& w : *wins) {
-        if (shown >= 3) break;          // three rings is all even a wide prelude row can carry
-        if (!w.hasFraction) continue;   // status-only window: never render it as 0%
+    for (const ui::UsageWindow* wp : pick) {
+        const ui::UsageWindow& w = *wp;
         const std::string cap = ui::usageWindowShortLabel(w);
         const float capW = ImGui::CalcTextSize(cap.c_str()).x;
         const float indW = capW + capGap + ringAdv;
@@ -2859,6 +2865,21 @@ static void drawComposerPrelude(AppState& st, bool busy) {
         if (clusterCursorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(clusterCursorX);
         if (usageW > 0.0f) {
             usageRingCluster(st, usageBudget, /*draw=*/true);
+            // Subscription quotas and the context window answer DIFFERENT questions
+            // ("when can I work again" vs "how full is this conversation"), and butting
+            // them together at identical weight is what made the row read as one soup.
+            // A hairline rule centred in the existing gap separates the two groups
+            // without costing layout width — clusterGap is already reserved, so this
+            // paints inside it and measure/draw stay in agreement.
+            const ImVec2 gp = ImGui::GetCursorScreenPos();
+            const float ruleH = ImGui::GetFrameHeight() * 0.52f;
+            const float ruleY = gp.y + (ImGui::GetFrameHeight() - ruleH) * 0.5f;
+            const float ruleX = std::round(gp.x + clusterGap * 0.5f);
+            ImVec4 ink = chatSurf().textSecondary;
+            ink.w *= 0.34f;   // present, never a competing element
+            ImGui::GetWindowDrawList()->AddLine(
+                ImVec2(ruleX, ruleY), ImVec2(ruleX, ruleY + ruleH),
+                ImGui::ColorConvertFloat4ToU32(ink), std::max(1.0f, ui::uiScale));
             ImGui::SameLine(0, clusterGap);
         }
         drawContextMeter(st, meterRoomFull);

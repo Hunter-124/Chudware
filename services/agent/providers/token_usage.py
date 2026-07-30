@@ -41,12 +41,30 @@ def record_usage(
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
     total_tokens: int | None = None,
+    context_tokens: int | None = None,
     raw: dict | None = None,
     source: str = "api",
 ) -> dict[str, Any]:
     """Normalize + stash one completion's usage; accumulate into the turn total.
 
     Missing fields stay 0 (honest lower bound, never fabricated).
+
+    ``prompt_tokens`` and ``context_tokens`` are DIFFERENT questions and must not
+    be conflated:
+
+    * ``prompt_tokens`` — the BILLED, non-cached input. Prompt-cache-aware
+      providers deliberately exclude cache reads here because they are priced
+      separately, so this is the number cost math wants.
+    * ``context_tokens`` — how full the model's window actually is, i.e. every
+      input token the model saw: non-cached + cache reads + cache writes. This is
+      the number a context METER wants.
+
+    Conflating them is not a rounding error. Live 2026-07-29 (case bench, k3): the
+    four completions of one turn reported prompt_tokens 8121, 719, 197, 1229 —
+    the drop is the prompt cache engaging, not the context shrinking — so the
+    desktop meter read "1k/1.0M" on a conversation holding well over 10k tokens.
+    ``context_tokens`` defaults to ``prompt_tokens`` so providers that do not
+    report cache counts stay exactly as accurate as they were.
     """
     try:
         pt = int(prompt_tokens) if prompt_tokens is not None else 0
@@ -62,6 +80,13 @@ def record_usage(
         tt = pt + ct
     if tt <= 0 and (pt > 0 or ct > 0):
         tt = pt + ct
+    try:
+        cx = int(context_tokens) if context_tokens is not None else 0
+    except (TypeError, ValueError):
+        cx = 0
+    # Occupancy can never be LESS than the billed input it contains; a provider
+    # that reports no cache counts simply has cx == pt.
+    cx = max(cx, pt)
 
     row: dict[str, Any] = {
         "provider": provider or "",
@@ -69,6 +94,7 @@ def record_usage(
         "prompt_tokens": max(0, pt),
         "completion_tokens": max(0, ct),
         "total_tokens": max(0, tt),
+        "context_tokens": max(0, cx),
         "source": source or "api",
     }
     if raw and isinstance(raw, dict):
@@ -89,6 +115,7 @@ def record_usage(
                 "prompt_tokens": row["prompt_tokens"],
                 "completion_tokens": row["completion_tokens"],
                 "total_tokens": row["total_tokens"],
+                "context_tokens": row["context_tokens"],
             })
     return row
 

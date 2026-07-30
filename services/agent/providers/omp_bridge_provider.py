@@ -141,6 +141,51 @@ def _directive_from_thinking(thinking: str) -> str:
     return ""
 
 
+#: Per-(provider, model) sidecar catalog caps, cached for the life of the worker.
+#: The worker is a fresh fork per turn, so this is at most ONE extra `models_list`
+#: call per turn against an already-running sidecar (~0.4 s cold, served from its
+#: bundled catalog — no network).
+_CATALOG_CAPS: dict[tuple[str, str], dict[str, Any] | None] = {}
+
+
+def catalog_caps(provider: str, model: str) -> dict[str, Any] | None:
+    """Authoritative ``{context, max_output, vision, tools}`` from the OMP catalog.
+
+    ``services.agent.model_catalog`` only knows providers it has hardcoded rows or
+    id-substring heuristics for, and it defaults everything else to the LOCAL
+    8192/no-vision row. For kimi-code/k3 that produced context=8192 (real:
+    1,048,576), max_output=0 (real: 131,072) and vision=False (k3 takes images) —
+    so the desktop context meter was measuring a 1M window against an 8192 ruler.
+    The sidecar already serves the curated row the GUI itself trusts; ask it
+    instead of adding another guess to the heuristic table.
+
+    Returns None when the sidecar has no row (or is unreachable) so the caller
+    keeps whatever it already resolved — never a fabricated capability.
+    """
+    key = (str(provider or ""), str(model or ""))
+    if key in _CATALOG_CAPS:
+        return _CATALOG_CAPS[key]
+    caps: dict[str, Any] | None = None
+    try:
+        result = _bridge().call("models_list", {"provider": key[0]})
+        for row in (result or {}).get("models") or []:
+            if not isinstance(row, dict) or str(row.get("id") or "") != key[1]:
+                continue
+            ctx = int(row.get("contextWindow") or 0)
+            if ctx > 0:
+                caps = {
+                    "context": ctx,
+                    "max_output": int(row.get("maxTokens") or 0),
+                    "vision": bool(row.get("vision")),
+                    "tools": bool(row.get("supportsTools", True)),
+                }
+            break
+    except Exception:  # noqa: BLE001 — capability lookup never breaks a turn
+        caps = None
+    _CATALOG_CAPS[key] = caps
+    return caps
+
+
 class OmpBridgeProvider(Provider):
     """A cloud model served through the OMP bun sidecar."""
 
@@ -281,18 +326,41 @@ class OmpBridgeProvider(Provider):
         return reply, thinking
 
     def _record_usage(self, usage: Any) -> None:
-        """Stash the sidecar's token counts (pi-catalog Usage) into the turn accumulator."""
+        """Stash the sidecar's token counts (pi-catalog Usage) into the turn accumulator.
+
+        The sidecar's Usage shape is ``{input, output, cacheRead, cacheWrite,
+        totalTokens, cost}``. ``input`` is the NON-CACHED input only — pi-ai
+        normalized it that way deliberately so ``input + cacheRead + cacheWrite``
+        is the total context size (see vendor/omp/packages/ai CHANGELOG 0.12.10,
+        and pi-ai's own error/flags.ts which computes occupancy exactly that way).
+
+        So ``input`` alone is the right number for COST and the wrong one for the
+        context meter: once the prompt cache engages it collapses to the per-call
+        delta. Live 2026-07-29 (case bench, k3): 8121 -> 719 -> 197 -> 1229 across
+        one turn, so the desktop meter showed "1k/1.0M" for a context holding
+        >10k. Report both, and let each consumer take the one it means.
+        """
         if not isinstance(usage, dict):
             return
         try:
             from . import token_usage as _tu  # noqa: PLC0415
 
+            # `_usage_int` returns None for an ABSENT key, so the occupancy sum has to
+            # coerce: `int + None` raises, the bare `except` below would swallow it, and
+            # the whole call's usage would silently go unrecorded for every provider
+            # whose Usage omits the cache fields. prompt/completion/total keep None
+            # (record_usage maps it to 0) so "not reported" stays distinguishable there.
+            def _z(key: str) -> int:
+                return _usage_int(usage, key) or 0
+
+            inp = _usage_int(usage, "input")
             _tu.record_usage(
                 provider=self.name,
                 model=str(self.model or ""),
-                prompt_tokens=_usage_int(usage, "input"),
+                prompt_tokens=inp,
                 completion_tokens=_usage_int(usage, "output"),
                 total_tokens=_usage_int(usage, "totalTokens"),
+                context_tokens=(inp or 0) + _z("cacheRead") + _z("cacheWrite"),
                 raw=usage,
                 source="api",
             )

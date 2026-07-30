@@ -1750,8 +1750,14 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             {"run_id", "used", "window", "model", "provider", "source",
              "window_source"}
 
-        ``used`` is the INPUT tokens of the most recent provider call (how full
-        the context is right now); ``window`` is the model's total window, 0 when
+        ``used`` is how full the model's context is right now: every input token
+        the completion saw. That is ``context_tokens`` (non-cached input + cache
+        reads + cache writes), NOT ``prompt_tokens`` — the latter is the BILLED
+        non-cached input, which collapses to a per-call delta as soon as the
+        prompt cache engages and made the meter read "1k/1.0M" on a >10k context
+        (live 2026-07-29, case bench, k3: 8121 -> 719 -> 197 -> 1229 in one turn).
+        ``context_tokens`` falls back to ``prompt_tokens`` for providers that
+        report no cache counts. ``window`` is the model's total window, 0 when
         genuinely unknown — never a guess. ``window_source`` says where that
         window came from ("user"/"catalog"/"probe"/"heuristic", "" when the
         provider object predates the field), because the numbers are NOT equally
@@ -1768,7 +1774,8 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             if _tu is None:
                 return
             last_u = _tu.get_last_usage() or {}
-            used = int(last_u.get("prompt_tokens") or 0)
+            used = int(last_u.get("context_tokens")
+                       or last_u.get("prompt_tokens") or 0)
             if used <= 0:
                 return
             from services.agent import agent_events as _ae  # noqa: PLC0415

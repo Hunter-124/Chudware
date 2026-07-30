@@ -2633,6 +2633,72 @@ def _pipeline(feature: dict, notes: list | None = None) -> dict:
     feat = ops[0]["feature"]
     return M._normalize_feature_refs(feat, feat.get("type"), notes)
 
+def _ops3(profile):
+    """box, sketch, extrude(profile) — the shape of the live keychain batch."""
+    return [
+        {"op": "add_feature", "feature": {"type": "box", "name": "Base"}},
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "S"}},
+        {"op": "add_feature", "feature": {"type": "extrude", "name": "Boss",
+                                          "refs": {"profile": profile}}},
+    ]
+
+
+class TestBatchPlaceholderValidation:
+    """Live run 2026-07-30 (Lexus-F keychain): the model wrote profile:"$2"/"$4" meaning
+    the 2nd and 4th ops — "$N" is ZERO-BASED — and the batch died on «profile '$2' ->
+    '$2' not found», which names no range, no base, and never says $2 WAS the feature
+    doing the referencing. Two features and a turn lost to an unstated off-by-one."""
+
+    def test_self_reference_says_so_and_names_the_slot_meant(self):
+        with pytest.raises(ValueError) as exc:
+            M._validate_batch_placeholders(_ops3("$2"))
+        msg = str(exc.value)
+        assert "refers to ITSELF" in msg
+        assert '"$1"' in msg          # the op it almost certainly meant
+        assert "ZERO-BASED" in msg
+        # The roster must let the model pick the right index without another call.
+        assert "$0=Base (box)" in msg and "$1=S (sketch)" in msg
+
+    def test_out_of_range_reports_the_real_range(self):
+        """Must NOT be reported as a forward reference: every out-of-range index is also
+        greater than the referencing op, so testing that first makes this unreachable."""
+        with pytest.raises(ValueError) as exc:
+            M._validate_batch_placeholders(_ops3("$7"))
+        msg = str(exc.value)
+        assert "out of range" in msg
+        assert "3 op(s)" in msg and '"$0".."$2"' in msg
+        assert "refers to ITSELF" not in msg
+
+    def test_forward_reference_is_named_as_ordering(self):
+        ops = _ops3("$1")
+        # Make the extrude reference an op created AFTER it.
+        ops.append({"op": "add_feature", "feature": {"type": "fillet", "name": "F"}})
+        ops[2]["feature"]["refs"]["profile"] = "$3"
+        with pytest.raises(ValueError) as exc:
+            M._validate_batch_placeholders(ops)
+        assert "creates LATER" in str(exc.value)
+
+    def test_a_valid_backward_reference_passes(self):
+        M._validate_batch_placeholders(_ops3("$1"))          # no raise
+        M._validate_batch_placeholders(_ops3(["$0", "$1"]))  # nested in a list
+
+    def test_placeholders_nested_in_a_selector_object_are_checked(self):
+        """The live payload's real shape is refs.profile=[{"kind":"region","sketch":"$N"}]
+        — a bare-string check would walk straight past it."""
+        with pytest.raises(ValueError) as exc:
+            M._validate_batch_placeholders(
+                _ops3([{"kind": "region", "sketch": "$2"}]))
+        assert "refers to ITSELF" in str(exc.value)
+
+    def test_a_feature_name_that_looks_like_a_placeholder_is_not_a_ref(self):
+        """`name` is not a ref slot; only refs/params are walked."""
+        ops = [{"op": "add_feature", "feature": {"type": "box", "name": "$9"}}]
+        M._validate_batch_placeholders(ops)  # no raise
+
+    def test_an_empty_or_non_list_batch_is_ignored(self):
+        M._validate_batch_placeholders([])
+        M._validate_batch_placeholders(None)
+
 
 def test_flat_fillet_edges_reach_refs_not_params():
     """Live: {"type":"fillet","edges":[...],"params":{"radius":2}} rejected 3x in a row

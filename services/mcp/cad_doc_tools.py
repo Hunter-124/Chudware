@@ -5090,6 +5090,77 @@ def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
                        '"$N" position in THIS batch, never a display name')
     return out
 
+def _validate_batch_placeholders(ops: Any) -> None:
+    """Reject an out-of-range, self- or forward-referential "$N" with the real roster.
+
+    "$N" is a ZERO-BASED index into THIS batch's op list, but 1-based is the natural
+    reading and nothing corrected it. Live run 2026-07-30 (a Lexus-F keychain): the model
+    wrote profile:"$2" and profile:"$4" meaning the 2nd and 4th ops, and the whole batch
+    died on «f5 (Keyring hole): profile '$2' -> '$2' not found; f7 (F emboss): profile
+    '$4' -> '$4' not found» — a message that names no range, no base, and does not
+    mention that $2 WAS the very feature doing the referencing. Two features and a turn
+    lost to an off-by-one nobody told the model about.
+
+    Runs AFTER every insert/expand/renumber pass, so the indices it checks are the ones
+    the engine will see.
+    """
+    if not isinstance(ops, list) or not ops:
+        return
+
+    def _name(i: int) -> str:
+        el = ops[i] if isinstance(ops[i], dict) else {}
+        feat = el.get("feature") if isinstance(el.get("feature"), dict) else {}
+        return str(feat.get("name") or el.get("name") or "")
+
+    def _kind(i: int) -> str:
+        el = ops[i] if isinstance(ops[i], dict) else {}
+        feat = el.get("feature") if isinstance(el.get("feature"), dict) else {}
+        return str(feat.get("type") or el.get("op") or "op")
+
+    def _slot(i: int) -> str:
+        return f"${i}={_name(i)} ({_kind(i)})" if _name(i) else f"${i}=({_kind(i)})"
+
+    last = len(ops) - 1
+    roster = ", ".join(_slot(i) for i in range(len(ops)))
+
+    def _walk(v: Any, i: int) -> None:
+        if isinstance(v, str):
+            s = v.strip()
+            if not _BATCH_REF_RE.match(s):
+                return
+            k = int(s[1:])
+            # Order matters: an out-of-range index is ALSO > i, so it must be tested
+            # first or its (more useful) message is unreachable.
+            if k > last:
+                why = (f"is out of range — this batch has {len(ops)} op(s), so its "
+                       f'placeholders are "$0".."${last}"')
+            elif k == i:
+                why = ("refers to ITSELF — a feature cannot be its own input"
+                       + (f'; counting from 0 the op before it is "${i - 1}"' if i else ""))
+            elif k > i:
+                why = (f"names op {k}, which this batch creates LATER — a ref can only "
+                       f"name a feature built EARLIER in the same batch")
+            else:
+                return
+            who = _name(i) or f"op {i}"
+            raise ValueError(
+                f'{who}: "{s}" {why}. "$N" is a ZERO-BASED index into THIS batch: '
+                f"{roster}. To name a feature an EARLIER CALL built, use its f<N> id.")
+        if isinstance(v, list):
+            for x in v:
+                _walk(x, i)
+        elif isinstance(v, dict):
+            for x in v.values():
+                _walk(x, i)
+
+    for i, el in enumerate(ops):
+        if not isinstance(el, dict):
+            continue
+        # Only REF slots carry placeholders; a `name` never does.
+        feat = el.get("feature") if isinstance(el.get("feature"), dict) else {}
+        for holder in (el.get("refs"), feat.get("refs"), feat.get("params"), el.get("params")):
+            _walk(holder, i)
+
 
 def _resolve_doc_name_refs(ops: Any, doc_id: str, notes: list) -> Any:
     """Rewrite a reference to a feature an EARLIER CALL built, by NAME, into its f<N> id.
@@ -6112,11 +6183,29 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         "create — new_part is a tool/doc op, never a feature type")
                 if doc_id or created:
                     continue  # a target doc already exists; the extra create is a no-op
-                r = cb.call("doc_new", {"kind": "part",
+                # Same resume-or-mint contract as the `new_part` TOOL (see its docstring
+                # and core/doc/session.cpp doc_new): a batch head naming a part that is
+                # ALREADY OPEN must resume it, not breed a numbered twin. This path used
+                # to call doc_new with no `resume_if_open`, so it always uniquified —
+                # measured live 2026-07-30: an agent created "fkey_live" with the tool,
+                # then opened a later batch with {"op":"new_part","name":"fkey_live"} and
+                # got a SECOND document, "fkey_live2", carrying 2 of the part's features
+                # while the other 7 stayed behind. One requested part, two tabs. The
+                # atomic-mint fix landed on the tool; this is its batch-op twin.
+                r = cb.call("doc_new", {"kind": "part", "resume_if_open": True,
                                         "name": head.get("name") or head.get("part") or "part"})
                 created = r.get("doc_id")
                 _CUR["doc_id"] = created
-                _LAST_VOLUME[created] = 0.0
+                if r.get("reused"):
+                    # NEVER seed a fake 0.0 baseline on a part that already carries
+                    # geometry — the next write-diff would report "0.0 -> X" instead of
+                    # the true delta (same hazard _resumed_reply documents).
+                    interpreted.append(
+                        f'resumed the open part "{r.get("name") or head.get("name")}" '
+                        f'(doc_id={created}, {r.get("feature_count")} feature(s)) for this '
+                        f"batch instead of minting a duplicate document")
+                else:
+                    _LAST_VOLUME[created] = 0.0
             if created and not doc_id:
                 doc_id = created
             d = _doc(doc_id)
@@ -6187,6 +6276,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             ops = _resolve_relative_profile_refs(ops, interpreted)
             # …and a name an EARLIER call created, which no batch-local table can carry.
             ops = _resolve_doc_name_refs(ops, d, interpreted)
+            # Indices are final here (every insert/expand/renumber pass has run), so a
+            # surviving "$N" can be range-checked against the batch the engine will see.
+            _validate_batch_placeholders(ops)
             # LAST: operands are canonical only now, and this reads them.
             ops = _unmerge_boolean_operands(ops, interpreted)
             # …and the same problem for operands built by an EARLIER batch, which

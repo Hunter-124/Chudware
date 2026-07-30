@@ -1533,6 +1533,22 @@ def _unique_part_name(tag: str) -> str:
     return f"{tag}_{uuid.uuid4().hex[:10]}"
 
 
+def _in_series(doc_name: str, requested: str) -> bool:
+    """`requested` and the sibling names doc_new mints for it.
+
+    Mirrors core/doc/session.cpp unique_doc_name: it strips a TRAILING INTEGER to get
+    the series base, so the siblings of "x1" are "x2"/"x3" and do NOT start with "x1".
+    """
+    n, req = (doc_name or "").strip().casefold(), (requested or "").strip().casefold()
+    if not n or not req:
+        return False
+    if n == req:
+        return True
+    base = req.rstrip("0123456789") or req
+    tail = n[len(base):] if n.startswith(base) else ""
+    return bool(tail) and tail.isdigit()
+
+
 def test_new_part_concurrent_same_name_yields_one_document():
     """Two THREADS calling new_part with the same name at the same instant get ONE doc.
 
@@ -1634,6 +1650,35 @@ def test_new_part_resume_discards_unbuilt_orphans(suffix):
     assert orphan["doc_id"] not in open_ids, "the empty orphan must be closed"
     assert built["doc_id"] in open_ids, "a document with geometry is NEVER discarded"
 
+
+def test_new_part_batch_head_resumes_instead_of_breeding_a_twin():
+    """`{"op":"new_part"}` as a BATCH HEAD is the second minting path, and the atomic
+    resume-or-mint fix originally landed only on the new_part TOOL.
+
+    Measured live 2026-07-30: an agent created "fkey_live" with the tool, built 7
+    features, then opened a later batch with {"op":"new_part","name":"fkey_live"} and no
+    doc_id — this path called doc_new with NO resume_if_open, so it uniquified and the
+    part's remaining work landed in a second document, "fkey_live2". One requested part,
+    two tabs, which is exactly the duplication the user reported."""
+    name = _unique_part_name("twin")
+    first, _ = _call("new_part", {"name": name})
+    r, _ = _call("add_features", {"doc_id": first["doc_id"], "ops": [
+        cb.feat("box", "Tag", {"length": cb.dim(50), "width": cb.dim(30),
+                               "height": cb.dim(4)})]})
+    assert r["ok"], r
+
+    # The batch-head form, deliberately WITHOUT doc_id — what the live agent sent.
+    got, _ = _call("add_features", {"ops": [
+        {"op": "new_part", "name": name},
+        cb.feat("cylinder", "Post", {"radius": cb.dim(2), "height": cb.dim(10)})]})
+    assert got["ok"], got
+    assert got["doc_id"] == first["doc_id"], got
+    assert any("resumed the open part" in n for n in (got.get("interpreted") or [])), got
+
+    series = [d for d in cb.call("doc_list", {})["docs"]
+              if _in_series(str(d.get("name", "")), name)]
+    assert len(series) == 1, f"one requested part must not become two documents: {series}"
+    assert series[0]["feature_count"] == 2, series   # both features in ONE document
 
 # ================================================================ AI-experience lane
 # Appended tests (HANDOFF_AI_EXPERIENCE §TODO-2 TESTS-MCP — doc pruned 2026-07-23): feature-overlap detection,

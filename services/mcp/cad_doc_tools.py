@@ -1506,10 +1506,27 @@ _CENTER_AT_ALIASES = ("center", "centre")
 _AT_ALIASES = ("position", "location", "origin") + _CENTER_AT_ALIASES
 _AXIS_ALIASES = ("direction", "dir", "normal", "orientation")
 _BOOLEAN_ALIASES = ("boolean", "operation")
+# The same intent written as a FLAG rather than a value: {"subtract": true}. Live
+# 2026-07-30 (run-13566637896867, sports_bike): the model asked for wheel pockets
+# with {"type":"cylinder",…,"subtract":true} and the engine FUSED them instead —
+# the key was consumed by nothing, so it never became mode:"cut". It then reported
+# "cylinder boss added no material … this primitive lies entirely inside it",
+# which is true of the boss it was silently turned into and says nothing about the
+# cut that was asked for. Wrong geometry with a confident error is the worst
+# outcome this normalizer can produce, so the flag spellings are honoured here.
+# "merge" and "add" are NOT flags: `merge` is already the canonical new-body key
+# and a bare `add` is too weak to override an explicit mode.
+_BOOLEAN_FLAG_MODES = {
+    "subtract": "cut", "cut": "cut", "difference": "cut", "remove": "cut",
+    "union": "boss", "fuse": "boss", "boss": "boss",
+}
+_FLAG_WORDS = {"true": True, "yes": True, "1": True,
+               "false": False, "no": False, "0": False}
 _PLACEMENT_AT_KEYS = ("at", "origin", "position", "location", "point")
 _PLACEMENT_AXIS_KEYS = ("axis", "direction", "normal", "dir")
 _PRIM_DIALECT_KEYS = frozenset(
-    ("placement",) + _AT_ALIASES + _AXIS_ALIASES + _BOOLEAN_ALIASES)
+    ("placement",) + _AT_ALIASES + _AXIS_ALIASES + _BOOLEAN_ALIASES
+    + tuple(_BOOLEAN_FLAG_MODES))
 _AXIS_WORDS = frozenset({"x", "+x", "-x", "y", "+y", "-y", "z", "+z", "-z"})
 _BOOLEAN_MODES = {
     "union": "boss", "add": "boss", "join": "boss", "fuse": "boss",
@@ -1637,6 +1654,23 @@ def _normalize_primitive_feature(feat: dict) -> dict:
             raise ValueError(
                 f"add_feature {feat.get('type')}: unknown '{k}':'{v}'. Supported: "
                 f"{_BOOLEAN_VALUES}")
+
+    # The flag spelling: {"subtract": true} rather than {"operation": "subtract"}.
+    # A truthy flag sets the mode; an explicit `mode` already present wins. A value
+    # that is neither a bool nor a yes/no word is left in place ON PURPOSE, so the
+    # engine names it -- consuming a key we could not interpret would recreate the
+    # silent drop this block exists to fix.
+    for k in sorted(_BOOLEAN_FLAG_MODES):
+        v = peek(k)
+        if v is _MISSING:
+            continue
+        flag = v if isinstance(v, bool) else _FLAG_WORDS.get(str(v).strip().lower(),
+                                                             _MISSING)
+        if flag is _MISSING:
+            continue
+        consume(k)
+        if flag and peek("mode") is _MISSING:
+            out["mode"] = _BOOLEAN_FLAG_MODES[k]
 
     # Canonicalize the axis WORD wherever it ended up ("+X" -> "+x"); a [x,y,z]
     # vector passes through. Feature level is the canonical home (session.cpp's
@@ -2541,6 +2575,50 @@ def _decode_embedded_structures(v: Any, notes: list, _depth: int = 0) -> Any:
     return out
 
 
+# Ops a model invents for "change this feature's parameter". Every one of them is
+# edit_feature. Deliberately EXCLUDES set_dim/set_dimension: those genuinely could
+# mean the sketch op `sketch_set_dim`, and guessing between two real ops is how a
+# normalizer starts building the wrong thing confidently.
+_PARAM_EDIT_OPS = frozenset({
+    "set_param", "set_parameter", "set_params", "set_parameters",
+    "update_param", "update_parameter", "change_param", "change_parameter",
+    "modify_param", "modify_parameter", "set_feature_param",
+})
+_PARAM_EDIT_ID_KEYS = ("id", "feature", "feature_id", "target", "name")
+_PARAM_EDIT_NAME_KEYS = ("param", "parameter", "key", "field")
+_PARAM_EDIT_VALUE_KEYS = ("value", "to", "new_value", "val")
+
+
+def _rewrite_param_edit(el: dict, index: int, notes: list) -> dict:
+    """``{"op":"set_param","feature":F,"param":P,"value":V}`` -> canonical edit_feature.
+
+    Also accepts the batched ``"params":{...}`` form. Refuses rather than guesses when
+    the target or the value is absent — a parameter edit aimed at nothing is not
+    something this pass can repair.
+    """
+    fid = next((el[k] for k in _PARAM_EDIT_ID_KEYS
+                if el.get(k) is not None), None)
+    if fid is None:
+        raise ValueError(
+            f'ops[{index}]: op:"{el.get("op")}" names no feature to edit. A parameter '
+            f'edit is {{"op":"edit_feature","id":"f1","params":{{"radius":12}}}}.')
+    params = el.get("params")
+    if not isinstance(params, dict):
+        pname = next((el[k] for k in _PARAM_EDIT_NAME_KEYS
+                      if el.get(k) is not None), None)
+        val = next((el[k] for k in _PARAM_EDIT_VALUE_KEYS if k in el), _MISSING)
+        if pname is None or val is _MISSING:
+            raise ValueError(
+                f'ops[{index}]: op:"{el.get("op")}" needs either "params":{{…}} or a '
+                f'"param" name with its "value". Got keys: {sorted(el)}.')
+        params = {str(pname): val}
+    notes.append(
+        f'interpreted op:"{el.get("op")}" as {{"op":"edit_feature","id":"{fid}",'
+        f'"params":{{…}}}} — changing a feature parameter is edit_feature')
+    order = {k: el[k] for k in _OP_ORDER_KEYS if k in el}
+    return {"op": "edit_feature", "id": fid, "params": params, **order}
+
+
 def _normalize_op_elements(ops: list, notes: list) -> list:
     """Give every batch element a valid `op`. Raises ValueError with a teaching message
     for an element that names neither an op nor a feature type."""
@@ -2588,6 +2666,19 @@ def _normalize_op_elements(ops: list, notes: list) -> list:
                     f'ops[{i}]["feature"] is a {type(bad).__name__} ({text!r}), not a JSON '
                     f"object — it did not decode into one either. feature must be a JSON "
                     f'object, e.g. {{"type":"cylinder","name":"PoleBore","params":{{...}}}}')
+            # {"op":"set_param","feature":"f1","param":"center","value":[700,0,300]}
+            # — a parameter edit written as its own op. That IS edit_feature, and the
+            # payload says so unambiguously: a feature reference plus one param and
+            # its value. Live 2026-07-30 (run-13566637896867, sports_bike): the model
+            # tried to move two tires it had just mis-placed and got "unknown op
+            # 'set_param'. closest: set_material, set_units, set_appearance,
+            # set_folder, set_rollback" — five ops that share nothing but the `set_`
+            # prefix, while edit_feature (the actual answer) was never suggested,
+            # because _score_match only ever sees the NAME, not the payload shape.
+            if kind in _PARAM_EDIT_OPS:
+                out.append(_normalize_op_target(
+                    _rewrite_param_edit(el, i, notes), "edit_feature", notes))
+                continue
             if kind in docops or kind == "new_part":
                 out.append(_normalize_op_target(el, kind, notes))
                 continue

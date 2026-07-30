@@ -81,7 +81,12 @@ report_engine_staleness() {
         # them made this report stale immediately after a successful build (found 2026-07-29 by
         # actually running ./build.sh core: it flagged core/build-occt-linux against
         # build-linux/hostd_gen/version_info.h). Only AUTHORED sources may mark an engine stale.
-        hit="$(find "$ROOT/core" -type d -name 'build*' -prune -o \
+        # Also prune core/hostd: those sources build the chudware-hostd DAEMON and are
+        # NOT linked into libchudware.so, so they can never make the engine stale. Left
+        # in, a daemon-only edit marked every engine permanently stale and the strict
+        # gate then failed a build that was in fact correct — a gate that cries wolf
+        # is one people learn to ignore. The daemon gets its own check below.
+        hit="$(find "$ROOT/core" -type d \( -name 'build*' -o -name hostd \) -prune -o \
                 \( -name '*.cpp' -o -name '*.h' \) -newer "$consumer" -print -quit \
                 2>/dev/null || true)"
         if [ -n "$hit" ]; then
@@ -90,6 +95,25 @@ report_engine_staleness() {
             echo "[build]       Nothing that reads it (gate.sh, the GUI, CHUDWARE_LIBCHUDWARE) will"
             echo "[build]       see your core changes. Rebuild that tree, e.g."
             echo "[build]       ninja -C core/build-linux bin/libchudware.so   # or ./build.sh all"
+        fi
+    done
+    # The daemon is a SEPARATE binary that links the same core libs, so every core
+    # source (hostd/ included) is one of its inputs. It went unchecked entirely until
+    # 2026-07-30, when a user hit duplicate "AI: <part>"/"<part>2" tabs against a
+    # four-day-old chudware-hostd while libchudware.so was current.
+    for consumer in "$ROOT/core/build-occt-linux/bin/chudware-hostd" \
+                    "$ROOT/core/build-linux/bin/chudware-hostd" \
+                    "$ROOT/services/dist/Chudware/chudware-hostd"; do
+        [ -f "$consumer" ] || continue
+        hit="$(find "$ROOT/core" -type d -name 'build*' -prune -o \
+                \( -name '*.cpp' -o -name '*.h' \) -newer "$consumer" -print -quit \
+                2>/dev/null || true)"
+        if [ -n "$hit" ]; then
+            stale=1
+            echo "[build] WARN: STALE DAEMON ${consumer#"$ROOT"/} is older than ${hit#"$ROOT"/}."
+            echo "[build]       The GUI's document registry lives in the daemon, so doc/tab fixes"
+            echo "[build]       will not reach the app. Rebuild + restage:"
+            echo "[build]       ./build.sh core && ./build.sh stage"
         fi
     done
     if [ -n "$strict" ] && [ "$stale" -eq 1 ]; then
@@ -109,11 +133,28 @@ report_engine_staleness() {
 # whatever options that tree was configured with, and then gate on the staleness check so a future
 # rename cannot quietly reintroduce the split.
 build_core() {
-    local rc=0 built=0 tree
+    local rc=0 built=0 tree tlist
     for tree in core/build-occt-linux core/build-linux; do
         [ -f "$ROOT/$tree/build.ninja" ] || continue
         echo "[build] core engine -> $tree/bin/libchudware.so (consumed tree)"
         ninja -C "$ROOT/$tree" bin/libchudware.so || rc=$?
+        # ...and the DAEMON from the same tree. chudware-hostd is a separate binary
+        # carrying core/hostd/*, so a core-only build left it untouched: on 2026-07-30
+        # a user hit duplicate "AI: sports_bike"/"sports_bike2" tabs against a hostd
+        # from four days earlier, because the doc-registry fix that stopped the
+        # duplicate mint lives in the daemon and `./build.sh core` never rebuilt it.
+        # `stage` then copied that stale daemon next to a fresh engine -- exactly the
+        # split this function's own comment says core must not reintroduce.
+        # NB: no `| grep -q` here. Under `set -o pipefail` grep exits at the first
+        # match, ninja dies on SIGPIPE, and the pipeline status makes this condition
+        # FALSE — which silently skipped the daemon build the first time round.
+        tlist="$(ninja -C "$ROOT/$tree" -t targets all 2>/dev/null || true)"
+        case "$tlist" in
+            *"bin/chudware-hostd:"*)
+                echo "[build] core daemon -> $tree/bin/chudware-hostd"
+                ninja -C "$ROOT/$tree" bin/chudware-hostd || rc=$?
+                ;;
+        esac
         built=1
     done
     if [ "$built" -eq 0 ]; then

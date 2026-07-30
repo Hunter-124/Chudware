@@ -3453,3 +3453,86 @@ def test_canonical_editing_ops_round_trip_unchanged():
         out, notes = _norm_edit(op)
         assert out == op
         assert notes == []
+
+
+# ===========================================================================
+# Live 2026-07-30, run-13566637896867 ("sports_bike"). Two defects in one turn,
+# both of the worst kind: the model said what it wanted and the harness did
+# something else.
+# ===========================================================================
+
+def test_subtract_flag_cuts_instead_of_silently_fusing():
+    """{"subtract": true} was consumed by nothing, so the engine FUSED the wheels.
+
+    The model then got "cylinder boss added no material ... this primitive lies
+    entirely inside it" -- true of the boss it was silently turned into, and
+    completely silent about the cut it actually asked for.
+    """
+    out = M._normalize_primitive_feature({
+        "type": "cylinder", "name": "front_tire_fix",
+        "params": {"radius": {"value": 300}, "height": {"value": 120},
+                   "center": [700, 0, 240], "axis": [0, 1, 0], "subtract": True}})
+    assert out.get("mode") == "cut"
+    assert "subtract" not in json.dumps(out)
+    assert out["at"] == [700, 0, 240]
+
+
+@pytest.mark.parametrize("key,want", [
+    ("subtract", "cut"), ("cut", "cut"), ("difference", "cut"), ("remove", "cut"),
+    ("union", "boss"), ("fuse", "boss"), ("boss", "boss"),
+])
+def test_every_boolean_flag_spelling_reaches_a_mode(key, want):
+    out = M._normalize_primitive_feature(
+        {"type": "box", "params": {"length": 10, key: True}})
+    assert out.get("mode") == want
+
+
+def test_false_flag_leaves_the_default_and_an_explicit_mode_wins():
+    off = M._normalize_primitive_feature(
+        {"type": "box", "params": {"length": 10, "subtract": False}})
+    assert "mode" not in off and "subtract" not in json.dumps(off)
+    explicit = M._normalize_primitive_feature(
+        {"type": "box", "mode": "boss", "params": {"length": 10, "subtract": True}})
+    assert explicit["mode"] == "boss"
+
+
+def test_uninterpretable_flag_value_is_left_for_the_engine_to_name():
+    """Never re-create the silent drop: only a real yes/no is consumed."""
+    out = M._normalize_primitive_feature(
+        {"type": "box", "params": {"length": 10, "subtract": {"weird": 1}}})
+    assert out["params"]["subtract"] == {"weird": 1}
+    assert "mode" not in out
+
+
+def test_set_param_is_read_as_edit_feature():
+    """"unknown op 'set_param'. closest: set_material, set_units, set_appearance,
+    set_folder, set_rollback" -- five ops sharing only the `set_` prefix, while
+    edit_feature (the answer) was never suggested."""
+    notes: list = []
+    out = M._normalize_op_elements(
+        [{"op": "set_param", "feature": "f1", "param": "center",
+          "value": [700, 0, 300]}], notes)
+    assert out == [{"op": "edit_feature", "id": "f1",
+                    "params": {"center": [700, 0, 300]}}]
+    assert any("edit_feature" in n for n in notes), notes
+
+
+def test_param_edit_accepts_the_params_dict_form():
+    notes: list = []
+    out = M._normalize_op_elements(
+        [{"op": "update_parameter", "id": "f3", "params": {"radius": 12}}], notes)
+    assert out == [{"op": "edit_feature", "id": "f3", "params": {"radius": 12}}]
+
+
+def test_param_edit_aimed_at_nothing_is_refused_not_guessed():
+    with pytest.raises(ValueError, match="names no feature"):
+        M._normalize_op_elements([{"op": "set_param", "param": "r", "value": 5}], [])
+    with pytest.raises(ValueError, match='needs either "params"'):
+        M._normalize_op_elements([{"op": "set_param", "feature": "f1"}], [])
+
+
+def test_set_dim_is_not_hijacked_from_the_sketch_op():
+    """set_dim could genuinely mean sketch_set_dim; guessing between two real ops
+    is how a normalizer starts confidently building the wrong thing."""
+    assert "set_dim" not in M._PARAM_EDIT_OPS
+    assert "set_dimension" not in M._PARAM_EDIT_OPS

@@ -681,9 +681,16 @@ Eigen::Vector2d face_uv_centroid(const TopoDS_Face& f,
 // that previously did `req_str(profile) + require_sketch + src.faces`.
 //
 // Semantics (backward-compatible with the simplified string model):
-//   - bare string sketch id, OR region selector(s) WITHOUT index/centroid
+//   - bare string sketch id, OR region selector(s) WITHOUT index/centroid/hint_index
 //     => ALL material faces of the sketch (even-odd outer regions WITH holes —
 //        concentric circles become one washer face).
+//   - region selector(s) carrying ONLY hint_index (the seed cad_doc_tools.py injects
+//     for "extrude this sketch") => hint_index addresses CONNECTED MATERIAL REGIONS
+//     (geom::connected_material_regions): 0 is the sketch's WHOLE material profile
+//     (so the injected default keeps meaning "the whole sketch" and never silently
+//     drops a region), k>0 narrows to connected region k, and an out-of-range k is
+//     its OWN error naming the sketch and the region count. See the guard comment
+//     below for the live run that made this load-bearing.
 //   - region selector(s) carrying centroid (prefer) and/or index:
 //       * centroid present => pick the material face whose (u,v) centroid is
 //         nearest the requested centroid (robust vs. reordering).
@@ -691,6 +698,9 @@ Eigen::Vector2d face_uv_centroid(const TopoDS_Face& f,
 //         orders regions (by centroid u then v) and take that index among the
 //         material faces. The GUI region picker emits material-region indices
 //         for profile wells (void/hole regions are not selectable as profiles).
+//         NB `index` addresses the per-LOOP doc_sketch_regions space (so a washer's
+//         void inner disc stays addressable); `hint_index` addresses the coarser
+//         connected-material-region space the agent readback narrates.
 //   Multiple selectors union their matched faces (de-duplicated by row index).
 std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
                                                const json& feat) {
@@ -742,8 +752,64 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
             { any_targeted = true; break; }
     }
     if (!any_targeted) {
-        // Whole-sketch: every material face (with holes already nested by faces_from_solved_sketch).
-        return src.faces;
+        // Untargeted, or targeted ONLY by hint_index. `hint_index` is the seed the tool
+        // layer injects for a plain "extrude this sketch" (cad_doc_tools.py), so index 0
+        // must keep meaning the sketch's WHOLE material profile — every material face,
+        // with holes already nested by faces_from_solved_sketch.
+        //
+        // A NON-ZERO hint is a real request for the k-th CONNECTED material region, and
+        // an out-of-range hint gets its OWN error. Live run run-42508173312214
+        // ("lexus_f_keychain"): the sketch readback narrated "3 material regions" for
+        // three OVERLAPPING rectangles (three closed LOOPS, one connected region), the
+        // model dutifully asked for regions 1 and 2, hint_index was silently IGNORED
+        // here, and both re-extruded the whole 264 mm^2 union into the body it was
+        // already fused into — surfacing as "extrude boss added no material" with a
+        // fabricated plane.top diagnosis. Whatever region count the readback reports,
+        // hint_index 0..N-1 must each resolve, and N.. must say exactly why it cannot.
+        std::vector<int> hints;
+        for (const json& s : sels)
+            if (s.is_object() && s.contains("hint_index") && s["hint_index"].is_number())
+                hints.push_back(static_cast<int>(s["hint_index"].get<double>()));
+        bool only_zero = true;
+        for (int h : hints)
+            if (h != 0) { only_zero = false; break; }
+        if (hints.empty() || only_zero) return src.faces;  // whole material profile
+
+        std::vector<std::vector<TopoDS_Face>> groups =
+            chudware::geom::connected_material_regions(src.entities, src.plane);
+        const int n_regions = static_cast<int>(groups.size());
+        std::vector<TopoDS_Face> out;
+        std::set<int> taken_group;
+        for (int h : hints) {
+            if (h < 0 || h >= n_regions) {
+                std::string msg =
+                    "profile: sketch \"" + sketch_id + "\" has " +
+                    std::to_string(n_regions) + " connected material region" +
+                    (n_regions == 1 ? "" : "s") + ", addressable as hint_index 0" +
+                    (n_regions == 1 ? "" : ".." + std::to_string(n_regions - 1)) +
+                    " — hint_index " + std::to_string(h) + " does not exist.";
+                if (n_regions == 1)
+                    msg += " Closed loops that OVERLAP or TOUCH form ONE material region "
+                           "and the extrude already unions them, so there is no second "
+                           "region left to add: hint_index 0 is the whole profile. To add "
+                           "material elsewhere, sketch a profile that does not overlap "
+                           "this one.";
+                else
+                    msg += " hint_index 0 is the whole profile; 1.." +
+                           std::to_string(n_regions - 1) +
+                           " each narrow to one connected region.";
+                throw std::runtime_error(msg);
+            }
+            if (h == 0) {  // the whole profile, unioned with any narrowed picks
+                for (const TopoDS_Face& f : src.faces) out.push_back(f);
+                continue;
+            }
+            if (!taken_group.insert(h).second) continue;  // de-dup repeated picks
+            for (const TopoDS_Face& f : groups[static_cast<size_t>(h)])
+                out.push_back(f);
+        }
+        if (out.empty()) return src.faces;
+        return out;
     }
 
     // Targeted pick: build the FULL region face list (material + void), matching
@@ -3204,18 +3270,25 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
                             throw std::runtime_error("primitive cut removed no material");
                     } else {
-                        // Symmetric buried-boss guard: a primitive boss merged into a body that
-                        // adds NO volume is buried inside it (a centred-on-origin cylinder/box
-                        // boss inside a plate). Fail loudly + teach placement rather than leave
-                        // the body silently unchanged.
+                        // Symmetric buried-boss guard: a primitive boss merged into a body
+                        // that adds NO volume lies entirely inside it. Report the
+                        // OBSERVATION and list the plausible causes — do not assert one of
+                        // them as fact (same lesson as the extrude-boss guard below, live
+                        // run run-42508173312214: a single-cause message sent the model
+                        // three calls deep fixing something that was never wrong).
                         GProp_GProps gb, ga;
                         BRepGProp::VolumeProperties(target, gb);
                         BRepGProp::VolumeProperties(out, ga);
                         if (ga.Mass() <= gb.Mass() + 1e-9)
                             throw std::runtime_error(
-                                type + " boss added no material (it is buried inside the body — "
-                                "place it on the surface, e.g. at:{\"of\":\"face\",\"side\":"
-                                "\"top\"}, or set centered:false)");
+                                type + " boss added no material — the fuse with the current "
+                                "body gained zero volume, so this primitive lies entirely "
+                                "inside it. Plausible causes: (a) it is smaller than, and "
+                                "sits inside, the body it merged into; (b) primitives are "
+                                "CENTRED on the origin, so it needs placing on the surface, "
+                                "e.g. at:{\"of\":\"face\",\"side\":\"top\"}, or "
+                                "centered:false; (c) mode:\"cut\" was meant instead of a "
+                                "boss. Check the placement before changing anything else.");
                     }
                     record_tool(id, pmode == "cut" ? "cut" : "add", solid);
                     consumed.insert(ptgt);
@@ -3813,19 +3886,62 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         TopoDS_Shape out = ::geom::fuse_unify(tgt, solid);
                         if (out.IsNull())
                             throw std::runtime_error("extrude boss fuse produced an empty shape");
-                        // Guard the silent buried-boss: primitives are CENTRED on the origin,
-                        // so plane.top is a centred block's MID-plane — a boss sketched there
-                        // and extruded inward lands entirely inside the body and adds nothing,
-                        // yet would report success. Fail loudly and teach the fix.
+                        // Zero-volume boss guard. The OBSERVATION is only "the fused solid
+                        // added nothing, so it lies entirely within the existing body"; the
+                        // CAUSE has several candidates, and this message used to assert one
+                        // of them (the centred-primitive mid-plane story) as fact. Live run
+                        // run-42508173312214 ("lexus_f_keychain"): the sketch was correctly
+                        // on the top FACE, the real cause was a profile region an earlier
+                        // extrude had already consumed, and the fabricated plane.top
+                        // diagnosis burned three consecutive calls editing a plane that was
+                        // never wrong before the run died on the worker timeout. So: name
+                        // the earlier consumer when there is one (decisive, cheap, and
+                        // otherwise invisible to the model), else report what was observed
+                        // and LIST the causes — keeping the mid-plane hint, which is still
+                        // the right diagnosis for the centred-primitive case it was written
+                        // for (see session.cpp's plane.top guidance).
                         GProp_GProps gbb, gab;
                         BRepGProp::VolumeProperties(tgt, gbb);
                         BRepGProp::VolumeProperties(out, gab);
-                        if (gab.Mass() <= gbb.Mass() + 1e-9)
-                            throw std::runtime_error(
-                                "extrude boss added no material (it is buried inside the body — "
-                                "primitives are centred on the origin, so sketch the boss on the "
-                                "actual face, e.g. refs.plane {\"of\":\"face\",\"side\":\"top\"}, "
-                                "not plane.top)");
+                        if (gab.Mass() <= gbb.Mass() + 1e-9) {
+                            // FIRST earlier feature that consumed this same sketch as its
+                            // profile — the one that placed the material already there.
+                            std::string prior;
+                            for (std::size_t k = 0; k < _fi && prior.empty(); ++k) {
+                                const json pf = normalize_feature(features[k]);
+                                if (features[k].value("suppressed", false) ||
+                                    pf.value("suppressed", false)) continue;
+                                const std::string pt = pf.value("type", std::string());
+                                if (pt != "extrude" && pt != "revolve" && pt != "sweep")
+                                    continue;
+                                auto ppit = pf.find("profile");
+                                if (ppit == pf.end()) continue;
+                                if (profile_sketch_id(*ppit) != prof) continue;
+                                prior = pf.value("id", std::string("?"));
+                                const std::string pn = pf.value("name", std::string());
+                                if (!pn.empty()) prior += " (\"" + pn + "\")";
+                            }
+                            std::string msg =
+                                "extrude boss added no material — the new solid lies entirely "
+                                "within the existing body, so fusing it changed nothing. ";
+                            if (!prior.empty())
+                                msg += "Profile sketch \"" + prof + "\" was ALREADY extruded "
+                                       "by " + prior + ", which consumed that material "
+                                       "region; re-extruding the same region cannot add "
+                                       "anything. Use a profile that does not overlap it, or "
+                                       "edit " + prior + " instead of adding a feature.";
+                            else
+                                msg += "Plausible causes: (a) an earlier feature already "
+                                       "extruded this profile region; (b) the boss grows INTO "
+                                       "the body rather than away from it — flip params.flip "
+                                       "or set refs/params dir; (c) the sketch sits on a "
+                                       "MID-plane instead of the surface: primitives are "
+                                       "centred on the origin, so plane.top is a centred "
+                                       "block's mid-plane — sketch on the actual face, e.g. "
+                                       "refs.plane {\"of\":\"face\",\"side\":\"top\"}, not "
+                                       "plane.top. Check which one applies before editing.";
+                            throw std::runtime_error(msg);
+                        }
                         consumed.insert(mtgt);
                         source_of[id] = mtgt;  // owner-map: merged boss derives from the body
                         results[id] = SolidResult{out};

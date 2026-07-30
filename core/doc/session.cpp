@@ -4861,6 +4861,104 @@ bool force_release_doc_lock() {
     return released;
 }
 
+// Serializes the whole check-then-mint of doc_new. unique_doc_name reads every open
+// document's name and new_part_session_locked registers a new one; those are two
+// separate visits to g_sessions, so without a lock spanning BOTH, concurrent
+// doc_new("Widget") calls each see "Widget" free and each mint. Observed live
+// 2026-07-29 (run-42508173312214): the user retried a request whose first worker was
+// still inside its 5-minute timeout, both attempts reached the ONE machine-wide
+// chudware-hostd, and one requested part became three GUI tabs
+// (lexus_f_keychain / ...2 / ...3).
+//
+// Lock order: this is the OUTERMOST lock in the file. It is taken only at the top of
+// doc_new, before g_registry_mtx and before any Session::mtx, and nothing acquires it
+// while holding either — so it cannot participate in a cycle.
+static std::mutex g_doc_mint_mtx;
+
+// Trim + case-fold, so the resume match below follows the SAME rule the Python side
+// uses (_docs_named in services/mcp/cad_common.py): an exact name match wins outright,
+// and only if there is none do case-insensitive matches count.
+static std::string fold_doc_name(const std::string& s) {
+    std::size_t b = 0, e = s.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    std::string out = s.substr(b, e - b);
+    for (char& c : out) c = (char)std::tolower(static_cast<unsigned char>(c));
+    return out;
+}
+
+// The already-open document `requested` names, or nullopt. MUST be called with
+// g_doc_mint_mtx held, which is what makes doc_new's resume-or-mint atomic.
+//
+// Which one, when several answer to the name, is the ranking services/mcp new_part used
+// to apply in Python before this became the engine's job: most features, then highest
+// revision, then the last in doc_list order. g_sessions is keyed by doc_id and doc_list
+// sorts by doc_id, so iterating the map ascending and letting a tie go to the LATER
+// candidate reproduces that ranking. Deterministic — never a coin flip.
+//
+// A BUILT part is resumed too, not skipped: the reply carries feature_count so the
+// caller can tell the agent what it resumed onto (docs/REFACTOR_LOG.md ~5274, ~5309 —
+// inheriting a stranger's half-built body silently is what produced twelve "boss added
+// no material (it is buried inside the body)" failures, so the count must travel).
+static std::optional<json> resume_open_doc(const std::string& requested,
+                                           const std::string& kind) {
+    std::vector<std::pair<std::string, std::shared_ptr<Session>>> pins;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        pins.reserve(g_sessions.size());
+        for (const auto& kv : g_sessions) pins.emplace_back(kv.first, kv.second);
+    }
+    std::sort(pins.begin(), pins.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    struct Cand {
+        std::string id, name;
+        long revision = 0;
+        int features = 0;
+        bool exact = false;
+    };
+    const std::string want = fold_doc_name(requested);
+    std::vector<Cand> cands;
+    for (const auto& [id, sp] : pins) {
+        // Pin-then-lock, one session at a time (T-PERF5, same as doc_list/unique_doc_name).
+        std::lock_guard<std::mutex> doc(sp->mtx);
+        if (!sp->doc.is_object()) continue;
+        const bool is_asm = sp->doc.value("schema", std::string()) == "aicad.asm/1";
+        if (is_asm != (kind == "assembly")) continue;  // never resume a part as an assembly
+        const std::string nm = sp->doc.value("name", std::string());
+        const bool exact = nm == requested;
+        if (!exact && fold_doc_name(nm) != want) continue;
+        Cand c;
+        c.id = id;
+        c.name = nm;
+        c.revision = sp->revision;
+        if (sp->doc.contains("features") && sp->doc["features"].is_array())
+            c.features = (int)sp->doc["features"].size();
+        c.exact = exact;
+        cands.push_back(std::move(c));
+    }
+    if (cands.empty()) return std::nullopt;
+    if (std::any_of(cands.begin(), cands.end(), [](const Cand& c) { return c.exact; }))
+        cands.erase(std::remove_if(cands.begin(), cands.end(),
+                                   [](const Cand& c) { return !c.exact; }),
+                    cands.end());
+    const Cand* best = &cands.front();
+    for (const Cand& c : cands)
+        if (c.features > best->features ||
+            (c.features == best->features && c.revision >= best->revision))
+            best = &c;
+    json resp = {{"ok", true},
+                 {"doc_id", best->id},
+                 {"name", best->name},
+                 {"revision", best->revision},
+                 {"feature_count", best->features},
+                 {"reused", true}};
+    json others = json::array();
+    for (const Cand& c : cands)
+        if (c.id != best->id) others.push_back(c.id);
+    if (!others.empty()) resp["duplicate_doc_ids"] = others;
+    return resp;
+}
+
 // Auto-unique document names, like real CAD. If `requested` exactly matches an
 // already-open document's name, strip any trailing integer to get the base
 // ("Part1" -> "Part") and return the first free "<base><N>", continuing past
@@ -4905,7 +5003,7 @@ static std::string unique_doc_name(const std::string& requested) {
 }
 
 // ----------------------------------------------------------------- public API
-json doc_new(const std::string& kind, const std::string& name) {
+json doc_new(const std::string& kind, const std::string& name, bool resume_if_open) {
     const std::string k = kind.empty() ? std::string("part") : kind;
     if (k != "part" && k != "assembly")
         throw OpError("invalid_op", "doc kind must be part|assembly, got '" + k + "'",
@@ -4913,6 +5011,12 @@ json doc_new(const std::string& kind, const std::string& name) {
     DocLock lk;
     const std::string requested =
         name.empty() ? (k == "assembly" ? std::string("Assembly1") : std::string("Part1")) : name;
+    // Everything from here to the registration is ONE atomic step (see g_doc_mint_mtx):
+    // resume the same-named document if the caller opted in, otherwise uniquify and mint.
+    std::unique_lock<std::mutex> mint(g_doc_mint_mtx);
+    if (resume_if_open) {
+        if (std::optional<json> resumed = resume_open_doc(requested, k)) return *resumed;
+    }
     const std::string resolved = unique_doc_name(requested);
     if (k == "assembly") {
         auto sp = std::make_shared<Session>();
@@ -4925,6 +5029,7 @@ json doc_new(const std::string& kind, const std::string& name) {
             sp->owns_journal = true;
             g_sessions[id] = sp;
         }
+        mint.unlock();  // registered under the name: the next mint can no longer collide
         Session& stored = lk.acquire(id);
         rebuild_assembly(stored);
         json resp = ops_response_assembly(stored, json::object());
@@ -4933,6 +5038,9 @@ json doc_new(const std::string& kind, const std::string& name) {
         return resp;
     }
     Session& stored = new_part_session_locked(resolved);
+    // Registered under `resolved`; the compile below touches only this brand-new
+    // session, so hold the mint lock no longer than the name reservation needs.
+    mint.unlock();
     CompileResult r = compile_session(stored);
     json resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
     resp["doc_id"] = stored.doc_id;
@@ -12246,18 +12354,28 @@ json closure_summary(const json& solved_coords) {
     return out;
 }
 
-// The number of MATERIAL regions of the feature's solved sketch, via the region
-// loop detection — used for the before/after closure delta. Caller MUST already hold
-// the DocLock (uses sketch_regions_locked, no re-lock). Returns -1 if regions can't be
+// The number of CONNECTED MATERIAL REGIONS of the feature's solved sketch — the
+// number the agent-facing readback narrates as "CLOSED (N material regions)" and the
+// number a profile `hint_index` can address (document.cpp::resolve_profile_faces).
+// Caller MUST already hold the DocLock (no re-lock). Returns -1 if regions can't be
 // computed (e.g. non-OCCT build); callers fall back to closure_summary.
+//
+// This used to count doc_sketch_regions' per-LOOP material regions, which is a
+// DIFFERENT number: doc_sketch_regions deliberately emits one region per closed loop
+// (the GUI region picker needs that granularity, e.g. a washer's void inner disc),
+// while extrusion fuses overlapping/touching loops into one solid. Live run
+// run-42508173312214 ("lexus_f_keychain"): three OVERLAPPING rectangles narrated as
+// "3 material regions", the model asked for regions 1 and 2, and the extruder — which
+// had already unioned all three into region 0 — rejected both. The readback was the
+// wrong side of that disagreement, so it now counts what extrusion can actually
+// address. doc_sketch_regions itself is untouched (GUI index parity).
 int material_region_count(Session& s, const std::string& sketch_fid) {
     try {
-        json r = sketch_regions_locked(s, sketch_fid);
-        if (!r.contains("regions") || !r["regions"].is_array()) return -1;
-        int n = 0;
-        for (const json& reg : r["regions"])
-            if (reg.value("is_material", false)) ++n;
-        return n;
+        json& feat = find_sketch_feature(s, sketch_fid);
+        chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+        SolveActive packed = solve_active(s, feat, std::nullopt);
+        return static_cast<int>(chudware::geom::connected_material_regions(
+            packed.entity_map, plane).size());
     } catch (...) {
         return -1;
     }

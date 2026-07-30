@@ -683,6 +683,7 @@ add_library(chudware_agent STATIC
   agent/state.cpp
   agent/machine.cpp
   agent/run.cpp
+  agent/run_stop.cpp
   agent/micro.cpp
   agent/ask.cpp
   agent/clarify.cpp

@@ -99,7 +99,8 @@ _TEACHING_TEXT = re.compile(
 
 #: Turn-level stop reasons that are the harness failing, not the model.
 _INFRA_STOPS = {"sweep_timeout", "bench_timeout", "no_turn_in_output", "worker_closed",
-                "provider_error", "provider_auth", "worker_crash", "engine_error"}
+                "provider_error", "provider_auth", "worker_crash", "worker_timeout",
+                "engine_error"}
 
 CLASS_HARNESS = "harness_defect"
 CLASS_REFUSAL = "correct_refusal"

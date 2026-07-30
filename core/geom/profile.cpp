@@ -5,7 +5,9 @@
 // the C++ pipeline produces the same washer/region behavior as the oracle.
 #include "geom/profile.h"
 
+#include <algorithm>
 #include <cmath>
+#include <utility>
 #include <vector>
 
 #include <BRepBuilderAPI_MakeEdge.hxx>
@@ -400,6 +402,46 @@ bool loop_contains(const Loop& outer, const Loop& inner) {
     return point_in_poly(loop_centroid(inner), outer.poly);
 }
 
+// Do two 2D segments intersect (crossing OR merely touching)? Touching counts: two
+// rectangles that share an edge extrude into ONE connected solid.
+bool segments_touch(const Eigen::Vector2d& a1, const Eigen::Vector2d& a2,
+                    const Eigen::Vector2d& b1, const Eigen::Vector2d& b2) {
+    auto cross = [](const Eigen::Vector2d& u, const Eigen::Vector2d& v) {
+        return u.x() * v.y() - u.y() * v.x();
+    };
+    const Eigen::Vector2d r = a2 - a1, s = b2 - b1, d = b1 - a1;
+    const double denom = cross(r, s);
+    if (std::abs(denom) <= kEps * kEps) {
+        // Parallel. Collinear (and overlapping in the 1D parameter range) => touching;
+        // strictly parallel-but-offset => no.
+        const double rr = r.dot(r);
+        if (rr <= kEps * kEps) return false;
+        if (std::abs(cross(d, r)) > kEps * std::sqrt(rr)) return false;
+        double t0 = d.dot(r) / rr, t1 = (d + s).dot(r) / rr;
+        if (t0 > t1) std::swap(t0, t1);
+        return t1 >= -kEps && t0 <= 1.0 + kEps;
+    }
+    const double t = cross(d, s) / denom, u = cross(d, r) / denom;
+    return t >= -kEps && t <= 1.0 + kEps && u >= -kEps && u <= 1.0 + kEps;
+}
+
+// Do two top-level loops share material — do their filled footprints overlap, touch,
+// or nest? Boundary intersection catches overlap/touching; the containment fallback
+// catches one loop wholly inside the other with no boundary contact.
+bool loops_share_material(const Loop& a, const Loop& b) {
+    const std::vector<Eigen::Vector2d>& A = a.poly;
+    const std::vector<Eigen::Vector2d>& B = b.poly;
+    if (A.size() >= 2 && B.size() >= 2) {
+        for (size_t i = 0; i < A.size(); ++i) {
+            const Eigen::Vector2d& a1 = A[i];
+            const Eigen::Vector2d& a2 = A[(i + 1) % A.size()];
+            for (size_t j = 0; j < B.size(); ++j)
+                if (segments_touch(a1, a2, B[j], B[(j + 1) % B.size()])) return true;
+        }
+    }
+    return loop_contains(a, b) || loop_contains(b, a);
+}
+
 // even-odd nesting: parent = smallest-area enclosing loop; depth = # of enclosers.
 void nest_loops(const std::vector<Loop>& loops, std::vector<double>& area,
                 std::vector<int>& parent, std::vector<int>& depth) {
@@ -558,6 +600,88 @@ std::vector<TopoDS_Face> all_region_faces_from_solved_sketch(
         faces.push_back(mf.Face());
     }
     return faces;
+}
+
+std::vector<std::vector<TopoDS_Face>> connected_material_regions(
+    const nlohmann::json& solved_entities, const SketchPlane& plane) {
+    // Same pipeline as faces_from_solved_sketch (this file's convention: duplicate the
+    // nesting walk rather than thread a flag through the public entry so that entry
+    // stays byte-identical for callers), then union-find the depth-0 loops by 2D
+    // footprint connectivity.
+    std::vector<std::vector<TopoDS_Face>> groups;
+    if (!solved_entities.is_object()) return groups;
+
+    std::vector<SketchEdge> edges;
+    for (auto it = solved_entities.begin(); it != solved_entities.end(); ++it) {
+        SketchEdge se;
+        if (build_edge(it.value(), plane, se)) edges.push_back(std::move(se));
+    }
+    if (edges.empty()) return groups;
+
+    std::vector<Loop> loops = detect_loops(edges);
+    if (loops.empty()) return groups;
+
+    const size_t n = loops.size();
+    std::vector<double> area;
+    std::vector<int> parent, depth;
+    nest_loops(loops, area, parent, depth);
+
+    // Top-level (material) loops, in loop order — the same loops whose faces
+    // faces_from_solved_sketch emits.
+    std::vector<size_t> outers;
+    for (size_t i = 0; i < n; ++i)
+        if (depth[i] == 0) outers.push_back(i);
+    if (outers.empty()) return groups;
+
+    // Union-find over the top-level loops; representative = lowest member slot, so
+    // group order follows the lowest member loop index.
+    std::vector<size_t> uf(outers.size());
+    for (size_t k = 0; k < uf.size(); ++k) uf[k] = k;
+    auto find = [&](size_t k) {
+        while (uf[k] != k) { uf[k] = uf[uf[k]]; k = uf[k]; }
+        return k;
+    };
+    for (size_t k = 0; k < outers.size(); ++k)
+        for (size_t m = k + 1; m < outers.size(); ++m) {
+            if (find(k) == find(m)) continue;
+            if (loops_share_material(loops[outers[k]], loops[outers[m]])) {
+                const size_t rk = find(k), rm = find(m);
+                uf[std::max(rk, rm)] = std::min(rk, rm);
+            }
+        }
+
+    auto wire_ccw = [&](const Loop& lp) -> TopoDS_Wire {
+        TopoDS_Wire w = make_wire(lp.edges);
+        if (w.IsNull()) return w;
+        if (signed_area(lp.poly) < 0.0) w = TopoDS::Wire(w.Reversed());
+        return w;
+    };
+
+    // One group per representative, in ascending representative order.
+    std::vector<size_t> reps;
+    for (size_t k = 0; k < outers.size(); ++k)
+        if (find(k) == k) reps.push_back(k);
+    std::sort(reps.begin(), reps.end());
+    for (size_t rep : reps) {
+        std::vector<TopoDS_Face> faces;
+        for (size_t k = 0; k < outers.size(); ++k) {
+            if (find(k) != rep) continue;
+            const size_t i = outers[k];
+            TopoDS_Wire outer = wire_ccw(loops[i]);
+            if (outer.IsNull()) continue;
+            BRepBuilderAPI_MakeFace mf(outer, /*OnlyPlane=*/true);
+            for (size_t j = 0; j < n; ++j) {
+                if (parent[j] != (int)i || depth[j] != 1) continue;
+                TopoDS_Wire hole = wire_ccw(loops[j]);
+                if (hole.IsNull()) continue;
+                mf.Add(TopoDS::Wire(hole.Reversed()));
+            }
+            if (!mf.IsDone()) continue;
+            faces.push_back(mf.Face());
+        }
+        if (!faces.empty()) groups.push_back(std::move(faces));
+    }
+    return groups;
 }
 
 TopoDS_Wire wire_from_solved_sketch(

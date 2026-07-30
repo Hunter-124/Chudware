@@ -30,7 +30,25 @@ from services.mcp import cad_common as C  # noqa: E402
 
 
 class _FakeEngine:
-    """Minimal core-RPC stand-in driven by a fixed doc_list; records doc_new calls."""
+    """Minimal core-RPC stand-in driven by a fixed doc_list; records doc_new MINTS.
+
+    `doc_new` MIRRORS the engine's resume contract (core/doc/session.cpp
+    resume_open_doc / doc_new): given `resume_if_open` it returns the most-built
+    same-name, same-kind document marked `reused`, carrying `feature_count` and any
+    `duplicate_doc_ids`; otherwise it mints a uniquified one.
+
+    new_part no longer makes that decision in Python. It used to do an unlocked
+    doc_list-then-doc_new pair, which cannot be race-free against the ONE shared
+    chudware-hostd every process attaches to — concurrent same-name callers each passed
+    the "not found" check and each minted (the live 3x-duplicate-tab bug). The choice
+    moved into the engine, under a lock spanning both halves.
+
+    So these tests cover new_part's REPLY plumbing on top of that contract; the RANKING
+    is the engine's and is pinned in core/tests/test_document.cpp
+    ("doc_new(resume_if_open) resumes the MOST BUILT of several same-name docs").
+    `new_calls` records only real MINTS, so "must not mint" stays assertable even though
+    doc_new is now always the call that is made.
+    """
 
     def __init__(self, docs):
         self.docs = list(docs)
@@ -41,9 +59,23 @@ class _FakeEngine:
         if method == "doc_list":
             return {"docs": [dict(e) for e in self.docs]}
         if method == "doc_new":
-            self.new_calls.append(p.get("name"))
-            return {"doc_id": "doc-cppMINTED", "name": (p.get("name") or "part") + "2",
-                    "revision": 0}
+            want = p.get("name") or "part"
+            kind = p.get("kind") or "part"
+            if p.get("resume_if_open"):
+                hits = [e for e in self.docs
+                        if e.get("name") == want and (e.get("kind") or "part") == kind]
+                if hits:
+                    best = max(hits, key=lambda e: (e.get("feature_count") or 0,
+                                                    e.get("revision") or 0))
+                    resp = {"doc_id": best["doc_id"], "name": want,
+                            "revision": best.get("revision", 0), "reused": True,
+                            "feature_count": best.get("feature_count", 0)}
+                    others = [e["doc_id"] for e in hits if e["doc_id"] != best["doc_id"]]
+                    if others:
+                        resp["duplicate_doc_ids"] = others
+                    return resp
+            self.new_calls.append(want)
+            return {"doc_id": "doc-cppMINTED", "name": want + "2", "revision": 0}
         if method == "doc_save":
             return {}
         return {}
@@ -84,7 +116,12 @@ def _new_part(**kw):
 def test_two_docs_of_the_same_name_resume_the_built_one(engine):
     """run-138660919763973: two open "mudbucket" docs, and new_part("mudbucket") minted a
     THIRD called mudbucket2. Any number of name matches must resume, never mint, and the
-    doc picked must be the most-built one (highest feature_count)."""
+    doc picked must be the most-built one (highest feature_count).
+
+    The resume/mint choice is the ENGINE's now (see _FakeEngine), so what this pins is
+    that new_part asks for it and reports the resumed document faithfully — doc_id,
+    counts, and a note naming the other claimant. The ranking itself is pinned in
+    core/tests/test_document.cpp."""
     fake = engine([
         {"doc_id": "doc-cpp0000001f", "name": "mudbucket", "revision": 3,
          "feature_count": 7},
@@ -95,7 +132,7 @@ def test_two_docs_of_the_same_name_resume_the_built_one(engine):
 
     assert r["ok"] is True
     assert r["resumed"] is True and r["reused"] is True
-    assert fake.new_calls == [], "a duplicate name must NEVER reach doc_new"
+    assert fake.new_calls == [], "a duplicate name must never MINT (doc_new resumes)"
     assert r["duplicates"] == 2
     assert r["doc_id"] == "doc-cpp0000001f", "the most-built doc is the one meant"
     # The envelope has to be honest about the collision AND teach the way out.

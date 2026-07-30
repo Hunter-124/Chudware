@@ -14,7 +14,9 @@ import json
 import math
 import os
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 
 # Allow `python mcp_server/test_cad_tools.py` (script dir, not repo root, lands on path).
@@ -1338,6 +1340,122 @@ def test_new_part_seeds_volume_baseline_for_write_diff():
     assert "volume_delta_mm3" in ch, ch
     assert ch["volume_delta_mm3"] > 0.0, ch  # material added from an empty part
     assert cad_tools._LAST_VOLUME[doc] == r2["volume_mm3"], "baseline updated to the new volume"
+
+
+# --- new_part resume-or-mint is ATOMIC ---------------------------------------------------
+# Live 2026-07-29, run-42508173312214: the trace holds ONE new_part("lexus_f_keychain")
+# and the GUI grew THREE tabs (lexus_f_keychain, ...2, ...3). new_part used to decide
+# "is it already open?" with a doc_list call and then mint with a separate doc_new, with
+# nothing locked across the two — so when the user retried a request whose first worker
+# was still inside its 5-minute timeout, both attempts reached the ONE machine-wide
+# daemon, both saw the name free, and both minted. doc_new(resume_if_open=True) now makes
+# the check and the mint one step under the engine's mint lock.
+
+def _unique_part_name(tag: str) -> str:
+    """A name no other document in the SHARED daemon can already answer to."""
+    return f"{tag}_{uuid.uuid4().hex[:10]}"
+
+
+def test_new_part_concurrent_same_name_yields_one_document():
+    """Two THREADS calling new_part with the same name at the same instant get ONE doc.
+
+    Sequential calls cannot cover this: the old code was correct whenever the first mint
+    had already committed. The defect only exists in the window between the check and the
+    mint, so the test has to put two callers inside it."""
+    name = _unique_part_name("toctou")
+    results: list = []
+    barrier = threading.Barrier(2)
+
+    def mint():
+        barrier.wait()  # release both callers into the check-then-mint window together
+        r, _ = _call("new_part", {"name": name})
+        results.append(r)
+
+    threads = [threading.Thread(target=mint) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert all(isinstance(r, dict) and r.get("ok") for r in results), results
+    assert len({r["doc_id"] for r in results}) == 1, (
+        f"two concurrent new_part({name!r}) calls minted two documents: {results}")
+    # And the daemon really holds one — a second mint renamed to "<name>2" would satisfy a
+    # doc_id check on the reply alone only if both replies pointed at it, so assert the pool.
+    named = [d for d in cb.call("doc_list", {})["docs"]
+             if (d.get("name") or "").startswith(name)]
+    assert len(named) == 1, named
+
+
+def test_new_part_fresh_still_mints_a_distinct_document():
+    """fresh=True is the documented escape hatch: it must never resume, and never sweep."""
+    name = _unique_part_name("freshdoc")
+    first, _ = _call("new_part", {"name": name})
+    second, _ = _call("new_part", {"name": name, "fresh": True})
+    assert first["ok"] and second["ok"], (first, second)
+    assert second["doc_id"] != first["doc_id"], second
+    assert not second.get("reused"), second
+    assert second["name"] != first["name"], second  # uniquified, and reported honestly
+    # fresh=True asks for a document ALONGSIDE what is open, so the empty original stays.
+    open_ids = {d["doc_id"] for d in cb.call("doc_list", {})["docs"]}
+    assert first["doc_id"] in open_ids, "fresh=True must not discard the existing document"
+
+
+def test_new_part_resume_reports_the_feature_count_it_resumed_onto():
+    """The BUILT/UNBUILT split (docs/REFACTOR_LOG.md ~5274, ~5309): a same-named part is
+    resumed either way, but a BUILT one must announce what it carries. Resuming a
+    half-built body SILENTLY is what produced twelve "boss added no material (it is buried
+    inside the body)" failures, so feature_count and the build-on-them note are the
+    contract, not decoration."""
+    name = _unique_part_name("resume_built")
+    first, _ = _call("new_part", {"name": name})
+    doc = first["doc_id"]
+
+    # UNBUILT: resumed, zero features, and NOT told to build on anything.
+    empty, _ = _call("new_part", {"name": name})
+    assert empty["doc_id"] == doc and empty.get("reused"), empty
+    assert empty["feature_count"] == 0, empty
+    assert "ALREADY CARRIES" not in empty["note"], empty
+
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(30), "width": cb.dim(20), "height": cb.dim(10)})]})
+    assert r["ok"], r
+
+    # BUILT: same document, and the reply carries the count it resumed onto.
+    built, _ = _call("new_part", {"name": name})
+    assert built["doc_id"] == doc and built.get("reused"), built
+    assert built["feature_count"] == 1, built
+    assert "ALREADY CARRIES 1 feature(s)" in built["note"], built
+    # A resume must never reset the volume baseline of a part that already has geometry.
+    from mcp_server import cad_tools
+    assert cad_tools._LAST_VOLUME[doc] == pytest.approx(6000.0, rel=1e-3), \
+        cad_tools._LAST_VOLUME[doc]
+
+
+@pytest.mark.parametrize("suffix", ["", "4"])
+def test_new_part_resume_discards_unbuilt_orphans(suffix):
+    """A worker SIGKILLed on the run timeout leaves its zero-geometry document open in the
+    shared daemon forever. The next resume of that name sweeps the empty leftovers — and
+    only the empty ones: a sibling in the same series that carries geometry survives.
+
+    Parametrized on the base name's LAST CHARACTER because the engine's unique_doc_name
+    strips a trailing integer to get the series base: the siblings of "x1" are "x2"/"x3",
+    which do NOT start with "x1". The sweep's series test assumed `name` + digits, so it
+    found nothing whenever the name ended in a digit — and this test's random hex suffix
+    made that a coin flip. Both shapes are now pinned."""
+    name = _unique_part_name("orphan") + suffix
+    keeper, _ = _call("new_part", {"name": name})
+    orphan, _ = _call("new_part", {"name": name, "fresh": True})   # the killed worker's doc
+    built, _ = _call("new_part", {"name": name, "fresh": True})
+    r, _ = _call("add_features", {"doc_id": built["doc_id"], "ops": [
+        cb.feat("box", "B", {"length": cb.dim(10), "width": cb.dim(10), "height": cb.dim(10)})]})
+    assert r["ok"], r
+
+    resumed, _ = _call("new_part", {"name": name})
+    assert resumed["doc_id"] == keeper["doc_id"], resumed
+    assert orphan["doc_id"] in (resumed.get("discarded_orphans") or []), resumed
+    open_ids = {d["doc_id"] for d in cb.call("doc_list", {})["docs"]}
+    assert orphan["doc_id"] not in open_ids, "the empty orphan must be closed"
+    assert built["doc_id"] in open_ids, "a document with geometry is NEVER discarded"
 
 
 # ================================================================ AI-experience lane

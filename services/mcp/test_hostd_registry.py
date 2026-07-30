@@ -213,6 +213,69 @@ def test_doc_changed_event_reaches_subscriber(scratch_daemon):
     assert not _events(a, "doc.changed")
 
 
+def test_doc_snapshot_served_immediately_after_mint(scratch_daemon):
+    """A freshly minted doc must answer doc_snapshot with a REAL empty-tree snapshot,
+    before any edit ever lands. This is what lets a GUI mirror tab prime itself the
+    frame it appears (engine_events primeMirrorFromSnapshot) instead of falling through
+    to doc_activate — which takes the doc's exclusive per-doc engine mutex and therefore
+    queues behind the agent's first add_features batch. Live run lexus_f_keychain
+    2026-07-29: the tab appeared instantly but only became usable once the agent's first
+    geometry committed."""
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    doc = a.call("doc_new", {"name": "mintsnap"})["doc_id"]
+
+    # The spectator (a different client, exactly like the GUI mirror) reads it lock-free.
+    snap = b.call("doc_snapshot", {"doc_id": doc})
+    assert snap.get("has_snapshot") is True, snap
+    assert snap["doc_id"] == doc
+    assert snap["revision"] == 0
+    # Shape parity with a real doc.changed push — the host parses ONE schema.
+    for key in ("source_client", "source_kind", "method", "user",
+                "tree", "owner_map", "datums", "rebuild", "feature_status", "aicm_path"):
+        assert key in snap, (key, sorted(snap))
+    assert snap["method"] == "doc_new"
+    # Empty part: a named tree with no features, and a bodiless-but-loadable AICM.
+    assert snap["tree"].get("features") == []
+    assert snap["tree"].get("name") == "mintsnap"
+    assert snap["feature_status"] == []
+    assert snap["aicm_path"], "host requires a non-empty aicm_path to park a snapshot"
+
+
+def test_doc_snapshot_mint_seed_yields_to_real_geometry(scratch_daemon):
+    """The mint seed must never shadow geometry: the first real push carries a higher
+    revision and replaces it wholesale."""
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    doc = a.call("doc_new", {"name": "mintseed"})["doc_id"]
+    seed = b.call("doc_snapshot", {"doc_id": doc})
+    assert seed["revision"] == 0 and seed["tree"]["features"] == []
+
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    live = b.call("doc_snapshot", {"doc_id": doc})
+    assert live.get("has_snapshot") is True, live
+    assert live["revision"] == 1
+    assert live["method"] == "doc_apply_ops"
+    assert len(live["tree"]["features"]) == 1
+    assert live["aicm_path"] != seed["aicm_path"]
+
+
+def test_doc_snapshot_skips_internal_doc(scratch_daemon):
+    """A doc minted {"internal": true} (the agent's preflight shadow clone) is never
+    announced, so it must not become spectatable through the snapshot seed either."""
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    doc = a.call("doc_new", {"name": "shadow", "internal": True})["doc_id"]
+    assert b.call("doc_snapshot", {"doc_id": doc}).get("has_snapshot") is False
+
+
+
 def test_doc_closed_event(scratch_daemon):
     a, b = DaemonClient(), DaemonClient()
     a.connect()

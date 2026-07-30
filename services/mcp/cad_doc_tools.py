@@ -4761,31 +4761,156 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             base = base.rsplit(".", 1)[0]
         return base.strip().casefold()
 
-    def _best_open_doc(matches: list) -> dict:
-        """The one of several same-named docs an agent MEANT: the most built
-        (highest feature_count), then the most revised, then the most recently
-        opened (last in doc_list order). Deterministic — never a coin flip."""
-        def _key(pair):
-            i, e = pair
-            built = e.get("feature_count")
-            rev = e.get("revision")
-            return (built if isinstance(built, (int, float)) else 0,
-                    rev if isinstance(rev, (int, float)) else 0,
-                    i)
-        return max(enumerate(matches), key=_key)[1]
+    def _resumed_reply(entry: dict, name: str, *, by_stem: str = "") -> dict:
+        """The new_part reply for a document RESUMED instead of minted.
+
+        `entry` is either the engine's doc_new(resume_if_open=True) reply or a doc_list
+        row — both carry doc_id / name / revision / feature_count. A resumed part that
+        ALREADY CARRIES features says so in the note: inheriting a half-built body
+        silently is what produced twelve "boss added no material (it is buried inside the
+        body)" failures (docs/REFACTOR_LOG.md ~5309), so the count always travels."""
+        did = entry["doc_id"]
+        _CUR["doc_id"] = did
+        # Never reset a real baseline to 0.0: the part may already carry
+        # geometry, and clobbering _LAST_VOLUME would make the next
+        # add_features report "0.0 -> X" instead of the true delta.
+        _LAST_VOLUME.setdefault(did, entry.get("volume", 0.0) or 0.0)
+        built = entry.get("feature_count")
+        carries = (f"; it ALREADY CARRIES {built} feature(s) — build on them "
+                   f"(get_part first), or call new_part(fresh=True) for a "
+                   f"separate empty document"
+                   if isinstance(built, int) and built > 0 else "")
+        out = {
+            "ok": True, "doc_id": did,
+            "name": entry.get("name") or name,
+            "revision": entry.get("revision", 0),
+            "reused": True, "resumed": True,
+            "feature_count": built,
+            "note": f'resumed the open part "{name}" (doc_id={did}) instead of '
+                    f"minting a duplicate document" + carries}
+        if by_stem:
+            out["resumed_by"] = by_stem
+            src = entry.get("path") or entry.get("file_path") or ""
+            out["note"] = (
+                f'resumed the open part imported from "{src}" (doc_id={did}), '
+                f'whose file stem is "{name}", instead of minting a duplicate '
+                f"document" + carries)
+        else:
+            others = [str(o) for o in (entry.get("duplicate_doc_ids") or [])]
+            if others:
+                out["duplicates"] = len(others) + 1
+                out["note"] += (
+                    f'; {len(others) + 1} open documents answer to "{name}" '
+                    f"({', '.join([did] + others)}) — pass doc_id= explicitly to work "
+                    f"in a specific one, or new_part(fresh=True) for a deliberately "
+                    f"separate document")
+        return out
+
+    def _in_name_series(doc_name: str, requested: str) -> bool:
+        """True for `requested` itself and for the sibling names doc_new's
+        unique_doc_name mints when it uniquifies a collision. Case-insensitive.
+
+        MIRRORS core/doc/session.cpp unique_doc_name (~4983-5002): it strips a TRAILING
+        INTEGER off the requested name to get the SERIES BASE, then appends N. So the
+        siblings of "Part1" are "Part2"/"Part3" — they do NOT start with "Part1".
+        Matching `requested` + digits therefore missed every name ENDING in a digit,
+        which is the common case (Part1, bracket_v2, Rev3, and any name carrying a hex
+        id whose last character happens to be a digit) and made the orphan sweep
+        silently find nothing. Caught by test_new_part_resume_discards_unbuilt_orphans,
+        which was passing or failing on the coin flip of its random suffix's last
+        character."""
+        n = (doc_name or "").strip().casefold()
+        req = (requested or "").strip().casefold()
+        if not n or not req:
+            return False
+        if n == req:
+            return True
+        base = req.rstrip("0123456789") or req  # all-digit name: the whole thing is base
+        if not n.startswith(base):
+            return False
+        tail = n[len(base):]
+        # `tail.size() > 9` is the engine's own guard against absurd suffixes.
+        return bool(tail) and tail.isdigit() and len(tail) <= 9
+
+    def _is_own_project_stub(path) -> bool:
+        """True when `path` is absent, or is a file new_part's own _project_save wrote
+        into CHUDWARE_PROJECT_SAVE_DIR. Anything else is a file the USER chose, and a
+        document backed by one is never discarded by the orphan sweep."""
+        if not path or not isinstance(path, str) or not path.strip():
+            return True
+        root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR")
+        if not root:
+            return False
+        try:
+            return os.path.dirname(os.path.realpath(path.strip())) == \
+                os.path.realpath(root)
+        except OSError:
+            return False
+
+    def _discard_unbuilt_orphans(name: str, keep: str) -> list:
+        """Close leftover EMPTY documents in the "name", "name2", "name3", ... series.
+
+        A worker SIGKILLed on the 5-minute run timeout (core/agent/run.cpp:782) never gets
+        to close the document it minted, and the machine-wide daemon keeps it open: the
+        GUI's read-only mirror attach clears hostd's orphan deadline, so its GC never
+        reaps it either. The user's retry then meets a stale empty tab — or three (live
+        2026-07-29, run-42508173312214: one requested part, three tabs).
+
+        SAFETY — only a document with NOTHING TO LOSE is closed, judged from the engine's
+        own doc_list summary: `empty` (its "no authored content worth recovering" flag)
+        AND feature_count 0 (no geometry), revision 0 (never edited), not `dirty` (no
+        unsaved work), kind "part", in this name series, and never `keep` or the current
+        doc. Its `path` must be absent or be the .step+ stub new_part itself wrote into
+        CHUDWARE_PROJECT_SAVE_DIR — a document backed by a file the USER chose is never
+        touched, however empty it looks. (That stub file is left on disk: deleting a
+        user-visible file is not this function's business, and an empty .step+ is
+        harmless.) Attachment is deliberately NOT consulted — the engine exposes none —
+        but a document passing every test above holds no content any attached client could
+        lose, and closing it fans out doc.closed so a mirror tab follows. A document
+        mid-operation is protected by the engine itself: doc_close try_locks and raises
+        doc_busy rather than tearing down a live session, and that error is swallowed here
+        so the doc simply stays open."""
+        closed = []
+        try:
+            rows = (cb.call("doc_list", {}) or {}).get("docs", [])
+        except Exception:  # noqa: BLE001 — cleanup must never fail the caller's mint
+            return closed
+        for e in rows:
+            if not isinstance(e, dict):
+                continue
+            did = e.get("doc_id")
+            if not did or did == keep or did == _CUR["doc_id"]:
+                continue
+            if e.get("kind", "part") != "part" or not _in_name_series(e.get("name"), name):
+                continue
+            if not e.get("empty") or e.get("feature_count") or e.get("component_count"):
+                continue
+            if e.get("dirty") or (e.get("revision") or 0) != 0:
+                continue
+            if not _is_own_project_stub(e.get("path")):
+                continue
+            try:
+                cb.call("doc_close", {"doc_id": did})
+            except Exception:  # noqa: BLE001 — doc_busy et al: leave it open
+                continue
+            _unpublish(did)
+            _LAST_VOLUME.pop(did, None)
+            closed.append(did)
+        return closed
 
     @mcp.tool()
     def new_part(name: str = "part", *, fresh: bool = False) -> str:
         """Create an editable part document named `name` and make it current.
 
         A part of that name that is ALREADY OPEN is RESUMED, never duplicated — and that
-        holds however many open documents answer to the name. A general agent that retries
-        a brief, or a `model3d` worker that respawns per turn, calls new_part(name="Widget")
-        again with no memory of the doc_id it got back; the engine's doc_new UNIQUIFIES the
-        collision into "Widget2" and mints a second document, and every mint fans out
-        doc.opened to the GUI, so copies of "the same part" pile up in the user's tab strip
-        (observed live: one requested part produced CD-1400_TwistedLatticeSphere and five
-        more numbered ...2 through ...6; and an import followed by two new_part("mudbucket")
+        holds however many open documents answer to the name, and however many callers ask
+        at the same instant. A general agent that retries a brief, or a `model3d` worker
+        that respawns per turn, calls new_part(name="Widget") again with no memory of the
+        doc_id it got back; left to itself the engine's doc_new UNIQUIFIES the collision
+        into "Widget2" and mints a second document, and every mint fans out doc.opened to
+        the GUI, so copies of "the same part" pile up in the user's tab strip (observed
+        live: one requested part produced CD-1400_TwistedLatticeSphere and five more
+        numbered ...2 through ...6; and an import followed by two new_part("mudbucket")
         calls left mudbucket, mudbucket and mudbucket2 open at once).
         The name IS the identity an agent addresses a part by, so asking for one that exists
         means "resume it". The rules, exactly:
@@ -4793,13 +4918,18 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
           * ONE OR MORE open parts named `name` -> resume the best of them (most features,
             then highest revision, then most recently opened). The reply reports
             `duplicates` and every colliding doc_id when there was more than one; pass
-            `doc_id=` to a modeling tool to work in a specific one.
+            `doc_id=` to a modeling tool to work in a specific one. The decision is made
+            INSIDE doc_new (resume_if_open), under the engine's mint lock — two callers
+            racing on the same name get one document, not two.
           * NO name match, but exactly ONE open part whose FILE STEM is `name`
             (import_part("Projects/Testing/mudbucket.step+") often leaves the doc named
             after the file) -> resume that one; the reply carries `resumed_by="path_stem"`.
             Several parts stemming to the same name are ambiguous and are NOT guessed — a
             new document is minted instead, because editing the wrong part is worse.
-          * `fresh=True` is the ONLY way to force a second document with a taken name.
+          * A resume also closes any EMPTY same-name-series leftovers (`discarded_orphans`)
+            — the zero-geometry documents a worker killed on the run timeout left behind.
+          * `fresh=True` is the ONLY way to force a second document with a taken name, and
+            it neither resumes nor discards anything.
 
         A resumed part that already carries geometry says so in `feature_count` and `note`:
         build ON what is there. Ignoring that and placing the next body at the origin is what
@@ -4810,56 +4940,40 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         """
         try:
             if not fresh:
+                # The PATH-STEM resume still needs the doc list: the engine keys documents
+                # by name, not by the file they were imported from. It never mints, so two
+                # racing callers both land on the same imported document.
                 docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                         if isinstance(e, dict) and e.get("doc_id")]
-                existing = _docs_named(docs, name)
-                by_stem = ""
-                if not existing:
+                if not _docs_named(docs, name):
                     folded = (name or "").strip().casefold()
                     stemmed = [e for e in docs if folded and _doc_path_stem(e) == folded]
                     # Exactly one is an identification; several is a guess, and the wrong
                     # part edited is worse than one extra document.
                     if len(stemmed) == 1:
-                        existing, by_stem = stemmed, "path_stem"
-                if existing:
-                    taken = _best_open_doc(existing)
-                    did = taken["doc_id"]
-                    _CUR["doc_id"] = did
-                    # Never reset a real baseline to 0.0: the part may already carry
-                    # geometry, and clobbering _LAST_VOLUME would make the next
-                    # add_features report "0.0 -> X" instead of the true delta.
-                    _LAST_VOLUME.setdefault(did, taken.get("volume", 0.0) or 0.0)
-                    built = taken.get("feature_count")
-                    carries = (f"; it ALREADY CARRIES {built} feature(s) — build on them "
-                               f"(get_part first), or call new_part(fresh=True) for a "
-                               f"separate empty document"
-                               if isinstance(built, int) and built > 0 else "")
-                    out = {
-                        "ok": True, "doc_id": did,
-                        "name": taken.get("name") or name,
-                        "revision": taken.get("revision", 0),
-                        "reused": True, "resumed": True,
-                        "feature_count": built,
-                        "note": f'resumed the open part "{name}" (doc_id={did}) instead of '
-                                f"minting a duplicate document" + carries}
-                    if by_stem:
-                        out["resumed_by"] = by_stem
-                        src = taken.get("path") or taken.get("file_path") or ""
-                        out["note"] = (
-                            f'resumed the open part imported from "{src}" (doc_id={did}), '
-                            f'whose file stem is "{name}", instead of minting a duplicate '
-                            f"document" + carries)
-                    elif len(existing) > 1:
-                        others = ", ".join(str(e.get("doc_id")) for e in existing)
-                        out["duplicates"] = len(existing)
-                        out["note"] += (
-                            f'; {len(existing)} open documents answer to "{name}" '
-                            f"({others}) — pass doc_id= explicitly to work in a specific "
-                            f"one, or new_part(fresh=True) for a deliberately separate "
-                            f"document")
-                    return _dumps(out)
-            r = cb.call("doc_new", {"kind": "part", "name": name})
+                        return _dumps(_resumed_reply(stemmed[0], name, by_stem="path_stem"))
+            # The NAME check is NOT made here. It used to be — an unlocked doc_list
+            # "is it open?" followed by a separate doc_new mint, with nothing holding
+            # across the two. When the user retried a request whose first worker was still
+            # inside its 5-minute timeout, both attempts reached the ONE machine-wide
+            # daemon, both saw the name free, and both minted: one requested part became
+            # three tabs (live 2026-07-29, run-42508173312214 — lexus_f_keychain, ...2,
+            # ...3). resume_if_open makes the engine do check-and-mint under its mint lock,
+            # so a concurrent loser resumes the winner's document instead of minting.
+            r = cb.call("doc_new", {"kind": "part", "name": name,
+                                    "resume_if_open": not fresh})
             did = r.get("doc_id")
+            if r.get("reused"):
+                out = _resumed_reply(r, name)
+                # Sweep the empty documents a killed worker left in this name series
+                # (never on fresh=True: that call explicitly asks for a document ALONGSIDE
+                # whatever is open, so removing one would contradict it).
+                dropped = _discard_unbuilt_orphans(name, did)
+                if dropped:
+                    out["discarded_orphans"] = dropped
+                    out["note"] += (f"; closed {len(dropped)} empty leftover document(s) "
+                                    f"of the same name ({', '.join(dropped)})")
+                return _dumps(out)
             _CUR["doc_id"] = did
             # Seed the write-diff baseline: an empty part has zero volume, so the FIRST
             # add_features reports a real volume delta ("0.0 -> X (+X)") instead of degrading

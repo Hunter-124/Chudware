@@ -51,6 +51,25 @@ std::vector<TopoDS_Face> faces_from_solved_sketch(
 std::vector<TopoDS_Face> all_region_faces_from_solved_sketch(
     const nlohmann::json& solved_entities, const SketchPlane& plane);
 
+// Group the material (depth-0) region faces into CONNECTED MATERIAL REGIONS: the
+// sets of top-level loops whose 2D footprints OVERLAP or TOUCH. Extruding such a
+// set fuses their prisms into ONE solid, so it is ONE material region however many
+// closed loops drew it — which is what "material region" means to a parametric
+// modeller (SolidWorks extrudes the unioned contour) and therefore what an agent
+// readback must count and what a `hint_index` can address.
+//
+// Motivating live run run-42508173312214 ("lexus_f_keychain"): three OVERLAPPING
+// rectangles in one sketch were narrated as "3 material regions" while the extruder
+// correctly fused them into one 264 mm^2 union, so the model asked for regions 1
+// and 2 — indices that addressed nothing and failed as "boss added no material".
+//
+// Each returned group holds the same faces faces_from_solved_sketch would emit for
+// its member loops (outer wire minus its direct hole wires), in loop order; the
+// groups themselves are ordered by their lowest member loop index. Concatenating
+// every group therefore reproduces faces_from_solved_sketch's whole-sketch profile.
+std::vector<std::vector<TopoDS_Face>> connected_material_regions(
+    const nlohmann::json& solved_entities, const SketchPlane& plane);
+
 // Build a single (open OR closed) wire from a sketch's raw non-construction edges,
 // lifted onto `plane`, in entity order — the SPINE/PATH a sweep follows and the
 // open trace a rib rides (where faces_from_solved_sketch's closed-loop assembly

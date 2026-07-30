@@ -71,6 +71,25 @@ using EmitFn = std::function<void(const json&)>;
 json run_design(const std::string& request, const std::string& doc_id, const json& provider_cfg,
                 EmitFn emit = nullptr, const json& options = json::object());
 
+// classify_worker_stop — the honest terminal classification for a general-work turn
+// whose python worker never answered.
+//
+// "non_modeling_request" means the request had nothing that could run it. A worker that
+// DIED is not that, and neither is one that went SILENT: run-42508173312214 (2026-07-29)
+// built five real, auto-persisted features on a keychain part, stopped responding, and
+// was reported to the user as a non-modeling request that "changed nothing" — while the
+// geometry sat in the feature tree. `may_have_changed_the_model` carries that second
+// half: every op in the general-work branch commits through the engine as it goes, so
+// only the offline path (which never reaches the worker) can promise nothing happened.
+//
+// reached_worker  false only for the offline pre-flight refusal.
+struct WorkerStop {
+    std::string stop_reason;
+    std::string status;
+    bool may_have_changed_the_model;
+};
+WorkerStop classify_worker_stop(bool crashed, bool timed_out, bool reached_worker);
+
 // run_assembly_design — multi-part TRUE assembly. Plans the request; if the plan is a single part
 // (or assembly:false) it delegates to run_design on `doc_id` (unchanged behavior). Otherwise it
 // builds each part in its OWN child doc (run_design per part), saves each to a .step+ file under

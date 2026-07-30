@@ -60,7 +60,18 @@ bool force_release_doc_lock();
 
 // Create a new blank document ("part"; "assembly" not yet supported). Returns the
 // ops-response + "doc_id". Registers the session in the process-global store.
-nlohmann::json doc_new(const std::string& kind, const std::string& name);
+//
+// `resume_if_open` opts into ATOMIC resume-or-mint. The name check and the mint are
+// otherwise two separate visits to the session registry, so two concurrent callers
+// asking for the same name both see it free and both mint (live 2026-07-29,
+// run-42508173312214: one new_part("lexus_f_keychain") in the trace, three tabs in the
+// GUI). With the flag set, an already-open document of that name is returned as-is
+// under the same lock that guards the uniquify scan — {"reused":true, "feature_count":N}
+// plus "duplicate_doc_ids" when several answer to the name. Callers that mean "the part
+// called X" (services/mcp new_part) pass true; callers that mean "another document"
+// (new_part(fresh=True), import, reverse-engineering) leave it false and keep uniquifying.
+nlohmann::json doc_new(const std::string& kind, const std::string& name,
+                       bool resume_if_open = false);
 
 // Apply an op batch. `base_revision` < 0 skips the optimistic-concurrency guard;
 // otherwise a mismatch throws OpError("stale_revision"). A bad op throws OpError.

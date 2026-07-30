@@ -128,3 +128,7 @@ repomix-output.*
 
 # Per-project agent memory (mnemopi SQLite) — runtime state, created on demand.
 .plm/
+
+# Cloudflare wrangler local state (tmp/ + cache/) for the public site — regenerated
+# on every build, never source.
+Webservice/public-site/.wrangler/

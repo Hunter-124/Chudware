@@ -597,12 +597,14 @@ std::string admin_worker_repo_root() {
 // `non_modeling_request` stop reason, because the child's stderr went to the
 // host's own stderr and the wait status was never inspected. Both are now
 // captured: `err` carries the signal name and the worker's last stderr, and the
-// caller reports stop_reason "worker_crash".
+// caller reports stop_reason "worker_crash". `timed_out` distinguishes a worker that
+// went SILENT from one that died or declined, so the caller can report the honest
+// stop_reason instead of filing a timeout under "non_modeling_request".
 bool call_admin_worker_turn(const std::string& request, const std::string& run_id,
                             const json& provider_cfg, const std::string& workspace_dir,
                             const json& history, const json& attachments,
                             RunEvents& events, json& turn_out,
-                            std::string& err, bool& crashed) {
+                            std::string& err, bool& crashed, bool& timed_out) {
     const std::string python = admin_worker_python_bin();
     if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
         err = "python runtime not found at " + python;
@@ -777,9 +779,21 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         return false;
     }
 
-    // A bounded project_organizer turn (up to 30 tool calls) genuinely needs
-    // minutes, not the sub-second budget of a status/list RPC — 5 min ceiling.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+    // A bounded project_organizer turn (up to 30 tool calls) genuinely needs minutes,
+    // not the sub-second budget of a status/list RPC. This ceiling used to be an
+    // ABSOLUTE 5 minutes from the write, which killed runs that were working the entire
+    // time: a live modelling run (run-42508173312214, 2026-07-29) streamed 270 assistant
+    // deltas and built five real, persisted features, then hit the wall clock and was
+    // reported to the user as `non_modeling_request` — "nothing was changed" — while the
+    // part sat in the feature tree. The worker STREAMS every event onto this run's stream
+    // (the notification branch below), so bytes on its stdout are proof of liveness: time
+    // out on SILENCE, not on duration. The absolute cap remains only as a backstop
+    // against a worker that streams forever without ever answering; the Stop button,
+    // polled every iteration, stays the user's real escape hatch.
+    constexpr auto kIdleTimeout = std::chrono::minutes(5);
+    constexpr auto kAbsoluteCap = std::chrono::hours(2);
+    const auto hard_deadline = std::chrono::steady_clock::now() + kAbsoluteCap;
+    auto idle_deadline = std::chrono::steady_clock::now() + kIdleTimeout;
     std::string read_buf;
     bool got_final = false;
     bool ok_final = false;
@@ -799,8 +813,12 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         }
         size_t nl = read_buf.find('\n');
         if (nl == std::string::npos) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                err = "timeout waiting for admin worker response";
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= idle_deadline || now >= hard_deadline) {
+                err = (now >= hard_deadline)
+                          ? "admin worker never answered within the 2h absolute cap"
+                          : "timeout waiting for admin worker response (no output for 5 min)";
+                timed_out = true;
                 break;
             }
             struct pollfd pfds[2] = {{rd, POLLIN, 0}, {ed, POLLIN, 0}};
@@ -837,7 +855,12 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
             }
             char chunk[4096];
             ssize_t got = ::read(rd, chunk, sizeof(chunk));
-            if (got > 0) { read_buf.append(chunk, static_cast<size_t>(got)); continue; }
+            if (got > 0) {
+                read_buf.append(chunk, static_cast<size_t>(got));
+                // Progress: the worker is alive and talking, so the silence clock restarts.
+                idle_deadline = std::chrono::steady_clock::now() + kIdleTimeout;
+                continue;
+            }
             if (got == 0) {
                 // EOF on the worker's stdout: it is gone, not idle. Report WHY.
                 err = death_detail("admin worker closed stdout without answering");
@@ -896,7 +919,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
 #else   // _WIN32
 bool call_admin_worker_turn(const std::string&, const std::string&, const json&,
                             const std::string&, const json&, const json&, RunEvents&,
-                            json&, std::string& err, bool&) {
+                            json&, std::string& err, bool&, bool&) {
     err = "admin worker bridge unavailable on this platform";
     return false;
 }
@@ -1076,28 +1099,35 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // the worker was unreachable, which was wrong for every case except the offline
         // pre-flight below (the ONE path that never calls the worker, and therefore the
         // one where an empty reason is the honest answer).
-        // `stop_reason` is "non_modeling_request" only for the refusal this branch is
-        // actually about (nothing could run the request). A worker that DIED is not a
-        // non-modeling request — reporting a SIGSEGV under that label sent the operator
-        // looking for a routing bug while a kernel crash went unlogged. `crashed` runs
-        // routes to "worker_crash" with status "failed", so the GUI shows a crash.
-        auto blocked_response = [&](const std::string& worker_err, bool worker_crashed = false)
-            -> json {
+        // The stop_reason/status/"did anything change" split now lives in
+        // classify_worker_stop (run.h) so a test can LINK the shipped rule instead of
+        // restating it in a lambda — the older stop_reason cases in test_agent.cpp are
+        // mirrored copies, which is exactly how a rule and its test drift apart.
+        auto blocked_response = [&](const std::string& worker_err, bool worker_crashed = false,
+                                    bool worker_timed_out = false) -> json {
             const std::string detail = worker_err.empty() ? why : worker_err;
-            const std::string stop = worker_crashed ? "worker_crash" : "non_modeling_request";
-            const std::string status = worker_crashed ? "failed" : "blocked";
+            const WorkerStop cls =
+                classify_worker_stop(worker_crashed, worker_timed_out, !worker_err.empty());
+            const std::string& stop = cls.stop_reason;
+            const std::string& status = cls.status;
             const std::string human =
                 worker_crashed
                     ? "The agent worker process died part-way through this turn, so the "
                       "turn was abandoned. This is a crash in Chudware, not something you "
                       "did. Details: " +
                           worker_err
-                : worker_err.empty()
+                : worker_timed_out
+                    ? "The agent stopped responding, so this turn was abandoned part-way "
+                      "through. Any features it had already built are still in the part — "
+                      "check the feature tree before re-running, so a retry does not build "
+                      "the same geometry twice. Details: " +
+                          worker_err
+                : !cls.may_have_changed_the_model
                     ? std::string("I handed this to the general agent, but couldn't reach it "
                                   "(offline mode is on), so nothing was changed. Turn offline "
                                   "mode off, or use the PLM tab / file explorer directly.")
-                    : "I handed this to the general agent, but the turn didn't complete, so "
-                      "nothing was changed. Reason: " +
+                    : "I handed this to the general agent, but the turn didn't complete. "
+                      "Anything it had already built is still in the part. Reason: " +
                           worker_err;
             events.emit("run_finished", json{{"status", status},
                                              {"stop_reason", stop},
@@ -1124,6 +1154,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         json turn;
         std::string worker_err;
         bool worker_crashed = false;
+        bool worker_timed_out = false;
         const std::string ws_dir = agent_workspace_dir(options);
         // Only `options` is reachable here: libchudware's agent_run handler splits the
         // RPC params into (request, doc_id, provider, options) and run_design never sees
@@ -1133,7 +1164,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         const json attachments = options.value("attachments", json::array());
         if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, history,
                                     attachments, events,
-                                    turn, worker_err, worker_crashed)) {
+                                    turn, worker_err, worker_crashed, worker_timed_out)) {
             if (worker_err == "cancelled" || run_ctl.cancelled()) {
                 events.emit("run_finished", json{{"status", "cancelled"},
                                                  {"stop_reason", "cancelled"}});
@@ -1144,9 +1175,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             }
             events.emit("run_note",
                         json{{"note", worker_crashed ? "agent worker process died mid-turn"
+                              : worker_timed_out     ? "agent worker stopped responding mid-turn"
                                                      : "general-work worker turn unavailable"},
                              {"reason", worker_err}});
-            return blocked_response(worker_err, worker_crashed);
+            return blocked_response(worker_err, worker_crashed, worker_timed_out);
         }
 
         const bool turn_ok = turn.value("success", false);

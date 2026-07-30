@@ -16,11 +16,13 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -484,7 +486,14 @@ TEST_CASE("buried primitive boss errors loudly instead of silently adding nothin
     REQUIRE(r.statuses.size() == 2);
     CHECK(r.statuses[0].ok);                  // plate builds
     CHECK_FALSE(r.statuses[1].ok);            // buried boss is rejected
-    CHECK(r.statuses[1].error.find("buried") != std::string::npos);
+    // Pin the CONTRACT, not one adjective: the message must state the observation it
+    // actually made (zero volume gained) and teach the placement fix. It used to assert
+    // the literal word "buried", which broke when the message stopped ASSERTING burial
+    // as the sole cause (run-42508173312214: that single-cause phrasing sent a live model
+    // three calls deep fixing a plane that was never wrong).
+    const std::string& err = r.statuses[1].error;
+    CHECK(err.find("added no material") != std::string::npos);
+    CHECK(err.find("centered:false") != std::string::npos);
     // The body survives as the plate alone (80*40*10), not silently corrupted.
     REQUIRE(r.body_count == 1);
 }
@@ -4141,5 +4150,360 @@ TEST_CASE("validate: a rejected selector slot teaches the whole grammar, incl. q
         const std::vector<std::string> errs = chudware::doc::validate_document(canon);
         for (const auto& x : errs) MESSAGE("  " << x);
         CHECK(errs.empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// doc_new: resume-or-mint is ATOMIC.
+//
+// Live 2026-07-29, run-42508173312214: the run trace holds exactly ONE
+// new_part("lexus_f_keychain") and the GUI grew THREE tabs (lexus_f_keychain,
+// ...2, ...3). The name check and the mint were two separate visits to the
+// session registry, and services/mcp new_part made the check in a doc_list call
+// of its own — so when the user retried a request whose first worker was still
+// inside its 5-minute timeout, both attempts reached the ONE machine-wide
+// chudware-hostd, both saw the name free, and both minted. unique_doc_name then
+// renamed the losers, and every mint fans out doc.opened.
+//
+// A SEQUENTIAL test cannot cover this: the old code was already correct whenever
+// the first mint had committed. The defect lives only in the window between the
+// check and the mint, so the test has to put several callers inside it.
+TEST_CASE("doc_new(resume_if_open) is atomic under concurrent same-name callers") {
+    using chudware::doc::doc_list;
+    using chudware::doc::doc_new;
+
+    constexpr int kThreads = 8;
+    const std::string name = "AtomicMintRace";
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::string> ids(kThreads);
+    std::vector<std::string> errs(kThreads);
+    std::vector<std::thread> ts;
+    ts.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i)
+        ts.emplace_back([&, i] {
+            ready.fetch_add(1);
+            while (!go.load()) std::this_thread::yield();  // all inside the window together
+            try {
+                ids[i] = doc_new("part", name, /*resume_if_open=*/true)
+                             .value("doc_id", std::string());
+            } catch (const std::exception& e) {
+                errs[i] = e.what();
+            }
+        });
+    while (ready.load() < kThreads) std::this_thread::yield();
+    go.store(true);
+    for (auto& t : ts) t.join();
+
+    for (int i = 0; i < kThreads; ++i) {
+        CHECK_MESSAGE(errs[i].empty(), "thread " << i << ": " << errs[i]);
+        REQUIRE_MESSAGE(!ids[i].empty(), "thread " << i << " got no doc_id");
+        CHECK_MESSAGE(ids[i] == ids[0],
+                      "concurrent doc_new(resume_if_open) minted a second document: "
+                          << ids[i] << " != " << ids[0]);
+    }
+    // And the registry really holds ONE: a uniquified loser would show up as
+    // "AtomicMintRace2" here even though its caller had already returned.
+    //
+    // `doc_list()` MUST be bound to a named value first. Iterating
+    // `doc_list().at("docs")` directly is UB under C++17 (this target is -std=c++17):
+    // the range expression is a reference INTO the returned temporary, so only that
+    // reference is lifetime-extended and the json itself dies before the first
+    // iteration. It read as an empty list, so this check counted 0 and looked like the
+    // atomic mint had failed when it had not. (C++23 P2718R0 extends the temporary;
+    // C++17 does not.)
+    const json listed = doc_list();
+    int in_series = 0;
+    for (const json& d : listed.at("docs"))
+        if (d.value("name", std::string()).rfind(name, 0) == 0) ++in_series;
+    CHECK(in_series == 1);
+}
+
+TEST_CASE("doc_new without resume_if_open still uniquifies (the fresh=True path)") {
+    using chudware::doc::doc_new;
+    const std::string name = "AtomicMintFresh";
+    const json a = doc_new("part", name);
+    const json b = doc_new("part", name);  // no opt-in: a DELIBERATE second document
+    CHECK(a.at("name").get<std::string>() == name);
+    CHECK(b.at("name").get<std::string>() == name + "2");
+    CHECK(a.at("doc_id").get<std::string>() != b.at("doc_id").get<std::string>());
+    CHECK_FALSE(b.value("reused", false));
+}
+
+// The BUILT/UNBUILT split (docs/REFACTOR_LOG.md ~5274, ~5309): resuming a same-named
+// part is right for the respawn case, but inheriting a stranger's HALF-BUILT body
+// silently is worse than a duplicate tab — twelve sibling tests once died on "boss
+// added no material (it is buried inside the body)" because of it. The resume is
+// therefore allowed for both, and feature_count travels with it so the caller can
+// tell the agent what it resumed onto.
+TEST_CASE("a resumed document reports the feature count it carries") {
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    const std::string name = "AtomicMintResume";
+    const json first = doc_new("part", name, /*resume_if_open=*/true);
+    const std::string id = first.at("doc_id").get<std::string>();
+    CHECK_FALSE(first.value("reused", false));  // nothing open yet: this one MINTED
+
+    const json unbuilt = doc_new("part", name, /*resume_if_open=*/true);
+    CHECK(unbuilt.value("reused", false));
+    CHECK(unbuilt.at("doc_id").get<std::string>() == id);
+    CHECK(unbuilt.at("feature_count").get<int>() == 0);
+
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Blk"},
+             {"params", {{"length", dimv(30)}, {"width", dimv(20)}, {"height", dimv(10)}}}}}},
+    });
+    REQUIRE(doc_apply_ops(id, -1, ops, false).value("volume", 0.0) ==
+            doctest::Approx(6000.0).epsilon(0.02));
+
+    const json built = doc_new("part", name, /*resume_if_open=*/true);
+    CHECK(built.value("reused", false));
+    CHECK(built.at("doc_id").get<std::string>() == id);
+    CHECK(built.at("feature_count").get<int>() == 1);  // the count MUST travel
+    CHECK(built.at("revision").get<long>() > 0);
+}
+
+// A part is never resumed as an assembly (or the reverse): the kinds are different
+// documents with different schemas, so a name collision across them must still mint.
+TEST_CASE("doc_new(resume_if_open) never resumes across document kinds") {
+    using chudware::doc::doc_new;
+    const std::string name = "AtomicMintKind";
+    const json part = doc_new("part", name, /*resume_if_open=*/true);
+    const json asmb = doc_new("assembly", name, /*resume_if_open=*/true);
+    CHECK_FALSE(asmb.value("reused", false));
+    CHECK(asmb.at("doc_id").get<std::string>() != part.at("doc_id").get<std::string>());
+}
+
+// run-138660919763973 (the "mudbucket" 3-tab bug): TWO open documents were both named
+// "mudbucket" and new_part("mudbucket") minted a THIRD called "mudbucket2". Any number
+// of name matches must resume, never mint, and the one picked must be the MOST BUILT —
+// resuming the empty twin silently strands the user's seven features in a tab the agent
+// then ignores.
+//
+// Two docs can legitimately share a name even though doc_new uniquifies: import_part and
+// the recovery path set doc["name"] directly, and doc_set_name renames after the fact.
+// This reproduces that state the same way, via doc_set_name.
+//
+// The ranking used to live in a Python helper (_best_open_doc in cad_doc_tools.py) that
+// the atomic-mint change deleted, because a check-then-mint in Python cannot be made
+// race-free against a shared daemon. It is engine behaviour now, so it is pinned here.
+TEST_CASE("doc_new(resume_if_open) resumes the MOST BUILT of several same-name docs") {
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_set_name;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    const std::string name = "AtomicMintRank";
+    // The BUILT one, minted first.
+    const std::string built_id =
+        doc_new("part", name, /*resume_if_open=*/true).at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Blk"},
+             {"params", {{"length", dimv(30)}, {"width", dimv(20)}, {"height", dimv(10)}}}}}},
+    });
+    REQUIRE(doc_apply_ops(built_id, -1, ops, false).value("volume", 0.0) ==
+            doctest::Approx(6000.0).epsilon(0.02));
+
+    // An EMPTY twin that ends up sharing the name, exactly as an import/recovery would.
+    const std::string empty_id =
+        doc_new("part", name + "Twin", /*resume_if_open=*/false).at("doc_id").get<std::string>();
+    doc_set_name(empty_id, name);
+    REQUIRE(empty_id != built_id);
+
+    const json resumed = doc_new("part", name, /*resume_if_open=*/true);
+    CHECK(resumed.value("reused", false));                       // resumed, never minted
+    CHECK(resumed.at("doc_id").get<std::string>() == built_id);  // the BUILT one
+    CHECK(resumed.at("doc_id").get<std::string>() != empty_id);
+    CHECK(resumed.at("feature_count").get<int>() == 1);
+    // And no third document was bred for the name.
+    const json listed = chudware::doc::doc_list();
+    int in_series = 0;
+    for (const json& d : listed.at("docs"))
+        if (d.value("name", std::string()).rfind(name, 0) == 0) ++in_series;
+    CHECK(in_series == 2);  // the built one + the renamed twin, and nothing new
+}
+
+// ---------------------------------------------------------------------------
+// REGION MODEL AGREEMENT + HONEST ZERO-VOLUME DIAGNOSIS.
+// Live run run-42508173312214 ("lexus_f_keychain", 2026-07-29). Its f4 sketch is the
+// three OVERLAPPING rectangles below (an "F"). Measured at that commit: the readback
+// narrated `Closure: CLOSED (3 material regions)` (it counted closed LOOPS) while the
+// extruder resolved hint_index 0 to the whole 264 mm^2 UNION (dvol 528 mm^3 at 2 mm).
+// The model believed the readback, asked for regions 1 and 2, and both re-extruded the
+// already-consumed union -> zero volume delta -> a message that ASSERTED a single
+// cause ("primitives are centred on the origin ... not plane.top"). None of that
+// applied; the model then burned three calls editing a plane that was never wrong.
+namespace {
+
+// The three rectangles of that run's f4, as sketch_add_entity ops on sketch "$0".
+// r1 = 6x18 = 108, r2 = 22x6 = 132, r3 = 16x6 = 96 mm^2. Pairwise overlaps
+// r1&r2 = 36, r1&r3 = 36, r2&r3 = 0  ->  UNION = 264 mm^2. All three share the
+// x=10 edge, so they are ONE connected material region.
+constexpr double kFUnionAreaMm2 = 264.0;
+
+json f_profile_rect_ops() {
+    auto rect = [](double x1, double y1, double x2, double y2) {
+        return json{{"op", "sketch_add_entity"}, {"sketch", "$0"},
+                    {"entity", json{{"type", "rectangle"},
+                                    {"corner1", json::array({x1, y1})},
+                                    {"corner2", json::array({x2, y2})}}}};
+    };
+    return json::array({rect(10, -6, 16, 12), rect(10, 6, 32, 12), rect(10, -1, 26, 5)});
+}
+
+// new part -> sketch on plane.top carrying the F profile -> extrude it with `profile`.
+// Returns the doc_apply_ops response (the extrude is the LAST feature_status row).
+json build_f_profile_doc(const char* name, const json& profile, double depth) {
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    const std::string id = doc_new("part", name).at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "sketch"}, {"name", "FSketch"},
+                 {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+                 {"refs", {{"plane", "plane.top"}}}}}},
+    });
+    for (const json& r : f_profile_rect_ops()) ops.push_back(r);
+    ops.push_back(json{{"op", "add_feature"}, {"feature",
+        json{{"type", "extrude"}, {"name", "FBoss"},
+             {"params", {{"mode", "boss"}, {"end", "blind"},
+                         {"depth", json{{"value", depth}, {"expr", nullptr}}}}},
+             {"refs", {{"profile", profile}}}}}});
+    json resp = doc_apply_ops(id, -1, ops, false);
+    resp["_doc_id"] = id;
+    return resp;
+}
+
+json region_selector(int hint) {
+    return json::array({json{{"kind", "region"}, {"sketch", "$0"}, {"hint_index", hint}}});
+}
+
+}  // namespace
+
+// (1) The two region models must AGREE: whatever count the readback narrates,
+// hint_index 0..N-1 must each resolve. Three overlapping loops = ONE material region,
+// and hint_index 0 is that region = the full union the extruder already builds.
+TEST_CASE("region model: 3 overlapping loops are ONE material region (readback == hint_index)") {
+    using chudware::doc::doc_sketch_health;
+    const double depth = 2.0;
+    json resp = build_f_profile_doc("FRegionAgree", region_selector(0), depth);
+    for (const auto& fst : resp.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(fst.value("ok", false), "feature " << fst.value("id", std::string())
+                        << " failed: " << status_err(fst));
+
+    // The readback side: the number the agent reads as "CLOSED (N material regions)".
+    const std::string sketch_fid = resp.at("id_map").at("$0").get<std::string>();
+    json health = doc_sketch_health(resp.at("_doc_id").get<std::string>(), sketch_fid);
+    REQUIRE(health.at("closure").contains("material_regions"));
+    const int narrated = health["closure"]["material_regions"].get<int>();
+    MESSAGE("narrated material regions = " << narrated);
+    CHECK(narrated == 1);  // was 3 (one per closed LOOP) at run-42508173312214
+
+    // The extruder side: hint_index 0 is the whole unioned profile, not one rectangle
+    // and not the 336 mm^2 naive sum of the three.
+    const double vol = resp.value("volume", 0.0);
+    MESSAGE("hint_index 0 volume = " << vol << " (union expects "
+            << kFUnionAreaMm2 * depth << ")");
+    CHECK(vol == doctest::Approx(kFUnionAreaMm2 * depth).epsilon(0.005));
+
+    // Every index the readback advertises must resolve. N == 1 -> exactly index 0.
+    for (int k = 0; k < narrated; ++k) {
+        json r = build_f_profile_doc("FRegionIdx", region_selector(k), depth);
+        const json& rows = r.at("rebuild").at("feature_status");
+        CHECK_MESSAGE(rows.back().value("ok", false),
+                      "hint_index " << k << " was advertised but does not resolve: "
+                      << status_err(rows.back()));
+    }
+}
+
+// (2) An out-of-range hint_index gets its OWN error naming the sketch, the index asked
+// for and the count available — it must NEVER degrade into the zero-volume message
+// (which is what sent run-42508173312214's model chasing a phantom plane bug).
+TEST_CASE("region model: an out-of-range hint_index names the sketch, index and count") {
+    for (int bad : {1, 2, 99}) {
+        json resp = build_f_profile_doc("FRegionOOR", region_selector(bad), 2.0);
+        const json& rows = resp.at("rebuild").at("feature_status");
+        const std::string err = status_err(rows.back());
+        REQUIRE_MESSAGE(!rows.back().value("ok", true),
+                        "hint_index " << bad << " must be rejected, not silently unioned");
+        MESSAGE("hint_index " << bad << " -> " << err);
+        CHECK(err.find("hint_index " + std::to_string(bad)) != std::string::npos);
+        CHECK(err.find("does not exist") != std::string::npos);
+        CHECK(err.find("1 connected material region") != std::string::npos);
+        // Decisively NOT the zero-volume story.
+        CHECK(err.find("added no material") == std::string::npos);
+        CHECK(err.find("plane.top") == std::string::npos);
+    }
+}
+
+// (3) The zero-volume boss message must report the OBSERVATION and list the causes,
+// never assert the centred-primitive/plane.top one as fact — and when an earlier
+// feature already extruded the same sketch it must NAME that feature.
+TEST_CASE("zero-volume boss: reports what was observed, not one asserted cause") {
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    auto sketch_op = [](const char* nm) {
+        return json{{"op", "add_feature"}, {"feature",
+            json{{"type", "sketch"}, {"name", nm},
+                 {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+                 {"refs", {{"plane", "plane.top"}}}}}};
+    };
+    auto rect_op = [](const char* sk, double x1, double y1, double x2, double y2) {
+        return json{{"op", "sketch_add_entity"}, {"sketch", sk},
+                    {"entity", json{{"type", "rectangle"},
+                                    {"corner1", json::array({x1, y1})},
+                                    {"corner2", json::array({x2, y2})}}}};
+    };
+    auto boss_op = [&](const char* nm, const char* sk, double d) {
+        return json{{"op", "add_feature"}, {"feature",
+            json{{"type", "extrude"}, {"name", nm},
+                 {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", dimv(d)}}},
+                 {"refs", {{"profile", json::array({json{{"kind", "region"},
+                                                         {"sketch", sk}}})}}}}}};
+    };
+
+    SUBCASE("no earlier consumer: observation + a LIST of causes, plane.top kept as one") {
+        // Body z 0..10 from a 40x40 base; then a small boss on plane.top (z=0, the
+        // body's BOTTOM face) extruded upward -> entirely inside the body.
+        const std::string id = doc_new("part", "BuriedBoss").at("doc_id").get<std::string>();
+        json ops = json::array({sketch_op("Base"), rect_op("$0", 0, 0, 40, 40),
+                                boss_op("Body", "$0", 10.0), sketch_op("Inner")});
+        ops.push_back(rect_op("$3", 10, 10, 20, 20));
+        ops.push_back(boss_op("Buried", "$3", 3.0));
+        json resp = doc_apply_ops(id, -1, ops, false);
+        const json& rows = resp.at("rebuild").at("feature_status");
+        const std::string err = status_err(rows.back());
+        REQUIRE_MESSAGE(!rows.back().value("ok", true), "a buried boss must fail loudly");
+        MESSAGE("buried boss -> " << err);
+        // The OBSERVATION, stated as such.
+        CHECK(err.find("lies entirely within the existing body") != std::string::npos);
+        // The causes are OFFERED, not asserted...
+        CHECK(err.find("Plausible causes") != std::string::npos);
+        // ...and the mid-plane/centred-primitive hint is still among them, because it
+        // IS the right diagnosis for the case this guard was originally written for.
+        CHECK(err.find("plane.top") != std::string::npos);
+        CHECK(err.find("centred on the origin") != std::string::npos);
+        // The old text asserted the cause with no alternatives — it must be gone.
+        CHECK(err.find("(it is buried inside the body —") == std::string::npos);
+    }
+
+    SUBCASE("earlier consumer: names the feature that already extruded the sketch") {
+        // The run-42508173312214 shape: the SAME sketch extruded twice. The second boss
+        // can add nothing, and the id of the first is the decisive fact.
+        const std::string id = doc_new("part", "DoubleBoss").at("doc_id").get<std::string>();
+        json ops = json::array({sketch_op("Base"), rect_op("$0", 0, 0, 40, 40),
+                                boss_op("First", "$0", 10.0), boss_op("Second", "$0", 10.0)});
+        json resp = doc_apply_ops(id, -1, ops, false);
+        const json& rows = resp.at("rebuild").at("feature_status");
+        const std::string err = status_err(rows.back());
+        REQUIRE_MESSAGE(!rows.back().value("ok", true), "re-extruding a consumed region fails");
+        MESSAGE("re-extruded profile -> " << err);
+        CHECK(err.find("ALREADY extruded by") != std::string::npos);
+        CHECK(err.find("\"First\"") != std::string::npos);  // names the earlier feature
+        // The decisive fact REPLACES the speculative list — no plane story here.
+        CHECK(err.find("plane.top") == std::string::npos);
     }
 }

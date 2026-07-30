@@ -197,6 +197,14 @@ private:
         // Measured on a live run: 142.9 s for one tab switch onto the part the agent was
         // building. This copy costs one tree per doc and is served without touching the
         // engine at all, so spectating a doc can never wait on the client writing it.
+        // SEEDED AT MINT TIME too (postCall's `minted` branch, same snapshotPayload
+        // builder): a doc_new response already carries the full ops_response, so the very
+        // first doc_snapshot after doc.opened serves a real empty-tree snapshot instead of
+        // has_snapshot=false. Without it the freshly revealed mirror tab still had to
+        // doc_activate, which is exactly the lock queue described above — the user saw the
+        // tab appear and then waited for the agent's first geometry before it opened.
+        // Only ever overwritten by a STRICTLY HIGHER revision, so the seed cannot shadow
+        // geometry.
         nlohmann::json lastPush;
     };
     struct PendingEvent {

@@ -3132,7 +3132,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
         try {
             if (m == "doc_new")
                 return emit(chudware::doc::doc_new(params.value("kind", std::string("part")),
-                                                params.value("name", std::string())),
+                                                params.value("name", std::string()),
+                                                params.value("resume_if_open", false)),
                             out_json, 0);
             if (m == "doc_apply_ops")
                 return emit(chudware::doc::doc_apply_ops(

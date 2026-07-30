@@ -474,6 +474,42 @@ bool DocRegistry::preCall(int clientId, const std::string& kind, const std::stri
 
 // -------------------------------------------------------- response sniffing
 
+// The doc.changed / DocState::lastPush payload built out of a mutating engine response.
+// ONE builder for BOTH the doc.changed fanout and the mint-time placeholder in postCall,
+// so the two shapes can never drift: lastPush is served VERBATIM to the GUI by
+// doc_snapshot (Server::handleDaemonMethod), and a payload the GUI mis-parses is worse
+// than none. Every geometry field is optional — a response that carries none yields the
+// bare envelope, exactly as before.
+static json snapshotPayload(const std::string& docId, long rev, int clientId,
+                            const std::string& kind, const std::string& method,
+                            const std::string& userId, const std::string& userDisplay,
+                            const json& result) {
+    json data = {{"doc_id", docId},
+                 {"revision", rev},
+                 {"source_client", clientId},
+                 {"source_kind", kind},
+                 {"method", method},
+                 {"user", {{"id", userId}, {"display", userDisplay}}}};
+    if (!result.is_object()) return data;
+    if (result.contains("tess") && result["tess"].is_object() &&
+        result["tess"].contains("aicm_path"))
+        data["aicm_path"] = result["tess"]["aicm_path"];
+    // Push the immutable revision snapshot with the mesh path. Additive fields let GUI
+    // viewers prewarm inactive-tab caches without a serialized follow-up doc_tree call.
+    if (result.contains("tree") && result["tree"].is_object())
+        data["tree"] = result["tree"];
+    if (result.contains("owner_map") && result["owner_map"].is_object())
+        data["owner_map"] = result["owner_map"];
+    if (result.contains("datums") && result["datums"].is_array())
+        data["datums"] = result["datums"];
+    if (result.contains("rebuild") && result["rebuild"].is_object()) {
+        data["rebuild"] = result["rebuild"];
+        if (result["rebuild"].contains("feature_status"))
+            data["feature_status"] = result["rebuild"]["feature_status"];
+    }
+    return data;
+}
+
 void DocRegistry::postCall(int clientId, const std::string& kind, const std::string& userId,
                            const std::string& userDisplay, const std::string& method,
                            const json& params, json& result) {
@@ -545,6 +581,34 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                 flush(pending);
                 return;
             }
+            // Mint-time snapshot, so a GUI mirror tab can prime the INSTANT it appears.
+            // WHY (live run, lexus_f_keychain 2026-07-29 — "really big delay from when it
+            // shows up in the viewport and when i can actually op the part preview, its
+            // almost like i have to wait until it adds the initial geometry"): lastPush was
+            // written ONLY by the doc.changed branch below, i.e. only once a LATER
+            // advancing mutating call landed. The mirror tab this doc.opened reveals primes
+            // itself through the lock-free doc_snapshot (host/src/core/engine_events.cpp
+            // primeMirrorFromSnapshot), served straight out of lastPush — still empty at
+            // that moment, so the prime answered has_snapshot=false, the tab took focus
+            // anyway and AppState::switchToTabCore fell through to a real doc_activate.
+            // doc_activate takes the doc's EXCLUSIVE per-doc engine mutex (core/doc/
+            // session.cpp DocLock + require_session), which the agent's add_features batch
+            // holds for its entire compile+tessellate — so the user's open returned exactly
+            // when the first geometry committed. A minting doc_new answers with the full
+            // ops_response (revision/tree/owner_map/datums/rebuild plus a tess.aicm_path
+            // for the bodiless AICM: write_aicm always emits its 12-byte header, so the
+            // host's aicm_loader parses it to zero bodies), which is precisely what the
+            // doc.changed push carries — hence the SAME builder, no second shape.
+            // Stored only when the response carried BOTH a revision and a tree: without
+            // either, host-side DocMirrorSnapshot::valid()/pushedSnapshot reject it and
+            // has_snapshot=true would be a lie the GUI pays a round-trip for.
+            // It can never shadow real geometry: this branch runs on the doc's FIRST
+            // sighting only, and the doc.changed branch below overwrites lastPush on every
+            // strictly-higher revision (`advanced` requires rev > d.revision).
+            if (rev >= 0 && result.is_object() && result.contains("tree") &&
+                result["tree"].is_object())
+                d.lastPush = snapshotPayload(docId, rev, clientId, kind, method, userId,
+                                             userDisplay, result);
             // "name" lets a subscriber title the doc's tab on the spot instead of
             // chasing a doc_tree round-trip (which takes the doc's engine lock while
             // the minting client is still mid-op). Omitted when the minting response
@@ -592,29 +656,8 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                 // No doc.changed for an internal doc (DocState::internal): no subscriber
                 // was told it opened, and the payload below copies the whole tree.
                 if (!d.internal) {
-                    json data = {{"doc_id", docId},
-                                 {"revision", rev},
-                                 {"source_client", clientId},
-                                 {"source_kind", kind},
-                                 {"method", method},
-                                 {"user", {{"id", userId}, {"display", userDisplay}}}};
-                    if (result.contains("tess") && result["tess"].is_object() &&
-                        result["tess"].contains("aicm_path"))
-                        data["aicm_path"] = result["tess"]["aicm_path"];
-                    // Push the immutable revision snapshot with the mesh path. Additive
-                    // fields let GUI viewers prewarm inactive-tab caches without a
-                    // serialized follow-up doc_tree call.
-                    if (result.contains("tree") && result["tree"].is_object())
-                        data["tree"] = result["tree"];
-                    if (result.contains("owner_map") && result["owner_map"].is_object())
-                        data["owner_map"] = result["owner_map"];
-                    if (result.contains("datums") && result["datums"].is_array())
-                        data["datums"] = result["datums"];
-                    if (result.contains("rebuild") && result["rebuild"].is_object())
-                        data["rebuild"] = result["rebuild"];
-                    if (result.contains("rebuild") && result["rebuild"].is_object() &&
-                        result["rebuild"].contains("feature_status"))
-                        data["feature_status"] = result["rebuild"]["feature_status"];
+                    json data = snapshotPayload(docId, rev, clientId, kind, method, userId,
+                                                userDisplay, result);
                     // Keep the payload so a mirror tab that appears AFTER this push can
                     // still be populated without a doc_activate (see DocState::lastPush).
                     d.lastPush = data;

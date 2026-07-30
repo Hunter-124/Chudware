@@ -12,6 +12,7 @@
 #include "agent/domain.h"
 #include "agent/firm_bid.h"
 #include "agent/iface_plan.h"
+#include "agent/run.h"
 
 
 using namespace chudware::agent;
@@ -2062,6 +2063,47 @@ TEST_CASE("eng_firm single-task mission budget accounting") {
         // Third task would need 12 against remaining 6 → refused.
         CHECK(spent + 12.0 > budget);
     }
+}
+
+TEST_CASE("a silent worker is not a non-modeling request") {
+    // run-42508173312214 (2026-07-29): a keychain modelling turn built five real,
+    // auto-persisted features, then stopped responding. The host filed it as
+    // stop_reason "non_modeling_request" / status "blocked" and told the user
+    // "nothing was changed" — while the geometry sat in the feature tree, which is
+    // what made the user retry and end up with duplicate parts.
+    // Unlike the mirrored lambdas above, this LINKS the shipped rule.
+    using chudware::agent::classify_worker_stop;
+
+    const auto silent = classify_worker_stop(/*crashed=*/false, /*timed_out=*/true,
+                                             /*reached_worker=*/true);
+    CHECK(silent.stop_reason == "worker_timeout");
+    CHECK(silent.stop_reason != "non_modeling_request");
+    CHECK(silent.status == "failed");
+    // The honesty half: the run committed ops through the engine as it went.
+    CHECK(silent.may_have_changed_the_model);
+
+    const auto died = classify_worker_stop(true, false, true);
+    CHECK(died.stop_reason == "worker_crash");
+    CHECK(died.status == "failed");
+    CHECK(died.may_have_changed_the_model);
+
+    // A worker killed on the timeout path still reports its signal; the crash is the
+    // more specific fact, so it must win rather than being masked by the timeout.
+    CHECK(classify_worker_stop(true, true, true).stop_reason == "worker_crash");
+
+    // The offline pre-flight never reaches the worker — the ONE case that may honestly
+    // promise the model is untouched, and the only one that stays "blocked".
+    const auto offline = classify_worker_stop(false, false, /*reached_worker=*/false);
+    CHECK(offline.stop_reason == "non_modeling_request");
+    CHECK(offline.status == "blocked");
+    CHECK_FALSE(offline.may_have_changed_the_model);
+
+    // Reached the worker and it declined for a real reason: still not a crash, but it
+    // may already have changed the model, so it must not claim otherwise.
+    const auto declined = classify_worker_stop(false, false, true);
+    CHECK(declined.stop_reason == "non_modeling_request");
+    CHECK(declined.status == "blocked");
+    CHECK(declined.may_have_changed_the_model);
 }
 
 TEST_CASE("mission stop_reason propagates real unit failure") {

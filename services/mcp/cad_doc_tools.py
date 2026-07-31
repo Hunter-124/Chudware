@@ -1747,6 +1747,28 @@ _DIAMETER_ALIASES = {
               "minor_diameter": "minor_r", "tube_diameter": "minor_r",
               "diameter": "major_r"},
 }
+# Straight RENAMES (no halving): the same dimension under the name a model reaches
+# for. Found 2026-07-30 by probing the siblings of the cylinder `depth` bug from
+# run-21784882079258 — a cone given radius1/radius2 and a torus given tube_radius
+# were both rejected for "required" params they had in fact supplied, and a box
+# given length/width/depth was told params.height was missing.
+#
+# A rename only ever fills a MISSING canonical key (enforced below), so an ambiguous
+# spelling can never overwrite what the model said explicitly: a box with
+# length+depth+height keeps its height, `depth` stays unconsumed, and the engine
+# names the real gap (width) instead of this pass inventing one.
+#
+# `cylinder` is deliberately absent: _check_cylinder_height already handles its
+# height aliases and carries the cylinder-vs-hole teaching that belongs with them.
+_PARAM_RENAMES = {
+    "cone": {"radius1": "r1", "radius2": "r2", "base_radius": "r1",
+             "bottom_radius": "r1", "top_radius": "r2", "radius": "r1",
+             "depth": "height", "length": "height"},
+    "torus": {"tube_radius": "minor_r", "minor_radius": "minor_r",
+              "major_radius": "major_r", "ring_radius": "major_r",
+              "radius": "major_r"},
+    "box": {"depth": "height", "thickness": "height"},
+}
 _SIZE_KEYS = ("size", "dimensions", "dimension", "dims")
 _BOX_DIMS = ("length", "width", "height")
 _MAX_INTERPRETED_NOTES = 8
@@ -1928,14 +1950,22 @@ def _halve(v: Any):
 
 
 def _normalize_primitive_dims(feat: dict, ftype: str, notes: list) -> dict:
-    """box `size` shorthand + diameter->radius aliases. Pure; identity when nothing applies."""
+    """box `size` shorthand, diameter->radius aliases, and per-type param renames.
+    Pure; identity when nothing applies."""
     aliases = _DIAMETER_ALIASES.get(ftype, {})
+    renames = _PARAM_RENAMES.get(ftype, {})
     size_key = next((k for k in _SIZE_KEYS
                      if k in feat or (isinstance(feat.get("params"), dict)
                                       and k in feat["params"])), None) if ftype == "box" else None
-    hits = [k for k in aliases
-            if k in feat or (isinstance(feat.get("params"), dict) and k in feat["params"])]
-    if not hits and not size_key:
+
+    def _present(k: str) -> bool:
+        return k in feat or (isinstance(feat.get("params"), dict) and k in feat["params"])
+
+    hits = [k for k in aliases if _present(k)]
+    rhits = [k for k in renames if _present(k)]
+    # A cone with r1 and no r2 needs the apex default below even when no alias fired.
+    apex_cone = (ftype == "cone" and _present("r1") and not _present("r2"))
+    if not hits and not rhits and not size_key and not apex_cone:
         return feat
 
     label = _feat_label(feat, ftype)
@@ -1986,6 +2016,28 @@ def _normalize_primitive_dims(feat: dict, ftype: str, notes: list) -> dict:
         given = v["value"] if _is_dim_object(v) and "value" in v else v
         notes.append(f"{label}: interpreted {key} {given!r} as {target} {shown!r} "
                      f"— a {ftype} is dimensioned by radius, not diameter")
+
+    for key in sorted(rhits):
+        target = renames[key]
+        if peek(target) is not _MISSING:
+            continue  # the canonical name was given too — leave the spare alone
+        v = consume(key)
+        if v is _MISSING or v is None:
+            continue
+        new_params[target] = v
+        notes.append(f"{label}: read {key} as {target} — a {ftype} is dimensioned by "
+                     f"{target}")
+
+    # A cone given ONE radius is the textbook cone: base r1, apex on top. The engine
+    # requires both radii (it builds frustums too), so {"type":"cone","radius":20,
+    # "height":40} was refused with "params.r1: required; params.r2: required" and no
+    # hint that r2 is the TOP radius or that a point means 0. A model that wanted a
+    # frustum states two radii, so one radius is unambiguous — but it is disclosed,
+    # never silent.
+    if ftype == "cone" and peek("r1") is not _MISSING and peek("r2") is _MISSING:
+        new_params["r2"] = 0
+        notes.append(f"{label}: read a single radius as a cone with a POINT on top "
+                     f"(r1 = base, r2 = 0). Give r2 for a truncated cone/frustum")
 
     if isinstance(feat.get("params"), dict) or new_params:
         out["params"] = new_params
@@ -4993,12 +5045,34 @@ _BORE_INTENT_WORDS = ("bore", "hole", "drill", "counterbore", "countersink", "po
                       "clearance", "thru", "through")
 
 
+# A cylinder's axial length, spelled the other ways a model states it. Every one of
+# these is unambiguous for a cylinder specifically: there is exactly one linear
+# dimension besides the radius. Live 2026-07-30 (run-21784882079258, a car): four
+# wheels arrived as {"radius":325,"depth":220,...} and the whole batch was rejected
+# with "params.height is required" — the spec was COMPLETE, just not in the spelling
+# the schema wanted. `depth` in particular is the canonical key for the extrude this
+# same model had just written, so the inconsistency is ours, not the model's.
+_CYL_HEIGHT_ALIASES = ("depth", "length", "thickness", "extent", "h")
+
+
 def _check_cylinder_height(feat: dict, ftype: str, notes: list) -> dict:
     if ftype != "cylinder":
         return feat
-    _out, _params, peek, _consume = _split_two_levels(feat)
+    out, params, peek, consume = _split_two_levels(feat)
     if peek("height") is not _MISSING:
         return feat
+    for alias in _CYL_HEIGHT_ALIASES:
+        v = peek(alias)
+        if v is _MISSING or v is None:
+            continue
+        consume(alias)
+        params["height"] = v
+        out["params"] = params
+        notes.append(
+            f'{_feat_label(feat, ftype)}: read params.{alias} as the cylinder\'s '
+            f"height — a cylinder is radius + height, and {alias} is its only other "
+            f"linear dimension")
+        return out
     label = _feat_label(feat, ftype)
     boreish = (str(peek("mode") or "").strip().lower() == "cut"
                or any(w in label.lower() for w in _BORE_INTENT_WORDS))

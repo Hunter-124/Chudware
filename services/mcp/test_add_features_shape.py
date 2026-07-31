@@ -3536,3 +3536,78 @@ def test_set_dim_is_not_hijacked_from_the_sketch_op():
     is how a normalizer starts confidently building the wrong thing."""
     assert "set_dim" not in M._PARAM_EDIT_OPS
     assert "set_dimension" not in M._PARAM_EDIT_OPS
+
+
+# ===========================================================================
+# Live 2026-07-30, run-21784882079258 (a car). Four wheels arrived as
+# {"radius":325,"depth":220,...} and the whole batch was rejected with
+# "params.height is required" -- a COMPLETE spec refused over a spelling, and
+# `depth` is the canonical key for the extrude the same model had just written.
+# Probing the sibling primitives found three more of the same class.
+# ===========================================================================
+
+def test_cylinder_depth_is_its_height():
+    notes: list = []
+    out = M._check_cylinder_height(
+        {"type": "cylinder", "name": "WheelFL",
+         "params": {"radius": 325, "depth": 220, "center": [1200, 790, 325],
+                    "axis": "Y", "mode": "boss"}}, "cylinder", notes)
+    assert out["params"]["height"] == 220
+    assert "depth" not in out["params"]
+    assert notes and "height" in notes[0]
+
+
+@pytest.mark.parametrize("alias", ["depth", "length", "thickness", "extent", "h"])
+def test_every_cylinder_length_spelling_is_accepted(alias):
+    out = M._check_cylinder_height(
+        {"type": "cylinder", "name": "C", "params": {"radius": 5, alias: 12}},
+        "cylinder", [])
+    assert out["params"]["height"] == 12
+
+
+def test_a_cylinder_with_no_length_at_all_is_still_refused():
+    with pytest.raises(ValueError, match="height is required"):
+        M._check_cylinder_height(
+            {"type": "cylinder", "name": "C", "params": {"radius": 5}}, "cylinder", [])
+
+
+@pytest.mark.parametrize("ftype,params,want", [
+    ("box", {"length": 10, "width": 10, "depth": 10},
+     {"length": 10, "width": 10, "height": 10}),
+    ("cone", {"radius1": 20, "radius2": 5, "depth": 40},
+     {"r1": 20, "r2": 5, "height": 40}),
+    ("torus", {"radius": 20, "tube_radius": 5},
+     {"major_r": 20, "minor_r": 5}),
+])
+def test_primitive_param_renames(ftype, params, want):
+    out = M._normalize_primitive_dims(
+        {"type": ftype, "name": "T", "params": dict(params)}, ftype, [])
+    assert out["params"] == want
+
+
+def test_a_rename_never_overwrites_an_explicit_canonical_key():
+    """box{length,depth,height}: `depth` is NOT the height here, so leave it and let
+    the engine name the real gap (width) rather than invent one."""
+    out = M._normalize_primitive_dims(
+        {"type": "box", "name": "T", "params": {"length": 10, "depth": 10, "height": 10}},
+        "box", [])
+    assert out["params"] == {"length": 10, "depth": 10, "height": 10}
+
+
+def test_single_radius_cone_gets_a_point_on_top():
+    """The engine requires r1 AND r2 because it builds frustums too, so the textbook
+    cone was refused with "r1: required; r2: required" and no hint that r2 is the TOP
+    radius or that a point means 0."""
+    for params in ({"radius": 20, "height": 40}, {"r1": 20, "height": 40}):
+        notes: list = []
+        out = M._normalize_primitive_dims(
+            {"type": "cone", "name": "T", "params": dict(params)}, "cone", notes)
+        assert out["params"]["r1"] == 20 and out["params"]["r2"] == 0
+        assert any("POINT on top" in n for n in notes), notes
+
+
+def test_a_frustum_keeps_both_radii():
+    out = M._normalize_primitive_dims(
+        {"type": "cone", "name": "T", "params": {"r1": 20, "r2": 8, "height": 40}},
+        "cone", [])
+    assert out["params"] == {"r1": 20, "r2": 8, "height": 40}

@@ -62,7 +62,13 @@ public:
 
     // Phase 3: the autosave scheduler (recovery id_remap served in hello) and
     // the doc registry (attach modes, holds, events) plug in before run().
-    void setAutosave(Autosave* a) { autosave_ = a; }
+    // Also teaches the scheduler which docs are INTERNAL throwaways (the agent
+    // preflight shadow clone) — the registry owns that flag, the autosave tier has
+    // to honour it or a clone lands in the user's "Recover?" prompt.
+    void setAutosave(Autosave* a) {
+        autosave_ = a;
+        if (a) a->setInternalFilter([this](const std::string& id) { return registry_.isInternal(id); });
+    }
     DocRegistry& registry() { return registry_; }
     // Phase 5: supervised agent children (agent_spawn/agent_stop/agent_list).
     ChildSupervisor& children() { return children_; }

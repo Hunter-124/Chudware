@@ -142,7 +142,13 @@ void DocRegistry::updateOrphanDeadlineLocked(DocState& d) {
         d.orphanDeadlineMs = 0;
         return;
     }
-    const long long grace = gcGraceMsForOrigin(d.originKind);
+    // Internal docs (DocState::internal) never take the 30-min agent floor. That floor
+    // exists so a mission-built part stays openable from the GUI after the agent
+    // detaches — but no client was ever TOLD an internal doc exists, so none can open
+    // it and the grace buys nothing. When the agent's worker dies mid-preflight (the
+    // one path where the clone's own `finally` cannot run), the base grace bounds the
+    // orphan to ~90 s instead of pinning a full shadow copy of the part for half an hour.
+    const long long grace = d.internal ? gcGraceMsBase() : gcGraceMsForOrigin(d.originKind);
     if (grace < 0) return;                                   // GC disabled
     if (d.orphanDeadlineMs == 0) d.orphanDeadlineMs = monoMs() + grace;
 }
@@ -771,6 +777,12 @@ bool DocRegistry::isAgentOrigin(const std::string& docId) {
     if (it == docs_.end()) return false;
     const std::string& k = it->second.originKind;
     return k == "agent" || k == "mcp";
+}
+
+bool DocRegistry::isInternal(const std::string& docId) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = docs_.find(docId);
+    return it != docs_.end() && it->second.internal;
 }
 
 json DocRegistry::lastPushFor(const std::string& docId) {

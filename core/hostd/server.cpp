@@ -278,7 +278,14 @@ bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
     // WITHOUT discarding -> a crash: RETIRE to the orphan tier so the work stays
     // recoverable, then close to free memory. A clean doc already safe in a real
     // user file is just closed.
-    const bool discard = std::string_view(reason) == "discarded";
+    //
+    // An INTERNAL doc is purged either way: it is the agent preflight advisor's
+    // throwaway shadow clone (DocRegistry::isInternal), never user work. The agent
+    // closes it itself in the normal case; when its worker dies mid-run doc-GC is
+    // the only thing left to clean up, and retiring it instead put `<part>_pf`
+    // clones in the "Recover?" prompt — a user accepted four of them and got a tab
+    // strip of half-built shadow copies of their real part.
+    const bool discard = std::string_view(reason) == "discarded" || registry_.isInternal(docId);
     json result;
     std::string err;
     if (!discard && autosave_) {

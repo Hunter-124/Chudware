@@ -42,10 +42,19 @@
 //  autosave skip, retireDoc no-op, crash-tier register skip, recovery_list purge.
 //  Fresh AI-minted blank parts used to fill the Recover? prompt with dozens of
 //  empty "AI part" tabs; those are garbage, not user work.
+//
+//  INTERNAL DOCS ARE NEVER RECOVERED (2026-07-30): a doc minted {"internal":true}
+//  (DocRegistry::isInternal — the agent preflight advisor's shadow clone) is a
+//  throwaway, not user work. It is skipped at the same boundaries as an empty doc:
+//  autosave skip, retireDoc refusal, and doc-GC PURGES rather than retires it. A
+//  clone whose owning worker died mid-run used to be retired to the orphan tier and
+//  then accepted from the "Recover?" prompt, giving the user a tab strip of
+//  `AI: <part>_pf`, `_pf2`, `_pf3` shadow copies of their real part.
 #pragma once
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -106,6 +115,19 @@ public:
         return !baseDir_.empty() && path.rfind(baseDir_, 0) == 0;
     }
 
+    // Predicate answering "is this doc an INTERNAL throwaway?" (DocRegistry::isInternal).
+    // Installed by Server::setAutosave; unset means "nothing is internal", so a unit test
+    // or a future embedder that never wires it keeps the old behaviour. An internal doc is
+    // the agent preflight advisor's shadow clone: it is NOT user work, so it is never
+    // autosaved and never retired to the orphan tier. Called from the autosave thread and
+    // the accept loop WITHOUT any Autosave lock held — the registry takes its own mutex.
+    void setInternalFilter(std::function<bool(const std::string&)> fn) {
+        isInternal_ = std::move(fn);
+    }
+    bool isInternalDoc(const std::string& docId) const {
+        return isInternal_ && isInternal_(docId);
+    }
+
 private:
     void loop();
     void recoverPriorSession();
@@ -118,6 +140,9 @@ private:
     std::string recoverDir_;  // crash-tier source session ("" when none)
     const std::atomic<int>* engineState_ = nullptr;
     double intervalS_ = 60.0;
+    // Set once by Server::setAutosave BEFORE the loop starts, then only read —
+    // no synchronisation needed for the member itself.
+    std::function<bool(const std::string&)> isInternal_;
 
     std::thread thread_;
     std::mutex mtx_;

@@ -401,6 +401,43 @@ def test_gc_retires_only_undelivered_docs(scratch_daemon, monkeypatch, tmp_path)
     assert saved not in ids, "a doc saved to a real file must NOT flood the recovery prompt"
 
 
+def test_gc_purges_internal_docs_instead_of_retiring_them(scratch_daemon, monkeypatch):
+    """An INTERNAL doc ({"internal":true} — the agent preflight advisor's shadow clone)
+    must never reach the recovery tier. The clone's own `finally` closes it in the normal
+    case, but when the agent's worker DIES mid-preflight only doc-GC is left; retiring it
+    then put `<part>_pf` entries in the "Recover?" prompt, and a user who accepted four of
+    them got a tab strip of half-built shadow copies of their real part (2026-07-30).
+
+    The unsaved NORMAL doc in the same sweep is the control: it must still be retired, so
+    this cannot pass by GC simply having stopped working."""
+    monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
+    keep = DaemonClient()
+    keep.connect()
+    scratch_daemon.append(_pid(keep))
+    a = DaemonClient()
+    a.connect()
+
+    clone = a.call("doc_new", {"name": "widget_pf", "internal": True})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": clone, "ops": BOX_OPS})
+    normal = a.call("doc_new", {"name": "widget"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": normal, "ops": _box_ops("n")})
+
+    a.close()  # worker death: neither doc was closed by its owner
+
+    deadline = time.time() + 8
+    ids: set = set()
+    while time.time() < deadline:
+        time.sleep(0.5)
+        ids = {e.get("doc_id") for e in keep.call("recovery_list").get("entries", [])}
+        if normal in ids:
+            break
+    assert normal in ids, "control: an unsaved abandoned doc MUST still be retired"
+    assert clone not in ids, "an internal preflight clone MUST be purged, never recovered"
+    names = {e.get("name") for e in keep.call("recovery_list").get("entries", [])}
+    assert not any((n or "").endswith("_pf") for n in names), names
+
+
 # ------------------------------------------------------------ foreign edits
 
 

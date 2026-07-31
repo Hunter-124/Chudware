@@ -1288,8 +1288,20 @@ def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
 def _project_save_stem(name: Optional[str], doc_id: str) -> str:
     """Sanitize a doc name into a filesystem-safe stem, mirroring the host's rule:
     spaces -> '_', keep alnum/'_'/'-', drop everything else. Falls back to the
-    doc_id when the name yields an empty stem."""
-    stem = re.sub(r"\s+", "_", name or "")
+    doc_id when the name yields an empty stem.
+
+    A doc NAMED for a file ("lexus_f_keychain.step" — agents do this) first has that
+    CAD extension REMOVED, matching save_part's replace-don't-stack rule. Without it
+    the dot was merely dropped as a disallowed character, so the deliverable landed at
+    "lexus_f_keychainstep.step+" while save_part wrote "lexus_f_keychain.step+" — two
+    files, two PLM items, one part."""
+    raw = name or ""
+    stem_part, dot, ext = raw.rpartition(".")
+    if dot and stem_part:
+        from services.mcp.cad_doc_tools import _CAD_EXTS_FOR_SAVE  # noqa: PLC0415 — cycle
+        if ext.lower() in _CAD_EXTS_FOR_SAVE or ext.lower() == "step+":
+            raw = stem_part
+    stem = re.sub(r"\s+", "_", raw)
     stem = "".join(c for c in stem if c.isalnum() or c in "_-")
     return stem or doc_id
 

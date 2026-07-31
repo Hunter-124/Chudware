@@ -104,6 +104,14 @@ public:
     // from their viewport while the agent is still building it.
     bool isAgentOrigin(const std::string& docId);
 
+    // True when this doc was minted with {"internal":true} (see DocState::internal) —
+    // the agent preflight advisor's throwaway shadow clone. Beyond suppressing fanout,
+    // the daemon must never treat one as user work: no autosave artifact, and doc-GC
+    // PURGES it instead of retiring it to the recovery tier. Without that, a clone the
+    // agent could not close (worker died mid-run) resurfaces in the "Recover?" prompt
+    // and the user accepts a tab strip of `AI: <part>_pf2/3/4` shadow copies.
+    bool isInternal(const std::string& docId);
+
     // The last doc.changed payload pushed for `docId` (see DocState::lastPush), or a
     // null json when nothing has been pushed yet. Reads only the registry mutex —
     // NEVER the engine or the doc's per-doc mutex — so a GUI can populate a mirror

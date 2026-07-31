@@ -245,6 +245,11 @@ void Autosave::saveDirtyDocs() {
         if (d.value("empty", false)) continue;
         const std::string id = d.value("doc_id", std::string());
         if (id.empty()) continue;
+        // Internal throwaway (the agent preflight shadow clone): not user work, so it
+        // gets no artifact on disk. This is the CRASH half of the guard — if the daemon
+        // dies hard, a clone that was never autosaved cannot be crash-registered into
+        // the orphan tier and offered back as a recoverable `<part>_pf` document.
+        if (isInternalDoc(id)) continue;
         const long rev = d.contains("revision") && d["revision"].is_number()
                              ? d["revision"].get<long>()
                              : -1;
@@ -303,6 +308,17 @@ void Autosave::noteRecoveredRemap(const std::string& oldId, const std::string& n
 
 bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
     if (docId.empty()) return false;
+    // Internal throwaway (the agent preflight shadow clone) — never recovery-worthy.
+    // Mirrors the empty-doc branch below: purge any artifact and report success so
+    // gcCloseDoc still closes the doc, it just leaves nothing behind to recover.
+    if (isInternalDoc(docId)) {
+        log().line("doc-gc: not retiring internal doc %s ('%s')", docId.c_str(), name.c_str());
+        std::error_code ec0;
+        fs::remove(sessionDir_ + "/" + docId + ".step+", ec0);
+        fs::remove(sessionDir_ + "/" + docId + ".json", ec0);
+        { std::lock_guard<std::mutex> lk(revMtx_); lastSavedRev_.erase(docId); }
+        return true;
+    }
     // Peek live doc_list for the empty flag before writing an orphan artifact.
     {
         json docs;

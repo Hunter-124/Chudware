@@ -126,3 +126,4 @@
 {"seq": null, "ts": "2026-07-29T01:25:23.470561Z", "actor": "preflight", "kind": "preflight_overridden", "payload": {"doc_id": "doc-cpp00000012", "tool": "add_features", "preflight_id": "pf_2895ee3d6e3b", "preflight_verdict": "fail"}}
 {"seq": null, "ts": "2026-07-29T01:25:44.579011Z", "actor": "preflight", "kind": "preflight_overridden", "payload": {"doc_id": "doc-cpp00000012", "tool": "add_features", "preflight_id": "pf_e67a5ea1f9fa", "preflight_verdict": "fail"}}
 {"seq": null, "ts": "2026-07-29T01:26:05.110906Z", "actor": "preflight", "kind": "preflight_overridden", "payload": {"doc_id": "doc-cpp00000012", "tool": "add_features", "preflight_id": "pf_74c7fb8a8937", "preflight_verdict": "fail"}}
+{"seq": null, "ts": "2026-07-31T18:30:10.332439Z", "actor": "preflight", "kind": "preflight_overridden", "payload": {"doc_id": "doc-cpp00000002", "tool": "add_features", "preflight_id": "pf_dbaf310c9948", "preflight_verdict": "fail"}}

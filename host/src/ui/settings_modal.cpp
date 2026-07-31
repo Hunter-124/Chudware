@@ -57,26 +57,12 @@ struct PromptRecord {
 };
 static std::vector<PromptRecord> s_promptRecs;
 static bool s_promptsLoaded = false;
+static bool s_promptsLoading = false;
+static bool s_builtinPromptLoading = false;
 static int  s_selectedRole  = 0;
 
 static std::string s_promptsError;
-static void loadPrompts(AppState& st) {
-    // Prefer list_editable_prompts (YAML mission roles + core .md, with overrides).
-    // Fall back to get_prompts_v2 (C++ core kRoles catalog) when the worker is old.
-    nlohmann::json result;
-    std::string err;
-    s_promptsError.clear();
-    bool ok = st.worker.call("list_editable_prompts", nlohmann::json::object(), result, err, 20000);
-    if (!ok) {
-        err.clear();
-        ok = st.worker.call("get_prompts_v2", nlohmann::json::object(), result, err, 20000);
-        if (!ok) {
-            s_promptsError = err.empty() ? "prompt catalog unavailable" : err;
-            st.addLog("[err] prompts catalog: " + s_promptsError);
-            s_promptsLoaded = false;
-            return;
-        }
-    }
+static void applyPromptCatalog(const nlohmann::json& result) {
     // Bare array or {"prompts":[...]} or error object
     auto str = [](const nlohmann::json& j, const char* k) -> std::string {
         auto it = j.find(k);
@@ -111,6 +97,35 @@ static void loadPrompts(AppState& st) {
     std::sort(s_promptRecs.begin(), s_promptRecs.end(),
               [](const PromptRecord& a, const PromptRecord& b) { return a.role < b.role; });
     s_promptsLoaded = true;
+}
+
+static void loadPrompts(AppState& st) {
+    if (s_promptsLoading) return;
+    // Prefer list_editable_prompts (YAML mission roles + core .md, with overrides).
+    // Fall back to get_prompts_v2 (C++ core kRoles catalog) when the worker is old.
+    s_promptsLoading = true;
+    s_promptsError.clear();
+    st.rpc.call("list_editable_prompts", nlohmann::json::object(),
+                [&st](const core::RpcResult& first) {
+        if (first.ok) {
+            s_promptsLoading = false;
+            applyPromptCatalog(first.result);
+            return;
+        }
+        // Match the synchronous path: only a transport failure falls back to the legacy RPC.
+        st.rpc.call("get_prompts_v2", nlohmann::json::object(),
+                    [&st](const core::RpcResult& fallback) {
+            s_promptsLoading = false;
+            if (!fallback.ok) {
+                s_promptsError = fallback.err.empty()
+                    ? "prompt catalog unavailable" : fallback.err;
+                st.addLog("[err] prompts catalog: " + s_promptsError);
+                s_promptsLoaded = false;
+                return;
+            }
+            applyPromptCatalog(fallback.result);
+        }, 20000);
+    }, 20000);
 }
 
 
@@ -5943,7 +5958,7 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                     if (s_aiSubSel == 2) {
                         // Full-height role prompt editor for power users / dev refinement.
-                        bool canFetch = st.workerStarted && !busy;
+                        const bool canFetch = st.workerStarted;
                         if (!s_promptsLoaded && canFetch) loadPrompts(st);
 
                         ImGui::AlignTextToFramePadding();
@@ -5953,16 +5968,16 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 "Edit per-role system prompts (pipeline + harness roles). "
                                 "Overrides save next to the shipped YAML cards.");
                         ImGui::SameLine();
-                        if (!canFetch) ImGui::BeginDisabled();
+                        if (!canFetch || s_promptsLoading) ImGui::BeginDisabled();
                         if (ImGui::SmallButton("Refresh##prompts_refresh")) {
                             s_promptsLoaded = false;
                             loadPrompts(st);
                         }
-                        if (!canFetch) ImGui::EndDisabled();
+                        if (!canFetch || s_promptsLoading) ImGui::EndDisabled();
                         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                            ImGui::SetTooltip(canFetch
-                                ? "Reload prompt catalog from the worker"
-                                : "Start the worker to load role prompts");
+                            ImGui::SetTooltip(!canFetch
+                                ? "Start the worker to load role prompts"
+                                : "Prompt catalog is loading");
                         if (!s_promptsError.empty()) {
                             ImGui::SameLine();
                             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
@@ -5970,7 +5985,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                             ImGui::PopStyleColor();
                         } else if (!s_promptsLoaded) {
                             ImGui::SameLine();
-                            dimText(st.workerStarted
+                            dimText(s_promptsLoading
                                 ? "Loading\xe2\x80\xa6"
                                 : "Worker not ready \xe2\x80\x94 start runtime to edit prompts.");
                         } else {
@@ -6047,24 +6062,32 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                             ImGui::PopFont();
                             flushSystemPromptOverride(st, /*force=*/false);
-                            if (!canFetch) ImGui::BeginDisabled();
+                            if (!canFetch || s_builtinPromptLoading) ImGui::BeginDisabled();
                             if (ImGui::Button("Load built-in prompt")) {
-                                nlohmann::json pr;
-                                std::string perr;
-                                if (st.worker.call("get_prompts", nlohmann::json::object(), pr, perr,
-                                                   20000)) {
-                                    std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
-                                    std::strncpy(st.spBuf.data(),
-                                                 pr.value("system_prompt", "").c_str(),
-                                                 st.spBuf.size() - 1);
-                                    commitSystemPromptOverride(st);  // deliberate load: persist
-                                } else {
-                                    st.addLog("[err] get_prompts: " + perr);
-                                }
+                                s_builtinPromptLoading = true;
+                                st.rpc.call("get_prompts", nlohmann::json::object(),
+                                            [&st](const core::RpcResult& r) {
+                                    s_builtinPromptLoading = false;
+                                    if (r.ok) {
+                                        std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
+                                        std::strncpy(st.spBuf.data(),
+                                                     r.result.value("system_prompt", "").c_str(),
+                                                     st.spBuf.size() - 1);
+                                        commitSystemPromptOverride(st);  // deliberate load: persist
+                                    } else {
+                                        st.addLog("[err] get_prompts: " + r.err);
+                                    }
+                                }, 20000);
                             }
-                            if (!canFetch) ImGui::EndDisabled();
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Copy the built-in prompt into the editor");
+                            if (!canFetch || s_builtinPromptLoading) ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                                ImGui::SetTooltip(s_builtinPromptLoading
+                                    ? "Loading built-in prompt"
+                                    : "Copy the built-in prompt into the editor");
+                            if (s_builtinPromptLoading) {
+                                ImGui::SameLine();
+                                dimText("Loading\xe2\x80\xa6");
+                            }
                             ImGui::SameLine();
                             if (ImGui::Button("Clear (use built-in)")) {
                                 std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
@@ -6365,6 +6388,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         // tool_guidance defaults in the per-tool Options popup.
                         static bool s_liveCatTried = false;
                         static bool s_liveCatOk = false;
+                        static bool s_liveCatLoading = false;
                         static double s_liveCatAt = -1e9;
                         static std::vector<std::string> s_liveFamilies;
                         static std::map<std::string, std::vector<std::string>> s_liveFamTools;
@@ -6464,23 +6488,26 @@ void drawSettingsModal(AppState& st, bool busy) {
                         };
 
                         // Pull the live tool catalog once the worker is up
-                        // (retry every 15 s until it succeeds). One synchronous
-                        // load on first open — same pattern as loadPrompts().
-                        if (st.workerStarted &&
+                        // (retry every 15 s until it succeeds). The generated catalog remains
+                        // usable while the queued request waits behind an active agent run.
+                        if (st.workerStarted && !s_liveCatLoading &&
                             (!s_liveCatTried ||
                              (!s_liveCatOk && ImGui::GetTime() - s_liveCatAt > 15.0))) {
                             s_liveCatTried = true;
+                            s_liveCatLoading = true;
                             s_liveCatAt = ImGui::GetTime();
-                            nlohmann::json p = nlohmann::json::object();
-                            nlohmann::json r;
-                            std::string err;
-                            if (st.worker.call("ai_tool_catalog", p, r, err, 20000) &&
-                                r.value("ok", false)) {
+                            st.rpc.call("ai_tool_catalog", nlohmann::json::object(),
+                                        [](const core::RpcResult& r) {
+                                s_liveCatLoading = false;
+                                if (!r.ok || !r.result.value("ok", false)) {
+                                    s_liveCatAt = ImGui::GetTime();
+                                    return;
+                                }
                                 s_liveFamTools.clear();
                                 s_liveDescs.clear();
                                 s_liveGuidance = nlohmann::json::object();
                                 for (const auto& row :
-                                     r.value("tools", nlohmann::json::array())) {
+                                     r.result.value("tools", nlohmann::json::array())) {
                                     const std::string name = row.value("name", "");
                                     const std::string fam = row.value("family", "?");
                                     if (name.empty()) continue;
@@ -6503,7 +6530,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                                   kv.first) == s_liveFamilies.end())
                                         s_liveFamilies.push_back(kv.first);
                                 s_liveCatOk = true;
-                            }
+                            }, 20000);
                         }
 
                         const double nowTf = ImGui::GetTime();
@@ -6638,6 +6665,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                         dimText("Per-tool rows: checkbox enables a tool globally (dimmed = off); "
                                 "Options overrides limits, included tool context, and AI usage "
                                 "guidance. Hover a name for what it does.");
+                        if (s_liveCatLoading)
+                            dimText("Loading live tool catalog; showing built-in catalog meanwhile.");
                         static char s_toolFilterBuf[64] = "";
                         ImGui::SetNextItemWidth(-1);
                         ImGui::InputTextWithHint("##tool_filter", "Filter tools...",
@@ -6910,8 +6939,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     static std::string s_previewText;
                                     static std::string s_previewErr;
                                     static double s_previewAt = -1e9;
-                                    const bool canPrev = st.workerStarted && !busy;
-                                    auto buildLocalPreview = [&]() {
+                                    static bool s_previewFetching = false;
+                                    const bool canPrev = st.workerStarted;
+                                    auto makeLocalPreview = [&]() {
                                         std::string sig = std::string("- ") + tn + "(…)";
                                         std::string body;
                                         if (s_toolDescOverride.count(tn) &&
@@ -6926,15 +6956,18 @@ void drawSettingsModal(AppState& st, bool busy) {
                                             entry += "\n    Note: " + s_toolNote[tn];
                                         else if (!curNote.empty())
                                             entry += "\n    Note: " + curNote;
-                                        s_previewText =
-                                            "[TOOLS] Call tools with EXACTLY these kwargs:\n" +
-                                            entry;
+                                        return "[TOOLS] Call tools with EXACTLY these kwargs:\n" +
+                                               entry;
+                                    };
+                                    auto buildLocalPreview = [&]() {
+                                        s_previewText = makeLocalPreview();
                                         s_previewErr.clear();
                                     };
                                     auto fetchPreview = [&](bool force) {
                                         const double now = ImGui::GetTime();
-                                        if (!force && s_previewTool == tn &&
-                                            (now - s_previewAt) < 1.5)
+                                        if (s_previewFetching ||
+                                            (!force && s_previewTool == tn &&
+                                             (now - s_previewAt) < 1.5))
                                             return;
                                         s_previewTool = tn;
                                         s_previewAt = now;
@@ -6949,20 +6982,24 @@ void drawSettingsModal(AppState& st, bool busy) {
                                         if (s_toolSchemaTrim.count(tn) &&
                                             s_toolSchemaTrim[tn] >= 0)
                                             p["trim"] = (s_toolSchemaTrim[tn] != 0);
-                                        nlohmann::json r;
-                                        std::string err;
-                                        if (!st.worker.call("ai_tool_preview", p, r, err, 8000) ||
-                                            !r.value("ok", false)) {
-                                            buildLocalPreview();
-                                            s_previewErr = err.empty()
-                                                ? r.value("error", "preview failed")
-                                                : err;
-                                            return;
-                                        }
-                                        s_previewText = r.value("text", "");
-                                        if (s_previewText.empty())
-                                            s_previewText = r.value("entry", "");
-                                        s_previewErr.clear();
+                                        const std::string localPreview = makeLocalPreview();
+                                        s_previewFetching = true;
+                                        st.rpc.call("ai_tool_preview", std::move(p),
+                                                    [localPreview](const core::RpcResult& r) {
+                                            s_previewFetching = false;
+                                            if (!r.ok || !r.result.value("ok", false)) {
+                                                s_previewText = localPreview;
+                                                s_previewErr = r.err.empty()
+                                                    ? r.result.value(
+                                                        "error", std::string("preview failed"))
+                                                    : r.err;
+                                                return;
+                                            }
+                                            s_previewText = r.result.value("text", "");
+                                            if (s_previewText.empty())
+                                                s_previewText = r.result.value("entry", "");
+                                            s_previewErr.clear();
+                                        }, 8000);
                                     };
                                     // Refresh when popup opens / tool changes. Edits rebuild
                                     // a local approximation until Refresh is clicked.
@@ -6974,13 +7011,21 @@ void drawSettingsModal(AppState& st, bool busy) {
                                         // Keep showing last worker text; user can Refresh.
                                     }
                                     ImGui::SameLine();
-                                    if (!canPrev) ImGui::BeginDisabled();
+                                    if (!canPrev || s_previewFetching) ImGui::BeginDisabled();
                                     if (ImGui::SmallButton("Refresh##tool_preview"))
                                         fetchPreview(/*force=*/true);
-                                    if (!canPrev) ImGui::EndDisabled();
+                                    if (!canPrev || s_previewFetching) ImGui::EndDisabled();
+                                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                                        ImGui::SetTooltip(s_previewFetching
+                                            ? "Loading tool preview"
+                                            : "Start the worker to refresh the preview");
                                     // Always refresh local approx when worker unavailable.
                                     if (!canPrev && (s_previewTool != tn || s_toolOptDirty))
                                         buildLocalPreview();
+                                    if (s_previewFetching) {
+                                        ImGui::SameLine();
+                                        dimText("Loading\xe2\x80\xa6");
+                                    }
                                     if (!s_previewErr.empty()) {
                                         ImGui::PushStyleColor(ImGuiCol_Text,
                                             ui::Palette::toU32(ui::palette.statusWarn));
@@ -7157,8 +7202,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                         static bool s_devFetching = false;
                         static bool s_includeTools = true;
 
-                        const bool canDev = st.workerStarted && !busy;
+                        const bool canDev = st.workerStarted;
                         auto fetchDevPreview = [&]() {
+                            if (s_devFetching) return;
                             s_devFetching = true;
                             s_devErr.clear();
                             if (!canDev) {
@@ -7171,54 +7217,64 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 s_devFetching = false;
                                 return;
                             }
-                            nlohmann::json p;
-                            p["include_tools"] = s_includeTools;
-                            nlohmann::json r;
-                            std::string err;
-                            if (!st.worker.call("ai_prompt_preview", p, r, err, 30000) ||
-                                !r.value("ok", false)) {
-                                s_devSys.clear();
-                                s_devUser.clear();
-                                s_devMeta.clear();
-                                s_devErr = err.empty()
-                                    ? r.value("error", std::string("ai_prompt_preview failed"))
-                                    : err;
-                                s_devLoaded = true;
+                            const bool includeTools = s_includeTools;
+                            st.rpc.call("ai_prompt_preview",
+                                        nlohmann::json{{"include_tools", includeTools}},
+                                        [includeTools](const core::RpcResult& r) {
                                 s_devFetching = false;
-                                return;
-                            }
-                            s_devSys = r.value("system", "");
-                            s_devUser = r.value("user_placeholder", "");
-                            auto meta = r.value("meta", nlohmann::json::object());
-                            char buf[256];
-                            std::snprintf(buf, sizeof(buf),
-                                "role=%s  tools≈%d  chars=%d  tokens≈%d  autolearn=%s",
-                                meta.value("role", "general_agent").c_str(),
-                                meta.value("allowed_tool_count", 0),
-                                meta.value("system_chars", 0),
-                                meta.value("system_tokens_est", 0),
-                                meta.value("autolearn", false) ? "on" : "off");
-                            s_devMeta = buf;
-                            s_devErr.clear();
-                            s_devLoaded = true;
-                            s_devFetching = false;
+                                if (s_includeTools != includeTools) {
+                                    s_devLoaded = false;
+                                    return;
+                                }
+                                if (!r.ok || !r.result.value("ok", false)) {
+                                    s_devSys.clear();
+                                    s_devUser.clear();
+                                    s_devMeta.clear();
+                                    s_devErr = r.err.empty()
+                                        ? r.result.value(
+                                            "error", std::string("ai_prompt_preview failed"))
+                                        : r.err;
+                                    s_devLoaded = true;
+                                    return;
+                                }
+                                s_devSys = r.result.value("system", "");
+                                s_devUser = r.result.value("user_placeholder", "");
+                                auto meta = r.result.value("meta", nlohmann::json::object());
+                                char buf[256];
+                                std::snprintf(buf, sizeof(buf),
+                                    "role=%s  tools≈%d  chars=%d  tokens≈%d  autolearn=%s",
+                                    meta.value("role", "general_agent").c_str(),
+                                    meta.value("allowed_tool_count", 0),
+                                    meta.value("system_chars", 0),
+                                    meta.value("system_tokens_est", 0),
+                                    meta.value("autolearn", false) ? "on" : "off");
+                                s_devMeta = buf;
+                                s_devErr.clear();
+                                s_devLoaded = true;
+                            }, 30000);
                         };
 
                         if (!s_devLoaded && canDev && !s_devFetching)
                             fetchDevPreview();
 
+                        if (s_devFetching) ImGui::BeginDisabled();
                         if (ImGui::Checkbox("Include tools slot", &s_includeTools)) {
                             s_devLoaded = false;
                         }
+                        if (s_devFetching) ImGui::EndDisabled();
                         ImGui::SameLine();
                         if (!canDev || s_devFetching) ImGui::BeginDisabled();
                         if (ImGui::Button("Refresh##dev_preview", ImVec2(100.0f * sc, 0)))
                             fetchDevPreview();
                         if (!canDev || s_devFetching) ImGui::EndDisabled();
                         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                            ImGui::SetTooltip(canDev
-                                ? "Re-assemble from live role cards + tool_schemas"
+                            ImGui::SetTooltip(s_devFetching
+                                ? "Assembling prompt preview"
                                 : "Start the worker to load the prompt preview");
+                        if (s_devFetching) {
+                            ImGui::SameLine();
+                            dimText("Loading\xe2\x80\xa6");
+                        }
                         if (!s_devMeta.empty()) {
                             ImGui::SameLine();
                             dimText(s_devMeta.c_str());

@@ -928,6 +928,18 @@ void AsmPanels::drawMateFormBody(AppState& st) {
     if (!mateOpen_) return;
     const auto& pal = ui::palette;
     mateFocus_ = false;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    auto continueFlow = [&style](float nextWidth) {
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        const float contentRight = cursor.x + ImGui::GetContentRegionAvail().x;
+        const float nextRight =
+            ImGui::GetItemRectMax().x + style.ItemSpacing.x + nextWidth;
+        if (nextRight <= contentRight) ImGui::SameLine();
+    };
+    auto continueButtonFlow = [&style, &continueFlow](const char* label) {
+        continueFlow(ImGui::CalcTextSize(label).x + style.FramePadding.x * 2.0f);
+    };
+
 
     if (!editComponentTarget_.empty()) {
         pushText(pal.textDim);
@@ -966,14 +978,14 @@ void AsmPanels::drawMateFormBody(AppState& st) {
     else              { opts = kGeneric;    nopts = 4; }
     if (mateType_ >= nopts) mateType_ = 0;
     for (int i = 0; i < nopts; ++i) {
-        if (i) ImGui::SameLine();
+        std::string label = opts[i];
+        if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
+        if (i) continueButtonFlow(label.c_str());
         bool sel = selectedMateType_.empty()
             ? (mateType_ == i)
             : (selectedMateType_ == opts[i]);
         if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
-        std::string label = opts[i];
-        if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
         if (ImGui::Button((label + "##mt" + std::to_string(i)).c_str())) {
             mateType_ = i;
             selectedMateType_ = opts[i];
@@ -990,16 +1002,9 @@ void AsmPanels::drawMateFormBody(AppState& st) {
         {"Hinge", "hinge"}, {"Slot", "slot"}, {"Cam Follower", "cam_follower"},
         {"Profile Center", "profile_center"}, {"Width", "width"}, {"Symmetric", "symmetric"},
     };
-    const float availW = ImGui::GetContentRegionAvail().x;
     for (int i = 0; i < (int)(sizeof(kAdvOpts) / sizeof(kAdvOpts[0])); ++i) {
         bool sel = (selectedMateType_ == kAdvOpts[i].type);
-        if (i) {
-            float next = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x +
-                         ImGui::GetStyle().ItemSpacing.x +
-                         ImGui::CalcTextSize(kAdvOpts[i].label).x +
-                         ImGui::GetStyle().FramePadding.x * 2.0f;
-            if (next <= availW) ImGui::SameLine();
-        }
+        if (i) continueButtonFlow(kAdvOpts[i].label);
         if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
         if (ImGui::Button((std::string(kAdvOpts[i].label) + "##adv" + std::to_string(i)).c_str())) {
@@ -1014,7 +1019,9 @@ void AsmPanels::drawMateFormBody(AppState& st) {
     ImGui::Spacing();
     ImGui::TextUnformatted("Mate alignment:");
     if (ImGui::RadioButton("Aligned", aligned_)) aligned_ = true;
-    ImGui::SameLine();
+    const float antiAlignedW = ImGui::GetFrameHeight() + style.ItemInnerSpacing.x +
+                               ImGui::CalcTextSize("Anti-Aligned").x;
+    continueFlow(antiAlignedW);
     if (ImGui::RadioButton("Anti-Aligned", !aligned_)) aligned_ = false;
     pushText(pal.textDim);
     ImGui::TextWrapped("Seating one face flat onto another is Anti-Aligned (the normals oppose).");
@@ -1022,7 +1029,8 @@ void AsmPanels::drawMateFormBody(AppState& st) {
 
     auto field = [](const char* label, std::vector<char>& buf, const char* id) {
         ImGui::TextUnformatted(label);
-        ImGui::SetNextItemWidth(ui::metrics::asmInputW());
+        ImGui::SetNextItemWidth(
+            std::min(ui::metrics::asmInputW(), ImGui::GetContentRegionAvail().x));
         ImGui::InputText(id, buf.data(), buf.size());
     };
     ImGui::Spacing();

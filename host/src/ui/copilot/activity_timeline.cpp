@@ -184,6 +184,8 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     // its text sits flush against the glass edge, unlike the prose/user bubbles above it.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
     ImGui::BeginChild("##stepcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
@@ -262,7 +264,7 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
         drawCodeBox("##err_v", s.error, fonts.mono, ui::metrics::px(200.0f));
     ImGui::PopStyleColor();
     ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##stepcard WindowPadding
+    ImGui::PopStyleVar(2);   // ##stepcard compact ItemSpacing + WindowPadding
     endGlassBubble(gb);
 }
 
@@ -434,6 +436,8 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
     ImGui::BeginChild("##thinkblk", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -493,7 +497,7 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##thinkblk WindowPadding
+    ImGui::PopStyleVar(2);   // ##thinkblk compact ItemSpacing + WindowPadding
     ImRect thinkRect = endGlassBubble(gb);
     const std::string thinkCopy = chatActivityCopyText(a);
     chatCopyContext(thinkRect, "##think_copy", thinkCopy);
@@ -524,6 +528,8 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
     ImGui::BeginChild("##actcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -671,7 +677,7 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
 
     ImGui::PopStyleColor();   // base ink
     ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##actcard WindowPadding
+    ImGui::PopStyleVar(2);   // ##actcard compact ItemSpacing + WindowPadding
     ImRect cardRect = endGlassBubble(gb);
 
     // ---- error frame: a red border around the whole card ----
@@ -759,6 +765,8 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
     ImGui::BeginChild("##thoughtbox", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(fonts.body);
@@ -832,7 +840,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         ImGui::PopStyleColor();
     }
     ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##thoughtbox WindowPadding
+    ImGui::PopStyleVar(2);   // ##thoughtbox compact ItemSpacing + WindowPadding
     ImRect thoughtRect = endGlassBubble(gb);
     const std::string thoughtCopy = chatActivityCopyText(a);
     chatCopyContext(thoughtRect, "##thought_copy", thoughtCopy);
@@ -1061,6 +1069,48 @@ std::string chatTokCount(int n) {
     return buf;
 }
 
+// Tool payloads are prose-shaped even when they contain JSON or an exception: at narrow chat
+// widths they must soft-wrap, not become a horizontally scrolling InputText. Size the nested
+// child from the WRAPPED text so the parent AutoResizeY child and its glass/failure outline
+// include the entire visible detail region. Long payloads stop at maxH and remain clipped/
+// scrollable inside this child; they can never paint below the owning tool card.
+static void drawToolDetailBox(const char* id, const std::string& text, ImFont* font,
+                              float maxH, bool failure) {
+    if (text.empty()) return;
+    const auto& pal = ui::palette;
+    const float padX = ui::metrics::cpChatCardPadX();
+    const float padY = ui::metrics::cpChatCardPadY();
+    if (font) ImGui::PushFont(font);
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float wrapW = ImMax(ImGui::GetFontSize(), availW - padX * 2.0f);
+    const float textH = ImGui::CalcTextSize(text.c_str(), nullptr, false, wrapW).y;
+    const float minH = ImGui::GetTextLineHeight() + padY * 2.0f;
+    const float boxH = ImMin(maxH, ImMax(minH, textH + padY * 2.0f));
+    const ImVec4 bg = failure
+        ? ImVec4(pal.codeBg[0], pal.codeBg[1], pal.codeBg[2], pal.codeBg[3])
+        : ImVec4(pal.proseBg[0], pal.proseBg[1], pal.proseBg[2], pal.proseBg[3]);
+    const ImVec4 ink = failure
+        ? ui::maxContrastTextOn(bg)
+        : ImVec4(pal.proseText[0], pal.proseText[1], pal.proseText[2], 1.0f);
+    const ImVec4 border = failure
+        ? semanticOnGlass(pal.statusWarn, chatSurf())
+        : ImVec4(pal.glassBorder[0], pal.glassBorder[1],
+                 pal.glassBorder[2], pal.glassBorder[3]);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX, padY));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui::metrics::rounding(4.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, ui::metrics::stroke(1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+    ImGui::PushStyleColor(ImGuiCol_Text, ink);
+    ImGui::PushStyleColor(ImGuiCol_Border, border);
+    ImGui::BeginChild(id, ImVec2(0.0f, boxH),
+                      ImGuiChildFlags_Border | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::TextWrapped("%s", text.c_str());
+    ImGui::EndChild();
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar(3);
+    if (font) ImGui::PopFont();
+}
+
 // M14 — one inline row per tool call: ok/fail glyph + tool icon + a HUMAN title (tool_phrase.h
 // turns `add_features` into "Building geometry"; the raw MCP symbol survives as the title's
 // tooltip, and as a dim suffix at chatToolDetail() >= 2) + latency, with the cleaned target as a
@@ -1121,6 +1171,8 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
     ImGui::BeginChild("##toolrow", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -1346,8 +1398,8 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                 const std::string t = ui::humanTarget(mi->reason);
                 if (!t.empty()) dimText(t.c_str());
                 if (!mp.args.empty())
-                    drawProseBox("##tooldetail", stripMdMarks(mp.args),
-                                 ui::metrics::copilotProseMaxH());
+                    drawToolDetailBox("##tooldetail", stripMdMarks(mp.args), nullptr,
+                                      ui::metrics::copilotProseMaxH(), /*failure=*/false);
                 drawArtifacts(mp.arts);
                 ImGui::PopID();
             }
@@ -1364,14 +1416,8 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                 ImGui::PushStyleColor(ImGuiCol_Text, failTone);
                 ImGui::TextWrapped("%s", errSummary(errBody).c_str());
                 ImGui::PopStyleColor();
-                const ImVec2 errMin = ImGui::GetCursorScreenPos();
-                const float errW = ImGui::GetContentRegionAvail().x;
-                drawCodeBox("##toolerr", errBody, fonts.mono, ui::metrics::px(200.0f));
-                const ImVec2 errMax(errMin.x + errW,
-                                    ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y);
-                ImGui::GetWindowDrawList()->AddRect(errMin, errMax,
-                                                    ui::Palette::toU32(pal.statusWarn),
-                                                    4.0f * sc, 0, ui::metrics::stroke(1.0f));
+                drawToolDetailBox("##toolerr", errBody, fonts.mono,
+                                  ui::metrics::px(200.0f), /*failure=*/true);
             }
             // The guard's own text quotes the repeated arguments verbatim ("…with the same
             // arguments ({})"), so a second box holding that same "{}" is noise — drop it in that
@@ -1379,13 +1425,14 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
             // box; either way right-click Copy on the row yields the whole raw detail.
             if (!argsBody.empty() &&
                 !(guard && errBody.find(argsBody) != std::string::npos))
-                drawProseBox("##tooldetail", stripMdMarks(argsBody), ui::metrics::copilotProseMaxH());
+                drawToolDetailBox("##tooldetail", stripMdMarks(argsBody), nullptr,
+                                  ui::metrics::copilotProseMaxH(), /*failure=*/false);
             drawArtifacts(artsBlob);
         }
         endCollapseBody(cb);
     }
     ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##toolrow WindowPadding
+    ImGui::PopStyleVar(2);   // ##toolrow compact ItemSpacing + WindowPadding
     ImRect rowRect = endGlassBubble(gb);
     if (hardFail)
         ImGui::GetWindowDrawList()->AddRect(rowRect.Min, rowRect.Max,
@@ -1415,6 +1462,11 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
 void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
                               bool showThinking, bool isLastTurn) {
     if (m.activity.empty()) return;
+    // The default ImGui vertical item gap is menu-sized. Keep the entire activity run — including
+    // the unboxed context lines and cards delegated to cards.cpp — on the shared chat rhythm.
+    // Card renderers may push the same value locally so their standalone entry points match.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
     const bool turnRunning = m.running;
     if (!turnRunning) {
         // Stale live rows on a finished turn (restored history, terminal events dropped after
@@ -1567,6 +1619,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         }
         ImGui::PopID();
     }
+    ImGui::PopStyleVar();   // timeline-wide compact ItemSpacing
 }
 
 // Forward: user bubble + rewind/edit actions (defined after AI-VC helpers).

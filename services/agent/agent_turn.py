@@ -255,7 +255,7 @@ _TRUNCATED_STOPS = frozenset({"length", "max_tokens", "maxtokens", "max_output_t
 
 
 def _looks_truncated(reply: str, stop_reason: Any = None) -> bool:
-    """True when *reply* is a tool directive CUT OFF mid-emission.
+    """True when a tool directive was cut off or fenced as malformed JSON.
 
     Live 2026-07-28 (run asm-152734881473315): after three research calls the
     model began a ```json {"tool":"mission_start", ...} directive and the
@@ -279,9 +279,17 @@ def _looks_truncated(reply: str, stop_reason: Any = None) -> bool:
     text = reply or ""
     if not text.strip():
         return False
-    # A closed fence means the model finished emitting; whatever went wrong
-    # afterwards is a parse/dialect problem, not truncation.
-    if _FENCE_RE.search(text):
+    # A closed fence can still hold malformed JSON. Live run
+    # run-77308371568450 closed the fence after omitting the outer `}`; the
+    # parser returned None and the valid tool intent was accepted as prose.
+    # A fenced directive opener is unmistakable, so retry any body that cannot
+    # decode rather than silently dropping it.
+    closed = list(_FENCE_RE.finditer(text))
+    if closed:
+        for match in reversed(closed):
+            body = match.group(1).strip()
+            if _TRUNC_OPENER_RE.search(body) and _loads_first_object(body) is None:
+                return True
         return False
     fence = text.rfind("```")
     if fence != -1:
@@ -2284,9 +2292,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         "tail": (reply or "")[-160:],
                     })
                     messages.append({"role": "user", "content": _parts(
-                        "[TRUNCATED] Your previous message was cut off mid "
-                        "tool call, so nothing ran. Re-emit ONLY that single "
-                        "tool call as compact JSON in one ```json fence - no "
+                        "[TRUNCATED] Your previous tool-call message was cut "
+                        "off or contained malformed JSON, so nothing ran. "
+                        "Re-emit ONLY that single tool call as compact JSON "
+                        "in one ```json fence - no "
                         "prose, no restated long text, and keep every string "
                         "argument short. If the call genuinely needs a long "
                         "body, do smaller steps instead."

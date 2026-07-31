@@ -73,6 +73,22 @@ _TRUNCATED = (
     'must f'
 )
 
+# Exact final reply from desktop run run-77308371568450. The model closed the
+# fence but omitted the OUTER object brace after args, so no tool call fired.
+_CLOSED_MALFORMED_ADD_FEATURES = (
+    '```json\n{"tool": "add_features", "args": {"doc_id": "doc-cpp00000002", '
+    '"ops": [{"op": "add_sketch", "name": "gap_profile", "plane": "XY", '
+    '"entities": [{"id": "g1", "type": "line", "p1": [5, -8], "p2": [20, -8]}, '
+    '{"id": "g2", "type": "line", "p1": [20, -8], "p2": [20, 8]}, '
+    '{"id": "g3", "type": "line", "p1": [20, 8], "p2": [5, 8]}, '
+    '{"id": "g4", "type": "line", "p1": [5, 8], "p2": [5, -8]}]}, '
+    '{"op": "extrude", "name": "SnapGap", "sketch": "gap_profile", '
+    '"distance": 14, "start_offset": -1, "mode": "cut"}]}\n```'
+)
+_CLOSED_FIXED_ADD_FEATURES = _CLOSED_MALFORMED_ADD_FEATURES.replace(
+    "]}\n```", "]}}\n```"
+)
+
 
 # ---------------------------------------------------------------------------
 # _looks_truncated: unit precision
@@ -85,7 +101,7 @@ def test_looks_truncated_detects_unclosed_fence_mid_string():
     assert at._looks_truncated(_TRUNCATED)
 
 
-def test_looks_truncated_ignores_complete_and_prose_replies():
+def test_looks_truncated_distinguishes_complete_prose_and_malformed_directives():
     from services.agent import agent_turn as at
 
     assert not at._looks_truncated(_CALL % "ledger_get")
@@ -97,8 +113,13 @@ def test_looks_truncated_ignores_complete_and_prose_replies():
     assert not at._looks_truncated(
         "The config uses { } braces and an unmatched [ here, for illustration."
     )
-    # A fenced block that closed is a parse problem, never truncation.
-    assert not at._looks_truncated('```json\n{"tool": "x", "args"\n```')
+    # A CLOSED fence is still retryable when its unmistakable directive cannot
+    # decode. This is the exact class that ended run-77308371568450.
+    assert at._looks_truncated('```json\n{"tool": "x", "args"\n```')
+    assert at._looks_truncated(_CLOSED_MALFORMED_ADD_FEATURES)
+    assert not at._looks_truncated(_CLOSED_FIXED_ADD_FEATURES)
+    # Invalid fenced prose without a directive opener is not commandeered.
+    assert not at._looks_truncated("```json\nnot actually a tool call {\n```")
 
 class TestAuthoritativeStopReason:
     """A reply capped mid-PROSE is truncated too, and no amount of brace-counting
@@ -213,6 +234,30 @@ def test_truncated_directive_recovers_when_model_re_emits():
     assert res.success is True, (res.stop_reason, res.result)
     tools = [c.get("tool") for c in (res.result or {}).get("calls") or []]
     assert "workspace_status" in tools, tools
+    assert _nudges(p, "[TRUNCATED]") == 1, _flat(p)
+
+def test_closed_malformed_live_add_features_is_reemitted_and_runs():
+    """run-77308371568450 must retry the dropped call, not confirm the prose."""
+    from services.agent import agent_turn as at
+
+    p = _ScriptedProvider([
+        _CALL % "describe_project",
+        _CLOSED_MALFORMED_ADD_FEATURES,
+        _CLOSED_FIXED_ADD_FEATURES,
+        "Done - the snap gap is cut.",
+    ])
+    res = at.run_turn(
+        "open the imported ring into a printable C-clip",
+        p,
+        allowed_tools=[*_GENERAL_ALLOW, "add_features"],
+        max_tool_calls=8,
+        tool_dispatch=_dispatch_ok,
+        actor="general_agent",
+        run_id="run-77308371568450-replay",
+    )
+    assert res.success is True, (res.stop_reason, res.result)
+    tools = [c.get("tool") for c in (res.result or {}).get("calls") or []]
+    assert tools.count("add_features") == 1, tools
     assert _nudges(p, "[TRUNCATED]") == 1, _flat(p)
 
 

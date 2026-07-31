@@ -5934,3 +5934,15 @@ and weldment flows. Role cleanup removes the nonexistent `vision` delegation and
 assignment, makes drawings build through `drawing_detailer`, and prevents ECAD/firmware analysis
 delivery from falling into `sim_engineer`. Focused Rules/skills/roles/recipes/mission tests and the
 advertised-tool repository audit cover the new contracts.
+
+## 2026-07-31 — Closed-fence malformed tool directives no longer end turns
+
+Desktop run `run-77308371568450` completed seven successful inspection calls, then emitted a closed
+`json` fence for `add_features` that omitted the outer object brace. `_parse_directive` correctly
+returned `None`, but `_looks_truncated` treated every closed fence as complete and the general lane
+accepted the raw JSON as a confirmed prose handoff. `services/agent/agent_turn.py` now retries any
+closed fenced directive opener that cannot decode, using the existing bounded single re-emit path;
+ordinary prose, non-directive code fences, and complete directives remain unchanged. The verbatim
+511-byte reply is pinned in `services/agent/test_turn_truncation.py`, including a full turn replay
+that proves the corrected re-emission dispatches `add_features`. Verification: 24 truncation tests,
+73 focused parser/turn tests, and all eight `scripts/check.py` gates pass.

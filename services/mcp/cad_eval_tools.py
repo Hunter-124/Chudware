@@ -107,6 +107,29 @@ _MASS_PROPERTY_RE = re.compile(
     r"\b(mass|weigh\w*|volume|density|inerti\w+|centre\s+of\s+mass|center\s+of\s+mass|"
     r"centroid|com|cog|mass\s+propert\w+|properties)\b")
 
+# `measure_part` is normally mass-properties only, but live models also use it as a generic
+# "measure this part" verb. These exact whole-part wall-thickness spellings name the existing
+# evaluate operation, not a face/edge selector. Keep this deliberately closed: a phrase such as
+# "hole thickness" still needs an explicit geometry query rather than a guessed target.
+_WALL_THICKNESS_INTENTS = frozenset({
+    "thickness",
+    "wall thickness",
+    "minimum thickness",
+    "minimum wall thickness",
+    "min thickness",
+    "min wall thickness",
+    "thinnest wall",
+    "thinnest wall thickness",
+})
+
+
+def _wall_thickness_intent(value) -> bool:
+    """Whether an argument value unambiguously asks for whole-part wall thickness."""
+    if not isinstance(value, str):
+        return False
+    normal = re.sub(r"[\s_-]+", " ", value.strip().casefold())
+    return normal in _WALL_THICKNESS_INTENTS
+
 
 def _reject_unknown(tool: str, kwargs: dict, accepted: str) -> None:
     """Leftover kwargs are a real mistake — name them and the parameters that DO exist."""
@@ -152,6 +175,56 @@ def _feature_rows(doc_id: str) -> Optional[list]:
         return None
     feats = tree.get("features")
     return feats if isinstance(feats, list) else None
+
+
+_QUERY_STATE_RECENT_FEATURES = 8
+
+
+def _query_model_state(doc_id: str) -> dict:
+    """Return a compact current feature roster to bind geometry matches to this model revision."""
+    state = cb.call("doc_tree", {"doc_id": doc_id}) or {}
+    tree = state.get("tree") or {}
+    features = tree.get("features") if isinstance(tree, dict) else []
+    features = features if isinstance(features, list) else []
+    total = len(features)
+    recent = features[-_QUERY_STATE_RECENT_FEATURES:]
+    recent_rows = [
+        {
+            "id": feature.get("id"),
+            "name": feature.get("name"),
+            "type": feature.get("type"),
+            "suppressed": bool(feature.get("suppressed", False)),
+        }
+        for feature in recent if isinstance(feature, dict)
+    ]
+    return {
+        "revision": state.get("revision"),
+        "feature_count": total,
+        "recent_features": recent_rows,
+        "recent_features_limit": _QUERY_STATE_RECENT_FEATURES,
+        "recent_features_returned": len(recent_rows),
+        "recent_features_omitted": total - len(recent_rows),
+        "recent_features_truncated": total > _QUERY_STATE_RECENT_FEATURES,
+    }
+
+
+def _wall_thickness_result(doc_id: str) -> dict:
+    """Build the canonical whole-part wall-thickness response for every route."""
+    res = cb.call("eval_thickness", {"doc_id": doc_id})
+    mn = res.get("min_thickness_mm")
+    if mn is not None:
+        mean = res.get("mean_thickness_mm")
+        summary = (f"thinnest wall = {mn:.4g} mm"
+                   + (f" (mean {mean:.4g} mm)" if mean is not None else ""))
+    else:
+        summary = ("no through-wall thickness could be measured (open/sheet body, or no "
+                   "opposite wall in line of sight) — every inward ray left the material "
+                   f"without hitting a far wall. Confirm {doc_id} really holds a closed solid "
+                   "with measure_part (a valid solid reports a volume), and if the part "
+                   "is meant to be hollow, shell it first (add_features with a shell op) "
+                   "so there ARE two walls to measure between.")
+    # Keep this insertion order identical to the long-standing wall_thickness response.
+    return {"ok": True, "doc_id": doc_id, "summary": summary, **res}
 
 
 def _add_box_call(doc_id: str) -> str:
@@ -579,8 +652,13 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             # checking the usual success flag saw None and couldn't tell a hit from a miss.
             # Echo the RESOLVED query too: when a phrase was normalised into keys, the model
             # needs to see what it actually asked for before trusting the matches.
-            out = {"ok": True, "query": q}
+            out = {"ok": True, "doc_id": d, "query": q}
             out.update(res if isinstance(res, dict) else {"result": res})
+            # Geometry selectors are revision-sensitive. Return a deliberately bounded tree
+            # fingerprint with every successful query so the caller can tell whether a later
+            # mutation invalidated these sids without receiving every feature's parameters.
+            out["doc_id"] = d
+            out["model_state"] = _query_model_state(d)
             if not (out.get("matches") or []):
                 out["note"] = ("no face/edge matched this query — loosen it (drop `side` or "
                                "`surf`) or call describe_part to see the actual roster")
@@ -894,6 +972,11 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         Pass body_id via a direct query if you need just one. (Previously this silently reported
         only the last body of an assembly.)
 
+        Whole-part wall thickness is also accepted only under exact intent spellings — e.g.
+        `measure_part(kind="thickness")` or `measure_part(what="wall thickness")` routes to
+        `wall_thickness` and returns its exact structured result plus `interpreted`. A face/edge
+        phrase remains a real geometry target and is refused rather than guessed.
+
         A document with no solid says WHICH situation it is — empty, or every feature failed to
         rebuild — and gives the call that fixes it.
         """
@@ -914,19 +997,31 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         "set_material instead.") from None
             # A "what should I measure" argument is ambiguous, and the two readings need OPPOSITE
             # answers, so the VALUE decides — not the key.
+            #  * exact whole-part thickness spellings route to the dedicated wall-thickness probe;
             #  * what="mass" / "volume" / "centre of mass" names something measure_part ALREADY
-            #    returns. Routing that away is wrong: measured live 2026-07-29 (sim pass 2b) the
-            #    first version of this block sent measure_part(what="mass") to measure_between,
-            #    which cannot answer it, and cost two calls.
-            #  * what="the hole diameter" names GEOMETRY, which measure_part genuinely cannot do
-            #    (measured live 2026-07-29, drawing pass 2) — that one must route.
+            #    returns, so routing that away is wrong;
+            #  * what="the hole diameter" names GEOMETRY, which measure_part cannot infer.
             asked = next((k for k in ("what", "target", "feature", "of", "query", "measure",
                                       "measures", "measurements", "properties", "props",
                                       "report", "values", "queries", "dimension", "element")
                           if k in extra), None)
+            # `kind` is NOT a generic measure_part alias: only its exact thickness value has a
+            # documented, unambiguous route. Keep unrelated kind= values on the refusal path.
+            if asked is None and "kind" in extra:
+                asked = "kind"
+            route_wall_thickness = False
             if asked is not None:
                 wanted = " ".join(str(extra[asked]).lower().split())
-                if _MASS_PROPERTY_RE.search(wanted):
+                if _wall_thickness_intent(extra[asked]):
+                    extra.pop(asked)
+                    route_wall_thickness = True
+                    notes.append(f"{asked}={wanted!r} read as whole-part wall_thickness")
+                elif asked == "kind":
+                    raise ValueError(
+                        f"measure_part(kind={extra[asked]!r}) only accepts kind=\"thickness\" "
+                        "for the whole-part wall-thickness computation. For a face/edge "
+                        "measurement, call measure_between(a_query=…[, b_query=…]).")
+                elif _MASS_PROPERTY_RE.search(wanted):
                     extra.pop(asked)
                     notes.append(f"ignored {asked}={wanted!r} — measure_part always reports "
                                  f"volume, mass, centre of mass and inertia together")
@@ -946,6 +1041,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             _reject_unknown("measure_part", extra,
                             "it takes doc_id= and density_g_cm3= only.")
             d = _doc(doc_id)
+            if route_wall_thickness:
+                return _dumps(_interpreted(_wall_thickness_result(d), notes))
             mass = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": density_g_cm3})
             out = {"ok": True, "doc_id": d, "mass": mass}
             try:
@@ -1282,20 +1379,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         d = None
         try:
             d = _doc(doc_id)
-            res = cb.call("eval_thickness", {"doc_id": d})
-            mn = res.get("min_thickness_mm")
-            if mn is not None:
-                mean = res.get("mean_thickness_mm")
-                summary = (f"thinnest wall = {mn:.4g} mm"
-                           + (f" (mean {mean:.4g} mm)" if mean is not None else ""))
-            else:
-                summary = ("no through-wall thickness could be measured (open/sheet body, or no "
-                           "opposite wall in line of sight) — every inward ray left the material "
-                           f"without hitting a far wall. Confirm {d} really holds a closed solid "
-                           "with measure_part (a valid solid reports a volume), and if the part "
-                           "is meant to be hollow, shell it first (add_features with a shell op) "
-                           "so there ARE two walls to measure between.")
-            return _dumps({"ok": True, "doc_id": d, "summary": summary, **res})
+            return _dumps(_wall_thickness_result(d))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "wall_thickness()"))
 

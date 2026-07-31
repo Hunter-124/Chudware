@@ -216,6 +216,36 @@ def test_delete_feature_accepts_the_feature_id_spelling():
     assert notes
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"op": "suppress_feature", "id": "f7"},
+         {"op": "set_suppressed", "id": "f7", "value": True}),
+        ({"op": "unsuppress_feature", "id": "f7"},
+         {"op": "set_suppressed", "id": "f7", "value": False}),
+        ({"op": "set_suppressed", "id": "f7", "suppressed": True},
+         {"op": "set_suppressed", "id": "f7", "value": True}),
+    ],
+)
+def test_suppression_dialect_rewrites_to_canonical_value(payload, expected):
+    notes: list = []
+    assert M._normalize_op_elements([payload], notes) == [expected]
+    assert notes
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"op": "suppress_feature", "id": "f7", "value": False},
+        {"op": "unsuppress_feature", "id": "f7", "suppressed": True},
+        {"op": "set_suppressed", "id": "f7", "value": False, "suppressed": True},
+    ],
+)
+def test_conflicting_suppression_spellings_are_rejected(payload):
+    with pytest.raises(ValueError, match="conflicting"):
+        M._normalize_op_elements([payload], [])
+
+
 # --------------------------------------------------------------------- feature types
 
 def test_feature_type_aliases_map_onto_the_engine_vocabulary():

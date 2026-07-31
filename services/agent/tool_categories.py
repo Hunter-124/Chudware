@@ -89,6 +89,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "query_geometry",
         "query_adjacency",
         "hover",
+        "wall_thickness",
     ],
     "inspect": [
         "inspect_part",
@@ -532,7 +533,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
 _CATEGORY_DESCS: dict[str, str] = {
     "modeling": "Part/assembly geometry: add_features ops, new/save/export docs",
     "sketch": "2D sketch health, constraints, project/convert faces",
-    "measure": "Mass props, distances, geometry queries, hover",
+    "measure": "Mass props, wall thickness, distances, geometry queries, hover",
     "inspect": "Visual inspect/render, DFM, interference, design review",
     "research": "Web search, materials, standards, eng calcs, datasheets",
     "sim": "FEA/CFD/motion and EM analysis jobs",

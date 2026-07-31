@@ -282,6 +282,7 @@ class TestToolCategories:
         got = tcat.resolve_categories(["research", "measure"])
         assert "research_web_search" in got
         assert "measure_part" in got
+        assert "wall_thickness" in got
         assert "cad_guide" in got
         # Cap is respected even when requesting everything.
         all_names = list(tcat.CATEGORY_PACKS.keys())

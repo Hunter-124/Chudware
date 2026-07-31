@@ -927,6 +927,7 @@ string handle_targets_entity(const string& handle,
     const json& etypej = get(ent, "type");
     string etype = etypej.is_string() ? etypej.get<string>() : "";
     if (etype == "spline" || etype == "style_spline") {
+        if (sub == "start" || sub == "end") return "";
         if (std::regex_match(sub, P_SUB_RE)) {
             const json& pts = get(ent, "points");
             size_t npts = pts.is_array() ? pts.size() : 0;

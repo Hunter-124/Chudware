@@ -449,6 +449,28 @@ TEST_CASE("spline fix pins every through-point; coincident on a node") {
     CHECK(double(sol.entities["p"]["p"][1]) == doctest::Approx(5.0));
 }
 
+TEST_CASE("spline start/end handles name endpoints, not interior knots") {
+    json s;
+    json sp = json{{"id", "e1"}, {"type", "spline"}, {"construction", false},
+                   {"points", json::array({json::array({0.0, 0.0}), json::array({10.0, 5.0}),
+                                           json::array({20.0, 5.0}), json::array({30.0, 0.0})})}};
+    s["entities"] = json::array({sp, line("e2", -5, -5, 35, -5)});
+    s["constraints"] = json::array({
+        rel("c1", "fix", {"e1"}),
+        rel("c2", "coincident", {"e1.start", "e2.p1"}),
+        rel("c3", "coincident", {"e1.end", "e2.p2"}),
+    });
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.dof == 0);
+    CHECK(double(sol.entities["e2"]["p1"][0]) == doctest::Approx(0.0));
+    CHECK(double(sol.entities["e2"]["p1"][1]) == doctest::Approx(0.0));
+    CHECK(double(sol.entities["e2"]["p2"][0]) == doctest::Approx(30.0));
+    CHECK(double(sol.entities["e2"]["p2"][1]) == doctest::Approx(0.0));
+    CHECK(double(sol.entities["e1"]["points"][1][0]) == doctest::Approx(10.0));
+    CHECK(double(sol.entities["e1"]["points"][1][1]) == doctest::Approx(5.0));
+}
+
 TEST_CASE("malformed entity + constraint on it: skipped, no crash (hostd SIGSEGV regression)") {
     // An entity whose allocation throws registers ZERO solver vars (the forward-tolerant
     // fallback in the solve loop). A constraint referencing it used to index that empty

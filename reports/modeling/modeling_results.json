@@ -1,10 +1,10 @@
 {
   "summary": {
-    "total": 50,
-    "executed": 50,
-    "pass": 49,
+    "total": 52,
+    "executed": 52,
+    "pass": 52,
     "fail": 0,
-    "xfail": 1,
+    "xfail": 0,
     "error": 0
   },
   "coverage": {
@@ -114,8 +114,8 @@
     ],
     "pct": 63.3
   },
-  "libaicad": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so",
-  "generated": "2026-07-03T17:39:35Z",
+  "libchudware": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libchudware.so",
+  "generated": "2026-07-31T13:45:25Z",
   "results": [
     {
       "id": "box",
@@ -127,7 +127,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 24000.0,
+      "volume": 23999.999999999996,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -157,7 +157,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.7562549114227295
+      "elapsed": 0.5287315845489502
     },
     {
       "id": "cylinder",
@@ -169,7 +169,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 21205.750411731104,
+      "volume": 21176.45606017272,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -183,7 +183,7 @@
         {
           "name": "vol!=",
           "ok": true,
-          "detail": "vol 0->21206 (\u0394+21206)"
+          "detail": "vol 0->21176 (\u0394+21176)"
         },
         {
           "name": "bodies",
@@ -199,7 +199,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.019498109817504883
+      "elapsed": 0.0031244754791259766
     },
     {
       "id": "sphere",
@@ -211,7 +211,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 14137.16694115407,
+      "volume": 14094.56853370183,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -225,7 +225,7 @@
         {
           "name": "vol!=",
           "ok": true,
-          "detail": "vol 0->14137 (\u0394+14137)"
+          "detail": "vol 0->14095 (\u0394+14095)"
         },
         {
           "name": "bodies",
@@ -247,7 +247,7 @@
           "text": "2 tiny edge(s) shorter than 0.01 mm"
         }
       ],
-      "elapsed": 0.09016942977905273
+      "elapsed": 0.02097344398498535
     },
     {
       "id": "cone",
@@ -259,7 +259,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 8508.480103472359,
+      "volume": 8489.455596194606,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -273,7 +273,7 @@
         {
           "name": "vol!=",
           "ok": true,
-          "detail": "vol 0->8508 (\u0394+8508)"
+          "detail": "vol 0->8489 (\u0394+8489)"
         },
         {
           "name": "bodies",
@@ -289,7 +289,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.029676437377929688
+      "elapsed": 0.0065097808837890625
     },
     {
       "id": "torus",
@@ -301,7 +301,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 9869.604401089357,
+      "volume": 9841.089544856444,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -315,7 +315,7 @@
         {
           "name": "vol!=",
           "ok": true,
-          "detail": "vol 0->9870 (\u0394+9870)"
+          "detail": "vol 0->9841 (\u0394+9841)"
         },
         {
           "name": "bodies",
@@ -331,7 +331,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.27691030502319336
+      "elapsed": 0.0510561466217041
     },
     {
       "id": "extrude_boss",
@@ -344,7 +344,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 9047.786842338604,
+      "volume": 9035.98189403229,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -358,7 +358,7 @@
         {
           "name": "vol!=",
           "ok": true,
-          "detail": "vol 0->9048 (\u0394+9048)"
+          "detail": "vol 0->9036 (\u0394+9036)"
         },
         {
           "name": "bodies",
@@ -374,7 +374,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.018607616424560547
+      "elapsed": 0.0034880638122558594
     },
     {
       "id": "extrude_cut",
@@ -387,7 +387,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 17591.504561362028,
+      "volume": 17594.16977010267,
       "seed_volume": 19200.0,
       "bodies": 1,
       "manifold": true,
@@ -401,7 +401,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 19200->17592 (\u0394-1608)"
+          "detail": "vol 19200->17594 (\u0394-1606)"
         },
         {
           "name": "bodies",
@@ -417,7 +417,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.06439518928527832
+      "elapsed": 0.010954856872558594
     },
     {
       "id": "revolve",
@@ -430,7 +430,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 42910.63851332392,
+      "volume": 42828.66864253775,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -444,7 +444,7 @@
         {
           "name": "vol!=",
           "ok": true,
-          "detail": "vol 0->42911 (\u0394+42911)"
+          "detail": "vol 0->42829 (\u0394+42829)"
         },
         {
           "name": "bodies",
@@ -466,7 +466,7 @@
           "text": "2 tiny edge(s) shorter than 0.01 mm"
         }
       ],
-      "elapsed": 0.961026668548584
+      "elapsed": 0.14685297012329102
     },
     {
       "id": "loft",
@@ -479,7 +479,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 53950.27734317552,
+      "volume": 53901.32400179585,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -493,7 +493,7 @@
         {
           "name": "vol!=",
           "ok": true,
-          "detail": "vol 0->53950 (\u0394+53950)"
+          "detail": "vol 0->53901 (\u0394+53901)"
         },
         {
           "name": "bodies",
@@ -509,7 +509,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.16260790824890137
+      "elapsed": 0.018961191177368164
     },
     {
       "id": "sweep",
@@ -522,7 +522,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 2010.6192982974676,
+      "volume": 2007.287787371662,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -536,7 +536,7 @@
         {
           "name": "vol!=",
           "ok": true,
-          "detail": "vol 0->2011 (\u0394+2011)"
+          "detail": "vol 0->2007 (\u0394+2007)"
         },
         {
           "name": "bodies",
@@ -552,7 +552,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.04077458381652832
+      "elapsed": 0.004082441329956055
     },
     {
       "id": "helix_spring",
@@ -566,7 +566,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 1065.917318931266,
+      "volume": 1053.5746898349676,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -580,7 +580,7 @@
         {
           "name": "vol!=",
           "ok": true,
-          "detail": "vol 0->1066 (\u0394+1066)"
+          "detail": "vol 0->1054 (\u0394+1054)"
         },
         {
           "name": "bodies",
@@ -596,7 +596,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 2.1925296783447266
+      "elapsed": 0.44075798988342285
     },
     {
       "id": "fillet",
@@ -608,8 +608,8 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 23340.84937505542,
-      "seed_volume": 24000.0,
+      "volume": 23336.88463642076,
+      "seed_volume": 23999.999999999996,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -622,7 +622,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 24000->23341 (\u0394-659)"
+          "detail": "vol 24000->23337 (\u0394-663)"
         },
         {
           "name": "bodies",
@@ -644,7 +644,7 @@
           "text": "8 tiny edge(s) shorter than 0.01 mm"
         }
       ],
-      "elapsed": 0.11007308959960938
+      "elapsed": 0.015438079833984375
     },
     {
       "id": "chamfer",
@@ -657,7 +657,7 @@
       "executed": true,
       "verdict": "PASS",
       "volume": 22524.0,
-      "seed_volume": 24000.0,
+      "seed_volume": 23999.999999999996,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -686,7 +686,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.07341361045837402
+      "elapsed": 0.01351165771484375
     },
     {
       "id": "shell",
@@ -699,7 +699,7 @@
       "executed": true,
       "verdict": "PASS",
       "volume": 7152.0,
-      "seed_volume": 24000.0,
+      "seed_volume": 23999.999999999996,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -728,7 +728,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.05663466453552246
+      "elapsed": 0.007386207580566406
     },
     {
       "id": "draft",
@@ -740,8 +740,8 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 23475.068018844457,
-      "seed_volume": 24000.0,
+      "volume": 23475.06801884446,
+      "seed_volume": 23999.999999999996,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -770,7 +770,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.02874016761779785
+      "elapsed": 0.003674745559692383
     },
     {
       "id": "rib",
@@ -813,7 +813,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.1602611541748047
+      "elapsed": 0.020983219146728516
     },
     {
       "id": "split",
@@ -825,8 +825,8 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 24000.0,
-      "seed_volume": 24000.0,
+      "volume": 23999.999999999996,
+      "seed_volume": 23999.999999999996,
       "bodies": 2,
       "manifold": true,
       "overlap_clean": true,
@@ -855,7 +855,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.05786013603210449
+      "elapsed": 0.007819414138793945
     },
     {
       "id": "boolean_fuse",
@@ -867,8 +867,8 @@
       "note": "overlapping fuse: single connected solid",
       "executed": true,
       "verdict": "PASS",
-      "volume": 33283.18530717959,
-      "seed_volume": 42707.963267948966,
+      "volume": 33272.77433553648,
+      "seed_volume": 42681.935838841164,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": false,
@@ -881,7 +881,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 42708->33283 (\u0394-9425)"
+          "detail": "vol 42682->33273 (\u0394-9409)"
         },
         {
           "name": "bodies",
@@ -897,7 +897,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.07543635368347168
+      "elapsed": 0.020814180374145508
     },
     {
       "id": "boolean_cut",
@@ -909,8 +909,8 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 20968.142105107596,
-      "seed_volume": 37053.09649148734,
+      "volume": 20978.136637885,
+      "seed_volume": 37036.43893685832,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": false,
@@ -923,7 +923,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 37053->20968 (\u0394-16085)"
+          "detail": "vol 37036->20978 (\u0394-16058)"
         },
         {
           "name": "bodies",
@@ -939,7 +939,49 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.05323147773742676
+      "elapsed": 0.014711856842041016
+    },
+    {
+      "id": "boolean_fuse_touching_face",
+      "category": "structural",
+      "kind": "single",
+      "ops_covered": [
+        "boolean"
+      ],
+      "note": "the T-BL30 disjoint-fuse invariant's boundary: two boxes sharing an exact coincident face (no overlap, no gap) is NOT disjoint \u2014 must weld into ONE solid (full combined volume), not be rejected",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 1999.9999999999995,
+      "seed_volume": 1999.9999999999995,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol==",
+          "ok": true,
+          "detail": "vol 2000->2000 (\u0394+0)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.010340452194213867
     },
     {
       "id": "hole_simple",
@@ -951,7 +993,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 18973.805328941533,
+      "volume": 18974.180123920694,
       "seed_volume": 19200.0,
       "bodies": 1,
       "manifold": true,
@@ -981,7 +1023,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.044016361236572266
+      "elapsed": 0.01036691665649414
     },
     {
       "id": "hole_cbore",
@@ -993,7 +1035,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 18773.528797275187,
+      "volume": 18774.235441975463,
       "seed_volume": 19200.0,
       "bodies": 1,
       "manifold": true,
@@ -1023,7 +1065,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.07525849342346191
+      "elapsed": 0.013684511184692383
     },
     {
       "id": "bolt_circle",
@@ -1035,8 +1077,8 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 39269.90816987242,
-      "seed_volume": 40212.38596594935,
+      "volume": 39226.85878166232,
+      "seed_volume": 40167.77493199271,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": false,
@@ -1049,7 +1091,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 40212->39270 (\u0394-942)"
+          "detail": "vol 40168->39227 (\u0394-941)"
         },
         {
           "name": "bodies",
@@ -1065,7 +1107,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.24085354804992676
+      "elapsed": 0.04184699058532715
     },
     {
       "id": "linear_pattern",
@@ -1079,7 +1121,7 @@
       "note": "3 bosses along X",
       "executed": true,
       "verdict": "PASS",
-      "volume": 20707.964473723103,
+      "volume": 20705.61540294855,
       "seed_volume": 19200.0,
       "bodies": 2,
       "manifold": true,
@@ -1093,7 +1135,7 @@
         {
           "name": "vol>",
           "ok": true,
-          "detail": "vol 19200->20708 (\u0394+1508)"
+          "detail": "vol 19200->20706 (\u0394+1506)"
         },
         {
           "name": "manifold",
@@ -1104,7 +1146,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.0845181941986084
+      "elapsed": 0.01772904396057129
     },
     {
       "id": "circular_pattern",
@@ -1118,8 +1160,8 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 43228.31491339552,
-      "seed_volume": 40212.38596594935,
+      "volume": 43178.70661305024,
+      "seed_volume": 40167.77493199271,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": false,
@@ -1132,7 +1174,7 @@
         {
           "name": "vol>",
           "ok": true,
-          "detail": "vol 40212->43228 (\u0394+3016)"
+          "detail": "vol 40168->43179 (\u0394+3011)"
         },
         {
           "name": "manifold",
@@ -1143,7 +1185,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.13783597946166992
+      "elapsed": 0.03388810157775879
     },
     {
       "id": "mirror",
@@ -1157,7 +1199,7 @@
       "note": "mirrored boss; asserts check_feature_overlap finds no bad pairs (has teeth)",
       "executed": true,
       "verdict": "PASS",
-      "volume": 20205.30964914873,
+      "volume": 20203.64389368583,
       "seed_volume": 19200.0,
       "bodies": 1,
       "manifold": true,
@@ -1171,7 +1213,7 @@
         {
           "name": "vol>",
           "ok": true,
-          "detail": "vol 19200->20205 (\u0394+1005)"
+          "detail": "vol 19200->20204 (\u0394+1004)"
         },
         {
           "name": "manifold",
@@ -1187,7 +1229,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.06520318984985352
+      "elapsed": 0.01301884651184082
     },
     {
       "id": "transform_move",
@@ -1199,8 +1241,8 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 24000.0,
-      "seed_volume": 24000.0,
+      "volume": 23999.999999999996,
+      "seed_volume": 23999.999999999996,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -1229,7 +1271,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.01051783561706543
+      "elapsed": 0.0030753612518310547
     },
     {
       "id": "transform_copy",
@@ -1241,8 +1283,8 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 48000.0,
-      "seed_volume": 24000.0,
+      "volume": 47999.99999999999,
+      "seed_volume": 23999.999999999996,
       "bodies": 2,
       "manifold": true,
       "overlap_clean": true,
@@ -1271,7 +1313,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.012488842010498047
+      "elapsed": 0.003620624542236328
     },
     {
       "id": "sm_base_flange",
@@ -1313,7 +1355,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.012637615203857422
+      "elapsed": 0.0035789012908935547
     },
     {
       "id": "sm_edge_flange",
@@ -1326,7 +1368,7 @@
       "note": "90\u00b0 bend off a base-flange rim (resolved edge)",
       "executed": true,
       "verdict": "PASS",
-      "volume": 6870.563174868856,
+      "volume": 6870.5631748688575,
       "seed_volume": 4800.0,
       "bodies": 1,
       "manifold": true,
@@ -1356,7 +1398,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.15984368324279785
+      "elapsed": 0.03222370147705078
     },
     {
       "id": "weld_member",
@@ -1369,7 +1411,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 22400.000000000015,
+      "volume": 22400.000000000004,
       "seed_volume": null,
       "bodies": 1,
       "manifold": true,
@@ -1399,7 +1441,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.02077937126159668
+      "elapsed": 0.00465846061706543
     },
     {
       "id": "surf_thicken",
@@ -1443,7 +1485,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.016970396041870117
+      "elapsed": 0.003539562225341797
     },
     {
       "id": "thread",
@@ -1456,8 +1498,8 @@
       "note": "external M12 V-groove",
       "executed": true,
       "verdict": "PASS",
-      "volume": 3259.9763327291266,
-      "seed_volume": 3392.9200658769764,
+      "volume": 3012.965248465866,
+      "seed_volume": 3387.2981411896835,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -1470,7 +1512,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 3393->3260 (\u0394-133)"
+          "detail": "vol 3387->3013 (\u0394-374)"
         },
         {
           "name": "bodies",
@@ -1486,7 +1528,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 8.043771505355835
+      "elapsed": 1.612673282623291
     },
     {
       "id": "text_engrave",
@@ -1498,7 +1540,7 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 19186.017511602928,
+      "volume": 19189.293535037777,
       "seed_volume": 19200.0,
       "bodies": 1,
       "manifold": true,
@@ -1512,7 +1554,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 19200->19186 (\u0394-14)"
+          "detail": "vol 19200->19189 (\u0394-11)"
         },
         {
           "name": "bodies",
@@ -1528,7 +1570,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.5801680088043213
+      "elapsed": 0.03848695755004883
     },
     {
       "id": "fillet_then_shell",
@@ -1541,8 +1583,8 @@
       "note": "shell after fillet (rounded pockets)",
       "executed": true,
       "verdict": "PASS",
-      "volume": 7012.938009881545,
-      "seed_volume": 24000.0,
+      "volume": 7012.120855468445,
+      "seed_volume": 23999.999999999996,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -1555,7 +1597,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 24000->7013 (\u0394-16987)"
+          "detail": "vol 24000->7012 (\u0394-16988)"
         },
         {
           "name": "bodies",
@@ -1571,7 +1613,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.08592963218688965
+      "elapsed": 0.02318549156188965
     },
     {
       "id": "shell_then_fillet",
@@ -1584,8 +1626,8 @@
       "note": "",
       "executed": true,
       "verdict": "PASS",
-      "volume": 7148.137166941146,
-      "seed_volume": 24000.0,
+      "volume": 7148.114468207452,
+      "seed_volume": 23999.999999999996,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -1614,7 +1656,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.09165167808532715
+      "elapsed": 0.01726222038269043
     },
     {
       "id": "draft_then_shell",
@@ -1628,7 +1670,7 @@
       "executed": true,
       "verdict": "PASS",
       "volume": 7094.707972828103,
-      "seed_volume": 24000.0,
+      "seed_volume": 23999.999999999996,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -1657,7 +1699,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.031734466552734375
+      "elapsed": 0.008991718292236328
     },
     {
       "id": "hole_then_chamfer",
@@ -1670,7 +1712,7 @@
       "note": "countersink-by-chamfer on a bore edge",
       "executed": true,
       "verdict": "PASS",
-      "volume": 18784.262572174946,
+      "volume": 18785.05996600116,
       "seed_volume": 19200.0,
       "bodies": 1,
       "manifold": true,
@@ -1684,7 +1726,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 19200->18784 (\u0394-416)"
+          "detail": "vol 19200->18785 (\u0394-415)"
         },
         {
           "name": "bodies",
@@ -1700,7 +1742,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.048775434494018555
+      "elapsed": 0.012381553649902344
     },
     {
       "id": "pattern_of_hole",
@@ -1713,7 +1755,7 @@
       "note": "cut-through-pattern: a bore array",
       "executed": true,
       "verdict": "PASS",
-      "volume": 18571.681469282044,
+      "volume": 18572.722566446362,
       "seed_volume": 19200.0,
       "bodies": 1,
       "manifold": true,
@@ -1727,7 +1769,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 19200->18572 (\u0394-628)"
+          "detail": "vol 19200->18573 (\u0394-627)"
         },
         {
           "name": "manifold",
@@ -1738,7 +1780,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.10394930839538574
+      "elapsed": 0.03865528106689453
     },
     {
       "id": "pattern_of_cut",
@@ -1752,7 +1794,7 @@
       "note": "cut-through-pattern of a subtractive feature",
       "executed": true,
       "verdict": "PASS",
-      "volume": 29987.256842043047,
+      "volume": 29991.254655154,
       "seed_volume": 32400.0,
       "bodies": 1,
       "manifold": true,
@@ -1766,7 +1808,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 32400->29987 (\u0394-2413)"
+          "detail": "vol 32400->29991 (\u0394-2409)"
         },
         {
           "name": "bodies",
@@ -1782,7 +1824,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.10510087013244629
+      "elapsed": 0.0322117805480957
     },
     {
       "id": "mirror_of_cut",
@@ -1796,7 +1838,7 @@
       "note": "mirror a subtractive feature",
       "executed": true,
       "verdict": "PASS",
-      "volume": 26915.044407846122,
+      "volume": 26918.167699339072,
       "seed_volume": 28800.0,
       "bodies": 1,
       "manifold": true,
@@ -1810,7 +1852,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 28800->26915 (\u0394-1885)"
+          "detail": "vol 28800->26918 (\u0394-1882)"
         },
         {
           "name": "bodies",
@@ -1826,7 +1868,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.07668614387512207
+      "elapsed": 0.022420883178710938
     },
     {
       "id": "boolean_then_fillet",
@@ -1839,8 +1881,8 @@
       "note": "round the fuse seam",
       "executed": true,
       "verdict": "PASS",
-      "volume": 41057.42478011262,
-      "seed_volume": 50095.573684677205,
+      "volume": 41042.509044475075,
+      "seed_volume": 50065.59008634498,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": false,
@@ -1864,7 +1906,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.1460590362548828
+      "elapsed": 0.028761625289916992
     },
     {
       "id": "revolve_then_shell",
@@ -1877,8 +1919,8 @@
       "note": "hollow a solid revolved cup (seed=revolve, test=shell)",
       "executed": true,
       "verdict": "PASS",
-      "volume": 15387.520817282813,
-      "seed_volume": 78539.81633974485,
+      "volume": 15375.113699323141,
+      "seed_volume": 78440.16847289226,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": true,
@@ -1891,7 +1933,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 78540->15388 (\u0394-63152)"
+          "detail": "vol 78440->15375 (\u0394-63065)"
         },
         {
           "name": "manifold",
@@ -1902,7 +1944,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.0328669548034668
+      "elapsed": 0.007702827453613281
     },
     {
       "id": "bolt_circle_then_shell",
@@ -1915,8 +1957,8 @@
       "note": "flanged cap: holes then hollow",
       "executed": true,
       "verdict": "PASS",
-      "volume": 14341.37046363741,
-      "seed_volume": 40212.38596594935,
+      "volume": 14326.353728296059,
+      "seed_volume": 40167.77493199271,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": false,
@@ -1929,7 +1971,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 40212->14341 (\u0394-25871)"
+          "detail": "vol 40168->14326 (\u0394-25841)"
         },
         {
           "name": "manifold",
@@ -1940,7 +1982,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.24262118339538574
+      "elapsed": 0.05463457107543945
     },
     {
       "id": "recipe_mount_bracket",
@@ -1956,7 +1998,7 @@
       "note": "fillet->shell->bolt-circle->chamfer",
       "executed": true,
       "verdict": "PASS",
-      "volume": 9585.060462457925,
+      "volume": 9584.995963330226,
       "seed_volume": 19200.0,
       "bodies": 1,
       "manifold": true,
@@ -1986,7 +2028,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.30827927589416504
+      "elapsed": 0.06003093719482422
     },
     {
       "id": "recipe_pulley",
@@ -2001,8 +2043,8 @@
       "note": "hub + lightening holes + bore",
       "executed": true,
       "verdict": "PASS",
-      "volume": 47548.00481208149,
-      "seed_volume": 57726.765009712435,
+      "volume": 47499.13355248697,
+      "seed_volume": 57661.0279760561,
       "bodies": 1,
       "manifold": true,
       "overlap_clean": false,
@@ -2015,7 +2057,7 @@
         {
           "name": "vol<",
           "ok": true,
-          "detail": "vol 57727->47548 (\u0394-10179)"
+          "detail": "vol 57661->47499 (\u0394-10162)"
         },
         {
           "name": "bodies",
@@ -2031,7 +2073,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.18680930137634277
+      "elapsed": 0.05160784721374512
     },
     {
       "id": "recipe_enclosure",
@@ -2046,7 +2088,7 @@
       "note": "shelled + rounded + vented box",
       "executed": true,
       "verdict": "PASS",
-      "volume": 13566.283185307186,
+      "volume": 13566.275678145557,
       "seed_volume": 60000.0,
       "bodies": 1,
       "manifold": true,
@@ -2076,7 +2118,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.15053033828735352
+      "elapsed": 0.028970718383789062
     },
     {
       "id": "nc_cut_misses_body",
@@ -2103,7 +2145,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.007210969924926758
+      "elapsed": 0.002465486526489258
     },
     {
       "id": "nc_open_surface_nonmanifold",
@@ -2141,7 +2183,7 @@
           "text": "4 free edge(s) detected (open shell)"
         }
       ],
-      "elapsed": 0.00541234016418457
+      "elapsed": 0.0022401809692382812
     },
     {
       "id": "nc_pattern_of_explicit_boolean",
@@ -2154,7 +2196,7 @@
       "note": "documented engine constraint: an explicit `boolean` feature is NOT patternable (only sketch boss/cut/hole); pattern the subtractive sketch-feature instead",
       "executed": true,
       "verdict": "PASS",
-      "volume": 28440.000000000004,
+      "volume": 28440.0,
       "seed_volume": 29520.0,
       "bodies": null,
       "manifold": null,
@@ -2169,7 +2211,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.01522970199584961
+      "elapsed": 0.009853601455688477
     },
     {
       "id": "nc_disjoint_fuse",
@@ -2178,25 +2220,52 @@
       "ops_covered": [
         "boolean"
       ],
-      "note": "documented contract: disjoint fuse must fail; engine returns ok+2 bodies (BUG)",
+      "note": "documented contract: disjoint fuse must fail (issue #8, fixed by T-BL30)",
       "executed": true,
-      "verdict": "XFAIL",
+      "verdict": "PASS",
       "volume": 1999.9999999999995,
       "seed_volume": 1999.9999999999995,
-      "bodies": 2,
-      "manifold": true,
-      "overlap_clean": false,
+      "bodies": null,
+      "manifold": null,
+      "overlap_clean": null,
       "checks": [
         {
           "name": "rebuild",
-          "ok": false,
-          "detail": "rebuild=True want=False"
+          "ok": true,
+          "detail": "rebuild=False want=False errs=['boolean: fuse produced 2 disjoint solids (operands must intersect or touch)']"
         }
       ],
-      "reason": "rebuild: rebuild=True want=False",
-      "xfail": "GH#disjoint-fuse",
+      "reason": "all expectations met",
+      "xfail": null,
       "issues": [],
-      "elapsed": 0.02578878402709961
+      "elapsed": 0.0027756690979003906
+    },
+    {
+      "id": "nc_disjoint_cut",
+      "category": "negative",
+      "kind": "negative",
+      "ops_covered": [
+        "boolean"
+      ],
+      "note": "a full-cross-section tool slicing a body into two disconnected remnants must fail (same disjoint-result invariant as nc_disjoint_fuse, T-BL30)",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 18000.0,
+      "seed_volume": 18000.0,
+      "bodies": null,
+      "manifold": null,
+      "overlap_clean": null,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=False want=False errs=['boolean: subtract produced an empty body']"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.005071163177490234
     }
   ]
 }

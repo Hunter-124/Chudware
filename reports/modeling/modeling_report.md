@@ -1,21 +1,21 @@
-# Modeling-Op Combination Battery — AI-CAD Feature Engine
+# Modeling-Op Combination Battery — Chudware Feature Engine
 
-**Generated:** 2026-07-03T17:39:35Z  
+**Generated:** 2026-07-31T13:45:25Z  
 **Script:** `scripts/modeling_battery.py` (T-BL19)  
-**Engine:** `/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so`  
+**Engine:** `/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libchudware.so`  
 **Method:** each case drives the real C++ feature engine via core_bridge (doc_new + doc_apply_ops) and asserts on live geometry (rebuild status, manifoldness, volume sign, body count).  
 
 ## Summary
 
 | Metric | Count |
 |--------|-------|
-| Cases total | 50 |
-| Executed | 50 |
-| PASS | 49 |
+| Cases total | 52 |
+| Executed | 52 |
+| PASS | 52 |
 | FAIL | 0 |
-| XFAIL (known bug) | 1 |
+| XFAIL (known bug) | 0 |
 | ERROR | 0 |
-| Elapsed | 16.5s |
+| Elapsed | 3.9s |
 
 ## Coverage
 
@@ -65,6 +65,7 @@ Registered modeling op-types (core/doc/validate.cpp): **49**. Executed by batter
 | split | structural | single | PASS | all expectations met |
 | boolean_fuse | structural | single | PASS | all expectations met |
 | boolean_cut | structural | single | PASS | all expectations met |
+| boolean_fuse_touching_face | structural | single | PASS | all expectations met |
 | hole_simple | intent | single | PASS | all expectations met |
 | hole_cbore | intent | single | PASS | all expectations met |
 | bolt_circle | intent | single | PASS | all expectations met |
@@ -95,7 +96,8 @@ Registered modeling op-types (core/doc/validate.cpp): **49**. Executed by batter
 | nc_cut_misses_body | negative | negative | PASS | all expectations met |
 | nc_open_surface_nonmanifold | negative | negative | PASS | all expectations met |
 | nc_pattern_of_explicit_boolean | negative | negative | PASS | all expectations met |
-| nc_disjoint_fuse | negative | negative | XFAIL | [GH#disjoint-fuse] rebuild: rebuild=True want=False |
+| nc_disjoint_fuse | negative | negative | PASS | all expectations met |
+| nc_disjoint_cut | negative | negative | PASS | all expectations met |
 
 ## No-all-skip contract
 

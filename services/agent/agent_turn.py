@@ -591,12 +591,11 @@ def _announces_next_step(text: str) -> bool:
         return False
     last = clauses[-1]
     # A colon introduces delivered content ("I'll explain: <answer>") — but only
-    # when something FOLLOWS it. A clause that ENDS on the colon promised a
-    # payload and shipped none, which is the opposite of delivery. Live
-    # 2026-07-29 (case bench, K3): "Manifest rejected - fixing schema with
-    # `kind`, `acceptance_criteria`, and `request_verbatim`:" was accepted as a
-    # bare finish, so a turn that had just been REJECTED by mission_start
-    # reported success=True stop_reason=confirmed and built nothing.
+    # when something follows it. A clause ending in a colon promised a payload
+    # and shipped none, even when it is a noun-phrase checklist rather than a
+    # recognized action verb.
+    if last.endswith(":"):
+        return True
     if ":" in last and last.split(":", 1)[1].strip():
         return False
     if _NEXT_STEP_OPENER_RE.match(last):
@@ -608,9 +607,6 @@ def _announces_next_step(text: str) -> bool:
     # an explicit now/next marker or a short clause. Mis-firing costs one extra
     # nudge; missing one strands the user's job half-done, so lean to detecting.
     if _GERUND_PROMISE_RE.match(last):
-        # The trailing colon is a promised-payload marker in its own right.
-        if last.endswith(":"):
-            return True
         words = last.split()
         return bool(re.search(r"\b(?:now|next|right away|asap)\b", last, re.IGNORECASE)
                     or len(words) <= 5)

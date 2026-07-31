@@ -20,8 +20,10 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cmath>
 #include <string>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -60,6 +62,12 @@ int persisted_coincident_count(const std::string& doc_id, const std::string& fid
 json line(const char* id, double x1, double y1, double x2, double y2) {
     return json{{"id", id}, {"type", "line"}, {"construction", false},
                 {"p1", json::array({x1, y1})}, {"p2", json::array({x2, y2})}};
+}
+json spline(const char* id, std::initializer_list<std::array<double, 2>> points) {
+    json pts = json::array();
+    for (const auto& p : points) pts.push_back(json::array({p[0], p[1]}));
+    return json{{"id", id}, {"type", "spline"}, {"construction", false},
+                {"points", std::move(pts)}};
 }
 json rel(const char* id, const char* type, std::vector<const char*> refs) {
     json r = json::array();
@@ -253,6 +261,34 @@ TEST_CASE("on-edit auto-coincident fires on add_feature without an explicit call
         if (r.value("is_material", false)) ++material;
     CHECK_MESSAGE(material >= 1,
         "the auto-closed profile should yield a material region: " << regs.dump());
+}
+
+TEST_CASE("on-edit auto-coincident closes spline endpoints without moving interior knots") {
+    json ents = json::array({
+        spline("e1", {{0, 0}, {15, 0}, {18, 20}, {10, 45}, {12, 60}, {0, 60}}),
+        line("e2", 0, 60, 0, 0),
+    });
+    auto [doc_id, fid] = make_sketch_doc(ents, json::array(), true);
+
+    json tree = doc_tree(doc_id);
+    const json* sketch = nullptr;
+    for (const json& feature : tree["tree"]["features"])
+        if (feature.value("id", std::string()) == fid) sketch = &feature;
+    REQUIRE(sketch != nullptr);
+    const json& constraints = (*sketch)["params"]["constraints"];
+    REQUIRE(constraints.size() == 2);
+    std::string refs = constraints.dump();
+    CHECK(refs.find("e1.start") != std::string::npos);
+    CHECK(refs.find("e1.end") != std::string::npos);
+    CHECK(refs.find("e1.p1") == std::string::npos);
+    CHECK(refs.find("e1.p2") == std::string::npos);
+
+    json regions = doc_sketch_regions(doc_id, fid);
+    int material = 0;
+    for (const json& region : regions.value("regions", json::array()))
+        if (region.value("is_material", false)) ++material;
+    CHECK_MESSAGE(material == 1,
+        "spline plus closing line should yield one material region: " << regions.dump());
 }
 
 TEST_CASE("auto_constrain default-off leaves add_feature sketches untouched") {

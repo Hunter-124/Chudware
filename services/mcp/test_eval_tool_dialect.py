@@ -89,14 +89,45 @@ def empty() -> str:
 # query_geometry: the spellings a model actually writes
 # --------------------------------------------------------------------------
 
-def test_canonical_query_is_untouched(part):
-    """The documented call must behave byte-identically — no stray `interpreted`."""
+def test_canonical_query_carries_current_compact_model_identity(part):
+    """Canonical query syntax stays canonical while matches say which model revision they came from."""
     out = _call("query_geometry", query={"of": "face", "side": "top"}, doc_id=part)
     assert out["ok"] is True
+    assert out["doc_id"] == part
     assert out["query"] == {"of": "face", "side": "top"}
     assert out["count"] == 1
-    assert list(out) == ["ok", "query", "count", "matches"]
+    assert "interpreted" not in out
+    state = out["model_state"]
+    assert isinstance(state["revision"], int)
+    assert state["feature_count"] == 2
+    assert state["recent_features_returned"] == len(state["recent_features"]) == 2
+    assert state["recent_features_limit"] >= state["recent_features_returned"]
+    assert state["recent_features_omitted"] == 0
+    assert state["recent_features_truncated"] is False
+    assert all(set(row) == {"id", "name", "type", "suppressed"}
+               for row in state["recent_features"])
 
+
+def test_query_model_state_roster_is_hard_bounded(monkeypatch):
+    """A large feature tree gives query feedback identity, not an unbounded parameter dump."""
+    import services.mcp.cad_eval_tools as ev
+
+    features = [{"id": f"f{i}", "name": f"Feature {i}", "type": "box",
+                 "suppressed": bool(i % 2)}
+                for i in range(10)]
+    monkeypatch.setattr(
+        ev.cb, "call",
+        lambda method, payload: {"revision": 17, "tree": {"features": features}}
+        if method == "doc_tree" and payload == {"doc_id": "state-doc"} else None)
+
+    state = ev._query_model_state("state-doc")
+    assert state["revision"] == 17 and state["feature_count"] == 10
+    assert state["recent_features_limit"] == 8
+    assert state["recent_features_returned"] == 8
+    assert state["recent_features_omitted"] == 2
+    assert state["recent_features_truncated"] is True
+    assert [row["id"] for row in state["recent_features"]] == [
+        f"f{i}" for i in range(2, 10)]
 
 def test_target_spelling_is_accepted(part):
     """The recorded failure: query_geometry(target=..., query=...) -> unexpected kwarg."""
@@ -407,6 +438,33 @@ def test_measure_part_density_aliases(part):
     alu = _call("measure_part", density=2.7, doc_id=part)
     assert alu["mass"]["mass_g"] < steel["mass"]["mass_g"]
     assert "read as density_g_cm3=" in _notes(alu)
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("kind", "thickness"),
+    ("what", "wall thickness"),
+])
+def test_measure_part_whole_part_thickness_aliases_share_wall_result(part, key, value):
+    """The live `kind="thickness"` payload is the whole-part probe, never a face/edge measure."""
+    canonical = _call("wall_thickness", doc_id=part)
+    routed = _call("measure_part", doc_id=part, **{key: value})
+
+    # The canonical path retains the pre-alias envelope/order exactly; only the alias gets a
+    # rewrite note. AICM field paths are per-call temporary outputs, so compare the real readings.
+    assert list(canonical)[:3] == ["ok", "doc_id", "summary"]
+    assert "interpreted" not in canonical
+    assert set(routed) == set(canonical) | {"interpreted"}
+    for field in ("doc_id", "summary", "min_thickness_mm", "mean_thickness_mm",
+                  "max_thickness_mm", "n_sampled"):
+        assert routed[field] == canonical[field]
+    assert f"{key}=" in _notes(routed)
+    assert "wall_thickness" in _notes(routed)
+
+
+def test_measure_part_does_not_guess_a_geometry_target_as_whole_part_thickness(part):
+    out = _call("measure_part", what="hole thickness", doc_id=part)
+    assert out["ok"] is False
+    assert "takes no geometry target" in out["error"]
 
 
 def test_an_alias_that_disagrees_with_the_canonical_value_is_refused(part):

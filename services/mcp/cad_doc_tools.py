@@ -2575,6 +2575,62 @@ _OP_TARGET_OPS = frozenset({
 })
 
 
+# Natural verbs for the one canonical suppression mutation.  These are deliberately
+# narrow: each action fixes the value, so accepting it cannot invert a model's intent.
+_SUPPRESSION_OP_ALIASES = {
+    "suppress_feature": True,
+    "unsuppress_feature": False,
+}
+
+
+def _normalize_suppression_op(op: dict, kind: str, notes: list) -> dict:
+    """Normalize explicit suppression verbs and the ``suppressed`` field alias.
+
+    The core operation is ``set_suppressed(id, value)``.  Its former ``value`` default
+    is false, so passing the natural ``suppressed:true`` spelling used to report success
+    while doing nothing.  Never pick between contradictory action/value spellings.
+    """
+    implied = _SUPPRESSION_OP_ALIASES.get(kind)
+    supplied = {key: op[key] for key in ("value", "suppressed") if key in op}
+    if kind == "set_suppressed":
+        if "suppressed" not in supplied:
+            return op
+        if any(type(value) is not bool for value in supplied.values()):
+            raise ValueError(
+                f'set_suppressed: "value" and "suppressed" must be booleans; got '
+                f'{supplied!r}. Use {{"op":"set_suppressed","id":"f1","value":true}}.')
+        if "value" in supplied and supplied["value"] != supplied["suppressed"]:
+            raise ValueError(
+                'set_suppressed has conflicting "value" and "suppressed" values. '
+                'Send one boolean intent: {"op":"set_suppressed","id":"f1","value":true}.')
+        out = dict(op)
+        out.pop("suppressed")
+        out["value"] = supplied["suppressed"]
+        notes.append(
+            'set_suppressed: interpreted "suppressed" as canonical "value" — '
+            'suppression state is written with value:true or value:false')
+        return out
+
+    if implied is None:
+        return op
+    conflicts = {key: value for key, value in supplied.items()
+                 if type(value) is not bool or value != implied}
+    if conflicts:
+        wanted = "true" if implied else "false"
+        raise ValueError(
+            f'{kind} means set_suppressed value:{wanted}, but got conflicting '
+            f'{conflicts!r}. Send either {{"op":"{kind}","id":"f1"}} or '
+            f'{{"op":"set_suppressed","id":"f1","value":{wanted}}}.')
+    out = {key: value for key, value in op.items() if key not in ("value", "suppressed")}
+    out["op"] = "set_suppressed"
+    out["value"] = implied
+    wanted = "true" if implied else "false"
+    notes.append(
+        f'interpreted op:"{kind}" as {{"op":"set_suppressed","id":…,"value":{wanted}}} '
+        "— set_suppressed is the canonical suppression mutation")
+    return out
+
+
 #: Keys whose value is a STRUCTURE. A string here is a nested encoding, never data —
 #: unlike name/mode/plane, where a string is exactly what belongs.
 _STRUCTURE_KEYS = frozenset({
@@ -2730,6 +2786,14 @@ def _normalize_op_elements(ops: list, notes: list) -> list:
             if kind in _PARAM_EDIT_OPS:
                 out.append(_normalize_op_target(
                     _rewrite_param_edit(el, i, notes), "edit_feature", notes))
+                continue
+            if kind in _SUPPRESSION_OP_ALIASES:
+                normalized = _normalize_suppression_op(el, kind, notes)
+                out.append(_normalize_op_target(normalized, "set_suppressed", notes))
+                continue
+            if kind == "set_suppressed":
+                normalized = _normalize_suppression_op(el, kind, notes)
+                out.append(_normalize_op_target(normalized, kind, notes))
                 continue
             if kind in docops or kind == "new_part":
                 out.append(_normalize_op_target(el, kind, notes))
@@ -6540,8 +6604,27 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     _enrich_zero_volume_errors(fs, ops, r.get("id_map") or {})
                 except Exception:  # noqa: BLE001 — enrichment must never mask a failure
                     pass
-                feats = [{"id": s.get("id"), "ok": s.get("ok"),
-                          "error": s.get("error"), "warning": s.get("warning")} for s in fs]
+                # doc_apply_ops already returns the rebuilt tree.  Match each status against
+                # that authoritative tree instead of paying for a second doc_tree RPC just to
+                # tell callers which feature their batch created or changed.
+                tree = r.get("tree") if isinstance(r.get("tree"), dict) else {}
+                feature_meta = {
+                    feature.get("id"): {
+                        "name": feature.get("name"),
+                        "type": feature.get("type"),
+                        "suppressed": bool(feature.get("suppressed", False)),
+                    }
+                    for feature in tree.get("features", [])
+                    if isinstance(feature, dict) and isinstance(feature.get("id"), str)
+                }
+                feats = []
+                for status in fs:
+                    feature = {"id": status.get("id"), "ok": status.get("ok"),
+                               "error": status.get("error"), "warning": status.get("warning")}
+                    meta = feature_meta.get(status.get("id"))
+                    if meta:
+                        feature.update(meta)
+                    feats.append(feature)
                 bodies = (r.get("tess") or {}).get("bodies", [])
                 ok = all(s.get("ok") for s in fs) if fs else True
 
@@ -6620,6 +6703,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     "body_count": len(bodies),
                     "volume_mm3": r.get("volume"),
                     "features": feats,
+                    "id_map": (r.get("id_map") if isinstance(r.get("id_map"), dict) else {}),
                 }
                 if interpreted:
                     out["interpreted"] = interpreted
@@ -6660,25 +6744,21 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                             ov = cb.call("eval_feature_overlap",
                                          {"doc_id": d, "features": added_ids})
                             pairs = ov.get("pairs") or []
-                            # `dead_features` is "built ok but owns no surviving face", which
-                            # every feature UPSTREAM of a dress op satisfies: measured live
-                            # 2026-07-30, an r2 fillet on a plain box moves all 6 of the box's
-                            # faces onto the fillet, so the box lands in dead_features and the
-                            # model was told "1 dead feature(s)" for a textbook-correct fillet
-                            # (nine of them on a ten-feature part). A warning that fires on
-                            # every finishing op is a warning the model learns to ignore. This
-                            # auto-warning is already scoped to the features THIS batch added,
-                            # so scope the dead list the same way; a cut that really kills an
-                            # earlier feature still travels as a boss_swallowed/cut_overlap
-                            # pair, which names BOTH ends and their shared volume.
+                            # `dead_features` means "owns no surviving face", not "failed to
+                            # build".  A later feature in THIS transaction legitimately takes
+                            # ownership from every upstream feature: box→chamfer and
+                            # sketch→cut→chamfer are normal examples.  Only the terminal added
+                            # feature can still be an honest batch-local dead/no-op warning;
+                            # genuine swallowed/cut failures remain visible through `pairs`.
                             dead_all = list(ov.get("dead_features") or [])
-                            dead = [f for f in dead_all if f in set(added_ids)]
+                            terminal_added_id = added_ids[-1]
+                            dead = [fid for fid in dead_all if fid == terminal_added_id]
                             if pairs or dead:
                                 summary = ov.get("summary")
                                 if isinstance(summary, str) and len(dead) != len(dead_all):
-                                    summary = summary.replace(
-                                        f"; {len(dead_all)} dead feature(s)",
-                                        f"; {len(dead)} dead feature(s)", 1)
+                                    old = f"; {len(dead_all)} dead feature(s)"
+                                    new = (f"; {len(dead)} dead feature(s)" if dead else "")
+                                    summary = summary.replace(old, new, 1)
                                 out["overlap_warnings"] = {
                                     "summary": summary,
                                     "pairs": pairs,

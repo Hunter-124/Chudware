@@ -49,6 +49,9 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <GC_MakeArcOfCircle.hxx>
+#include <GeomAPI_Interpolate.hxx>
+#include <Geom_BSplineCurve.hxx>
+#include <TColgp_HArray1OfPnt.hxx>
 #include <BRepTools.hxx>
 #include <BRep_Tool.hxx>
 #include <Bnd_Box.hxx>
@@ -11695,6 +11698,34 @@ bool reg_build_edge(const json& ent, const chudware::geom::SketchPlane& pl, RegE
                 double a = a0 + sweep * i / n;
                 out.samples.emplace_back(c.x() + r * std::cos(a), c.y() + r * std::sin(a));
             }
+            return true;
+        }
+        if (t == "spline" || t == "style_spline") {
+            if (!ent.contains("points") || !ent["points"].is_array()) return false;
+            std::vector<Eigen::Vector2d> pts;
+            for (const json& q : ent["points"]) {
+                if (!q.is_array() || q.size() < 2) continue;
+                Eigen::Vector2d p(q[0].get<double>(), q[1].get<double>());
+                if (!pts.empty() && reg_near(pts.back(), p)) continue;
+                pts.push_back(p);
+            }
+            if (pts.size() < 2) return false;
+            const bool self_closed = pts.size() >= 4 && reg_near(pts.front(), pts.back());
+            if (self_closed) pts.pop_back();
+            const int n = static_cast<int>(pts.size());
+            Handle(TColgp_HArray1OfPnt) arr = new TColgp_HArray1OfPnt(1, n);
+            for (int i = 0; i < n; ++i) arr->SetValue(i + 1, reg_lift(pl, pts[i]));
+            GeomAPI_Interpolate interp(
+                arr, self_closed ? Standard_True : Standard_False, 1.0e-6);
+            interp.Perform();
+            if (!interp.IsDone() || interp.Curve().IsNull()) return false;
+            BRepBuilderAPI_MakeEdge mk(interp.Curve());
+            if (!mk.IsDone()) return false;
+            out.edge = mk.Edge();
+            out.p_start = pts.front();
+            out.p_end = self_closed ? pts.front() : pts.back();
+            out.closed = self_closed;
+            out.samples = pts;
             return true;
         }
     } catch (...) { return false; }

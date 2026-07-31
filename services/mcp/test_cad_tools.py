@@ -1519,6 +1519,62 @@ def test_a_dress_op_does_not_report_the_body_it_dressed_as_a_dead_feature():
     assert pairs[0]["volume_mm3"] == pytest.approx(4840.0, abs=1.0), pairs
 
 
+def test_suppression_aliases_change_tree_state_and_echo_canonical_rewrites():
+    """Natural suppress/unsuppress verbs must mutate, never fall through to value:false."""
+    r, _ = _call("new_part", {"name": "suppression_alias", "fresh": True})
+    doc = r["doc_id"]
+    built, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Block", {"length": cb.dim(20), "width": cb.dim(20),
+                                 "height": cb.dim(20)})]})
+    assert built["ok"], built
+    fid = built["id_map"]["$0"]
+    feature = next(f for f in built["features"] if f["id"] == fid)
+    assert feature == {
+        "id": fid, "ok": True, "error": None, "warning": None,
+        "name": "Block", "type": "box", "suppressed": False,
+    }, built
+
+    suppressed, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "suppress_feature", "id": fid}]})
+    assert suppressed["ok"] and suppressed["interpreted"], suppressed
+    tree = cb.call("doc_tree", {"doc_id": doc})["tree"]
+    assert next(f for f in tree["features"] if f["id"] == fid)["suppressed"] is True
+
+    unsuppressed, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "unsuppress_feature", "id": fid}]})
+    assert unsuppressed["ok"] and unsuppressed["interpreted"], unsuppressed
+    tree = cb.call("doc_tree", {"doc_id": doc})["tree"]
+    assert next(f for f in tree["features"] if f["id"] == fid)["suppressed"] is False
+
+    canonical_alias, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "set_suppressed", "id": fid, "suppressed": True}]})
+    assert canonical_alias["ok"] and canonical_alias["interpreted"], canonical_alias
+    tree = cb.call("doc_tree", {"doc_id": doc})["tree"]
+    assert next(f for f in tree["features"] if f["id"] == fid)["suppressed"] is True
+
+
+def test_one_batch_box_chamfer_keeps_upstream_ownership_noise_out_of_feedback():
+    """A later dress feature owns faces; it does not make its same-batch box dead."""
+    r, _ = _call("new_part", {"name": "same_batch_chamfer", "fresh": True})
+    doc = r["doc_id"]
+    result, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Block", {"length": cb.dim(60), "width": cb.dim(40),
+                                 "height": cb.dim(20)}),
+        cb.feat("chamfer", "Edge break", {"length": cb.dim(1)},
+                {"edges": {"of": "edge", "side": "+z"}}),
+    ]})
+    assert result["ok"], result
+    assert set(result["id_map"]) >= {"$0", "$1"}, result
+    by_id = {f["id"]: f for f in result["features"]}
+    assert by_id[result["id_map"]["$0"]]["name"] == "Block"
+    assert by_id[result["id_map"]["$0"]]["type"] == "box"
+    assert by_id[result["id_map"]["$0"]]["suppressed"] is False
+    assert by_id[result["id_map"]["$1"]]["name"] == "Edge break"
+    assert by_id[result["id_map"]["$1"]]["type"] == "chamfer"
+    assert by_id[result["id_map"]["$1"]]["suppressed"] is False
+    assert "overlap_warnings" not in result, result.get("overlap_warnings")
+
+
 # --- new_part resume-or-mint is ATOMIC ---------------------------------------------------
 # Live 2026-07-29, run-42508173312214: the trace holds ONE new_part("lexus_f_keychain")
 # and the GUI grew THREE tabs (lexus_f_keychain, ...2, ...3). new_part used to decide

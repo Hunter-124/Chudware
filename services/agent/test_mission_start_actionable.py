@@ -252,6 +252,15 @@ def test_trailing_colon_promise_is_not_a_finish():
                        "is 12 g6.")
     assert not promise("Here are the results: volume 1.2e5 mm^3, mass 940 g.")
 
+    # Live run run-25836956409821: the final checklist is a promise despite
+    # beginning with a noun phrase, not one of the action-verb openers.
+    assert promise("DFM passes now (1.09 mm min web). Final look + verify "
+                   "battery + export:")
+
+    # Delivered colon payloads remain complete answers, not trailing promises.
+    assert not promise("DFM passes now (1.09 mm min web). Final look: battery "
+                       "verified and export saved to /tmp/case.step.")
+
 
 def test_planning_narration_is_recognised_as_a_promise():
     """The verbatim live reply that ended the case-bench turn as no_code."""

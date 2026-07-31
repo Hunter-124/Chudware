@@ -900,7 +900,12 @@ Handle resolve_handle(const std::string& handle, const EntMap& entities,
         }
     }
     if (t == "spline" || t == "style_spline") {
-        if (sub.empty()) return ident_point(pick(vidx, {0, 1}));
+        if (sub.empty() || sub == "start")
+            return ident_point(pick(vidx, {0, 1}));
+        if (sub == "end") {
+            const int n = static_cast<int>(vidx.size());
+            return ident_point(pick(vidx, {n - 2, n - 1}));
+        }
         if (!sub.empty() && sub[0] == 'p') {
             int k = std::stoi(sub.substr(1));
             return ident_point(pick(vidx, {2 * k, 2 * k + 1}));
@@ -1407,8 +1412,14 @@ void add_fix(System& sys, const std::string& cid, const std::string& handle,
                 tgt(2 * i + 1) = num(pts[i][1]);
             }
             pin(var_map.at(eid), tgt);
-        } else if (!sub.empty() && sub[0] == 'p') {
-            int k = std::stoi(sub.substr(1));
+        } else {
+            int k = -1;
+            if (sub == "start")
+                k = 0;
+            else if (sub == "end")
+                k = static_cast<int>(pts.size()) - 1;
+            else if (sub[0] == 'p')
+                k = std::stoi(sub.substr(1));
             if (k >= 0 && k < static_cast<int>(pts.size())) {
                 VectorXd tgt(2);
                 tgt << num(pts[k][0]), num(pts[k][1]);
@@ -3003,9 +3014,9 @@ std::vector<Endpoint> entity_endpoints(const json& coords) {
                 const json& p0 = ent["points"].front();
                 const json& pn = ent["points"].back();
                 if (p0.is_array() && p0.size() >= 2)
-                    push(id, "p1", num(p0[0]), num(p0[1]));
+                    push(id, "start", num(p0[0]), num(p0[1]));
                 if (pn.is_array() && pn.size() >= 2)
-                    push(id, "p2", num(pn[0]), num(pn[1]));
+                    push(id, "end", num(pn[0]), num(pn[1]));
             }
         }
     }

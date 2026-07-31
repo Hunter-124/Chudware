@@ -5904,3 +5904,19 @@ because `private_hostd.py` copies the latter for the test daemon.
 that cancel had to be a child process because a Python thread cannot be killed mid-`ctypes`, and the
 child runs with `CHUDWARE_ENGINE_DAEMON=0` deliberately so killing it cannot leave the shared hostd
 still solving.
+
+## 2026-07-31 — Live modeling-tool dialect, feedback, and spline-loop repair
+
+Desktop run `run-25836956409821` exposed two rejected-but-unambiguous calls, one silent suppression
+no-op, a false same-batch dead-feature warning, and a turn accepted while ending on a promised
+trailing-colon checklist. `services/mcp/cad_{doc,eval}_tools.py` now canonicalize suppression and
+whole-part thickness intents with explicit `interpreted` notes, return batch `id_map` plus compact
+feature/model state, and preserve only terminal same-batch dead ownership warnings;
+`services/agent/agent_turn.py` resumes trailing-colon promises, while the measure category exposes
+`wall_thickness` directly. The live 52-case modeling battery then found the underlying spline gap:
+auto-coincident used interior `p1`/`p2` spline knots as endpoints and the sketch-region RPC omitted
+spline edges entirely. `core/sketch/sketch.cpp`, `core/doc/{validate,session}.cpp`, and focused
+regressions add unambiguous `start`/`end` spline handles and spline region edges. Verification:
+verbatim live-call replay, advertised-tool audit, focused Python/C++ regressions, and modeling battery
+52/52 PASS; historical ledger replay remains 57/190 honestly rejected calls (the repaired desktop
+payloads were not present in that corpus).

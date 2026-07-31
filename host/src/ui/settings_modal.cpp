@@ -183,22 +183,61 @@ static void helpMarker(const char* desc) {
         ImGui::EndTooltip();
     }
 }
-// A zero-width Selectable asks ImGui to resolve the row against the current window's WorkRect.
-// That is the authoritative usable width for both combo popups and list children: the normal
-// half-ItemSpacing expansion reaches the popup/child clip edges, while the owner window clips it
-// naturally. Do not add a row-local clip rect here; it cuts off that expansion and can truncate
-// the vertical header fill.
-static bool settingsFullRowSelectable(const char* label, bool selected, float height = 0.0f) {
-    return ImGui::Selectable(label, selected, ImGuiSelectableFlags_None,
-                             ImVec2(0.0f, height));
+// Match chatCopyContext's proven row treatment: Selectable owns input/focus/close semantics,
+// while its header colors stay transparent and the current window draw list paints the wash
+// after the item. Popup rows use a stable label-width fallback because an auto-sizing combo
+// reports a tiny window width on its measuring frame.
+static bool settingsManualRowSelectable(const char* label, bool selected, float height,
+                                        bool popupRow) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImVec2 windowPos = ImGui::GetWindowPos();
+    const float windowWidth = ImGui::GetWindowWidth();
+    const float border = style.WindowBorderSize;
+    const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+    float rowWidth = 0.0f;
+    if (popupRow) {
+        const float textWidth = ImGui::CalcTextSize(label).x + 2.0f * style.FramePadding.x;
+        const float widthToInnerRight =
+            windowPos.x + windowWidth - border - rowPos.x;
+        rowWidth = ImMax(widthToInnerRight, textWidth);
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+    const bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_None,
+                                           ImVec2(rowWidth, height));
+    const bool hovered = ImGui::IsItemHovered();
+    ImGui::PopStyleColor(3);
+
+    if (selected || hovered) {
+        const float rowHeight = ImGui::GetItemRectSize().y;
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            ImVec2(windowPos.x + border, rowPos.y),
+            ImVec2(windowPos.x + windowWidth - border, rowPos.y + rowHeight),
+            ImGui::GetColorU32(ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                                     ui::palette.accent[2], 0.30f)));
+    }
+    return clicked;
 }
-static bool settingsFullRowCombo(const char* id, int* current,
-                                 const char* const* labels, int count) {
+
+static bool settingsPopupRowSelectable(const char* label, bool selected,
+                                       float height = 0.0f) {
+    return settingsManualRowSelectable(label, selected, height, true);
+}
+
+static bool settingsChildRowSelectable(const char* label, bool selected,
+                                       float height = 0.0f) {
+    return settingsManualRowSelectable(label, selected, height, false);
+}
+
+static bool settingsPopupRowCombo(const char* id, int* current,
+                                  const char* const* labels, int count) {
     bool changed = false;
     if (ImGui::BeginCombo(id, labels[*current])) {
         for (int i = 0; i < count; ++i) {
             const bool selected = (i == *current);
-            if (settingsFullRowSelectable(labels[i], selected)) {
+            if (settingsPopupRowSelectable(labels[i], selected)) {
                 *current = i;
                 changed = true;
             }
@@ -2901,7 +2940,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
                         if (hay.find(fq) == std::string::npos) continue;
                     }
                     const bool selected = (pi == sel);
-                    if (settingsFullRowSelectable(picks[pi].label.c_str(), selected)) {
+                    if (settingsPopupRowSelectable(picks[pi].label.c_str(), selected)) {
                         RoleAssign next = a;  // preserve thinking
                         next.mode = picks[pi].mode;
                         if (picks[pi].mode == RoleMode::Fixed) {
@@ -2945,7 +2984,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
             if (ImGui::BeginCombo("##role_think", kThinkLabels[thinkSel])) {
                 for (int ti = 0; ti < 4; ++ti) {
                     const bool selT = (ti == thinkSel);
-                    if (settingsFullRowSelectable(kThinkLabels[ti], selT)) {
+                    if (settingsPopupRowSelectable(kThinkLabels[ti], selT)) {
                         RoleAssign next = a;
                         next.thinking = kThinkValues[ti];
                         setRoleAssign(st, key, next);
@@ -3191,7 +3230,7 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
                 if (hay.find(fq) == std::string::npos) continue;
             }
             const bool selected = (pi == sel);
-            if (settingsFullRowSelectable(picks[pi].label.c_str(), selected)) {
+            if (settingsPopupRowSelectable(picks[pi].label.c_str(), selected)) {
                 if (picks[pi].mode == RoleMode::Fixed) {
                     a.isDefault = false;
                     a.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
@@ -3222,7 +3261,7 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
     if (ImGui::BeginCombo("##ef_think", kThinkLabels[thinkSel])) {
         for (int ti = 0; ti < 3; ++ti) {
             const bool selT = (ti == thinkSel);
-            if (settingsFullRowSelectable(kThinkLabels[ti], selT)) {
+            if (settingsPopupRowSelectable(kThinkLabels[ti], selT)) {
                 a.thinking = kThinkValues[ti];
                 saveEngFirmModelsUi();
             }
@@ -3331,7 +3370,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0f);
         int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
-        if (settingsFullRowCombo(id, &v, kPrefLabels, 4)) {
+        if (settingsPopupRowCombo(id, &v, kPrefLabels, 4)) {
             *pref = v;
             if (pref == &settings.planPreference)
                 settings.planMode = (v != 0);
@@ -3378,7 +3417,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::SetNextItemWidth(-1.0f);
             int ra = (settings.roleAdoption != 0) ? 1 : 0;
             const char* kAdopt[] = {"Supervised", "Free"};
-            if (settingsFullRowCombo("##h_role_adopt", &ra, kAdopt, 2)) {
+            if (settingsPopupRowCombo("##h_role_adopt", &ra, kAdopt, 2)) {
                 settings.roleAdoption = ra;
                 changed = true;
             }
@@ -4620,7 +4659,7 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
                 const ImVec2 textPos = ImGui::GetCursorScreenPos();
                 const std::string rowLabel =
                     ui::foldToAtlasGlyphs(sk.name) + "##skill_catalog_row";
-                if (settingsFullRowSelectable(rowLabel.c_str(), sel, rowH)) {
+                if (settingsChildRowSelectable(rowLabel.c_str(), sel, rowH)) {
                     s_ovSkills.creating = false;
                     s_ovSkills.selected = sk.name;
                     ovLoadSkillBody(st, sk.name);
@@ -4910,7 +4949,7 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 const ImVec2 textPos = ImGui::GetCursorScreenPos();
                 const std::string label = ovTriggerLabel(tr);
                 const std::string rowLabel = label + "##rule_catalog_row";
-                if (settingsFullRowSelectable(rowLabel.c_str(), sel, rowH)) {
+                if (settingsChildRowSelectable(rowLabel.c_str(), sel, rowH)) {
                     s_ovTrig.creating = false;
                     s_ovTrig.selected = tr.id;
                     ovLoadTriggerBody(st, tr.id);
@@ -5804,11 +5843,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                 const bool aiNarrow = ImGui::GetContentRegionAvail().x < 640.0f * sc;
                 if (aiNarrow) {
                     ImGui::SetNextItemWidth(-1);
-                    settingsFullRowCombo("##ai_sub_pick", &s_aiSubSel, kAiSubLabels, 8);
+                    settingsPopupRowCombo("##ai_sub_pick", &s_aiSubSel, kAiSubLabels, 8);
                 } else {
-                    // Borderless nav rail. The Selectable owns the complete row and resolves its
-                    // width from this child, so its selected/hover wash cannot enter the content
-                    // pane or stop short of the rail's usable edge.
+                    // Borderless nav rail. Its rows paint against this child's own inner
+                    // borders, so the wash fills the rail without entering the content pane.
                     const ImVec2 railMn = ImGui::GetCursorScreenPos();
                     const float railAvailH = ImGui::GetContentRegionAvail().y;
                     const float railW = 148.0f * sc;
@@ -5824,7 +5862,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                     for (int i = 0; i < 8; ++i) {
                         ImGui::PushID(i);
                         const bool selRow = (i == s_aiSubSel);
-                        if (settingsFullRowSelectable(kAiSubLabels[i], selRow, railRowH))
+                        if (settingsChildRowSelectable(kAiSubLabels[i], selRow, railRowH))
                             s_aiSubSel = i;
                         if (selRow) ImGui::SetItemDefaultFocus();
                         ImGui::PopID();
@@ -5969,7 +6007,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                             auto& pr = s_promptRecs[i];
                             std::string lbl = pr.role;
                             if (pr.overridden) lbl += " *";
-                            if (settingsFullRowSelectable(lbl.c_str(), sel))
+                            if (settingsChildRowSelectable(lbl.c_str(), sel))
                                 s_selectedRole = i;
                             if (sel) ImGui::SetItemDefaultFocus();
                             if (ImGui::IsItemHovered())
@@ -5980,7 +6018,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         {
                             std::string syslbl = "system (override)";
                             if (st.spBuf[0] != 0) syslbl += " *";
-                            if (settingsFullRowSelectable(syslbl.c_str(), s_selectedRole >= sysIdx))
+                            if (settingsChildRowSelectable(syslbl.c_str(), s_selectedRole >= sysIdx))
                                 s_selectedRole = sysIdx;
                             if (s_selectedRole >= sysIdx) ImGui::SetItemDefaultFocus();
                             if (ImGui::IsItemHovered())

@@ -1088,26 +1088,47 @@ void drawAISettingsBody(AppState& st, bool busy) {
         cpMenuLabel(label);
         ImGui::SetNextItemWidth(-1);
         pushField();
-        // Explicit popup-row geometry keeps the header wash on the row's full usable width.
-        // Selectable normally expands its paint by half ItemSpacing; zero only the horizontal
-        // component so the wash reaches (but never crosses) both popup content edges while the
-        // normal vertical spacing continues to define the option-row height.
+        // Selectable's own header fill is intentionally transparent: popup auto-sizing makes
+        // content-region widths unstable on the measuring frame, so each row is sized from its
+        // label until the popup has a real width and its blue fill is drawn manually edge to edge.
         if (ImGui::BeginCombo(id, kPrefLabels[v])) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::maxContrastTextOn(popBg));
-            const ImVec2 optionSpacing = ImGui::GetStyle().ItemSpacing;
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, optionSpacing.y));
+            const ImGuiStyle& optionStyle = ImGui::GetStyle();
+            const float border = optionStyle.WindowBorderSize;
+            const float windowWidth = ImGui::GetWindowWidth();
+            const ImVec2 windowPos = ImGui::GetWindowPos();
+            const float labelInset = ui::metrics::U(2.0f);
             for (int i = 0; i < 4; ++i) {
                 const bool selected = (i == v);
-                const float optionRowW = ImGui::GetContentRegionAvail().x;
-                if (ImGui::Selectable(kPrefLabels[i], selected, ImGuiSelectableFlags_None,
-                                      ImVec2(optionRowW, 0.0f))) {
+                const float labelWidth =
+                    ImGui::CalcTextSize(kPrefLabels[i]).x + 2.0f * optionStyle.FramePadding.x;
+                const float rowWidth =
+                    ImMax(windowWidth - 2.0f * border, labelWidth) - labelInset;
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + labelInset);
+                const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+                ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+                const bool clicked =
+                    ImGui::Selectable(kPrefLabels[i], selected, ImGuiSelectableFlags_None,
+                                      ImVec2(rowWidth, 0.0f));
+                const bool hovered = ImGui::IsItemHovered();
+                ImGui::PopStyleColor(3);
+                if (selected || hovered) {
+                    const float rowHeight = ImGui::GetItemRectSize().y;
+                    ImGui::GetWindowDrawList()->AddRectFilled(
+                        ImVec2(windowPos.x + border, rowPos.y),
+                        ImVec2(windowPos.x + windowWidth - border, rowPos.y + rowHeight),
+                        ImGui::GetColorU32(
+                            ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.30f)));
+                }
+                if (clicked) {
                     *pref = i;
                     if (pref == &s.planPreference) s.planMode = (i != 0);
                     changed = true;
                 }
                 if (selected) ImGui::SetItemDefaultFocus();
             }
-            ImGui::PopStyleVar();
             ImGui::PopStyleColor();
             ImGui::EndCombo();
         }

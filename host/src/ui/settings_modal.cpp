@@ -183,33 +183,22 @@ static void helpMarker(const char* desc) {
         ImGui::EndTooltip();
     }
 }
-// Selectable backgrounds expand by half ItemSpacing on every side. In a split pane or popup that
-// can push the header wash outside its own row, while an implicit width can vary with its label.
-// Give Settings list options the full content width, remove the horizontal expansion, and clip
-// their paint to both the row and the current pane/popup.
-static bool settingsBoundedSelectable(const char* label, bool selected) {
-    const ImVec2 rowMn = ImGui::GetCursorScreenPos();
-    const float rowW = ImGui::GetContentRegionAvail().x;
-    const ImVec2 spacing = ImGui::GetStyle().ItemSpacing;
-    const float halfSpacingY = spacing.y * 0.5f;
-    const ImVec2 rowMx(rowMn.x + rowW,
-                       rowMn.y + ImGui::GetTextLineHeight() + halfSpacingY);
-
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, spacing.y));
-    ImGui::PushClipRect(ImVec2(rowMn.x, rowMn.y - halfSpacingY), rowMx, true);
-    const bool pressed =
-        ImGui::Selectable(label, selected, ImGuiSelectableFlags_None, ImVec2(rowW, 0.0f));
-    ImGui::PopClipRect();
-    ImGui::PopStyleVar();
-    return pressed;
+// A zero-width Selectable asks ImGui to resolve the row against the current window's WorkRect.
+// That is the authoritative usable width for both combo popups and list children: the normal
+// half-ItemSpacing expansion reaches the popup/child clip edges, while the owner window clips it
+// naturally. Do not add a row-local clip rect here; it cuts off that expansion and can truncate
+// the vertical header fill.
+static bool settingsFullRowSelectable(const char* label, bool selected, float height = 0.0f) {
+    return ImGui::Selectable(label, selected, ImGuiSelectableFlags_None,
+                             ImVec2(0.0f, height));
 }
-static bool settingsBoundedCombo(const char* id, int* current,
+static bool settingsFullRowCombo(const char* id, int* current,
                                  const char* const* labels, int count) {
     bool changed = false;
     if (ImGui::BeginCombo(id, labels[*current])) {
         for (int i = 0; i < count; ++i) {
             const bool selected = (i == *current);
-            if (settingsBoundedSelectable(labels[i], selected)) {
+            if (settingsFullRowSelectable(labels[i], selected)) {
                 *current = i;
                 changed = true;
             }
@@ -2912,7 +2901,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
                         if (hay.find(fq) == std::string::npos) continue;
                     }
                     const bool selected = (pi == sel);
-                    if (settingsBoundedSelectable(picks[pi].label.c_str(), selected)) {
+                    if (settingsFullRowSelectable(picks[pi].label.c_str(), selected)) {
                         RoleAssign next = a;  // preserve thinking
                         next.mode = picks[pi].mode;
                         if (picks[pi].mode == RoleMode::Fixed) {
@@ -2956,7 +2945,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
             if (ImGui::BeginCombo("##role_think", kThinkLabels[thinkSel])) {
                 for (int ti = 0; ti < 4; ++ti) {
                     const bool selT = (ti == thinkSel);
-                    if (settingsBoundedSelectable(kThinkLabels[ti], selT)) {
+                    if (settingsFullRowSelectable(kThinkLabels[ti], selT)) {
                         RoleAssign next = a;
                         next.thinking = kThinkValues[ti];
                         setRoleAssign(st, key, next);
@@ -3202,7 +3191,7 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
                 if (hay.find(fq) == std::string::npos) continue;
             }
             const bool selected = (pi == sel);
-            if (settingsBoundedSelectable(picks[pi].label.c_str(), selected)) {
+            if (settingsFullRowSelectable(picks[pi].label.c_str(), selected)) {
                 if (picks[pi].mode == RoleMode::Fixed) {
                     a.isDefault = false;
                     a.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
@@ -3233,7 +3222,7 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
     if (ImGui::BeginCombo("##ef_think", kThinkLabels[thinkSel])) {
         for (int ti = 0; ti < 3; ++ti) {
             const bool selT = (ti == thinkSel);
-            if (settingsBoundedSelectable(kThinkLabels[ti], selT)) {
+            if (settingsFullRowSelectable(kThinkLabels[ti], selT)) {
                 a.thinking = kThinkValues[ti];
                 saveEngFirmModelsUi();
             }
@@ -3342,7 +3331,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0f);
         int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
-        if (settingsBoundedCombo(id, &v, kPrefLabels, 4)) {
+        if (settingsFullRowCombo(id, &v, kPrefLabels, 4)) {
             *pref = v;
             if (pref == &settings.planPreference)
                 settings.planMode = (v != 0);
@@ -3389,7 +3378,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::SetNextItemWidth(-1.0f);
             int ra = (settings.roleAdoption != 0) ? 1 : 0;
             const char* kAdopt[] = {"Supervised", "Free"};
-            if (settingsBoundedCombo("##h_role_adopt", &ra, kAdopt, 2)) {
+            if (settingsFullRowCombo("##h_role_adopt", &ra, kAdopt, 2)) {
                 settings.roleAdoption = ra;
                 changed = true;
             }
@@ -4583,7 +4572,21 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
     const float titleBudget = ImGui::GetTextLineHeight() + 10.0f * S;
     const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - titleBudget);
     ui::InterwebzTwoColumnBegin(12.0f);
-    if (ui::InterwebzGroupBegin("##set_skill_list", "Catalog", ImVec2(0, colH))) {
+    if (ui::InterwebzGroupBegin("##set_skill_list", "Skills", ImVec2(0, colH))) {
+        int userSkills = 0;
+        int projectSkills = 0;
+        for (const auto& sk : s_ovSkills.skills) {
+            if (sk.source == "user") ++userSkills;
+            else if (sk.source == "project") ++projectSkills;
+        }
+        std::string catalogMeta = std::to_string(s_ovSkills.skills.size()) + " available";
+        if (userSkills > 0) catalogMeta += "  \xc2\xb7  " + std::to_string(userSkills) + " user";
+        if (projectSkills > 0)
+            catalogMeta += "  \xc2\xb7  " + std::to_string(projectSkills) + " project";
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+        ImGui::TextUnformatted(catalogMeta.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 2.0f * S));
         if (ImGui::Button("New skill", ImVec2(-1, 0))) {
             s_ovSkills.creating = true;
             s_ovSkills.selected.clear();
@@ -4597,7 +4600,7 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Create a user skill from the skill-creator template.");
-        ImGui::Dummy(ImVec2(0, 4.0f * S));
+        ImGui::Separator();
 
         if (!s_ovSkills.loaded && s_ovSkills.listInFlight) {
             ImGui::TextUnformatted("Loading skills\xe2\x80\xa6");
@@ -4605,53 +4608,48 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
                        ui::palette.textDim[2], 1));
-            ImGui::TextWrapped("No skills discovered.");
+            ImGui::TextWrapped("No skills found. Create a user skill to add reusable guidance.");
             ImGui::PopStyleColor();
         } else {
+            const float lineH = ImGui::GetTextLineHeight();
+            const float rowH = lineH * 3.0f + 8.0f * S;
             for (size_t i = 0; i < s_ovSkills.skills.size(); ++i) {
                 const auto& sk = s_ovSkills.skills[i];
                 ImGui::PushID((int)i);
                 const bool sel = (!s_ovSkills.creating && s_ovSkills.selected == sk.name);
-                if (ImGui::Selectable("##skrow", sel, 0, ImVec2(0, 0))) {
+                const ImVec2 textPos = ImGui::GetCursorScreenPos();
+                const std::string rowLabel =
+                    ui::foldToAtlasGlyphs(sk.name) + "##skill_catalog_row";
+                if (settingsFullRowSelectable(rowLabel.c_str(), sel, rowH)) {
                     s_ovSkills.creating = false;
                     s_ovSkills.selected = sk.name;
                     ovLoadSkillBody(st, sk.name);
                 }
-                // Paint name + source chip on the same row.
-                {
-                    ImVec2 rmin = ImGui::GetItemRectMin();
-                    ImVec2 rmax = ImGui::GetItemRectMax();
-                    // Expand row height for two lines: name + description.
-                    (void)rmin; (void)rmax;
-                }
-                ImGui::SameLine(0, 0);
-                ImGui::BeginGroup();
-                ImGui::TextUnformatted(sk.name.c_str());
-                ImGui::SameLine();
-                {
-                    const char* chip = sk.source.c_str();
-                    ImU32 chipCol = ui::Palette::toU32(ui::palette.textDim);
-                    if (sk.source == "user")
-                        chipCol = ui::Palette::toU32(ui::palette.accent);
-                    else if (sk.source == "project")
-                        chipCol = ui::Palette::toU32(ui::palette.statusOk);
-                    ImGui::PushStyleColor(ImGuiCol_Text, chipCol);
-                    ImGui::Text("[%s]", chip);
-                    ImGui::PopStyleColor();
-                }
-                if (!sk.description.empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                               ui::palette.textDim[2], 1));
-                    ImGui::TextWrapped("%s", sk.description.c_str());
-                    ImGui::PopStyleColor();
-                }
-                ImGui::EndGroup();
-                // Make the group also selectable.
-                if (ImGui::IsItemClicked()) {
-                    s_ovSkills.creating = false;
-                    s_ovSkills.selected = sk.name;
-                    ovLoadSkillBody(st, sk.name);
+                if (sel) ImGui::SetItemDefaultFocus();
+
+                const ImVec2 rowMax = ImGui::GetItemRectMax();
+                const float textW = ImMax(40.0f * S, rowMax.x - textPos.x - 6.0f * S);
+                const std::string description = sk.description.empty()
+                    ? "No description provided."
+                    : ui::foldToAtlasGlyphs(sk.description);
+                const std::string descriptionFit = ellipsizeToFit(description, textW);
+                std::string source = sk.source.empty() ? "builtin" : sk.source;
+                std::string injection = sk.inject.empty() ? "manual" : sk.inject;
+                const std::string metadata = ellipsizeToFit(ui::foldToAtlasGlyphs(
+                    source + "  \xc2\xb7  " + injection + " injection"), textW);
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddText(ImVec2(textPos.x, textPos.y + lineH + 2.0f * S),
+                            ui::Palette::toU32(ui::palette.textDim),
+                            descriptionFit.c_str());
+                const float* metaColor = sk.source == "user"
+                    ? ui::palette.accent
+                    : (sk.source == "project" ? ui::palette.statusOk : ui::palette.textDim);
+                dl->AddText(ImVec2(textPos.x, textPos.y + lineH * 2.0f + 4.0f * S),
+                            ui::Palette::toU32(metaColor), metadata.c_str());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s\n%s\nSource: %s\nInjection: %s",
+                                      ui::foldToAtlasGlyphs(sk.name).c_str(),
+                                      description.c_str(), source.c_str(), injection.c_str());
                 }
                 ImGui::PopID();
                 ImGui::Dummy(ImVec2(0, 2.0f * S));
@@ -4661,7 +4659,7 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
     ui::InterwebzGroupEnd();
 
     ui::InterwebzTwoColumnNext();
-    if (ui::InterwebzGroupBegin("##set_skill_ed", "Editor", ImVec2(0, colH))) {
+    if (ui::InterwebzGroupBegin("##set_skill_ed", "Skill editor", ImVec2(0, colH))) {
         if (s_ovSkills.creating) {
             ImGui::TextUnformatted("Name");
             ImGui::SetNextItemWidth(-1);
@@ -4678,12 +4676,19 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
             ImGui::TextWrapped("Select a skill to edit, or New skill.");
             ImGui::PopStyleColor();
         } else {
-            ui::InterwebzKeyValueRow("Skill", s_ovSkills.selected.c_str());
-            // Source chip for selected.
-            const char* src = "builtin";
+            const OvSkillRow* selectedSkill = nullptr;
             for (const auto& sk : s_ovSkills.skills)
-                if (sk.name == s_ovSkills.selected) { src = sk.source.c_str(); break; }
-            ui::InterwebzKeyValueRow("Source", src);
+                if (sk.name == s_ovSkills.selected) { selectedSkill = &sk; break; }
+            ui::InterwebzKeyValueRow("Skill", s_ovSkills.selected.c_str());
+            ui::InterwebzKeyValueRow(
+                "Source", selectedSkill && !selectedSkill->source.empty()
+                    ? selectedSkill->source.c_str() : "builtin");
+            ui::InterwebzKeyValueRow(
+                "Injection", selectedSkill && !selectedSkill->inject.empty()
+                    ? selectedSkill->inject.c_str() : "manual");
+            ui::InterwebzKeyValueRow(
+                "Status", s_ovSkills.bodyInFlight
+                    ? "Loading" : (s_ovSkills.bodyDirty ? "Unsaved changes" : "Saved"));
         }
 
         if (s_ovSkills.creating || !s_ovSkills.selected.empty()) {
@@ -4829,6 +4834,20 @@ static void drawSettingsContextTab(AppState& st, float S) {
     const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - titleBudget);
     ui::InterwebzTwoColumnBegin(10.0f);
     if (ui::InterwebzGroupBegin("##set_trig_list", "Rules", ImVec2(0, colH))) {
+        int enabledRules = 0;
+        int customRules = 0;
+        for (const auto& tr : s_ovTrig.rows) {
+            if (tr.enabled) ++enabledRules;
+            if (tr.source == "override" || tr.source == "user") ++customRules;
+        }
+        std::string rulesMeta = std::to_string(s_ovTrig.rows.size()) + " available  \xc2\xb7  "
+                              + std::to_string(enabledRules) + " enabled";
+        if (customRules > 0)
+            rulesMeta += "  \xc2\xb7  " + std::to_string(customRules) + " customized";
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+        ImGui::TextUnformatted(rulesMeta.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 2.0f * S));
         const float gap = 6.0f * S;
         const float halfW = ImMax(60.0f * S,
                                   (ImGui::GetContentRegionAvail().x - gap) * 0.5f);
@@ -4873,93 +4892,63 @@ static void drawSettingsContextTab(AppState& st, float S) {
             s_rulesAuthorOpen = true;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Guided authoring for rules, skills and context injections.");
-        ImGui::Dummy(ImVec2(0, 4.0f * S));
+        ImGui::Separator();
 
         if (!s_ovTrig.loaded && s_ovTrig.listInFlight) {
             ImGui::TextUnformatted("Loading rules\xe2\x80\xa6");
         } else if (s_ovTrig.rows.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, dimCol);
-            ImGui::TextWrapped("No rules discovered.");
+            ImGui::TextWrapped("No rules found. Create one to inject guidance when work matches.");
             ImGui::PopStyleColor();
         } else {
+            const float lineH = ImGui::GetTextLineHeight();
+            const float rowH = lineH * 4.0f + 10.0f * S;
             for (size_t i = 0; i < s_ovTrig.rows.size(); ++i) {
                 const auto& tr = s_ovTrig.rows[i];
                 ImGui::PushID((int)i);
                 const bool sel = (!s_ovTrig.creating && s_ovTrig.selected == tr.id);
-                if (ImGui::Selectable("##trigrow", sel, 0, ImVec2(0, 0))) {
+                const ImVec2 textPos = ImGui::GetCursorScreenPos();
+                const std::string label = ovTriggerLabel(tr);
+                const std::string rowLabel = label + "##rule_catalog_row";
+                if (settingsFullRowSelectable(rowLabel.c_str(), sel, rowH)) {
                     s_ovTrig.creating = false;
                     s_ovTrig.selected = tr.id;
                     ovLoadTriggerBody(st, tr.id);
                 }
-                ImGui::SameLine(0, 0);
-                ImGui::BeginGroup();
-                // Primary text is the human label; the id moves to the meta line below, where it
-                // stays visible because /rule and every triggers_* RPC key on it.
-                const std::string label = ovTriggerLabel(tr);
-                ompStatusDotText(label.c_str(),
-                                 tr.enabled ? ui::palette.statusOk : ui::palette.textDim,
-                                 tr.enabled, ui::palette.text);
-                ImGui::SameLine();
-                {
-                    // builtin = shipped default, override = shipped rule the user edited,
-                    // user = rule the user created (RPC `source` field).
-                    const char* chip = tr.source.empty() ? "builtin" : tr.source.c_str();
-                    ImU32 chipCol = ui::Palette::toU32(ui::palette.textDim);
-                    if (tr.source == "user")
-                        chipCol = ui::Palette::toU32(ui::palette.accent);
-                    else if (tr.source == "override")
-                        chipCol = ui::Palette::toU32(ui::palette.statusOk);
-                    ImGui::PushStyleColor(ImGuiCol_Text, chipCol);
-                    ImGui::Text("[%s]", chip);
-                    ImGui::PopStyleColor();
-                }
+                if (sel) ImGui::SetItemDefaultFocus();
 
-                // Meta line: the id (the handle everything else keys on) plus the rate limits.
-                {
-                    std::string meta = ui::foldToAtlasGlyphs(tr.id);
-                    meta += "  \xc2\xb7  " + std::to_string(tr.budgetTokens) + " tok  \xc2\xb7  cd "
-                          + std::to_string(tr.cooldownTurns);
-                    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
-                    const std::string fit = ovFitText(
-                        meta, ImMax(40.0f * S, ImGui::GetContentRegionAvail().x));
-                    ImGui::PushStyleColor(ImGuiCol_Text, dimCol);
-                    ImGui::TextUnformatted(fit.c_str());
-                    ImGui::PopStyleColor();
-                    if (st.fonts.mono) ImGui::PopFont();
-                }
-
-                ImGui::PushStyleColor(ImGuiCol_Text, dimCol);
+                const ImVec2 rowMax = ImGui::GetItemRectMax();
+                const float textW = ImMax(40.0f * S, rowMax.x - textPos.x - 6.0f * S);
+                const std::string source = tr.source.empty() ? "builtin" : tr.source;
+                std::string meta = ui::foldToAtlasGlyphs(tr.id);
+                meta += tr.enabled ? "  \xc2\xb7  enabled" : "  \xc2\xb7  disabled";
+                meta += "  \xc2\xb7  " + source + "  \xc2\xb7  "
+                      + std::to_string(tr.budgetTokens) + " tok  \xc2\xb7  cd "
+                      + std::to_string(tr.cooldownTurns);
+                const std::string metaFit = ovFitText(meta, textW);
+                std::string purpose;
                 if (!tr.purpose.empty())
-                    ImGui::TextWrapped("%s", ui::foldToAtlasGlyphs(tr.purpose).c_str());
+                    purpose = ui::foldToAtlasGlyphs(tr.purpose);
                 else if (!tr.pack.empty())
-                    ImGui::TextWrapped("pack: %s", ui::foldToAtlasGlyphs(tr.pack).c_str());
-                ImGui::PopStyleColor();
-
-                // What actually fires the rule. Trimmed to the column, full text on hover.
-                {
-                    const bool never = tr.keywords.empty() && tr.tools.empty()
-                                       && tr.events.empty();
-                    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
-                    const std::string line = ovFitText(
-                        ovTriggerSummary(tr),
-                        ImMax(40.0f * S, ImGui::GetContentRegionAvail().x));
-                    ImGui::PushStyleColor(ImGuiCol_Text, never
-                        ? ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
-                                 ui::palette.statusWarn[2], 1)
-                        : ImVec4(ui::palette.text[0], ui::palette.text[1],
-                                 ui::palette.text[2], 1));
-                    ImGui::TextUnformatted(line.c_str());
-                    ImGui::PopStyleColor();
-                    if (st.fonts.mono) ImGui::PopFont();
-                }
-                ImGui::EndGroup();
+                    purpose = ui::foldToAtlasGlyphs("Injects pack " + tr.pack);
+                else
+                    purpose = "No purpose provided.";
+                const std::string purposeFit = ovFitText(purpose, textW);
+                const bool never = tr.keywords.empty() && tr.tools.empty() && tr.events.empty();
+                const std::string matchFit = ovFitText(ovTriggerSummary(tr), textW);
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddText(ImVec2(textPos.x, textPos.y + lineH + 2.0f * S),
+                            ui::Palette::toU32(tr.enabled
+                                ? ui::palette.textDim : ui::palette.statusWarn),
+                            metaFit.c_str());
+                dl->AddText(ImVec2(textPos.x, textPos.y + lineH * 2.0f + 4.0f * S),
+                            ui::Palette::toU32(ui::palette.textDim), purposeFit.c_str());
+                dl->AddText(ImVec2(textPos.x, textPos.y + lineH * 3.0f + 6.0f * S),
+                            ui::Palette::toU32(never
+                                ? ui::palette.statusWarn : ui::palette.text),
+                            matchFit.c_str());
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("%s", ovTriggerTooltip(tr).c_str());
-                if (ImGui::IsItemClicked()) {
-                    s_ovTrig.creating = false;
-                    s_ovTrig.selected = tr.id;
-                    ovLoadTriggerBody(st, tr.id);
-                }
                 ImGui::PopID();
                 ImGui::Dummy(ImVec2(0, 3.0f * S));
             }
@@ -4968,7 +4957,7 @@ static void drawSettingsContextTab(AppState& st, float S) {
     ui::InterwebzGroupEnd();
 
     ui::InterwebzTwoColumnNext();
-    if (ui::InterwebzGroupBegin("##set_trig_ed", "Editor", ImVec2(0, colH))) {
+    if (ui::InterwebzGroupBegin("##set_trig_ed", "Rule editor", ImVec2(0, colH))) {
         if (s_ovTrig.creating) {
             ImGui::TextUnformatted("Id");
             ImGui::SetNextItemWidth(-1);
@@ -5815,12 +5804,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                 const bool aiNarrow = ImGui::GetContentRegionAvail().x < 640.0f * sc;
                 if (aiNarrow) {
                     ImGui::SetNextItemWidth(-1);
-                    settingsBoundedCombo("##ai_sub_pick", &s_aiSubSel, kAiSubLabels, 8);
+                    settingsFullRowCombo("##ai_sub_pick", &s_aiSubSel, kAiSubLabels, 8);
                 } else {
-                    // Borderless nav rail: selection is a soft accent wash (not the design
-                    // system's glow-border, which reads as a boxed outline at this size) —
-                    // the Selectable's own Header colors are suppressed so only the wash and
-                    // the label paint. A hairline divider separates rail from content.
+                    // Borderless nav rail. The Selectable owns the complete row and resolves its
+                    // width from this child, so its selected/hover wash cannot enter the content
+                    // pane or stop short of the rail's usable edge.
                     const ImVec2 railMn = ImGui::GetCursorScreenPos();
                     const float railAvailH = ImGui::GetContentRegionAvail().y;
                     const float railW = 148.0f * sc;
@@ -5832,43 +5820,15 @@ void drawSettingsModal(AppState& st, bool busy) {
                                       ImGuiChildFlags_AlwaysUseWindowPadding,
                                       ImGuiWindowFlags_NoScrollbar |
                                           ImGuiWindowFlags_NoScrollWithMouse);
-                    const ImVec4 kTransparent(0, 0, 0, 0);
-                    ImGui::PushStyleColor(ImGuiCol_Header, kTransparent);
-                    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, kTransparent);
-                    ImGui::PushStyleColor(ImGuiCol_HeaderActive, kTransparent);
                     const float railRowH = ImGui::GetTextLineHeight() + 6.0f * sc;
                     for (int i = 0; i < 8; ++i) {
                         ImGui::PushID(i);
                         const bool selRow = (i == s_aiSubSel);
-                        const ImVec2 rmn = ImGui::GetCursorScreenPos();
-                        const ImVec2 rmx(rmn.x + ImGui::GetContentRegionAvail().x,
-                                         rmn.y + railRowH);
-                        const ImVec2 railSpacing = ImGui::GetStyle().ItemSpacing;
-                        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                                            ImVec2(0.0f, railSpacing.y));
-                        ImGui::PushClipRect(rmn, rmx, true);
-                        if (ImGui::Selectable("##ai_rail_row", selRow, ImGuiSelectableFlags_None,
-                                              ImVec2(rmx.x - rmn.x, railRowH)))
+                        if (settingsFullRowSelectable(kAiSubLabels[i], selRow, railRowH))
                             s_aiSubSel = i;
-                        const bool hovRow = ImGui::IsItemHovered();
-                        ImDrawList* rdl = ImGui::GetWindowDrawList();
-                        // Bare dp radius — coloredRowWash scales it internally.
-                        if (selRow)
-                            ui::coloredRowWash(rdl, rmn, rmx, 6.0f, ui::palette.accent,
-                                               0.30f, /*selected=*/false);
-                        else if (hovRow)
-                            ui::coloredRowWash(rdl, rmn, rmx, 6.0f, ui::palette.accent,
-                                               0.10f, /*selected=*/false);
-                        rdl->AddText(
-                            ImVec2(rmn.x + 8.0f * sc,
-                                   rmn.y + (railRowH - ImGui::GetFontSize()) * 0.5f),
-                            ui::Palette::toU32(selRow ? ui::palette.accent : ui::palette.text),
-                            kAiSubLabels[i]);
-                        ImGui::PopClipRect();
-                        ImGui::PopStyleVar();
+                        if (selRow) ImGui::SetItemDefaultFocus();
                         ImGui::PopID();
                     }
-                    ImGui::PopStyleColor(3);
                     ImGui::EndChild();
                     ImGui::PopStyleVar(2);  // ItemSpacing, WindowPadding
                     {
@@ -6009,8 +5969,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                             auto& pr = s_promptRecs[i];
                             std::string lbl = pr.role;
                             if (pr.overridden) lbl += " *";
-                            if (settingsBoundedSelectable(lbl.c_str(), sel))
+                            if (settingsFullRowSelectable(lbl.c_str(), sel))
                                 s_selectedRole = i;
+                            if (sel) ImGui::SetItemDefaultFocus();
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("%s%s", pr.role.c_str(),
                                                   pr.overridden ? " (overridden)" : "");
@@ -6019,8 +5980,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                         {
                             std::string syslbl = "system (override)";
                             if (st.spBuf[0] != 0) syslbl += " *";
-                            if (settingsBoundedSelectable(syslbl.c_str(), s_selectedRole >= sysIdx))
+                            if (settingsFullRowSelectable(syslbl.c_str(), s_selectedRole >= sysIdx))
                                 s_selectedRole = sysIdx;
+                            if (s_selectedRole >= sysIdx) ImGui::SetItemDefaultFocus();
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("Override the agent system prompt (advanced)");
                         }

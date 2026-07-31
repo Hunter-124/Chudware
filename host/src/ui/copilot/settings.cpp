@@ -1088,16 +1088,26 @@ void drawAISettingsBody(AppState& st, bool busy) {
         cpMenuLabel(label);
         ImGui::SetNextItemWidth(-1);
         pushField();
-        // BeginCombo rather than Combo so the popup rows can carry their own ink (see popBg).
+        // Explicit popup-row geometry keeps the header wash on the row's full usable width.
+        // Selectable normally expands its paint by half ItemSpacing; zero only the horizontal
+        // component so the wash reaches (but never crosses) both popup content edges while the
+        // normal vertical spacing continues to define the option-row height.
         if (ImGui::BeginCombo(id, kPrefLabels[v])) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::maxContrastTextOn(popBg));
+            const ImVec2 optionSpacing = ImGui::GetStyle().ItemSpacing;
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, optionSpacing.y));
             for (int i = 0; i < 4; ++i) {
-                if (ImGui::Selectable(kPrefLabels[i], i == v)) {
+                const bool selected = (i == v);
+                const float optionRowW = ImGui::GetContentRegionAvail().x;
+                if (ImGui::Selectable(kPrefLabels[i], selected, ImGuiSelectableFlags_None,
+                                      ImVec2(optionRowW, 0.0f))) {
                     *pref = i;
                     if (pref == &s.planPreference) s.planMode = (i != 0);
                     changed = true;
                 }
+                if (selected) ImGui::SetItemDefaultFocus();
             }
+            ImGui::PopStyleVar();
             ImGui::PopStyleColor();
             ImGui::EndCombo();
         }

@@ -1371,12 +1371,6 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         ImGui::TextWrapped("Identical call repeated — the harness skipped it and asked the model "
                            "to try another approach. The tool never ran.");
         ImGui::PopStyleColor();
-    } else if (hardFail && !errBody.empty() && (simple || openE <= 0.0f)) {
-        // Keep a one-line cause visible even when collapsed (same calm tone as drawAgentStep).
-        // In simplified mode this IS the failure presentation — there is no drawer behind it.
-        ImGui::PushStyleColor(ImGuiCol_Text, failTone);
-        ImGui::TextWrapped("%s", errSummary(errBody).c_str());
-        ImGui::PopStyleColor();
     }
     if (simple) {
         // No drawer, but a render the agent looked at must still reach the user.

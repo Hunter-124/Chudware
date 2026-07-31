@@ -20,7 +20,7 @@ triggers:
         - "\\btap\\b"
         - "\\bthread\\b"
         - "\\bthreaded\\b"
-        - "M\\d+(?:\\.\\d+)?(?:[xX×]\\d+(?:\\.\\d+)?)?"
+        - "\\bM\\d+(?:\\.\\d+)?(?:[xX×]\\d+(?:\\.\\d+)?)?\\b"
         - "\\bUNC\\b"
         - "\\bUNF\\b"
         - "\\bpilot hole\\b"
@@ -66,15 +66,11 @@ triggers:
   - id: press_fit_mention
     match:
       keywords:
-        - "\\bpress fit\\b"
-        - "\\bpress.fit\\b"
+        - "\\bpress[ -]?fit\\b"
         - "\\binterference fit\\b"
         - "\\bknurled\\b"
         - "\\bpressed in\\b"
         - "\\bforced fit\\b"
-        - "\\bp6\\b"
-        - "\\bs6\\b"
-        - "\\br6\\b"
       tools: []
       events: []
     inject:
@@ -92,14 +88,10 @@ triggers:
   - id: snap_fit_mention
     match:
       keywords:
-        - "\\bsnap fit\\b"
-        - "\\bsnap.fit\\b"
-        - "\\bcantilever hook\\b"
-        - "\\blatch\\b"
-        - "\\bdetent\\b"
+        - "\\bsnap[ -]?fit\\b"
+        - "\\bcantilever (?:hook|latch)\\b"
         - "\\bsnap hook\\b"
         - "\\bsnap arm\\b"
-        - "\\bclip\\b"
       tools: []
       events: []
     inject:
@@ -115,7 +107,6 @@ triggers:
         - "\\bthin wall\\b"
         - "\\bthin-wall\\b"
         - "\\bwall thickness\\b"
-        - "\\bshell\\b"
         - "\\bminimum wall\\b"
       tools:
         - wall_thickness
@@ -167,7 +158,6 @@ triggers:
         - "\\bbr(?:ass|onze)\\b"
         - "\\bcast iron\\b"
         - "\\bpolycarbonate\\b"
-        - "\\bPC\\b"
         - "\\bnylon\\b"
       tools:
         - set_material
@@ -184,14 +174,12 @@ triggers:
     match:
       keywords:
         - "\\btolerance\\b"
-        - "\\bfit\\b"
         - "\\bH7\\b"
         - "\\bg6\\b"
         - "\\bf7\\b"
         - "\\bk6\\b"
         - "\\bp6\\b"
         - "\\bISO 286\\b"
-        - "\\bclearance\\b"
         - "\\bsliding fit\\b"
         - "\\brunning fit\\b"
       tools:
@@ -213,15 +201,13 @@ triggers:
   - id: thread_engagement
     match:
       keywords:
-        - "\\bengagement\\b"
-        - "\\bthread length\\b"
-        - "\\bstud\\b"
         - "\\bthread engagement\\b"
-        - "\\bthrough-hole\\b"
-        - "\\bblind hole\\b"
-        - "\\bboss\\b"
+        - "\\bthread length\\b"
+        - "\\bthrough[ -]hole\\b"
+        - "\\bblind[ -]hole\\b"
       tools:
         - research_thread_spec
+        - tap_drill
       events: []
     inject:
       context_pack: thread_engagement
@@ -237,13 +223,10 @@ triggers:
   - id: interference_pre_op
     match:
       keywords:
-        - "\\bplace\\b"
         - "\\bassemble\\b"
-        - "\\bmount\\b"
-        - "\\bmate\\b"
         - "\\bcheck interference\\b"
-        - "\\bclearance\\b"
         - "\\boverlap\\b"
+        - "\\b(?:place|mount|mate)\\b(?:\\s+\\w+){0,3}\\s+\\b(?:part|component|body|board|assembly)\\b"
       tools:
         - part_place
         - solve_mates
@@ -260,15 +243,12 @@ triggers:
   - id: dfm_pre_op
     match:
       keywords:
-        - "\\bmanufactur\\b"
-        - "\\bmachine\\b"
-        - "\\bprint\\b"
-        - "\\bmold\\b"
-        - "\\bprocess\\b"
+        - "\\bmanufactur(?:e|ed|ing|ability|able)\\b"
         - "\\bDFM\\b"
-        - "\\bdesign for\\b"
-        - "\\bwall\\b"
-        - "\\bdraft\\b"
+        - "\\bdesign for manufacturability\\b"
+        - "\\b3D print(?:er|ing|ed)?\\b"
+        - "\\bCNC machin(?:e|ed|ing)\\b"
+        - "\\binjection mold(?:ed|ing)?\\b"
       tools:
         - set_process
         - dfm_check
@@ -285,15 +265,12 @@ triggers:
   - id: interface_check_pre_op
     match:
       keywords:
-        - "\\binterface\\b"
-        - "\\balign\\b"
         - "\\bhole pattern\\b"
         - "\\bbolt holes\\b"
         - "\\bcoaxial\\b"
-        - "\\bcontact face\\b"
-        - "\\bfastener\\b"
-        - "\\bregister\\b"
-        - "\\bpass.through\\b"
+        - "\\bcontact (?:face|plane)\\b"
+        - "\\bpass[ -]through\\b"
+        - "\\b(?:align|mate)\\b(?:\\s+\\w+){0,3}\\s+\\b(?:part|component|face|axis|pattern)\\b"
       tools:
         - interface_check
         - part_place
@@ -316,12 +293,10 @@ triggers:
         - "\\bbend deduction\\b"
         - "\\bsheet metal\\b"
         - "\\bsheet-metal\\b"
-        - "\\bflange\\b"
         - "\\bflat pattern\\b"
-        - "\\bK.factor\\b"
+        - "\\bK[ -]?factor\\b"
         - "\\bbend radius\\b"
         - "\\bpress brake\\b"
-        - "\\bformed\\b"
       tools:
         - bend_allowance
       events: []
@@ -343,14 +318,12 @@ triggers:
   - id: molded_draft
     match:
       keywords:
-        - "\\bdraft\\b"
         - "\\bdraft angle\\b"
         - "\\bmolded\\b"
         - "\\bmoulded\\b"
         - "\\binjection mold\\b"
         - "\\binjection mould\\b"
         - "\\brelease angle\\b"
-        - "\\bcavity\\b"
         - "\\bcore pull\\b"
       tools:
         - draft_analysis
@@ -386,6 +359,7 @@ triggers:
         - add_gdt
         - add_surface_finish
         - export_drawing
+        - set_titleblock
       events: []
     inject:
       context_pack: drawing_standards
@@ -399,14 +373,14 @@ triggers:
       keywords:
         - "\\bFEA\\b"
         - "\\bCFD\\b"
-        - "\\bstress\\b"
+        - "\\bstress (?:analysis|simulation|study)\\b"
         - "\\bmodal\\b"
         - "\\bthermal\\b"
         - "\\bbuckling\\b"
         - "\\bfatigue\\b"
         - "flow simulation"
         - "motion study"
-        - "\\bmesh\\b"
+        - "\\b(?:simulation )?mesh quality\\b"
       tools:
         - run_fea_static
         - run_fea_modal
@@ -417,6 +391,7 @@ triggers:
         - run_cfd_flow
         - run_cfd_accurate
         - simulate_motion
+        - describe_results
       events: []
     inject:
       context_pack: sim_setup
@@ -430,12 +405,12 @@ triggers:
       keywords:
         - "\\bschematic\\b"
         - "\\bPCB\\b"
-        - "\\bnet\\b"
+        - "\\bnetlist\\b"
         - "\\bfootprint\\b"
         - "\\bimpedance\\b"
         - "\\bERC\\b"
         - "\\bDRC\\b"
-        - "\\bautorout"
+        - "\\bautorout(?:e|er|ing)\\b"
         - "\\bnet class\\b"
         - "\\bsilkscreen\\b"
       tools:
@@ -449,6 +424,9 @@ triggers:
         - ecad_set_net_class
         - ecad_run_erc
         - ecad_run_drc
+        - ecad_add_power
+        - board_from_schematic
+        - ecad_simulate
       events: []
     inject:
       context_pack: ecad_design
@@ -460,13 +438,12 @@ triggers:
   - id: cam_setup
     match:
       keywords:
-        - "\\bmachin"
+        - "\\bmachin(?:e|ed|ing)\\b"
         - "\\btoolpath\\b"
         - "feeds and speeds"
-        - "\\bstock\\b"
-        - "\\bsetup\\b"
-        - "\\bpost.?process"
-        - "\\bg.?code\\b"
+        - "\\bCAM (?:stock|setup|job)\\b"
+        - "\\bpost[ -]?process(?:or|ing)?\\b"
+        - "\\bg[ -]?code\\b"
         - "\\bstepover\\b"
         - "\\bstepdown\\b"
       tools:
@@ -478,6 +455,9 @@ triggers:
         - cam_simulate
         - cam_post
         - cam_set_stock
+        - cam_setup_sheet
+        - cam_materials
+        - cam_op_types
       events: []
     inject:
       context_pack: cam_setup
@@ -489,12 +469,10 @@ triggers:
   - id: part_sourcing
     match:
       keywords:
-        - "\\bvendor\\b"
         - "\\bsupplier\\b"
         - "\\bpurchase\\b"
-        - "\\bbuy\\b"
-        - "\\bquote\\b"
-        - "lead time"
+        - "\\blead time\\b"
+        - "\\brequest (?:a )?quote\\b"
         - "\\bBOM\\b.*\\bcost|cost.*\\bBOM\\b"
         - "\\bsource\\b.*\\bpart|part.*\\bsource\\b"
       tools:
@@ -506,6 +484,8 @@ triggers:
         - bom_rollup
         - request_quote
         - match_part_number
+        - parts_taxonomy
+        - vendors_health
       events: []
     inject:
       context_pack: sourcing
@@ -566,7 +546,7 @@ triggers:
         - "\\bcheckpoint\\b"
         - "\\brelease\\b"
         - "\\brevision\\b"
-        - "where.used"
+        - "\\bwhere[ -]used\\b"
         - "\\brollback\\b"
         - "\\bchange order\\b"
         - "\\bitem master\\b"
@@ -581,6 +561,8 @@ triggers:
         - plm_compare
         - plm_where_used
         - plm_rollback
+        - plm_status
+        - plm_set_ai_mode
       events: []
     inject:
       context_pack: plm_flow

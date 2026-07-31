@@ -1,0 +1,22 @@
+schema: aicad.recipe/1
+id: assembly_fit_check
+title: Assemble and verify mating parts
+domains: [assembly, cad]
+keywords: [assembly, mate, fit together, interference, interface check, component]
+summary: Add components, solve explicit mates, then verify interference and functional interfaces.
+steps:
+  - tool: new_assembly
+    note: Create the target assembly document.
+  - tool: asm_add_component
+    note: Add verified component documents without remodeling catalog parts.
+  - tool: asm_mate
+    note: Apply only the mates needed to express design intent.
+  - tool: solve_mates
+    note: Resolve the mate system and diagnose conflicts before adding more mates.
+  - tool: check_interference
+    note: Treat measured solid overlap as a blocker unless intentionally modeled.
+  - tool: interface_check
+    note: Verify axes, patterns, and contact planes that interference alone cannot prove.
+verify:
+  - mate solve succeeds without conflicting constraints
+  - interference and interface checks pass or report named exceptions

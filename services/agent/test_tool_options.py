@@ -261,6 +261,33 @@ class TestDesignRecipe(unittest.TestCase):
         top = hit["recipes"][0]
         self.assertTrue(top.get("steps"))
 
+    def test_recipe_metadata_and_live_tool_spellings(self):
+        from services.agent.design_recipe import design_recipe
+
+        pcb = next(r for r in design_recipe("PCB from schematic", 20)["recipes"]
+                   if r["id"] == "pcb_from_schematic")
+        self.assertEqual(pcb["schema"], "aicad.recipe/1")
+        self.assertIn("ecad", pcb["domains"])
+        tools = [step["tool"] for step in pcb["steps"]]
+        self.assertIn("ecad_place_symbol", tools)
+        self.assertIn("ecad_run_drc", tools)
+        self.assertFalse({"place_symbol", "wire", "run_erc", "autoroute", "run_drc"} & set(tools))
+
+        sheet = next(r for r in design_recipe("sheet metal box", 20)["recipes"]
+                     if r["id"] == "sheet_metal_box")
+        self.assertNotIn("bend_allowance", [step["tool"] for step in sheet["steps"]])
+
+    def test_malformed_recipe_is_rejected(self):
+        from services.agent.design_recipe import _validate_recipe
+
+        self.assertIsNone(_validate_recipe(
+            {"schema": "aicad.recipe/1", "id": "bad", "title": "Bad",
+             "summary": "Missing steps"}, fallback_id="bad"))
+        self.assertIsNone(_validate_recipe(
+            {"schema": "wrong/1", "id": "bad", "title": "Bad",
+             "summary": "Wrong schema", "steps": [{"tool": "x"}]},
+            fallback_id="bad"))
+
 
 class TestHints(unittest.TestCase):
     def test_hint_for_known(self):

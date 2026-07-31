@@ -3,9 +3,9 @@ name: assess-model-state
 description: Read-only health check of the open model — describe, measure, overlap, interference, interface_check, verify_battery — before editing or declaring done.
 inject: auto
 triggers:
-  keywords: [assess, health check, sanity check, what is wrong, what's wrong, whats wrong, model state, state of, status of, inspect the, review the part, check the part, check the model, check the assembly, verify the, for problems, any problems, any errors]
+  keywords: [model health check, geometry sanity check, state of this model, what is wrong with the model, what's wrong with the model, inspect the part, inspect the assembly, review the part, check the part, check the model, check the assembly, verify the geometry, model problems, geometry errors]
   tools: [describe_part, describe_assembly, measure_part, verify_battery, check_feature_overlap, check_interference, interface_check]
-  phases: [part_verify, deliver]
+  phases: [part_verify]
 ---
 
 # Assess Model State

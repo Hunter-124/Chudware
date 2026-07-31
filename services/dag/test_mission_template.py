@@ -64,3 +64,29 @@ class TestTierPlumbing:
         assert build_node["inputs"].get("deliverable") == "d1"
         assert build_node["inputs"].get("role") == "feature_modeler"
         assert build_node["inputs"].get("tier") == "local-24k"
+
+
+def _manifest_for(kind: str, name: str) -> dict:
+    return {
+        "request_verbatim": f"Create {name}.",
+        "ambiguities": [],
+        "deliverables": [{
+            "id": "d1", "name": name, "kind": kind,
+            "description": name, "acceptance_criteria": [],
+        }],
+    }
+
+
+def test_drawing_gets_specialist_build_and_reviewer_delivery():
+    graph = build_mission_graph(_manifest_for("drawing", "Dimensioned drawing"))
+    roles = {node["id"]: node["inputs"].get("role") for node in graph["nodes"]}
+    assert roles["n_build_d1"] == "drawing_detailer"
+    assert roles["n_verify_d1"] == "reviewer"
+    assert roles["n_deliver_d1"] == "reviewer"
+
+
+def test_ecad_analysis_does_not_fall_back_to_sim_engineer_for_delivery():
+    graph = build_mission_graph(_manifest_for("analysis", "PCB schematic and board"))
+    roles = {node["id"]: node["inputs"].get("role") for node in graph["nodes"]}
+    assert roles["n_build_d1"] == "ecad_engineer"
+    assert roles["n_deliver_d1"] == "reviewer"

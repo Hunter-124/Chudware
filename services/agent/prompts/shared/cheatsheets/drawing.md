@@ -23,34 +23,30 @@ THE REVIEW LOOP (this is how you get a PROFESSIONAL sheet): after make_drawing,
   3. fix with the granular ops below (read coordinates off the rendered sheet - they are SHEET millimetres),
   4. render again. Repeat until it reads like a real drawing.
 
-GRANULAR ops (worker RPCs on the drawing doc id returned by drawing_make):
-- drawing_add_view {doc_id, type:"base|projected|iso", orientation, position:[x,y]}
-- drawing_set_view {doc_id, view_id, position:[x,y], scale}   -> MOVE / RESCALE a view (spread overlaps; scale 1.0=1:1, 0.5=1:2, 2.0=2:1)
-- drawing_remove_view {doc_id, view_id}
-- drawing_add_section {doc_id, parent_view_id, cut_line:[[x,y],[x,y],...], opts:{mode:"full|half", reverse:false}}  -- cut_line may be multi-point (offset/jogged section)
-- drawing_add_detail {doc_id, parent_view_id, center:[x,y], radius}
-- drawing_model_items {doc_id, view_id}                      -> auto-dimension one view
-- drawing_add_callout {doc_id, view_id, kind:"hole", a:[x,y]} -> snap a circle, "(diameter)d" callout
-- drawing_add_dim {doc_id, view_id, type:"linear_dim|aligned_dim|radial_dim|diameter_dim|angular_dim", a:[x,y], b:[x,y], pos:[x,y]}
-- drawing_set_annotation {doc_id, view_id, ann_id, tol_type:"symmetric|deviation|limit|basic", tol_upper, tol_lower, prefix, suffix, precision, critical:true}
-- drawing_set_titleblock {doc_id, sheet_id:"s1", fields:{...}}
-- export_drawing {doc_id, path, format:"dxf|pdf"}
+GRANULAR TOOLS (use the drawing `doc_id` returned by `make_drawing`):
+- `add_drawing_view {doc_id, orientation, view_type, x, y}`
+- `set_view {doc_id, view_id, x?, y?, scale?}` — move or rescale a view.
+- `add_section_view {doc_id, parent, axis, mode, reverse?, label?}`
+- `add_detail_view {doc_id, parent_view_id, cx, cy, radius}`
+- `add_dimension {doc_id, view_id, dtype, a, b?, pos?}` — `a`/`b` may be sheet points or model feature ids.
+- `set_titleblock {doc_id, fields:{title, drawn_by, date, material, finish, scale, rev, sheet, part_number, company}}`
+- `export_drawing {doc_id, path, fmt:"dxf|pdf"}`
 
-GD&T (ASME Y14.5) - vector symbols rendered identically on screen, in the PNG, and in the DXF/PDF:
-- drawing_add_gdt {doc_id, view_id, spec:{symbol, tol_value, tol_diameter:bool, tol_modifier:"none|mmc|lmc|projected", datums:[{ref:"A",modifier:"none|mmc|lmc"}], a:[x,y] (feature point), pos:[x,y] (frame location)}}
-    symbol = position|flatness|perpendicularity|parallelism|angularity|concentricity|symmetry|profile_surface|profile_line|circularity|cylindricity|straightness|circular_runout|total_runout
-- drawing_add_datum {doc_id, view_id, spec:{label:"A", a:[x,y], pos:[x,y]}}                 -> datum feature (triangle + boxed letter)
-- drawing_add_datum_target {doc_id, view_id, spec:{label:"A1", target_type:"point|line|area", size, a, pos}}
-- drawing_add_surface_finish {doc_id, view_id, spec:{value:"1.6", machining:"any|required|prohibited", all_around:bool, a, pos}}
-- drawing_add_weld {doc_id, view_id, spec:{weld_type:"fillet|square|vee|bevel|plug", size:"6", other_side:bool, all_around:bool, a, pos}}
+GD&T (ASME Y14.5):
+- `add_gdt {doc_id, view_id, symbol, tolerance, a, pos, datums?, diameter?, modifier?}`
+  where `symbol` is position|flatness|perpendicularity|parallelism|angularity|concentricity|
+  symmetry|profile_surface|profile_line|circularity|cylindricity|straightness|
+  circular_runout|total_runout.
+- `add_datum {doc_id, view_id, label, a, pos}`
+- `add_surface_finish {doc_id, view_id, ra, a, pos, machining?, all_around?}`
 
 Example - 3-view + iso, auto-dimensioned, a half section, a position callout to datum A:
-{"action":"make_drawing","spec":{"views":["front","top","right","iso"],"model_items":true,"hole_callouts":true,"sections":[{"parent":"top","axis":"horizontal","mode":"half"}],"title":{"title":"PLATE","material":"AL 6061","scale":"1:1","rev":"A"}}}
-(then) drawing_add_datum {view_id, spec:{label:"A", a:[..], pos:[..]}}
-(then) drawing_add_gdt {view_id, spec:{symbol:"position", tol_value:"0.1", tol_diameter:true, tol_modifier:"mmc", datums:[{ref:"A"}], a:[..], pos:[..]}}
+`make_drawing {views:["front","top","right","iso"], model_items:true, hole_callouts:true, sections:[{parent:"top",axis:"horizontal",mode:"half"}], title:{title:"PLATE",material:"AL 6061",scale:"1:1",rev:"A"}}`
+(then) `add_datum {view_id, label:"A", a:[..], pos:[..]}`
+(then) `add_gdt {view_id, symbol:"position", tolerance:"0.1", diameter:true, modifier:"mmc", datums:["A"], a:[..], pos:[..]}`
 
 4 common mistakes:
 1. A drawing projects the CURRENT part - build/finish the 3D model first, THEN make_drawing.
 2. Coordinates a/b/pos/center/cut_line are SHEET millimetres (the projected page) - read them off review_drawing, do NOT use model coordinates.
-3. Mark a critical size with drawing_set_annotation {critical:true, tol_type:"symmetric", tol_upper:0.1} - do NOT bake the tolerance into the dim text. For geometric control (position/flatness/...) use drawing_add_gdt, not a note.
+3. Use `add_gdt` for geometric controls; do not invent unsupported annotation-edit or weld-symbol tools.
 4. Don't ship the first pass - ALWAYS review_drawing and fix overlaps / missing dims before export_drawing.

@@ -3,9 +3,9 @@ name: reverse-engineer
 description: Rebuild an existing solid/mesh into editable parametric features, or drive a camera capture session from a physical part to dimensionally-correct CAD.
 inject: auto
 triggers:
-  keywords: [reverse engineer, reverse-engineer, scan, mesh, point cloud, photogrammetry, STEP import, webcam, caliper, calipers, replacement part, 3d print, scan to cad]
+  keywords: [reverse engineer, reverse-engineer, scan this part, scan the part, scan to cad, point cloud, photogrammetry, STEP import, webcam capture, caliper measurement, calipers, replacement part]
   tools: [reverse_engineer, compare_parts, measure_from_photo, convert_face_to_sketch, import_part, reveng_status, reveng_start_session, reveng_add_images, reveng_reconstruct, reveng_set_scale, reveng_fit_primitives, reveng_build_parametric, reveng_attach_result, get_reveng_deviation]
-  phases: [geometry, feature]
+  phases: [geometry]
 ---
 
 # Reverse Engineer

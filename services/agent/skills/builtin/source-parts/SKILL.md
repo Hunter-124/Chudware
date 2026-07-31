@@ -5,7 +5,7 @@ inject: auto
 triggers:
   keywords: [fastener, screw, bolt, bearing, purchase, catalog, off the shelf, standard part, McMaster, MISUMI, source a, source an, source the, nema, stepper, nut, washer, standoff, dowel pin, o-ring]
   tools: [part_search, part_place, part_source, parts_taxonomy, bom_rollup]
-  phases: [feature, assembly, layout]
+  phases: []
 ---
 
 # Source Parts

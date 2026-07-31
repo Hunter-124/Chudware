@@ -29,13 +29,9 @@ def _load_recipes(force: bool = False) -> list[dict[str, Any]]:
                 data = yaml.safe_load(text) or {}
             except Exception:  # noqa: BLE001 — no PyYAML: minimal parse
                 data = _minimal_yaml(text)
-            if not isinstance(data, dict):
-                continue
-            rid = str(data.get("id") or path.stem).strip()
-            if not rid:
-                continue
-            data["id"] = rid
-            out.append(data)
+            recipe = _validate_recipe(data, fallback_id=path.stem)
+            if recipe is not None:
+                out.append(recipe)
     _CACHE = out
     return out
 
@@ -100,6 +96,43 @@ def _minimal_yaml(text: str) -> dict[str, Any]:
     return data
 
 
+def _validate_recipe(data: Any, *, fallback_id: str) -> dict[str, Any] | None:
+    """Return a normalized aicad.recipe/1 mapping, or skip malformed content."""
+    if not isinstance(data, dict) or data.get("schema") != "aicad.recipe/1":
+        return None
+    recipe = dict(data)
+    recipe["id"] = str(recipe.get("id") or fallback_id).strip()
+    if not recipe["id"] or not str(recipe.get("title") or "").strip():
+        return None
+    if not str(recipe.get("summary") or "").strip():
+        return None
+    for key in ("domains", "keywords", "verify"):
+        value = recipe.get(key)
+        if value is None:
+            recipe[key] = []
+        elif not isinstance(value, list):
+            return None
+        else:
+            recipe[key] = [str(item).strip() for item in value if str(item).strip()]
+    steps = recipe.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return None
+    normalized_steps: list[dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict) or not str(step.get("tool") or "").strip():
+            return None
+        params = step.get("params") or {}
+        if not isinstance(params, dict):
+            return None
+        normalized_steps.append({
+            "tool": str(step["tool"]).strip(),
+            "params": dict(params),
+            "note": str(step.get("note") or "").strip(),
+        })
+    recipe["steps"] = normalized_steps
+    return recipe
+
+
 def _score(query: str, recipe: dict[str, Any]) -> int:
     q = query.lower()
     if not q.strip():
@@ -142,6 +175,9 @@ def design_recipe(query: str = "", max_results: int = 3) -> dict[str, Any]:
                 "note": s.get("note") or "",
             })
         return {
+            "schema": r.get("schema"),
+            "domains": list(r.get("domains") or []),
+            "keywords": list(r.get("keywords") or []),
             "id": r.get("id"),
             "title": r.get("title") or r.get("id"),
             "summary": r.get("summary") or "",
@@ -154,6 +190,9 @@ def design_recipe(query: str = "", max_results: int = 3) -> dict[str, Any]:
             "ok": True,
             "recipes": [
                 {
+                    "schema": r.get("schema"),
+                    "domains": list(r.get("domains") or []),
+                    "keywords": list(r.get("keywords") or []),
                     "id": r.get("id"),
                     "title": r.get("title") or r.get("id"),
                     "summary": r.get("summary") or "",

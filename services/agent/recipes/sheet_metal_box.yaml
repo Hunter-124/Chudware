@@ -5,10 +5,10 @@ domains: [sheetmetal, cad]
 keywords: [sheet metal, base flange, edge flange, flat pattern, K-factor, bend]
 summary: Constant-thickness folded box via sm_* features.
 steps:
-  - tool: bend_allowance
-    note: K-factor / BA for thickness and radius.
+  - tool: new_part
+    note: Create the target part and record process, thickness, radius, and K-factor assumptions.
   - tool: add_features
-    note: sm_base_flange on closed sketch first.
+    note: Build sm_base_flange on a closed sketch first.
   - tool: query_geometry
     note: Resolve bend edges on thickness faces.
   - tool: add_features

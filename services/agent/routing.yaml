@@ -51,7 +51,6 @@ assignments:
   feature_architect:      [cheap_local, strong]   # T-DP2 design-pipeline Stage 1
   geometry_designer:      [cheap_local, strong]   # T-DP3 design-pipeline Stage 2
   linkage_planner:        [cheap_local, strong]   # T-DP4 design-pipeline Stage 3
-  assembler:              [cheap_local, strong]
   department_manager:     [strongest]
   # W17-added roles (additive):
   layout_engineer:        [cheap_local, strong]

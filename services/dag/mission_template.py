@@ -62,7 +62,7 @@ _BUILD_ROLE_BY_KIND = {
 _DELIVER_ROLE_BY_KIND = {
     "cam_program": "cam_programmer",
     "drawing": "reviewer",
-    "analysis": "sim_engineer",
+    "analysis": "reviewer",
     "report": "reviewer",
 }
 
@@ -85,7 +85,7 @@ _REPORT_TASK_CLASS = "simple_part"
 
 # Kinds that get a real BUILD + VERIFY node (not only SPECIFY → DELIVER leaf).
 _BUILDABLE_KINDS = frozenset({
-    "part", "assembly", "modification", "analysis",
+    "part", "assembly", "modification", "analysis", "drawing",
 })
 
 

@@ -3,9 +3,9 @@ name: cam-job
 description: Build a CAM job end-to-end — stock, setup, tools, ops, generate, simulate, then post only when clean.
 inject: auto
 triggers:
-  keywords: [machining, toolpath, stock, setup, g-code, gcode, feeds and speeds, CNC, mill]
+  keywords: [CAM job, CNC machining, machining toolpath, toolpath, g-code, gcode, feeds and speeds, milling operation, postprocessor]
   tools: [cam_new_job, cam_generate, cam_simulate, cam_post, cam_set_stock]
-  phases: [build, deliver]
+  phases: []
 ---
 
 # CAM Job

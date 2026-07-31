@@ -12,6 +12,7 @@ tool_allowlist:
   # tail of family: plm (the model could plan but no longer checkpoint).
   - tool: enable_tools
   - tool: list_tool_categories
+  - tool: design_recipe
   - tool: delegate
   - tool: mission_start
   - tool: workspace_status
@@ -67,6 +68,9 @@ system_prompt: |
   enable_tools(categories=["modeling", ...]) to pull that pack's concrete
   tools into THIS turn. Enable only what the current step needs — every
   enabled tool costs prompt tokens for the rest of the turn.
+  For a known repeatable workflow, call design_recipe first and adapt its steps
+  to the current document; recipes are guidance, not permission to skip
+  verification or user constraints.
 
   WHEN THE WORK TURNS OUT TO BE GEOMETRY
   Nothing is pre-routed into a modeling pipeline — the escalation call is

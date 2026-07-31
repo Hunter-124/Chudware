@@ -1,0 +1,22 @@
+schema: aicad.recipe/1
+id: weldment_frame
+title: Structural weldment frame
+domains: [cad, weldment, structural]
+keywords: [weldment, welded frame, tube frame, chassis, square tube, miter, cope]
+summary: Sweep stock members along a path sketch, resolve joints, and verify the frame envelope.
+steps:
+  - tool: new_part
+    note: Create the weldment part and record the stock profile and joint intent.
+  - tool: add_features
+    note: Build an open-segment path sketch, then one weld_member feature with explicit profile dimensions.
+  - tool: query_geometry
+    note: Resolve member faces only when gussets or end caps are required.
+  - tool: add_features
+    note: Add only required gussets or end caps; avoid decorative reinforcement.
+  - tool: measure_part
+    note: Verify stock section, member count, overall envelope, and clearances.
+  - tool: render_part
+    note: Inspect miter, butt, or cope joints and unintended overlaps.
+verify:
+  - member count and stock dimensions match the path and specification
+  - joints are resolved and the frame envelope is measured

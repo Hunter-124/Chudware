@@ -5920,3 +5920,17 @@ regressions add unambiguous `start`/`end` spline handles and spline region edges
 verbatim live-call replay, advertised-tool audit, focused Python/C++ regressions, and modeling battery
 52/52 PASS; historical ledger replay remains 57/190 honestly rejected calls (the repaired desktop
 payloads were not present in that corpus).
+
+## 2026-07-31 — Rules, skills, roles, and recipe quality sweep
+
+The shipped Rules catalog now gives every default a concise human label and purpose, expands
+`dfm_pre_op` to **Design for manufacturability pre-op**, caps the complete injected block (prefix,
+pack, and exemplar), fixes ISO-fit extraction, narrows high-noise natural-language triggers, and
+keeps the YAML/no-PyYAML mirror under full normalized parity tests. Domain guidance gained restrained
+DFM, surfacing, and weldment skills; broad phase triggers and the reverse-engineering `3d print`
+false positive were removed. Recipes now validate `aicad.recipe/1` metadata, expose domains and
+keywords, use live ECAD/sheet-metal tool names, and cover assembly, PLM release, surface-to-solid,
+and weldment flows. Role cleanup removes the nonexistent `vision` delegation and stale `assembler`
+assignment, makes drawings build through `drawing_detailer`, and prevents ECAD/firmware analysis
+delivery from falling into `sim_engineer`. Focused Rules/skills/roles/recipes/mission tests and the
+advertised-tool repository audit cover the new contracts.

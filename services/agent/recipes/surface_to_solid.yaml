@@ -1,0 +1,22 @@
+schema: aicad.recipe/1
+id: surface_to_solid
+title: Build and convert surface geometry
+domains: [cad, surfacing]
+keywords: [surface modeling, surface loft, boundary surface, knit, thicken, freeform shell]
+summary: Build explicit surface bodies, inspect continuity, then knit or thicken into a verified solid.
+steps:
+  - tool: new_part
+    note: Create the target part and preserve the intended open or solid result.
+  - tool: add_features
+    note: Build solved profiles and the simplest viable surf_* feature sequence.
+  - tool: query_geometry
+    note: Resolve body, edge, and face selectors before trim, knit, replace, or thicken operations.
+  - tool: add_features
+    note: Knit watertight panels or thicken a valid surface only when a solid is required.
+  - tool: measure_part
+    note: Confirm thickness, envelope, area, and nonzero volume when a solid was promised.
+  - tool: render_part
+    note: Inspect seams, trimming, and topology from useful views.
+verify:
+  - open surfaces remain intentional or the final body has nonzero volume
+  - measured wall and envelope match the design intent

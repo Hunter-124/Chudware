@@ -51,6 +51,8 @@ def test_shipped_routing_yaml_is_valid_and_covers_all_roles():
                 break
     missing = role_ids - set(data["assignments"])
     assert not missing, f"routing.yaml missing assignment rows for: {missing}"
+    extra = set(data["assignments"]) - role_ids - {"default"}
+    assert not extra, f"routing.yaml has assignments for unknown roles: {extra}"
     assert "default" in data["assignments"]
 
 

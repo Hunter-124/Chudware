@@ -1,13 +1,15 @@
-# DFM pre-op context pack (aicad.trigger/1 — T-DP6)
+# Design for manufacturability pre-op (aicad.trigger/1 — T-DP6)
 
-**When this fires:** the model mentions manufacturing, machining, printing, molding,
-or wall thickness — or calls `set_process`, `dfm_check`, `wall_thickness`.
+**When this fires:** manufacturing intent is explicit, or the model calls `set_process`,
+`resolve_process`, `dfm_check`, or `wall_thickness`.
 
 **Key facts:**
 - `dfm_check` runs `eval_thickness` + `eval_draft` against the bound ProcessProfile
   thresholds and returns `{dfm_pass, checks:[{check, value_mm, limit_mm, ok, note}]}`.
 - A **blocker** advisory fires when `dfm_pass=false`. The advisor names the offending
   check, the measured value, the process minimum, and the delta to fix.
+- Apply only checks relevant to the selected process. If the process is unknown and changes
+  the design decision, resolve it or ask; do not invent a process or block on irrelevant rules.
 - Process minimums (from ProcessProfile table — source: engine_oracle/dfm/):
   - FDM: min wall ~1.2 mm, no draft required
   - Injection molding: min wall ~1.0 mm, ≥1° draft required on vertical faces

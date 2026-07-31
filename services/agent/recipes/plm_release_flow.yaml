@@ -1,0 +1,22 @@
+schema: aicad.recipe/1
+id: plm_release_flow
+title: Checkpoint and release design work
+domains: [plm, project]
+keywords: [PLM, checkpoint, revision, release, where used, rollback]
+summary: Save source recipe state, inspect impact, checkpoint, then release with traceable evidence.
+steps:
+  - tool: plm_open
+    note: Open the project vault and identify the tracked source artifacts.
+  - tool: plm_status
+    note: Review modified, untracked, and unresolved items before recording history.
+  - tool: plm_where_used
+    note: Inspect downstream consumers before changing or releasing shared items.
+  - tool: plm_save
+    note: Save the editable source recipe and metadata; do not version derived solved state by default.
+  - tool: plm_checkpoint
+    note: Create a plain-language recovery point before release.
+  - tool: plm_release
+    note: Release only after required checks and dependencies are clear.
+verify:
+  - checkpoint identifies the source artifacts and design intent
+  - release has no unresolved where-used or validation blockers

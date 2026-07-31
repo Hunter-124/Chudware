@@ -681,3 +681,19 @@ class TestSketch2dModel3dRoles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_role_prompts_do_not_delegate_to_unknown_roles():
+    roles_dir = _REPO / "services" / "agent" / "roles"
+    known = {
+        line.split(":", 1)[1].strip()
+        for path in roles_dir.glob("*.yaml")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("id:")
+    }
+    referenced: set[str] = set()
+    for root in (roles_dir, _REPO / "services" / "agent" / "prompts"):
+        for path in root.glob("*.yaml" if root == roles_dir else "*.md"):
+            text = path.read_text(encoding="utf-8")
+            referenced.update(re.findall(r"delegate\(role=[\"']([^\"']+)", text))
+    assert referenced <= known, f"role prompts delegate to unknown roles: {referenced - known}"

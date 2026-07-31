@@ -7,17 +7,17 @@ summary: Schematic place/wire, ERC, board, route, DRC.
 steps:
   - tool: ecad_new_schematic
     note: New schematic doc.
-  - tool: place_symbol
-    note: Or ecad_place_symbol / ecad_find_part.
-  - tool: wire
-    note: Nets + power before SPICE.
-  - tool: run_erc
-    note: Fix all errors.
+  - tool: ecad_place_symbol
+    note: Place verified library symbols; use ecad_find_part when needed.
+  - tool: ecad_wire
+    note: Connect nets and power before simulation.
+  - tool: ecad_run_erc
+    note: Fix all schematic errors.
   - tool: board_from_schematic
-    note: Create PCB.
-  - tool: autoroute
-    note: Or manual route + fill_zones.
-  - tool: run_drc
-    note: Board sign-off.
+    note: Create the PCB from the clean schematic.
+  - tool: ecad_autoroute
+    note: Route, then fill zones or refine manually as needed.
+  - tool: ecad_run_drc
+    note: Fix all board-rule errors before sign-off.
 verify:
   - ERC and DRC clean or blocked with named failures

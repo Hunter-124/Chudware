@@ -3,9 +3,9 @@ name: make-drawing
 description: Produce 2D drawings with correct view order, measured dimensions, GD&T, title block, and export.
 inject: auto
 triggers:
-  keywords: [drawing, dimension, GD&T, title block, section view, detail view]
+  keywords: [2D drawing, engineering drawing, dimensioned drawing, GD&T, title block, section view, detail view, drawing sheet]
   tools: [make_drawing, add_dimension, add_drawing_view, export_drawing]
-  phases: [drawing, deliver]
+  phases: [drawing]
 ---
 
 # Make Drawing

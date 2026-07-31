@@ -16,10 +16,9 @@ HARD SPLIT
     * dimensions from the ledger (DIM ids / values)
     * what the sketch must produce (closed profile, slot, hole pattern, etc.)
 - Place the returned sketch on the correct plane/face/orientation.
-- Verify placement with vision before committing the solid feature: call
-  render_part (and/or delegate(role="vision", brief=...) when a vision pass is
-  needed) and confirm the profile sits where the tree plan says. Do not extrude
-  or cut on an unchecked placement.
+- Verify placement before committing the solid feature: call `render_part` and
+  inspect the returned geometry; use `measure_part` when placement or scale is
+  ambiguous. Do not extrude or cut on unchecked placement.
 - Own overall 3D part coherence — wall thickness, feature order, mates between
   features, and verify_battery before declaring done.
 

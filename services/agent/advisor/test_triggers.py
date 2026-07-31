@@ -405,7 +405,64 @@ def test_builtin_fallback_table_mirrors_the_yaml():
         f"only in yaml: {sorted(set(y) - set(b))}; "
         f"only in builtin: {sorted(set(b) - set(y))}")
     for tid in sorted(y):
-        for field in ("keywords", "tools"):
-            assert y[tid]["match"].get(field) == b[tid]["match"].get(field), (
-                f"{tid}.match.{field} drifted between triggers.yaml and "
-                f"_BUILTIN_TRIGGERS")
+        assert triggers._normalize_trigger(y[tid]) == triggers._normalize_trigger(b[tid]), (
+            f"{tid} drifted between triggers.yaml and _BUILTIN_TRIGGERS"
+        )
+
+
+def test_builtin_rules_have_concise_human_metadata():
+    rows = {row["id"]: row for row in triggers.list_triggers()
+            if row.get("source") == "builtin"}
+    assert rows
+    assert all(row["label"] and row["purpose"] for row in rows.values())
+    assert rows["dfm_pre_op"]["label"] == "Design for manufacturability pre-op"
+    assert all(len(row["label"]) <= 80 and len(row["purpose"]) <= 120
+               for row in rows.values())
+
+
+@pytest.mark.parametrize(("text", "unexpected"), [
+    ("print this text and process the data", "dfm_pre_op"),
+    ("the wall in the room needs paint", "dfm_pre_op"),
+    ("run the shell script", "thin_wall"),
+    ("align the text in the network interface", "interface_check_pre_op"),
+    ("review the email draft", "molded_draft"),
+    ("the job is stressful and the network mesh is down", "sim_setup"),
+    ("buy time and quote the paragraph", "part_sourcing"),
+    ("clip the file and release the latch", "snap_fit_mention"),
+])
+def test_generic_language_does_not_overtrigger_rules(text, unexpected):
+    assert unexpected not in _fired(text)
+
+
+@pytest.mark.parametrize("text", [
+    "design for manufacturability review before release",
+    "3D print the enclosure",
+    "CNC machine the bracket",
+    "check whether this part is manufacturable",
+])
+def test_dfm_rule_keeps_real_manufacturing_intent(text):
+    assert "dfm_pre_op" in _fired(text)
+
+
+def test_trigger_budget_caps_prefix_pack_and_exemplar():
+    items, events = triggers.match_triggers(
+        output_text="design for manufacturability review",
+        cooldown_state=_fresh_state(),
+    )
+    row = next(t for t in triggers.load_table() if t["id"] == "dfm_pre_op")
+    item = next(i for i in items if i["check"] == "context:dfm_pre_op")
+    event = next(e for e in events if e["trigger_id"] == "dfm_pre_op")
+    assert len(item["finding"]) <= row["budget_tokens"] * triggers._CHARS_PER_TOKEN
+    assert event["tokens"] <= row["budget_tokens"]
+
+
+@pytest.mark.parametrize(("text", "nominal"), [
+    ("H7/g6 Ø20", 20.0),
+    ("h7/g6 dia 20", 20.0),
+    ("H7/g6 20 mm", 20.0),
+])
+def test_iso_fit_extraction_prefers_fit_pair_and_common_nominals(text, nominal):
+    values = triggers._extract_inputs(
+        text, {"fit": "fit_designation", "nominal": "nominal_mm"})
+    assert values["fit"].lower() == "h7/g6"
+    assert values["nominal"] == nominal

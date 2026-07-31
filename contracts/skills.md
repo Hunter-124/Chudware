@@ -25,3 +25,4 @@ metadata always in context (~100 tokens/skill), full body injected on activation
 - Grounding rule: every builtin skill teaches verify-before-done (describe/measure/check_* after
   mutations) and single-source-of-truth sequencing (model the mating part FIRST, reference its
   dims — never parallel-guess mating interfaces).
+- Builtin domain extensions: surface-modeling, weldment-frame, design-for-manufacturability.

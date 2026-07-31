@@ -78,6 +78,7 @@ def test_discover_builtins_from_repo():
         "simulate", "assess-model-state", "source-parts", "ecad-board",
         "skill-creator",
         "make-drawing", "cam-job", "sheet-metal", "reverse-engineer", "plm-workflow",
+        "surface-modeling", "weldment-frame", "design-for-manufacturability",
     }
     assert expected <= names, f"missing builtins: {expected - names}"
     # skills_list shape
@@ -276,6 +277,7 @@ def test_skills_rpc_list_nine_builtins():
         "simulate", "assess-model-state", "source-parts", "ecad-board",
         "skill-creator",
         "make-drawing", "cam-job", "sheet-metal", "reverse-engineer", "plm-workflow",
+        "surface-modeling", "weldment-frame", "design-for-manufacturability",
     }
     assert expected <= names
     assert out["count"] >= len(expected)
@@ -476,3 +478,32 @@ def test_mid_session_turn_still_keyword_activates_while_catalog_is_suppressed(re
     finally:
         at._CATALOG_INJECTED_SESSIONS.discard(key)
         sk.reset_session(sid)
+
+
+def test_plain_3d_printing_does_not_activate_reverse_engineering():
+    import os
+    for key in ("CHUDWARE_SKILLS_PROJECT_DIR", "CHUDWARE_SKILLS_USER_DIR",
+                "CHUDWARE_SKILLS_BUILTIN_DIR"):
+        os.environ.pop(key, None)
+    sk.clear_cache()
+    sk.reset_session("print-not-re")
+    bodies = sk.activate_for_prompt(
+        "Design a new enclosure for FDM 3D printing", session_id="print-not-re")
+    assert not any("# Reverse Engineer" in body for body in bodies)
+
+
+def test_new_domain_skills_activate_on_specific_intent():
+    import os
+    for key in ("CHUDWARE_SKILLS_PROJECT_DIR", "CHUDWARE_SKILLS_USER_DIR",
+                "CHUDWARE_SKILLS_BUILTIN_DIR"):
+        os.environ.pop(key, None)
+    sk.clear_cache()
+    cases = [
+        ("surface", "build a boundary surface and thicken it", "# Surface Modeling"),
+        ("weld", "make a square tube welded frame", "# Weldment Frame"),
+        ("dfm", "run a design for manufacturability review", "# Design for Manufacturability"),
+    ]
+    for session, prompt, heading in cases:
+        sk.reset_session(session)
+        assert any(heading in body for body in
+                   sk.activate_for_prompt(prompt, session_id=session))

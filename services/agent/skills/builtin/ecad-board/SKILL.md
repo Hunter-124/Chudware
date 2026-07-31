@@ -5,7 +5,7 @@ inject: auto
 triggers:
   keywords: [schematic, pcb, ecad, board outline, footprint, netlist, kicad, ascii board, route the board, autoroute, autoplace, ground plane, copper pour, silkscreen, solder mask]
   tools: [ecad_new_schematic, ecad_to_3d, render_board_ascii, render_schematic_ascii, render_sim_ascii, apply_ascii_edits, ecad_autoroute, ecad_autoplace]
-  phases: [feature, deliver]
+  phases: []
 ---
 
 # ECAD Board

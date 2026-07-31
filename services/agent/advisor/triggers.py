@@ -58,7 +58,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "match": {
             "keywords": [
                 r"\btap\b", r"\bthread\b", r"\bthreaded\b",
-                r"M\d+(?:\.\d+)?(?:[xX×]\d+(?:\.\d+)?)?",
+                r"\bM\d+(?:\.\d+)?(?:[xX×]\d+(?:\.\d+)?)?\b",
                 r"\bUNC\b", r"\bUNF\b", r"\bpilot hole\b", r"\btap drill\b",
             ],
             "tools": [],
@@ -100,9 +100,8 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "press_fit_mention",
         "match": {
             "keywords": [
-                r"\bpress fit\b", r"\bpress.fit\b", r"\binterference fit\b",
+                r"\bpress[ -]?fit\b", r"\binterference fit\b",
                 r"\bknurled\b", r"\bpressed in\b", r"\bforced fit\b",
-                r"\bp6\b", r"\bs6\b", r"\br6\b",
             ],
             "tools": [],
             "events": [],
@@ -122,9 +121,8 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "snap_fit_mention",
         "match": {
             "keywords": [
-                r"\bsnap fit\b", r"\bsnap.fit\b", r"\bcantilever hook\b",
-                r"\blatch\b", r"\bdetent\b", r"\bsnap hook\b",
-                r"\bsnap arm\b", r"\bclip\b",
+                r"\bsnap[ -]?fit\b", r"\bcantilever (?:hook|latch)\b",
+                r"\bsnap hook\b", r"\bsnap arm\b",
             ],
             "tools": [],
             "events": [],
@@ -142,7 +140,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "match": {
             "keywords": [
                 r"\bthin wall\b", r"\bthin-wall\b", r"\bwall thickness\b",
-                r"\bshell\b", r"\bminimum wall\b",
+                r"\bminimum wall\b",
             ],
             "tools": ["wall_thickness"],
             "events": ["thin_wall"],
@@ -184,7 +182,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"\baluminum\b", r"\baluminium\b", r"\bsteel\b", r"\bstainless\b",
                 r"\bABS\b", r"\bPLA\b", r"\bPETG\b", r"\btitanium\b",
                 r"\bbr(?:ass|onze)\b", r"\bcast iron\b", r"\bpolycarbonate\b",
-                r"\bPC\b", r"\bnylon\b",
+                r"\bnylon\b",
             ],
             "tools": ["set_material", "research_material_lookup"],
             "events": [],
@@ -201,9 +199,9 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "tolerance_mention",
         "match": {
             "keywords": [
-                r"\btolerance\b", r"\bfit\b", r"\bH7\b", r"\bg6\b",
+                r"\btolerance\b", r"\bH7\b", r"\bg6\b",
                 r"\bf7\b", r"\bk6\b", r"\bp6\b", r"\bISO 286\b",
-                r"\bclearance\b", r"\bsliding fit\b", r"\brunning fit\b",
+                r"\bsliding fit\b", r"\brunning fit\b",
             ],
             "tools": ["fit_calc", "measure_between"],
             "events": [],
@@ -223,11 +221,10 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "thread_engagement",
         "match": {
             "keywords": [
-                r"\bengagement\b", r"\bthread length\b", r"\bstud\b",
-                r"\bthread engagement\b", r"\bthrough-hole\b",
-                r"\bblind hole\b", r"\bboss\b",
+                r"\bthread engagement\b", r"\bthread length\b",
+                r"\bthrough[ -]hole\b", r"\bblind[ -]hole\b",
             ],
-            "tools": ["research_thread_spec"],
+            "tools": ["research_thread_spec", "tap_drill"],
             "events": [],
         },
         "inject": {
@@ -244,8 +241,8 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "interference_pre_op",
         "match": {
             "keywords": [
-                r"\bplace\b", r"\bassemble\b", r"\bmount\b", r"\bmate\b",
-                r"\bcheck interference\b", r"\bclearance\b", r"\boverlap\b",
+                r"\bassemble\b", r"\bcheck interference\b", r"\boverlap\b",
+                r"\b(?:place|mount|mate)\b(?:\s+\w+){0,3}\s+\b(?:part|component|body|board|assembly)\b",
             ],
             "tools": ["part_place", "solve_mates", "check_interference"],
             "events": ["assembly_body_added"],
@@ -265,9 +262,9 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "dfm_pre_op",
         "match": {
             "keywords": [
-                r"\bmanufactur\b", r"\bmachine\b", r"\bprint\b", r"\bmold\b",
-                r"\bprocess\b", r"\bDFM\b", r"\bdesign for\b",
-                r"\bwall\b", r"\bdraft\b",
+                r"\bmanufactur(?:e|ed|ing|ability|able)\b", r"\bDFM\b",
+                r"\bdesign for manufacturability\b", r"\b3D print(?:er|ing|ed)?\b",
+                r"\bCNC machin(?:e|ed|ing)\b", r"\binjection mold(?:ed|ing)?\b",
             ],
             "tools": ["set_process", "dfm_check", "wall_thickness", "resolve_process"],
             "events": [],
@@ -287,9 +284,9 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "interface_check_pre_op",
         "match": {
             "keywords": [
-                r"\binterface\b", r"\balign\b", r"\bhole pattern\b",
-                r"\bbolt holes\b", r"\bcoaxial\b", r"\bcontact face\b",
-                r"\bfastener\b", r"\bregister\b", r"\bpass.through\b",
+                r"\bhole pattern\b", r"\bbolt holes\b", r"\bcoaxial\b",
+                r"\bcontact (?:face|plane)\b", r"\bpass[ -]through\b",
+                r"\b(?:align|mate)\b(?:\s+\w+){0,3}\s+\b(?:part|component|face|axis|pattern)\b",
             ],
             "tools": ["interface_check", "part_place", "solve_mates"],
             "events": [],
@@ -311,8 +308,8 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "match": {
             "keywords": [
                 r"\bbend allowance\b", r"\bbend deduction\b", r"\bsheet metal\b",
-                r"\bsheet-metal\b", r"\bflange\b", r"\bflat pattern\b",
-                r"\bK.factor\b", r"\bbend radius\b", r"\bpress brake\b", r"\bformed\b",
+                r"\bsheet-metal\b", r"\bflat pattern\b",
+                r"\bK[ -]?factor\b", r"\bbend radius\b", r"\bpress brake\b",
             ],
             "tools": ["bend_allowance"],
             "events": [],
@@ -333,9 +330,9 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "molded_draft",
         "match": {
             "keywords": [
-                r"\bdraft\b", r"\bdraft angle\b", r"\bmolded\b", r"\bmoulded\b",
+                r"\bdraft angle\b", r"\bmolded\b", r"\bmoulded\b",
                 r"\binjection mold\b", r"\binjection mould\b", r"\brelease angle\b",
-                r"\bcavity\b", r"\bcore pull\b",
+                r"\bcore pull\b",
             ],
             "tools": ["draft_analysis"],
             "events": [],
@@ -363,6 +360,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 "make_drawing", "add_drawing_view", "add_section_view",
                 "add_detail_view", "add_dimension", "add_gdt",
                 "add_surface_finish", "export_drawing",
+                "set_titleblock",
             ],
             "events": [],
         },
@@ -378,14 +376,15 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "sim_setup",
         "match": {
             "keywords": [
-                r"\bFEA\b", r"\bCFD\b", r"\bstress\b", r"\bmodal\b",
-                r"\bthermal\b", r"\bbuckling\b", r"\bfatigue\b",
-                r"flow simulation", r"motion study", r"\bmesh\b",
+                r"\bFEA\b", r"\bCFD\b", r"\bstress (?:analysis|simulation|study)\b",
+                r"\bmodal\b", r"\bthermal\b", r"\bbuckling\b", r"\bfatigue\b",
+                r"flow simulation", r"motion study", r"\b(?:simulation )?mesh quality\b",
             ],
             "tools": [
                 "run_fea_static", "run_fea_modal", "run_fea_fatigue",
                 "run_fea_thermal", "run_fea_buckling", "run_fea_contact",
                 "run_cfd_flow", "run_cfd_accurate", "simulate_motion",
+                "describe_results",
             ],
             "events": [],
         },
@@ -401,14 +400,15 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "ecad_design",
         "match": {
             "keywords": [
-                r"\bschematic\b", r"\bPCB\b", r"\bnet\b", r"\bfootprint\b",
-                r"\bimpedance\b", r"\bERC\b", r"\bDRC\b", r"\bautorout",
+                r"\bschematic\b", r"\bPCB\b", r"\bnetlist\b", r"\bfootprint\b",
+                r"\bimpedance\b", r"\bERC\b", r"\bDRC\b", r"\bautorout(?:e|er|ing)\b",
                 r"\bnet class\b", r"\bsilkscreen\b",
             ],
             "tools": [
                 "ecad_new_schematic", "ecad_new_pcb", "ecad_place_symbol", "ecad_wire",
                 "ecad_autoroute", "ecad_fill_zones", "ecad_update_from_sch",
                 "ecad_set_net_class", "ecad_run_erc", "ecad_run_drc",
+                "ecad_add_power", "board_from_schematic", "ecad_simulate",
             ],
         },
         "inject": {
@@ -423,14 +423,15 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "cam_setup",
         "match": {
             "keywords": [
-                r"\bmachin", r"\btoolpath\b", r"feeds and speeds",
-                r"\bstock\b", r"\bsetup\b", r"\bpost.?process",
-                r"\bg.?code\b", r"\bstepover\b", r"\bstepdown\b",
+                r"\bmachin(?:e|ed|ing)\b", r"\btoolpath\b", r"feeds and speeds",
+                r"\bCAM (?:stock|setup|job)\b", r"\bpost[ -]?process(?:or|ing)?\b",
+                r"\bg[ -]?code\b", r"\bstepover\b", r"\bstepdown\b",
             ],
             "tools": [
                 "cam_new_job", "cam_add_setup", "cam_add_tool",
                 "cam_add_operation", "cam_generate", "cam_simulate",
                 "cam_post", "cam_set_stock",
+                "cam_setup_sheet", "cam_materials", "cam_op_types",
             ],
             "events": [],
         },
@@ -446,14 +447,15 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "part_sourcing",
         "match": {
             "keywords": [
-                r"\bvendor\b", r"\bsupplier\b", r"\bpurchase\b", r"\bbuy\b",
-                r"\bquote\b", r"lead time",
+                r"\bsupplier\b", r"\bpurchase\b", r"\blead time\b",
+                r"\brequest (?:a )?quote\b",
                 r"\bBOM\b.*\bcost|cost.*\bBOM\b",
                 r"\bsource\b.*\bpart|part.*\bsource\b",
             ],
             "tools": [
                 "part_search", "part_get", "part_place", "part_source",
                 "bom_price", "bom_rollup", "request_quote", "match_part_number",
+                "parts_taxonomy", "vendors_health",
             ],
             "events": [],
         },
@@ -511,13 +513,14 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "match": {
             "keywords": [
                 r"\bcheckpoint\b", r"\brelease\b", r"\brevision\b",
-                r"where.used", r"\brollback\b", r"\bchange order\b",
+                r"\bwhere[ -]used\b", r"\brollback\b", r"\bchange order\b",
                 r"\bitem master\b",
             ],
             "tools": [
                 "plm_init", "plm_open", "plm_save", "plm_checkpoint",
                 "plm_release", "plm_history", "plm_restore", "plm_compare",
                 "plm_where_used", "plm_rollback",
+                "plm_status", "plm_set_ai_mode",
             ],
             "events": [],
         },
@@ -531,6 +534,32 @@ _BUILTIN_TRIGGERS: list[dict] = [
     },
 ]
 
+# Human-facing metadata is kept separate from matcher mechanics so every shipped Rule has a
+# concise settings label and purpose without repeating prose inside the no-PyYAML fallback table.
+_RULE_METADATA: dict[str, tuple[str, str]] = {
+    "thread_mention": ("Thread sizing", "Inject tap-drill and thread-selection guidance for threaded features."),
+    "bearing_seat": ("Bearing fits", "Surface shaft and housing fit guidance for bearing seats."),
+    "press_fit_mention": ("Press fits", "Surface interference-fit tolerances when a press fit is intended."),
+    "snap_fit_mention": ("Snap fits", "Inject strain and geometry checks for snap-fit features."),
+    "thin_wall": ("Thin walls", "Surface process-specific wall-thickness guidance when thin walls matter."),
+    "fastener_pattern": ("Fastener patterns", "Inject fastener-hole and pattern sizing guidance."),
+    "material_mention": ("Material properties", "Provide sourced material properties when a material affects the design."),
+    "tolerance_mention": ("Tolerances and fits", "Inject ISO fit and tolerance guidance for mating dimensions."),
+    "thread_engagement": ("Thread engagement", "Surface minimum engagement guidance for threaded joints."),
+    "interference_pre_op": ("Assembly interference pre-op", "Verify physical interference before completing assembly work."),
+    "dfm_pre_op": ("Design for manufacturability pre-op", "Apply process-specific manufacturability checks before export or release."),
+    "interface_check_pre_op": ("Interface alignment pre-op", "Verify mating patterns, axes, and contact planes before completion."),
+    "sheet_bend": ("Sheet-metal bends", "Inject bend allowance and flat-pattern guidance for sheet metal."),
+    "molded_draft": ("Mold draft", "Surface draft-angle requirements for molded geometry."),
+    "drawing_standards": ("Drawing standards", "Guide measured views, dimensions, annotations, and drawing export."),
+    "sim_setup": ("Simulation setup", "Require sourced materials, explicit loads, constraints, and result checks."),
+    "ecad_design": ("ECAD design", "Guide schematic, board, ERC, DRC, and electrical verification flow."),
+    "cam_setup": ("CAM setup", "Guide stock, toolpaths, simulation, and postprocessing."),
+    "part_sourcing": ("Part sourcing", "Prefer verified catalog parts and supplier data over hand-modeled hardware."),
+    "reveng_flow": ("Reverse engineering", "Guide scan or reference geometry into verified parametric reconstruction."),
+    "plm_flow": ("PLM workflow", "Guide checkpoints, revisions, releases, where-used checks, and recovery."),
+}
+
 _CHARS_PER_TOKEN = 4  # repo-wide heuristic (matches render.py / ledger.py)
 
 # ---------------------------------------------------------------------------
@@ -542,14 +571,16 @@ _THREAD_DESIGNATION_RE = re.compile(
     r"\b(M\d+(?:\.\d+)?(?:\s*[xX×]\s*\d+(?:\.\d+)?)?)\b"
 )
 
-# Matches ISO 286 fit designation: H7/g6, H7, g6, H8/f7
+# Matches ISO 286 fit designations, preferring a complete pair (H7/g6) over unrelated tokens.
 _FIT_DESIGNATION_RE = re.compile(
-    r"\b([A-Z][A-Z]?\d+(?:[/\\][a-z][a-z]?\d+)?)\b"
+    r"\b([A-Z]\d+[/\\][a-z]\d+|[HhGgFfKkPpRrSs]\d+)\b", re.IGNORECASE
 )
 
-# Matches bare nominal dimension (mm): "20 mm", "Ø20", "∅20", "d=25.4"
+# Matches common nominal dimensions: "20 mm", "Ø20", "dia 20", "diameter 20", "d=25.4".
 _NOMINAL_MM_RE = re.compile(
-    r"(?:Ø|∅|ø|d\s*=\s*|\bdiameter\s+)(\d+(?:\.\d+)?)"
+    r"(?:(?:Ø|∅|ø|\bd(?:ia(?:meter)?)?\s*=\s*|\bdia(?:meter)?\s+)"
+    r"(\d+(?:\.\d+)?)(?:\s*mm)?|(\d+(?:\.\d+)?)\s*mm\b)",
+    re.IGNORECASE,
 )
 
 # ---------------------------------------------------------------------------
@@ -677,6 +708,8 @@ def _label_for(raw: dict) -> str:
     if label:
         return label[:80]
     tid = str(raw.get("id") or "").strip()
+    if tid in _RULE_METADATA:
+        return _RULE_METADATA[tid][0]
     words = tid.replace("_", " ").replace("-", " ").strip()
     return (words[:1].upper() + words[1:]) if words else ""
 
@@ -696,7 +729,9 @@ def _normalize_trigger(raw: dict) -> Optional[dict]:
     prerun = inject.get("prerun_calcs") if isinstance(inject.get("prerun_calcs"), list) else []
     pack = str(inject.get("context_pack") or "").strip()
     exemplar = str(inject.get("exemplar") or "").strip()
-    purpose = str(raw.get("purpose") or "").strip() or exemplar
+    purpose = str(raw.get("purpose") or "").strip()
+    if not purpose:
+        purpose = _RULE_METADATA.get(tid, ("", exemplar))[1]
     try:
         budget = int(raw.get("budget_tokens", 250))
     except (TypeError, ValueError):
@@ -902,6 +937,27 @@ def _read_pack_cached(path: pathlib.Path) -> Optional[str]:
     return text
 
 
+def _truncate_to_budget(text: str, budget_tokens: int) -> str:
+    """Truncate *text* to the token heuristic without splitting a content line."""
+    budget_chars = max(0, budget_tokens) * _CHARS_PER_TOKEN
+    if len(text) <= budget_chars:
+        return text
+    marker = "[… truncated to budget]"
+    if budget_chars <= len(marker):
+        return marker[:budget_chars]
+    content_budget = budget_chars - len(marker) - 1
+    lines: list[str] = []
+    used = 0
+    for line in text.splitlines():
+        cost = len(line) + (1 if lines else 0)
+        if used + cost > content_budget:
+            break
+        lines.append(line)
+        used += cost
+    prefix = "\n".join(lines)
+    return f"{prefix}\n{marker}" if prefix else marker
+
+
 def _load_pack(pack_name: str, budget_tokens: int) -> str:
     """Read a context pack file and truncate to *budget_tokens* whole lines.
 
@@ -920,20 +976,7 @@ def _load_pack(pack_name: str, budget_tokens: int) -> str:
     if text is None:
         return f"[context pack '{pack_name}' not found]"
 
-    budget_chars = budget_tokens * _CHARS_PER_TOKEN
-    if len(text) <= budget_chars:
-        return text
-
-    # Truncate by whole lines to stay within budget.
-    lines: list[str] = []
-    used = 0
-    for line in text.splitlines():
-        cost = len(line) + 1
-        if used + cost > budget_chars:
-            break
-        lines.append(line)
-        used += cost
-    return "\n".join(lines) + "\n[… truncated to budget]"
+    return _truncate_to_budget(text, budget_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -959,8 +1002,9 @@ def _extract_inputs(text: str, input_map: dict[str, str]) -> dict[str, Any]:
         elif group_name == "nominal_mm":
             m = _NOMINAL_MM_RE.search(text)
             if m:
+                value = next((g for g in m.groups() if g is not None), "")
                 try:
-                    extracted[param] = float(m.group(1))
+                    extracted[param] = float(value)
                 except ValueError:
                     pass
     return extracted
@@ -1132,11 +1176,10 @@ def match_triggers(
         if exemplar:
             pack_text = pack_text + f"\nExample: {exemplar}" if pack_text else f"Example: {exemplar}"
 
-        # Measure token cost
-        token_cost = (len(pack_text) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
-
-        # ── build context item ─────────────────────────────────────────────
-        finding_text = f"[context: {tid}] {pack_text}"
+        # The configured cap covers everything injected, including the context prefix and
+        # exemplar. Applying it only while loading the pack let every exemplar exceed its Rule.
+        finding_text = _truncate_to_budget(f"[context: {tid}] {pack_text}", budget)
+        token_cost = (len(finding_text) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
         item: dict[str, Any] = {
             "id": f"ctx_{tid}",
             "severity": "info",

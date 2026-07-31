@@ -183,6 +183,44 @@ static void helpMarker(const char* desc) {
         ImGui::EndTooltip();
     }
 }
+// Selectable backgrounds expand by half ItemSpacing on every side. In a split pane or popup that
+// can push the header wash outside its own row, while an implicit width can vary with its label.
+// Give Settings list options the full content width, remove the horizontal expansion, and clip
+// their paint to both the row and the current pane/popup.
+static bool settingsBoundedSelectable(const char* label, bool selected) {
+    const ImVec2 rowMn = ImGui::GetCursorScreenPos();
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    const ImVec2 spacing = ImGui::GetStyle().ItemSpacing;
+    const float halfSpacingY = spacing.y * 0.5f;
+    const ImVec2 rowMx(rowMn.x + rowW,
+                       rowMn.y + ImGui::GetTextLineHeight() + halfSpacingY);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, spacing.y));
+    ImGui::PushClipRect(ImVec2(rowMn.x, rowMn.y - halfSpacingY), rowMx, true);
+    const bool pressed =
+        ImGui::Selectable(label, selected, ImGuiSelectableFlags_None, ImVec2(rowW, 0.0f));
+    ImGui::PopClipRect();
+    ImGui::PopStyleVar();
+    return pressed;
+}
+static bool settingsBoundedCombo(const char* id, int* current,
+                                 const char* const* labels, int count) {
+    bool changed = false;
+    if (ImGui::BeginCombo(id, labels[*current])) {
+        for (int i = 0; i < count; ++i) {
+            const bool selected = (i == *current);
+            if (settingsBoundedSelectable(labels[i], selected)) {
+                *current = i;
+                changed = true;
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
+
 
 // Shared Settings section chrome: accent title + even vertical rhythm across every tab.
 // Prefer this over raw ImGui::SeparatorText so Appearance/General/AI/… share one look.
@@ -2874,7 +2912,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
                         if (hay.find(fq) == std::string::npos) continue;
                     }
                     const bool selected = (pi == sel);
-                    if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
+                    if (settingsBoundedSelectable(picks[pi].label.c_str(), selected)) {
                         RoleAssign next = a;  // preserve thinking
                         next.mode = picks[pi].mode;
                         if (picks[pi].mode == RoleMode::Fixed) {
@@ -2918,7 +2956,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
             if (ImGui::BeginCombo("##role_think", kThinkLabels[thinkSel])) {
                 for (int ti = 0; ti < 4; ++ti) {
                     const bool selT = (ti == thinkSel);
-                    if (ImGui::Selectable(kThinkLabels[ti], selT)) {
+                    if (settingsBoundedSelectable(kThinkLabels[ti], selT)) {
                         RoleAssign next = a;
                         next.thinking = kThinkValues[ti];
                         setRoleAssign(st, key, next);
@@ -3164,7 +3202,7 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
                 if (hay.find(fq) == std::string::npos) continue;
             }
             const bool selected = (pi == sel);
-            if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
+            if (settingsBoundedSelectable(picks[pi].label.c_str(), selected)) {
                 if (picks[pi].mode == RoleMode::Fixed) {
                     a.isDefault = false;
                     a.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
@@ -3195,7 +3233,7 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
     if (ImGui::BeginCombo("##ef_think", kThinkLabels[thinkSel])) {
         for (int ti = 0; ti < 3; ++ti) {
             const bool selT = (ti == thinkSel);
-            if (ImGui::Selectable(kThinkLabels[ti], selT)) {
+            if (settingsBoundedSelectable(kThinkLabels[ti], selT)) {
                 a.thinking = kThinkValues[ti];
                 saveEngFirmModelsUi();
             }
@@ -3304,7 +3342,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0f);
         int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
-        if (ImGui::Combo(id, &v, kPrefLabels, 4)) {
+        if (settingsBoundedCombo(id, &v, kPrefLabels, 4)) {
             *pref = v;
             if (pref == &settings.planPreference)
                 settings.planMode = (v != 0);
@@ -3351,7 +3389,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::SetNextItemWidth(-1.0f);
             int ra = (settings.roleAdoption != 0) ? 1 : 0;
             const char* kAdopt[] = {"Supervised", "Free"};
-            if (ImGui::Combo("##h_role_adopt", &ra, kAdopt, 2)) {
+            if (settingsBoundedCombo("##h_role_adopt", &ra, kAdopt, 2)) {
                 settings.roleAdoption = ra;
                 changed = true;
             }
@@ -5777,12 +5815,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 const bool aiNarrow = ImGui::GetContentRegionAvail().x < 640.0f * sc;
                 if (aiNarrow) {
                     ImGui::SetNextItemWidth(-1);
-                    if (ImGui::BeginCombo("##ai_sub_pick", kAiSubLabels[s_aiSubSel])) {
-                        for (int i = 0; i < 8; ++i)
-                            if (ImGui::Selectable(kAiSubLabels[i], i == s_aiSubSel))
-                                s_aiSubSel = i;
-                        ImGui::EndCombo();
-                    }
+                    settingsBoundedCombo("##ai_sub_pick", &s_aiSubSel, kAiSubLabels, 8);
                 } else {
                     // Borderless nav rail: selection is a soft accent wash (not the design
                     // system's glow-border, which reads as a boxed outline at this size) —
@@ -5807,12 +5840,18 @@ void drawSettingsModal(AppState& st, bool busy) {
                     for (int i = 0; i < 8; ++i) {
                         ImGui::PushID(i);
                         const bool selRow = (i == s_aiSubSel);
-                        if (ImGui::Selectable("##ai_rail_row", selRow, 0, ImVec2(0, railRowH)))
+                        const ImVec2 rmn = ImGui::GetCursorScreenPos();
+                        const ImVec2 rmx(rmn.x + ImGui::GetContentRegionAvail().x,
+                                         rmn.y + railRowH);
+                        const ImVec2 railSpacing = ImGui::GetStyle().ItemSpacing;
+                        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                            ImVec2(0.0f, railSpacing.y));
+                        ImGui::PushClipRect(rmn, rmx, true);
+                        if (ImGui::Selectable("##ai_rail_row", selRow, ImGuiSelectableFlags_None,
+                                              ImVec2(rmx.x - rmn.x, railRowH)))
                             s_aiSubSel = i;
                         const bool hovRow = ImGui::IsItemHovered();
                         ImDrawList* rdl = ImGui::GetWindowDrawList();
-                        const ImVec2 rmn = ImGui::GetItemRectMin();
-                        const ImVec2 rmx = ImGui::GetItemRectMax();
                         // Bare dp radius — coloredRowWash scales it internally.
                         if (selRow)
                             ui::coloredRowWash(rdl, rmn, rmx, 6.0f, ui::palette.accent,
@@ -5822,9 +5861,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                                                0.10f, /*selected=*/false);
                         rdl->AddText(
                             ImVec2(rmn.x + 8.0f * sc,
-                                   rmn.y + (rmx.y - rmn.y - ImGui::GetFontSize()) * 0.5f),
+                                   rmn.y + (railRowH - ImGui::GetFontSize()) * 0.5f),
                             ui::Palette::toU32(selRow ? ui::palette.accent : ui::palette.text),
                             kAiSubLabels[i]);
+                        ImGui::PopClipRect();
+                        ImGui::PopStyleVar();
                         ImGui::PopID();
                     }
                     ImGui::PopStyleColor(3);
@@ -5968,7 +6009,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                             auto& pr = s_promptRecs[i];
                             std::string lbl = pr.role;
                             if (pr.overridden) lbl += " *";
-                            if (ImGui::Selectable(lbl.c_str(), sel))
+                            if (settingsBoundedSelectable(lbl.c_str(), sel))
                                 s_selectedRole = i;
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("%s%s", pr.role.c_str(),
@@ -5978,7 +6019,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         {
                             std::string syslbl = "system (override)";
                             if (st.spBuf[0] != 0) syslbl += " *";
-                            if (ImGui::Selectable(syslbl.c_str(), s_selectedRole >= sysIdx))
+                            if (settingsBoundedSelectable(syslbl.c_str(), s_selectedRole >= sysIdx))
                                 s_selectedRole = sysIdx;
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("Override the agent system prompt (advanced)");

@@ -2382,9 +2382,18 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         }
     } else if (kind == "agent.context") {
         // Per-completion usage telemetry (Python general lane). app.cpp feeds the
-        // composer meter from the same event; HERE we only accumulate the turn's
-        // prompt-cache reads so the assistant bubble's meta row can show them.
-        m.cacheReadTok += jint(data, "cache_read");
+        // composer meter from the same event; HERE we keep the turn's prompt-cache
+        // reads for the assistant bubble's meta row. The DISPLAYED figure is the
+        // per-completion PEAK, not the running sum: prompt caching re-reads the same
+        // prefix on every call, so a 12-call turn on a 23k context summed to "150.8k
+        // cached" — a number no reader can reconcile with the meter beside it. The
+        // sum survives in cacheReadTotTok for the tooltip, where it reads as cost.
+        const int cr = jint(data, "cache_read");
+        if (cr > 0) {
+            m.cacheReadTok = std::max(m.cacheReadTok, cr);
+            m.cacheReadTotTok += cr;
+            ++m.cacheReadCalls;
+        }
     }
     // Resume-safe: mark history dirty on activity/text/plan changes; force on terminal events.
     if (m.running || kind == "run_finished" || kind == "mission_finished" ||

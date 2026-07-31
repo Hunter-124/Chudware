@@ -71,9 +71,12 @@ static std::string chatTimeTooltip(double ts) {
     return buf;
 }
 
-// Age label with the turn's prompt-cache total appended ("3m ago · 41.2k cached").
+// Age label with the turn's prompt-cache figure appended ("3m ago · 21.4k cached").
 // Shared by the in-card meta row and the above-card model label so a mutating
 // turn's cache reads are visible in the same form as a prose turn's.
+// `cacheTok` is the PEAK single-completion read (ChatMsg::cacheReadTok), never the
+// turn sum — with prompt caching the same prefix is re-read every call, so the sum
+// outgrows the context window and reads as nonsense next to the meter.
 static std::string chatAgeCacheLabel(double ts, int cacheTok) {
     std::string age = chatAgeLabel(ts);
     if (cacheTok > 0 && !age.empty()) {
@@ -84,13 +87,21 @@ static std::string chatAgeCacheLabel(double ts, int cacheTok) {
     return age;
 }
 
-// Tooltip twin of chatAgeCacheLabel: absolute time + cache sentence.
-static std::string chatAgeCacheTip(double ts, int cacheTok) {
+// Tooltip twin of chatAgeCacheLabel: absolute time + cache sentence. The tooltip is
+// where the CUMULATIVE figure belongs — it is a cost quantity, and spelling out the
+// call count is what stops the two numbers looking contradictory.
+static std::string chatAgeCacheTip(double ts, int cacheTok, int totTok = 0, int calls = 0) {
     std::string tip = chatTimeTooltip(ts);
     if (cacheTok > 0) {
         tip += " \xc2\xb7 ";
         tip += chatTokCount(cacheTok);
-        tip += " tokens read from the prompt cache this turn";
+        tip += " tokens served from the prompt cache on this turn's largest model call";
+        if (calls > 1 && totTok > cacheTok) {
+            tip += "\n";
+            tip += chatTokCount(totTok);
+            tip += " cached-token reads billed across the turn's " + std::to_string(calls)
+                 + " calls (the same prefix is re-read each call).";
+        }
     }
     return tip;
 }
@@ -98,9 +109,10 @@ static std::string chatAgeCacheTip(double ts, int cacheTok) {
 // In-bubble meta row: author name (left) + relative age (right; hover = absolute
 // time). Renders as a bubble's first (assistant) or last (user) row so the author
 // lives INSIDE the message box. Name may be null (age-only row). cacheTok > 0 appends
-// the turn's prompt-cache read total to the age ("3m ago · 41.2k cached").
+// the turn's peak prompt-cache read to the age ("3m ago · 21.4k cached"); totTok/calls
+// carry the cumulative figure, which only ever appears in the hover tooltip.
 static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec4& nameCol,
-                           double ts, int cacheTok = 0) {
+                           double ts, int cacheTok = 0, int totTok = 0, int calls = 0) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const std::string age = chatAgeCacheLabel(ts, cacheTok);
     if ((!name || !name[0]) && age.empty()) return;   // legacy turn, no model — no blank row
@@ -123,7 +135,7 @@ static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec
         ImGui::TextUnformatted(age.c_str());
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) {
-            const std::string tip = chatAgeCacheTip(ts, cacheTok);
+            const std::string tip = chatAgeCacheTip(ts, cacheTok, totTok, calls);
             if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
         }
     }
@@ -612,7 +624,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 ImGui::TextUnformatted(age.c_str());
                 ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered()) {
-                    const std::string tip = chatAgeCacheTip(m.ts, m.cacheReadTok);
+                    const std::string tip = chatAgeCacheTip(m.ts, m.cacheReadTok,
+                                                            m.cacheReadTotTok, m.cacheReadCalls);
                     if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
                 }
             }
@@ -672,7 +685,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         // wasn't drawn above the turn (VC-restore turns keep the top row).
         if (metaInCard && !metaDrawn) {
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
-                           turnSurf.textSecondary, m.ts, m.cacheReadTok);
+                           turnSurf.textSecondary, m.ts, m.cacheReadTok,
+                           m.cacheReadTotTok, m.cacheReadCalls);
             metaDrawn = true;
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }
@@ -773,7 +787,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         const ImVec4 warnCol = semanticOnGlass(pal.statusWarn, chatSurf());
         if (metaInCard && !metaDrawn) {
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
-                           turnSurf.textSecondary, m.ts, m.cacheReadTok);
+                           turnSurf.textSecondary, m.ts, m.cacheReadTok,
+                           m.cacheReadTotTok, m.cacheReadCalls);
             metaDrawn = true;
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }

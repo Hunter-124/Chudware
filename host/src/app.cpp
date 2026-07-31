@@ -3356,6 +3356,22 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     pp.features = {"M3 clearance bore r=1.7 through - cut a Cylinder",
                    "1mm chamfer on the top rim - chamfer(top_edges, length=1)"};
     a.plan.parts.push_back(pp);
+    // A thinking box that has ALREADY overflowed the streaming height cap, so the shot
+    // exercises the case the box exists for: once it clamps at copilotProseStreamCapH it
+    // must keep the NEWEST thoughts in view, not freeze on the opening sentence.
+    ActivityItem think;
+    think.rowKind = 2;
+    think.stage = "thought:stream";
+    think.title = "Thinking";
+    think.status = "running";
+    think.streaming = true;
+    think.expanded = true;
+    for (int i = 1; i <= 14; ++i)
+      think.detail += "Step " + std::to_string(i) +
+                      ": the chamfer tips dip under the FDM minimum wall, so the rim "
+                      "needs to come back before the bore is cut. ";
+    think.detail += "LAST-LINE-MARKER";
+    a.activity.push_back(think);
     st.chat.push_back(a);
   }
   if (st.wantAssembly) {
@@ -3568,6 +3584,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
     st.chat.push_back(a);
   }
+
+  // The four chat seeds above run BEFORE the startup session restore, which assigns over
+  // st.chat — so on any machine with a saved conversation store the seeded turns were silently
+  // discarded and the shot captured the user's own transcript instead (and on an EMPTY store the
+  // restore left the hero state up). Keep a copy and re-apply it at frame 1, after the restore,
+  // so a chat shot always shows the scenario it names.
+  const std::vector<ChatMsg> shotChatSeed = st.chat;
 
   // Scripted screenshot/test scenarios
   // (CHUDWARE_SHOT=m1/sketch/asm/fea/evalmass/activity): the six step machines +
@@ -5756,8 +5779,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (shot && st.frame == 1) {
       if (st.wantSettings)
         st.openSettings = true;
-      if (st.wantChat || st.wantAssembly || st.wantPlan || st.wantCopilotSlash)
+      if (st.wantChat || st.wantAssembly || st.wantPlan || st.wantCopilotSlash) {
         st.designStarted = true; // show the conversation takeover
+        // Re-apply the seed the restore clobbered (see shotChatSeed).
+        if (!shotChatSeed.empty() && st.chat.size() != shotChatSeed.size())
+          st.chat = shotChatSeed;
+      }
       // Seed AFTER the startup session load (frame 0 clears the composer while
       // restoring the active conversation / prompt draft).
       if (st.wantCopilotSlash)

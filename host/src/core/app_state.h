@@ -690,10 +690,17 @@ struct ChatMsg {
     // Per-message copilot mode stamp (CopilotMode 0..5). -1 = unstamped / no mode border.
     // Set at submitTurn from st.aiInteraction; auto-switch (Ask→Agent) updates the assistant.
     int copilotMode = -1;
-    // Assistant turn: running total of prompt-cache read tokens across the turn's completions
-    // (agent.context events, feed.cpp). 0 = no cache hits / provider reports no cache counts.
-    // Shown in the bubble meta row so cache hits are visible per turn, not just in the meter.
+    // Assistant turn: prompt-cache read tokens of the turn's LARGEST single completion
+    // (agent.context events, feed.cpp). This is the figure shown in the bubble meta row,
+    // because it is the only one comparable to the context meter beside it: with prompt
+    // caching every completion re-reads the same prefix, so SUMMING the per-call reads
+    // produced "150.8k cached" on a 23k context — arithmetically defensible, and read by
+    // every human as a lie. 0 = no cache hits / provider reports no cache counts.
     int cacheReadTok = 0;
+    // Sum of the same per-completion reads across the turn, plus how many completions
+    // reported one. Cost-shaped rather than occupancy-shaped, so it lives in the tooltip.
+    int cacheReadTotTok = 0;
+    int cacheReadCalls = 0;
     // ---- M19 render-windowing cache (GUI-only, not persisted) ----
     // Height this message occupied last time it was actually drawn at uiCachedW width. Lets the
     // chat log emit a same-height Dummy for messages far outside the scroll viewport instead of

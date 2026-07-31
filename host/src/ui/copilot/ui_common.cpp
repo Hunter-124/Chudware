@@ -180,6 +180,14 @@ void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float ma
 // scrolling inside a small fixed box, so the card visibly fills out mid-stream; once content
 // would exceed maxH (the generous cap, e.g. copilotProseStreamCapH()) it clamps there and falls
 // back to the same scrolling presentation as the static case.
+//
+// At that clamp the box STOPS growing but the text keeps arriving, so a scroll-at-zero box
+// freezes on the model's FIRST paragraph and hides everything it is currently thinking —
+// exactly the moment the box is worth watching. While growToFit is on, the body therefore
+// sticks to the bottom. The stick is released the moment the user scrolls up (detected by
+// comparing this frame's scroll against LAST frame's maximum, since a pinned box always sits
+// exactly at the previous maximum) and re-armed when they scroll back down, so reading back
+// through the reasoning mid-stream is never yanked away.
 void drawProseBox(const char* id, const std::string& text, float maxH, bool growToFit) {
     const auto& p = ui::palette;
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
@@ -196,6 +204,19 @@ void drawProseBox(const char* id, const std::string& text, float maxH, bool grow
         ImVec4(p.proseText[0], p.proseText[1], p.proseText[2], 1));
     ImGui::TextWrapped("%s", text.c_str());
     ImGui::PopStyleColor();
+    if (growToFit) {
+        // Per-child persistent state (the child window's own storage), so several streaming
+        // boxes on screen at once each track their own reader independently.
+        ImGuiStorage* stg = ImGui::GetStateStorage();
+        const ImGuiID kPrevMax = ImGui::GetID("##prose_prevmax");
+        const float prevMax = stg->GetFloat(kPrevMax, 0.0f);
+        const float maxY = ImGui::GetScrollMaxY();
+        // Pinned == sitting at the maximum the content had when this frame's scroll value was
+        // last settable. 1px of slack absorbs the sub-pixel line-height rounding.
+        if (maxY > 0.0f && ImGui::GetScrollY() >= prevMax - 1.0f)
+            ImGui::SetScrollY(maxY);
+        stg->SetFloat(kPrevMax, maxY);
+    }
     ImGui::EndChild();
     ImGui::PopStyleColor();
 }

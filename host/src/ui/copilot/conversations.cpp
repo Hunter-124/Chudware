@@ -507,7 +507,11 @@ void persistChatHistory(AppState& st) {
             // reload it means the app died (or was killed) mid-run — see parseChatSessionJson.
             if (!m.fromUser && m.running) entry["run"] = true;
             if (m.ts > 0.0) entry["ts"] = m.ts;   // send/receive time for the in-bubble age label
-            if (!m.fromUser && m.cacheReadTok > 0) entry["cache_tok"] = m.cacheReadTok;
+            if (!m.fromUser && m.cacheReadTok > 0) {
+                entry["cache_tok"] = m.cacheReadTok;          // peak single completion (shown)
+                entry["cache_tot"] = m.cacheReadTotTok;       // turn sum (tooltip)
+                entry["cache_n"]   = m.cacheReadCalls;
+            }
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
             if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
             // Error card fields — the humanized headline and the raw failure text (capped like
@@ -800,6 +804,11 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             cm.errorFull = m.value("ef", std::string());
             cm.ts = m.value("ts", 0.0);          // 0 = legacy (constructed with now) — no age label
             cm.cacheReadTok = m.value("cache_tok", 0);
+            // Legacy sessions wrote only cache_tok (a SUM under the old semantics). Falling
+            // back to it here would reprint the inflated figure in the tooltip, so default the
+            // total to the peak: a one-call turn, which is the honest reading of "unknown".
+            cm.cacheReadTotTok = m.value("cache_tot", cm.cacheReadTok);
+            cm.cacheReadCalls  = m.value("cache_n", cm.cacheReadTok > 0 ? 1 : 0);
             // Restore plan/task-list state when present (legacy sessions omit the key).
             if (m.contains("plan_state") && m["plan_state"].is_object()) {
                 cm.planState = parsePlanState(m["plan_state"]);

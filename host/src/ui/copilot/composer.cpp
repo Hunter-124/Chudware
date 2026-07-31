@@ -2298,8 +2298,10 @@ static CtxMeterUsage contextMeterUsage(const AppState& st) {
 // measureContextMeter() so the reserved width can never disagree with the drawn one. Four honest
 // states, none of which ever prints a zero denominator or a fabricated figure:
 //   measured, win > 0  -> "12k/200k" with a filled fraction ring
-//   estimated, win > 0 -> "\xe2\x89\x88" "8k/200k" — the almost-equal sign is the on-screen mark
-//                         that this came from counting the transcript, not from the provider
+//   estimated, win > 0 -> "~8k/200k" — the tilde is the on-screen mark that this came from
+//                         counting the transcript, not from the provider. ASCII deliberately:
+//                         U+2248 is NOT in the UI font's glyph ranges and rendered as a literal
+//                         "?", which turned the estimate into a broken-looking "?978/262k".
 //   empty transcript   -> "\xe2\x80\x94/200k": nothing measured AND nothing to count, so the
 //                         numerator is an em dash and the ring sits empty — a pure capacity hint
 //   win == 0           -> "ctx \xe2\x80\x94" with NO ring: the window is unknown, so there is no
@@ -2313,7 +2315,7 @@ static CtxMeterText contextMeterText(const AppState& st) {
     if (win <= 0) return {std::string("\xe2\x80\x94"), false};
     const CtxMeterUsage u = contextMeterUsage(st);
     std::string num = u.tokens <= 0  ? std::string("\xe2\x80\x94")
-                      : u.estimate   ? "\xe2\x89\x88" + fmtTokens(u.tokens)
+                      : u.estimate   ? "~" + fmtTokens(u.tokens)
                                      : fmtTokens(u.tokens);
     return {num + "/" + fmtTokens(win), true};
 }
@@ -2340,7 +2342,11 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
     const float gap = ui::metrics::px(5), ringAdv = gaugeRingAdvance();
     const CtxMeterText txt = contextMeterText(st);
     const std::string& full = txt.full;
-    const std::string lean = "ctx " + full;   // standalone (no ring) keeps a "ctx" tag so it reads
+    // The ringless form only earns its "ctx" tag when the WINDOW is unknown ("ctx —" would
+    // otherwise be a bare em dash). Dropping the ring for lack of ROOM must never swap in a
+    // WIDER string than the one that did not fit — that is what pushed "23k/262k" past the
+    // column's right edge and clipped the trailing glyph.
+    const std::string lean = txt.ringOk ? full : ("ctx " + full);
     const float fh = ImGui::GetFrameHeight();
     // Ring + readout only when the window is known AND there is room for both; uses the SAME
     // roomForMeter the caller passed to measureContextMeter() so the width it reserved and the
@@ -2546,13 +2552,13 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
 // Width drawContextMeter() will occupy, so the caller can right-align it on its line above the
 // composer. Shares contextMeterText() with drawContextMeter() and mirrors its showRing decision,
 // so reserved width == drawn width in EVERY state (measured fraction, the wider
-// "\xe2\x89\x88"-prefixed estimate, em-dash numerator, and the ringless unknown-window tag).
+// "~"-prefixed estimate, em-dash numerator, and the ringless unknown-window tag).
 static float measureContextMeter(AppState& st, float roomForMeter) {
     const float gap = ui::metrics::px(5), ringAdv = gaugeRingAdvance();
     const CtxMeterText txt = contextMeterText(st);
     const float fullTw = ImGui::CalcTextSize(txt.full.c_str()).x;
     if (txt.ringOk && roomForMeter >= ringAdv + gap + fullTw) return ringAdv + gap + fullTw;
-    return ImGui::CalcTextSize(("ctx " + txt.full).c_str()).x;
+    return txt.ringOk ? fullTw : ImGui::CalcTextSize(("ctx " + txt.full).c_str()).x;
 }
 
 // Provider rate-limit gauges for the prelude row: one ring per usage window the ACTIVE
@@ -2833,9 +2839,20 @@ static void drawComposerPrelude(AppState& st, bool busy) {
         auto* markRun = st.runIfExists(st.activeConvId());
         const bool showBusyMark = !(markRun && markRun->stopRequested.load()) &&
                                   (busy || activeConversationRunning(st));
-        const float meterRoomFull = ImGui::GetContentRegionAvail().x;
+        // The gauge cluster is RIGHT-aligned, so its last glyph sits on the column's clip
+        // edge. Two things then clip the readout, and both are fixed here rather than in the
+        // gauge: (a) the meter was measured against the FULL remaining width, so it kept its
+        // ring even when the cluster as a whole could not fit and overflowed the row; (b) the
+        // text landed exactly at contentRegionMax, where the trailing glyph's ink is shaved by
+        // the clip rect. Budget the meter to the space actually left of the mode chip, and
+        // hold a hair of inset off the edge.
+        const float edgeInset = ui::metrics::px(2);
+        const float rowRightScreen =
+            ImGui::GetWindowPos().x + ImGui::GetContentRegionMax().x - edgeInset;
+        const float meterRoomFull = std::max(0.0f,
+            std::min(ImGui::GetContentRegionAvail().x - edgeInset,
+                     rowRightScreen - (tmx.x + ui::metrics::px(6))));
         const float meterW = measureContextMeter(st, meterRoomFull);
-        const float rowRightScreen = ImGui::GetWindowPos().x + ImGui::GetContentRegionMax().x;
         // Provider-limit rings ride LEFT of the context gauge as one right-aligned cluster, and
         // give way first when the column narrows: the context gauge always wins, and the cluster
         // may never reach back over the mode chip (px(6) keeps a visible break between them).
@@ -2861,7 +2878,7 @@ static void drawComposerPrelude(AppState& st, bool busy) {
         }
         // Gauge cluster on the SAME row, right-aligned as one block.
         ImGui::SameLine(0, 0.0f);
-        const float clusterCursorX = ImGui::GetContentRegionMax().x - clusterW;
+        const float clusterCursorX = ImGui::GetContentRegionMax().x - edgeInset - clusterW;
         if (clusterCursorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(clusterCursorX);
         if (usageW > 0.0f) {
             usageRingCluster(st, usageBudget, /*draw=*/true);

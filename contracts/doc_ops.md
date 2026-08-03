@@ -173,6 +173,13 @@ change (§2).
 > at CREATION time still fails the op (`convert_failed`/`unsupported_ref`) — staleness only
 > applies to later rebuilds.
 
+> **Amendment (T-BL51, 2026-08-03) — external-ref re-projection is part of the edit's undo
+> step.** The refresh runs on the batch's working tree BEFORE the undo snapshot is committed,
+> so `doc_undo` restores the source geometry AND the projection that belonged to it in one
+> step (converted entities never linger at coordinates their source no longer has); `doc_redo`
+> restores both again. Entity ids owned by a ref are stable across undo/redo. Neither
+> `doc_undo` nor `doc_redo` re-resolves selectors — they replay a self-consistent snapshot.
+
 **Sketch move/copy (C54 — translate or duplicate the selection by a delta):**
 
 | op | fields |

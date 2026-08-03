@@ -22,7 +22,9 @@
 #define _USE_MATH_DEFINES
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -86,6 +88,20 @@ std::string make_box(const char* name, double W, double D, double H) {
     for (const auto& st : r.at("rebuild").at("feature_status"))
         REQUIRE_MESSAGE(st.value("ok", false), "box feature failed: " << st.dump());
     return doc_id;
+}
+
+// Widest |u| reached by the entities a converted (external-ref) group owns — the scalar
+// that says whether the projection followed its source. Ignores entities the user drew.
+double converted_max_u(const json& sketch_feature, const std::vector<std::string>& owned) {
+    double max_u = 0.0;
+    for (const auto& e : sketch_feature.at("params").at("entities")) {
+        const std::string eid = e.value("id", std::string());
+        if (std::find(owned.begin(), owned.end(), eid) == owned.end()) continue;
+        for (const char* key : {"p1", "p2"})
+            if (e.contains(key))
+                max_u = std::max(max_u, std::abs(e.at(key).at(0).get<double>()));
+    }
+    return max_u;
 }
 
 }  // namespace
@@ -380,6 +396,147 @@ TEST_CASE("assoc: deleting the source feature marks the ref stale, rebuild still
             CHECK(e.value("radius", 0.0) == doctest::Approx(5.0).epsilon(1e-6));
         }
     CHECK_MESSAGE(found, "last-good converted entity must survive a stale ref");
+}
+
+TEST_CASE("assoc: undo/redo across a re-projection restores both states") {
+    const double W = 40.0, D = 30.0, H = 20.0;
+    std::string doc_id = make_box("UndoConvert", W, D, H);
+
+    // Same rig as the re-projection test: stable datum-plane sketch 50 above the box,
+    // Convert Entities on the box's bottom face, then a boss riding the converted loop.
+    json mk = json::array({json{{"op", "add_feature"}, {"feature",
+        json{{"type", "sketch"}, {"name", "SkAbove"},
+             {"params", {{"entities", json::array()}, {"constraints", json::array()},
+                         {"offset", 50.0}}},
+             {"refs", {{"plane", "plane.top"}}}}}}});
+    const std::string fid =
+        doc_apply_ops(doc_id, -1, mk, false).at("id_map").at("$0").get<std::string>();
+
+    json qb = doc_query(doc_id, json{{"of", "face"}, {"side", "bottom"}});
+    REQUIRE(qb.value("count", 0) >= 1);
+    json cv = json::array({json{{"op", "sketch_convert"}, {"sketch", fid},
+        {"refs", json::array({json{{"kind", "face"}, {"selector", qb.at("matches").at(0)}}})}}});
+    doc_apply_ops(doc_id, -1, cv, false);
+
+    json ex = json::array({json{{"op", "add_feature"}, {"feature",
+        json{{"type", "extrude"}, {"name", "Boss"},
+             {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", dimv(5.0)}}},
+             {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", fid},
+                        {"centroid", json::array({W / 2.0, D / 2.0})},
+                        {"hint_index", 0}}})}}}}}}});
+    json er = doc_apply_ops(doc_id, -1, ex, false);
+    json skf = feature_of(er.at("tree"), fid);
+    REQUIRE(skf.at("params").at("external_refs").size() == 1);
+    std::vector<std::string> ids_before;
+    for (const auto& e : skf["params"]["external_refs"][0]["entity_ids"])
+        ids_before.push_back(e.get<std::string>());
+    REQUIRE(ids_before.size() == 4);
+    const double vol_narrow = W * D * H + W * D * 5.0;
+    const double vol_wide = 60.0 * D * H + 60.0 * D * 5.0;
+    CHECK(er.value("volume", 0.0) == doctest::Approx(vol_narrow).epsilon(1e-6));
+    CHECK(converted_max_u(skf, ids_before) == doctest::Approx(W).epsilon(1e-6));
+
+    // ONE undoable batch widens the source 40 -> 60; the ref re-projects with it.
+    json ed = json::array({
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e1"},
+             {"params", {{"p2", json::array({60.0, 0.0})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e2"},
+             {"params", {{"p1", json::array({60.0, 0.0})}, {"p2", json::array({60.0, D})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e3"},
+             {"params", {{"p1", json::array({60.0, D})}}}},
+    });
+    json rr = doc_apply_ops(doc_id, -1, ed, false);
+    CHECK(rr.value("volume", 0.0) == doctest::Approx(vol_wide).epsilon(1e-6));
+    CHECK(converted_max_u(feature_of(rr.at("tree"), fid), ids_before) ==
+          doctest::Approx(60.0).epsilon(1e-6));
+
+    // UNDO: the re-projection is part of the same undo step as the source edit, so the
+    // converted loop must snap back to 40 — not linger at the widened coordinates.
+    json ur = chudware::doc::doc_undo(doc_id);
+    skf = feature_of(ur.at("tree"), fid);
+    const json& xr_undo = skf.at("params").at("external_refs")[0];
+    CHECK(xr_undo.value("stale", true) == false);
+    REQUIRE(xr_undo.at("entity_ids").size() == ids_before.size());
+    for (std::size_t i = 0; i < ids_before.size(); ++i)
+        CHECK(xr_undo["entity_ids"][i].get<std::string>() == ids_before[i]);
+    CHECK_MESSAGE(converted_max_u(skf, ids_before) == doctest::Approx(W).epsilon(1e-6),
+                  "undo left the converted loop at the post-edit projection");
+    CHECK(ur.value("volume", 0.0) == doctest::Approx(vol_narrow).epsilon(1e-6));
+
+    // REDO: back to the widened projection, same entity ids throughout.
+    json rdr = chudware::doc::doc_redo(doc_id);
+    skf = feature_of(rdr.at("tree"), fid);
+    const json& xr_redo = skf.at("params").at("external_refs")[0];
+    CHECK(xr_redo.value("stale", true) == false);
+    REQUIRE(xr_redo.at("entity_ids").size() == ids_before.size());
+    for (std::size_t i = 0; i < ids_before.size(); ++i)
+        CHECK(xr_redo["entity_ids"][i].get<std::string>() == ids_before[i]);
+    CHECK(converted_max_u(skf, ids_before) == doctest::Approx(60.0).epsilon(1e-6));
+    CHECK(rdr.value("volume", 0.0) == doctest::Approx(vol_wide).epsilon(1e-6));
+}
+
+TEST_CASE("assoc: external refs survive a native .step+ save/open and stay associative") {
+    namespace fs = std::filesystem;
+    const double W = 40.0, D = 30.0, H = 20.0;
+    std::string doc_id = make_box("SaveConvert", W, D, H);
+
+    json mk = json::array({json{{"op", "add_feature"}, {"feature",
+        json{{"type", "sketch"}, {"name", "SkAbove"},
+             {"params", {{"entities", json::array()}, {"constraints", json::array()},
+                         {"offset", 50.0}}},
+             {"refs", {{"plane", "plane.top"}}}}}}});
+    const std::string fid =
+        doc_apply_ops(doc_id, -1, mk, false).at("id_map").at("$0").get<std::string>();
+
+    json qb = doc_query(doc_id, json{{"of", "face"}, {"side", "bottom"}});
+    REQUIRE(qb.value("count", 0) >= 1);
+    json cv = json::array({json{{"op", "sketch_convert"}, {"sketch", fid},
+        {"refs", json::array({json{{"kind", "face"}, {"selector", qb.at("matches").at(0)}}})}}});
+    json cr = doc_apply_ops(doc_id, -1, cv, false);
+    // NB: bind the feature to a named json — feature_of returns by value, and a temporary
+    // in a range-for's sub-expression is not lifetime-extended (silently empty iteration).
+    json created = feature_of(cr.at("tree"), fid);
+    std::vector<std::string> ids_before;
+    for (const auto& e : created.at("params").at("external_refs")[0].at("entity_ids"))
+        ids_before.push_back(e.get<std::string>());
+    REQUIRE(ids_before.size() == 4);
+
+    fs::path out = fs::temp_directory_path() / "chudware_convert_xref_roundtrip.step+";
+    chudware::doc::doc_save(doc_id, out.string());
+    REQUIRE(fs::exists(out));
+    json op = chudware::doc::doc_open(out.string());
+    const std::string nid = op.at("doc_id").get<std::string>();
+
+    // The record survived the container: same ref, same owned entity ids, still live.
+    json skf = feature_of(op.at("tree"), fid);
+    REQUIRE_MESSAGE(!skf.is_null(), "reopened doc lost the converted sketch: " << fid);
+    REQUIRE(skf.at("params").at("external_refs").size() == 1);
+    const json& xr = skf["params"]["external_refs"][0];
+    CHECK(xr.value("stale", true) == false);
+    CHECK(xr.contains("source"));
+    REQUIRE(xr.at("entity_ids").size() == ids_before.size());
+    for (std::size_t i = 0; i < ids_before.size(); ++i)
+        CHECK(xr["entity_ids"][i].get<std::string>() == ids_before[i]);
+    CHECK(converted_max_u(skf, ids_before) == doctest::Approx(W).epsilon(1e-6));
+
+    // ...and it is still ASSOCIATIVE in the reopened session, not a dead record: widen the
+    // source in the NEW doc and the converted loop follows.
+    json ed = json::array({
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e1"},
+             {"params", {{"p2", json::array({60.0, 0.0})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e2"},
+             {"params", {{"p1", json::array({60.0, 0.0})}, {"p2", json::array({60.0, D})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e3"},
+             {"params", {{"p1", json::array({60.0, D})}}}},
+    });
+    json rr = doc_apply_ops(nid, -1, ed, false);
+    skf = feature_of(rr.at("tree"), fid);
+    CHECK(skf["params"]["external_refs"][0].value("stale", true) == false);
+    CHECK_MESSAGE(converted_max_u(skf, ids_before) == doctest::Approx(60.0).epsilon(1e-6),
+                  "reopened external ref stopped following its source");
+
+    std::error_code ec;
+    fs::remove(out, ec);
 }
 
 TEST_CASE("assoc: associative=false is a one-shot copy (no external_refs, no update)") {

@@ -3,7 +3,7 @@ id: T-BL51
 title: Associative Convert Entities — projected sketch references update when the source geometry changes
 workstream: backlog
 owner:
-status: todo
+status: review
 priority: 3
 lane: modeling-core
 kind: new
@@ -26,18 +26,18 @@ projected entity back to its source face/edge selector is stored; when the sourc
 
 ## Definition of done
 
-- [ ] Store the source ref (selector + kind) on each projected entity (or on a per-convert group
+- [x] Store the source ref (selector + kind) on each projected entity (or on a per-convert group
       record) in the sketch feature params — survives save/load.
-- [ ] On document rebuild, re-resolve each stored source ref and re-project; update the pinned
+- [x] On document rebuild, re-resolve each stored source ref and re-project; update the pinned
       entity coordinates in place (same entity ids, so downstream constraints/dimensions survive).
-- [ ] Dangling-reference behaviour: source feature deleted/selector no longer resolves → mark the
+- [x] Dangling-reference behaviour: source feature deleted/selector no longer resolves → mark the
       projected entity dangling (keep last-known geometry, surface a per-entity status the GUIs can
       tint yellow, SolidWorks-style) — do NOT silently drop it or fail the rebuild.
-- [ ] Constraint solver interplay: re-projected coordinates re-enter through the same
+- [x] Constraint solver interplay: re-projected coordinates re-enter through the same
       `fix`-pinned path so the solve after rebuild converges deterministically.
-- [ ] Tests: resize the source body → converted entities follow; delete the source → dangling not
+- [x] Tests: resize the source body → converted entities follow; delete the source → dangling not
       crashing; undo/redo across a re-projection.
-- [ ] Contract: extend the T-BL43 amendment in contracts/doc_ops.md (append-only) with the
+- [x] Contract: extend the T-BL43 amendment in contracts/doc_ops.md (append-only) with the
       associative-update + dangling semantics.
 
 ## Driver notes
@@ -55,3 +55,22 @@ projected entity back to its source face/edge selector is stored; when the sourc
 - **Tier: OPUS** — rebuild-loop + reference-stability work; same rationale as T-BL43.
 
 ## Progress log
+
+
+**2026-08-03 — closed.** The substance of this card shipped under **T-BL49** (2026-07-07):
+`params.external_refs[]` (`x<N>` records owning their projected entity ids),
+`refresh_sketch_external_refs` running on every mutating `doc_apply_ops` batch and on
+`doc_rebuild`/`doc_activate` *before* the compile, `reconcile_external_ref_entities` updating
+entities in place under stable ids (re-adding the `fix` pin, cascading constraints only when a
+re-projection changes an entity's TYPE), `stale:true` + last-good geometry on an unresolvable
+source, a feature-status warning in `document.cpp`, `sketch_health.external_refs[]`, and the
+`sketch_break_external_ref` op. The T-BL49 amendment in `contracts/doc_ops.md` covers it.
+
+Gap closed today: the DoD's third test case (undo/redo across a re-projection) did not exist.
+Added `assoc: undo/redo across a re-projection restores both states` to
+`core/tests/test_sketch_convert.cpp` — it pins the ordering that makes undo correct (the refresh
+runs on the batch's working tree, so the undo snapshot pushed from the pre-batch `s.doc` carries
+the projection that matches its source): widen the source 40→60, undo → converted loop and the
+downstream boss volume snap back to 40, redo → both return to 60, entity ids stable across all
+four states. Also appended the T-BL51 undo/redo amendment to `contracts/doc_ops.md`.
+Verified: `ctest -R "sketch|convert"` 8/8, `test_sketch_convert` 8 cases / 103 assertions.

@@ -88,6 +88,39 @@ def test_mirror_verify_battery_writes_artifact(tmp_path):
     ), arts
 
 
+def test_mirror_verify_battery_never_turns_failed_findings_into_pass(tmp_path):
+    """Live run-88954488724871 had three ok:false findings and three zero scores, yet
+    the turn mirror emitted battery_result PASS.  Mirror must use the canonical grader."""
+    from services.agent.agent_turn import _mirror_c1_grading_evidence
+    from services.agent.ledger import Ledger
+
+    led = Ledger("c1_bat_fail", tmp_path / "l.json")
+    _mirror_c1_grading_evidence(
+        "verify_battery", {"doc_id": "doc-1"},
+        {
+            "scores": {
+                "dfm_check": 0.0,
+                "self_intersection": 0.0,
+                "wall_thickness": 1.0,
+                "watertight": 0.0,
+            },
+            "findings": [
+                {"check": "dfm_check", "ok": False, "detail": "unknown check"},
+                {"check": "self_intersection", "ok": False, "detail": "unknown check"},
+                {"check": "watertight", "ok": False, "detail": "unknown check"},
+            ],
+        },
+        led, "reviewer",
+    )
+
+    artifact = next(e for e in led.events if e["kind"] == "artifact")
+    battery = next(e for e in led.events if e["kind"] == "battery_result")
+    assert artifact["payload"]["verdict"] == "FAIL", artifact
+    assert battery["payload"]["verdict"] == "FAIL", battery
+    assert battery["payload"]["ok"] is False
+    assert "failing findings" in battery["payload"]["detail"]
+
+
 def test_plan_build_productive_auto_complete():
     """plan/build handoff class: productive tools + no formal done → confirmed."""
     from services.agent import agent_turn

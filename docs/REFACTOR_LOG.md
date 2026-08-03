@@ -5946,3 +5946,21 @@ ordinary prose, non-directive code fences, and complete directives remain unchan
 511-byte reply is pinned in `services/agent/test_turn_truncation.py`, including a full turn replay
 that proves the corrected re-emission dispatches `add_features`. Verification: 24 truncation tests,
 73 focused parser/turn tests, and all eight `scripts/check.py` gates pass.
+
+
+## 2026-08-03 — Holster-run inspection and verification feedback repair
+
+Desktop runs `run-88954488724871` and `run-19345781609857` showed two separate failure
+classes. The model built a rectangular primitive stack instead of the requested contoured
+holster, then incorrectly judged its own annotated contact sheet as correct; the modeling
+operations themselves all succeeded. The later audit exposed real harness defects:
+`contact_sheet`'s first durable path could be deleted by its own cache prune,
+`inspect_section(plane="XZ", offset=0)` rejected a complete section request, and the
+live-turn battery mirror converted `ok:false` findings plus zero scores into PASS.
+`services/mcp/cad_common.py`, `cad_eval_tools.py`, `services/verify/battery.py`, and
+`services/agent/agent_turn.py` now preserve the first render directory, support named/custom
+offset section planes, rewrite `watertight` exactly, teach that the kernel does not yet
+prove single-body self-intersection instead of silently substituting a weaker check, run
+`dfm_check` as a real battery check, and share the acceptance grader's honest PASS/WARN/FAIL
+semantics. Focused regressions plus a live box-with-through-hole probe verify
+HLR ASCII, a four-view contact sheet, shifted section areas, and the combined battery output.

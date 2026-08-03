@@ -588,6 +588,7 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "check_symmetry":            ("cad",  "check_symmetry",            "seconds",   "any",   "binary"),
     "wall_thickness":            ("cad",  "wall_thickness",            "seconds",   "any",   "findings"),
     "draft_analysis":            ("cad",  "draft_analysis",            "seconds",   "any",   "findings"),
+    "dfm_check":                 ("intake", "dfm_check",               "seconds",   "any",   "dfm"),
     "solve_mates":               ("cad",  "solve_mates",               "seconds",   "any",   "binary"),
     # T-BL49: design-time interface alignment (hole patterns, coaxiality, contact planes,
     # fastener pass-through) between mating components.  Implemented directly (gap) since it
@@ -625,6 +626,14 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "power_budget":              ("gap",  "power_budget",              "subsecond", "any",   "findings"),
 }
 
+# Common verification vocabulary models use in build briefs.  These are exact semantic
+# rewrites to existing checks, not fuzzy guesses; verify() echoes every rewrite.
+CHECK_ALIASES: dict[str, str] = {
+    "watertight": "is_manifold",
+    "manifold": "is_manifold",
+    "solid_health": "eval_check",
+}
+
 # ---------------------------------------------------------------------------
 # Private MCP singleton — one FastMCP per module_key, built on first use
 # ---------------------------------------------------------------------------
@@ -648,6 +657,9 @@ def _get_fn(module_key: str, fn_name: str):
         elif module_key == "cam":
             from mcp_server.cam_tools import register_cam_tools
             register_cam_tools(_mcp)
+        elif module_key == "intake":
+            from mcp_server.intake_tools import register_intake_tools
+            register_intake_tools(_mcp)
         _PRIVATE_MCP[module_key] = _mcp
     mcp = _PRIVATE_MCP[module_key]
     tool = mcp._tool_manager._tools.get(fn_name)
@@ -1197,6 +1209,23 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tupl
                     "detail": r.get("summary") or r.get("error") or "",
                 })
 
+    elif reward_shape == "dfm":
+        checks = r.get("checks") if isinstance(r.get("checks"), list) else []
+        failed = [c for c in checks if isinstance(c, dict) and c.get("ok") is False]
+        score = 1.0 if r.get("dfm_pass") is True and not failed else 0.0
+        for item in failed:
+            findings.append({
+                "check": check_name,
+                "ok": False,
+                "detail": item.get("note") or str(item),
+            })
+        if not checks and r.get("dfm_pass") is not True:
+            findings.append({
+                "check": check_name,
+                "ok": False,
+                "detail": r.get("error") or "DFM check returned no process checks",
+            })
+
     else:  # "findings"
         # interface_check (T-BL49) reports a `findings` list of {severity, detail, fix, ...};
         # only severity=="fail" entries should drive the score/fail (warns are advisory). Other
@@ -1238,6 +1267,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
           "findings": [{check, ok, detail}, ...],    # sorted by check name
           "elapsed_ms": float,
           "skipped": [check_name, ...],  # platform-filtered checks
+          "interpreted": [{from, to}, ...],  # accepted check-name aliases
         }
     """
     import inspect
@@ -1249,17 +1279,32 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
         checks = [n for n, meta in CHECKS.items()
                   if meta[2] == "subsecond" and (meta[3] == "any" or is_posix)]
 
+    interpreted: list[dict[str, str]] = []
+    normalized: list[str] = []
+    for requested in checks:
+        key = str(requested).strip()
+        canonical = CHECK_ALIASES.get(key.lower(), key)
+        if canonical != key:
+            interpreted.append({"from": key, "to": canonical})
+        if canonical not in normalized:
+            normalized.append(canonical)
+    checks = normalized
+
     scores: dict[str, float] = {}
     findings: list[dict] = []
     skipped: list[str] = []
 
     for name in sorted(checks):  # deterministic order
         if name not in CHECKS:
-            findings.append({
-                "check": name,
-                "ok": False,
-                "detail": f"unknown check {name!r}",
-            })
+            if name in ("self_intersection", "self_intersections"):
+                detail = (
+                    "self-intersection is not a deterministic battery check yet. "
+                    "check_geometry_health reports self_intersection.checked=false explicitly; "
+                    "do not substitute eval_check/is_manifold because neither proves this."
+                )
+            else:
+                detail = f"unknown check {name!r}"
+            findings.append({"check": name, "ok": False, "detail": detail})
             scores[name] = 0.0
             continue
 
@@ -1326,6 +1371,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
         "findings": sorted(findings, key=lambda f: f.get("check", "")),
         "elapsed_ms": round(elapsed, 1),
         "skipped": sorted(skipped),
+        "interpreted": interpreted,
     }
 
 

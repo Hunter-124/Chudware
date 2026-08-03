@@ -126,8 +126,9 @@ def test_render_output_path_prunes_once(cache, monkeypatch):
     old = time.time() - 30 * 86400
     os.utime(stale, (old, old))
 
-    cad_common.render_output_path("first", ".png")
+    first = Path(cad_common.render_output_path("first", ".png"))
     assert not stale.exists()
+    assert first.parent.is_dir()  # first render must not target a day dir pruned moments earlier
     assert cad_common._RENDER_PRUNE_DONE is True
 
     stale.parent.mkdir(parents=True, exist_ok=True)

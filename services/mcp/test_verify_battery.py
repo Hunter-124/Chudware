@@ -220,6 +220,49 @@ def test_verify_unknown_check(monkeypatch):
     assert any("nonexistent_check" in f.get("check", "") for f in result["findings"])
 
 
+def test_verify_aliases_watertight_but_does_not_fake_self_intersection(monkeypatch):
+    """The live holster vocabulary gets exact rewrites and an honest capability boundary."""
+    import services.verify.battery as bat
+
+    monkeypatch.setitem(
+        bat.GAP_FNS, "is_manifold",
+        lambda **_: json.dumps({"ok": True, "summary": "manifold"}),
+    )
+    result = bat.verify(
+        doc_id="x", checks=["watertight", "self_intersection"],
+    )
+    assert result["scores"] == {"is_manifold": 1.0, "self_intersection": 0.0}
+    assert result["interpreted"] == [
+        {"from": "watertight", "to": "is_manifold"},
+    ]
+    assert len(result["findings"]) == 1
+    assert result["findings"][0]["check"] == "self_intersection"
+    assert result["findings"][0]["ok"] is False
+    assert "do not substitute eval_check/is_manifold" in result["findings"][0]["detail"]
+
+
+def test_extract_score_dfm_uses_dfm_pass_and_failed_checks():
+    from services.verify.battery import _extract_score
+
+    score, findings = _extract_score(
+        "dfm_check", "dfm",
+        json.dumps({
+            "ok": True,
+            "dfm_pass": False,
+            "checks": [
+                {"check": "min_wall", "ok": False,
+                 "note": "thinnest wall 0.50mm vs fdm minimum 0.8mm"},
+            ],
+        }),
+    )
+    assert score == 0.0
+    assert findings == [{
+        "check": "dfm_check",
+        "ok": False,
+        "detail": "thinnest wall 0.50mm vs fdm minimum 0.8mm",
+    }]
+
+
 def test_verify_findings_deterministic(monkeypatch):
     """Findings list (not just scores) is identical across repeated runs."""
     import services.verify.battery as bat

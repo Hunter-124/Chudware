@@ -1307,54 +1307,145 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def inspect_section(plane: Optional[str] = None, doc_id: Optional[str] = None,
+    def inspect_section(plane: Optional[Union[str, dict]] = None,
+                        doc_id: Optional[str] = None,
+                        offset: Optional[float] = None,
+                        origin: Optional[list] = None,
+                        normal: Optional[list] = None,
+                        xdir: Optional[list] = None,
                         **kwargs: Annotated[Any, Field(default=None)]) -> str:
-        """Cut the part with a datum plane and report the CROSS-SECTION area + section moments.
+        """Cut the part with a plane and report the CROSS-SECTION area + section moments.
 
         This is the "section the part to inspect its internals" probe. It slices the active
-        body with one of the reserved datum planes and computes the real properties of the
-        resulting cut face — the cross-section a draftsman would dimension.
+        body and computes the real properties of the resulting cut face — the cross-section a
+        draftsman would dimension.
 
         plane : "top" (XY, normal +Z), "front" (XZ, normal -Y), or "right" (YZ, normal +X) —
-                the reserved Chudware datum planes (Z-up). The cut passes through the origin.
-                Spellable as its axis pair ("XY"/"xz"/"YZ"), as a normal axis ("z"/"+x"), or as
-                section= / at= / datum= / plane_name= — every rewrite is echoed in
-                `interpreted`, and an unreadable name lists the three legal planes instead of
-                dying on "not a reserved planar datum".
+                the reserved Chudware datum planes (Z-up). Spellable as "XY"/"XZ"/"YZ", a
+                normal axis, section=, datum=, or plane_name=. You may instead pass a custom
+                {"origin":[x,y,z], "normal":[nx,ny,nz], "xdir":[...]} plane.
+        offset: shift a named plane by this many mm along its signed normal. offset=0 is the
+                world-origin datum. offset_mm=, distance= and a numeric at= are accepted.
+        origin/normal/xdir: flattened spelling of the custom-plane object. origin and normal
+                must be supplied together; xdir is optional.
 
         Returns {ok, area_mm2, centroid:[x,y,z], Ixx, Iyy, Ixy, summary}:
           * area_mm2 — the cross-section area (mm^2), the headline number. For a solid this is
             the filled region; for a thin/hollow wall it's the material the plane cuts through.
           * centroid — the area centroid of the section, in world coordinates.
-          * Ixx/Iyy/Ixy — the section second moments of area (mm^4), expressed in the cutting
-            plane's frame (use for bending stiffness / section modulus reasoning).
-        Use it to verify a beam's cross-section, check a wall's cut area, or feed a hand
-        bending calc. A plane that misses the body (empty cut) returns area 0.
+          * Ixx/Iyy/Ixy — centroidal section second moments (mm^4) in the cutting-plane frame.
+        A plane that misses the body (empty cut) returns area 0.
         """
         d = None
         try:
             extra = _extra_kwargs(dict(kwargs))
             notes: list = []
+
+            at = extra.pop("at", None)
+            if at is not None:
+                if isinstance(at, (int, float)) and not isinstance(at, bool):
+                    if offset is not None and float(offset) != float(at):
+                        raise ValueError(
+                            f"inspect_section(): offset={offset!r} conflicts with at={at!r}.")
+                    offset = float(at)
+                    notes.append(f"at={at!r} read as offset={offset:g} mm")
+                else:
+                    if plane is not None and plane != at:
+                        raise ValueError(
+                            f"inspect_section(): plane={plane!r} conflicts with at={at!r}.")
+                    plane = at
+                    notes.append(f"at={at!r} read as plane={at!r}")
+
             plane = _one_alias("inspect_section", "plane", extra,
-                               ("section", "section_plane", "at", "datum", "datum_plane",
+                               ("section", "section_plane", "datum", "datum_plane",
                                 "plane_name", "axis"), plane, notes)
-            _reject_unknown("inspect_section", extra, "it takes plane= and doc_id=.")
-            plane = _read_plane("inspect_section", plane, notes)
-            d = _doc(doc_id)
-            res = cb.call("eval_section_props", {"doc_id": d, "plane": plane})
-            area = res.get("area_mm2", 0.0)
-            if area and area > 0:
-                summary = f"cross-section area at plane '{plane}' = {area:.6g} mm^2"
+            offset = _one_alias("inspect_section", "offset", extra,
+                                ("offset_mm", "distance", "distance_mm"), offset, notes)
+            origin = _one_alias("inspect_section", "origin", extra,
+                                ("point", "location"), origin, notes)
+            normal = _one_alias("inspect_section", "normal", extra,
+                                ("normal_dir", "direction"), normal, notes)
+            xdir = _one_alias("inspect_section", "xdir", extra,
+                              ("x_dir",), xdir, notes)
+            _reject_unknown(
+                "inspect_section", extra,
+                "it takes plane=, offset=, origin=, normal=, xdir= and doc_id=.")
+
+            if isinstance(plane, dict):
+                plane_ref: Union[str, dict] = dict(plane)
+                if origin is not None or normal is not None or xdir is not None:
+                    raise ValueError(
+                        "inspect_section(): pass the custom plane either as plane={origin,normal"
+                        "[,xdir]} OR as flattened origin=/normal=/xdir= arguments, not both.")
+            elif origin is not None or normal is not None or xdir is not None:
+                if origin is None or normal is None:
+                    raise ValueError(
+                        "inspect_section(): a custom cut needs both origin=[x,y,z] and "
+                        "normal=[nx,ny,nz]; xdir=[x,y,z] is optional.")
+                plane_ref = {"origin": origin, "normal": normal}
+                if xdir is not None:
+                    plane_ref["xdir"] = xdir
+                if plane is not None:
+                    notes.append(
+                        f"plane={plane!r} ignored because explicit origin=/normal= define the cut")
             else:
-                summary = (f"plane '{plane}' produced no closed cross-section (the cut may miss "
-                           f"the body or only graze an edge) — area = 0. The cut always passes "
-                           f"through the ORIGIN, so a part modelled away from it sections empty: "
-                           f"check where the body sits with measure_part (centre of mass) and "
-                           f"try another plane, e.g. inspect_section(plane=\"front\").")
+                named = _read_plane("inspect_section", plane, notes)
+                plane_ref = named
+                if offset is not None:
+                    if isinstance(offset, bool) or not isinstance(offset, (int, float)):
+                        raise ValueError(
+                            f"inspect_section(offset={offset!r}): offset must be a number in mm.")
+                    distance = float(offset)
+                    if distance != 0.0:
+                        normals = {
+                            "top": [0.0, 0.0, 1.0],
+                            "front": [0.0, -1.0, 0.0],
+                            "right": [1.0, 0.0, 0.0],
+                        }
+                        n = normals[named]
+                        plane_ref = {
+                            "origin": [distance * n[0], distance * n[1], distance * n[2]],
+                            "normal": n,
+                        }
+                        notes.append(
+                            f"offset={distance:g} mm shifted the {named!r} datum along its normal")
+
+                        offset = None  # already applied; do not re-shift in the custom-plane path
+            if isinstance(plane_ref, dict) and offset not in (None, 0, 0.0):
+                if "origin" not in plane_ref or "normal" not in plane_ref:
+                    raise ValueError(
+                        "inspect_section(): offset on a custom plane requires origin and normal.")
+                o = plane_ref.get("origin")
+                n = plane_ref.get("normal")
+                if not (isinstance(o, (list, tuple)) and len(o) == 3
+                        and isinstance(n, (list, tuple)) and len(n) == 3):
+                    raise ValueError(
+                        "inspect_section(): custom plane origin/normal must be numeric [x,y,z].")
+                mag = sum(float(v) * float(v) for v in n) ** 0.5
+                if mag <= 1e-12:
+                    raise ValueError("inspect_section(): custom plane normal is near-zero.")
+                distance = float(offset)
+                plane_ref["origin"] = [
+                    float(o[i]) + distance * float(n[i]) / mag for i in range(3)
+                ]
+                notes.append(f"offset={distance:g} mm shifted the custom plane along its normal")
+
+            d = _doc(doc_id)
+            res = cb.call("eval_section_props", {"doc_id": d, "plane": plane_ref})
+            area = res.get("area_mm2", 0.0)
+            label = plane_ref if isinstance(plane_ref, str) else "custom"
+            if area and area > 0:
+                summary = f"cross-section area at plane '{label}' = {area:.6g} mm^2"
+            else:
+                summary = (
+                    f"plane '{label}' produced no closed cross-section (the cut may miss the "
+                    f"body or only graze an edge) — area = 0. Check where the body sits with "
+                    f"measure_part and move the cut with offset= or origin=/normal=.")
             return _dumps(_interpreted(
-                {"ok": True, "doc_id": d, "plane": plane, "summary": summary, **res}, notes))
+                {"ok": True, "doc_id": d, "plane": plane_ref,
+                 "summary": summary, **res}, notes))
         except Exception as e:  # noqa: BLE001
-            return _err(_teach_no_bodies(e, d, f'inspect_section(plane="{plane or "top"}")'))
+            return _err(_teach_no_bodies(e, d, 'inspect_section(plane="top", offset=0)'))
 
 
 

@@ -9375,36 +9375,29 @@ def _mirror_c1_grading_evidence(tool: str, args: dict, result: Any,
 
     if tool == "verify_battery":
         verdict = None
+        verdict_detail = ""
+        # Keep the live-turn mirror on the SAME verdict semantics as acceptance grading.
+        # The old local parser only treated severity=fail as a failure, so ordinary battery
+        # findings shaped {"ok": false} (and zero scores) were mirrored as PASS.  That is
+        # exactly what happened in live run-88954488724871.
+        from services.agent.reviewer_exec import (  # noqa: PLC0415
+            NOT_CHECKED,
+            interpret_battery_result,
+        )
         for src in (payload, answer):
             if not isinstance(src, dict):
                 continue
-            for k in ("verdict", "status", "result"):
-                v = src.get(k)
-                if isinstance(v, str) and v.strip():
-                    verdict = v.strip().upper()
-                    break
-            if verdict:
+            candidate, detail = interpret_battery_result(src)
+            if candidate != NOT_CHECKED:
+                verdict = candidate
+                verdict_detail = detail
                 break
-            # scores/findings shape: PASS when no failing findings
-            findings = src.get("findings")
-            scores = src.get("scores")
-            if findings is not None or scores is not None:
-                failing = []
-                if isinstance(findings, list):
-                    failing = [f for f in findings
-                               if isinstance(f, dict)
-                               and str(f.get("severity") or f.get("level") or "")
-                               .lower() in ("fail", "error", "blocker")]
-                verdict = "FAIL" if failing else "PASS"
-                break
-        if verdict is None and payload.get("ok") is True:
-            verdict = "PASS"
         if verdict:
             try:
                 ledger.add_artifact(
                     actor, "battery", "battery",
                     path="", stage="verify",
-                    note=f"verify_battery {verdict}",
+                    note=f"verify_battery {verdict}: {verdict_detail}",
                     verdict=verdict,
                 )
             except Exception:  # noqa: BLE001
@@ -9440,7 +9433,7 @@ def _mirror_c1_grading_evidence(tool: str, args: dict, result: Any,
                 ledger.append(actor, "battery_result", {
                     "verdict": verdict,
                     "ok": verdict == "PASS",
-                    "detail": f"verify_battery {verdict}",
+                    "detail": verdict_detail or f"verify_battery {verdict}",
                     "checks": checks,
                     "source": "agent_turn_mirror",
                     "doc_id": (args or {}).get("doc_id") if isinstance(args, dict) else None,

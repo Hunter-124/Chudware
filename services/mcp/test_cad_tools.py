@@ -1198,6 +1198,20 @@ def test_inspect_section_real_area():
     assert "mm^2" in s["summary"], s
     # Second moments of a 40(b) x 20(h) rect about its centroid in the plane frame are nonzero.
     assert s["Ixx"] > 0 and s["Iyy"] > 0, s
+    # The live run run-19345781609857 used the natural plane+offset spelling.  The
+    # wrapper must forward that as the engine's arbitrary origin/normal plane instead of
+    # rejecting a complete request at the tool boundary.
+    shifted, _ = _call("inspect_section", {
+        "plane": "right", "offset": 10, "doc_id": doc,
+    })
+    assert shifted["ok"] and abs(shifted["area_mm2"] - 800.0) < 1.0, shifted
+    assert shifted["plane"]["origin"] == [10.0, 0.0, 0.0], shifted
+    assert shifted["plane"]["normal"] == [1.0, 0.0, 0.0], shifted
+
+    custom, _ = _call("inspect_section", {
+        "origin": [0, 5, 0], "normal": [0, 1, 0], "doc_id": doc,
+    })
+    assert custom["ok"] and abs(custom["area_mm2"] - 1200.0) < 1.0, custom
 
 
 def test_wall_thickness_numeric_on_shell():

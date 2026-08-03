@@ -655,12 +655,14 @@ def render_output_path(stem: str = "render", suffix: str = ".png") -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(stem or ""))
     safe = re.sub(r"-{2,}", "-", safe).strip("-.")[:60].strip("-.") or "render"
     day = Path(_paths.CACHE) / "renders" / time.strftime("%Y-%m-%d")
-    day.mkdir(parents=True, exist_ok=True)
     global _RENDER_PRUNE_DONE
     if not _RENDER_PRUNE_DONE:
-        # Opportunistic, once per process: keeps the cache bounded without a cron/daemon.
+        # Prune before creating today's directory.  prune_render_cache() removes empty day
+        # directories; creating the directory first let the first render path in a process
+        # point into a directory the prune had just deleted.
         _RENDER_PRUNE_DONE = True
         prune_render_cache()
+    day.mkdir(parents=True, exist_ok=True)
     return os.path.abspath(str(day / f"{safe}-{os.urandom(4).hex()}{suffix}"))
 
 

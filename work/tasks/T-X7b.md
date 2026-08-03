@@ -25,3 +25,17 @@ honestly left partial and split here:
 - [ ] McMaster (and where available) STEP acquire -> import_part with source metadata.
 - [ ] Structured price/availability feeds the bom_price approved-provider seam.
 - [ ] Tests; scripts/gate.sh PASS; graphify update.
+
+## Locked decisions
+
+- **No McMaster API key (Hunter, 2026-08-03).** McMaster will not issue one, so the
+  acquisition path is the **CEF driving method**, not a vendor API: the interactive
+  sign-in panel (`host/src/ui/widgets/cef/`, `docs/design/cef_webview.md`) establishes the
+  session in the shared warm profile, and `services/browser/cef_client.py` drives that same
+  profile headlessly. `services/browser/adapters/mcmaster.py::acquire` already resolves the
+  client-minted `.step` download URL by running the page's own JS — the remaining work is
+  wiring its result into `import_part` with source metadata, NOT adding an API client.
+  Any adapter written against a hypothetical McMaster API is out of scope.
+- Structured price/availability still feeds the `bom_price` approved-provider seam from
+  whatever the CEF fetch parsed; a scraped price must be labelled with its provenance and
+  timestamp rather than presented as a vendor-quoted figure.

@@ -29,7 +29,9 @@ model completion, so a queued steer lands as a user-role message at the
 sub-agent's next model call.  A steer queued after the sub-agent finished stays
 pending forever (the GUI shows the session status so the user can tell).
 ``request_terminate`` is the same shape: a flag honored at the next turn
-boundary — never a hard kill.
+boundary — never a hard kill.  Pause, approval holds, and runtime overrides
+are also polled only at turn boundaries: work already in flight finishes first,
+and a model/provider or effort change starts with the next model completion.
 
 Concurrency model: one writer per sub-agent for meta/transcript (the runner);
 the steer queue is append-only from any process and consumed only by the runner.
@@ -49,7 +51,26 @@ from typing import Any, Optional
 SCHEMA = "aicad.subagent_session/1"
 
 #: Session statuses mirror delegation node statuses plus "terminated".
-STATUSES = ("pending", "approved", "running", "done", "failed", "revoked", "terminated")
+STATUSES = (
+    "pending", "approved", "running", "paused", "done", "failed", "revoked",
+    "terminated",
+)
+
+_CONTROL_DEFAULTS = {
+    "paused": False,
+    "awaiting_approval": False,
+    "spawn_decision": "",
+    "model_override": "",
+    "provider_override": "",
+    "effort_override": "",
+}
+
+
+def _default_control_state(meta: dict) -> dict:
+    """Return *meta* with control-plane keys present for legacy records."""
+    for key, default in _CONTROL_DEFAULTS.items():
+        meta.setdefault(key, default)
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +167,7 @@ def register_session(
     model: str = "",
     budget_tokens: int = 0,
     status: str = "pending",
+    awaiting_approval: bool = False,
 ) -> dict:
     """Create (or refresh) a session record.  Returns the stored metadata dict."""
     sid = _safe_id(subagent_id)
@@ -163,6 +185,13 @@ def register_session(
         "budget_tokens": int(budget_tokens),
         "status": status if status in STATUSES else "pending",
         "terminate_requested": bool(existing.get("terminate_requested", False)),
+        "paused": bool(existing.get("paused", False)),
+        "awaiting_approval": bool(
+            existing.get("awaiting_approval", awaiting_approval)),
+        "spawn_decision": str(existing.get("spawn_decision", "")),
+        "model_override": str(existing.get("model_override", "")),
+        "provider_override": str(existing.get("provider_override", "")),
+        "effort_override": str(existing.get("effort_override", "")),
         "created_ts": existing.get("created_ts") or _now(),
         "updated_ts": _now(),
     }
@@ -180,7 +209,7 @@ def get_session(subagent_id: str) -> Optional[dict]:
         return None
     try:
         meta = json.loads(path.read_text(encoding="utf-8"))
-        return meta if isinstance(meta, dict) else None
+        return _default_control_state(meta) if isinstance(meta, dict) else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -214,6 +243,7 @@ def list_sessions(limit: int = 50) -> list[dict]:
             if not isinstance(meta, dict) or meta.get("schema") != SCHEMA:
                 continue
             sid = meta.get("id", "")
+            _default_control_state(meta)
             meta["pending_steers"] = len(pending_steers(sid)) if sid else 0
             meta["transcript_len"] = len(_read_lines(_transcript_path(sid))) if sid else 0
             sessions.append(meta)
@@ -251,7 +281,7 @@ def get_transcript(subagent_id: str, limit: int = 200) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Steering queue (injection) + terminate flag
+# Steering queue (injection), terminate flag, and turn-boundary controls
 # ---------------------------------------------------------------------------
 
 def queue_steer(subagent_id: str, text: str, *, source: str = "user") -> dict:
@@ -321,3 +351,92 @@ def request_terminate(subagent_id: str) -> bool:
 def terminate_requested(subagent_id: str) -> bool:
     meta = get_session(subagent_id)
     return bool(meta and meta.get("terminate_requested"))
+
+
+def set_paused(subagent_id: str, paused: bool) -> bool:
+    """Set or clear the turn-boundary pause flag."""
+    meta = get_session(subagent_id)
+    if meta is None:
+        return False
+    meta["paused"] = bool(paused)
+    meta["updated_ts"] = _now()
+    _write_meta(meta["id"], meta)
+    return True
+
+
+def is_paused(subagent_id: str) -> bool:
+    meta = get_session(subagent_id)
+    return bool(meta and meta.get("paused"))
+
+
+def set_runtime_override(
+    subagent_id: str,
+    *,
+    model=None,
+    provider=None,
+    effort=None,
+) -> bool:
+    """Set runtime overrides; ``None`` leaves a value and ``""`` clears it."""
+    meta = get_session(subagent_id)
+    if meta is None:
+        return False
+    if model is not None:
+        meta["model_override"] = str(model).strip()
+    if provider is not None:
+        meta["provider_override"] = str(provider).strip()
+    if effort is not None:
+        raw_effort = str(effort).strip()
+        if raw_effort:
+            from services.agent.role_models import (  # noqa: PLC0415
+                clamp_subagent_effort,
+            )
+            clamped = clamp_subagent_effort(raw_effort)
+            if clamped not in ("low", "medium", "high"):
+                raise ValueError(
+                    "effort must be one of: low, medium, high, or empty")
+            meta["effort_override"] = clamped
+        else:
+            meta["effort_override"] = ""
+    meta["updated_ts"] = _now()
+    _write_meta(meta["id"], meta)
+    return True
+
+
+def runtime_override(subagent_id: str) -> dict:
+    meta = get_session(subagent_id) or {}
+    return {
+        "model": str(meta.get("model_override", "")),
+        "provider": str(meta.get("provider_override", "")),
+        "effort": str(meta.get("effort_override", "")),
+    }
+
+
+def decide_spawn(
+    subagent_id: str,
+    *,
+    approve: bool,
+    by: str = "user",
+) -> bool:
+    """Record a pending spawn decision for the runner's next boundary poll."""
+    meta = get_session(subagent_id)
+    if meta is None:
+        return False
+    meta["spawn_decision"] = "approved" if approve else "denied"
+    meta["awaiting_approval"] = False
+    meta["spawn_decided_by"] = str(by)
+    meta["spawn_decided_ts"] = _now()
+    meta["updated_ts"] = _now()
+    _write_meta(meta["id"], meta)
+    if approve:
+        set_status(meta["id"], "approved", note=f"spawn approved by {by}")
+    return True
+
+
+def spawn_decision(subagent_id: str) -> str:
+    meta = get_session(subagent_id)
+    return str(meta.get("spawn_decision", "")) if meta else ""
+
+
+def awaiting_approval(subagent_id: str) -> bool:
+    meta = get_session(subagent_id)
+    return bool(meta and meta.get("awaiting_approval"))

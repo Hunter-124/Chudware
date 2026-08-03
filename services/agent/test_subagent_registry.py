@@ -15,6 +15,7 @@ Proves, offline (mock provider, tmpdir registry — no all-skip):
 """
 from __future__ import annotations
 
+import json
 import pytest
 
 from services.agent import subagent_registry as reg
@@ -257,3 +258,134 @@ def test_rpc_terminate_requires_confirm():
     ok = _rpc("subagent_terminate", {"subagent_id": "dg_r2", "confirm": True})
     assert ok["ok"] and ok["terminate_requested"]
     assert reg.terminate_requested("dg_r2")
+
+
+def test_rpc_control_pause_resume_roundtrip():
+    reg.register_session("dg_ctl_pause", role="worker", status="running")
+
+    paused = _rpc(
+        "subagent_control",
+        {"subagent_id": "dg_ctl_pause", "op": "pause"},
+    )
+    assert paused["ok"] and paused["paused"] is True
+    assert reg.is_paused("dg_ctl_pause")
+
+    resumed = _rpc(
+        "subagent_control",
+        {"subagent_id": "dg_ctl_pause", "op": "resume"},
+    )
+    assert resumed["ok"] and resumed["paused"] is False
+    assert not reg.is_paused("dg_ctl_pause")
+
+
+def test_rpc_control_deny_requires_confirm_and_records_decision():
+    reg.register_session(
+        "dg_ctl_deny", role="worker", awaiting_approval=True)
+
+    refused = _rpc(
+        "subagent_control",
+        {"subagent_id": "dg_ctl_deny", "op": "deny"},
+    )
+    assert not refused["ok"] and refused.get("requires_confirm") is True
+    assert reg.spawn_decision("dg_ctl_deny") == ""
+
+    denied = _rpc(
+        "subagent_control",
+        {"subagent_id": "dg_ctl_deny", "op": "deny", "confirm": True},
+    )
+    assert denied["ok"] and denied["spawn_decision"] == "denied"
+    assert reg.spawn_decision("dg_ctl_deny") == "denied"
+
+
+def test_rpc_control_approve_refuses_non_pending_session():
+    reg.register_session("dg_ctl_not_waiting", role="worker", status="running")
+
+    refused = _rpc(
+        "subagent_control",
+        {"subagent_id": "dg_ctl_not_waiting", "op": "approve"},
+    )
+    assert not refused["ok"]
+    assert "not awaiting" in refused["reason"]
+    assert reg.spawn_decision("dg_ctl_not_waiting") == ""
+
+
+def test_rpc_control_approve_releases_pending_spawn():
+    reg.register_session(
+        "dg_ctl_approve", role="worker", awaiting_approval=True)
+
+    approved = _rpc(
+        "subagent_control",
+        {"subagent_id": "dg_ctl_approve", "op": "approve"},
+    )
+    assert approved["ok"] and approved["spawn_decision"] == "approved"
+    assert approved["awaiting_approval"] is False
+    session = reg.get_session("dg_ctl_approve")
+    assert session["status"] == "approved"
+    assert session["awaiting_approval"] is False
+
+
+def test_rpc_control_runtime_effort_validation_and_list_roundtrip():
+    reg.register_session("dg_ctl_runtime", role="worker", status="running")
+
+    refused = _rpc(
+        "subagent_control",
+        {
+            "subagent_id": "dg_ctl_runtime",
+            "op": "set_runtime",
+            "effort": "impossibly-hard",
+        },
+    )
+    assert not refused["ok"]
+    assert reg.runtime_override("dg_ctl_runtime")["effort"] == ""
+
+    updated = _rpc(
+        "subagent_control",
+        {
+            "subagent_id": "dg_ctl_runtime",
+            "op": "set_runtime",
+            "effort": "high",
+        },
+    )
+    assert updated["ok"] and updated["effort_override"] == "high"
+    assert reg.runtime_override("dg_ctl_runtime")["effort"] == "high"
+    listed = _rpc("subagent_list", {})
+    session = next(
+        item for item in listed["sessions"]
+        if item["id"] == "dg_ctl_runtime"
+    )
+    assert session["effort_override"] == "high"
+
+
+def test_rpc_list_defaults_control_keys_for_legacy_meta():
+    sid = "dg_legacy"
+    legacy = {
+        "schema": reg.SCHEMA,
+        "id": sid,
+        "role": "worker",
+        "status": "running",
+        "created_ts": "2026-01-01T00:00:00+00:00",
+        "updated_ts": "2026-01-01T00:00:00+00:00",
+    }
+    reg._meta_path(sid).write_text(json.dumps(legacy), encoding="utf-8")
+
+    listed = _rpc("subagent_list", {})
+    assert listed["ok"]
+    session = next(item for item in listed["sessions"] if item["id"] == sid)
+    assert {
+        key: session[key]
+        for key in (
+            "paused",
+            "awaiting_approval",
+            "spawn_decision",
+            "model_override",
+            "provider_override",
+            "effort_override",
+        )
+    } == {
+        "paused": False,
+        "awaiting_approval": False,
+        "spawn_decision": "",
+        "model_override": "",
+        "provider_override": "",
+        "effort_override": "",
+    }

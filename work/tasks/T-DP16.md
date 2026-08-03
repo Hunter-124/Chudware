@@ -3,7 +3,7 @@ id: T-DP16
 title: AI-Agent workspace — full-screen comprehensive copilot (DAG + worker steering + session mgmt)
 workstream: DP
 owner: unassigned
-status: in_progress
+status: review
 branch: task/T-DP16-ai-agent-workspace
 depends_on: [T-DP15, T-DP17]
 lane: app-gui
@@ -64,13 +64,31 @@ turn boundary and says so in the transcript.
 
 - [x] AI-Agent workspace renders the DAG centerpiece + steering rail + session list.
       (Ships: `drawAgentHubView`, `drawNavColumn`, view 4 `chatDrawSessionsList`.)
-- [ ] Worker steering actions wired to the delegation/mission control seams:
+- [x] Worker steering actions wired to the delegation/mission control seams:
       - [x] redirect (`subagent_steer`) and kill (`subagent_terminate`)
-      - [ ] pause / resume
-      - [ ] live model + effort change
-      - [ ] pending-spawn approve / deny (releases the stranded depth>1 delegations)
-- [ ] Session management: switch/fork/resume works against real sessions.
-      (switch/resume ship; `forkConversation` is the remainder.)
+      - [x] pause / resume (`subagent_control` op `pause`/`resume`; park loop in
+            `agent_turn.py`, 0.5 s poll, `CHUDWARE_SUBAGENT_HOLD_MAX_S` cap, auto-resume on expiry)
+      - [x] live model + effort change (`op: set_runtime`; effort scales the per-completion cap
+            off the original base, model/provider rebuild the provider via `config.get_provider`)
+      - [x] pending-spawn approve / deny — `delegation.request_delegation` now registers
+            `awaiting_approval` whenever the routing policy is not `auto`, so the depth>1
+            delegations that were stranded `pending` forever are released by a human decision.
+            Deny is confirm-gated; an expired approval hold denies fail-safe.
+- [x] Session management: switch/fork/resume works against real sessions.
+      (`forkConversation` in `conversations.cpp:1467`; Fork button in `drawSessionsPanel`.
+      Forking the ACTIVE session copies the live `st.chat` buffer, resets run-in-flight state and
+      drops step thumbnail texture ids so the fork never shares a GL handle.)
 - [x] Overlay copilot unchanged in modeling; comprehensive view only in this workspace.
-- [ ] Shot scenarios (populated mission, empty state) render without crashing;
-      ui_style_check clean; `python3 scripts/check.py` PASS. Visual judgment is Hunter's.
+- [x] Gates green 2026-08-03: `test_subagent_registry` 12 -> 18 passed; `test_delegation`
+      99 passed; `ninja Chudware` links; `scripts/check.py` all 8 gates PASS;
+      `gui_lint.py --rule theme` 0 findings; headless `CHUDWARE_SHOT=chat` and
+      `CHUDWARE_SHOT=workspaces` (8 captures incl. `workspace_08_ai`) both exit 0.
+      Visual judgment is Hunter's — see the checklist in the handover.
+
+## Progress log
+
+- **2026-08-03** — Card corrected against reality (the `ui/imgui` framing was dead; the workspace
+  already largely shipped). Closed the two genuine gaps: the sub-agent control plane
+  (pause/resume, live model+effort override, spawn approve/deny) enforced at the single existing
+  turn boundary in `agent_turn.run_turn`, and session fork. Contract amendment appended at
+  `contracts/worker_rpc.md` §6.

@@ -423,6 +423,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
             std::snprintf(sub, sizeof(sub), "%d messages", nMsg);
         const char* archLabel = c.archived ? "Restore" : "Archive";
         const float archBtnW = ImGui::CalcTextSize(archLabel).x + 16.0f * sc;
+        const float forkBtnW = ImGui::CalcTextSize("Fork").x + 16.0f * sc;
         const float actionGap = 4.0f * sc;
         // Action-zone geometry must be computed ONCE and shared by the title clip and the
         // buttons below: the reserve used to assume the trash button was trashSz wide, but
@@ -432,7 +433,8 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const float delBtnW = delImg + style.FramePadding.x * 2.0f;
         const float delBtnH = delImg + style.FramePadding.y * 2.0f;
         const float rightMargin = 4.0f * sc;
-        const float actionsW = delBtnW + archBtnW + actionGap + rightMargin;
+        const float actionsW = delBtnW + archBtnW + forkBtnW +
+                               actionGap * 2.0f + rightMargin;
 
         ImGui::PushID(i);
         const ImVec2 rowMin = ImGui::GetCursorScreenPos();
@@ -590,6 +592,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
         bool doDel = false;
         bool doArchiveToggle = false;
+        bool doFork = false;
         if (rowHot) {
             const float delX = rowMax.x - delBtnW - rightMargin;
             ImGui::SetCursorScreenPos(ImVec2(delX, rowMin.y + (rowH - delBtnH) * 0.5f));
@@ -611,11 +614,18 @@ void drawSessionsPanel(AppState& st, bool busy) {
                     : "Archive: hides from the default list but keeps the full transcript "
                       "(unlike Delete). Toggle \"Show archived\" above to find it again.");
             doArchiveToggle = archClick && !running;
+
+            const float forkX = archX - forkBtnW - actionGap;
+            ImGui::SetCursorScreenPos(ImVec2(forkX, rowMin.y + (rowH - delBtnH) * 0.5f));
+            doFork = ImGui::Button("Fork", ImVec2(forkBtnW, delBtnH));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Fork this session into a new idle copy");
         }
 
         ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
         ImGui::PopID();
         if (doDel) { closeConversation(st, i); break; }
+        if (doFork) { forkConversation(st, i); break; }
         if (doArchiveToggle) { archiveConversation(st, i, !c.archived); break; }
     }
     if (!anyRowShown) {

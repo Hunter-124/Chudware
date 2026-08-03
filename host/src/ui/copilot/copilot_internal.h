@@ -339,6 +339,7 @@ void        newConversation(AppState& st);
 void        switchConversation(AppState& st, int idx);
 void        closeConversation(AppState& st, int idx);
 void        archiveConversation(AppState& st, int idx, bool archived);
+int         forkConversation(AppState& st, int idx);   // -> new conversation index, or -1
 
 // ---- AI settings (settings) ----
 // Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");

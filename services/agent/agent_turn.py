@@ -2029,16 +2029,76 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             pass
         return newly
 
+    _subagent_base_completion_cap = completion_cap
+    _subagent_last_effort = ""
+    _subagent_last_runtime: tuple[str, str] = ("", "")
+
+    def _park_subagent(_sreg, hold_kind: str) -> tuple[str, float]:
+        """Park one approval/pause hold and return its boundary outcome."""
+        started = time.monotonic()
+        status = "pending" if hold_kind == "approval" else "paused"
+        _sreg.set_status(subagent_id, status, note=f"{hold_kind} hold active")
+        _sreg.append_transcript(
+            subagent_id, "system",
+            (
+                "Approval hold entered; waiting for a human approve/deny at "
+                "turn-boundary polls."
+                if hold_kind == "approval"
+                else "Pause hold entered; work already in flight finished before "
+                     "parking at this turn boundary."
+            ),
+        )
+        hold_max_s = max(
+            0.0,
+            float(os.environ.get("CHUDWARE_SUBAGENT_HOLD_MAX_S", "900")),
+        )
+        while True:
+            elapsed = time.monotonic() - started
+            if _sreg.terminate_requested(subagent_id):
+                return "terminate", elapsed
+            if hold_kind == "approval":
+                decision = _sreg.spawn_decision(subagent_id)
+                if decision or not _sreg.awaiting_approval(subagent_id):
+                    return decision or "released", elapsed
+            elif not _sreg.is_paused(subagent_id):
+                return "released", elapsed
+            if elapsed >= hold_max_s:
+                return "timeout", elapsed
+            time.sleep(0.5)
+
+    def _spawn_denied_result(
+        _sreg,
+        *,
+        detail: str,
+        transcript_line: str,
+        timed_out: bool = False,
+    ) -> TurnResult:
+        _sreg.set_status(
+            subagent_id, "revoked",
+            note="spawn approval hold expired" if timed_out else "spawn denied by user",
+        )
+        _sreg.append_transcript(subagent_id, "system", transcript_line)
+        _log(ledger, actor, {
+            "event": "subagent_spawn_denied",
+            "subagent_id": subagent_id,
+            "stop_reason": "denied_by_user",
+            "error_detail": detail,
+            "timed_out": timed_out,
+        })
+        return TurnResult(False, "denied_by_user",
+                          {"calls": calls,
+                           "tool_calls": tool_calls_made,
+                           "stop_reason": "denied_by_user",
+                           "error_detail": detail})
+
     for _ in range(budget + 1):
-        # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  When this turn IS a
-        # sub-agent session (subagent_id set), drain the cross-process steering queue
-        # BEFORE each model completion — a user steer queued from the GUI lands as a
-        # user-role message at the very next model call — and honor a pending
-        # terminate flag by stopping cleanly (never a hard kill).  Best-effort: a
-        # registry failure never breaks the turn.
+        # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  Cross-process
+        # controls never interrupt in-flight work; they land before the next
+        # model completion.  Best-effort: registry failure never breaks a turn.
         if subagent_id:
             try:
                 from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                # Termination remains first: every other hold/control yields to it.
                 if _sreg.terminate_requested(subagent_id):
                     _sreg.set_status(subagent_id, "terminated",
                                      note="terminated by user at turn boundary")
@@ -2054,6 +2114,95 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                        "tool_calls": tool_calls_made,
                                        "stop_reason": "terminated_by_user",
                                        "error_detail": "Run cancelled by user."})
+
+                decision = _sreg.spawn_decision(subagent_id)
+                if decision == "denied":
+                    return _spawn_denied_result(
+                        _sreg,
+                        detail="Spawn denied by user.",
+                        transcript_line=(
+                            "Sub-agent spawn denied by the user at a turn boundary."),
+                    )
+                if _sreg.awaiting_approval(subagent_id) and not decision:
+                    hold_outcome, held_s = _park_subagent(_sreg, "approval")
+                    if hold_outcome == "terminate":
+                        _sreg.append_transcript(
+                            subagent_id, "system",
+                            f"Approval hold left after {held_s:.1f}s; a pending "
+                            "termination will be honored at the next boundary.")
+                        continue
+                    if hold_outcome == "timeout":
+                        _sreg.decide_spawn(
+                            subagent_id, approve=False, by="approval_timeout")
+                        return _spawn_denied_result(
+                            _sreg,
+                            detail=(
+                                f"Approval hold timed out after {held_s:.1f}s; "
+                                "unapproved spawn denied fail-safe."
+                            ),
+                            transcript_line=(
+                                f"Approval hold expired after {held_s:.1f}s; "
+                                "the unapproved spawn was denied fail-safe."),
+                            timed_out=True,
+                        )
+                    if hold_outcome == "denied":
+                        return _spawn_denied_result(
+                            _sreg,
+                            detail="Spawn denied by user.",
+                            transcript_line=(
+                                f"Approval hold left after {held_s:.1f}s: "
+                                "spawn denied by the user."),
+                        )
+                    _sreg.set_status(
+                        subagent_id, "running",
+                        note="spawn approved; approval hold released")
+                    _sreg.append_transcript(
+                        subagent_id, "system",
+                        f"Approval hold left after {held_s:.1f}s: spawn approved; "
+                        "continuing at this turn boundary.")
+                    _log(ledger, actor, {
+                        "event": "subagent_approval_hold_released",
+                        "subagent_id": subagent_id,
+                        "duration_s": held_s,
+                        "outcome": hold_outcome,
+                    })
+
+                if _sreg.is_paused(subagent_id):
+                    hold_outcome, held_s = _park_subagent(_sreg, "pause")
+                    if hold_outcome == "terminate":
+                        _sreg.append_transcript(
+                            subagent_id, "system",
+                            f"Pause hold left after {held_s:.1f}s; a pending "
+                            "termination will be honored at the next boundary.")
+                        continue
+                    if hold_outcome == "timeout":
+                        _sreg.set_paused(subagent_id, False)
+                        outcome_note = (
+                            f"Pause hold expired after {held_s:.1f}s and "
+                            "auto-resumed; continuing at this turn boundary.")
+                    else:
+                        outcome_note = (
+                            f"Pause hold left after {held_s:.1f}s; resumed at "
+                            "this turn boundary.")
+                    _sreg.set_status(
+                        subagent_id, "running",
+                        note="pause hold released")
+                    _sreg.append_transcript(
+                        subagent_id, "system", outcome_note)
+                    _log(ledger, actor, {
+                        "event": (
+                            "subagent_pause_hold_expired"
+                            if hold_outcome == "timeout"
+                            else "subagent_pause_hold_released"
+                        ),
+                        "subagent_id": subagent_id,
+                        "duration_s": held_s,
+                        "outcome": (
+                            "auto_resumed"
+                            if hold_outcome == "timeout" else "resumed"
+                        ),
+                    })
+
                 for _steer in _sreg.consume_steers(subagent_id):
                     messages.append({"role": "user", "content": _parts(
                         "[Human steering] " + str(_steer.get("text", "")))})
@@ -2063,6 +2212,79 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     _log(ledger, actor, {"event": "subagent_steer_applied",
                                          "subagent_id": subagent_id,
                                          "steer_id": _steer.get("steer_id", "")})
+
+                runtime = _sreg.runtime_override(subagent_id)
+                effort_override = str(runtime.get("effort", ""))
+                if effort_override != _subagent_last_effort:
+                    multipliers = {
+                        "": 1.0, "low": 0.5, "medium": 1.0, "high": 2.0,
+                    }
+                    if effort_override in multipliers:
+                        old_cap = completion_cap
+                        completion_cap = max(
+                            512,
+                            min(
+                                16384,
+                                int(
+                                    _subagent_base_completion_cap
+                                    * multipliers[effort_override]
+                                ),
+                            ),
+                        )
+                        _log(ledger, actor, {
+                            "event": "subagent_effort_override",
+                            "subagent_id": subagent_id,
+                            "effort": effort_override,
+                            "old_completion_cap": old_cap,
+                            "new_completion_cap": completion_cap,
+                        })
+                        _subagent_last_effort = effort_override
+
+                model_override = str(runtime.get("model", ""))
+                provider_override = str(runtime.get("provider", ""))
+                runtime_key = (model_override, provider_override)
+                current_model = str(
+                    getattr(provider, "model", "") or model_id or "")
+                if (
+                    model_override
+                    and runtime_key != _subagent_last_runtime
+                    and model_override != current_model
+                ):
+                    _subagent_last_runtime = runtime_key
+                    try:
+                        from services.agent import config as agent_config  # noqa: PLC0415
+                        cfg = dict(agent_config.load_config() or {})
+                        cfg2 = dict(cfg)
+                        cfg2["model"] = model_override
+                        alt = agent_config.get_provider(
+                            name=provider_override or None, cfg=cfg2)
+                        old_model = current_model
+                        provider = alt
+                        _log(ledger, actor, {
+                            "event": "subagent_model_override",
+                            "subagent_id": subagent_id,
+                            "old_model": old_model,
+                            "model": model_override,
+                            "provider": provider_override,
+                        })
+                        _sreg.append_transcript(
+                            subagent_id, "system",
+                            f"Runtime model override applied at turn boundary: "
+                            f"{model_override}.")
+                    except Exception as exc:  # noqa: BLE001
+                        _log(ledger, actor, {
+                            "event": "subagent_model_override_failed",
+                            "subagent_id": subagent_id,
+                            "model": model_override,
+                            "provider": provider_override,
+                            "error": str(exc)[:300],
+                        })
+                        _sreg.append_transcript(
+                            subagent_id, "system",
+                            "Runtime model/provider override failed at the turn "
+                            f"boundary; continuing with {current_model or 'the current model'}.")
+                elif model_override and runtime_key != _subagent_last_runtime:
+                    _subagent_last_runtime = runtime_key
             except Exception:  # noqa: BLE001
                 pass
         # T-W21 §20 (Rules): inject the context packs of every rule matching the

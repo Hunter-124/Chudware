@@ -1464,6 +1464,67 @@ void archiveConversation(AppState& st, int idx, bool archived) {
     persistChatHistory(st);
 }
 
+int forkConversation(AppState& st, int idx) {
+    if (idx < 0 || idx >= (int)st.conversations.size()) return -1;
+
+    const Conversation& source = st.conversations[idx];
+    std::string base = source.title;
+    int ordinal = 1;
+    const std::string plainSuffix = " (fork)";
+    if (base.size() >= plainSuffix.size() &&
+        base.compare(base.size() - plainSuffix.size(), plainSuffix.size(), plainSuffix) == 0) {
+        base.resize(base.size() - plainSuffix.size());
+        ordinal = 2;
+    } else if (!base.empty() && base.back() == ')') {
+        const size_t marker = base.rfind(" (fork ");
+        if (marker != std::string::npos && marker + 7 < base.size() - 1) {
+            int parsed = 0;
+            bool digits = true;
+            for (size_t p = marker + 7; p + 1 < base.size(); ++p) {
+                if (!std::isdigit(static_cast<unsigned char>(base[p]))) {
+                    digits = false;
+                    break;
+                }
+                parsed = parsed * 10 + (base[p] - '0');
+            }
+            if (digits && parsed >= 2) {
+                base.resize(marker);
+                ordinal = parsed + 1;
+            }
+        }
+    }
+
+    auto forkTitle = [&](int n) {
+        return base + (n == 1 ? " (fork)" : " (fork " + std::to_string(n) + ")");
+    };
+    std::string title = forkTitle(ordinal);
+    while (std::any_of(st.conversations.begin(), st.conversations.end(),
+                       [&](const Conversation& c) { return c.title == title; }))
+        title = forkTitle(++ordinal);
+
+    Conversation fork;
+    fork.id = newConvId(st);
+    fork.title = std::move(title);
+    fork.docLink = source.docLink;
+    fork.scopeClass = source.scopeClass;
+    fork.archived = false;
+    fork.msgs = idx == st.activeConv ? st.chat : source.msgs;
+    for (auto& msg : fork.msgs) {
+        msg.running = false;
+        msg.liveStatus.clear();
+        for (auto& step : msg.steps) {
+            step.thumb.id = 0;
+            step.triedThumb = false;
+        }
+    }
+
+    const int inserted = idx + 1;
+    st.conversations.insert(st.conversations.begin() + inserted, std::move(fork));
+    if (st.activeConv >= inserted) ++st.activeConv;
+    switchConversation(st, inserted);
+    return st.activeConv;
+}
+
 // (Conversations are switched from the Sessions picker in the Copilot header.)
 
 // Probe the local OpenAI-compatible endpoint for its loaded models + reachability, so the

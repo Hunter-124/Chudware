@@ -558,7 +558,8 @@ class DelegationTree:
                 parent_run_id=self._run_id, parent_node_id=parent_id,
                 requested_by=parent.role,
                 model=(model_assign.id or ""), budget_tokens=budget_tokens,
-                status="pending")
+                status="pending",
+                awaiting_approval=(approval_policy_str != "auto"))
         except Exception:  # noqa: BLE001
             pass
 
@@ -903,7 +904,7 @@ def delegate(
         if result.get("status") == "approved":
             ...  # proceed with the sub-agent
         elif result.get("status") == "pending":
-            ...  # awaiting overseer approval — proceed with sibling work
+            ...  # surfaced in the GUI approval queue; a human approve/deny releases it
     """
     try:
         node = tree.request_delegation(

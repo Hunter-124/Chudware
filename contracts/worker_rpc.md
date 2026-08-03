@@ -512,3 +512,60 @@ Daemon clients may declare seat identity on the first `hello` handshake:
 unless env `CHUDWARE_UNDO_AGENTS=1` is set (kill-switch restoring free undo for agents). Agents keep
 `doc_checkpoint` / `doc_revert` and PLM rollback for intentional rollback.
 
+
+## 6. Sub-agent control plane (append-only, 2026-08-03 — T-DP16)
+
+Worker methods served by `services/agent/subagent_rpc.py` over the file-backed registry
+`services/agent/subagent_registry.py`. Every control is **advisory and turn-boundary bound**:
+nothing interrupts in-flight work, and each response carries an honest `note` saying so.
+Enforcement lives in exactly one place — the `if subagent_id:` block at the top of
+`agent_turn.run_turn`'s completion loop.
+
+| method | params → result |
+|---|---|
+| `subagent_list` | `{}` → `{ok, sessions[]}` |
+| `subagent_transcript` | `{subagent_id}` → `{ok, session, messages[], pending_steers[]}` |
+| `subagent_steer` | `{subagent_id, text}` → `{ok, queued, steer_id, session_status, note}` |
+| `subagent_terminate` | `{subagent_id, confirm}` → `{ok, terminate_requested, note}` — refuses without `confirm:true` |
+| `subagent_control` | `{subagent_id, op, …}` → see below |
+
+### 6.1 `subagent_control`
+
+`op` is one of `pause` · `resume` · `approve` · `deny` · `set_runtime`.
+`set_runtime` also takes `model`, `provider`, `effort` (`low`\|`medium`\|`high`); `""` clears an
+override, an absent key leaves it unchanged. `deny` requires `confirm:true` and otherwise returns
+`{ok:false, reason, requires_confirm:true}` — the same M16 gate `subagent_terminate` uses.
+
+Success shape:
+
+```json
+{"ok": true, "note": "<honest semantics>", "session_status": "…",
+ "paused": false, "awaiting_approval": false, "spawn_decision": "",
+ "model_override": "", "provider_override": "", "effort_override": ""}
+```
+
+### 6.2 Session object fields (added to `subagent_list[].sessions` and `subagent_transcript.session`)
+
+`paused` (bool) · `awaiting_approval` (bool) · `spawn_decision` (`""`\|`"approved"`\|`"denied"`) ·
+`model_override` · `provider_override` · `effort_override`. All six are **always present** with
+their defaults, including for registry meta files written before this amendment.
+
+### 6.3 Turn-boundary semantics
+
+Checked in this order, once per completion:
+
+1. **Terminate** — unchanged, and still wins over every other hold.
+2. **Approval hold** — a session with `awaiting_approval` and no decision parks (0.5 s poll).
+   `delegation.request_delegation` now sets `awaiting_approval` whenever the routing approval
+   policy is not `auto`, which is what releases the previously stranded depth>1 delegations
+   (`routing.yaml` `approval_policy.deeper: overseer`, and nothing ever called
+   `DelegationTree.approve()`). A denial returns `TurnResult(stop_reason="denied_by_user")`.
+3. **Pause hold** — same park loop, status `paused`.
+4. **Steer drain** — unchanged.
+5. **Runtime override** — `effort` scales the per-completion cap off the turn's ORIGINAL base
+   (low 0.5× · medium 1.0× · high 2.0×, clamped to `[512, 16384]`); `model`/`provider` rebuild the
+   provider via `config.get_provider`. A failed rebuild logs `subagent_model_override_failed` and
+   keeps the current provider — an override never breaks a turn.
+
+Both holds are capped by `CHUDWARE_SUBAGENT_HOLD_MAX_S` (default 900 s). On expiry a **pause
+auto-resumes**; an **approval hold denies, fail-safe** — an unapproved spawn never runs.

@@ -453,7 +453,9 @@ struct SubMsg {
 struct SubagentSession {
     std::string id, role, brief, status, model, spawnKind;
     std::string createdTs, updatedTs;   // ISO-8601 UTC (registry created_ts / updated_ts)
+    std::string spawnDecision, modelOverride, providerOverride, effortOverride;
     int budgetTokens = 0, pendingSteers = 0, transcriptLen = 0;
+    bool paused = false, awaitingApproval = false;
 };
 
 // Registry snapshot (the Agent Hub row list) — global, one poll loop.
@@ -463,6 +465,7 @@ struct SubagentRegistry {
     bool   listedOnce  = false;
     double lastListT   = 0.0;
     std::string listErr;
+    std::string controlNote;
     // Ids seen by the auto-pop logic — a NEW live sub-agent pops its chat window once
     // (agent.ui_follow_active_session); parked/finished ones never auto-pop.
     std::set<std::string> seenIds;
@@ -479,14 +482,19 @@ struct SubChatState {
     double lastTrT   = 0.0;
     std::string viewErr;
 
-    // steering composer
+    // steering + turn-boundary runtime controls
     char        steerBuf[2048] = {0};
-    bool        steerPending   = false;
-    std::string steerNote;      // the worker's honest injection-semantics note
+    char        modelBuf[256]   = {0};
+    int         effortIdx       = 0;
+    bool        runtimeSeeded   = false;
+    bool        steerPending    = false;
+    bool        ctlPending      = false;
+    std::string steerNote;      // the worker's honest turn-boundary semantics note
 
     bool termPending = false;
 };
 static std::unordered_map<std::string, SubChatState> s_subChats;
+static std::set<std::string> s_subControlPending;
 
 // Role color (v3): a stable hue per role string so a sub-agent's row, popup chrome and chat
 // accents all share one identity color. FNV-1a -> hue; fixed sat/val keeps it legible on glass.
@@ -535,6 +543,12 @@ static SubagentSession parseSubSession(const nlohmann::json& s) {
     o.budgetTokens  = s.value("budget_tokens", 0);
     o.pendingSteers = s.value("pending_steers", 0);
     o.transcriptLen = s.value("transcript_len", 0);
+    o.paused          = s.value("paused", false);
+    o.awaitingApproval = s.value("awaiting_approval", false);
+    o.spawnDecision   = s.value("spawn_decision", "");
+    o.modelOverride   = s.value("model_override", "");
+    o.providerOverride = s.value("provider_override", "");
+    o.effortOverride  = s.value("effort_override", "");
     return o;
 }
 
@@ -629,6 +643,60 @@ static void fetchSubagentTranscript(AppState& st, SubChatState& cs, bool force =
             }
     });
 }
+static void applySubagentControlResult(SubagentSession& s, const nlohmann::json& result) {
+    s.status           = result.value("session_status", s.status);
+    s.paused           = result.value("paused", s.paused);
+    s.awaitingApproval = result.value("awaiting_approval", s.awaitingApproval);
+    s.spawnDecision    = result.value("spawn_decision", s.spawnDecision);
+    s.modelOverride    = result.value("model_override", s.modelOverride);
+    s.providerOverride = result.value("provider_override", s.providerOverride);
+    s.effortOverride   = result.value("effort_override", s.effortOverride);
+}
+
+// Shared async body for popup and roster controls. The callback re-resolves both stores:
+// either surface may have changed or closed while the worker was handling the request.
+static void sendSubagentControlById(AppState& st, const std::string& id, const char* op,
+                                    const nlohmann::json& extra) {
+    if (!st.workerStarted || id.empty() || s_subControlPending.count(id)) return;
+    s_subControlPending.insert(id);
+    auto openIt = s_subChats.find(id);
+    if (openIt != s_subChats.end()) openIt->second.ctlPending = true;
+
+    nlohmann::json p = extra;
+    p["subagent_id"] = id;
+    p["op"] = op;
+    st.rpc.call("subagent_control", std::move(p), [&st, want = id](const core::RpcResult& r) {
+        s_subControlPending.erase(want);
+        auto chatIt = s_subChats.find(want);
+        if (chatIt != s_subChats.end()) chatIt->second.ctlPending = false;
+
+        std::string note;
+        if (!r.ok) {
+            note = r.err.empty() ? "worker unreachable" : r.err;
+        } else if (!r.result.value("ok", false)) {
+            note = r.result.value("reason", std::string("sub-agent control failed"));
+        } else {
+            note = r.result.value("note", std::string("applied at the next turn boundary"));
+            for (auto& s : s_sub.sessions)
+                if (s.id == want) { applySubagentControlResult(s, r.result); break; }
+            if (chatIt != s_subChats.end()) {
+                applySubagentControlResult(chatIt->second.cur, r.result);
+                chatIt->second.runtimeSeeded = false;
+                chatIt->second.lastTrT = 0.0;
+                fetchSubagentTranscript(st, chatIt->second, /*force=*/true);
+            }
+            s_sub.lastListT = 0.0;
+        }
+        s_sub.controlNote = note;
+        if (chatIt != s_subChats.end()) chatIt->second.steerNote = note;
+    });
+}
+
+static void sendSubagentControl(AppState& st, SubChatState& cs, const char* op,
+                                const nlohmann::json& extra = nlohmann::json::object()) {
+    if (!st.workerStarted || cs.ctlPending) return;
+    sendSubagentControlById(st, cs.cur.id, op, extra);
+}
 
 static void sendSubagentSteer(AppState& st, SubChatState& cs) {
     if (!st.workerStarted || cs.steerPending) return;
@@ -716,6 +784,13 @@ static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeId
     const float* sc = statusColor(cs.cur.status);
 
     fetchSubagentTranscript(st, cs);
+    if (!cs.runtimeSeeded && !cs.trPending) {
+        std::snprintf(cs.modelBuf, sizeof(cs.modelBuf), "%s", cs.cur.modelOverride.c_str());
+        cs.effortIdx = cs.cur.effortOverride == "low"    ? 1 :
+                       cs.cur.effortOverride == "medium" ? 2 :
+                       cs.cur.effortOverride == "high"   ? 3 : 0;
+        cs.runtimeSeeded = true;
+    }
 
     // Role-themed chrome: the window bg + title bar carry the role identity color (M15
     // evolved — unmistakable WHICH sub-agent a chat belongs to, several open at once).
@@ -772,18 +847,24 @@ static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeId
             }
             ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + 6.0f * S));
         }
+        if (cs.cur.paused) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                       palette.statusWarn[2], 1.0f));
+            ImGui::TextUnformatted("PAUSED — takes effect at a turn boundary");
+            ImGui::PopStyleColor();
+        }
 
-        // --- read-only run parameters (M17) ----------------------------------------
+        // --- starting run parameters ------------------------------------------------
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::Text("Model: %s", cs.cur.model.empty()
-                                     ? "inherited from parent mission (read-only)"
-                                     : (cs.cur.model + "  (read-only)").c_str());
-        ImGui::Text("Effort / budget: %s%s",
+        ImGui::Text("Started with model: %s", cs.cur.model.empty()
+                                                   ? "inherited from parent mission"
+                                                   : cs.cur.model.c_str());
+        ImGui::Text("Starting effort / budget: %s",
                     cs.cur.budgetTokens > 0
                         ? (std::to_string(cs.cur.budgetTokens) + " tokens").c_str()
-                        : "inherited",
-                    "  (read-only)");
+                        : "inherited");
         if (!cs.cur.brief.empty()) {
             ImGui::TextUnformatted("Starting prompt (read-only):");
             ImGui::PushStyleColor(ImGuiCol_Text,
@@ -796,7 +877,7 @@ static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeId
         ImGui::Spacing();
 
         // --- transcript -------------------------------------------------------------
-        const float composerH = ImGui::GetFrameHeightWithSpacing() * 4.6f;
+        const float composerH = ImGui::GetFrameHeightWithSpacing() * 7.2f;
         float logH = ImGui::GetContentRegionAvail().y - composerH;
         if (logH < 90.0f * S) logH = 90.0f * S;
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(rc[0], rc[1], rc[2], 0.06f));
@@ -866,6 +947,14 @@ static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeId
             ImGui::SetTooltip("Inject a steering message. It is queued and read by the sub-agent "
                               "at its next turn boundary (before its next model call).");
         ImGui::SameLine();
+        ImGui::BeginDisabled(!st.workerStarted || cs.ctlPending);
+        if (ImGui::SmallButton(cs.cur.paused ? "Resume" : "Pause"))
+            sendSubagentControl(st, cs, cs.cur.paused ? "resume" : "pause");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s this sub-agent at its next turn boundary.",
+                              cs.cur.paused ? "Resume" : "Pause");
+        ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                    palette.textDisabled[2], 1.0f));
@@ -901,6 +990,39 @@ static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeId
             ImGui::SameLine();
             if (ImGui::Button("Keep running")) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
+        }
+
+        ImGui::SetNextItemWidth(std::max(120.0f * S, ImGui::GetContentRegionAvail().x * 0.48f));
+        ImGui::BeginDisabled(!st.workerStarted || cs.ctlPending);
+        ImGui::InputTextWithHint("##subagent_model", "Model override (blank = default)",
+                                 cs.modelBuf, sizeof(cs.modelBuf));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(94.0f * S);
+        static const char* effortItems[] = {"Default", "low", "medium", "high"};
+        ImGui::Combo("##subagent_effort", &cs.effortIdx, effortItems,
+                     IM_ARRAYSIZE(effortItems));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(cs.ctlPending ? "Applying\xE2\x80\xA6" : "Apply")) {
+            nlohmann::json extra;
+            extra["model"] = std::string(cs.modelBuf);
+            extra["effort"] = cs.effortIdx == 0 ? "" : effortItems[cs.effortIdx];
+            sendSubagentControl(st, cs, "set_runtime", extra);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Apply model and effort overrides at the next turn boundary.");
+
+        if (!cs.cur.modelOverride.empty() || !cs.cur.effortOverride.empty()) {
+            std::string overrideText = "override:";
+            if (!cs.cur.modelOverride.empty()) overrideText += " " + cs.cur.modelOverride;
+            if (!cs.cur.effortOverride.empty()) {
+                overrideText += cs.cur.modelOverride.empty() ? " " : " / ";
+                overrideText += cs.cur.effortOverride;
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+            ImGui::TextUnformatted(overrideText.c_str());
+            ImGui::PopStyleColor();
         }
         if (!cs.steerNote.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text,
@@ -1302,17 +1424,50 @@ static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float li
                         ImGui::ColorConvertFloat4ToU32(surf.textTertiary), meta.c_str());
         }
 
-        // line 2: dim brief (or status), truncated to the row width; pending-steer badge
+        // line 2: dim brief (or status), truncated around queue/approval controls
         y += lineH;
+        const float approvalReserve = s.awaitingApproval ? 132.0f * S : 90.0f * S;
         std::string sub = s.brief.empty() ? s.status : s.brief;
-        const float subMaxW = rw - ui::metrics::cpMenuRowPadX() * 2.0f - 90.0f * S;
+        const float subMaxW = rw - ui::metrics::cpMenuRowPadX() * 2.0f - approvalReserve;
         while (!sub.empty() && ImGui::CalcTextSize(sub.c_str()).x > subMaxW)
             sub.pop_back();
         if (sub.size() < (s.brief.empty() ? s.status : s.brief).size())
             sub += "\xE2\x80\xA6";
         dl->AddText(ImVec2(r0.x + ui::metrics::cpMenuRowPadX(), y),
                     ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub.c_str());
-        if (s.pendingSteers > 0) {
+        if (s.awaitingApproval) {
+            const bool ctlPending = s_subControlPending.count(s.id) > 0;
+            const float denyW = ImGui::CalcTextSize("Deny").x + 12.0f * S;
+            const float approveW = ImGui::CalcTextSize("Approve").x + 12.0f * S;
+            const float bx = r1.x - ui::metrics::cpMenuRowPadY() - denyW -
+                             approveW - 4.0f * S;
+            ImGui::SetCursorScreenPos(ImVec2(bx, y - 2.0f * S));
+            ImGui::BeginDisabled(!st.workerStarted || ctlPending);
+            if (ImGui::SmallButton("Approve"))
+                sendSubagentControlById(st, s.id, "approve", nlohmann::json::object());
+            ImGui::SameLine(0.0f, 4.0f * S);
+            if (ImGui::SmallButton("Deny\xE2\x80\xA6"))
+                ImGui::OpenPopup("##subagent_deny_confirm");
+            ImGui::EndDisabled();
+            if (ImGui::BeginPopupModal("##subagent_deny_confirm", nullptr,
+                                       ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted("Deny this pending sub-agent?");
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+                ImGui::TextWrapped("The denial is recorded at the next turn boundary. "
+                                   "No sub-agent will be spawned.");
+                ImGui::PopStyleColor();
+                ImGui::Spacing();
+                if (ImGui::Button("Deny")) {
+                    sendSubagentControlById(
+                        st, s.id, "deny", nlohmann::json{{"confirm", true}});
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Keep pending")) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        } else if (s.pendingSteers > 0) {
             char badge[24];
             std::snprintf(badge, sizeof(badge), "%d queued", s.pendingSteers);
             const float bw = ImGui::CalcTextSize(badge).x + ui::metrics::cpMenuRowPadX();
@@ -1384,6 +1539,12 @@ static void drawAgentHubView(AppState& st) {
                         dag.ctxCount,    dag.ctxCount == 1 ? "" : "s");
             ImGui::PopStyleColor();
         }
+    }
+    if (!s_sub.controlNote.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::TextWrapped("%s", s_sub.controlNote.c_str());
+        ImGui::PopStyleColor();
     }
     ImGui::Spacing();
 
@@ -1496,11 +1657,15 @@ static void drawNavColumn(AppState& st, float navW) {
         if (s.status == "running" || s.status == "pending" ||
             s.status == "in_progress" || s.status == "waiting")
             ++live;
+    int awaitingApproval = 0;
+    for (const auto& s : s_sub.sessions)
+        if (s.awaitingApproval) ++awaitingApproval;
     int wip = 0;
     for (const auto& t : st.docTabs)
         if (t.aiHandoff || t.aiPulse || t.agentDone) ++wip;
 
-    if (navRow(0, "Agent Hub",    s_ai.view == 0, surf, live)) s_ai.view = 0;
+    if (navRow(0, "Agent Hub",    s_ai.view == 0, surf,
+               awaitingApproval > 0 ? awaitingApproval : live)) s_ai.view = 0;
     if (navRow(1, "Session Plan", s_ai.view == 1, surf))       s_ai.view = 1;
     if (navRow(2, "Active Work",  s_ai.view == 2, surf, wip))  s_ai.view = 2;
     if (navRow(3, "Documents",    s_ai.view == 3, surf))       s_ai.view = 3;

@@ -5989,3 +5989,36 @@ hoists an `edit_feature` target out of a `feature` wrapper; `cad_exchange_tools.
 `export_part(format=…)`. Measured end to end: the same request now runs 25 tool calls,
 builds a 155 x 34 x 100 mm holster shell with cavity, snag hook and fillets, passes the
 battery, and exports STEP + STL.
+## 2026-08-03 — T-DP16: sub-agent control plane + session fork
+
+Files: `services/agent/{subagent_registry,subagent_rpc,agent_turn,delegation}.py`,
+`services/agent/test_subagent_registry.py`, `host/src/ui/ai/ai_workspace.cpp`,
+`host/src/ui/copilot/{conversations.cpp,copilot_internal.h,panel.cpp}`,
+`contracts/worker_rpc.md` §6, `work/tasks/T-DP16.md`.
+
+The card was stale in the same way T-BL51 was: it framed `ui/imgui` as the only live GUI
+(retired — `host/` is the single GUI target) and asked for a workspace that already shipped
+at ~5.3k lines under `host/src/ui/ai/`. Rewrote the card against the observed surface first,
+in its own commit, then built only the two genuine gaps.
+
+Design point worth keeping: every new sub-agent control is enforced at the ONE pre-existing
+turn boundary in `agent_turn.run_turn` (`if subagent_id:` at the top of the completion loop),
+next to the steer drain and terminate check — the file-backed registry is the cross-process
+control plane and `run_turn` is the single place it is obeyed. Nothing is a hard kill; both
+holds poll at 0.5 s and are capped by `CHUDWARE_SUBAGENT_HOLD_MAX_S` (pause auto-resumes on
+expiry, an unapproved spawn denies fail-safe). Do not add a second enforcement site.
+
+Latent bug fixed in passing: `routing.yaml` sets `approval_policy.deeper: overseer`, and
+nothing in the codebase ever called `DelegationTree.approve()` — so every depth>1 delegation
+was registered `pending` and stranded forever while `delegate()`'s docstring told the caller
+to "proceed with sibling work". `request_delegation` now marks those sessions
+`awaiting_approval`, and the GUI approval queue releases them.
+
+Deferred: the delegation TREE object itself is still never reconciled with the registry's
+decision (the tree lives in-process in a mission run; the registry is the durable mirror the
+GUI speaks to). If a future task needs `DelegationNode.status` to agree with the registry,
+that reconciliation is the missing piece.
+
+Gotcha: `forkConversation` must read `st.chat` — not `conversations[idx].msgs` — when forking
+the ACTIVE session, and must zero `step.thumb.id` on the copy or the fork and its source share
+a GL texture handle.

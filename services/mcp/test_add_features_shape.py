@@ -3641,3 +3641,104 @@ def test_a_frustum_keeps_both_radii():
         {"type": "cone", "name": "T", "params": {"r1": 20, "r2": 8, "height": 40}},
         "cone", [])
     assert out["params"] == {"r1": 20, "r2": 8, "height": 40}
+
+
+# ------------------------------------------------------------------ arc dialects
+# Live run probe-holster-3 (k3-256k, 2026-08-03) lost FOUR consecutive add_features
+# calls to the arc entity alone: the canonical form is centre + radius + start/end
+# ANGLES, and the model reached in turn for endpoint+centre, `arc3` with a mid point,
+# and start_angle/end_angle. Each of those fully determines one arc, so each builds.
+
+def _arc(entity):
+    feat = _sketch_ops({"op": "sketch", "name": "prof", "plane": "XY",
+                        "entities": [entity]})
+    return feat["params"]["entities"][0]
+
+
+def test_arc_from_endpoints_and_centre_becomes_angles():
+    out = _arc({"type": "arc", "start": [76, 55], "end": [44, 55],
+                "center": [60, 39], "sweep": "ccw"})
+    assert out["center"] == [60.0, 39.0]
+    assert out["start"] == pytest.approx(45.0)
+    assert out["end"] == pytest.approx(135.0)
+    assert out["radius"] == pytest.approx(22.62741699)
+    assert out["ccw"] is True
+    # the dialect keys must not survive into the engine payload
+    assert "sweep" not in out
+
+
+def test_arc_sweep_word_cw_is_honoured():
+    out = _arc({"type": "arc", "start": [1, 0], "end": [0, 1],
+                "center": [0, 0], "sweep": "clockwise"})
+    assert out["ccw"] is False
+    assert out["start"] == pytest.approx(0.0)
+    assert out["end"] == pytest.approx(90.0)
+
+
+def test_three_point_arc_expands_with_the_traversal_direction():
+    out = _arc({"type": "arc3", "start": [76, 55], "mid": [60, 39], "end": [44, 55]})
+    assert out["type"] == "arc"
+    assert out["center"] == pytest.approx([60.0, 55.0])
+    assert out["radius"] == pytest.approx(16.0)
+    assert out["start"] == pytest.approx(0.0)
+    assert out["end"] == pytest.approx(180.0)
+    # start -> mid -> end runs BELOW the centre, i.e. clockwise
+    assert out["ccw"] is False
+    assert "mid" not in out
+
+
+def test_arc_start_angle_end_angle_spelling():
+    out = _arc({"type": "arc", "center": [60, 55], "radius": 16,
+                "start_angle": 0, "end_angle": 180})
+    assert out["start"] == 0.0 and out["end"] == 180.0
+    assert "start_angle" not in out and "end_angle" not in out
+
+
+def test_canonical_arc_is_left_alone():
+    out = _arc({"type": "arc", "center": [0, 0], "radius": 5,
+                "start": 0, "end": 90, "ccw": True})
+    assert out["center"] == [0, 0] and out["radius"] == 5
+    assert out["start"] == 0 and out["end"] == 90 and out["ccw"] is True
+
+
+@pytest.mark.parametrize("entity, message", [
+    ({"type": "arc", "start": [0, 0], "mid": [5, 0], "end": [10, 0]}, "collinear"),
+    ({"type": "arc", "start": [0, 0], "end": [10, 0]}, "infinitely many arcs"),
+    ({"type": "arc", "start": [0, 0], "end": [10, 0], "center": [0, 5]},
+     "not the same distance from the centre"),
+    ({"type": "arc", "start": [0, 0], "end": [10, 0], "center": [5, 0],
+      "radius": 99}, "disagrees with the endpoints"),
+    ({"type": "arc", "start": [1, 0], "end": [0, 1], "center": [0, 0],
+      "sweep": "widdershins"}, "neither clockwise nor counter-clockwise"),
+])
+def test_an_underspecified_or_contradictory_arc_is_taught_not_guessed(entity, message):
+    """Tolerance is never guessing: each rejection names the values it received."""
+    with pytest.raises(ValueError) as ei:
+        _arc(entity)
+    assert message in str(ei.value)
+
+
+def test_edit_feature_target_nested_in_a_feature_wrapper_is_hoisted():
+    """Live probe-holster-7: preflight_ops accepted the flat spelling, then the same
+    edit written with an add_feature-style `feature` wrapper died on
+    «edit_feature: no feature ''» with the id sitting inside the wrapper."""
+    notes: list = []
+    ops = M._normalize_op_elements(
+        [{"op": "edit_feature",
+          "feature": {"id": "f3", "params": {"origin": [0, 15, 60]}}}], notes)
+    assert ops == [{"op": "edit_feature", "id": "f3",
+                    "params": {"origin": [0, 15, 60]}}]
+    assert any("feature.id" in n for n in notes), notes
+
+
+def test_delete_feature_keeps_reading_the_flat_spellings():
+    notes: list = []
+    assert M._normalize_op_elements(
+        [{"op": "delete_feature", "feature_id": "f3"}], notes,
+    ) == [{"op": "delete_feature", "id": "f3"}]
+    # …and a call that was already canonical is untouched and unremarked.
+    quiet: list = []
+    assert M._normalize_op_elements(
+        [{"op": "edit_feature", "id": "f3", "params": {"radius": 5}}], quiet,
+    ) == [{"op": "edit_feature", "id": "f3", "params": {"radius": 5}}]
+    assert quiet == []

@@ -18,6 +18,7 @@ Enforcement points:
 from __future__ import annotations
 
 from typing import Any, Callable, Optional
+import re
 
 # ---------------------------------------------------------------------------
 # Destructive classifier (WI-6 / WI-12 shared HARD set)
@@ -722,6 +723,10 @@ def declared_by_op(op: dict) -> set[str]:
     return out
 
 
+#: A sketch ENTITY / CONSTRAINT handle: "e2", "e1.p1", "c4". Never a feature id.
+_SKETCH_HANDLE_RE = re.compile(r"^[ec]\d+(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
 def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
                            known_names: set[str] | None = None) -> list[str]:
     """Return dangling ref ids from *ops* against *known_ids*/*known_names*.
@@ -735,6 +740,7 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
     pre-batch doc tree alone made that shape a hard block no model could
     satisfy — the refs it names only exist once the batch applies.
     """
+
     known_names = known_names or set()
     missing: list[str] = []
     declared: set[str] = set()
@@ -746,6 +752,17 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
         return (ref in known_ids or ref in known_names or ref in declared
                 or ref in RESERVED_DATUMS)
 
+    # Sketch-scoped ops (sketch_add_constraint / sketch_set_dim / sketch_trim / …)
+    # name SKETCH ENTITY handles in `refs` — "e2", "e1.p1", "c4". Those live in a
+    # different namespace from the feature tree this guard is built on, so every
+    # one of them read as dangling and the guard hard-blocked legitimate work:
+    # live probe-holster-5 lost a constraint batch to "Missing: e2, e4, e1" while
+    # e1/e2/e4 existed inside the very sketch the op named. The engine validates
+    # these handles itself, and precisely ("'axis.y' is not a valid handle").
+    def _is_sketch_scoped(op: dict) -> bool:
+        kind = str(op.get("op") or op.get("kind") or "")
+        return kind.startswith("sketch_") or "sketch" in op
+
     for op in ops:
         if not isinstance(op, dict):
             continue
@@ -753,6 +770,7 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
         refs = feat.get("refs") if isinstance(feat.get("refs"), dict) else {}
         # Also scan top-level refs on the op
         top_refs = op.get("refs") if isinstance(op.get("refs"), dict) else {}
+        sketch_scoped = _is_sketch_scoped(op)
         for ref_map in (refs, top_refs):
             for _key, ref_val in ref_map.items():
                 candidates: list[Any] = []
@@ -771,6 +789,8 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
                         continue
                     if ref_id.startswith("$"):
                         continue  # pending id map in same batch
+                    if sketch_scoped and _SKETCH_HANDLE_RE.match(ref_id):
+                        continue  # a sketch entity/constraint handle, not a feature id
                     # Plain-English geometry queries are not stable ids
                     if _resolves(ref_id):
                         continue

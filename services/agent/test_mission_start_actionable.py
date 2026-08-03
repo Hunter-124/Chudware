@@ -299,6 +299,131 @@ def test_promise_detector_never_blocks_a_real_answer():
     assert "[UNFINISHED]" in "\n".join(p.seen)
 
 
+#: Verbatim from live run-22629074806645 (K3): after real research + fs_write the
+#: model promised the build and the turn was reported CONFIRMED with nothing made.
+_PROMISE_AFTER_WORK = (
+    "Reference doc saved. Now updating the task list and starting the model."
+)
+
+
+def test_promise_detector_sees_a_subject_dropped_coordinated_tail():
+    """Verbatim from live probe-holster-1 (K3, general lane).
+
+    The promise sits after "and", so every anchored opener missed it and the
+    turn finished CONFIRMED after three calls with no part. The table pins both
+    directions: coordinated promises detected, ordinary reports left alone.
+    """
+    from services.agent.agent_turn import _announces_next_step as promise
+
+    assert promise(
+        "I've confirmed the Ruger LCP 3701 specs and will now load the "
+        "modeling packs to create the part.")
+    assert promise("Specs confirmed, now loading the modeling packs.")
+    assert promise(
+        "Reference doc saved. Now updating the task list and starting the model.")
+
+    # Reports that merely CONTAIN a future tense or a coordinating conjunction
+    # must still be accepted as answers.
+    assert not promise(
+        "The bracket is done and will fit the rail with 0.4 mm clearance.")
+    assert not promise("I measured the bore and the wall is 2.4 mm thick.")
+    assert not promise(
+        "The holster will need a retention ridge, which I added as f6.")
+    assert not promise(
+        "Exported /tmp/holster.stl and verified the mesh is manifold.")
+
+
+def test_promise_detector_sees_a_temporal_lead_in():
+    """Verbatim from live probe-holster-6: "Now let me …" finished the turn CONFIRMED
+    because every opener was anchored and `now` pushed the promise one word right."""
+    from services.agent.agent_turn import _announces_next_step as promise
+
+    assert promise("Battery is clean — all applicable checks score 1.0. "
+                   "Now let me confirm the finished dimensions.")
+    assert promise("Next let me check it.")
+    assert promise("Then I'll cut the pocket.")
+
+    # The same lead-ins in a REPORT stay answers.
+    assert not promise("Now the part measures 131 x 26 x 91 mm.")
+    assert not promise("Finally the wall came out at 2.4 mm.")
+    assert not promise(
+        "First the shell, then the cavity: both are in the tree as f1 and f2.")
+
+
+def _run_allowed(replies, allowed):
+    """Like _run, but with the allowlist the live lane actually carries."""
+    from services.agent import agent_turn as at
+
+    p = _ScriptedProvider(replies)
+    calls: list[str] = []
+
+    def dispatch(tool, args):
+        calls.append(tool)
+        return {"ok": True, "doc_id": "doc-1"}
+
+    res = at.run_turn(
+        "design me a custom PC case for a Dell OptiPlex 7040",
+        p, tool_dispatch=dispatch,
+        tools_text=", ".join(allowed), allowed_tools=list(allowed),
+        max_tool_calls=30, max_tokens=8192,
+    )
+    return res, calls, p
+
+
+def test_repeated_promise_is_escalated_then_refused_not_banked_as_success():
+    res, calls, p = _run_allowed(
+        [
+            '```json\n{"tool": "fs_write", "args": {"path": "ref.md", '
+            '"content": "specs"}}\n```',
+            _PROMISE_AFTER_WORK,
+            _PROMISE_AFTER_WORK,
+            _PROMISE_AFTER_WORK,
+        ],
+        ["task_list", "fs_write", "new_part"],
+    )
+    steer = "\n".join(p.seen)
+    assert "[UNFINISHED]" in steer, steer[-800:]
+    # The identical-reply guard used to fall through to a bare handoff, so the
+    # promise itself became the answer. It must escalate with the vocabulary...
+    assert "[STILL UNFINISHED]" in steer, steer[-800:]
+    assert "new_part" in steer.split("[STILL UNFINISHED]")[1]
+    # ...and then end honestly rather than claiming the work was done.
+    assert res.success is False, (res.stop_reason, res.result)
+    assert res.stop_reason == "no_code", res.stop_reason
+
+
+def test_blank_finish_after_real_work_is_never_a_confirmed_answer():
+    """An empty reply used to be accepted as a done handoff with an empty summary."""
+    res, _calls, p = _run(
+        [
+            '```json\n{"tool": "new_part", "args": {"name": "shell"}}\n```',
+            "",
+            "",
+            "",
+        ],
+        tools_result={"ok": True, "doc_id": "doc-1"},
+    )
+    assert res.success is False, (res.stop_reason, res.result)
+    assert "[STILL UNFINISHED]" in "\n".join(p.seen)
+
+
+def test_escalation_still_accepts_the_answer_that_follows_it():
+    """The escalation must remain a push, never a gate that rejects real delivery."""
+    res, calls, p = _run(
+        [
+            '```json\n{"tool": "new_part", "args": {"name": "shell"}}\n```',
+            _PROMISE_AFTER_WORK,
+            _PROMISE_AFTER_WORK,
+            "Done. The shell is a closed solid, 305 x 210 x 180 mm, 2 mm wall.",
+        ],
+        tools_result={"ok": True, "doc_id": "doc-1"},
+    )
+    assert "[STILL UNFINISHED]" in "\n".join(p.seen)
+    # The delivered report is NOT refused as another promise. (A modeling done
+    # envelope can still be held by the verify_battery guardrail — a different,
+    # deliberate gate — so assert only that the promise path released it.)
+    assert res.stop_reason != "no_code", (res.stop_reason, res.result)
+
 # ---------------------------------------------------------------------------
 # 4. the mission path must be EXECUTABLE, not just plannable
 # ---------------------------------------------------------------------------

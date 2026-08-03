@@ -5964,3 +5964,28 @@ prove single-body self-intersection instead of silently substituting a weaker ch
 `dfm_check` as a real battery check, and share the acceptance grader's honest PASS/WARN/FAIL
 semantics. Focused regressions plus a live box-with-through-hole probe verify
 HLR ASCII, a four-view contact sheet, shifted section areas, and the combined battery output.
+
+## 2026-08-03 — General-lane promise stalls and sketch/edit/export dialect gaps
+
+Live desktop run `run-22629074806645` (k3-256k) stopped after five calls having written
+only a reference document, and reported success; the closing message was "Now updating the
+task list and starting the model." Nine live replays (`probe-holster-1` … `-10`) turned that
+one complaint into six general defects. In `services/agent/agent_turn.py` the promise
+detector missed a subject-dropped coordinated tail ("… and will now load the modeling
+packs"), a temporal lead-in ("Now let me confirm …") and a plan-introducing colon
+("Final checks: …"), and — worse — a REPEATED promise fell through the identical-reply
+guard and was banked as a `confirmed` finish; it now escalates once with the tool
+vocabulary and then ends the turn honestly, and the distinct-narration allowance rose from
+3 to 8 because a run died with 23 of 30 tool calls unspent. `services/agent/guardrails.py`
+no longer hard-blocks sketch-scoped ops whose `refs` are entity handles (`e2`, `e1.p1`) —
+they were checked against the FEATURE tree and always read as dangling.
+`core/doc/session.cpp` reserves caller-authored entity ids before expanding a rectangle or
+polygon, fixing "duplicate 'e2'" for any batch mixing an expandable shape with an
+explicitly-id'd sibling. `services/mcp/cad_doc_tools.py` accepts the endpoint+centre,
+three-point (`arc3`) and `start_angle`/`end_angle` arc dialects, runs the standalone
+`sketch_add_constraint` op through the same constraint normalizer the inline path has
+always used (including "type from `kind`"), aliases the delete/remove op spellings, and
+hoists an `edit_feature` target out of a `feature` wrapper; `cad_exchange_tools.py` reads
+`export_part(format=…)`. Measured end to end: the same request now runs 25 tool calls,
+builds a 155 x 34 x 100 mm holster shell with cavity, snag hook and fillets, passes the
+battery, and exports STEP + STL.

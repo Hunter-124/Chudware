@@ -534,9 +534,22 @@ def _handoff_text(handoff: Any) -> str:
 #: FINAL clause only: "I'll explain: <answer>" delivers (colon payload), while
 #: "...truncated - let me get the tail end." is a promise and must not finish.
 _NEXT_STEP_OPENER_RE = re.compile(
-    r"^(?:let me|let'?s|i'?ll|i will|i'?m going to|i am going to|now i|"
+    # An optional temporal lead-in: live probe-holster-6 finished CONFIRMED on
+    # "Now let me confirm the finished dimensions." because every opener was
+    # anchored and "now"/"next"/"then" pushed the promise one word to the right.
+    r"^(?:(?:and\s+)?(?:now|next|then|first|finally),?\s+)?"
+    r"(?:let me|let'?s|i'?ll|i will|i'?m going to|i am going to|now i|"
     r"next,?\s+i|give me a (?:sec|second|moment)|one moment|hold on|"
     r"checking|i need to|i should|i'?m about to)\b",
+    re.IGNORECASE,
+)
+#: Nouns that make a COLON introduce a plan instead of the promised content.
+#: "I'll explain: <answer>" delivers; "Final checks: wall thickness, a render,
+#: then final measurements." is a list of work not done (live probe-holster-8,
+#: accepted as the finished answer with 16 tool calls of budget left).
+_PLAN_COLON_RE = re.compile(
+    r"(?:^|\b)(?:final|remaining|next|outstanding|still)?\s*"
+    r"(?:checks?|steps?|actions?|items?|tasks?|todos?|to-?dos?|work|left)\s*:\s*\S",
     re.IGNORECASE,
 )
 #: Bare present-participle promises with the subject dropped — "Fixing all of
@@ -570,18 +583,42 @@ _GERUND_PROMISE_RE = re.compile(
     r"assembling|exporting|importing|saving)\b",
     re.IGNORECASE,
 )
+#: Work verbs in BASE form, for a promise whose subject was dropped by a
+#: coordinating conjunction: "I've confirmed the specs and will now load the
+#: modeling packs to create the part." Live probe-holster-1 (K3) finished that
+#: turn CONFIRMED with nothing modelled, because the promise is not at the start
+#: of the clause and so no anchored opener ever saw it. Deliberately narrower
+#: than the gerund list: a bare "will <verb>" tail also covers ordinary future
+#: statements ("the bracket will fit the rail"), so only verbs that name work
+#: the agent itself performs belong here.
+_IMPLICIT_PROMISE_RE = re.compile(
+    r"^(?:will|going to|about to|gonna)\s+(?:now\s+|then\s+|next\s+|also\s+)?"
+    r"(?:load|build|create|model|sketch|draft|write|update|edit|add|make|"
+    r"generate|render|apply|implement|run|execute|export|import|save|enable|"
+    r"switch|start|begin|proceed|continue|compile|design|measure|verify|"
+    r"check|validate|fetch|gather|research|gather|set up|lay out|spin up|"
+    r"kick off|dispatch|delegate|fix|correct|revise|rebuild|regenerate)\b",
+    re.IGNORECASE,
+)
+#: Coordinating boundaries INSIDE one clause. Splitting here lets the anchored
+#: openers above be tested against a subject-dropped tail without loosening them
+#: into unanchored searches (which match reports as readily as promises).
+_COORD_SPLIT_RE = re.compile(r"\b(?:and|then)\b|,")
 #: Clause boundaries INCLUDING dashes/semicolons — the live miss was an em-dash
 #: ("The listing got truncated - let me get the tail end of the directory.").
 _CLAUSE_SPLIT_RE = re.compile(r"[.!?\n;]|\s[-\u2013\u2014]\s")
 
 
-#: How many times ONE turn may push a mid-thought narration into taking its own
-#: next step. A single push was not enough for models that narrate between every
-#: tool call (K3): the second narration ended the turn with the tool budget
-#: almost untouched. Nudges are cheap (one completion) and can only ever be
-#: followed by a real finish check, so a small allowance recovers turns that used
-#: to die; the identical-reply guard in run_turn stops it becoming a loop.
-_CONTINUE_NUDGE_MAX = 3
+#: How many DISTINCT mid-thought narrations one turn may push into taking their
+#: own next step. A single push was not enough for models that narrate between
+#: every tool call (K3): the second narration ended the turn with the tool budget
+#: almost untouched. Live probe-holster-4 hit the ceiling of 3 after seven
+#: productive calls and quit with 23 of 30 unspent, so the allowance now tracks
+#: the tool budget instead of a hand-picked small number. This can NOT loop: the
+#: identical-reply guard means a repeated narration consumes no allowance at all
+#: (it escalates once, then the turn ends), so the ceiling is only ever reached
+#: by a model that keeps saying something NEW and still refuses to act.
+_CONTINUE_NUDGE_MAX = 8
 
 
 def _norm_reply(text: str) -> str:
@@ -605,8 +642,24 @@ def _announces_next_step(text: str) -> bool:
     if last.endswith(":"):
         return True
     if ":" in last and last.split(":", 1)[1].strip():
-        return False
-    if _NEXT_STEP_OPENER_RE.match(last):
+        # …unless the words BEFORE the colon name a plan rather than a payload.
+        return bool(_PLAN_COLON_RE.search(last))
+    if _clause_promises(last):
+        return True
+    # A promise can also ride on a coordinated tail whose subject was dropped:
+    # "I've confirmed the specs and will now load the modeling packs." The
+    # anchored openers only ever see the head of the clause, so re-test each
+    # coordinated fragment with the same anchored rules.
+    for frag in _COORD_SPLIT_RE.split(last)[1:]:
+        frag = (frag or "").strip()
+        if frag and (_IMPLICIT_PROMISE_RE.match(frag) or _clause_promises(frag)):
+            return True
+    return False
+
+
+def _clause_promises(clause: str) -> bool:
+    """True when one clause OPENS with a promise rather than a report."""
+    if _NEXT_STEP_OPENER_RE.match(clause):
         return True
     # A gerund opener is only a PROMISE when the clause states an intention
     # rather than reporting one: "Fixing all of it now." / "Updating the deck."
@@ -614,9 +667,9 @@ def _announces_next_step(text: str) -> bool:
     # ("Fixing the slide numbers required renumbering three slides."), so demand
     # an explicit now/next marker or a short clause. Mis-firing costs one extra
     # nudge; missing one strands the user's job half-done, so lean to detecting.
-    if _GERUND_PROMISE_RE.match(last):
-        words = last.split()
-        return bool(re.search(r"\b(?:now|next|right away|asap)\b", last, re.IGNORECASE)
+    if _GERUND_PROMISE_RE.match(clause):
+        words = clause.split()
+        return bool(re.search(r"\b(?:now|next|right away|asap)\b", clause, re.IGNORECASE)
                     or len(words) <= 5)
     return False
 
@@ -1851,10 +1904,12 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     # `_novol_nudge`, and the second narration ended the turn `no_code` with 28
     # of 30 tool calls unspent). Bounded two ways so a chatty model still
     # terminates: a hard count, AND progress — a reply identical to one already
-    # nudged proves the push is not landing, so it falls through rather than
-    # re-asking forever.
+    # nudged proves the push is not landing, so it escalates once and then ends
+    # the turn honestly rather than banking the promise as a delivered answer.
     _continue_nudge = [0]
     _continue_nudged: set[str] = set()
+    # One escalation after a repeated/blank promise, on either finish path.
+    _escalate_nudge = [0]
     # At most one "your last message was cut off" re-emit request per turn. A
     # second truncation must end the turn honestly (no_code) rather than burn
     # the whole budget re-asking for the same oversized directive.
@@ -2355,22 +2410,52 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 # Neither branch can return success, so turn honesty is
                 # unchanged - only which nudge the model is shown, and how many
                 # times a mid-thought reply may be pushed.
-                if (
-                    _announces_next_step(reply)
-                    and tool_calls_made < budget
-                    and _continue_nudge[0] < _CONTINUE_NUDGE_MAX
-                    and _norm_reply(reply) not in _continue_nudged
-                ):
-                    _continue_nudge[0] += 1
-                    _continue_nudged.add(_norm_reply(reply))
-                    messages.append({"role": "user", "content": _parts(
-                        "[UNFINISHED] You described the next step instead of "
-                        "taking it, and the turn is not over. Do it now with a "
-                        "real tool call. Only finish when the user's request is "
-                        "actually answered - then state the ANSWER, not a plan."
-                    )})
-                    last_reason = _RETRY
-                    continue
+                _promise = _announces_next_step(reply)
+                _blank = not (reply or "").strip()
+                if (_promise or _blank) and tool_calls_made < budget:
+                    _seen_before = _norm_reply(reply) in _continue_nudged
+                    if (
+                        _continue_nudge[0] < _CONTINUE_NUDGE_MAX
+                        and not _seen_before
+                    ):
+                        _continue_nudge[0] += 1
+                        _continue_nudged.add(_norm_reply(reply))
+                        messages.append({"role": "user", "content": _parts(
+                            "[UNFINISHED] You described the next step instead of "
+                            "taking it, and the turn is not over. Do it now with a "
+                            "real tool call. Only finish when the user's request is "
+                            "actually answered - then state the ANSWER, not a plan."
+                        )})
+                        last_reason = _RETRY
+                        continue
+                    # The model repeated the same promise (or said nothing at
+                    # all) after being nudged. The identical-reply guard used to
+                    # fall straight through to the bare-handoff accept below, so
+                    # the turn was reported CONFIRMED while the promised work was
+                    # never done — live run-22629074806645 ended "Now updating the
+                    # task list and starting the model." with success. Escalate
+                    # once with the concrete vocabulary, then end honestly.
+                    if _escalate_nudge[0] < 1:
+                        _escalate_nudge[0] += 1
+                        _names = ", ".join(sorted(allow)[:12]) if allow else ""
+                        messages.append({"role": "user", "content": _parts(
+                            "[STILL UNFINISHED] That is the second reply in a row "
+                            "that promises work instead of doing it, so nothing has "
+                            "been delivered. Reply with ONE tool call and no prose"
+                            + (f". Available tools include: {_names}." if _names
+                               else ".")
+                            + " If the request truly cannot be carried out, say why "
+                            "in plain language instead of describing a next step."
+                        )})
+                        last_reason = _RETRY
+                        continue
+                    _log(ledger, actor, {
+                        "event": "promise_finish_rejected",
+                        "tool_calls": tool_calls_made,
+                        "reply": (reply or "")[:200],
+                    })
+                    last_reason = _NOCODE
+                    break
                 # Fabricated-success gate: a finish that claims work - or says
                 # nothing at all - while the turn did no real work is not done.
                 _unearned = _unearned_finish_block(
@@ -2524,21 +2609,46 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 if (
                     _announces_next_step(_ho_text)
                     and tool_calls_made < budget
-                    and _continue_nudge[0] < _CONTINUE_NUDGE_MAX
-                    and _norm_reply(_ho_text) not in _continue_nudged
                     and _request_wants_work(request)
                     and callable(dispatch)
                 ):
-                    _continue_nudge[0] += 1
-                    _continue_nudged.add(_norm_reply(_ho_text))
-                    messages.append({"role": "user", "content": _parts(
-                        "[UNFINISHED] You announced the next step instead of "
-                        "performing it. Carry it out NOW, in this reply, with "
-                        "the tool calls it needs, then report what actually "
-                        "changed. Do not finish with another promise."
-                    )})
-                    last_reason = _RETRY
-                    continue
+                    if (
+                        _continue_nudge[0] < _CONTINUE_NUDGE_MAX
+                        and _norm_reply(_ho_text) not in _continue_nudged
+                    ):
+                        _continue_nudge[0] += 1
+                        _continue_nudged.add(_norm_reply(_ho_text))
+                        messages.append({"role": "user", "content": _parts(
+                            "[UNFINISHED] You announced the next step instead of "
+                            "performing it. Carry it out NOW, in this reply, with "
+                            "the tool calls it needs, then report what actually "
+                            "changed. Do not finish with another promise."
+                        )})
+                        last_reason = _RETRY
+                        continue
+                    # Repeated promise inside a done envelope: same defect as the
+                    # prose path, and a `done` wrapper makes it look authoritative.
+                    if _escalate_nudge[0] < 1:
+                        _escalate_nudge[0] += 1
+                        _names = ", ".join(sorted(allow)[:12]) if allow else ""
+                        messages.append({"role": "user", "content": _parts(
+                            "[STILL UNFINISHED] Your done envelope again promises "
+                            "the work rather than reporting it, so nothing has been "
+                            "delivered. Reply with ONE tool call and no prose"
+                            + (f". Available tools include: {_names}." if _names
+                               else ".")
+                            + " If it cannot be done, say why instead of promising."
+                        )})
+                        last_reason = _RETRY
+                        continue
+                    _log(ledger, actor, {
+                        "event": "promise_finish_rejected",
+                        "path": "handoff",
+                        "tool_calls": tool_calls_made,
+                        "reply": (_ho_text or "")[:200],
+                    })
+                    last_reason = _NOCODE
+                    break
             block = _done_guardrail_block(handoff, ledger, actor, calls)
             if block is not None:
                 messages.append({"role": "user", "content": _parts(block)})

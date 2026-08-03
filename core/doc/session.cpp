@@ -1002,6 +1002,16 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     // "hexagon" entity that builds no region and fails the extrude.
     if (env["type"] == "sketch" && env["params"].is_object() &&
         env["params"].contains("entities") && env["params"]["entities"].is_array()) {
+        // Reserve every canonical id the caller ALREADY wrote before expanding
+        // anything. A multi-entity expansion (rectangle/polygon/slot/airfoil)
+        // mints one e<N> per emitted segment, and IdGen is seeded only from the
+        // stored document — so a batch of [rectangle, circle{id:e2}] minted
+        // e1..e4 for the rectangle and then hit "duplicate 'e2'" on the circle.
+        // Live probe-holster-3: two consecutive add_features calls lost to it.
+        for (const json& e : env["params"]["entities"]) {
+            if (e.is_object() && e.contains("id") && e["id"].is_string())
+                gen.note(e["id"].get<std::string>());
+        }
         json norm = json::array();
         for (json& e : env["params"]["entities"]) {
             if (!e.is_object()) { norm.push_back(e); continue; }

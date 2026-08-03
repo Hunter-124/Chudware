@@ -160,6 +160,164 @@ def _flat_radius(e: dict) -> tuple[Optional[float], bool]:
     return None, False
 
 
+#: Spellings of the three-point ("through a point on the arc") arc the engine has no
+#: separate type for. It is the SolidWorks/Fusion 3-point arc, so models reach for it
+#: constantly; expanding it here is arithmetic on a fully specified shape, not a guess.
+_ARC3_TYPES = frozenset({"arc3", "arc_3p", "arc3p", "3parc", "3p_arc",
+                         "three_point_arc", "threepointarc", "point_arc"})
+#: Mid-point ("through") spellings for that form.
+_ARC_MID_KEYS = ("mid", "midpoint", "mid_point", "pm", "via", "through",
+                 "through_point", "point_on_arc", "on_arc")
+#: Endpoint spellings. p1/p2 come from the 3D sketch arc, from/to from the line dialect.
+_ARC_START_KEYS = ("start", "start_point", "startpoint", "p1", "from", "a")
+_ARC_END_KEYS = ("end", "end_point", "endpoint", "p2", "to", "b")
+#: Angle spellings for the CANONICAL form (degrees about the centre).
+_ARC_START_ANGLE_KEYS = ("start_angle", "startangle", "a0", "theta0", "theta1", "ang0")
+_ARC_END_ANGLE_KEYS = ("end_angle", "endangle", "a1", "theta2", "ang1")
+#: Sweep-direction words. The engine carries the direction in a bool `ccw`.
+_ARC_CCW_WORDS = {"ccw": True, "counterclockwise": True, "counter_clockwise": True,
+                  "anticlockwise": True, "anti_clockwise": True, "left": True,
+                  "cw": False, "clockwise": False, "right": False}
+_ARC_SWEEP_KEYS = ("sweep", "direction", "dir", "orientation", "winding")
+
+
+def _pt2(v: Any) -> Optional[tuple[float, float]]:
+    """(x, y) when *v* is a 2D numeric point in any accepted spelling, else None."""
+    p = _xy(v)
+    if isinstance(p, list) and len(p) >= 2:
+        x, y = p[0], p[1]
+        if isinstance(x, (int, float)) and not isinstance(x, bool) \
+                and isinstance(y, (int, float)) and not isinstance(y, bool):
+            return float(x), float(y)
+    return None
+
+
+def _first_key(e: dict, keys: tuple) -> Optional[str]:
+    return next((k for k in keys if k in e), None)
+
+
+def _arc_angle(center: tuple, p: tuple) -> float:
+    return math.degrees(math.atan2(p[1] - center[1], p[0] - center[0])) % 360.0
+
+
+def _normalize_arc_entity(ne: dict, label: str, sink: set) -> None:
+    """Rewrite the arc dialects models actually write into the engine's canonical form.
+
+    Canonical (validate.cpp): center + radius + start/end ANGLES IN DEGREES + ccw.
+    Accepted here, because each is a complete and unambiguous specification:
+      * endpoints as POINTS plus the centre  — the endpoint/centre arc every CAD UI draws;
+      * three points (start, a point on the arc, end) — the 3-point arc, incl. `arc3`;
+      * start_angle / end_angle spellings of the canonical angles.
+    Anything under-specified or self-contradictory raises a teaching ValueError naming
+    the values received rather than silently building a different arc.
+    """
+    # Direction word -> the engine's bool, whichever dialect named it.
+    if "ccw" not in ne or isinstance(ne.get("ccw"), str):
+        word = ne.get("ccw") if isinstance(ne.get("ccw"), str) else None
+        if word is None:
+            sk = _first_key(ne, _ARC_SWEEP_KEYS)
+            word = ne.get(sk) if isinstance(ne.get(sk), str) else None
+            if word is not None:
+                ne.pop(sk, None)
+        if isinstance(word, str):
+            flag = _ARC_CCW_WORDS.get(word.strip().lower().replace(" ", "_"))
+            if flag is None:
+                raise ValueError(
+                    f"{label}: arc sweep {word!r} is neither clockwise nor "
+                    f"counter-clockwise. Accepted: "
+                    f"{', '.join(sorted(_ARC_CCW_WORDS))}.")
+            ne["ccw"] = flag
+            sink.add("arc_sweep_word")
+
+    # Angle spellings of the canonical form.
+    for keys, canon in ((_ARC_START_ANGLE_KEYS, "start"), (_ARC_END_ANGLE_KEYS, "end")):
+        k = _first_key(ne, keys)
+        if k is None:
+            continue
+        v = ne[k]
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if isinstance(ne.get(canon), (int, float)) and not isinstance(
+                    ne.get(canon), bool) and float(ne[canon]) != float(v):
+                raise ValueError(
+                    f"{label}: arc {canon}={ne[canon]!r} conflicts with {k}={v!r}.")
+            ne[canon] = float(v)
+            ne.pop(k, None)
+            sink.add("arc_angle_key")
+
+    s_key = _first_key(ne, _ARC_START_KEYS)
+    e_key = _first_key(ne, _ARC_END_KEYS)
+    s_pt = _pt2(ne.get(s_key)) if s_key else None
+    e_pt = _pt2(ne.get(e_key)) if e_key else None
+    m_key = _first_key(ne, _ARC_MID_KEYS)
+    m_pt = _pt2(ne.get(m_key)) if m_key else None
+    if s_pt is None and e_pt is None:
+        return  # already angular (or nothing to work with) — engine reports the rest
+    if s_pt is None or e_pt is None:
+        raise ValueError(
+            f"{label}: an arc given point endpoints needs BOTH of them; got "
+            f"{s_key}={ne.get(s_key)!r}, {e_key}={ne.get(e_key)!r}.")
+
+    center = _pt2(ne.get("center"))
+    if m_pt is not None:
+        # Circumcentre of the three points.
+        ax, ay = s_pt
+        bx, by = m_pt
+        cx_, cy_ = e_pt
+        d = 2.0 * (ax * (by - cy_) + bx * (cy_ - ay) + cx_ * (ay - by))
+        if abs(d) < 1e-9:
+            raise ValueError(
+                f"{label}: the three arc points {s_pt}, {m_pt}, {e_pt} are collinear, "
+                f"so they define a straight line rather than an arc. Use a line, or "
+                f"move the middle point off the chord.")
+        ux = ((ax * ax + ay * ay) * (by - cy_) + (bx * bx + by * by) * (cy_ - ay)
+              + (cx_ * cx_ + cy_ * cy_) * (ay - by)) / d
+        uy = ((ax * ax + ay * ay) * (cx_ - bx) + (bx * bx + by * by) * (ax - cx_)
+              + (cx_ * cx_ + cy_ * cy_) * (bx - ax)) / d
+        computed = (ux, uy)
+        if center is not None and math.dist(center, computed) > 1e-6 * max(
+                1.0, math.dist(s_pt, computed)):
+            raise ValueError(
+                f"{label}: arc center={list(center)} disagrees with the centre implied "
+                f"by start/mid/end ({[round(v, 6) for v in computed]}). Give the three "
+                f"points OR the centre, not both.")
+        center = computed
+        # Traversal order start -> mid -> end fixes the sweep direction.
+        ne["ccw"] = ((bx - ax) * (cy_ - ay) - (by - ay) * (cx_ - ax)) > 0
+        ne.pop(m_key, None)
+        sink.add("arc_three_point")
+    elif center is None:
+        raise ValueError(
+            f"{label}: an arc through {list(s_pt)} and {list(e_pt)} needs either a "
+            f"center=[x,y] or a third point on the arc "
+            f"(mid=[x,y]) — two endpoints alone describe infinitely many arcs.")
+
+    r_start = math.dist(center, s_pt)
+    r_end = math.dist(center, e_pt)
+    if abs(r_start - r_end) > max(1e-6, 1e-4 * max(r_start, r_end)):
+        raise ValueError(
+            f"{label}: arc endpoints are not the same distance from the centre "
+            f"({r_start:.6g} mm vs {r_end:.6g} mm), so they do not lie on one arc.")
+    radius = (r_start + r_end) / 2.0
+    declared = _flat_radius(ne)[0] if "radius" not in ne else ne.get("radius")
+    if isinstance(declared, (int, float)) and not isinstance(declared, bool) \
+            and abs(float(declared) - radius) > max(1e-6, 1e-4 * radius):
+        raise ValueError(
+            f"{label}: arc radius={declared!r} disagrees with the endpoints, which are "
+            f"{radius:.6g} mm from the centre.")
+    ne["center"] = [center[0], center[1]]
+    ne["radius"] = radius
+    ne["start"] = _arc_angle(center, s_pt)
+    ne["end"] = _arc_angle(center, e_pt)
+    for k in (s_key, e_key):
+        if k not in ("start", "end"):
+            ne.pop(k, None)
+    for k in _RADIUS_KEYS + _DIAMETER_KEYS:
+        if k != "radius":
+            ne.pop(k, None)
+    ne.setdefault("ccw", True)
+    sink.add("arc_endpoints")
+
+
 def _norm_datum(v: Any) -> Optional[str]:
     """A plane/axis word -> the engine's reserved datum token. Non-strings -> None.
 
@@ -486,7 +644,7 @@ def _constraint_dialect_keys(c: dict) -> bool:
     return False
 
 
-def _normalize_one_constraint(c: dict, remap, etypes: dict[str, str], label: str,
+def _normalize_one_constraint(c: dict, remap, etypes: Optional[dict], label: str,
                               rewrites: set) -> dict:
     """One relation/dimension -> the engine's canonical constraint object.
 
@@ -497,6 +655,12 @@ def _normalize_one_constraint(c: dict, remap, etypes: dict[str, str], label: str
     KIND of rewrite, not one per constraint.
     Raises ValueError for a ref that names nothing — a dangling relation is never dropped.
     """
+    # etypes=None means "the entity roster is not in hand" — the standalone
+    # sketch_add_constraint op names a sketch that is already in the document, so the
+    # membership check belongs to the engine there. Type/ref/value normalization is
+    # roster-independent and still runs.
+    roster_known = etypes is not None
+    etypes = etypes or {}
     nc = dict(c)
 
     # ---- type ---------------------------------------------------------------
@@ -511,6 +675,22 @@ def _normalize_one_constraint(c: dict, remap, etypes: dict[str, str], label: str
         rewrites.add(f'"{raw_type}" -> {alias}')
         ctype = alias
     generic = ctype in _GENERIC_DIM_TYPES
+    if generic:
+        # "Which dimension" named in a PARAM rather than in the type — the shape a model
+        # writes when it thinks of the type as the category ({"type":"dimension",
+        # "kind":"length"}). An explicit concrete kind settles it with no guessing.
+        for key in ("kind", "dim_type", "dimension_type", "measure", "subtype"):
+            named = _slug(nc.get(key))
+            concrete = _CONSTRAINT_TYPE_ALIASES.get(named, named)
+            if isinstance(concrete, tuple):
+                concrete, extras = concrete
+                nc.update(extras)
+            if concrete in _DIM_CTYPES:
+                rewrites.add(f'"{raw_type}" + {key}:"{nc[key]}" -> {concrete}')
+                ctype = concrete
+                generic = False
+                nc.pop(key, None)
+                break
     if ctype:
         nc["type"] = ctype
 
@@ -589,6 +769,8 @@ def _normalize_one_constraint(c: dict, remap, etypes: dict[str, str], label: str
                 f"handle. A relation references sketch entities by id — "
                 f'{", ".join(known) if known else "(this sketch has no entities)"} — '
                 f'optionally with a point suffix ("e1.p2", "e3.center").')
+        if not roster_known:
+            continue
         base = h.partition(".")[0]
         if base in ("origin",) or base in etypes:
             continue
@@ -618,6 +800,12 @@ def _normalize_one_constraint(c: dict, remap, etypes: dict[str, str], label: str
             ctype = "radius"
         elif base_type in ("line", "slot"):
             ctype = "length"
+        elif not roster_known:
+            raise ValueError(
+                f'{label}: "{raw_type}" does not say WHICH dimension. On an existing '
+                f"sketch this op cannot infer it, so name the concrete relation in "
+                f'"type": length (one whole line), radius or diameter (one circle/arc), '
+                f"distance (two refs), angle (two lines).")
         else:
             raise ValueError(
                 f'{label}: "{raw_type}" does not say WHICH dimension, and refs='
@@ -1019,6 +1207,10 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
                 used_shorthand.add("construction_alias")
             elif ck:
                 used_shorthand.add("construction_word")
+        if _slug(ne.get("type")) in _ARC3_TYPES:
+            # The engine has one "arc" type; the three-point form is a spelling of it.
+            ne["type"] = "arc"
+            used_shorthand.add("arc_three_point_type")
         etype = ne.get("type")
         if etype == "line":
             # Endpoint aliases models write: p1/p2 canonical; start/end, from/to, and
@@ -1069,8 +1261,10 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             for k in ("start", "end"):
                 if isinstance(ne.get(k), list):
                     ne[k] = _xy(ne[k])
-            if etype == "arc" and "ccw" not in ne:
-                ne["ccw"] = True
+            if etype == "arc":
+                _normalize_arc_entity(ne, _feat_label(feat, "sketch"), used_shorthand)
+                if "ccw" not in ne:
+                    ne["ccw"] = True
             if etype in ("circle", "arc") and "radius" not in ne:
                 flat_r, was_diam = _flat_radius(ne)
                 if flat_r is not None:
@@ -1296,7 +1490,8 @@ _SKETCH_EDIT_KEY_ALIASES: dict[str, dict[str, str]] = {
                       "angle_deg": "angle", "degrees": "angle", "rotation": "angle"},
     "sketch_toggle_construction": {"entity": "id", "entity_id": "id", "target": "id"},
     "sketch_set_dim": {"constraint": "id", "cid": "id", "dim": "id",
-                       "constraint_id": "id", "reference": "driven",
+                       "constraint_id": "id", "dimension": "id", "dim_id": "id",
+                       "dimension_id": "id", "reference": "driven",
                        "is_reference": "driven"},
 }
 #: Ops the engine reads as a LIST of entity ids, and the spellings a model puts them under.
@@ -1330,13 +1525,70 @@ def _edit_op_label(op: dict) -> str:
     return f'{op.get("op")} on sketch "{sk}"' if isinstance(sk, str) else str(op.get("op"))
 
 
+#: Op-name spellings session.cpp does not have. The engine's own "closest:" hint already
+#: names the right one, but a rejected batch costs a whole round trip for a synonym.
+_SKETCH_OP_NAME_ALIASES = {
+    "sketch_remove_constraint": "sketch_delete_constraint",
+    "sketch_remove_entity": "sketch_delete_entity",
+    "sketch_add_relation": "sketch_add_constraint",
+    "sketch_add_dimension": "sketch_add_constraint",
+    "sketch_set_dimension": "sketch_set_dim",
+}
+#: Op-level spellings of the refs a standalone constraint op needs INSIDE its constraint.
+_CONSTRAINT_OP_REF_KEYS = ("refs", "entities", "handles", "elements", "targets")
+
+
+def _normalize_constraint_op(op: dict, notes: list) -> dict:
+    """`sketch_add_constraint` -> the canonical constraint object.
+
+    The INLINE sketch path has run every relation through `_normalize_one_constraint`
+    for a long time; this standalone op never did, so the same payload that builds
+    inline was rejected by document validation once the sketch already existed
+    (live probe-holster-5: `type:"dimension"` + `kind:"length"`, and refs written at
+    op level where the engine does not read them). The entity roster is not in hand
+    here — the sketch is already in the document — so membership stays the engine's
+    call and only the roster-independent normalization runs.
+    """
+    con = op.get("constraint")
+    if not isinstance(con, dict):
+        return op
+    nc = dict(op)
+    con = dict(con)
+    rewrites: set = set()
+    # Refs written beside the constraint rather than inside it.
+    if not any(k in con for k in _CONSTRAINT_OP_REF_KEYS):
+        for key in _CONSTRAINT_OP_REF_KEYS:
+            v = nc.get(key)
+            if isinstance(v, list) and v:
+                con["refs"] = list(v)
+                nc.pop(key, None)
+                rewrites.add(f"op-level {key}[] -> constraint.refs[]")
+                break
+            if isinstance(v, str) and v.strip():
+                con["refs"] = [v]
+                nc.pop(key, None)
+                rewrites.add(f'op-level {key}:"…" -> constraint.refs[…]')
+                break
+    nc["constraint"] = _normalize_one_constraint(
+        con, lambda h: h, None, _edit_op_label(op), rewrites)
+    if rewrites:
+        notes.append(f"{_edit_op_label(op)}: " + "; ".join(sorted(rewrites)))
+    return nc
+
+
 def _normalize_sketch_edit_op(op: dict, notes: list) -> dict:
     """One 2D editing op -> the exact key names session.cpp reads.
 
     Raises ValueError for a payload whose INTENT cannot be expressed in one op — those
     would otherwise apply a different edit and report success.
     """
-    name = op.get("op")
+    raw_name = op.get("op")
+    name = _SKETCH_OP_NAME_ALIASES.get(raw_name, raw_name)
+    if name != raw_name:
+        op = {**op, "op": name}
+        notes.append(f'op "{raw_name}" -> "{name}" (the engine\'s own spelling)')
+    if name == "sketch_add_constraint":
+        return _normalize_constraint_op(op, notes)
     aliases = _SKETCH_EDIT_KEY_ALIASES.get(name)
     if aliases is None:
         return op
@@ -1349,6 +1601,16 @@ def _normalize_sketch_edit_op(op: dict, notes: list) -> dict:
             moved.append(f"{alias} -> {canon}")
         elif alias in nc:
             nc.pop(alias)
+
+    # An OBJECT where the engine reads a constraint id reached nlohmann as
+    # `type must be string, but is object` — a kernel exception, not a teaching
+    # rejection (live probe-holster-5). Say what the slot takes instead.
+    if name == "sketch_set_dim" and "id" in nc and not isinstance(nc["id"], str):
+        raise ValueError(
+            f"{label}: sketch_set_dim RETUNES an existing dimension, so `id` is that "
+            f'dimension\'s constraint id ("c3") — got {nc["id"]!r}. To CREATE a '
+            f"dimension use sketch_add_constraint with the concrete type "
+            f'(length/radius/diameter/distance/angle) and its `value`.')
 
     # ---- entity selection ---------------------------------------------------
     if name in _EDIT_ENTITY_LIST_OPS and not isinstance(nc.get("entities"), list):
@@ -2832,6 +3094,28 @@ def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
     """`{"op":"delete_feature","feature_id":"f2"}` -> the canonical `id` key."""
     if kind not in _OP_TARGET_OPS or op.get("id") is not None:
         return op
+    # The target (and its params) nested inside a `feature` wrapper — the shape a model
+    # reaches for because add_feature has one. session.cpp reads the id at OP level, so
+    # this arrived as «edit_feature: no feature ''» with the id sitting right there
+    # (live probe-holster-7, after preflight_ops had accepted the flat spelling).
+    inner = op.get("feature")
+    if isinstance(inner, dict):
+        for alias in ("id",) + _OP_TARGET_ALIASES:
+            v = inner.get(alias)
+            if isinstance(v, str) and v.strip():
+                out = dict(op)
+                out["id"] = v.strip()
+                rest = {k: x for k, x in inner.items() if k != alias}
+                if isinstance(rest.get("params"), dict) and "params" not in out:
+                    out["params"] = rest.pop("params")
+                for k, x in rest.items():
+                    out.setdefault(k, x)
+                out.pop("feature", None)
+                notes.append(
+                    f'{kind}: read the target out of feature.{alias}="{v}" — this op '
+                    f'addresses its feature with a top-level `id` (and `params` beside it)')
+                return out
+
     for alias in _OP_TARGET_ALIASES:
         v = op.get(alias)
         if isinstance(v, str) and v.strip():

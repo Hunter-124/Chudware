@@ -507,6 +507,44 @@ def test_publishing_a_task_list_is_not_doing_the_work():
     ) is None
 
 
+def test_reading_the_document_is_not_building_it():
+    """A readback is context, never a deliverable.
+
+    Regression for a live 2026-08-04 sweep leg: asked to "Model an L bracket from 6 mm
+    steel … tell me the mass when you are done", claude-sonnet-5 called `enable_tools`,
+    then `get_part(summary=True)` on an EMPTY document, and finished — success=True,
+    stop_reason=confirmed, zero geometry, and a handoff whose own task list still read
+    "status": "running". `get_part` was not classified as meta, so `_did_real_work`
+    counted looking at nothing as having done something.
+    """
+    import services.agent.agent_turn as at
+
+    request = ("Model an L bracket from 6 mm steel: one leg 80 mm long, the other 60 mm. "
+               "Tell me the mass when you are done.")
+    live = [{"tool": "enable_tools", "ok": True}, {"tool": "get_part", "ok": True}]
+    assert not at._did_real_work(live)
+    assert at._unearned_finish_block(
+        live, "The bracket is built.", empty_is_unearned=True,
+        request=request, can_act=True) is not None
+
+    # One genuine modelling call and it IS work, even if that call failed.
+    assert at._did_real_work(live + [{"tool": "add_features", "ok": False}])
+
+
+@pytest.mark.parametrize("tool", ["measure_part", "measure_between", "render_part",
+                                  "query_geometry", "verify_battery", "export_part",
+                                  "inspect_part"])
+def test_a_tool_that_can_BE_the_answer_still_counts_as_work(tool):
+    """"Render the part" / "measure the bore" are satisfied BY those calls.
+
+    Sweeping every readback into the meta set would make those requests
+    unsatisfiable by construction — the opposite failure.
+    """
+    import services.agent.agent_turn as at
+
+    assert at._did_real_work([{"tool": tool, "ok": True}])
+
+
 # ---------------------------------------------------------------------------
 # A delegate that never ran is not work (live 2026-07-29, firmware pass 2c)
 # ---------------------------------------------------------------------------

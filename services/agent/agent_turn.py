@@ -770,8 +770,21 @@ _UNEARNED_FINISH_NUDGE = (
 #: is a statement of what you are ABOUT to do; counting it as having done it is
 #: precisely the fabricated-progress failure the unearned-finish gate exists to
 #: catch.
+#: Pure READBACKS belong here for the same reason, and their absence is how a live
+#: 2026-08-04 bracket request ("Model an L bracket… tell me the mass") closed as
+#: success=confirmed after exactly two calls — ``enable_tools`` then
+#: ``get_part(summary=True)`` on an empty document — with a handoff whose own task list
+#: still read "status": "running". ``get_part`` is not meta, so `_did_real_work` said yes
+#: and the gate never looked.
+#:
+#: Only tools that DESCRIBE the workspace are listed. Anything that can be the answer a
+#: user asked for is deliberately absent — measure_*/render_*/query_geometry/inspect_part/
+#: verify_battery/export_part are real deliverables for the requests that name them, and
+#: banning those would make "render the part" unsatisfiable by construction.
 _META_TOOLS_NOT_WORK = frozenset({
     "enable_tools", "list_tool_categories", "task_list",
+    "get_part", "describe_part", "list_parts", "describe_project",
+    "workspace_status", "cad_guide", "check_metadata", "list_artifacts",
 })
 
 

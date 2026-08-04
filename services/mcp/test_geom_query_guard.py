@@ -141,3 +141,62 @@ def test_a_bogus_sid_no_longer_fillets_the_whole_body(bored_cube):
     assert "READBACK" in str(out.get("error")), out
     after = _call("query_geometry", doc_id=bored_cube, query={"of": "face", "surf": "round"})
     assert len(after.get("matches") or []) == len(before.get("matches") or [])
+
+
+# ── a sid in a REF slot selects the element it names ─────────────────────────
+# Same live sweep, shaft leg: the model wrote refs.edges=[{"kind":"edge","sid":"E6b9abd"}]
+# and the validator answered «incomplete engine topology selector — a 'edge' selector
+# needs centroid [x,y,z]». It answered THAT by inventing centroid:[0,0,0], which was
+# accepted — and chamfered the rim at z=0 instead of the one at z=100 the sid named.
+# Only a BARE sid string was ever resolved against the document; a selector dict carrying
+# one was not.
+
+@pytest.fixture()
+def rod() -> str:
+    """A 100 mm rod standing on z=0: two circular rims, unambiguously far apart."""
+    doc = _call("new_part", name="query_guard_rod", fresh=True)["doc_id"]
+    built = _call("add_features", doc_id=doc, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "cylinder", "name": "Rod",
+            "params": {"radius": {"value": 12.5}, "height": {"value": 100}},
+            "centered": False, "at": [0, 0, 0]}}])
+    assert built.get("ok") is True, built
+    return doc
+
+
+def _top_rim(doc: str) -> dict:
+    ms = _call("query_geometry", doc_id=doc, query={"of": "edge", "surf": "circle"})["matches"]
+    top = [m for m in ms if m["centroid"][2] > 50]
+    assert len(top) == 1, ms
+    return top[0]
+
+
+@pytest.mark.parametrize("shape", ["bare", "kind_sid", "kind_sid_fake_centroid", "query"])
+def test_every_sid_shape_chamfers_the_rim_the_sid_names(rod, shape):
+    sid = _top_rim(rod)["sid"]
+    selector = {
+        "bare": sid,
+        "kind_sid": {"kind": "edge", "sid": sid},
+        # The fabricated field the harness's own error message provoked.
+        "kind_sid_fake_centroid": {"kind": "edge", "sid": sid, "centroid": [0.0, 0.0, 0.0]},
+        "query": {"of": "edge", "sid": sid},
+    }[shape]
+    out = _call("add_features", doc_id=rod, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "chamfer", "name": "Break", "params": {"distance": {"value": 1}},
+            "refs": {"edges": [selector]}}}])
+    assert out.get("ok") is True, out
+    cones = _call("query_geometry", doc_id=rod, query={"of": "face", "surf": "conical"})
+    zs = [m["centroid"][2] for m in cones.get("matches") or []]
+    assert len(zs) == 1, cones
+    assert zs[0] > 50, f"{shape}: chamfered the WRONG rim at z={zs[0]}"
+
+
+def test_a_stale_sid_in_a_ref_names_the_live_roster(rod):
+    out = _call("add_features", doc_id=rod, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "chamfer", "name": "Break", "params": {"distance": {"value": 1}},
+            "refs": {"edges": [{"kind": "edge", "sid": "e000000"}]}}}])
+    assert out.get("ok") is False, out
+    assert "e000000" in str(out.get("error")), out
+    assert "sids change" in str(out.get("error")), out

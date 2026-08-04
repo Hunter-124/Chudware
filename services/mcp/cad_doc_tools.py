@@ -4592,7 +4592,8 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
             if not is_geom_query(m):
                 fixed.append(m)
                 continue
-            q, qnotes = normalize_geom_query(m, where=f"{label}: refs.{slot}")
+            q, qnotes = normalize_geom_query(m, where=f"{label}: refs.{slot}",
+                                             defer_sid=True)
             notes.extend(qnotes)
             fixed.append(q)
             touched = touched or q != m
@@ -5172,8 +5173,27 @@ def _bare_sid(v: Any) -> Optional[str]:
     return s if _SID_RE.fullmatch(s) else None
 
 
+def _ref_sid(v: Any) -> Optional[str]:
+    """The sid a ref member names — bare, or carried inside a selector/query dict.
+
+    A sid IS the identity of one face/edge, so wherever it appears the engine's own live
+    match for it is the authoritative selector. Only the bare-string form used to be
+    resolved, which is how the fabricated-centroid path opened: the validator rejected
+    ``{"kind":"edge","sid":"E6b9abd"}`` for a missing centroid, and a live model
+    (claude-sonnet-5, 2026-08-04) answered by inventing ``centroid:[0,0,0]``. That was
+    ACCEPTED, and chamfered the rim at z=0 instead of the one at z=100 the sid named.
+    """
+    if isinstance(v, str):
+        return _bare_sid(v)
+    if isinstance(v, dict):
+        sid = v.get("sid")
+        if isinstance(sid, str) and _SID_RE.fullmatch(sid.strip()):
+            return sid.strip()
+    return None
+
+
 def _walk_sid_refs(ops: Any):
-    """Yield (refs dict, slot, index-or-None, sid) for every bare sid sitting in a ref slot."""
+    """Yield (refs dict, slot, index-or-None, sid) for every sid sitting in a ref slot."""
     for op in ops if isinstance(ops, list) else ():
         feat = op.get("feature") if isinstance(op, dict) else None
         refs = feat.get("refs") if isinstance(feat, dict) else None
@@ -5184,11 +5204,11 @@ def _walk_sid_refs(ops: Any):
                 continue
             if isinstance(v, list):
                 for i, x in enumerate(v):
-                    sid = _bare_sid(x)
+                    sid = _ref_sid(x)
                     if sid:
                         yield refs, slot, i, sid
             else:
-                sid = _bare_sid(v)
+                sid = _ref_sid(v)
                 if sid:
                     yield refs, slot, None, sid
 
@@ -5435,12 +5455,12 @@ def _resolve_sid_refs(ops: Any, doc_id: str, notes: list) -> Any:
             if slot not in _SID_REF_SLOTS:
                 continue
             if isinstance(v, list):
-                lst = [resolved.get(_bare_sid(x) or "", x) for x in v]
+                lst = [resolved.get(_ref_sid(x) or "", x) for x in v]
                 if lst != v:
                     new_refs[slot], touched = lst, True
             else:
-                sid = _bare_sid(v)
-                if sid:
+                sid = _ref_sid(v)
+                if sid and resolved[sid] != v:
                     new_refs[slot], touched = resolved[sid], True
         if not touched:
             out.append(op)
@@ -5449,9 +5469,10 @@ def _resolve_sid_refs(ops: Any, doc_id: str, notes: list) -> Any:
     if resolved:
         shown = ", ".join(sorted(resolved))
         notes.append(
-            f"wrapped bare face/edge sid(s) {shown} into selector objects "
-            f'({{"kind":"face","sid":"…"}}) — a ref slot takes a selector, a reserved datum, '
-            f'an f<N> id or a "$N" placeholder, never a bare sid')
+            f"resolved face/edge sid(s) {shown} against this document — the sid IS the "
+            f"element's identity, so the engine's own measured selector (kind + centroid "
+            f"+ surf) replaces whatever accompanied it. A centroid guessed to satisfy "
+            f'"incomplete engine topology selector" would have picked a DIFFERENT element')
     return out
 
 

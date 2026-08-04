@@ -5456,7 +5456,7 @@ def is_geom_query(value: Any) -> bool:
     return isinstance(value, dict) and (value.get("kind") == "query" or "of" in value)
 
 
-def normalize_geom_query(query: dict, *, where: str) -> tuple:
+def normalize_geom_query(query: dict, *, where: str, defer_sid: bool = False) -> tuple:
     """Canonicalise a geometry-query dict's keys; reject one that cannot select.
 
     Returns ``(query, notes)``. Raises ``ValueError`` with the real vocabulary for
@@ -5490,6 +5490,12 @@ def normalize_geom_query(query: dict, *, where: str) -> tuple:
               f"matched EVERY candidate instead of the one you named. Query keys: "
               f"{GEOM_QUERY_VOCAB_HELP}")
     readback = sorted(k for k in out if k in GEOM_QUERY_READBACK_KEYS)
+    if defer_sid and isinstance(out.get("sid"), str) and _SID_RE.fullmatch(out["sid"].strip()):
+        # add_features resolves a real sid against the live document (_resolve_sid_refs),
+        # which both selects the right element and gives a better error for a stale one.
+        # A value that is not sid-SHAPED is not a sid at all — it falls through to the
+        # rejection below rather than being handed on to a resolver that will skip it.
+        return out, notes
     if readback and not (set(out) & GEOM_QUERY_NARROWING_KEYS):
         raise ValueError(
             f"{where}: " + ", ".join(repr(k) for k in readback)

@@ -316,17 +316,21 @@ def score_fea(doc_id: str) -> dict:
         return {"passed": None,
                 "reason": str((res or {}).get("error"))[:240] if isinstance(res, dict)
                 else "no result"}
-    fos = res.get("min_fos")
+    # The scalars are nested under "summary" — the same shape that made
+    # verify_battery grade every solve 1.0. Read there, tolerate flat.
+    summary = res.get("summary") if isinstance(res.get("summary"), dict) else {}
+    fos = summary.get("min_fos", res.get("min_fos"))
     return {
         "passed": (float(fos) > 1.0) if isinstance(fos, (int, float)) else None,
         "min_fos": fos,
-        "max_von_mises_mpa": res.get("max_von_mises_mpa"),
-        "max_disp_mm": res.get("max_disp_mm"),
+        "max_von_mises_mpa": summary.get("max_von_mises_mpa",
+                                         res.get("max_von_mises_mpa")),
+        "max_disp_mm": summary.get("max_disp_mm", res.get("max_disp_mm")),
     }
 
 
 def score_doc(doc_id: str) -> dict:
-    """Every deterministic scorer, plus a single roll-up fraction."""
+    """Every deterministic scorer against ONE document, plus a roll-up."""
     scores = {
         "bore_fit": score_bore_fit(doc_id),
         "hole_pattern": score_hole_pattern(doc_id),
@@ -337,7 +341,44 @@ def score_doc(doc_id: str) -> dict:
     scores["passed_count"] = sum(1 for g in graded if g)
     scores["graded_count"] = len(graded)
     scores["fraction"] = (scores["passed_count"] / len(graded)) if graded else 0.0
+    scores["doc_id"] = doc_id
     return scores
+
+
+def score_mission(preferred_doc: str) -> dict:
+    """Score the document the mission actually BUILT.
+
+    The bound document is only a hint. The advisory loop's BUILD node calls
+    `new_part` and works in a document of its own, so grading the bound doc
+    would report 0.00 for every advisory leg — a bench artifact, not a result.
+    The question worth answering is "did this loop produce a conforming part",
+    so score every candidate document in the session and keep the best, and
+    record WHICH document was graded so the number stays auditable.
+    """
+    candidates: list[str] = [preferred_doc] if preferred_doc else []
+    listing = _dispatch("list_parts", {})
+    for row in (listing or {}).get("docs") or []:
+        did = row.get("doc_id") if isinstance(row, dict) else None
+        # An empty document cannot satisfy any criterion; skip it so a stray
+        # scratch doc never outranks the real one on a tie.
+        if did and did not in candidates and not row.get("empty"):
+            candidates.append(did)
+    if not candidates:
+        return {"fraction": 0.0, "graded_count": 0, "passed_count": 0,
+                "reason": "no documents open at scoring time", "doc_id": ""}
+
+    scored = []
+    for did in candidates:
+        try:
+            scored.append(score_doc(did))
+        except Exception as exc:  # noqa: BLE001
+            scored.append({"fraction": 0.0, "doc_id": did,
+                           "error": f"{type(exc).__name__}: {exc}"})
+    best = max(scored, key=lambda s: (s.get("fraction") or 0.0,
+                                      s.get("graded_count") or 0))
+    best["candidates_considered"] = [s.get("doc_id") for s in scored]
+    best["scored_bound_doc"] = best.get("doc_id") == preferred_doc
+    return best
 
 
 # ── Gap classification ───────────────────────────────────────────────────────
@@ -483,11 +524,10 @@ def run_leg(
         except Exception:  # noqa: BLE001
             leg.usage = {}
 
-    if leg.doc_id:
-        try:
-            leg.scores = score_doc(leg.doc_id)
-        except Exception as exc:  # noqa: BLE001
-            leg.scores = {"error": f"{type(exc).__name__}: {exc}", "fraction": 0.0}
+    try:
+        leg.scores = score_mission(leg.doc_id)
+    except Exception as exc:  # noqa: BLE001
+        leg.scores = {"error": f"{type(exc).__name__}: {exc}", "fraction": 0.0}
     return leg
 
 
@@ -698,8 +738,22 @@ def _live_matrix(*, smoke: bool) -> list[LegResult]:
     tiers = _tiers_from_env()
     loops = ["baseline", "advisory"]
     seeds = [1] if smoke else [1, 2, 3]
+    # SEED-MAJOR on purpose. The spend guard can halt the matrix at any cell, so
+    # order it such that whatever completed is still a balanced comparison:
+    # each seed contributes a full loop x tier block before the next seed
+    # starts. A tier-major order would spend the entire budget on one model and
+    # leave the comparison unmakeable.
     cells = [(loop, tier, seed)
-             for tier in tiers for loop in loops for seed in seeds]
+             for seed in seeds for tier in tiers for loop in loops]
+
+    # Doc-GC retires "abandoned" documents on a grace timer. A live leg runs for
+    # minutes with the target doc idle between tool calls, and a retired doc
+    # takes the leg's work with it — the geometry the scorers are about to
+    # measure. Measured 2026-08-04: hostd logged
+    # "doc-gc: retire doc_save(doc-cpp00000010) failed" against a live leg's own
+    # document. Pin GC off for the matrix; this is a measurement harness, and
+    # the docs are cleaned up with the process.
+    os.environ.setdefault("CHUDWARE_DOC_GC", "0")
 
     cfg = dict(agent_config.load_config())
 
@@ -715,7 +769,8 @@ def _live_matrix(*, smoke: bool) -> list[LegResult]:
         return {"anthropic-sub": "anthropic", "kimi-sub": "kimi-code"}.get(name, name)
 
     guard = sg.SpendGuard()
-    out_dir = BENCHES_DIR / BENCH_ID / "results"
+    # BENCHES_DIR is an os.path string, not a Path — coerce before joining.
+    out_dir = Path(BENCHES_DIR) / BENCH_ID / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     def _checkpoint(leg: LegResult) -> None:
@@ -724,8 +779,23 @@ def _live_matrix(*, smoke: bool) -> list[LegResult]:
         (out_dir / f"leg_{leg.run_id}.json").write_text(
             json.dumps(leg.to_dict(), indent=2, default=str))
 
-    legs = run_matrix(cells, provider_for=provider_for, guard=guard,
-                      guard_provider_for=guard_provider_for, on_leg=_checkpoint)
+    # A private daemon, not the one behind the user's window. core_bridge
+    # attaches to whatever hostd is already listening, so without this the
+    # matrix shares an engine with the GUI and with any concurrent pytest run.
+    # Measured 2026-08-04: during one live leg the shared daemon's open-document
+    # count climbed 2 -> 15 from a parallel suite, and the leg's own target doc
+    # was destroyed mid-run. Legs scored against a contended engine measure the
+    # contention, not the loop.
+    from services.mcp import private_hostd
+
+    with private_hostd.private_daemon() as isolated:
+        if not isolated:
+            print("[warn] NOT isolated — an explicit CHUDWARE_HOSTD_SOCKET or a "
+                  "missing daemon binary means this shares an engine; results "
+                  "may reflect interference.", flush=True)
+        legs = run_matrix(cells, provider_for=provider_for, guard=guard,
+                          guard_provider_for=guard_provider_for,
+                          on_leg=_checkpoint)
 
     report = render_markdown(legs, gap_ledger(legs), spend=guard.report())
     (out_dir / "comparison.md").write_text(report)

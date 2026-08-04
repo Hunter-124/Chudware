@@ -425,7 +425,7 @@ class Ledger:
             )
         payload: dict = {
             "id": dim_id, "name": name, "value": value, "unit": unit,
-            "driver": driver, "tolerance": tolerance or {},
+            "driver": driver, "tolerance": _normalize_tolerance(tolerance),
             "status": status, "confirmed_by": confirmed_by,
             "refs": refs or {},
             # provenance lives in the event payload for audit; not in materialized state
@@ -678,6 +678,29 @@ def _active_stage(state: dict) -> str | None:
     return None
 
 
+def _normalize_tolerance(tol: Any) -> dict:
+    """Coerce a dimension tolerance into the dict form the ledger stores.
+
+    The signature says ``dict``, but nothing enforced it and the value comes
+    straight from a model-authored tool call. Writing a fit class as a bare
+    string — ``tolerance="g6"`` — is the natural way to express a toleranced
+    dimension, and it is exactly what a shaft/bore mission produces. That
+    string then reached ``_render_dimensions``, which called ``tol.get("fit")``
+    and raised ``AttributeError: 'str' object has no attribute 'get'``, taking
+    down ``ledger_render`` — the advisory loop's whole state surface — on a
+    perfectly reasonable call. Observed live 2026-08-04 on the bearing-mount
+    bracket mission (a 20 g6 fit).
+
+    A bare string is a fit designation; anything else unrecognized is dropped
+    rather than guessed at.
+    """
+    if isinstance(tol, dict):
+        return tol
+    if isinstance(tol, str) and tol.strip():
+        return {"fit": tol.strip()}
+    return {}
+
+
 def _render_dimensions(dimensions: list[dict], active_stage: str | None) -> list[str]:
     """Render dimensions, sorted by id for determinism."""
     if not dimensions:
@@ -685,7 +708,9 @@ def _render_dimensions(dimensions: list[dict], active_stage: str | None) -> list
     sorted_dims = sorted(dimensions, key=lambda d: d.get("id", ""))
     lines = ["## Dimensions"]
     for d in sorted_dims:
-        tol = d.get("tolerance") or {}
+        # Defensive as well as normalized at ingest: state materialized from
+        # events written before the normalizer existed still carries raw strings.
+        tol = _normalize_tolerance(d.get("tolerance"))
         tol_str = ""
         if tol.get("fit"):
             tol_str = f" [{tol['fit']}]"

@@ -6129,3 +6129,59 @@ Verified: agent suite 3142->3169 passed (0 failed), `scripts/check.py` all 8 gat
 `./build.sh` links, headless `CHUDWARE_SHOT=chat` and `workspaces` (8 captures incl.
 `workspace_08_ai`) both exit 0, and a depth-2 delegation smoke landed 35 mirrored messages
 in the conversation's sidecar where one truncated reply used to be the entire record.
+
+## 2026-08-04 — T-W11 advisory bench + two verifier/guidance bugs it uncovered
+Hunter authorized paid subscription quota for T-W11 (Pillar-20 capstone) with the
+explicit instruction that the tokens buy *found gaps*, not a model leaderboard. Two
+real defects fell out before a single paid token was spent, both found by mining
+what already existed on disk. **(1) The tier was dropped on the `enable_tools`
+tools-block re-render.** `agent_turn._apply_categories` replaces the entire §9.1
+block mid-turn and called `render_tools_block()` without `tier=`, silently taking
+`DEFAULT_TOOLS_BUDGET_TOKENS` (2500, the local-24k floor) instead of the turn's own
+budget (frontier = 10000). Measured on `add_features`: 12792 chars of schema and
+guidance at `tier=frontier` versus 335 untiered — 2.8% of the 11886-char authored
+docstring, with the tool dropping out of the expansion pass entirely. It landed on
+exactly the wrong turn, because `general_agent` starts without the modeling family
+and can only reach `add_features` THROUGH `enable_tools`. In 59 genuine user runs
+(`cache/runs/*/events.jsonl`, filtered to `run-`/`linear-`/`asm-` prefixes — the
+skill's `^run-\d+$` filter is stale and misses the GUI's own linear lane),
+`add_features` is 62 of 86 tool failures (72%) at a 23.2% overall failure rate, and
+every observed failure class is documented in the guidance being discarded.
+**(2) `verify_battery`'s FEA check graded nothing.** `_extract_score` scans its
+scalar key list at the TOP level, but the sim tools return the scalars nested under
+`summary`, so no key matched and it fell through to `1.0 if ok else 0.0` — "did the
+solver run", not "did the part pass". An 80x50x4 aluminium plate at 50 kN solves
+`ok=True` with `min_fos` 0.9944 (a FAILING margin) and scored a perfect 1.0; it now
+scores 0.4972. That is fabricated success inside the check that gates mission
+done-ness. `run_fea_static`'s docstring also advertised a flat return shape the tool
+has never produced — the same misdirection that caused the bug.
+
+New: `tools/flywheel/bench/benches/advisor_e2e.py` (registered in `runner.py`'s
+`_BENCH_MODULES`) runs the bearing-mount-bracket mission through the baseline linear
+lane and the advisory orchestrator-over-DAG lane, scores it with deterministic
+checks only (bore fit via `fit_calc`, hole pattern via `query_geometry` `concavity ==
+"bore"`, `is_manifold`, FEA `min_fos`), and emits a **gap ledger** bucketing every
+observed tool failure into harness_defect / dialect_gap / guidance_gap / teaching.
+`tools/flywheel/bench/spend_guard.py` reads live subscription utilization from the
+OMP bridge's OAuth store (`<appdata>/omp-bridge-auth.db`, opened read-only+immutable)
+and halts a matrix at an ABSOLUTE cap; an unreadable meter fail-safes to stop.
+
+Gotchas for the next person. Live legs MUST hold a private daemon
+(`services/mcp/private_hostd.private_daemon()`): `core_bridge` attaches to whatever
+hostd is listening, and during one leg the shared daemon's open-doc count climbed
+2 -> 15 from a concurrent pytest run and the leg's own target document was destroyed
+mid-run. Doc-GC also retires idle documents — hostd logged
+`doc-gc: retire doc_save(doc-cpp00000010) failed` against a live leg's own doc — so
+the matrix pins `CHUDWARE_DOC_GC=0`. Matrix cells are SEED-MAJOR so a spend-cap stop
+still leaves a balanced loop x tier block. `_bind_tool` bypasses `_reconcile_kwargs`
+(which lives in `_dispatch_tool`), so probing dialect gaps through `_bind_tool`
+manufactures false positives — `export_part(format=)` "reproduced" that way and is
+in fact fixed. Likewise the `undo_denied` refusal DOES ship full recovery guidance in
+its `hint` field; the event's `error_preview` clips it, which makes the corpus look
+worse than reality. `BENCHES_DIR` is an `os.path` string, not a `Path`.
+
+Filed `work/backlog/T-BL61.md`: a fillet inside `doc_apply_ops` SIGSEGVs hostd via
+OCCT `ChFi3d_Builder::PerformFilletOnVertex` (coredump + full backtrace on the card).
+`geom::blend_drop_failing` cannot contain it — OCCT segfaults rather than throwing,
+and a catch block cannot catch a signal. No deterministic reproducer yet; a bare box
+and a bored plate both survive every radius tried.

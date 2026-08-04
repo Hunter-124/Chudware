@@ -408,6 +408,36 @@ class TestUpsertHelpers(unittest.TestCase):
         self.assertEqual(len(ledger.state["dimensions"]), 1)
         self.assertEqual(ledger.state["dimensions"][0]["value"], 20.02)
 
+    def test_string_tolerance_does_not_crash_ledger_render(self):
+        """A bare fit class ("g6") is the natural way to tolerance a dimension.
+
+        It used to be stored verbatim and then indexed as a dict by
+        _render_dimensions -> AttributeError: 'str' object has no attribute
+        'get', which took down ledger_render (the advisory loop's entire state
+        surface). Observed live on a 20 g6 bearing-bore mission, 2026-08-04.
+        """
+        from services.agent.ledger import ledger_render
+
+        run_id, path = _fresh("str_tol")
+        ledger = Ledger(run_id, path)
+        ledger.upsert_dimension("foreman", "DIM1", "shaft bore", 20.0, "mm",
+                                "sliding fit", provenance="calc: fit_calc",
+                                tolerance="g6")
+        stored = ledger.state["dimensions"][0]["tolerance"]
+        self.assertEqual(stored, {"fit": "g6"}, "normalized at ingest")
+        rendered = ledger_render(ledger, 4000)
+        self.assertIn("[g6]", rendered)
+
+    def test_render_tolerates_a_raw_string_already_in_state(self):
+        """State materialized from events written BEFORE the normalizer still
+        carries raw strings — rendering must not raise on those either."""
+        from services.agent.ledger import _render_dimensions
+
+        lines = _render_dimensions(
+            [{"id": "D1", "name": "bore", "value": 20.0, "unit": "mm",
+              "tolerance": "H7", "status": "proposed"}], None)
+        self.assertTrue(any("[H7]" in l for l in lines), lines)
+
     def test_add_decision_upserts_by_id(self):
         run_id, path = _fresh("upsert_dec")
         ledger = Ledger(run_id, path)

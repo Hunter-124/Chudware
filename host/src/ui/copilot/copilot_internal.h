@@ -136,7 +136,25 @@ void markChatHistoryDirty();
 extern std::atomic<bool> s_chatHistoryDirty;
 extern double            s_chatHistoryLastPersist;
 
+
 namespace ui {
+// ---- append-only lossless main-chat archive (conversations) ----
+// Message construction sites call appendChatRawMessage after insertion. feedTurnActivity wraps
+// its one folding seam in ChatRawActivityCapture, which records every added or changed row.
+void appendChatRawMessage(AppState& st, const ChatMsg& message) noexcept;
+class ChatRawActivityCapture {
+public:
+    explicit ChatRawActivityCapture(ChatMsg& message) noexcept;
+    ~ChatRawActivityCapture();
+
+    ChatRawActivityCapture(const ChatRawActivityCapture&) = delete;
+    ChatRawActivityCapture& operator=(const ChatRawActivityCapture&) = delete;
+
+private:
+    ChatMsg& message_;
+    std::string conversationId_;
+    std::vector<std::string> before_;
+};
 
 // ---- model label / token formatting (ui_common) ----
 std::string shortModelName(const std::string& id);

@@ -557,6 +557,7 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
                 ChatMsg m;
                 m.fromUser = false;
                 st.chat.push_back(std::move(m));
+                appendChatRawMessage(st, st.chat.back());
                 host = &st.chat.back();
             }
             PlanState ps;

@@ -3,7 +3,7 @@ id: T-BL02
 title: Format interop track (reverse-engineering intake)
 workstream: backlog
 owner: mooseinatree
-status: doing
+status: backlog
 branch: task/T-BL02-format-interop
 depends_on: []
 lane: modeling-core
@@ -54,3 +54,6 @@ or the Linux symlink layout. Canonical edits go in the tracked tree (`engine_ora
 the runtime `engine/` copy is kept in sync for pytest (Python imports resolve to `engine/`).
 - 2026-07-04 00:53 UTC [mooseinatree] DXF import slice complete + pushed on branch task/T-BL02-format-interop (merge-ready). ezdxf (MIT) -> engine/doc/formats_dxf.py: LINE/CIRCLE/ARC/LWPOLYLINE(bulge)/POLYLINE/ELLIPSE/SPLINE/INSERT -> build123d planar B-rep (closed wires -> Faces, open -> wires), wired into import_path + FORMAT_REGISTRY (.dxf, import-only) + doc_formats matrix. 8 round-trip tests pass (python -m pytest engine/doc/test_formats_dxf.py). requirements.txt + contracts/licenses.md updated (ezdxf MIT, no debt). scripts/check.py stdlib gate PASS; core-build/ctest/full-pytest need Linux env (SKIP on this Windows box) - foreman Linux merge pass to run full gate.sh. ORACLE SIDE ONLY: GUI/MCP import runs in the C++ core (core/doc/formats.cpp, no DXF reader yet) -> follow-up T-BL47 cut for the bit-identical C++ mirror; import_part MCP docstring intentionally left unchanged until the core can import DXF. T-BL02 remains the ongoing interop umbrella (reopen after merge for next format: Parasolid/CATIA/etc.).
 - 2026-07-04 02:25 UTC [mooseinatree] Added DWG import + folded in clean-room format reference docs (branch task/T-BL02-format-interop, pushed). DWG: engine/doc/formats_dwg.py converts DWG->DXF via an external user-provided converter (ODA File Converter through ezdxf.addons.odafc, or LibreDWG dwg2dxf on PATH; subprocess-only, never bundled) then reuses the DXF pipeline (refactored formats_dxf.bodies_from_doc for sharing). Import-only; wired into import_path + FORMAT_REGISTRY + doc_formats. 5 DWG tests (12 pass incl. DXF, 1 skipped real-roundtrip needs a converter). licenses.md rows added (ODA FC proprietary + LibreDWG GPL, both subprocess-only). Reference docs: docs/reference/ (file-format survey, Db/Ge/Gi/Gs data model, build guidance) adapted clean-room from public-spec sources, cross-linked to formats.py/T-BL02/licenses.md. Still oracle-side (C++ core mirror = T-BL47 covers DXF; DWG would follow the same converter->DXF path there).
+- 2026-08-04 [audit] DXF/DWG/.3dm shipped and were ported to C++ (core/doc/formats.cpp);
+  Parasolid/CATIA V5/Inventor/Altium and the ODA membership decision remain untouched;
+  last prior activity 2026-07-04.

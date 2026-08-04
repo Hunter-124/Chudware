@@ -909,39 +909,39 @@ def _drop_oldest_tool_results(messages: list[dict], *, keep_recent: int = 6) -> 
 
 
 class _RawMirroredMessages(list):
-    """``run_turn``'s provider conversation, mirrored into the lossless raw log.
+    """``run_turn``'s provider conversation, mirrored into a lossless raw log.
 
-    The messages list is otherwise a local that dies when ``run_turn`` returns,
-    which is why a sub-agent's real conversation never reached disk: the only
-    model output that was ever persisted was a 4000-char slice of the final
-    reply. Subclassing the list captures every mutation at ONE seam instead of
-    at the ~60 call sites that build it.
+    The messages list is otherwise a local that dies when ``run_turn`` returns.
+    Subclassing the list captures every mutation at ONE seam instead of at the
+    ~60 call sites that build it.
 
-    Every record is verbatim and uncapped — see ``contracts/worker_rpc.md``,
-    schema ``chudware.subagent.raw/1``. Mirroring is best-effort: a failing
+    Every record is verbatim and uncapped. Mirroring is best-effort: a failing
     raw log must never break the turn it is recording.
     """
 
-    __slots__ = ("_sid", "_sreg")
+    __slots__ = ("_target", "_append_raw")
 
-    def __init__(self, subagent_id: str, sreg: Any, initial: Any = ()) -> None:
+    def __init__(self, target: Any, raw_writer: Any, initial: Any = ()) -> None:
         super().__init__(initial)
-        self._sid = subagent_id
-        self._sreg = sreg
+        self._target = target
+        self._append_raw = (
+            raw_writer if callable(raw_writer) else raw_writer.append_raw)
         for message in list(self):
             self._mirror(message)
 
+    def _write(self, record: dict) -> None:
+        self._append_raw(self._target, record)
+
     def _mirror(self, message: Any) -> None:
         try:
-            self._sreg.append_raw(
-                self._sid, {"kind": "message", "message": message})
+            self._write({"kind": "message", "message": message})
         except Exception:  # noqa: BLE001
             pass
 
     def _mirror_compaction(self, before: int) -> None:
         """Record an in-place rewrite verbatim — compaction must not lose text."""
         try:
-            self._sreg.append_raw(self._sid, {
+            self._write({
                 "kind": "compaction",
                 "before": before,
                 "after": len(self),
@@ -990,11 +990,16 @@ class _RawMirroredMessages(list):
         self._mirror_compaction(before)
 
 
-def _raw_lifecycle(sreg: Any, subagent_id: str, event: str, note: str = "") -> None:
-    """Best-effort lifecycle record into a sub-agent's lossless raw log."""
+def _raw_lifecycle(
+    target: Any,
+    raw_writer: Any,
+    event: str,
+    note: str = "",
+) -> None:
+    """Best-effort lifecycle record into a lossless raw log."""
     try:
-        sreg.append_raw(
-            subagent_id, {"kind": "lifecycle", "event": event, "note": note})
+        append_raw = raw_writer if callable(raw_writer) else raw_writer.append_raw
+        append_raw(target, {"kind": "lifecycle", "event": event, "note": note})
     except Exception:  # noqa: BLE001
         pass
 
@@ -2138,7 +2143,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         note = ("Pause hold entered; work already in flight finished before "
                 "parking at this turn boundary.")
         _sreg.append_transcript(subagent_id, "system", note)
-        _raw_lifecycle(_sreg, subagent_id, "paused", note)
+        _raw_lifecycle(subagent_id, _sreg, "paused", note)
         while True:
             elapsed = time.monotonic() - started
             if _sreg.terminate_requested(subagent_id):
@@ -2149,22 +2154,45 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 return "controller_gone", elapsed
             time.sleep(0.5)
 
-    # Lossless capture: mirror the provider conversation into the sub-agent's
-    # append-only raw log for the rest of this run. Everything above this point
-    # (history, request, skills) is replayed into the log by the constructor.
-    if subagent_id:
-        try:
-            from services.agent import subagent_registry as _sreg_raw  # noqa: PLC0415
-            messages = _RawMirroredMessages(subagent_id, _sreg_raw, messages)
-            _raw_lifecycle(_sreg_raw, subagent_id, "started",
-                           f"Sub-agent turn started (actor={actor}).")
-        except Exception:  # noqa: BLE001
-            pass
-
+    # Lossless capture: mirror the provider conversation for either a sub-agent
+    # or a session-bound main turn. Everything above this point (history,
+    # request, skills) is replayed into the log by the constructor.
+    try:
+        from services.agent import subagent_registry as _sreg_raw  # noqa: PLC0415
+        _raw_target = None
+        _raw_writer = None
+        _raw_started_note = ""
+        if subagent_id:
+            _raw_target = subagent_id
+            _raw_writer = _sreg_raw
+            _raw_started_note = f"Sub-agent turn started (actor={actor})."
+        else:
+            _session_id, _transcript_dir = _sreg_raw.bound_session()
+            if _session_id and _transcript_dir is not None:
+                from services.agent import raw_log as _raw_log  # noqa: PLC0415
+                _raw_target = (
+                    _transcript_dir.parent / f"{_session_id}.agent.jsonl")
+                _main_raw_header = {
+                    "kind": "header",
+                    "schema": "chudware.chat.agent/1",
+                    "session_id": _session_id,
+                    "created_ts": time.time(),
+                }
+                _raw_writer = lambda path, record: _raw_log.append(
+                    path, record, _main_raw_header)
+                _raw_started_note = (
+                    f"Main agent turn started (actor={actor}).")
+        if _raw_target is not None and _raw_writer is not None:
+            messages = _RawMirroredMessages(
+                _raw_target, _raw_writer, messages)
+            _raw_lifecycle(
+                _raw_target, _raw_writer, "started", _raw_started_note)
+    except Exception:  # noqa: BLE001
+        pass
     for _ in range(budget + 1):
-        # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  Cross-process
+        # Phase 4 (M11/M16/M17): the sub-agent turn boundary. Cross-process
         # controls never interrupt in-flight work; they land before the next
-        # model completion.  Best-effort: registry failure never breaks a turn.
+        # model completion. Best-effort: registry failure never breaks a turn.
         if subagent_id:
             try:
                 from services.agent import subagent_registry as _sreg  # noqa: PLC0415
@@ -2212,12 +2240,13 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         note="pause hold released")
                     _sreg.append_transcript(
                         subagent_id, "system", outcome_note)
-                    _raw_lifecycle(_sreg, subagent_id, "resumed", outcome_note)
+                    _raw_lifecycle(
+                        subagent_id, _sreg, "resumed", outcome_note)
                     _log(ledger, actor, {
                         "event": (
-                            "subagent_pause_hold_orphaned"
+                            "subagent_pause_auto_released"
                             if hold_outcome == "controller_gone"
-                            else "subagent_pause_hold_released"
+                            else "subagent_resumed"
                         ),
                         "subagent_id": subagent_id,
                         "duration_s": held_s,

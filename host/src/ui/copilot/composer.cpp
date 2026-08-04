@@ -609,6 +609,7 @@ static void applyWireMessagesToChat(AppState& st, const nlohmann::json& messages
         }
         if (cm.text.empty()) continue;
         st.chat.push_back(std::move(cm));
+        ui::appendChatRawMessage(st, st.chat.back());
     }
     for (auto& m : st.chat) m.uiCachedH = -1.0f;
     persistChatHistory(st);
@@ -620,6 +621,7 @@ static void pushSessionNotice(AppState& st, const std::string& text) {
     n.text = text;
     n.model = "system";
     st.chat.push_back(std::move(n));
+    ui::appendChatRawMessage(st, st.chat.back());
     persistChatHistory(st);
     st.toast(ui::ToastLevel::Info, text.size() > 80 ? text.substr(0, 77) + "..." : text);
 }
@@ -1352,6 +1354,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
                 "The above is a handoff document from a previous session. "
                 "Use this context to continue the work seamlessly.";
             st.chat.push_back(std::move(seed));
+            appendChatRawMessage(st, st.chat.back());
             persistChatHistory(st);
             st.toast(ui::ToastLevel::Success, "New session started with handoff context");
             st.addLog("[..] /handoff: new session seeded");
@@ -1490,6 +1493,7 @@ void submitTurn(AppState& st, const std::string& text) {
             u.text += "]";
         }
         st.chat.push_back(u);
+        appendChatRawMessage(st, st.chat.back());
     }
     {
         ChatMsg a;
@@ -1499,6 +1503,7 @@ void submitTurn(AppState& st, const std::string& text) {
         // Instant classification chrome — don't wait for the first drained event frame.
         a.liveStatus = "Routing request\xe2\x80\xa6";
         st.chat.push_back(a);
+        appendChatRawMessage(st, st.chat.back());
     }
     st.designStarted = true;   // conversation is now active (kept for shot scenarios)
     // Sending a message is intent to follow the reply: re-engage stick-to-bottom on every
@@ -4244,6 +4249,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                     u.copilotMode = st.aiInteraction;
                     u.liveStatus = "steering";  // subtle caption under the bubble
                     st.chat.push_back(std::move(u));
+                    appendChatRawMessage(st, st.chat.back());
                 } else {
                     // Auto-sends when the assistant frees up (drain at the top of drawComposer).
                     st.queuedPrompts.emplace_back(text);

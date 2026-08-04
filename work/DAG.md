@@ -28,7 +28,7 @@ graph TD
   end
   subgraph WS_BL["workstream BL"]
     T_BL52["T-BL52: Reconcile HSS imperial takeoff designations with the mm section-geometry grammar"]:::todo
-    T_BL53["T-BL53: Discord bot /stats + /leaderboard — implement the git-derived stats/embed helpers in notify_discord.py"]:::review
+    T_BL53["T-BL53: Discord bot /stats + /leaderboard — implement the git-derived stats/embed helpers in notify_discord.py"]:::dropped
   end
   subgraph WS_C["workstream C"]
     T_C1["T-C1: firmware_rpc.md contract and engine/firmware/ scaffold"]:::done
@@ -55,7 +55,7 @@ graph TD
     T_DP16["T-DP16: AI-Agent workspace — full-screen comprehensive copilot (DAG + worker steering + session mgmt)"]:::done
     T_DP17["T-DP17: Interactive agent DAG / flowchart widget — clickable nodes to sub-agent detail"]:::done
     T_DP18["T-DP18: AI time-remaining estimator — tokens/s x expected tokens per subtask"]:::done
-    T_DP19["T-DP19: Gym real-run interpreter fix — let the tuning loop produce real per-class gradients"]:::review
+    T_DP19["T-DP19: Gym real-run interpreter fix — let the tuning loop produce real per-class gradients"]:::done
     T_DP2["T-DP2: feature_architect role + functional-decomposition helpers + requirement-coverage checker"]:::done
     T_DP3["T-DP3: geometry_designer role + proactive op-aware helper/calculator registry"]:::done
     T_DP4["T-DP4: linkage_planner role + reference-integrity / datum / interface-consistency checkers"]:::done
@@ -123,7 +123,7 @@ graph TD
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
     T_G10["T-G10: Chudware rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::done
     T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code — CLOSED AS REVERSED"]:::done
-    T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::doing
+    T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::blocked
     T_G13["T-G13: Fix issue 7 (scenario deadlock) - ScenarioRunner step-machine scenarios deadlock offscreen"]:::done
     T_G14["T-G14: Dark-mode readability + popup/subwindow correctness (black-on-black text, transparent borders, evaluate window sizing)"]:::done
     T_G15["T-G15: Screenshot-based icon pipeline + broken/missing icon fixes (ribbon-wide icon regeneration)"]:::done
@@ -183,7 +183,7 @@ graph TD
     T_R2["T-R2: PLM vault core - services/plm/ engine, auto-history, checkpoint/release/restore, plm_* MCP tools"]:::done
     T_R3["T-R3: PLM change intelligence - plain-language summaries, AI-assist/AI-managed tiers, compare views"]:::done
     T_R4["T-R4: PLM items & releases - part numbers, rev letters, release pinning + BOM freeze, where-used"]:::done
-    T_R5["T-R5: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)"]:::doing
+    T_R5["T-R5: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)"]:::todo
     T_R6["T-R6: PLM Project Hub - full-screen master workspace (item grid, activity, release board, where-used, Copilot dock)"]:::todo
     T_R7["T-R7: PLM sharing & team sync v1 - remote profiles, one-button Sync, advisory locks, copy-as-variant conflicts"]:::todo
     T_R8["T-R8: Self-hosted PLM server + live co-editing — two people in the same part, no locks"]:::todo
@@ -215,7 +215,7 @@ graph TD
     RE_23["RE-23: Parts Library RE round-trip"]:::done
     RE_24["RE-24: E2E scan demo test"]:::done
     RE_25["RE-25: E2E datasheet demo bearing 6205"]:::done
-    RE_26["RE-26: degradation matrix + license_debt updates"]:::review
+    RE_26["RE-26: degradation matrix + license_debt updates"]:::done
     RE_27["RE-27: ribbon polish + icons + screenshots"]:::done
     RE_28["RE-28: 3DGS splat renderer"]:::done
     RE_29["RE-29: Reveng web/part-number research ingestion (datasheet lane front-end)"]:::done
@@ -313,16 +313,16 @@ graph TD
     T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::done
   end
   subgraph WS_WIN["workstream WIN"]
-    T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC"]:::review
-    T_WIN2["T-WIN2: Windows packaging skeleton + bundled llama.cpp Windows seam"]:::todo
+    T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC"]:::blocked
   end
   subgraph WS_X["workstream X"]
+    T_WIN2["T-WIN2: Windows CI runner — build + smoke the host/ GUI on Hunter's Windows box"]:::todo
     T_X1["T-X1: Browser session service - persistent per-site login profiles + headless fetch"]:::done
     T_X2["T-X2: Source adapter framework + GrabCAD/TraceParts adapters"]:::done
     T_X3["T-X3: part_search federation seam - browser adapters as providers"]:::done
     T_X4["T-X4: Datasheet and document acquisition - authenticated-browser fallback"]:::done
-    T_X5["T-X5: Profile manager UX seam - list/refresh/delete site profiles + expiry detection"]:::doing
-    T_X6["T-X6: Hardening - license register, captcha/2FA failure modes, gated integration tests"]:::review
+    T_X5["T-X5: Profile manager UX seam - list/refresh/delete site profiles + expiry detection"]:::todo
+    T_X6["T-X6: Hardening - license register, captcha/2FA failure modes, gated integration tests"]:::done
     T_X7["T-X7: Vendor adapter wave 2 - Amazon, McMaster-Carr, JLCPCB, PCBWay + manufacturing-service discovery"]:::done
     T_X7b["T-X7b: Vendor wave-2 follow-ups — McMaster STEP import + structured price to bom_price seam"]:::done
     T_X8["T-X8: In-app visible browser login - headed session window launched from the app, profile capture, expiry re-login"]:::todo
@@ -330,7 +330,7 @@ graph TD
   end
   subgraph WS_backlog["workstream backlog"]
     T_BL01["T-BL01: V&V benchmark harness"]:::done
-    T_BL02["T-BL02: Format interop track (reverse-engineering intake)"]:::doing
+    T_BL02["T-BL02: Format interop track (reverse-engineering intake)"]:::backlog
     T_BL03["T-BL03: Intake Gates 1-3 (process profiles, photo metrology, fit coupons)"]:::backlog
     T_BL04["T-BL04: Fatigue + thermal + buckling + contact FEA (CalculiX)"]:::done
     T_BL05["T-BL05: FPGA/HDL flow"]:::backlog
@@ -345,7 +345,7 @@ graph TD
     T_BL14["T-BL14: GNN adapter training for GO families + sw_fixtures STEP export"]:::backlog
     T_BL15["T-BL15: SUPERSEDED by workstream R — in-app document version control (Pillar 19)"]:::backlog
     T_BL16["T-BL16: Motion/kinematics simulation of mechanisms"]:::done
-    T_BL16b["T-BL16b: GUI viewport playback/scrub for a simulate_motion trajectory"]:::doing
+    T_BL16b["T-BL16b: GUI viewport playback/scrub for a simulate_motion trajectory"]:::done
     T_BL17["T-BL17: Random/harmonic vibration response (frequency response analysis)"]:::done
     T_BL18["T-BL18: Gear/bearing life and AGMA tooth-strength checks"]:::done
     T_BL19["T-BL19: Modeling-op combination battery - engine-level AI testing of feature tools and sequences"]:::done
@@ -353,7 +353,7 @@ graph TD
     T_BL21["T-BL21: Hollow structural sections - model true wall voids (RHS/HSS) for mass/interference correctness"]:::done
     T_BL22["T-BL22: Wire dormant AI seams into the live loop - adapter routing/telemetry + regen_diagnose binding"]:::done
     T_BL23["T-BL23: Verifier battery CAM scoring keys - machined_fraction + gouges in _extract_score"]:::done
-    T_BL24["T-BL24: JLCPCB signed-request auth - rework JLCPCBProvider off the static-bearer assumption"]:::review
+    T_BL24["T-BL24: JLCPCB signed-request auth - rework JLCPCBProvider off the static-bearer assumption"]:::blocked
     T_BL25["T-BL25: Doc-scoped IntakeLedger - persist scope=doc answers per interaction.md section 5"]:::done
     T_BL26["T-BL26: ai-cad MCP freshness audit - server instructions, cad_guide topics, context injection vs shipped capabilities"]:::done
     T_BL27["T-BL27: Surfaces — surf_replace_face 'could not heal' unless the replacement splits the solid"]:::done
@@ -365,7 +365,7 @@ graph TD
     T_BL33["T-BL33: Dark-mode GUI residual — FM plane-row text + hover-action tooltips black-on-black (issue"]:::done
     T_BL34["T-BL34: Icon pipeline v2 — color the preview-render models + annotate operation intent over the tiles"]:::review
     T_BL35["T-BL35: Surfaces — surf_revolve axis well rejects datum axis (K_EDGE→K_EDGEAXIS) + gate readyForPreview on the axis well"]:::review
-    T_BL36["T-BL36: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted"]:::review
+    T_BL36["T-BL36: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted"]:::todo
     T_BL37["T-BL37: Origin as a selectable, renderable reference point — FM selectable + viewport point render + engine ref-resolution"]:::done
     T_BL38["T-BL38: Copilot context bar — auto-track selected model's context window, place between model picker and send, constrain picker width, k-token count + click-through breakdown"]:::done
     T_BL39["T-BL39: Copilot messages — remove the 'Assistant'/'Hi! Describe a part…' greeting, show the generating model(s) as attribution, compact the user/model display"]:::done
@@ -380,7 +380,7 @@ graph TD
     T_BL48["T-BL48: Wire ui/imgui interactive sketcher entry — dispatch sketch enter/edit/exit so active sketch editing works (unblocks T-BL41/44/46)"]:::done
     T_BL49["T-BL49: AI fitment & interface-alignment checker — interface_check tool for mating components (hole patterns, coaxiality, contact planes, fastener clearance)"]:::done
     T_BL50["T-BL50: Layout-first planning helper — critical-dimension & interface capture up front, with a coverage gate so the AI can't miss critical dims"]:::done
-    T_BL51["T-BL51: Associative Convert Entities — projected sketch references update when the source geometry changes"]:::review
+    T_BL51["T-BL51: Associative Convert Entities — projected sketch references update when the source geometry changes"]:::done
     T_BL56["T-BL56: 3D sketcher P1 — sketch3d data model + core Newton solver skeleton"]:::backlog
     T_BL57["T-BL57: 3D sketcher P2 — 3D curves + relational constraints + edge-body emit"]:::backlog
     T_BL58["T-BL58: 3D sketcher P3 — feature integration (sweep path, loft guide-curves)"]:::backlog
@@ -724,7 +724,6 @@ graph TD
   T_W5 --> T_W8
   T_W4 --> T_W9
   T_W5 --> T_W9
-  T_WIN1 --> T_WIN2
   T_X1 --> T_X2
   T_X2 --> T_X3
   T_X2 --> T_X4

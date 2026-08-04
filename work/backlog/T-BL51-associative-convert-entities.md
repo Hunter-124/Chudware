@@ -2,8 +2,8 @@
 id: T-BL51
 title: Associative Convert Entities — projected sketch references update when the source geometry changes
 workstream: backlog
-owner:
-status: review
+owner: hunter
+status: done
 priority: 3
 lane: modeling-core
 kind: new

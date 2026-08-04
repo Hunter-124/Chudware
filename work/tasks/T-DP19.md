@@ -3,7 +3,7 @@ id: T-DP19
 title: Gym real-run interpreter fix — let the tuning loop produce real per-class gradients
 workstream: DP
 owner: opus-dp19
-status: review
+status: done
 branch: task/T-DP19-gym-realrun-interpreter
 depends_on: [T-DP10]
 lane: ml-flywheel

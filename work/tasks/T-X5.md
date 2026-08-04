@@ -3,7 +3,7 @@ id: T-X5
 title: Profile manager UX seam - list/refresh/delete site profiles + expiry detection
 workstream: X
 owner: gissa
-status: doing
+status: todo
 branch: task/T-X5-profile-manager-seam
 depends_on: [T-X1]
 lane: parts-sourcing
@@ -79,3 +79,5 @@ mission brief, "GUI panel is a LATER task").
 - Don't build the GUI. Don't be tempted to. Define the JSON, stop there.
 
 ## Progress log
+- 2026-08-04 [audit] Reopened: audit found zero code and an empty progress log — this
+  task was never started. Still wanted (account/profile management), just not now.

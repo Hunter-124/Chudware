@@ -43,6 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from services.agent import raw_log
+
 SCHEMA = "aicad.subagent_session/1"
 RAW_SCHEMA = "chudware.subagent.raw/1"
 
@@ -61,7 +63,6 @@ _CONTROL_DEFAULTS = {
 
 _BOUND_SESSION_ID = ""
 _BOUND_TRANSCRIPT_DIR = ""
-_RAW_SEQUENCE_CACHE: dict[str, tuple[int, int]] = {}
 
 
 def _default_control_state(meta: dict) -> dict:
@@ -101,6 +102,12 @@ def bind_session(session_id: str, transcript_dir: str) -> None:
     _BOUND_TRANSCRIPT_DIR = (
         str(Path(directory).expanduser().resolve()) if directory else ""
     )
+
+
+def bound_session() -> tuple[str, Path | None]:
+    """Return the process-bound owning session and sub-agent transcript dir."""
+    directory = Path(_BOUND_TRANSCRIPT_DIR) if _BOUND_TRANSCRIPT_DIR else None
+    return _BOUND_SESSION_ID, directory
 
 
 def _meta_path(subagent_id: str) -> Path:
@@ -309,78 +316,23 @@ def raw_path(subagent_id: str) -> Path | None:
 
 
 def append_raw(subagent_id: str, record: dict) -> None:
-    """Append an uncapped raw record, creating its schema header when needed.
-
-    This is deliberately best-effort: persistence failures never escape into
-    the agent loop.  The next sequence number is recovered from disk on every
-    append, so it remains monotonic across process restarts.
-    """
+    """Append an uncapped raw record for a registered sub-agent."""
     try:
         sid = _safe_id(subagent_id)
         path = raw_path(sid)
         if path is None:
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        file_size = path.stat().st_size if path.exists() else 0
-        cache_key = str(path)
-        cached = _RAW_SEQUENCE_CACHE.get(cache_key)
-        if cached is not None and cached[0] == file_size:
-            next_seq = cached[1]
-        else:
-            complete_lines = 0
-            if file_size:
-                with open(path, "rb") as stream:
-                    while chunk := stream.read(1024 * 1024):
-                        complete_lines += chunk.count(b"\n")
-            # The first complete line is the header.  Thus the number of
-            # complete lines is also the next data-record sequence number.
-            next_seq = max(1, complete_lines)
-        needs_separator = False
-        if file_size:
-            with open(path, "rb") as stream:
-                stream.seek(-1, os.SEEK_END)
-                needs_separator = stream.read(1) != b"\n"
-        lines: list[dict] = []
-        if file_size == 0:
-            meta = get_session(sid) or {}
-            lines.append({
-                "kind": "header",
-                "schema": RAW_SCHEMA,
-                "subagent_id": sid,
-                "session_id": str(meta.get("session_id", "")),
-                "role": str(meta.get("role", "")),
-                "parent_id": str(meta.get("parent_node_id", "")),
-                "run_id": str(meta.get("parent_run_id", "")),
-                "created_ts": time.time(),
-            })
-        payload = dict(record)
-        try:
-            payload["ts"] = float(payload.get("ts", time.time()))
-        except (TypeError, ValueError):
-            payload["ts"] = time.time()
-        payload["seq"] = next_seq
-        lines.append(payload)
-        encoded = (
-            (b"\n" if needs_separator else b"")
-            + "".join(
-                json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
-                for item in lines
-            ).encode("utf-8")
-        )
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            remaining = memoryview(encoded)
-            while remaining:
-                written = os.write(fd, remaining)
-                if written <= 0:
-                    raise OSError("raw transcript append made no progress")
-                remaining = remaining[written:]
-        finally:
-            os.close(fd)
-        _RAW_SEQUENCE_CACHE[cache_key] = (
-            file_size + len(encoded),
-            next_seq + 1,
-        )
+        meta = get_session(sid) or {}
+        raw_log.append(path, record, {
+            "kind": "header",
+            "schema": RAW_SCHEMA,
+            "subagent_id": sid,
+            "session_id": str(meta.get("session_id", "")),
+            "role": str(meta.get("role", "")),
+            "parent_id": str(meta.get("parent_node_id", "")),
+            "run_id": str(meta.get("parent_run_id", "")),
+            "created_ts": time.time(),
+        })
     except Exception:  # noqa: BLE001 — raw persistence must not break the turn
         return
 
@@ -393,12 +345,7 @@ def read_raw(
     """Read raw records in append order; zero *limit* means no limit."""
     try:
         path = raw_path(subagent_id)
-        if path is None:
-            return []
-        records = _read_lines(path)
-        start = max(0, int(offset))
-        count = int(limit)
-        return records[start:] if count <= 0 else records[start:start + count]
+        return raw_log.read(path, limit=limit, offset=offset) if path else []
     except Exception:  # noqa: BLE001 — registry reads are best-effort
         return []
 

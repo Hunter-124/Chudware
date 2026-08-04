@@ -56,7 +56,11 @@ def _resolve_owner(args):
         raise RuntimeError("no --owner given and no identity set — run "
                            "`work.py whoami --github <username>` once, or pass --owner")
     return owner
-STATUSES = {"todo", "doing", "review", "done", "blocked", "backlog"}
+
+
+# "dropped" = cancelled outright and never coming back. Distinct from "backlog"
+# (shelved, still wanted): a dropped card must not read as future work.
+STATUSES = {"todo", "doing", "review", "done", "blocked", "backlog", "dropped"}
 REQUIRED = ("id", "title", "workstream", "owner", "status", "branch", "depends_on")
 
 # Workflow v2 (2026-07-03, Hunter directive — see work/WORKFLOW.md):
@@ -490,27 +494,6 @@ def cmd_claim(tasks, errors, args):
         lock.unlink(missing_ok=True)
 
 
-def _notify_hook(t):
-    """Best-effort Discord ping on a board change (see work/tools/notify_discord.py).
-
-    Fire-and-forget and fully guarded: this must NEVER delay or break the board
-    commit. No-ops silently if the notifier isn't configured on this machine.
-    """
-    try:
-        token = ROOT / "sync" / ".discord-token"
-        if not token.exists():
-            return
-        txt = token.read_text(encoding="utf-8").strip()
-        if not txt or txt.startswith("PASTE_"):
-            return
-        script = ROOT / "tools" / "notify_discord.py"
-        subprocess.Popen([sys.executable, str(script), "--hook", t.get("id", "")],
-                         cwd=str(ROOT.parent),
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
-
 def _commit_task_change(t, msg):
     """Commit + push a single task-file change to master under the claim lock."""
     main = _main_worktree()
@@ -521,7 +504,6 @@ def _commit_task_change(t, msg):
         if _git(["push"], main).returncode != 0:
             _git(["pull", "--rebase"], main)
             _git(["push"], main, check=True)
-    _notify_hook(t)  # low-latency Discord ping for review/blocked/human-owned changes
 
 
 def _owned_task(tasks, tid, owner):
@@ -815,7 +797,7 @@ def cmd_roadblocks(tasks, errors, args):
         "blocked": [row(t) for t in tasks.values() if t.get("status") == "blocked"],
         "human_owned": [row(t) for t in tasks.values()
                         if t.get("owner") == "main-checkout"
-                        and t.get("status") not in ("done", "backlog")],
+                        and t.get("status") not in ("done", "backlog", "dropped")],
         "questions": _open_questions(),
     }
     for key in ("review_queue", "blocked", "human_owned"):

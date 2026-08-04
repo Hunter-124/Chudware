@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import pytest
 
+from services.agent import raw_log
 from services.agent import subagent_registry as reg
 from services.agent import subagent_rpc
 from services.agent.agent_turn import run_turn
@@ -445,6 +446,45 @@ def test_raw_log_never_raises_into_the_agent_loop():
 
     kinds = [r.get("kind") for r in reg.read_raw("dg_raw_bad")]
     assert "lifecycle" in kinds
+
+
+def test_bound_main_turn_writes_full_agent_conversation(tmp_path):
+    sessions = tmp_path / "Sessions"
+    reg.bind_session("conv_main", str(sessions / "conv_main.subagents"))
+    provider = RecordingProvider([_DONE])
+
+    result = run_turn(
+        "summarize the shaft design decisions",
+        provider,
+        name="general_agent",
+    )
+
+    assert result.success
+    path = sessions / "conv_main.agent.jsonl"
+    records = raw_log.read(path)
+    assert records[0]["kind"] == "header"
+    assert records[0]["schema"] == "chudware.chat.agent/1"
+    assert records[0]["session_id"] == "conv_main"
+    messages = [
+        record["message"] for record in records
+        if record.get("kind") == "message"
+    ]
+    assert messages[:-1] == provider.seen_messages[0]
+    assert messages[-1]["role"] == "assistant"
+    assert _msg_texts([messages[-1]]) == _DONE
+
+
+def test_unbound_main_turn_writes_no_agent_archive(tmp_path):
+    provider = RecordingProvider([_DONE])
+
+    result = run_turn(
+        "summarize the shaft design decisions",
+        provider,
+        name="general_agent",
+    )
+
+    assert result.success
+    assert list(tmp_path.rglob("*.agent.jsonl")) == []
 
 
 def test_rpc_transcript_raw_flag_returns_raw_records():

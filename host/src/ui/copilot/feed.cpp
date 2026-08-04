@@ -746,6 +746,7 @@ void markChatHistoryDirty() {
 }
 
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data) {
+    ui::ChatRawActivityCapture rawCapture(m);
     // Plan-section position marker (rowKind 18): the plan/objectives section renders at the
     // point in the timeline where the plan FIRST arrived, not pinned to the top of the turn.
     // Without this a late plan used to pop in ABOVE thinking blocks the user had already read,

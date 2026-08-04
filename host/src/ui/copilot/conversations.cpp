@@ -52,7 +52,11 @@ std::vector<ChatMsg>* conversationMsgs(AppState& st, const std::string& convId) 
     return nullptr;
 }
 
-#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#elif !defined(__EMSCRIPTEN__)
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -155,6 +159,9 @@ static std::string chatSessionFilePath(const std::string& id) {
 }
 static std::string chatSubagentsDirPath(const std::string& id) {
     return chatSessionsDir() + "/" + chatSessionFileStem(id) + ".subagents";
+}
+static std::string chatRawLogPath(const std::string& id) {
+    return chatSessionsDir() + "/" + chatSessionFileStem(id) + ".raw.jsonl";
 }
 
 // File STEMS of sessions this process has verifiably held LIVE (loaded successfully, or
@@ -375,7 +382,9 @@ std::string newConvId(AppState& st) {
         st.convCounter, taken,
         [](const std::string& id, void*) {
             std::error_code ec;
-            return std::filesystem::exists(chatSessionFilePath(id), ec);
+            if (std::filesystem::exists(chatSessionFilePath(id), ec)) return true;
+            ec.clear();
+            return std::filesystem::exists(chatRawLogPath(id), ec);
         },
         nullptr);
 }
@@ -420,6 +429,419 @@ static nlohmann::json planStateToJson(const PlanState& ps) {
     }
     return j;
 }
+// ---- append-only, uncapped chat archive --------------------------------------------------
+// <id>.json above remains the bounded fast-reload representation. This JSONL sibling is the
+// recovery/archive representation: compact records, no caps, no wholesale rewrites.
+static nlohmann::json rawActivityToJson(const ActivityItem& a) {
+    return {
+        {"stage", a.stage},
+        {"title", a.title},
+        {"detail", a.detail},
+        {"reason", a.reason},
+        {"status", a.status},
+        {"durationMs", a.durationMs},
+        {"tokensIn", a.tokensIn},
+        {"tokensOut", a.tokensOut},
+        {"opsCount", a.opsCount},
+        {"expanded", a.expanded},
+        {"missionHeader", a.missionHeader},
+        {"rowKind", a.rowKind},
+        {"ctxTokens", a.ctxTokens},
+        {"streaming", a.streaming},
+        {"userToggled", a.userToggled},
+    };
+}
+
+static nlohmann::json rawFitToJson(const FitReport& fit) {
+    nlohmann::json interferences = nlohmann::json::array();
+    for (const auto& p : fit.interferences)
+        interferences.push_back({{"a", p.a}, {"b", p.b}, {"value", p.value}});
+    nlohmann::json clearances = nlohmann::json::array();
+    for (const auto& p : fit.clearances)
+        clearances.push_back({{"a", p.a}, {"b", p.b}, {"value", p.value}});
+    return {
+        {"present", fit.present},
+        {"ok", fit.ok},
+        {"summary", fit.summary},
+        {"interferences", std::move(interferences)},
+        {"clearances", std::move(clearances)},
+    };
+}
+
+static nlohmann::json rawPartsToJson(const std::vector<PartInfo>& parts) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& part : parts)
+        out.push_back({{"name", part.name}, {"stlPath", part.stlPath},
+                       {"dims", part.dims}, {"volume", part.volume}});
+    return out;
+}
+
+static nlohmann::json rawPlanToJson(const PlanInfo& plan) {
+    nlohmann::json parts = nlohmann::json::array();
+    for (const auto& part : plan.parts)
+        parts.push_back({{"name", part.name}, {"purpose", part.purpose},
+                         {"dims", part.dims}, {"features", part.features}});
+    return {
+        {"present", plan.present},
+        {"name", plan.name},
+        {"summary", plan.summary},
+        {"fit", plan.fit},
+        {"parts", std::move(parts)},
+    };
+}
+
+static nlohmann::json rawClarifyToJson(const ClarifyState& clarify) {
+    nlohmann::json questions = nlohmann::json::array();
+    for (const auto& q : clarify.questions) {
+        size_t answerLen = 0;
+        while (answerLen < q.answer.size() && q.answer[answerLen] != '\0') ++answerLen;
+        nlohmann::json options = nlohmann::json::array();
+        for (const auto& option : q.options)
+            options.push_back({{"value", option.first}, {"label", option.second}});
+        questions.push_back({
+            {"key", q.key},
+            {"ask", q.ask},
+            {"unit", q.unit},
+            {"suggested", q.suggested},
+            {"answer", std::string(q.answer.data(), answerLen)},
+            {"kind", q.kind},
+            {"multi", q.multi},
+            {"options", std::move(options)},
+            {"targets", q.targets},
+            {"selectedValues", q.selectedValues},
+            {"selectedKind", q.selectedKind},
+            {"pickArmed", q.pickArmed},
+        });
+    }
+    return {
+        {"awaiting", clarify.awaiting},
+        {"active", clarify.active},
+        {"request", clarify.request},
+        {"questions", std::move(questions)},
+        {"assumptions", clarify.assumptions},
+        {"geometryPickQ", clarify.geometryPickQ},
+    };
+}
+
+static nlohmann::json rawStepsToJson(const std::vector<AgentStep>& steps) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& step : steps) {
+        out.push_back({
+            {"index", step.index},
+            {"ok", step.ok},
+            {"done", step.done},
+            {"notes", step.notes},
+            {"thinking", step.thinking},
+            {"code", step.code},
+            {"diff", step.diff},
+            {"dims", step.dims},
+            {"error", step.error},
+            {"contactSheet", step.contactSheet},
+            {"stdoutText", step.stdoutText},
+            {"isAssembly", step.isAssembly},
+            {"parts", rawPartsToJson(step.parts)},
+            {"fit", rawFitToJson(step.fit)},
+            {"triedThumb", step.triedThumb},
+            {"showThinking", step.showThinking},
+            {"showCode", step.showCode},
+            {"showDiff", step.showDiff},
+            {"showError", step.showError},
+        });
+    }
+    return out;
+}
+
+static nlohmann::json rawMessageToJson(const ChatMsg& m) {
+    return {
+        {"fromUser", m.fromUser},
+        {"ts", m.ts},
+        {"text", m.text},
+        {"running", m.running},
+        {"model", m.model},
+        {"errKind", m.errKind},
+        {"errorHuman", m.errorHuman},
+        {"errorFull", m.errorFull},
+        {"errFullOpen", m.errFullOpen},
+        {"liveStatus", m.liveStatus},
+        {"plan", rawPlanToJson(m.plan)},
+        {"planState", planStateToJson(m.planState)},
+        {"planStatePresent", m.planState.present},
+        {"curMissionTask", m.curMissionTask},
+        {"steps", rawStepsToJson(m.steps)},
+        {"clarify", rawClarifyToJson(m.clarify)},
+        {"planApprovePending", m.planApprovePending},
+        {"planApproveRequest", m.planApproveRequest},
+        {"planApproveExtras", m.planApproveExtras},
+        {"planExecutionStyle", m.planExecutionStyle},
+        {"planApproveReason", m.planApproveReason},
+        {"resultPartial", m.resultPartial},
+        {"copilotMode", m.copilotMode},
+        {"cacheReadTok", m.cacheReadTok},
+        {"cacheReadTotTok", m.cacheReadTotTok},
+        {"cacheReadCalls", m.cacheReadCalls},
+    };
+}
+
+static std::mutex s_chatRawFileMutex;
+static std::unordered_map<std::string, long long> s_chatRawNextSeq;
+static std::mutex s_chatRawOwnerMutex;
+static std::unordered_map<const ChatMsg*, std::string> s_chatRawOwners;
+static std::unordered_map<std::string, std::vector<std::string>> s_chatRawMessageSnapshots;
+
+// Recover from the last valid compact line rather than a process-local counter. A torn final
+// write is skipped and the preceding valid seq wins, so relaunch never restarts from 1.
+static long long chatRawNextSeqFromDisk(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return 1;
+    in.seekg(0, std::ios::end);
+    std::streamoff pos = in.tellg();
+    if (pos <= 0) return 1;
+    std::string reversed;
+    constexpr std::streamoff kChunk = 64 * 1024;
+    while (pos > 0) {
+        const std::streamoff take = std::min(pos, kChunk);
+        pos -= take;
+        in.seekg(pos, std::ios::beg);
+        std::string chunk((size_t)take, '\0');
+        in.read(chunk.data(), take);
+        const std::streamsize got = in.gcount();
+        for (std::streamsize i = got; i > 0; --i) {
+            const char ch = chunk[(size_t)i - 1];
+            if (ch != '\n') {
+                if (ch != '\r' || !reversed.empty()) reversed.push_back(ch);
+                continue;
+            }
+            if (reversed.empty()) continue;
+            std::reverse(reversed.begin(), reversed.end());
+            try {
+                const nlohmann::json line = nlohmann::json::parse(reversed);
+                if (line.is_object() && line.contains("seq") && line["seq"].is_number_integer())
+                    return std::max(1LL, line["seq"].get<long long>() + 1);
+                if (line.is_object() && line.value("kind", std::string()) == "header") return 1;
+            } catch (...) {
+            }
+            reversed.clear();
+        }
+    }
+    if (!reversed.empty()) {
+        std::reverse(reversed.begin(), reversed.end());
+        try {
+            const nlohmann::json line = nlohmann::json::parse(reversed);
+            if (line.is_object() && line.contains("seq") && line["seq"].is_number_integer())
+                return std::max(1LL, line["seq"].get<long long>() + 1);
+        } catch (...) {
+        }
+    }
+    return 1;
+}
+
+static bool chatRawNeedsSeparator(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    if (size <= 0) return false;
+    in.seekg(-1, std::ios::end);
+    char last = '\0';
+    in.get(last);
+    return last != '\n';
+}
+
+static bool appendChatRawBytes(const std::string& path, const std::string& bytes) {
+#if defined(_WIN32)
+    const int fd = ::_open(path.c_str(), _O_WRONLY | _O_CREAT | _O_APPEND | _O_BINARY,
+                           _S_IREAD | _S_IWRITE);
+    if (fd < 0) return false;
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        const unsigned int want =
+            (unsigned int)std::min<size_t>(bytes.size() - offset, 0x7fffffffU);
+        const int wrote = ::_write(fd, bytes.data() + offset, want);
+        if (wrote <= 0) {
+            ::_close(fd);
+            return false;
+        }
+        offset += (size_t)wrote;
+    }
+    ::_close(fd);
+    return true;
+#elif defined(__EMSCRIPTEN__)
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out) return false;
+    out.write(bytes.data(), (std::streamsize)bytes.size());
+    return (bool)out;
+#else
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return false;
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        const ssize_t wrote = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        if (wrote <= 0) {
+            ::close(fd);
+            return false;
+        }
+        offset += (size_t)wrote;
+    }
+    ::close(fd);
+    return true;
+#endif
+}
+
+static void appendChatRawRecord(const std::string& conversationId, const char* kind,
+                                const char* payloadKey, const nlohmann::json& payload) noexcept {
+    if (conversationId.empty()) return;
+    try {
+        std::lock_guard<std::mutex> lock(s_chatRawFileMutex);
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::create_directories(chatSessionsDir(), ec);
+        if (ec) return;
+        const std::string path = chatRawLogPath(conversationId);
+        const bool empty = !fs::exists(path, ec) || (!ec && fs::file_size(path, ec) == 0);
+        if (ec) return;
+        auto [it, inserted] = s_chatRawNextSeq.emplace(path, 1);
+        if (inserted) it->second = chatRawNextSeqFromDisk(path);
+        const long long seq = it->second;
+        std::string encoded;
+        if (!empty && chatRawNeedsSeparator(path)) encoded.push_back('\n');
+        if (empty) {
+            const nlohmann::json header = {
+                {"kind", "header"},
+                {"schema", "chudware.chat.raw/1"},
+                {"conversation_id", conversationId},
+                {"created_ts", chatNowEpoch()},
+            };
+            encoded += header.dump();
+            encoded.push_back('\n');
+        }
+        nlohmann::json record = {
+            {"ts", chatNowEpoch()},
+            {"seq", seq},
+            {"kind", kind},
+            {payloadKey, payload},
+        };
+        encoded += record.dump();
+        encoded.push_back('\n');
+        if (appendChatRawBytes(path, encoded)) ++it->second;
+    } catch (...) {
+        // The raw archive is strictly best-effort; chat operation success never depends on it.
+    }
+}
+
+static std::string activeConversationId(const AppState& st) {
+    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return {};
+    return st.conversations[(size_t)st.activeConv].id;
+}
+
+static void bindChatRawOwners(const std::string& conversationId,
+                              const std::vector<ChatMsg>& messages) noexcept {
+    if (conversationId.empty()) return;
+    try {
+        std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
+        for (const auto& message : messages) s_chatRawOwners[&message] = conversationId;
+    } catch (...) {
+    }
+}
+
+void appendChatRawMessage(AppState& st, const ChatMsg& message) noexcept {
+    try {
+        const std::string conversationId = activeConversationId(st);
+        if (conversationId.empty()) return;
+        bindChatRawOwners(conversationId, st.chat);
+        const nlohmann::json payload = rawMessageToJson(message);
+        const std::string snapshot = payload.dump();
+        appendChatRawRecord(conversationId, "message", "message", payload);
+        size_t index = st.chat.size();
+        for (size_t i = 0; i < st.chat.size(); ++i) {
+            if (&st.chat[i] == &message) {
+                index = i;
+                break;
+            }
+        }
+        if (index == st.chat.size()) return;
+        std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
+        auto& snapshots = s_chatRawMessageSnapshots[conversationId];
+        if (snapshots.size() <= index) snapshots.resize(index + 1);
+        snapshots[index] = snapshot;
+    } catch (...) {
+        // Message insertion must remain successful even when raw serialization fails.
+    }
+}
+
+static void archiveChangedChatMessages(const std::string& conversationId,
+                                       const std::vector<ChatMsg>& messages) noexcept {
+    try {
+        bindChatRawOwners(conversationId, messages);
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const nlohmann::json payload = rawMessageToJson(messages[i]);
+            const std::string snapshot = payload.dump();
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
+                auto& snapshots = s_chatRawMessageSnapshots[conversationId];
+                if (snapshots.size() <= i) snapshots.resize(i + 1);
+                changed = snapshots[i] != snapshot;
+                if (changed) snapshots[i] = snapshot;
+            }
+            if (changed) appendChatRawRecord(conversationId, "message", "message", payload);
+        }
+    } catch (...) {
+        // The bounded session snapshot must still proceed when the archive cannot.
+    }
+}
+
+static void seedChatRawSnapshots(const std::string& conversationId,
+                                 const std::vector<ChatMsg>& messages) noexcept {
+    try {
+        bindChatRawOwners(conversationId, messages);
+        std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
+        auto& snapshots = s_chatRawMessageSnapshots[conversationId];
+        snapshots.clear();
+        snapshots.reserve(messages.size());
+        for (const auto& message : messages)
+            snapshots.push_back(rawMessageToJson(message).dump());
+    } catch (...) {
+    }
+}
+
+ChatRawActivityCapture::ChatRawActivityCapture(ChatMsg& message) noexcept : message_(message) {
+    try {
+        {
+            std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
+            const auto it = s_chatRawOwners.find(&message_);
+            if (it == s_chatRawOwners.end()) return;
+            conversationId_ = it->second;
+        }
+        before_.reserve(message_.activity.size());
+        for (const auto& row : message_.activity)
+            before_.push_back(rawActivityToJson(row).dump());
+    } catch (...) {
+        conversationId_.clear();
+        before_.clear();
+    }
+}
+
+ChatRawActivityCapture::~ChatRawActivityCapture() {
+    if (conversationId_.empty()) return;
+    try {
+        std::unordered_map<std::string, int> unchanged;
+        unchanged.reserve(before_.size());
+        for (const auto& snapshot : before_) ++unchanged[snapshot];
+        for (const auto& row : message_.activity) {
+            const nlohmann::json payload = rawActivityToJson(row);
+            const std::string snapshot = payload.dump();
+            auto it = unchanged.find(snapshot);
+            if (it != unchanged.end() && it->second > 0) {
+                --it->second;
+                continue;
+            }
+            appendChatRawRecord(conversationId_, "activity", "row", payload);
+        }
+    } catch (...) {
+        // Activity folding must remain successful even when serialization or append fails.
+    }
+}
+
 
 // Defined near the lifecycle functions below.
 static bool conversationIsFresh(const AppState& st, int idx);
@@ -599,6 +1021,10 @@ void persistChatHistory(AppState& st) {
         };
         const std::vector<ChatMsg>& liveMsgs =
             (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
+        // Archive the uncapped in-memory state before serializeMsgs applies the bounded
+        // <id>.json representation. This also records terminal message mutations (full error,
+        // final prose, plan/step state) after the creation record.
+        archiveChangedChatMessages(st.conversations[i].id, liveMsgs);
         nlohmann::json convObj = {{"id", st.conversations[i].id},
                                  {"title", st.conversations[i].title},
                                  {"msgs", serializeMsgs(liveMsgs)}};
@@ -657,10 +1083,20 @@ void persistChatHistory(AppState& st) {
             if (keep.count(stem) || !s_pruneableSessionStems.count(stem)) continue;
             fs::remove(de.path(), ec);
             if (!ec) {
-                // The raw sub-agent transcript tree is owned by the same vouched-for session.
-                // Best-effort removal must remain behind the exact JSON prune safety gate.
+                // Both append-only transcript families are owned by the same vouched-for
+                // session. Best-effort removal stays behind the exact JSON prune safety gate.
                 std::error_code rawEc;
                 fs::remove_all(chatSubagentsDirPath(stem), rawEc);
+                rawEc.clear();
+                fs::remove(chatRawLogPath(stem), rawEc);
+                {
+                    std::lock_guard<std::mutex> lock(s_chatRawFileMutex);
+                    s_chatRawNextSeq.erase(chatRawLogPath(stem));
+                }
+                {
+                    std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
+                    s_chatRawMessageSnapshots.erase(stem);
+                }
                 s_pruneableSessionStems.erase(stem);
             }
         }
@@ -1042,6 +1478,12 @@ void loadChatHistory(AppState& st) {
         restoreActiveConversation(st);
     }
     restorePromptDraft(st);
+    // Loading is not a new chat event. Seed change detection from the restored state so the
+    // first persistence tick does not duplicate the entire prior transcript into the archive.
+    for (int i = 0; i < (int)st.conversations.size(); ++i) {
+        const auto& messages = (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
+        seedChatRawSnapshots(st.conversations[i].id, messages);
+    }
     // An imported legacy store is written through to the per-session transcripts on the
     // next debounced persist. A recovered orphan likewise needs the index rewritten so it
     // is listed (and therefore reachable on every future load) again.
@@ -1514,13 +1956,19 @@ int forkConversation(AppState& st, int idx) {
     Conversation fork;
     fork.id = newConvId(st);
     {
-        // A fork owns a full snapshot of the source's lossless sub-agent logs. Raw-log copy is
-        // best effort: conversation forking must still succeed if the filesystem refuses it.
+        // A fork owns full snapshots of both raw-log families. Copies are best effort:
+        // conversation forking must still succeed if the filesystem refuses either one.
         namespace fs = std::filesystem;
         std::error_code ec;
         const fs::path sourceRaw = chatSubagentsDirPath(source.id);
         if (fs::exists(sourceRaw, ec) && !ec) {
             fs::copy(sourceRaw, chatSubagentsDirPath(fork.id), fs::copy_options::recursive, ec);
+        }
+        ec.clear();
+        const fs::path sourceChatRaw = chatRawLogPath(source.id);
+        if (fs::exists(sourceChatRaw, ec) && !ec) {
+            ec.clear();
+            fs::copy_file(sourceChatRaw, chatRawLogPath(fork.id), ec);
         }
     }
     fork.title = std::move(title);
@@ -1536,6 +1984,7 @@ int forkConversation(AppState& st, int idx) {
             step.triedThumb = false;
         }
     }
+    seedChatRawSnapshots(fork.id, fork.msgs);
 
     const int inserted = idx + 1;
     st.conversations.insert(st.conversations.begin() + inserted, std::move(fork));

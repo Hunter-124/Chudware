@@ -1,34 +1,34 @@
 ---
 id: T-WIN2
-title: Windows packaging skeleton + bundled llama.cpp Windows seam
-workstream: WIN
+title: Windows CI runner — build + smoke the host/ GUI on Hunter's Windows box
+workstream: X
 owner: unassigned
 status: todo
-branch: task/T-WIN2-win-packaging
-depends_on: [T-WIN1]
+branch: task/T-WIN2-windows-ci-runner
+depends_on: []
 lane: platform-infra
 kind: new
-priority: 3
+priority: 2
 ---
 
 ## Context
 
-Follow-on to T-WIN1. T-W26 (in flight, another session) is bundling llama.cpp +
-local-model provisioning with a DOCUMENTED Windows seam left unimplemented — you
-implement the Windows side against whatever seam T-W26 lands (read its merged
-code/notes first; do not start this task until T-W26 is merged).
-
-## Steps
-
-1. Read T-W26's merged local_runtime/model_manager + its Windows-seam notes.
-2. Windows binary path: pinned llama.cpp Windows release fetch + checksum, app-data
-   paths (%APPDATA%/Chudware), server lifecycle on Windows (process mgmt differences).
-3. Packaging skeleton: installer or portable-zip layout that carries the app, the
-   runtime fetcher, and first-run provisioning; document signing as future work.
-4. Live smoke on your box: provision a model, run one bench turn against the
-   bundled server (tools/flywheel/bench/benches/roles_local.py, CHUDWARE_LOCAL_ENDPOINT).
+Hunter has a Windows machine on the local network already serving as a CI runner
+for his cloudcastle project; replicate that setup here so Windows bring-up stops
+needing manual hardware time. This unblocks T-WIN1 (Windows 10 full-app bring-up),
+which is currently `status: blocked` on "needs a Windows machine running the
+CURRENT host/ tree" — every prior Windows pass has been a manual, ad-hoc checkout
+on that box.
 
 ## Definition of done
 
-- [ ] Bundled runtime works end-to-end on Windows 10 (real smoke, honest report)
-- [ ] Packaging layout documented + scripted; license_debt.md updated if vendored
+- [ ] Runner registered and reachable
+- [ ] `./build.sh`-equivalent MSVC build of core/ + host/ green on Windows
+- [ ] The app launches and produces a headless capture
+- [ ] The `AppState::tryStartWorker()` `#ifndef _WIN32` gate at
+      `host/src/core/app_state.cpp:580` assessed (it currently disables the
+      in-process worker fallback on Windows and causes headless-capture hangs)
+- [ ] Result wired into the existing CI reporting
+- [ ] T-WIN1 unblocked or explicitly re-scoped
+
+## Progress log

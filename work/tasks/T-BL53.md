@@ -3,7 +3,7 @@ id: T-BL53
 title: Discord bot /stats + /leaderboard — implement the git-derived stats/embed helpers in notify_discord.py
 workstream: BL
 owner: gissa
-status: review
+status: dropped
 branch: task/T-BL53-discord-stats
 depends_on: []
 lane: platform-infra
@@ -58,3 +58,9 @@ out of scope here) and does NOT commit the untracked `discord_bot.py` (leave tha
 TESTED locally against real git data with discord.py 2.7.1: discord.Embed.from_dict validated all 3 embeds (stats/leaderboard/digest), no empty field values. Sample: all-time leaderboard = Hunter-124 2506, gissa 105, opus-wynn 38; 7-day stats total 2155 commits/5 contributors; daily digest 186 commits, board 200/241 done, +3 screenshots. All bot stats/leaderboard/digest/screenshot imports now resolve.
 
 OUT OF SCOPE (flagged, not done): discord_bot.py's bootstrap still needs nd._get (REST-GET guild resolution) to actually launch the Gateway process â€” that's separate bot-startup work, not part of the stats feature. discord_bot.py + requirements-discord-bot.txt remain UNTRACKED (left for their owner; not committed here). NOT merged, NOT done.
+- 2026-08-04 [audit] Dropped at Hunter's direction 2026-08-04; the Discord bot is
+  cancelled. (Note: `status: dropped` is not a value `work/tools/work.py` accepts —
+  STATUSES = {todo, doing, review, done, blocked, backlog} — so this card is filed
+  as `status: backlog` to keep it inert/out-of-rotation while recording the
+  cancellation here. Source files are NOT deleted; the tooling-deletion decision is
+  separate and still open.)

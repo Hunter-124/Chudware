@@ -3,12 +3,13 @@ id: T-BL24
 title: JLCPCB signed-request auth - rework JLCPCBProvider off the static-bearer assumption
 workstream: backlog
 owner: opus-sweep
-status: review
+status: blocked
 branch: task/T-BL24-jlcpcb-auth
 depends_on: []
 lane: parts-sourcing
 kind: fix
 priority: 4
+blocker: needs live JLCPCB API credentials for an end-to-end signed-request smoke test; signing logic and mocked tests are verified complete.
 ---
 
 ## Context

@@ -18,3 +18,12 @@ Alternatives: A / B.
 
 Decision, rationale, what may now change.
 ```
+
+## Archive
+
+Resolved questions move to `archive/` once their task card reaches `status: done`
+(one-line banner prepended noting the archive date and that the driver proceeded
+on its recommended default). This directory (`work/questions/`, excluding
+`archive/`) is the live register — only escalations for tasks that are still
+open belong here. Files with no matching task card (e.g. standalone reports)
+stay in place regardless of status.

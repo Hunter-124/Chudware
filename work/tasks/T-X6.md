@@ -3,7 +3,7 @@ id: T-X6
 title: Hardening - license register, captcha/2FA failure modes, gated integration tests
 workstream: X
 owner: opus-x6
-status: review
+status: done
 branch: task/T-X6-browser-hardening
 depends_on: [T-X3, T-X4]
 lane: parts-sourcing

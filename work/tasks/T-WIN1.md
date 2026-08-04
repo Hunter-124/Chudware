@@ -3,12 +3,13 @@ id: T-WIN1
 title: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC
 workstream: WIN
 owner: gissa
-status: review
+status: blocked
 branch: task/T-WIN1-windows-bringup
 depends_on: []
 lane: platform-infra
 kind: new
 priority: 2
+blocker: needs a Windows machine running the CURRENT host/ tree; Hunter is standing up his Windows box as a CI runner (see the new T-WIN2 card).
 ---
 
 ## Context

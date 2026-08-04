@@ -75,6 +75,17 @@ def test_a_count_spelling_inside_the_query_dict_is_canonicalised(spelling):
     assert out == {"of": "face", "count": 2}
 
 
+@pytest.mark.parametrize("spelling", ["at", "position", "point", "nearest"])
+def test_a_coordinate_spelling_inside_the_query_dict_means_near(spelling):
+    """Live claude-opus-5 2026-08-04: a chamfer wrote refs.edges={"of":"edge","at":[…]}.
+
+    In a QUERY a coordinate can only mean "the one nearest here" — `at` means placement
+    on a FEATURE, and the guard never runs on those."""
+    out, notes = normalize_geom_query({"of": "edge", spelling: [10, 0, 5]}, where="q")
+    assert out == {"of": "edge", "near": [10, 0, 5]}
+    assert notes
+
+
 def test_a_key_the_engine_never_reads_is_refused_not_ignored():
     with pytest.raises(ValueError) as ei:
         normalize_geom_query({"of": "face", "bogus_key": "zzz"}, where="q")

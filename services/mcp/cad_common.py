@@ -5433,6 +5433,10 @@ GEOM_QUERY_DOMAIN_KEYS = frozenset({"of", "kind"})
 GEOM_QUERY_ALIASES = {
     "surface": "surf", "shape": "surf",
     "limit": "count", "max": "count", "max_results": "count",
+    # A coordinate in a QUERY can only mean "the one nearest here" — the engine's `near`.
+    # (`at` means PLACEMENT on a feature, but this runs on geometry queries only.)
+    # Live claude-opus-5, 2026-08-04: refs.edges={"of":"edge","at":[…]} on a chamfer.
+    "at": "near", "position": "near", "point": "near", "nearest": "near",
 }
 #: Fields query_geometry / describe_part put ON a match. Handing a whole match
 #: object back as a query is a documented workflow, so they are tolerated — but

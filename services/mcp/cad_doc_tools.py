@@ -2030,7 +2030,23 @@ _PARAM_RENAMES = {
               "major_radius": "major_r", "ring_radius": "major_r",
               "radius": "major_r"},
     "box": {"depth": "height", "thickness": "height"},
+    # The bolt-circle diameter is the ONE param nothing but the literal key `pcd`
+    # reached. core/doc/document.cpp accepts `bolt_circle_d` at compile time, but
+    # validate.cpp's required set is {diameter, count, pcd}, so that alias was dead on
+    # arrival — the batch was rejected before the compiler ever saw it. Every spelling
+    # here is the DIAMETER under another name, so nothing is scaled: a radius spelling
+    # is deliberately absent, because filling `pcd` from a radius would silently place
+    # the ring at half its size.
+    "bolt_circle": {"bolt_circle_d": "pcd", "bolt_circle_diameter": "pcd",
+                    "bcd": "pcd", "circle_diameter": "pcd",
+                    "pitch_circle_diameter": "pcd", "pattern_diameter": "pcd",
+                    "bolt_hole_circle": "pcd"},
 }
+#: Feature types the dimension-alias pass runs for. It started life as the primitive
+#: set, which is why `_PARAM_RENAMES["bolt_circle"]` would otherwise never have fired:
+#: the alias tables are keyed by feature type already, so the gate follows them rather
+#: than a hand-kept list that has to be remembered twice.
+_DIM_ALIAS_TYPES = _PRIMITIVE_TYPES | frozenset(_PARAM_RENAMES) | frozenset(_DIAMETER_ALIASES)
 _SIZE_KEYS = ("size", "dimensions", "dimension", "dims")
 _BOX_DIMS = ("length", "width", "height")
 _MAX_INTERPRETED_NOTES = 8
@@ -2313,12 +2329,12 @@ def _normalize_feature_dims(feat: dict, ftype: str, notes: list) -> dict:
     elements, and `diameter:"50mm"` must already be the number 50 before it is halved.
     """
     out = feat
-    if ftype in _PRIMITIVE_TYPES:
+    if ftype in _DIM_ALIAS_TYPES:
         out = _normalize_primitive_dims(out, ftype, notes)
     converted, changed = _convert_units(out, notes, _feat_label(feat, ftype) + ".")
     if changed:
         out = converted
-    if ftype in _PRIMITIVE_TYPES:
+    if ftype in _DIM_ALIAS_TYPES:
         out = _normalize_primitive_dims(out, ftype, notes)
     return out
 
@@ -2423,13 +2439,22 @@ _PATTERN_SOURCE_KEYS = ("source", "seed", "feature", "features", "of", "target",
 #: linear_pattern's params are count1/spacing1; circular_pattern's are count/angle.
 _LINEAR_COUNT_KEYS = ("count1", "count", "instances", "n", "copies", "quantity", "num")
 _LINEAR_SPACING_KEYS = ("spacing1", "spacing", "distance", "pitch", "step", "gap")
-_LINEAR_DIR_KEYS = ("dir1", "dir", "direction", "axis", "along", "vector")
+#: Direction 1 and direction 2 are DIFFERENT slots (refs.dir1 / refs.dir2), so their
+#: spellings must stay apart — a dir1 lookup that swallowed "direction2" would build a
+#: single row along the wrong axis. The numbered forms are what a model writes for a
+#: two-way grid ("Direction 1"/"Direction 2" is the CAD-UI wording); without them the
+#: only way to express the second direction was the literal key `dir2`, so a grid
+#: pattern was unreachable in every dialect but the canonical one.
+_LINEAR_DIR_KEYS = ("dir1", "dir", "direction", "axis", "along", "vector",
+                    "direction1", "direction_1", "dir_1", "axis1")
+_LINEAR_DIR2_KEYS = ("dir2", "direction2", "direction_2", "dir_2", "axis2")
 _CIRCULAR_COUNT_KEYS = ("count", "count1", "instances", "n", "copies", "quantity", "num")
 _CIRCULAR_ANGLE_KEYS = ("angle", "total_angle", "span", "sweep", "arc", "extent")
 _CIRCULAR_AXIS_KEYS = ("axis", "about", "around", "axis1", "dir1", "direction")
 _PATTERN_CONSUMED_KEYS = frozenset(
     _PATTERN_KIND_KEYS + _PATTERN_SOURCE_KEYS + _LINEAR_COUNT_KEYS + _LINEAR_SPACING_KEYS
-    + _LINEAR_DIR_KEYS + _CIRCULAR_COUNT_KEYS + _CIRCULAR_ANGLE_KEYS + _CIRCULAR_AXIS_KEYS)
+    + _LINEAR_DIR_KEYS + _LINEAR_DIR2_KEYS + _CIRCULAR_COUNT_KEYS + _CIRCULAR_ANGLE_KEYS
+    + _CIRCULAR_AXIS_KEYS)
 
 
 def _param_or_ref(feat: dict, params: dict, key: str) -> Any:
@@ -2527,7 +2552,8 @@ def _normalize_pattern_feature(feat: dict, notes: list) -> dict:
         for k in ("count2", "spacing2"):
             if params.get(k) is not None:
                 out_params[k] = params[k]
-        d2 = _param_or_ref(feat, params, "dir2")
+        d2 = next((v for k in _LINEAR_DIR2_KEYS
+                   if (v := _param_or_ref(feat, params, k)) is not None), None)
         if d2 is not None:
             out_refs["dir2"] = d2
     # Strip every alias FIRST, then lay the canonical values on top — the destination key

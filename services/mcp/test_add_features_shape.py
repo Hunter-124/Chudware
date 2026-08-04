@@ -3643,6 +3643,81 @@ def test_a_frustum_keeps_both_radii():
     assert out["params"] == {"r1": 20, "r2": 8, "height": 40}
 
 
+# ------------------------------------------- pattern directions & bolt-circle PCD
+# Free repertoire probe 2026-08-04: a canonically-typed `linear_pattern` carrying
+# `params.direction1`/`direction2` — the CAD-UI wording every mechanical model has
+# read a thousand times — was rejected with «refs.dir1: required for linear_pattern»,
+# and `direction2` had NO alias at all, so a two-way grid was only expressible as the
+# literal `refs.dir2`. `bolt_circle` was worse: nothing but the literal key `pcd`
+# reached the slot, and `bolt_circle_d` — an alias core/doc/document.cpp explicitly
+# accepts — died in validate.cpp before the compiler ever ran.
+
+@pytest.mark.parametrize("spelling", ["direction1", "direction_1", "dir_1", "axis1",
+                                      "direction", "dir"])
+def test_every_first_direction_spelling_reaches_refs_dir1(spelling):
+    feat = _pipeline({"type": "linear_pattern", "name": "Row",
+                      "params": {"count1": 3, "spacing1": 35, spelling: "x"},
+                      "refs": {"features": ["f2"]}})
+    assert feat["refs"]["dir1"] == "axis.x", feat
+    assert spelling not in feat.get("params", {})
+
+
+@pytest.mark.parametrize("spelling", ["direction2", "direction_2", "dir_2", "axis2"])
+def test_every_second_direction_spelling_reaches_refs_dir2(spelling):
+    feat = _pipeline({"type": "linear_pattern", "name": "Grid",
+                      "params": {"count1": 3, "spacing1": 35, "direction1": "x",
+                                 "count2": 2, "spacing2": 40, spelling: "y"},
+                      "refs": {"features": ["f2"]}})
+    assert feat["refs"]["dir1"] == "axis.x", feat
+    assert feat["refs"]["dir2"] == "axis.y", feat
+    assert feat["params"]["count2"] == 2 and feat["params"]["spacing2"] == 40
+
+
+def test_the_two_directions_never_swallow_each_other():
+    """A dir1 lookup that matched "direction2" would build one row along the wrong axis."""
+    feat = _pipeline({"type": "linear_pattern", "name": "Col",
+                      "params": {"count2": 2, "spacing2": 40, "direction2": "y",
+                                 "count1": 3, "spacing1": 35},
+                      "refs": {"features": ["f2"]}})
+    assert feat["refs"].get("dir1") is None, feat
+    assert feat["refs"]["dir2"] == "axis.y", feat
+
+
+@pytest.mark.parametrize("spelling", ["bolt_circle_d", "bolt_circle_diameter", "bcd",
+                                      "circle_diameter", "pitch_circle_diameter",
+                                      "pattern_diameter", "bolt_hole_circle"])
+def test_every_bolt_circle_diameter_spelling_reaches_pcd(spelling):
+    notes: list = []
+    out = M._normalize_feature_dims(
+        {"type": "bolt_circle", "name": "BC",
+         "params": {"diameter": 6, "count": 6, spelling: 60}}, "bolt_circle", notes)
+    assert out["params"]["pcd"] == 60, out
+    assert spelling not in out["params"]
+    if spelling != "pcd":
+        assert any("pcd" in n for n in notes), notes
+
+
+def test_a_bolt_circle_radius_is_never_read_as_the_diameter():
+    """Filling pcd from a radius would put the ring at half its size, silently.
+
+    The engine's «params.pcd: required» names the canonical key, which is the honest
+    answer — a scaled guess is not."""
+    out = M._normalize_feature_dims(
+        {"type": "bolt_circle", "name": "BC",
+         "params": {"diameter": 6, "count": 6, "bolt_circle_radius": 30}},
+        "bolt_circle", [])
+    assert "pcd" not in out["params"]
+    assert out["params"]["bolt_circle_radius"] == 30
+
+
+def test_an_explicit_pcd_wins_over_a_spare_spelling():
+    out = M._normalize_feature_dims(
+        {"type": "bolt_circle", "name": "BC",
+         "params": {"diameter": 6, "count": 6, "pcd": 60, "bcd": 999}},
+        "bolt_circle", [])
+    assert out["params"]["pcd"] == 60
+
+
 # ------------------------------------------------------------------ arc dialects
 # Live run probe-holster-3 (k3-256k, 2026-08-03) lost FOUR consecutive add_features
 # calls to the arc entity alone: the canonical form is centre + radius + start/end

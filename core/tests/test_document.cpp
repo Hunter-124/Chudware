@@ -634,6 +634,58 @@ TEST_CASE("an object-form sketch point is honoured, not silently read as the ori
     CHECK(bb["max"][0].get<double>() == doctest::Approx(40.0 + R).epsilon(0.01));
 }
 
+// doc_bbox must report the ANALYTIC box, not the cached display mesh. BRepBndLib::
+// AddOptimal defaults useTriangulation to TRUE, which bounds the tessellation and pads by
+// its deflection, so every curved face inflated the reported size while the solid stayed
+// exact. Measured 2026-08-04 before the fix: a plain box came back [40.0000002]^3, but a
+// r=5 h=40 cylinder (volume exact to 1e-11) came back
+// [10.0062156, 10.0093228, 40.012431] — note x != y, which is the giveaway that this is a
+// facet artifact and not geometry. A live agent handed the user "bbox_mm: [40.0, 40.0,
+// 40.012]" for a 40 mm cube with a through hole. doc_bbox also feeds make_standard_part's
+// placement datum, so the error was not merely cosmetic. Exact means exact: these are
+// closed-form sizes, asserted tightly on purpose — a loose epsilon here would have let
+// the original defect through.
+TEST_CASE("doc_bbox reports the analytic box, not the padded triangulation") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dim = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    auto size_of = [&](const char* name, const json& feature) {
+        json nr = doc_new("part", name);
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({json{{"op", "add_feature"}, {"feature", feature}}});
+        json resp = doc_apply_ops(id, -1, ops, false);
+        REQUIRE_MESSAGE(resp.value("volume", 0.0) > 0.0,
+                        name << " built no solid: " << resp.dump().substr(0, 300));
+        return chudware::doc::doc_bbox(id).at("size");
+    };
+
+    // A box has no curved face and was already exact apart from the residual gap.
+    {
+        json s = size_of("BboxBox", json{{"type", "box"}, {"name", "B"},
+            {"params", {{"width", dim(40)}, {"length", dim(40)}, {"height", dim(40)}}}});
+        CHECK(s[0].get<double>() == doctest::Approx(40.0).epsilon(1e-12));
+        CHECK(s[1].get<double>() == doctest::Approx(40.0).epsilon(1e-12));
+        CHECK(s[2].get<double>() == doctest::Approx(40.0).epsilon(1e-12));
+    }
+    // A cylinder is the regression witness: one curved face, and the pre-fix box was
+    // wrong on ALL THREE axes by different amounts.
+    {
+        json s = size_of("BboxCyl", json{{"type", "cylinder"}, {"name", "C"},
+            {"params", {{"radius", dim(5)}, {"height", dim(40)}}}});
+        CHECK(s[0].get<double>() == doctest::Approx(10.0).epsilon(1e-12));
+        CHECK(s[1].get<double>() == doctest::Approx(10.0).epsilon(1e-12));
+        CHECK(s[2].get<double>() == doctest::Approx(40.0).epsilon(1e-12));
+    }
+    // A sphere: curved in every direction.
+    {
+        json s = size_of("BboxSph", json{{"type", "sphere"}, {"name", "S"},
+            {"params", {{"radius", dim(12)}}}});
+        for (int i = 0; i < 3; ++i)
+            CHECK(s[i].get<double>() == doctest::Approx(24.0).epsilon(1e-12));
+    }
+}
+
 // 1i. PRIMITIVE `axis`: the feature-level orientation param. Before this, primitives were
 //     hard-wired to their natural local +Z — `axis`/`direction`/`dir` were all silently
 //     ignored, so there was NO way to make a sideways cylinder without sketch+extrude, and

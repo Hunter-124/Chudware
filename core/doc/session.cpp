@@ -7740,9 +7740,23 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
 }
 
 // Precise world axis-aligned bounding box of the whole document (all bodies), via
-// BRepBndLib::AddOptimal (matches the sim/eval box). Returns {min,max,size,center} in mm.
+// BRepBndLib::AddOptimal over the ANALYTIC surfaces. Returns {min,max,size,center} in mm.
 // Used to hand callers (e.g. make_standard_part) the extents + a placement datum so they
 // can position a part without a measure round-trip (Bug A-1).
+//
+// useTriangulation MUST stay false. AddOptimal defaults it to TRUE, which bounds the
+// shape's CACHED DISPLAY MESH and pads by its deflection, so every curved face inflated
+// the box while the solid itself was exact. Measured 2026-08-04: a plain box reported
+// [40.0000002]^3, but a r=5 h=40 cylinder (volume exact to 1e-11) reported
+// [10.0062156, 10.0093228, 40.012431] — note x != y, the giveaway that this is a facet
+// artifact and not geometry. A 40 mm cube with a 10 mm through hole reported z = 40.012431
+// and a live agent handed the user "bbox_mm: [40.0, 40.0, 40.012]" as the part's size.
+// sim_bbox_diag solves the same problem with BRepTools::Clean, but that MUTATES the shape
+// by dropping the render mesh — not allowed here: doc_bbox is on hostd's read-only RPC
+// allowlist (doc/../hostd/doc_registry.cpp). Ignoring the mesh needs no mutation, and for
+// planes/cylinders/cones/spheres/tori the analytic bound is exact.
+// SetGap(0) removes the residual safety margin (the 2e-7 above) so a reported dimension
+// is the real one; AddOptimal is already called with useShapeTolerance=false.
 json doc_bbox(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
@@ -7751,7 +7765,10 @@ json doc_bbox(const std::string& doc_id) {
         throw_no_bodies(doc_id, r, "bound");
     Bnd_Box box;
     for (const TopoDS_Shape& shp : r.shapes)
-        if (!shp.IsNull()) BRepBndLib::AddOptimal(shp, box);
+        if (!shp.IsNull())
+            BRepBndLib::AddOptimal(shp, box, /*useTriangulation=*/Standard_False,
+                                   /*useShapeTolerance=*/Standard_False);
+    box.SetGap(0.0);
     if (box.IsVoid())
         throw OpError("invalid_op", "bounding box is empty", {{"doc_id", doc_id}});
     Standard_Real xmin, ymin, zmin, xmax, ymax, zmax;

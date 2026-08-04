@@ -31,6 +31,7 @@ from .cad_common import (
     _err,
     _palette_caption_block,
     _reading_from_measure,
+    _resolve_material,
     _resolve_measure_target,
     _resolve_one_selector,
     _target_bbox,
@@ -1004,13 +1005,17 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def measure_part(doc_id: Optional[str] = None, density_g_cm3: float = 7.85,
+    def measure_part(doc_id: Optional[str] = None, density_g_cm3: Optional[float] = None,
                      **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Mass properties of the current part: volume (mm^3), mass (g), centre of mass, inertia.
 
         density_g_cm3 sets the material density used for mass (default 7.85 = steel). Also
-        accepted as density= / density_g_cc= / material_density= / rho= (echoed in
-        `interpreted`). Also runs a geometry sanity check (closed/valid solid).
+        accepted as density= / density_g_cc= / material_density= / rho=, or as a NAME —
+        material="aluminum" resolves against the same material table the solvers use and
+        the density it picked comes back in `interpreted`. NOTE: set_material is the
+        VISUAL material and does NOT change this density, so a part you coloured aluminium
+        still weighs steel here unless you say so. Also runs a geometry sanity check
+        (closed/valid solid).
 
         Multi-body docs: the top-level volume/mass/com/inertia are the COMBINED total of ALL
         bodies, and `mass.bodies[]` lists each body's own properties (with `mass.body_count`).
@@ -1031,15 +1036,41 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             notes: list = []
             density = _one_alias("measure_part", "density_g_cm3", extra,
                                  ("density", "density_g_cc", "density_gcm3", "material_density",
-                                  "rho"), None, notes)
-            if density is not None:
+                                  "rho"), density_g_cm3, notes)
+            # A material NAME is the spelling a model reaches for once it has decided the
+            # part is aluminium, and it used to be refused with "use set_material instead"
+            # — which is false: set_material is the VISUAL material and never touches the
+            # density this tool computes mass with, so following that advice returns a
+            # steel mass for an aluminium part with nothing to say it did. Resolve the name
+            # against the same material table the solvers use, and echo the density used.
+            named = extra.pop("material", None)
+            named = _one_alias("measure_part", "material", extra,
+                               ("material_name", "mat"), named, notes)
+            if named is not None and density is None:
+                props = _resolve_material(named)
+                resolved = props.get("density_g_cm3")
+                if not isinstance(resolved, (int, float)) or resolved <= 0:
+                    raise ValueError(
+                        f"measure_part(material={named!r}): that material carries no density, "
+                        f"so mass cannot be computed. Pass density_g_cm3= directly.")
+                density = resolved
+                notes.append(f"material={named!r} resolved to density_g_cm3={resolved} — mass "
+                             f"is computed from density; set_material sets the VISUAL material "
+                             f"only and does not change it")
+            elif named is not None:
+                notes.append(f"ignored material={named!r} — density_g_cm3={density} was given "
+                             f"explicitly and wins")
+            # Steel is the documented default, applied only when nothing else said otherwise.
+            if density is None:
+                density_g_cm3 = 7.85
+            else:
                 try:
                     density_g_cm3 = float(density)
                 except (TypeError, ValueError):
                     raise ValueError(
                         f"measure_part(density_g_cm3={density!r}): density is a NUMBER in g/cm^3 "
-                        "(steel 7.85, aluminium 2.70, ABS 1.04). To pick a material by name use "
-                        "set_material instead.") from None
+                        "(steel 7.85, aluminium 2.70, ABS 1.04), or pass material= with a name "
+                        "from the material table.") from None
             # A "what should I measure" argument is ambiguous, and the two readings need OPPOSITE
             # answers, so the VALUE decides — not the key.
             #  * exact whole-part thickness spellings route to the dedicated wall-thickness probe;

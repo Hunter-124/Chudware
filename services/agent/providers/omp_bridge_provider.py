@@ -304,8 +304,11 @@ class OmpBridgeProvider(Provider):
                     # No sink: send EXACTLY what we send today (no `stream` key,
                     # no on_event kwarg) — behaviour is byte-identical.
                     result = bridge.call("complete", params, timeout=self.timeout)
-                if str(result.get("stopReason") or "") == "error":
-                    break  # surfaced below with its status — resampling won't help
+                if str(result.get("stopReason") or "") in ("error", "length"):
+                    # "error" carries its own status; "length" is DETERMINISTIC — the same
+                    # prompt under the same budget truncates identically, so a resample is
+                    # a fully billed no-op. Both are surfaced below.
+                    break
                 if str(result.get("text") or ""):
                     break  # usable reply
                 salvaged = _directive_from_thinking(str(result.get("thinking") or ""))
@@ -333,6 +336,19 @@ class OmpBridgeProvider(Provider):
         reply = str(result.get("text") or "")
         thinking = str(result.get("thinking") or "")
         if not reply and not thinking:
+            # The endpoint already SAID why. Measured 2026-08-04: claude-fable-5 with the
+            # harness's default reasoningEffort="high" spends the whole maxTokens budget
+            # reasoning and answers stopReason "length" with no text and no thinking —
+            # every leg died in a second as an unexplained `provider_error`. The same call
+            # with no reasoningEffort replies normally, so the fix is in the caller's
+            # hands; say so instead of reporting a blank.
+            if str(result.get("stopReason") or "") == "length":
+                effort = f' at reasoningEffort="{self.reasoning_effort}"' if self.reasoning_effort else ""
+                raise bridge.BridgeUnavailable(
+                    f"omp-bridge {self.name}: {self.model} spent the whole max_tokens "
+                    f"budget ({max_tokens}) before writing anything{effort} — the reply was "
+                    f"TRUNCATED, not missing (stopReason=length). Raise max_tokens or lower "
+                    f"the reasoning effort for this model.")
             raise bridge.BridgeUnavailable(
                 f"omp-bridge {self.name}: endpoint returned no completion")
         self._record_usage(result.get("usage"))

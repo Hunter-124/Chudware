@@ -7343,8 +7343,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         body: which body — "b1", "b2", ... (1-based) or an int ordinal. Default: ALL bodies.
 
         Persists on the document (round-trips through the native .step+) and is picked up by
-        render_part. NOTE: this is the VISUAL material; to set the material for SIMULATION
-        (density/stiffness) pass `material=` to run_fea_static / run_cfd_flow instead.
+        render_part. NOTE: this is the VISUAL material ONLY — it does not change what the
+        part WEIGHS or how it behaves. For mass, pass material= (or density_g_cm3=) to
+        measure_part; for stiffness/strength, pass material= to run_fea_static /
+        run_cfd_flow. Colouring a part aluminium and then asking for its mass reports a
+        STEEL mass unless you name the material there too.
         """
         try:
             d = _doc(doc_id)

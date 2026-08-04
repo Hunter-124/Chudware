@@ -242,6 +242,36 @@ def test_two_empty_samples_still_surface_the_real_error(monkeypatch):
         prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
 
 
+def test_a_length_stop_is_reported_as_truncation_not_a_missing_reply(monkeypatch):
+    """Live 2026-08-04: claude-fable-5 at the harness default reasoningEffort="high"
+    burns the whole max_tokens budget reasoning and answers stopReason "length" with no
+    text and no thinking. Every leg died in a second as an unexplained provider_error,
+    while the same call with no reasoning effort replies normally."""
+    _fake_bridge(monkeypatch, [
+        ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
+    ])
+    prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-fable-5",
+                             reasoning_effort="high")
+    with pytest.raises(omp_bridge.BridgeUnavailable) as ei:
+        prov.complete_ex("sys", [{"role": "user", "content": "hi"}], max_tokens=16)
+    msg = str(ei.value)
+    assert "TRUNCATED" in msg and "16" in msg and "high" in msg, msg
+
+
+def test_a_length_stop_is_never_resampled(monkeypatch):
+    """The same prompt under the same budget truncates identically — a resample is a
+    fully billed no-op."""
+    calls = _fake_bridge(monkeypatch, [
+        ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
+        ([], {"text": "would never be reached", "thinking": "", "stopReason": "stop",
+              "usage": {}}),
+    ])
+    prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-fable-5")
+    with pytest.raises(omp_bridge.BridgeUnavailable):
+        prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
+    assert len(calls) == 1, "a deterministic truncation must not be paid for twice"
+
+
 # --- (f) raising callback never breaks the bridge RPC --------------------------
 
 def test_raising_callback_does_not_break_call():

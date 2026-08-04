@@ -1061,22 +1061,46 @@ def _prose_geom_query(v: Any, kind: str) -> Optional[dict]:
     return None
 
 
+#: A side token the ENGINE itself accepts under `side` (picks.cpp::kQueryGrammar), plus the
+#: prose synonyms _FACE_SIDE_WORDS already knows. Used only where the ref SLOT has already
+#: pinned the topology kind, so the face/edge noun a phrase would have to carry is implicit.
+_BARE_SIDE_TOKENS = {
+    **_FACE_SIDE_WORDS,
+    "+x": "+x", "-x": "-x", "+y": "+y", "-y": "-y", "+z": "+z", "-z": "-z",
+}
+
+
+def _bare_side_query(v: Any, kind: str) -> Optional[dict]:
+    """`refs.face="top"` -> `{"of":"face","side":"top"}`; anything else -> None.
+
+    The phrase mappers need a face/edge NOUN ("the top face"), so the ONE-WORD form every
+    model writes for the slot that already names the kind fell through to the datum path
+    and died on «'top' is neither a reserved datum nor a feature id». Observed twice in one
+    live sweep (claude-sonnet-5, 2026-08-04), on a plate and on a flange.
+    """
+    if kind not in ("face", "edge") or not isinstance(v, str):
+        return None
+    side = _BARE_SIDE_TOKENS.get(v.strip().lower())
+    return {"of": kind, "side": side} if side else None
+
+
 def _geom_ref_member(v: Any, kind: str) -> Optional[dict]:
     """One ref member -> the canonical geometry query it means, or None to leave it alone.
 
-    Handles the prose phrase itself and the {"query": …} wrapper the model reaches for
-    ({"edges":{"query":"the vertical edges"}} — the live 2026-07-28 rejection). A wrapper
-    around a query DICT is just the query nested one level too deep, so it is unwrapped; a
-    wrapper around prose that does not map is left in place so the engine still reports it.
+    Handles the prose phrase itself, the bare side word, and the {"query": …} wrapper the
+    model reaches for ({"edges":{"query":"the vertical edges"}} — the live 2026-07-28
+    rejection). A wrapper around a query DICT is just the query nested one level too deep,
+    so it is unwrapped; a wrapper around prose that does not map is left in place so the
+    engine still reports it.
     """
-    q = _prose_geom_query(v, kind)
+    q = _prose_geom_query(v, kind) or _bare_side_query(v, kind)
     if q is not None:
         return q
     if isinstance(v, dict) and set(v) == {"query"}:
         inner = v["query"]
         if isinstance(inner, dict) and inner:
             return dict(inner)
-        return _prose_geom_query(inner, kind)
+        return _prose_geom_query(inner, kind) or _bare_side_query(inner, kind)
     return None
 
 

@@ -261,17 +261,24 @@ class OmpBridgeProvider(Provider):
             params["stream"] = True
 
         try:
-            # K3 textless-resample: kimi-code thinking-then-stop responses with ZERO text
-            # are unusable to the text-dialect harness (no fenced tool block, no finish
-            # envelope). Identical replays correlate through the endpoint's prompt cache
-            # (measured 3 consecutive empties on one history), so each retry APPENDS a
-            # cache-busting nudge that also restates the dialect. The nudge rides only
-            # the wire copy — the harness history stays verbatim.
-            # Cost control: every resample is a FULLY BILLED completion that
-            # re-sends the whole prompt. Before spending one, check whether the
-            # model already wrote the directive into its reasoning channel (k3
-            # frequently does) — that costs nothing and is the common case.
-            attempts = 2 if self.wire_provider == "kimi-code" else 1
+            # Textless resample. A completion with NO text and NO thinking is unusable to
+            # the harness: agent_turn sees nothing to parse and the turn dies as
+            # `provider_error`, losing every tool call it had already made. Measured
+            # 2026-08-04 on the basic-modeling sweep: TWO of eight claude-sonnet-5 legs
+            # ended that way mid-build, and an immediate replay of the same history
+            # completed normally — so one resample is the difference between a lost turn
+            # and a finished part. Every provider gets it.
+            #
+            # kimi-code additionally gets a cache-busting nudge that restates the dialect:
+            # its thinking-then-stop empties correlate through the endpoint's prompt cache
+            # (measured 3 consecutive empties on one history), so an identical replay
+            # returns the identical nothing. The nudge rides only the wire copy — the
+            # harness history stays verbatim.
+            # Cost control: a resample is a FULLY BILLED completion that re-sends the whole
+            # prompt, so it only ever fires on a wholly empty sample, and only once. Before
+            # spending it, check whether the model wrote the directive into its reasoning
+            # channel (k3 frequently does) — that costs nothing and is the common case.
+            attempts = 2
             result: dict[str, Any] = {}
             wire_messages = params["messages"]
             for attempt in range(attempts):
@@ -286,9 +293,10 @@ class OmpBridgeProvider(Provider):
                                 discard()
                             except Exception:  # noqa: BLE001
                                 pass
-                    params["messages"] = wire_messages + [
-                        {"role": "user", "content": _KIMI_RESAMPLE_NUDGE}
-                    ]
+                    if self.wire_provider == "kimi-code":
+                        params["messages"] = wire_messages + [
+                            {"role": "user", "content": _KIMI_RESAMPLE_NUDGE}
+                        ]
                 if sink is not None:
                     result = bridge.call("complete", params, timeout=self.timeout,
                                          on_event=on_event)
@@ -304,6 +312,11 @@ class OmpBridgeProvider(Provider):
                 if salvaged:
                     result["text"] = salvaged
                     break  # free: the block was in the reasoning channel
+                if (self.wire_provider != "kimi-code"
+                        and str(result.get("thinking") or "")):
+                    # Reasoning with no text is still a completion everywhere but the k3
+                    # text dialect, and it is accepted below — don't pay for a resample.
+                    break
             # attempts exhausted with empty text: result holds the last sample and the
             # no-completion raise below still applies when thinking is empty too.
         except bridge.BridgeUnavailable as exc:

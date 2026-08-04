@@ -2871,6 +2871,48 @@ def test_extrude_family_face_alias(ftype):
     assert feat["refs"]["profile"] == [{"kind": "region", "sketch": "S1"}]
 
 
+# ------------------------------------------------- a bare side word in a face/edge slot
+# Live 2026-08-04 (claude-sonnet-5, basic-modeling sweep), on two different parts:
+# {"type":"hole","refs":{"face":"top"}} died on «'top' is neither a reserved datum nor a
+# feature id». The prose mapper needs a face/edge NOUN ("the top face"), so the one-word
+# form — for the slot that has ALREADY named the kind — fell through to the datum path.
+
+@pytest.mark.parametrize("word,side", [
+    ("top", "top"), ("bottom", "bottom"), ("front", "front"), ("back", "back"),
+    ("rear", "back"), ("left", "left"), ("right", "right"), ("underside", "bottom"),
+    ("+z", "+z"), ("-x", "-x"),
+])
+def test_a_bare_side_word_in_refs_face_becomes_a_query(word, side):
+    notes: list = []
+    feat = M._normalize_feature_refs(
+        {"type": "hole", "name": "Bore", "refs": {"face": word},
+         "params": {"diameter": 6}}, "hole", notes)
+    assert feat["refs"]["face"] == {"of": "face", "side": side}, feat
+    assert notes
+
+
+def test_a_bare_side_word_in_refs_edges_becomes_an_edge_query():
+    feat = M._normalize_feature_refs(
+        {"type": "fillet", "name": "R", "refs": {"edges": "top"},
+         "params": {"radius": 2}}, "fillet", [])
+    assert feat["refs"]["edges"] == [{"of": "edge", "side": "top"}], feat
+
+
+def test_a_feature_id_in_a_face_slot_is_left_for_the_engine():
+    """Only a side TOKEN is claimed — an f<N> id still means the feature it names."""
+    feat = M._normalize_feature_refs(
+        {"type": "hole", "name": "Bore", "refs": {"face": "f1"},
+         "params": {"diameter": 6}}, "hole", [])
+    assert feat["refs"]["face"] == "f1"
+
+
+def test_a_plane_slot_keeps_its_datum_reading():
+    """refs.plane="top" is the ORIGIN datum, not a face — the side-word map must not steal it."""
+    feat = M._normalize_feature_refs(
+        {"type": "sketch", "name": "S", "refs": {"plane": "top"}}, "sketch", [])
+    assert feat["refs"]["plane"] == "plane.top"
+
+
 @pytest.mark.parametrize("axis_value,expected", [
     ([0, 0, 1], "axis.z"),
     ([0, 0, -1], "axis.z"),

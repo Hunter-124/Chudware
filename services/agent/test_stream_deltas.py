@@ -199,6 +199,49 @@ def test_resample_discards_first_attempt_buffer(monkeypatch):
     assert len(calls[1]["params"]["messages"]) == 2
 
 
+# --- (e2) a wholly empty sample is resampled on EVERY provider ----------------
+# Live 2026-08-04 basic-modeling sweep: two of eight claude-sonnet-5 legs died
+# mid-build on a single completion that carried no text and no thinking. The
+# harness has nothing to parse, so the turn ended `provider_error` and every tool
+# call it had already made was thrown away — while an immediate replay of the same
+# history completed normally. Only kimi-code resampled; now everyone does.
+
+def test_an_empty_anthropic_sample_is_resampled_instead_of_killing_the_turn(monkeypatch):
+    calls = _fake_bridge(monkeypatch, [
+        ([], {"text": "", "thinking": "", "stopReason": "stop", "usage": {}}),
+        ([], {"text": "the real reply", "thinking": "", "stopReason": "stop", "usage": {}}),
+    ])
+    prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-sonnet-5")
+    reply, _ = prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 2, "the empty sample was not resampled"
+    assert reply == "the real reply"
+    # The k3 cache-buster is dialect-specific and must NOT ride other providers.
+    assert len(calls[1]["params"]["messages"]) == 1
+
+
+def test_reasoning_without_text_is_not_paid_for_twice(monkeypatch):
+    """Thinking alone is a completion outside the k3 text dialect — accepted as-is."""
+    calls = _fake_bridge(monkeypatch, [
+        ([], {"text": "", "thinking": "reasoned it out", "stopReason": "stop", "usage": {}}),
+    ])
+    prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-opus-5")
+    reply, thinking = prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 1, "a thinking-only sample must not trigger a billed resample"
+    assert reply == "" and thinking == "reasoned it out"
+
+
+def test_two_empty_samples_still_surface_the_real_error(monkeypatch):
+    _fake_bridge(monkeypatch, [
+        ([], {"text": "", "thinking": "", "stopReason": "stop", "usage": {}}),
+        ([], {"text": "", "thinking": "", "stopReason": "stop", "usage": {}}),
+    ])
+    prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-sonnet-5")
+    with pytest.raises(omp_bridge.BridgeUnavailable, match="no completion"):
+        prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
+
+
 # --- (f) raising callback never breaks the bridge RPC --------------------------
 
 def test_raising_callback_does_not_break_call():

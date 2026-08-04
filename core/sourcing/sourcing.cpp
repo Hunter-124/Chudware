@@ -6,6 +6,7 @@
 //                                             -> {ok, quote} | {ok:false, reason, hint}
 //   match_part_number       {mpn, generate?}  -> {ok, match} | {ok:false, error}
 //   vendor_part_fetch       {supplier, part_number} -> {ok, part} | {ok:false, error}
+//   vendor_part_register    {supplier, part_number, ...optional fields} -> {ok, part} | {ok:false, error}
 //   spec_sheet_match        {text_or_url?, mpn?, template, dims?} -> {ok, match} | {ok:false, error}
 //   list_spec_templates     {}                -> {ok, templates:[...]}
 #include "sourcing/sourcing.h"
@@ -102,6 +103,16 @@ bool call(const std::string& method, const json& params, const Seams& seams, jso
             result = {{"ok", true},
                       {"part", provider_fetch(str_param(params, "supplier"),
                                               str_param(params, "part_number"), seams)}};
+        } catch (const ProviderError& e) {
+            result = {{"ok", false}, {"error", e.what()}};
+        }
+        return true;
+    }
+    if (method == "vendor_part_register") {
+        try {
+            result = {{"ok", true},
+                      {"part", register_local_cad(str_param(params, "supplier"),
+                                                  str_param(params, "part_number"), params)}};
         } catch (const ProviderError& e) {
             result = {{"ok", false}, {"error", e.what()}};
         }

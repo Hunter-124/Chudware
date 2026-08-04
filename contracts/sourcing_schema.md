@@ -206,3 +206,66 @@ same no-scrape / config-only-keys policy as providers; missing credentials degra
 A `QuoteResult` can be folded into a `made` `BomLine` (§3): `unit_price`→`unit_cost`,
 `ext_price`→`ext_cost`, with `cost_model` recording `{"source": "quote", "provider", "quote_id"}`.
 ```
+
+
+## Amendment — 2026-08-03 — T-X7b
+
+### `vendor_part_register`
+
+The sourcing worker accepts a `vendor_part_register` request with the following
+parameters:
+
+```json
+{
+  "supplier": "<required non-empty string>",
+  "part_number": "<required non-empty string>",
+  "cad_path": "<optional string>",
+  "description": "<optional string>",
+  "product_url": "<optional string>",
+  "specs": {},
+  "source": "<optional string>",
+  "unit_price": null,
+  "currency": "USD",
+  "price_breaks": [{"qty": 1, "unit_price": 1.25}],
+  "stock": null,
+  "lead_time_days": null,
+  "moq": null,
+  "fetched_ts": null,
+  "provenance": {
+    "method": "browser_scrape",
+    "source_url": "https://supplier.example/part",
+    "session_profile_used": "default",
+    "license_note": "source terms apply",
+    "scraped": true
+  }
+}
+```
+
+`supplier` and `part_number` are required. All other keys are optional. The
+result is `{"ok": true, "part": <upserted record>}` on success or
+`{"ok": false, "error": "<reason>"}` on validation or registration failure.
+`price_breaks` entries require numeric `qty` and `unit_price` values.
+
+Vendor index records are keyed by
+`slug(supplier) + "::" + slug(part_number)`. A component lookup first uses that
+supplier-qualified key. If the component has no supplier, or the qualified key
+misses, lookup scans the index in lexicographic key order and returns the first
+record whose `part_number` slug matches. Thus an ambiguous supplier-less lookup
+is deterministic; a supplied exact supplier always takes precedence.
+
+Registration is an upsert. Supplied optional keys overwrite the current record,
+while omitted keys retain their current values. In particular, a price-only
+upsert does not blank an existing `cad_path`, `cad_format`, `source_mtime`, or
+`specs`; a new price-only record legitimately has an empty `cad_path` and null
+`cad_format` and `source_mtime`. `added_ts` is written once at creation and
+preserved, while `updated_ts` is written on every upsert. Records include a
+`provenance` object, defaulting to `{}`. `currency` defaults to `"USD"` only
+when a record is created. A supplied `fetched_ts` is retained verbatim; when it
+is omitted from an upsert that supplies `unit_price`, `price_breaks`, `stock`,
+`lead_time_days`, or `moq`, it defaults to the current epoch time. Other
+upserts preserve the existing `fetched_ts`.
+
+A scraped price MUST carry `provenance.scraped: true` and a `fetched_ts` that
+records when it was obtained. A scraped price is explicitly not a vendor-quoted
+figure and MUST remain distinguishable from API-sourced or formally quoted
+pricing through its provenance.

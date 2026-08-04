@@ -553,6 +553,18 @@ TEST_CASE("dispatch: envelopes mirror the Python worker wrappers") {
     CHECK(call("list_spec_templates", json::object(), s, r));
     CHECK(r["templates"].size() == 4);
 
+    CHECK(call("vendor_part_register",
+               json::parse(R"({"supplier":"Dispatch Vendor","part_number":"D-1",
+                               "unit_price":1.25,"currency":"USD",
+                               "provenance":{"method":"browser_scrape","scraped":true}})"),
+               s, r));
+    CHECK(r["ok"] == true);
+    CHECK(r["part"]["unit_price"] == doctest::Approx(1.25));
+    CHECK(r["part"]["provenance"]["scraped"] == true);
+    CHECK(call("vendor_part_register", json::parse(R"({"part_number":"D-2"})"), s, r));
+    CHECK(r["ok"] == false);
+    CHECK(r["error"] == "supplier is required");
+
     CHECK(!call("doc_new", json::object(), s, r));  // not ours -> fall through
 }
 
@@ -564,9 +576,13 @@ TEST_CASE("vendor registry: register_local_cad copies + indexes the record") {
         std::ofstream f(src);
         f << "ISO-10303-21;\nEND-ISO-10303-21;\n";
     }
-    const json rec = register_local_cad("spec_sheet", "TEST-1", src.string(), "test part",
-                                        "", json::parse(R"({"body_diameter_mm":6.3})"),
-                                        "spec_sheet");
+    const json rec = register_local_cad(
+        "spec_sheet", "TEST-1",
+        {{"cad_path", src.string()},
+         {"description", "test part"},
+         {"product_url", ""},
+         {"specs", json::parse(R"({"body_diameter_mm":6.3})")},
+         {"source", "spec_sheet"}});
     CHECK(rec["supplier"] == "spec_sheet");
     CHECK(rec["part_number"] == "TEST-1");
     CHECK(rec["cad_format"] == "step");
@@ -578,9 +594,98 @@ TEST_CASE("vendor registry: register_local_cad copies + indexes the record") {
     const json idx = json::parse(in);
     REQUIRE(idx.contains("spec_sheet::test-1"));
     CHECK(idx["spec_sheet::test-1"]["part_number"] == "TEST-1");
-    CHECK_THROWS_AS(register_local_cad("s", "p", "/nonexistent/file.step", "", "",
-                                       json::object(), "manual"),
+    CHECK_THROWS_AS(register_local_cad(
+                        "s", "p", {{"cad_path", "/nonexistent/file.step"},
+                                   {"source", "manual"}}),
                     ProviderError);
+}
+
+TEST_CASE("vendor registry lookup uses supplier-qualified keys and deterministic fallback") {
+    namespace fs = std::filesystem;
+    register_local_cad("Zeta Supply", "MATCH-42",
+                       {{"unit_price", 9.25}, {"currency", "USD"}});
+    register_local_cad("Alpha Supply", "MATCH-42",
+                       {{"unit_price", 2.50}, {"currency", "USD"}});
+
+    Seams seams;
+    seams.vendor_lookup = [](const json& component) -> json {
+        try {
+            const fs::path index = fs::path(vendor_parts_dir()) / "index.json";
+            if (!fs::exists(index)) return json();
+            std::ifstream in(index);
+            return vendor_index_lookup(json::parse(in), component);
+        } catch (...) {
+            return json();
+        }
+    };
+    const json tree = json::parse(
+        R"({"tree":{"components":[{"mpn":"MATCH-42","vendor_supplier":"Zeta Supply",
+                                   "quantity":3}]}})");
+    const json bom = bom_rollup_lines(tree, seams);
+    REQUIRE(bom.size() == 1);
+    REQUIRE(bom[0]["vendor_part"].is_object());
+    CHECK(bom[0]["part_ref"] == "zeta-supply::match-42");
+    CHECK(bom[0]["vendor_part"]["supplier"] == "Zeta Supply");
+    CHECK(bom[0]["vendor_part"]["unit_price"] == doctest::Approx(9.25));
+
+    std::ifstream in(fs::path(vendor_parts_dir()) / "index.json");
+    const json index = json::parse(in);
+    const json fallback =
+        vendor_index_lookup(index, json::parse(R"({"part_number":"MATCH-42"})"));
+    CHECK(fallback["supplier"] == "Alpha Supply");
+    CHECK(fallback["unit_price"] == doctest::Approx(2.50));
+}
+
+TEST_CASE("vendor registry price-only upsert preserves CAD and price provenance") {
+    namespace fs = std::filesystem;
+    const fs::path src = fs::temp_directory_path() / "chudware_vendor_merge_test.step";
+    {
+        std::ofstream f(src);
+        f << "ISO-10303-21;\nEND-ISO-10303-21;\n";
+    }
+    const json initial = register_local_cad(
+        "Merge Vendor", "MERGE-1",
+        {{"cad_path", src.string()},
+         {"specs", json::parse(R"({"diameter_mm":12.0})")},
+         {"description", "original"}});
+    CHECK(initial["fetched_ts"].is_null());
+
+    const json provenance = json::parse(
+        R"({"method":"browser_scrape","source_url":"https://example.test/part",
+            "session_profile_used":"default","license_note":"source terms apply",
+            "scraped":true})");
+    const json priced = register_local_cad(
+        "Merge Vendor", "MERGE-1",
+        {{"unit_price", 4.75}, {"stock", 12}, {"provenance", provenance}});
+    CHECK(priced["cad_path"] == initial["cad_path"]);
+    CHECK(priced["cad_format"] == "step");
+    CHECK(priced["specs"] == initial["specs"]);
+    CHECK(priced["added_ts"] == initial["added_ts"]);
+    CHECK(priced["unit_price"] == doctest::Approx(4.75));
+    REQUIRE(priced["fetched_ts"].is_number());
+    CHECK(priced["fetched_ts"].get<double>() > 0.0);
+    CHECK(priced["provenance"] == provenance);
+
+    const json fetched_ts = priced["fetched_ts"];
+    const json renamed = register_local_cad(
+        "Merge Vendor", "MERGE-1", {{"description", "renamed"}});
+    CHECK(renamed["fetched_ts"] == fetched_ts);
+    CHECK(renamed["cad_path"] == initial["cad_path"]);
+    CHECK(renamed["specs"] == initial["specs"]);
+    CHECK(renamed["provenance"] == provenance);
+    CHECK(renamed["description"] == "renamed");
+}
+
+TEST_CASE("vendor registry rejects malformed price breaks at the offending entry") {
+    CHECK_THROWS_WITH_AS(
+        register_local_cad(
+            "Bad Break Vendor", "BAD-1",
+            {{"price_breaks",
+              json::parse(R"([{"qty":1,"unit_price":0.5},
+                               {"qty":"ten","unit_price":0.4}])")}}),
+        "price_breaks[1] must be an object with numeric qty and unit_price; got "
+        "{\"qty\":\"ten\",\"unit_price\":0.4}",
+        ProviderError);
 }
 
 int main(int argc, char** argv) {

@@ -46,9 +46,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Optional
 
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
@@ -413,6 +417,107 @@ _IMPORT_ALIASES = {
     "source": "artifact_path", "artifact": "artifact_path",
     "localpath": "artifact_path", "step": "artifact_path",
 }
+
+_VENDOR_REGISTER_PARAMS = (
+    "supplier", "part_number", "artifact_path", "unit_price", "currency",
+    "price_breaks", "stock", "lead_time_days", "moq", "description",
+    "product_url", "specs",
+)
+
+_VENDOR_REGISTER_ALIASES = {
+    "vendor": "supplier", "site": "supplier",
+    "sku": "part_number", "mpn": "part_number", "pn": "part_number",
+    "path": "artifact_path", "file": "artifact_path", "filepath": "artifact_path",
+    "price": "unit_price", "unitcost": "unit_price",
+    "pricebreak": "price_breaks", "breaks": "price_breaks",
+    "leadtime": "lead_time_days",
+    "minimumorder": "moq", "minimumorderquantity": "moq",
+    "title": "description", "url": "product_url", "sourceurl": "product_url",
+    "parameters": "specs", "attributes": "specs",
+}
+
+_VENDOR_SOURCE_KEYS = (
+    "site", "title", "sku", "source_url", "price", "license_note",
+    "session_profile_used",
+)
+
+_SCRAPED_PRICE_RE = re.compile(
+    r"^\s*(?:US\$|\$|USD)\s*"
+    r"(?P<amount>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _queue_source_for_artifact(artifact_path: str) -> dict | None:
+    """Return a done queue job's provenance when its artifact resolves to *artifact_path*."""
+    try:
+        from services.browser.queue import queue_status
+        jobs = queue_status().get("jobs", [])
+    except Exception:  # noqa: BLE001
+        return None
+    target = os.path.realpath(artifact_path)
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        candidate = job.get("artifact_path", "")
+        if (job.get("status") != "done" or not candidate
+                or os.path.realpath(str(candidate)) != target):
+            continue
+        spec = job.get("spec_data")
+        source = dict(spec) if isinstance(spec, dict) else {}
+        source.setdefault("site", job.get("site"))
+        source.setdefault("artifact_path", candidate)
+        return source
+    return None
+
+
+def _epoch_seconds(value: Any) -> float:
+    """Normalize numeric or ISO-8601 acquisition times; fall back to the current instant."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if math.isfinite(number):
+            return number
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw:
+            try:
+                number = float(raw)
+                if math.isfinite(number):
+                    return number
+            except ValueError:
+                pass
+            try:
+                instant = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if instant.tzinfo is None:
+                    instant = instant.replace(tzinfo=timezone.utc)
+                return instant.timestamp()
+            except ValueError:
+                pass
+    return time.time()
+
+
+def _vendor_source_metadata(source: dict, artifact_path: str) -> dict:
+    """Build the opaque document metadata payload from an acquisition envelope."""
+    metadata = {
+        key: source[key]
+        for key in _VENDOR_SOURCE_KEYS
+        if key in source and source[key] not in (None, "")
+    }
+    metadata["fetched_ts"] = _epoch_seconds(source.get("fetched_ts"))
+    metadata["artifact_path"] = artifact_path
+    metadata["acquired_via"] = "browser_scrape"
+    return metadata
+
+
+def _parse_scraped_unit_price(raw: Any) -> float | None:
+    """Parse only an unambiguous USD display price, never ranges or pack pricing."""
+    if not isinstance(raw, str):
+        return None
+    match = _SCRAPED_PRICE_RE.fullmatch(raw)
+    if match is None:
+        return None
+    value = float(match.group("amount").replace(",", ""))
+    return value if math.isfinite(value) else None
 
 _PLACE_ALIASES = {
     "id": "part_id", "part": "part_id", "partnumber": "part_id",
@@ -1969,34 +2074,38 @@ def register_parts_tools(mcp: FastMCP) -> None:
             return _err(f"scrape_queue_status failed: {exc}")
 
     @mcp.tool()
-    def import_artifact(artifact_path: str = "", **kwargs: _VarKw) -> str:
-        """Import a locally acquired CAD file (STEP/IGES) into a new editable part doc.
+    def import_artifact(artifact_path: str = "", source: Optional[dict] = None,
+                        **kwargs: _VarKw) -> str:
+        """Import acquired STEP/IGES geometry and stamp its vendor provenance on the doc.
 
-        This is the second step after a scrape/download queue job completes with
-        status="done": take the artifact_path returned by scrape_queue_status and
-        import it into the CAD kernel, creating an editable part document.
+        For a completed scrape job, pass its artifact_path. The matching done queue
+        job's spec_data is recorded under document metadata key ``vendor_source``;
+        ``source`` may explicitly override that envelope. Missing provenance does not
+        block geometry import, and metadata-stamp failures return ``metadata_warning``.
 
-        artifact_path : local filesystem path to the acquired CAD file (e.g. a .step
-                        file downloaded by the McMaster or GrabCAD adapter). Obtain it
-                        from scrape_queue_status's artifact_path field on a done job.
+        artifact_path : local filesystem path reported by scrape_queue_status.
+        source        : optional provenance-envelope override for non-queue callers.
 
-        Returns a PlacementResult dict:
-          {ok, domain: "import_file", doc_id, editable: true, detail: {imported_from, ...}}
-        or {ok: false, reason: ..., hint: ...} on failure.
-
-        After import you can call reverse_engineer(source=doc_id) for parametric
-        feature recovery where the geometry supports it.
+        Returns the core PlacementResult plus ``vendor_source`` when the stamp succeeds.
+        After import, reverse_engineer(source=doc_id) can attempt parametric recovery.
         """
-        import os
         notes: list[str] = []
-        mapped, leftover = _absorb(kwargs, ("artifact_path",), _IMPORT_ALIASES,
-                                   notes, ["artifact_path"] if artifact_path else [])
+        given = ["artifact_path"] if artifact_path else []
+        if source is not None:
+            given.append("source")
+        mapped, leftover = _absorb(
+            kwargs, ("artifact_path", "source"), _IMPORT_ALIASES, notes, given)
         if leftover:
             return json.dumps(_unknown_args_error(
-                "import_artifact", leftover, ("artifact_path",),
-                "import_artifact takes ONE local file path — the artifact_path a "
-                "done scrape_queue_status job reports."), ensure_ascii=False)
+                "import_artifact", leftover, ("artifact_path", "source"),
+                "Pass the local artifact_path from a done scrape_queue_status job; "
+                "source may be that job's provenance dict."), ensure_ascii=False)
         path = str(mapped.get("artifact_path", artifact_path) or "").strip()
+        source_data = mapped.get("source", source)
+        if source_data is not None and not isinstance(source_data, dict):
+            return _err("import_artifact source must be a provenance object.",
+                        "Pass source={...}, or omit it to resolve spec_data from the "
+                        "matching done scrape queue job.")
         if not path:
             return _err("import_artifact needs an artifact_path — none was given.",
                         "Run scrape_enqueue(site, query), poll "
@@ -2006,11 +2115,162 @@ def register_parts_tools(mcp: FastMCP) -> None:
             return _err(f"file not found: {path}",
                         "Verify the artifact_path from scrape_queue_status. "
                         "The file may have been cleaned up.")
+        if source_data is None:
+            source_data = _queue_source_for_artifact(path)
         try:
             # _place_import_file was ported to core/parts (T-RF19).
             from . import core_bridge as cb
-            result = cb.call("part_import_file", {"path": path})
-            return json.dumps(result, ensure_ascii=False)
+            imported = cb.call("part_import_file", {"path": path})
         except Exception as exc:  # noqa: BLE001
             return _err(f"import_artifact failed: {exc}",
                         "Ensure the native core (CHUDWARE_LIBCHUDWARE) is available.")
+
+        if not isinstance(imported, dict):
+            return json.dumps(imported, ensure_ascii=False)
+        result = dict(imported)
+        if notes:
+            result["interpreted"] = _interpreted_notes(notes)
+        if not result.get("ok") or source_data is None:
+            return json.dumps(result, ensure_ascii=False)
+
+        vendor_source = _vendor_source_metadata(source_data, path)
+        doc_id = result.get("doc_id")
+        if not doc_id:
+            result["metadata_warning"] = (
+                "vendor_source was not stamped because the successful import reply "
+                "contained no doc_id")
+            return json.dumps(result, ensure_ascii=False)
+        try:
+            stamped = cb.call("doc_set_meta", {
+                "doc_id": doc_id,
+                "key": "vendor_source",
+                "value": vendor_source,
+            })
+            if not isinstance(stamped, dict) or not stamped.get("ok"):
+                detail = (stamped.get("error") or stamped.get("reason")
+                          if isinstance(stamped, dict) else repr(stamped))
+                raise RuntimeError(detail or "doc_set_meta returned ok=false")
+        except Exception as exc:  # noqa: BLE001
+            result["metadata_warning"] = f"vendor_source metadata stamp failed: {exc}"
+        else:
+            result["vendor_source"] = vendor_source
+        return json.dumps(result, ensure_ascii=False)
+
+    @mcp.tool()
+    def vendor_part_register(supplier: str = "", part_number: str = "",
+                             artifact_path: str = "", **kwargs: _VarKw) -> str:
+        """Register scraped price/availability for bom_price; import_artifact handles geometry.
+
+        Prices registered here are scraped figures with fetch timestamps, not vendor quotes.
+        A completed queue artifact supplies its vendor envelope; explicit unit_price,
+        currency, price_breaks, stock, lead_time_days, moq, description, product_url,
+        and specs kwargs override scraped fields. Ambiguous display prices remain null.
+        """
+        notes: list[str] = []
+        given = [
+            key for key, value in (
+                ("supplier", supplier),
+                ("part_number", part_number),
+                ("artifact_path", artifact_path),
+            ) if value
+        ]
+        mapped, leftover = _absorb(
+            kwargs, _VENDOR_REGISTER_PARAMS, _VENDOR_REGISTER_ALIASES, notes, given)
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "vendor_part_register", leftover, _VENDOR_REGISTER_PARAMS,
+                "Pass a completed scrape artifact_path and optional structured "
+                "price/availability overrides."), ensure_ascii=False)
+
+        supplier = str(mapped.get("supplier", supplier) or "").strip()
+        part_number = str(mapped.get("part_number", part_number) or "").strip()
+        path = str(mapped.get("artifact_path", artifact_path) or "").strip()
+        source_data = _queue_source_for_artifact(path) if path else None
+        source_data = source_data or {}
+        supplier = supplier or str(source_data.get("site") or "").strip()
+        part_number = part_number or str(source_data.get("sku") or "").strip()
+        if not supplier or not part_number:
+            missing = " and ".join(
+                name for name, value in (
+                    ("supplier", supplier), ("part_number", part_number)
+                ) if not value)
+            return _err(f"vendor_part_register needs {missing}.",
+                        "Pass them explicitly, or provide artifact_path for a matching "
+                        "done queue job whose spec_data contains site and sku.")
+
+        raw_price = source_data.get("price")
+        price_unparsed = None
+        if "unit_price" in mapped:
+            value = mapped["unit_price"]
+            try:
+                if isinstance(value, bool):
+                    raise ValueError
+                unit_price = float(value)
+                if not math.isfinite(unit_price) or unit_price < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return _err("unit_price must be a finite non-negative number.",
+                            "For an ambiguous scraped display price, omit unit_price; "
+                            "the tool will preserve it as price_unparsed instead.")
+        else:
+            unit_price = _parse_scraped_unit_price(raw_price)
+            if raw_price not in (None, "") and unit_price is None:
+                price_unparsed = raw_price
+
+        specs = mapped.get("specs")
+        if specs is not None:
+            specs, specs_error = _parse_json_dict(specs, "specs")
+            if specs_error:
+                return _err(specs_error)
+
+        fetched_ts = _epoch_seconds(source_data.get("fetched_ts"))
+        provenance = {"method": "cef_browser_scrape", "scraped": True}
+        for key in ("source_url", "session_profile_used", "license_note"):
+            if source_data.get(key) not in (None, ""):
+                provenance[key] = source_data[key]
+
+        params = {
+            "supplier": supplier,
+            "part_number": part_number,
+            "source": "browser_scrape",
+            "unit_price": unit_price,
+            "currency": str(mapped.get("currency", "USD") or "USD").strip().upper(),
+            "fetched_ts": fetched_ts,
+            "provenance": provenance,
+        }
+        description = mapped.get("description", source_data.get("title"))
+        product_url = mapped.get("product_url", source_data.get("source_url"))
+        if description not in (None, ""):
+            params["description"] = description
+        if product_url not in (None, ""):
+            params["product_url"] = product_url
+        if specs is not None:
+            params["specs"] = specs
+        for key in ("price_breaks", "stock", "lead_time_days", "moq"):
+            if key in mapped:
+                params[key] = mapped[key]
+
+        try:
+            from . import core_bridge as cb
+            core_reply = cb.call("vendor_part_register", params)
+            result = (dict(core_reply) if isinstance(core_reply, dict)
+                      else {"ok": False,
+                            "error": f"unexpected core reply: {core_reply!r}"})
+        except Exception as exc:  # noqa: BLE001
+            result = {
+                "ok": False,
+                "reason": f"vendor_part_register failed: {exc}",
+                "hint": "Ensure the native core exposes vendor_part_register.",
+            }
+        if price_unparsed is not None:
+            result["price_unparsed"] = price_unparsed
+            result["hint"] = (
+                "The scraped display price was ambiguous and was not registered as "
+                "unit_price; pass unit_price= explicitly after verifying the unit.")
+        if notes:
+            result["interpreted"] = _interpreted_notes(notes)
+        if result.get("ok"):
+            result["note"] = (
+                f"Scraped price data fetched at {fetched_ts} is not a vendor quote; "
+                f"bom_price will now resolve it for {supplier} + {part_number}.")
+        return json.dumps(result, ensure_ascii=False)

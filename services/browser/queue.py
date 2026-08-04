@@ -210,13 +210,12 @@ def _run_job(job: ScrapeJob) -> None:
         if result.get("ok"):
             job.artifact_path = result.get("artifact_path", "")
             job.status = JobStatus.DONE
-            # Capture spec metadata from the provenance envelope for GUI display.
-            # All non-plumbing keys (ok, source_url, fetched_ts, session_profile_used,
-            # license_note, artifact_path) are considered "vendor extras" (sku, price,
-            # title, asin, lcsc, etc.) and collected into spec_data.
-            _SKIP_KEYS = {"ok", "session_profile_used", "license_note"}
+            # Preserve the full acquisition provenance (except the success flag)
+            # alongside vendor extras so downstream imports and pricing registration
+            # can stamp the exact source, browser profile, licence, and fetch time.
             job.spec_data = {k: v for k, v in result.items()
-                             if k not in _SKIP_KEYS and v is not None}
+                             if k != "ok" and v is not None}
+            job.spec_data.setdefault("site", job.site)
             return
         else:
             job.error = result.get("hint", result.get("reason", "acquire failed"))

@@ -679,26 +679,26 @@ json provider_fetch(const std::string& supplier, const std::string& part_number,
                 "'parts_providers.mcmaster' section to %APPDATA%/Chudware/config.json with "
                 "'enabled': true, 'api_url', 'username', 'password', and 'client_cert' "
                 "(see docs/PARTS_LIBRARY.md). Until then, download the CAD for '" + mpn +
-                "' from mcmaster.com and register it with vendor_part_register_local_cad.");
+                "' from mcmaster.com and register it with vendor_part_register.");
         throw ProviderError(
             "McMaster-Carr API adapter is not wired yet. Credentials are configured, but the "
             "approved Product Information API call must be implemented before automated fetch "
             "can run. Download the CAD manually and register it with "
-            "vendor_part_register_local_cad, or wait for the API adapter.");
+            "vendor_part_register, or wait for the API adapter.");
     }
     if (key == "grabcad" || key == "traceparts") {
         const std::string display = key == "grabcad" ? "GrabCAD" : "TraceParts";
         throw ProviderError(
             display + " provider is not yet configured. No website scraping is performed. "
             "Download the CAD for '" + mpn + "' from " + display +
-            " and register it with vendor_part_register_local_cad, or wire an approved API "
+            " and register it with vendor_part_register, or wire an approved API "
             "adapter. See docs/PARTS_LIBRARY.md.");
     }
     throw ProviderError(
         "no provider for supplier '" + supplier +
         "'. Known providers: digikey, grabcad, mcmaster, mouser, nexar, traceparts. "
         "For unsupported suppliers, register a downloaded CAD file with "
-        "vendor_part_register_local_cad.");
+        "vendor_part_register.");
 }
 
 }  // namespace sourcing

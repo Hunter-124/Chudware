@@ -482,12 +482,17 @@ json register_from_spec_sheet(const json& dims, const std::string& tmpl,
     // Register the built model as a source="spec_sheet" VendorPart (vendor registry).
     json specs = numeric;
     specs["template"] = tmpl;
+    json fields = {
+        {"cad_path", model_path},
+        {"description", description.empty() ? preview.substr(0, preview.find('\n'))
+                                             : description},
+        {"product_url", ""},
+        {"specs", specs},
+        {"source", "spec_sheet"},
+    };
     json rec;
     try {
-        rec = register_local_cad("spec_sheet", mpn, model_path,
-                                 description.empty() ? preview.substr(0, preview.find('\n'))
-                                                     : description,
-                                 "", specs, "spec_sheet");
+        rec = register_local_cad("spec_sheet", mpn, fields);
     } catch (const std::exception& e) {
         out["reason"] = std::string("vendor registration failed: ") + e.what();
         return out;

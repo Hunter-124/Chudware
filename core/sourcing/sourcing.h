@@ -156,13 +156,15 @@ json load_config();  // {} on any read/parse failure (never hard-fails)
 // ---- vendor registry (engine_oracle/vendor_parts.py) -------------------------------------------
 // %APPDATA%/Chudware/vendor_parts (mirror of engine/paths.py::VENDOR_PARTS).
 std::string vendor_parts_dir();
-// Register a local CAD file in the vendor-parts index (port of register_local_cad with
-// copy_file=True): copies the file under vendor_parts/<slug>/<slug>/, writes the record
-// into index.json, returns the asdict-shaped record. Throws on a missing CAD file.
+// Upsert a vendor-parts index record. `fields` accepts every optional key in the
+// vendor_part_register contract (cad_path, description, product_url, specs, source,
+// unit_price, currency, price_breaks, stock, lead_time_days, moq, fetched_ts,
+// provenance). Supplied keys overwrite; omitted keys keep the existing record's value.
 json register_local_cad(const std::string& supplier, const std::string& part_number,
-                        const std::string& cad_path, const std::string& description,
-                        const std::string& product_url, const json& specs,
-                        const std::string& source);
+                        const json& fields);
+// Resolve a component against a parsed vendor-parts index using the registry's
+// supplier-qualified key convention and deterministic part-number fallback.
+json vendor_index_lookup(const json& index, const json& component);
 
 // ---- single dispatch entry --------------------------------------------------------------------
 // Worker-method surface: bom_rollup, bom_price, request_quote, match_part_number,

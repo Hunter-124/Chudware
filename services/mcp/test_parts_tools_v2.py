@@ -370,12 +370,218 @@ class TestRegistration:
                      "vendors_health", "cam_tool_import", "part_get",
                      "part_place", "vendor_status", "vendor_login",
                      "match_model", "reverse_engineer_product",
-                     "scrape_enqueue", "scrape_queue_status", "import_artifact"):
+                     "scrape_enqueue", "scrape_queue_status", "import_artifact",
+                     "vendor_part_register"):
             assert name in m.tools, name
         out = json.loads(m.tools["parts_taxonomy"]())
         assert out["ok"] is True
         out = json.loads(m.tools["part_search"]("bearing", facets='{"bore_mm": 12}'))
         assert out["ok"] is True and out["count"] == 1
+
+
+@pytest.fixture()
+def registered_parts_tools():
+    mcp = _FakeMCP()
+    pt.register_parts_tools(mcp)
+    return mcp.tools
+
+
+def _queue_job(artifact_path: str, **spec_data) -> dict:
+    return {
+        "ok": True,
+        "jobs": [{
+            "id": "job-vendor-1",
+            "site": "mcmaster",
+            "query": "socket head screw",
+            "status": "done",
+            "artifact_path": artifact_path,
+            "spec_data": spec_data,
+        }],
+    }
+
+
+class TestVendorAcquisitionBridge:
+    def test_import_resolves_done_queue_source_and_stamps_doc(
+            self, monkeypatch, tmp_path, registered_parts_tools):
+        artifact = tmp_path / "part.step"
+        artifact.write_text("STEP")
+        queued_path = tmp_path / "queued.step"
+        queued_path.symlink_to(artifact)
+
+        from services.browser import queue
+        monkeypatch.setattr(queue, "queue_status", lambda: _queue_job(
+            str(queued_path), sku="91290A115",
+            source_url="https://www.mcmaster.com/91290A115/",
+            fetched_ts="2026-08-03T12:00:00Z"))
+        calls = []
+
+        from services.mcp import core_bridge as cb
+
+        def _call(method, params):
+            calls.append((method, params))
+            if method == "part_import_file":
+                return {"ok": True, "doc_id": "doc-import-1"}
+            if method == "doc_set_meta":
+                return {"ok": True, "key": "vendor_source"}
+            raise AssertionError(f"unexpected rpc {method}")
+
+        monkeypatch.setattr(cb, "call", _call)
+        out = json.loads(registered_parts_tools["import_artifact"](
+            artifact_path=str(artifact)))
+
+        assert out["ok"] is True
+        metadata_calls = [params for method, params in calls
+                          if method == "doc_set_meta"]
+        assert len(metadata_calls) == 1
+        assert metadata_calls[0]["key"] == "vendor_source"
+        assert metadata_calls[0]["value"]["sku"] == "91290A115"
+        assert (metadata_calls[0]["value"]["source_url"]
+                == "https://www.mcmaster.com/91290A115/")
+        assert out["vendor_source"] == metadata_calls[0]["value"]
+
+    def test_import_without_matching_job_skips_metadata(
+            self, monkeypatch, tmp_path, registered_parts_tools):
+        artifact = tmp_path / "part.step"
+        artifact.write_text("STEP")
+        from services.browser import queue
+        monkeypatch.setattr(queue, "queue_status", lambda: _queue_job(
+            str(tmp_path / "different.step"), sku="OTHER"))
+        calls = []
+
+        from services.mcp import core_bridge as cb
+
+        def _call(method, params):
+            calls.append((method, params))
+            return {"ok": True, "doc_id": "doc-import-2"}
+
+        monkeypatch.setattr(cb, "call", _call)
+        out = json.loads(registered_parts_tools["import_artifact"](
+            artifact_path=str(artifact)))
+
+        assert out["ok"] is True
+        assert [method for method, _ in calls] == ["part_import_file"]
+        assert "vendor_source" not in out
+
+    def test_metadata_failure_warns_but_preserves_import_success(
+            self, monkeypatch, tmp_path, registered_parts_tools):
+        artifact = tmp_path / "part.step"
+        artifact.write_text("STEP")
+        from services.browser import queue
+        monkeypatch.setattr(queue, "queue_status", lambda: _queue_job(
+            str(artifact), sku="91290A115"))
+
+        from services.mcp import core_bridge as cb
+
+        def _call(method, params):
+            if method == "part_import_file":
+                return {"ok": True, "doc_id": "doc-import-3"}
+            if method == "doc_set_meta":
+                raise RuntimeError("metadata store unavailable")
+            raise AssertionError(f"unexpected rpc {method}")
+
+        monkeypatch.setattr(cb, "call", _call)
+        out = json.loads(registered_parts_tools["import_artifact"](
+            artifact_path=str(artifact)))
+
+        assert out["ok"] is True
+        assert "metadata store unavailable" in out["metadata_warning"]
+        assert "vendor_source" not in out
+
+    def test_vendor_register_parses_simple_scraped_price(
+            self, monkeypatch, tmp_path, registered_parts_tools):
+        artifact = tmp_path / "part.step"
+        from services.browser import queue
+        monkeypatch.setattr(queue, "queue_status", lambda: _queue_job(
+            str(artifact), site="mcmaster", sku="91290A115", price="$12.34",
+            source_url="https://www.mcmaster.com/91290A115/",
+            fetched_ts="2026-08-03T12:00:00Z"))
+        captured = {}
+
+        from services.mcp import core_bridge as cb
+
+        def _call(method, params):
+            assert method == "vendor_part_register"
+            captured.update(params)
+            return {"ok": True, "part": {"supplier": params["supplier"]}}
+
+        monkeypatch.setattr(cb, "call", _call)
+        out = json.loads(registered_parts_tools["vendor_part_register"](
+            artifact_path=str(artifact)))
+
+        assert out["ok"] is True
+        assert captured["unit_price"] == 12.34
+        assert captured["supplier"] == "mcmaster"
+        assert captured["part_number"] == "91290A115"
+
+    def test_vendor_register_does_not_invent_pack_unit_price(
+            self, monkeypatch, tmp_path, registered_parts_tools):
+        artifact = tmp_path / "part.step"
+        raw_price = "$10.00 / pack of 50"
+        from services.browser import queue
+        monkeypatch.setattr(queue, "queue_status", lambda: _queue_job(
+            str(artifact), site="mcmaster", sku="PACK-50", price=raw_price))
+        captured = {}
+
+        from services.mcp import core_bridge as cb
+
+        def _call(method, params):
+            captured.update(params)
+            return {"ok": True, "part": {}}
+
+        monkeypatch.setattr(cb, "call", _call)
+        out = json.loads(registered_parts_tools["vendor_part_register"](
+            artifact_path=str(artifact)))
+
+        assert captured["unit_price"] is None
+        assert out["price_unparsed"] == raw_price
+        assert "pass unit_price=" in out["hint"]
+
+    def test_vendor_register_passes_scrape_provenance_and_fetch_epoch(
+            self, monkeypatch, tmp_path, registered_parts_tools):
+        artifact = tmp_path / "part.step"
+        from services.browser import queue
+        monkeypatch.setattr(queue, "queue_status", lambda: _queue_job(
+            str(artifact), site="mcmaster", sku="91290A115", price="$12.34",
+            source_url="https://www.mcmaster.com/91290A115/",
+            session_profile_used="mcmaster-profile",
+            license_note="User obtained under McMaster terms.",
+            fetched_ts="2026-08-03T12:00:00Z"))
+        captured = {}
+
+        from services.mcp import core_bridge as cb
+
+        def _call(method, params):
+            captured.update(params)
+            return {"ok": True, "part": {}}
+
+        monkeypatch.setattr(cb, "call", _call)
+        out = json.loads(registered_parts_tools["vendor_part_register"](
+            artifact_path=str(artifact)))
+
+        assert out["ok"] is True
+        assert captured["provenance"] == {
+            "method": "cef_browser_scrape",
+            "scraped": True,
+            "source_url": "https://www.mcmaster.com/91290A115/",
+            "session_profile_used": "mcmaster-profile",
+            "license_note": "User obtained under McMaster terms.",
+        }
+        assert isinstance(captured["fetched_ts"], float)
+        assert captured["fetched_ts"] == 1785758400.0
+
+    def test_vendor_register_missing_core_rpc_degrades_to_error_envelope(
+            self, monkeypatch, registered_parts_tools):
+        from services.mcp import core_bridge as cb
+
+        def _call(method, params):
+            raise RuntimeError("unknown method vendor_part_register")
+
+        monkeypatch.setattr(cb, "call", _call)
+        out = json.loads(registered_parts_tools["vendor_part_register"](
+            supplier="mcmaster", part_number="91290A115", unit_price=12.34))
+
+        assert out["ok"] is False
+        assert "unknown method vendor_part_register" in out["reason"]
 
 
 # ---------------------------------------------------------------------------

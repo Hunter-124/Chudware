@@ -1016,12 +1016,8 @@ static chudware::sourcing::Seams build_sourcing_seams() {
             const fs::path idx = fs::path(chudware::sourcing::vendor_parts_dir()) / "index.json";
             if (!fs::exists(idx)) return json();
             std::ifstream in(idx);
-            json index = json::parse(in);
-            std::string mpn = component.value("mpn", std::string());
-            if (mpn.empty()) mpn = component.value("part_number", std::string());
-            if (mpn.empty()) return json();
-            auto it = index.find(chudware::sourcing::vendor_slug(mpn));
-            return it != index.end() ? *it : json();
+            const json index = json::parse(in);
+            return chudware::sourcing::vendor_index_lookup(index, component);
         } catch (...) {
             return json();
         }

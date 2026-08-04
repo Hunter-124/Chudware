@@ -586,7 +586,7 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
                             job->errorIsCad = (sr == "failed" || sr == "model_failed" ||
                                               sr == "no_geometry" || sr == "no_code" ||
                                               sr == "max_iters" || sr == "decompose_failed" ||
-                                              sr == "budget_exceeded" || sr.empty());
+                                              sr.empty());
                         }
                     }
                     job->missionVerdict = result.value("verdict", std::string());

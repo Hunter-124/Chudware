@@ -1857,7 +1857,6 @@ void submitTurn(AppState& st, const std::string& text) {
             {"org", "eng_firm"},
             {"corporate_force", true},
             {"execute_as", "eng_firm"},
-            {"budget_usd", st.settings.companyBudgetUsd},
             {"advisor", true}});
         bool needFresh = true;
         if (st.docMirror.hasDoc()) {

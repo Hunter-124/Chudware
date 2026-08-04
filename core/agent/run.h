@@ -58,7 +58,6 @@ using EmitFn = std::function<void(const json&)>;
 //                advisor?,         // bool, default true — advisory inject + plan review
 //                advisory_text?,   // optional pre-seeded advisory block
 //                execution_style?, // "edit"|"swarm"|"eng_firm" (overrides recommend_structure)
-//                budget_usd?,      // eng_firm spend ceiling (default = firm_bid estimate)
 //                run_depth?,       // nested sub-run depth (delegate / swarm unit)
 //                is_sub_run?,      // true inside nested units (disables further delegate)
 //                firm_role_seed?   // specialist prompt prefix for eng_firm sub-runs

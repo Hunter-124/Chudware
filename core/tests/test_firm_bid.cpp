@@ -21,17 +21,12 @@ TEST_CASE("estimate is deterministic") {
     CHECK(a.total_tokens == b.total_tokens);
 }
 
-TEST_CASE("tokens_to_usd is linear and clamps negatives") {
-    CHECK(tokens_to_usd(1000, 3.0) == doctest::Approx(3.0));
-    CHECK(tokens_to_usd(500, 2.0) == doctest::Approx(1.0));
-    CHECK(tokens_to_usd(1000, -1.0) == doctest::Approx(0.0));
-}
 
 TEST_CASE("specialist in-domain underbids generalists") {
     // For an ECAD task, the Circuit Labs specialist should bid fewer tokens than the
     // generalist firms (which pay a spread-thin penalty off their native domain).
-    auto bids = collect_bids("route a PCB for an ESP32", Complexity::Standard, Domain::Ecad,
-                             /*usd_per_1k=*/3.0, /*budget_usd=*/1000.0);
+    auto bids =
+        collect_bids("route a PCB for an ESP32", Complexity::Standard, Domain::Ecad);
     REQUIRE(!bids.empty());
     // Cheapest in-scope bid should be the ECAD specialist.
     CHECK(bids.front().in_scope);
@@ -46,17 +41,6 @@ TEST_CASE("specialist in-domain underbids generalists") {
     CHECK(specialist < generalist);
 }
 
-TEST_CASE("budget ceiling flags over-budget bids") {
-    auto bids = collect_bids("a two-stage planetary gearbox assembly", Complexity::Complex,
-                             Domain::Assembly, /*usd_per_1k=*/3.0, /*budget_usd=*/0.01);
-    // A $0.01 ceiling can't cover a complex job -> every bid is over budget.
-    for (const auto& b : bids) CHECK_FALSE(b.within_budget);
-
-    // Unlimited budget (0) -> all in-scope bids are within budget.
-    auto unl = collect_bids("a two-stage planetary gearbox assembly", Complexity::Complex,
-                            Domain::Assembly, 3.0, /*budget_usd=*/0.0);
-    for (const auto& b : unl) CHECK(b.within_budget);
-}
 
 TEST_CASE("roster covers every domain with a specialist") {
     const auto& roster = firm_roster();

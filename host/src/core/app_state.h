@@ -135,9 +135,6 @@ struct Settings {
     // Copilot composer mode: Agent | Plan | Swarm | Edit | Ask. Persisted as "copilot_mode".
     // Values match AppState::aiInteraction / CopilotMode.
     int copilotMode = 0;         // 0=Agent 1=Plan 2=Swarm 3=Edit 4=Ask 5=EngFirm
-    // Eng. Firm mode: max spend (USD) the orchestrator/firms must complete the job within.
-    // Contractor firms bid in predicted tokens, converted to $, against this ceiling.
-    double companyBudgetUsd = 25.0;
     int maxIters = 0;            // refine-pass cap per turn; 0 = automatic
     int maxTokens = 0;           // max output tokens per model call; 0 = automatic (per-provider
                                  // default). Raise this if a reasoning model returns "no JSON ops"

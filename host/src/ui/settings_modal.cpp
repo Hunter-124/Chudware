@@ -3645,19 +3645,6 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
         }
 
-        ImGui::TableNextColumn();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Eng. Firm budget (USD)");
-        ImGui::SameLine();
-        helpMarker("Used when the composer is in Eng. Firm mode.");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(-1.0f);
-        double b = settings.companyBudgetUsd;
-        if (ImGui::InputDouble("##h_engfirmbudget", &b, 5.0, 25.0, "$%.2f")) {
-            if (b < 0.0) b = 0.0;
-            settings.companyBudgetUsd = b;
-            changed = true;
-        }
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();  // CellPadding

@@ -4064,74 +4064,40 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     }
 
     // ---- Eng. Firm: firm_bids + firm_team telemetry (roster once) ----
-    // Mission-level award is FIRM SELECTION only (telemetry + default lead).
-    // It does NOT reserve/debit budget. spent_usd accumulates only when a task
-    // is actually awarded and executed; per-task remaining = budget - spent.
+    // Mission-level award is firm selection telemetry plus the default task lead.
     std::vector<TeamMember> firm_team_members;
     std::string awarded_firm_id, awarded_firm_name;
-    double awarded_usd = 0.0;  // selection telemetry; NEVER added to spent_usd
-    double budget_usd = options.value("budget_usd", 0.0);
-    const double usd_per_1k = options.value("usd_per_1k", 3.0);
+    long awarded_tokens = 0;
     json firm_ledger = json::array();  // in-memory per-run ledger
-    double spent_usd = 0.0;            // actual task spend only; starts at 0
 
     if (eng_firm_mode) {
-        // Default budget from firm_bid estimate when host did not set one.
-        if (budget_usd <= 0.0) {
-            auto est = estimate_task_tokens(request, mcx.level, mdom.domain);
-            budget_usd = tokens_to_usd(est.total_tokens, usd_per_1k);
-        }
-        std::vector<Bid> bids =
-            collect_bids(request, mcx.level, mdom.domain, usd_per_1k, budget_usd);
+        std::vector<Bid> bids = collect_bids(request, mcx.level, mdom.domain);
         json jbids = json::array();
         for (const auto& b : bids) {
             jbids.push_back(json{{"firm_id", b.firm_id},
                                  {"firm", b.firm_name},
                                  {"in_scope", b.in_scope},
-                                 {"tokens", b.tokens},
-                                 {"usd", b.usd},
-                                 {"within_budget", b.within_budget}});
-            // Cheapest in-scope within TOTAL budget wins selection (not spend).
-            if (awarded_firm_id.empty() && b.in_scope && b.within_budget) {
+                                 {"tokens", b.tokens}});
+            // Bids are sorted cheapest-first with in-scope firms first.
+            if (awarded_firm_id.empty() && b.in_scope) {
                 awarded_firm_id = b.firm_id;
                 awarded_firm_name = b.firm_name;
-                awarded_usd = b.usd;
+                awarded_tokens = b.tokens;
             }
+        }
+        // The static roster contains generalists, but preserve a deterministic
+        // selection if that invariant is ever broken.
+        if (awarded_firm_id.empty() && !bids.empty()) {
+            awarded_firm_id = bids.front().firm_id;
+            awarded_firm_name = bids.front().firm_name;
+            awarded_tokens = bids.front().tokens;
         }
         events.emit("firm_bids", json{{"domain", mdom.label()},
                                       {"complexity", mcx.label()},
-                                      {"budget_usd", budget_usd},
-                                      {"usd_per_1k", usd_per_1k},
                                       {"bids", jbids},
                                       {"awarded_firm_id", awarded_firm_id},
                                       {"awarded_firm", awarded_firm_name},
-                                      {"awarded_usd", awarded_usd}});
-        // No affordable firm → abort BEFORE executing any task.
-        if (awarded_firm_id.empty()) {
-            events.emit("run_note",
-                        json{{"note", "no firm within budget"},
-                             {"budget_usd", budget_usd},
-                             {"spent_usd", 0.0}});
-            events.emit("mission_finished",
-                        json{{"status", "failed"},
-                             {"stop_reason", "budget_exceeded"},
-                             {"doc_id", doc_id},
-                             {"verdict", ""},
-                             {"execution_style", execution_style},
-                             {"spent_usd", 0.0},
-                             {"budget_usd", budget_usd}});
-            return json{{"run_id", run_id},
-                        {"status", "failed"},
-                        {"stop_reason", "budget_exceeded"},
-                        {"doc_id", doc_id},
-                        {"revision", 0},
-                        {"verdict", ""},
-                        {"tasks", json::array()},
-                        {"execution_style", execution_style},
-                        {"spent_usd", 0.0},
-                        {"budget_usd", budget_usd},
-                        {"firm_ledger", firm_ledger}};
-        }
+                                      {"awarded_tokens", awarded_tokens}});
         firm_team_members = assemble_team(request, mdom.domain);
         json jteam = json::array();
         for (const auto& tm : firm_team_members)
@@ -4249,7 +4215,6 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     bool any_built = false;
     bool any_ok = false;
     bool reported = false;
-    bool budget_exceeded = false;
     // First real failure cause from a unit (provider_error / no_geometry / …).
     // Used so mission_finished never returns opaque stop_reason="planned".
     std::string first_fail_reason;
@@ -4274,17 +4239,6 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
 
     auto run_one_task = [&](size_t i) -> void {
         if (run_ctl.cancelled()) { task_status[i] = "skipped"; return; }
-        if (budget_exceeded) {
-            task_status[i] = "abandoned";
-            set_task_plan_status(i, "abandoned", "budget_exceeded");
-            task_results.push_back(json{{"capability", tasks[i].capability},
-                                        {"title", tasks[i].title},
-                                        {"id", tasks[i].id},
-                                        {"status", "abandoned"},
-                                        {"doc_id", current_doc},
-                                        {"summary", "budget_exceeded"}});
-            return;
-        }
         const Task& tk = tasks[i];
         std::string target_doc = (tk.target == "active") ? doc_id : current_doc;
         events.emit("mission_task_started",
@@ -4297,75 +4251,53 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         set_task_plan_status(i, "running", "");
 
         // Eng-firm per-task bid/award + team seeds + ledger.
-        // remaining = TOTAL budget minus ACTUAL prior task spend (not mission selection).
         std::string firm_role_seed;
-        double task_bid_usd = 0.0;
+        long task_bid_tokens = 0;
         // Per-task provider override (eng_firm models). Defaults to ambient.
         json task_provider_cfg = provider_cfg;
         if (eng_firm_mode) {
             ComplexityVerdict tcx = classify_complexity(tk.req);
             DomainVerdict tdom = classify_domain(tk.req);
-            const double remaining = budget_usd - spent_usd;
-            // Ceiling for collect_bids is remaining actual budget (spent starts 0).
-            std::vector<Bid> tbids =
-                collect_bids(tk.req, tcx.level, tdom.domain, usd_per_1k, remaining);
+            std::vector<Bid> tbids = collect_bids(tk.req, tcx.level, tdom.domain);
             std::string win_id, win_name;
-            double win_usd = 0.0;
-            bool awarded = false;
-            // Prefer the mission-selected firm when their bid fits remaining —
-            // even if task-domain reclassification dropped them out of scope.
-            // Mission selection already cleared the TOTAL budget gate.
+            long win_tokens = 0;
+            std::string award_reason;
+            // Prefer the mission-selected firm even if task-domain reclassification
+            // dropped it out of scope.
             if (!awarded_firm_id.empty()) {
                 for (const auto& b : tbids) {
                     if (b.firm_id != awarded_firm_id) continue;
-                    if (b.usd <= remaining + 1e-9) {
-                        win_id = b.firm_id;
-                        win_name = b.firm_name.empty() ? awarded_firm_name : b.firm_name;
-                        win_usd = b.usd;
-                        awarded = true;
-                    }
+                    win_id = b.firm_id;
+                    win_name = b.firm_name.empty() ? awarded_firm_name : b.firm_name;
+                    win_tokens = b.tokens;
+                    award_reason = "mission-selected firm";
                     break;
                 }
             }
-            // Else: cheapest in-scope bid within remaining budget.
-            if (!awarded) {
+            // Otherwise use the cheapest in-scope estimated-token bid.
+            if (win_id.empty()) {
                 for (const auto& b : tbids) {
-                    if (b.in_scope && b.within_budget) {
-                        win_id = b.firm_id;
-                        win_name = b.firm_name;
-                        win_usd = b.usd;
-                        awarded = true;
-                        break;
-                    }
+                    if (!b.in_scope) continue;
+                    win_id = b.firm_id;
+                    win_name = b.firm_name;
+                    win_tokens = b.tokens;
+                    award_reason = "lowest in-scope estimated-token bid";
+                    break;
                 }
             }
-            if (!awarded) {
-                // No affordable firm for this task against remaining actual budget.
-                budget_exceeded = true;
-                task_status[i] = "abandoned";
-                set_task_plan_status(i, "abandoned", "budget_exceeded");
-                events.emit("run_note",
-                            json{{"note", "no firm within remaining budget"},
-                                 {"task_id", tk.id},
-                                 {"remaining_usd", remaining},
-                                 {"budget_usd", budget_usd},
-                                 {"spent_usd", spent_usd}});
-                task_results.push_back(json{{"capability", tk.capability},
-                                            {"title", tk.title},
-                                            {"id", tk.id},
-                                            {"status", "abandoned"},
-                                            {"doc_id", current_doc},
-                                            {"summary", "budget_exceeded"}});
-                return;
+            if (win_id.empty() && !tbids.empty()) {
+                win_id = tbids.front().firm_id;
+                win_name = tbids.front().firm_name;
+                win_tokens = tbids.front().tokens;
+                award_reason = "first available estimated-token bid";
             }
             if (win_name.empty()) win_name = awarded_firm_name;
-            if (win_name.empty() && win_id == awarded_firm_id) win_name = awarded_firm_name;
-            task_bid_usd = win_usd;
+            task_bid_tokens = win_tokens;
             events.emit("firm_award", json{{"kind", "firm_award"},
                                            {"firm", win_name},
                                            {"firm_id", win_id},
-                                           {"bid_usd", win_usd},
-                                           {"reason", "lowest in-scope bid within remaining budget"},
+                                           {"tokens", win_tokens},
+                                           {"reason", award_reason},
                                            {"task_id", tk.id},
                                            {"title", tk.title}});
             // firm:-namespaced plan_state item for the award.
@@ -4676,11 +4608,10 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         }
 
         if (eng_firm_mode) {
-            spent_usd += task_bid_usd;
             firm_ledger.push_back(json{{"task_id", tk.id},
                                        {"title", tk.title},
                                        {"status", status},
-                                       {"bid_usd", task_bid_usd},
+                                       {"tokens", task_bid_tokens},
                                        {"summary", summary}});
             events.emit("firm_comm",
                         json{{"kind", "firm_comm"},
@@ -4698,13 +4629,6 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                                           {"kind", "task"}});
                 emit_plan_state(events, "checklist", "Firm awards", "", mission_plan_rev + 1000,
                                 firm_items);
-            }
-            if (budget_usd > 0.0 && spent_usd > budget_usd + 1e-9) {
-                budget_exceeded = true;
-                events.emit("run_note",
-                            json{{"note", "budget_exceeded"},
-                                 {"spent_usd", spent_usd},
-                                 {"budget_usd", budget_usd}});
             }
         }
 
@@ -4735,7 +4659,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     // Drive waves.
     const int total_waves = static_cast<int>(waves.size());
     for (int wi = 0; wi < total_waves; ++wi) {
-        if (budget_exceeded || run_ctl.cancelled()) break;
+        if (run_ctl.cancelled()) break;
         const auto& wave = waves[wi];
         if (swarm_mode) {
             json wave_tasks = json::array();
@@ -4751,7 +4675,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         }
         // Sequential units within the wave (v1).
         for (size_t idx : wave) {
-            if (budget_exceeded || run_ctl.cancelled()) break;
+            if (run_ctl.cancelled()) break;
             run_one_task(idx);
             // Update swarm_wave task status after each unit.
             if (swarm_mode) {
@@ -4808,14 +4732,6 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         // in cancel_run); remaining tasks were skipped above. Report honestly.
         status = "cancelled";
         stop_reason = "cancelled";
-    } else if (budget_exceeded && !any_built && !any_ok) {
-        // Pure budget abort with no usable work.
-        status = "failed";
-        stop_reason = "budget_exceeded";
-    } else if (budget_exceeded && (any_built || any_ok)) {
-        // Some units finished before the budget wall — preserve work as partial.
-        status = "partial";
-        stop_reason = "budget_exceeded";
     } else if (any_failed && (any_built || any_ok || tasks_completed > 0)) {
         // Mixed outcomes: keep completed geometry, surface the first unit failure.
         // e.g. u1 design done + u2 assembly model_failed → partial / model_failed
@@ -4839,8 +4755,6 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                     {"doc_id", final_doc},
                     {"verdict", verdict},
                     {"execution_style", execution_style},
-                    {"spent_usd", spent_usd},
-                    {"budget_usd", budget_usd},
                     {"tasks_completed", tasks_completed},
                     {"tasks_failed", tasks_failed},
                     {"tasks_abandoned", tasks_abandoned}};
@@ -4868,11 +4782,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         result["components"] = components;
     }
     if (!re_report.empty()) result["reverse_engineer"] = re_report;
-    if (eng_firm_mode) {
-        result["spent_usd"] = spent_usd;
-        result["budget_usd"] = budget_usd;
-        result["firm_ledger"] = firm_ledger;
-    }
+    if (eng_firm_mode) result["firm_ledger"] = firm_ledger;
     return result;
 }
 

@@ -65,10 +65,6 @@ TokenEstimate estimate_task_tokens(const std::string& request, Complexity cx, Do
     return e;
 }
 
-double tokens_to_usd(long tokens, double usd_per_1k) {
-    if (usd_per_1k < 0.0) usd_per_1k = 0.0;
-    return (static_cast<double>(tokens) / 1000.0) * usd_per_1k;
-}
 
 const std::vector<Firm>& firm_roster() {
     // Specialists are leaner (efficiency < 1) IN their domain; generalists take any
@@ -88,8 +84,7 @@ const std::vector<Firm>& firm_roster() {
     return kRoster;
 }
 
-std::vector<Bid> collect_bids(const std::string& request, Complexity cx, Domain dom,
-                              double usd_per_1k, double budget_usd) {
+std::vector<Bid> collect_bids(const std::string& request, Complexity cx, Domain dom) {
     const TokenEstimate base = estimate_task_tokens(request, cx, dom);
     std::vector<Bid> bids;
     for (const Firm& f : firm_roster()) {
@@ -103,8 +98,6 @@ std::vector<Bid> collect_bids(const std::string& request, Complexity cx, Domain 
         double eff = f.efficiency;
         if (f.generalist && dom != f.specialty) eff *= 1.15;
         b.tokens = static_cast<long>(base.total_tokens * eff);
-        b.usd = tokens_to_usd(b.tokens, usd_per_1k);
-        b.within_budget = (budget_usd <= 0.0) || (b.usd <= budget_usd);
         bids.push_back(b);
     }
     // Cheapest in-scope first; out-of-scope sink to the bottom.

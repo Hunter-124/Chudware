@@ -556,7 +556,6 @@ void loadSettings(Settings& s) {
             if (cm < 0 || cm > 5) cm = 0;
             s.copilotMode = cm;
         }
-        s.companyBudgetUsd = j.value("company_budget_usd", 25.0);
         s.maxIters = j.value("max_iters", 0);
         s.maxTokens = j.value("max_output_tokens", 0);
         s.contextWindow = j.value("context_window", 0);
@@ -937,7 +936,6 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         if (cm < 0 || cm > 5) cm = 0;
         j["copilot_mode"] = kModeNames[cm];
     }
-    j["company_budget_usd"] = s.companyBudgetUsd;
     if (s.maxIters > 0) j["max_iters"] = s.maxIters;
     if (s.maxTokens > 0) j["max_output_tokens"] = s.maxTokens;
     if (s.contextWindow > 0) j["context_window"] = s.contextWindow;

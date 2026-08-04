@@ -1213,7 +1213,6 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         opts["execute_as"] = "eng_firm";
         opts["org"] = "eng_firm";
         opts["corporate_force"] = true;
-        opts["budget_usd"] = st.settings.companyBudgetUsd;
     } else if (asSwarm) {
         opts["mode"] = "swarm";
         opts["execute_as"] = "swarm";
@@ -1829,35 +1828,28 @@ void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts) {
                     if (!b.is_object()) continue;
                     std::string firm = jstr(b, "firm");
                     if (firm.empty()) continue;
-                    double usd = 0.0;
                     long tokens = 0;
-                    if (b.contains("usd") && b["usd"].is_number()) usd = b["usd"].get<double>();
                     if (b.contains("tokens") && b["tokens"].is_number_integer())
                         tokens = b["tokens"].get<long>();
                     else if (b.contains("tokens") && b["tokens"].is_number())
                         tokens = (long)b["tokens"].get<double>();
-                    bool inScope = true, within = true;
+                    bool inScope = true;
                     if (b.contains("in_scope") && b["in_scope"].is_boolean())
                         inScope = b["in_scope"].get<bool>();
-                    if (b.contains("within_budget") && b["within_budget"].is_boolean())
-                        within = b["within_budget"].get<bool>();
                     char line[256];
-                    if (tokens > 0 && usd > 0.0)
-                        std::snprintf(line, sizeof(line), "  %s  \xc2\xb7 %ld tok  \xc2\xb7 $%.2f",
-                                      firm.c_str(), tokens, usd);
-                    else if (usd > 0.0)
-                        std::snprintf(line, sizeof(line), "  %s  \xc2\xb7 $%.2f", firm.c_str(), usd);
+                    if (tokens > 0)
+                        std::snprintf(line, sizeof(line), "  %s  \xc2\xb7 %ld estimated tokens",
+                                      firm.c_str(), tokens);
                     else
                         std::snprintf(line, sizeof(line), "  %s", firm.c_str());
-                    ImVec4 col = surf.textPrimary;
-                    if (!inScope || !within) col = surf.textTertiary;
+                    ImVec4 col = inScope ? surf.textPrimary : surf.textTertiary;
                     ImGui::PushStyleColor(ImGuiCol_Text, col);
                     ImGui::TextUnformatted(line);
                     ImGui::PopStyleColor();
-                    if (!inScope || !within) {
+                    if (!inScope) {
                         ImGui::SameLine(0, 6 * sc);
                         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-                        ImGui::TextUnformatted(!inScope ? "out of scope" : "over budget");
+                        ImGui::TextUnformatted("out of scope");
                         ImGui::PopStyleColor();
                     }
                 }
@@ -1865,12 +1857,15 @@ void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts) {
             // Awarded firm chip when packed on the same event.
             std::string awarded = jstr(j, "awarded_firm");
             if (!awarded.empty()) {
-                double ausd = 0.0;
-                if (j.contains("awarded_usd") && j["awarded_usd"].is_number())
-                    ausd = j["awarded_usd"].get<double>();
-                char aw[160];
-                if (ausd > 0.0)
-                    std::snprintf(aw, sizeof(aw), "Awarded %s  \xc2\xb7 $%.2f", awarded.c_str(), ausd);
+                long awardedTokens = 0;
+                if (j.contains("awarded_tokens") && j["awarded_tokens"].is_number_integer())
+                    awardedTokens = j["awarded_tokens"].get<long>();
+                else if (j.contains("awarded_tokens") && j["awarded_tokens"].is_number())
+                    awardedTokens = (long)j["awarded_tokens"].get<double>();
+                char aw[192];
+                if (awardedTokens > 0)
+                    std::snprintf(aw, sizeof(aw), "Awarded %s  \xc2\xb7 %ld estimated tokens",
+                                  awarded.c_str(), awardedTokens);
                 else
                     std::snprintf(aw, sizeof(aw), "Awarded %s", awarded.c_str());
                 ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
@@ -1896,10 +1891,11 @@ void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts) {
                 if (firm.empty()) continue;
                 copyTxt += "\n- ";
                 copyTxt += firm;
-                if (b.contains("usd") && b["usd"].is_number()) {
-                    char u[32];
-                    std::snprintf(u, sizeof(u), " $%.2f", b["usd"].get<double>());
-                    copyTxt += u;
+                if (b.contains("tokens") && b["tokens"].is_number()) {
+                    char estimate[48];
+                    std::snprintf(estimate, sizeof(estimate), " %ld estimated tokens",
+                                  (long)b["tokens"].get<double>());
+                    copyTxt += estimate;
                 }
             }
         }

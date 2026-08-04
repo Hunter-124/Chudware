@@ -1937,133 +1937,34 @@ TEST_CASE("swarm plan gate requires approved_plan or advisor path") {
     CHECK_FALSE(needs_gate("edit", false));
 }
 
-TEST_CASE("eng_firm budget filter excludes over-ceiling bids") {
-    // collect_bids marks within_budget; award eligibility is in_scope && within_budget.
-    // With a tiny budget every firm is over ceiling → no award candidate.
-    auto bids = collect_bids("two brackets that bolt together", Complexity::Complex,
-                             Domain::Assembly, /*usd_per_1k=*/3.0, /*budget_usd=*/5.0);
+TEST_CASE("eng_firm selects cheapest in-scope token bid") {
+    auto bids =
+        collect_bids("two brackets that bolt together", Complexity::Complex, Domain::Assembly);
     REQUIRE_FALSE(bids.empty());
     int in_scope = 0;
-    int affordable = 0;
     for (const auto& b : bids) {
         if (b.in_scope) ++in_scope;
-        if (b.in_scope && b.within_budget) ++affordable;
         // Every bid must carry a non-empty firm name (firm_award.firm source).
         CHECK_FALSE(b.firm_name.empty());
         CHECK_FALSE(b.firm_id.empty());
-        if (b.usd > 5.0 + 1e-9) CHECK_FALSE(b.within_budget);
+        CHECK(b.tokens > 0);
     }
     CHECK(in_scope > 0);
-    CHECK(affordable == 0);  // budget_usd=5 cannot cover any bid
 
-    // Award picker (mirrors run_mission eng_firm path): refuse when none affordable.
     auto pick_award = [](const std::vector<Bid>& bs) -> const Bid* {
         for (const auto& b : bs)
-            if (b.in_scope && b.within_budget) return &b;
-        return nullptr;
+            if (b.in_scope) return &b;
+        return bs.empty() ? nullptr : &bs.front();
     };
-    CHECK(pick_award(bids) == nullptr);
-
-    // Generous budget → cheapest in-scope wins, firm name populated.
-    auto rich = collect_bids("simple plate", Complexity::Solo, Domain::Modeling, 3.0, 1000.0);
-    const Bid* win = pick_award(rich);
+    const Bid* win = pick_award(bids);
     REQUIRE(win != nullptr);
-    CHECK(win->within_budget);
+    CHECK(win->in_scope);
     CHECK_FALSE(win->firm_name.empty());
-    // Sorted cheapest-first among in-scope.
-    for (const auto& b : rich) {
-        if (b.in_scope && b.within_budget) {
-            CHECK(win->usd <= b.usd + 1e-9);
-            break;
-        }
-    }
+    // Sorted cheapest-first among in-scope firms.
+    for (const auto& b : bids)
+        if (b.in_scope) CHECK(win->tokens <= b.tokens);
 }
 
-TEST_CASE("eng_firm budget_exceeded abort before overspend") {
-    // Per-task metering: remaining = total budget - actual spent (starts 0).
-    // Mission-level award is selection only — never pre-debits spent.
-    double budget = 10.0;
-    double spent = 0.0;  // selection awarded_usd is NOT seeded here
-    std::vector<double> bids = {4.0, 4.0, 4.0};  // third would exceed if awarded
-    int completed = 0;
-    int abandoned = 0;
-    bool exceeded = false;
-    auto try_award = [&](double bid_usd) -> bool {
-        // Filter: refuse award that would exceed remaining actual budget.
-        if (budget > 0.0 && spent + bid_usd > budget + 1e-9) return false;
-        spent += bid_usd;
-        return true;
-    };
-    for (double b : bids) {
-        if (exceeded) {
-            ++abandoned;
-            continue;
-        }
-        if (!try_award(b)) {
-            exceeded = true;
-            ++abandoned;
-            continue;
-        }
-        ++completed;
-    }
-    CHECK(exceeded);
-    CHECK(completed == 2);
-    CHECK(abandoned == 1);
-    CHECK(spent <= budget + 1e-9);
-}
-
-TEST_CASE("eng_firm single-task mission budget accounting") {
-    // Mission-level selection bid does NOT reserve budget. Per-task award checks
-    // the task estimate against remaining = budget - spent (spent starts 0).
-    // Single-task whose estimate fits total budget must execute; over-total aborts.
-    auto mission_then_task = [](double budget, double selection_bid, double task_bid)
-        -> std::pair<bool /*execute*/, double /*spent*/> {
-        // Mission selection: record firm, do NOT debit spent.
-        double awarded_usd = selection_bid;  // telemetry only
-        double spent = 0.0;
-        (void)awarded_usd;
-        // Prefer mission firm if task bid fits remaining actual budget.
-        const double remaining = budget - spent;
-        if (task_bid <= remaining + 1e-9) {
-            spent += task_bid;  // debit only on actual task award
-            return {true, spent};
-        }
-        // No affordable firm → abort before execution.
-        return {false, spent};
-    };
-
-    // Live spot: estimate ≈ 15.06, budget 25 → must execute (not abort at spent=0).
-    {
-        auto [ok, spent] = mission_then_task(25.0, 15.06, 15.06);
-        CHECK(ok);
-        CHECK(spent == doctest::Approx(15.06));
-        CHECK(spent <= 25.0 + 1e-9);
-    }
-    // Same estimate, budget 10 → budget_exceeded before any task spend.
-    {
-        auto [ok, spent] = mission_then_task(10.0, 15.06, 15.06);
-        CHECK_FALSE(ok);
-        CHECK(spent == doctest::Approx(0.0));
-    }
-    // Multi-task: selection bid ignored; successive tasks debit remaining.
-    {
-        double budget = 30.0;
-        double spent = 0.0;
-        double selection = 15.06;  // NOT reserved
-        (void)selection;
-        std::vector<double> tasks = {12.0, 12.0, 12.0};
-        int ran = 0;
-        for (double t : tasks) {
-            if (spent + t > budget + 1e-9) break;
-            spent += t;
-            ++ran;
-        }
-        CHECK(ran == 2);
-        CHECK(spent == doctest::Approx(24.0));
-        // Third task would need 12 against remaining 6 → refused.
-        CHECK(spent + 12.0 > budget);
-    }
-}
 
 TEST_CASE("a silent worker is not a non-modeling request") {
     // run-42508173312214 (2026-07-29): a keychain modelling turn built five real,
@@ -2113,8 +2014,8 @@ TEST_CASE("mission stop_reason propagates real unit failure") {
         std::string status;
         std::string stop_reason;
     };
-    auto resolve = [](bool budget_exceeded, bool any_built, bool any_ok, bool created_doc,
-                      bool any_failed, const std::string& first_fail,
+    auto resolve = [](bool any_built, bool any_ok, bool created_doc, bool any_failed,
+                      const std::string& first_fail,
                       const std::vector<std::string>& fail_summaries) -> Outcome {
         auto fail_r = [&]() -> std::string {
             if (!first_fail.empty()) return first_fail;
@@ -2122,10 +2023,6 @@ TEST_CASE("mission stop_reason propagates real unit failure") {
                 if (!it->empty()) return *it;
             return "mission_failed";
         };
-        if (budget_exceeded && !any_built && !any_ok)
-            return {"failed", "budget_exceeded"};
-        if (budget_exceeded && (any_built || any_ok))
-            return {"partial", "budget_exceeded"};
         if (any_failed && (any_built || any_ok))
             return {"partial", fail_r()};
         if (any_built && !any_failed)
@@ -2133,37 +2030,31 @@ TEST_CASE("mission stop_reason propagates real unit failure") {
         if (any_ok && !any_failed) return {"done", "done"};
         return {"failed", fail_r()};
     };
-    // Pure budget abort.
-    {
-        auto o = resolve(true, false, false, false, false, "", {});
-        CHECK(o.status == "failed");
-        CHECK(o.stop_reason == "budget_exceeded");
-    }
     // All-success build / assemble.
     {
-        auto o = resolve(false, true, true, false, false, "", {});
+        auto o = resolve(true, true, false, false, "", {});
         CHECK(o.status == "done");
         CHECK(o.stop_reason == "built");
     }
     {
-        auto o = resolve(false, true, true, true, false, "", {});
+        auto o = resolve(true, true, true, false, "", {});
         CHECK(o.status == "done");
         CHECK(o.stop_reason == "assembled");
     }
     // Total failure surfaces real cause (never "planned").
     {
-        auto o = resolve(false, false, false, false, true, "provider_error", {"provider_error"});
+        auto o = resolve(false, false, false, true, "provider_error", {"provider_error"});
         CHECK(o.status == "failed");
         CHECK(o.stop_reason == "provider_error");
         CHECK(o.stop_reason != "planned");
     }
     {
-        auto o = resolve(false, false, false, false, true, "no_geometry", {});
+        auto o = resolve(false, false, false, true, "no_geometry", {});
         CHECK(o.status == "failed");
         CHECK(o.stop_reason == "no_geometry");
     }
     {
-        auto o = resolve(false, false, false, false, true, "", {"", "parse_error"});
+        auto o = resolve(false, false, false, true, "", {"", "parse_error"});
         CHECK(o.status == "failed");
         CHECK(o.stop_reason == "parse_error");
     }

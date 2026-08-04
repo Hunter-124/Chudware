@@ -2066,7 +2066,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         m.activity.push_back(std::move(ni));
         if (m.running) m.liveStatus = ni.title;
     } else if (kind == "firm_bids") {
-        // Contractor bidding card: firm names + token/$ estimates + budget.
+        // Contractor bidding card: firm names and estimated token counts.
         ActivityItem ni;
         ni.rowKind = 12;
         ni.stage = "firm:bids";
@@ -2074,16 +2074,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ni.status = "done";
         std::string domain = jstr(data, "domain");
         std::string complexity = jstr(data, "complexity");
-        double budget = 0.0;
-        if (data.contains("budget_usd") && data["budget_usd"].is_number())
-            budget = data["budget_usd"].get<double>();
         char reason[160];
-        if (budget > 0.0)
-            std::snprintf(reason, sizeof(reason), "%s%s%s \xc2\xb7 budget $%.2f",
-                          domain.c_str(),
-                          (!domain.empty() && !complexity.empty()) ? " \xc2\xb7 " : "",
-                          complexity.c_str(), budget);
-        else if (!domain.empty() || !complexity.empty())
+        if (!domain.empty() || !complexity.empty())
             std::snprintf(reason, sizeof(reason), "%s%s%s",
                           domain.c_str(),
                           (!domain.empty() && !complexity.empty()) ? " \xc2\xb7 " : "",
@@ -2095,9 +2087,6 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         nlohmann::json pack = nlohmann::json::object();
         pack["domain"] = domain;
         pack["complexity"] = complexity;
-        pack["budget_usd"] = budget;
-        if (data.contains("usd_per_1k") && data["usd_per_1k"].is_number())
-            pack["usd_per_1k"] = data["usd_per_1k"];
         nlohmann::json bids = nlohmann::json::array();
         if (data.contains("bids") && data["bids"].is_array()) {
             for (const auto& b : data["bids"]) {
@@ -2111,16 +2100,14 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                     row["tokens"] = b["tokens"];
                 else if (b.contains("tokens_est") && b["tokens_est"].is_number())
                     row["tokens"] = b["tokens_est"];
-                if (b.contains("usd") && b["usd"].is_number()) row["usd"] = b["usd"];
-                if (b.contains("within_budget")) row["within_budget"] = b["within_budget"];
                 if (b.contains("in_scope")) row["in_scope"] = b["in_scope"];
                 bids.push_back(std::move(row));
             }
         }
         pack["bids"] = std::move(bids);
-        // Also surface awarded_* when the emitter packs it on the same event.
+        // Also surface the award when the emitter packs it on the same event.
         if (data.contains("awarded_firm")) pack["awarded_firm"] = data["awarded_firm"];
-        if (data.contains("awarded_usd")) pack["awarded_usd"] = data["awarded_usd"];
+        if (data.contains("awarded_tokens")) pack["awarded_tokens"] = data["awarded_tokens"];
         ni.detail = pack.dump();
         // Upsert single bids card (replace prior if re-emitted).
         bool replaced = false;
@@ -2141,19 +2128,18 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         if (firm.empty()) firm = jstr(data, "firm_name");
         if (firm.empty()) firm = jstr(data, "awarded_firm");
         ni.title = firm.empty() ? "Firm awarded" : ("Awarded " + firm);
-        double bid = 0.0;
-        if (data.contains("bid_usd") && data["bid_usd"].is_number())
-            bid = data["bid_usd"].get<double>();
-        else if (data.contains("usd") && data["usd"].is_number())
-            bid = data["usd"].get<double>();
-        else if (data.contains("awarded_usd") && data["awarded_usd"].is_number())
-            bid = data["awarded_usd"].get<double>();
+        long bidTokens = 0;
+        if (data.contains("tokens") && data["tokens"].is_number_integer())
+            bidTokens = data["tokens"].get<long>();
+        else if (data.contains("tokens") && data["tokens"].is_number())
+            bidTokens = (long)data["tokens"].get<double>();
         std::string reason = jstr(data, "reason");
         char line[192];
-        if (bid > 0.0 && !reason.empty())
-            std::snprintf(line, sizeof(line), "$%.2f \xc2\xb7 %s", bid, reason.c_str());
-        else if (bid > 0.0)
-            std::snprintf(line, sizeof(line), "$%.2f", bid);
+        if (bidTokens > 0 && !reason.empty())
+            std::snprintf(line, sizeof(line), "%ld estimated tokens \xc2\xb7 %s", bidTokens,
+                          reason.c_str());
+        else if (bidTokens > 0)
+            std::snprintf(line, sizeof(line), "%ld estimated tokens", bidTokens);
         else if (!reason.empty())
             std::snprintf(line, sizeof(line), "%s", reason.c_str());
         else

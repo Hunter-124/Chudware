@@ -154,6 +154,25 @@ def test_a_bogus_sid_no_longer_fillets_the_whole_body(bored_cube):
     assert len(after.get("matches") or []) == len(before.get("matches") or [])
 
 
+@pytest.mark.parametrize("shape", ["kwarg", "dict", "string"])
+def test_query_geometry_answers_about_the_sid_it_handed_out(bored_cube, shape):
+    """Live claude-opus-5: query_geometry(doc_id=…, sid="F1b1b80") answered
+    "needs a geometry query". The tool puts a sid on every match and the docs tell the
+    model to address that element by it, so asking about one has exactly one meaning."""
+    sid = _bore_sid(bored_cube)
+    kwargs = {"kwarg": {"sid": sid}, "dict": {"query": {"sid": sid}},
+              "string": {"query": sid}}[shape]
+    out = _call("query_geometry", doc_id=bored_cube, **kwargs)
+    assert out.get("ok") is True, out
+    assert out["count"] == 1 and out["matches"][0]["sid"] == sid, out
+    assert out["matches"][0]["surf"] == "cylinder", out
+
+
+def test_query_geometry_names_a_stale_sid(bored_cube):
+    out = _call("query_geometry", doc_id=bored_cube, sid="F000000")
+    assert out.get("ok") is False and "F000000" in str(out.get("error")), out
+
+
 # ── a sid in a REF slot selects the element it names ─────────────────────────
 # Same live sweep, shaft leg: the model wrote refs.edges=[{"kind":"edge","sid":"E6b9abd"}]
 # and the validator answered «incomplete engine topology selector — a 'edge' selector

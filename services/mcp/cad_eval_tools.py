@@ -17,6 +17,7 @@ from .cad_common import (
     _BBOX_INTENT_RE,
     _EMPHASIS_PALETTE,
     _QVOCAB_HELP,
+    _SID_RE,
     _apply_emphasis_overlay,
     _as_face_query,
     _between_from_batch,
@@ -592,6 +593,24 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         try:
             extra = _extra_kwargs(dict(kwargs))
             notes: list = []
+            # A sid IS an element, not a query. This tool hands sids out on every match and
+            # the docs tell the model to address the element by one, so asking about a sid
+            # here has exactly one meaning. Live claude-opus-5 2026-08-04:
+            # query_geometry(doc_id=…, sid="F1b1b80") answered "needs a geometry query".
+            sid = extra.pop("sid", None)
+            if sid is None and isinstance(query, dict) and set(query) == {"sid"}:
+                sid, query = query["sid"], None
+            if sid is None and isinstance(query, str) and _SID_RE.fullmatch(query.strip()):
+                sid, query = query.strip(), None
+            if isinstance(sid, str) and sid.strip():
+                d = _doc(doc_id)
+                match = resolve_readback_selector(d, {"sid": sid.strip()})
+                notes.append(f'sid="{sid.strip()}" names ONE element — resolved it against '
+                             f"this document instead of reading it as a query predicate "
+                             f"(the engine has no `sid` predicate)")
+                return _dumps(_interpreted(
+                    {"ok": True, "doc_id": d, "query": {"sid": sid.strip()},
+                     "count": 1, "matches": [match]}, notes))
             q, subjects = _read_query("query_geometry", query, extra, notes)
             # Output-shape flags asking for something this tool ALREADY does. Every match carries
             # centroid/normal/axis unconditionally, so return_coords=True is a request that is

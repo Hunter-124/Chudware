@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -53,6 +54,19 @@ namespace chudware::doc {
 constexpr double kResolveMapTolFrac = 1e-3;
 
 namespace {
+// Keep these three sets byte-for-byte aligned with services/mcp/cad_common.py's
+// GEOM_QUERY_NARROWING_KEYS / DOMAIN_KEYS / READBACK_KEYS. Direct core_bridge calls bypass
+// that Python guard, so this is the authoritative engine-side boundary vocabulary.
+static const std::set<std::string> kQueryNarrowingKeys = {
+    "side", "surf", "parallel", "perpendicular", "pick", "near", "index",
+    "count", "body_id",
+};
+static const std::set<std::string> kQueryDomainKeys = {"of", "kind"};
+static const std::set<std::string> kQueryReadbackKeys = {
+    "sid", "centroid", "normal", "axis", "radius", "area_or_len", "concavity",
+    "hint_index", "owner_feature",
+};
+
 
 // Format a double like Python's f"{x:.4g}" (general format, 4 significant digits) for
 // the no-unique-subshape reason strings.
@@ -609,6 +623,41 @@ bool side_is_free_text(const std::string& s) {
 }
 
 }  // namespace
+std::vector<std::string> unknown_query_keys(const nlohmann::json& q) {
+    if (!q.is_object()) return {};
+
+    std::vector<std::string> unknown;
+    for (auto it = q.begin(); it != q.end(); ++it) {
+        const std::string& key = it.key();
+        if (kQueryNarrowingKeys.find(key) == kQueryNarrowingKeys.end() &&
+            kQueryDomainKeys.find(key) == kQueryDomainKeys.end() &&
+            kQueryReadbackKeys.find(key) == kQueryReadbackKeys.end() &&
+            key != "doc_id" && key != "query") {
+            unknown.push_back(key);
+        }
+    }
+    std::sort(unknown.begin(), unknown.end());
+    return unknown;
+}
+
+std::string unknown_query_keys_error(const std::string& where,
+                                     const std::vector<std::string>& keys) {
+    std::string out = where + ": the geometry query has unknown ";
+    out += keys.size() == 1 ? "key " : "keys ";
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (i != 0) out += ", ";
+        out += "'" + keys[i] + "'";
+    }
+    out += ". A key the engine does not know narrows NOTHING and therefore silently matched "
+           "every candidate. Real narrowing keys are side, surf, parallel, perpendicular, "
+           "pick, near, index, count, body_id. For curved-style intent, use 'surf': "
+           "'curved'/'round' means any non-planar face, and 'cylindrical', 'conical', "
+           "'spherical', or 'toroidal' select a specific curved type (exact 'cylinder', "
+           "'cone', 'sphere', and 'torus' also work).";
+    out += kQueryGrammar;
+    return out;
+}
+
 
 bool is_geom_query(const nlohmann::json& v) {
     return v.is_object() && (v.value("kind", std::string()) == "query" || v.contains("of"));

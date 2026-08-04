@@ -229,8 +229,17 @@ def test_curved_faceset_covers_cylinder_exactly():
         doc = cb.call("doc_new", {"name": "c2_cyl_cover"})["doc_id"]
         cb.call("doc_apply_ops", {"doc_id": doc, "ops": [{"op": "add_feature", "feature": {
             "type": "cylinder", "params": {"radius": 10.0, "height": 100.0}}}]})
-        q = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "curved": True}})
-        sel = [m for m in q.get("matches", []) if m.get("kind") == "face"][0]
+        # `surf:"curved"` is the real spelling of "any non-planar face". This used to
+        # ask for {"curved": True} — an inert key resolve_geom_query dropped silently,
+        # so the query actually returned all THREE faces and this test passed only
+        # because the barrel happened to enumerate first. The engine now rejects an
+        # unknown query key outright (doc/picks.cpp::unknown_query_keys), and asking
+        # correctly lets us assert the count too.
+        q = cb.call("doc_query", {"doc_id": doc,
+                                  "query": {"of": "face", "surf": "curved"}})
+        faces = [m for m in q.get("matches", []) if m.get("kind") == "face"]
+        assert len(faces) == 1, f"a cylinder has ONE curved face, got {len(faces)}"
+        sel = faces[0]
         fp = cb.call("doc_face_points", {"doc_id": doc, "selector": sel})
         step = fsc.export_step(doc)
         mesh = fsc.mesh_step(step, order=2, fineness=0.3)

@@ -7352,6 +7352,10 @@ static TopoDS_Shape whole_doc_shape(Session& s) {
 json doc_query(const std::string& doc_id, const json& query) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    const std::vector<std::string> unknown = chudware::doc::unknown_query_keys(query);
+    if (!unknown.empty())
+        throw OpError("invalid_op",
+                      chudware::doc::unknown_query_keys_error("doc_query", unknown));
     // Default: query the WHOLE document — every body of a multi-body/assembly doc (see
     // whole_doc_shape). An optional 1-based "body_id" in the query dict still selects a
     // SPECIFIC surviving solid — the same per-body selection eval_measure/eval_mass/

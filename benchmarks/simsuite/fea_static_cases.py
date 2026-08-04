@@ -527,19 +527,29 @@ def case_annulus_lame_native(case_id, order=2, fineness=0.25):
                                          + STEEL["nu"])
     t0 = time.time()
     doc, _ = build_annulus(Ro, Ri, H)
-    # Inner bore = the curved face whose analytic cylinder radius is Ri.
-    q = _cb().call("doc_query", {"doc_id": doc, "query": {"of": "face", "curved": True}})
-    bore = None
-    for mt in q.get("matches", []):
-        if mt.get("kind") != "face":
-            continue
-        fp = _cb().call("doc_face_points", {"doc_id": doc, "selector": mt})
-        surf = fp.get("surface") or {}
-        if surf.get("type") == "cylinder" and abs(surf.get("radius", 0.0) - Ri) < 1e-6:
-            bore = fp
-            break
-    if bore is None:
-        raise RuntimeError("annulus bore face not found via doc_face_points surface descriptor")
+    # Inner bore = the ONE concave cylindrical face; `pick:"inner"` is what tells the
+    # two coaxial walls apart (Ro=40 outer vs Ri=20 bore). This used to ask for
+    # {"of":"face","curved":True}: `curved` is not a query key, so resolve_geom_query
+    # dropped it silently and the query matched all 4 faces of the annulus — measured
+    # identical to a bare {"of":"face"}. The radius test below happened to land on the
+    # bore regardless, which is exactly why the dead key survived review. The engine
+    # now rejects an unknown query key outright (doc/picks.cpp::unknown_query_keys).
+    q = _cb().call("doc_query", {"doc_id": doc,
+                                 "query": {"of": "face", "surf": "cylinder",
+                                           "pick": "inner"}})
+    faces = [m for m in q.get("matches", []) if m.get("kind") == "face"]
+    if len(faces) != 1:
+        raise RuntimeError(
+            f"annulus bore: expected exactly 1 inner cylindrical face, got {len(faces)}")
+    bore = _cb().call("doc_face_points", {"doc_id": doc, "selector": faces[0]})
+    surf = bore.get("surface") or {}
+    # C2 witness, kept as an assertion now that the query does the narrowing: the
+    # faceset MUST carry the analytic cylinder descriptor at radius Ri, else
+    # nodes_in_faceset_surface has no |dist_to_axis - R| test to apply and the
+    # pressure spreads off the bore.
+    if surf.get("type") != "cylinder" or abs(surf.get("radius", 0.0) - Ri) > 1e-6:
+        raise RuntimeError(
+            f"annulus bore face is not the analytic r={Ri} cylinder: {surf!r}")
     step = export_step(doc)
     bot = plane_faceset([0, 0, -H / 2], [0, 0, -1], tol_mm=Ro + 1)
     setup_s = time.time() - t0

@@ -149,5 +149,12 @@ constexpr const char* kQueryGrammar =
     "+x|-x|+y|-y|+z|-z), surf, parallel, perpendicular, pick, near, count, index. Example: "
     "{\"of\":\"face\",\"side\":\"top\"}. For a free-text description call describe_part / "
     "hover(sid) instead.";
+// Return every key the engine does not understand, sorted for deterministic diagnostics.
+// Non-object values have no query keys and return an empty vector.
+std::vector<std::string> unknown_query_keys(const nlohmann::json& q);
+
+// Format a teaching rejection for unknown query keys and append kQueryGrammar.
+std::string unknown_query_keys_error(const std::string& where,
+                                     const std::vector<std::string>& keys);
 
 }  // namespace chudware::doc

@@ -315,6 +315,62 @@ TEST_CASE("dangling edge selector: fillet errors, extrude body survives as a box
     CHECK((hi[2] - lo[2]) == doctest::Approx(D).epsilon(1e-4));
 }
 
+TEST_CASE("geom query: unknown key guard mirrors the public vocabulary") {
+    using chudware::doc::unknown_query_keys;
+    using chudware::doc::unknown_query_keys_error;
+
+    const std::vector<std::string> bad =
+        unknown_query_keys(json{{"of", "face"}, {"curved", true}});
+    REQUIRE(bad.size() == 1);
+    CHECK(bad[0] == "curved");
+    const std::string message = unknown_query_keys_error("doc_query", bad);
+    CHECK(message.find("curved") != std::string::npos);
+    CHECK(message.find("surf") != std::string::npos);
+
+    // Every engine-side legal key is tolerated, including transport fields present on
+    // flat doc_query RPC params and fields copied from query_geometry/describe_part readback.
+    const json all_legal = {
+        {"side", "top"}, {"surf", "cylinder"}, {"parallel", "z"},
+        {"perpendicular", "x"}, {"pick", "inner"}, {"near", json::array({0, 0, 0})},
+        {"index", json::array({0})}, {"count", 1}, {"body_id", 1},
+        {"of", "face"}, {"kind", "query"},
+        {"sid", "F1"}, {"centroid", json::array({0, 0, 0})},
+        {"normal", json::array({0, 0, 1})}, {"axis", json::array({0, 0, 1})},
+        {"radius", 2.0}, {"area_or_len", 10.0}, {"concavity", "concave"},
+        {"hint_index", 0}, {"owner_feature", "f1"},
+        {"doc_id", "d1"}, {"query", json::object()},
+    };
+    CHECK(unknown_query_keys(all_legal).empty());
+
+    const json readback_match = {
+        {"kind", "face"}, {"sid", "F1"}, {"centroid", json::array({1, 2, 3})},
+        {"surf", "cylinder"}, {"area_or_len", 20.0}, {"normal", json::array({1, 0, 0})},
+    };
+    CHECK(unknown_query_keys(readback_match).empty());
+    CHECK(unknown_query_keys(
+              json{{"of", "face"}, {"surf", "cylinder"}, {"sid", "F1"}}).empty());
+    CHECK(unknown_query_keys(json::array({"of", "face"})).empty());
+
+    const std::vector<std::string> sorted =
+        unknown_query_keys(json{{"zzz", 1}, {"curved", true}, {"aaa", 2}});
+    REQUIRE(sorted.size() == 3);
+    CHECK(sorted[0] == "aaa");
+    CHECK(sorted[1] == "curved");
+    CHECK(sorted[2] == "zzz");
+}
+
+TEST_CASE("geom query: surf cylinder and pick inner selects one tube wall") {
+    const double RO = 40.0, RI = 20.0, H = 120.0;
+    TopoDS_Shape tube = geom::cut(geom::make_cylinder_centered(RO, H),
+                                  geom::make_cylinder_centered(RI, H + 10.0));
+    REQUIRE_FALSE(tube.IsNull());
+
+    chudware::doc::QueryPicks inner = chudware::doc::resolve_geom_query(
+        tube, json{{"of", "face"}, {"surf", "cylinder"}, {"pick", "inner"}});
+    CHECK_MESSAGE(inner.error.empty(), inner.error);
+    CHECK(inner.faces.size() == 1);
+}
+
 // (c) GEOMETRY-QUERY VOCABULARY. The plain-language predicates a spatially-limited model
 //     reaches for — direction words (top/front/..), surf words (flat/round), parallel axis
 //     words, and size superlatives (largest/longest) — must resolve to the SAME kernel

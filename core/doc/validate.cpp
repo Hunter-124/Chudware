@@ -8,7 +8,7 @@
 // operator outside {+,-,*,/,**, unary +/-}, a non-numeric constant, a call to a
 // function not in _FUNCS, keyword arguments, or any other construct. '^' -> '**'.
 #include "doc/validate.h"
-#include "doc/picks.h"  // kQueryGrammar — one canonical query-grammar string, never a copy
+#include "doc/picks.h"  // shared geometry-query vocabulary, errors, and grammar
 #include <algorithm>
 
 #include <cctype>
@@ -787,6 +787,8 @@ const std::set<string> AXIS_DIR_SLOTS = {"axis", "dir1", "dir2", "pull"};
 // draft neutral, and the relational at:{...} on a primitive). Only a PRESENT `of`
 // naming something other than edge/face is an error.
 vector<string> validate_geom_query(const json& q, const string& where) {
+    const vector<string> unknown = unknown_query_keys(q);
+    if (!unknown.empty()) return {unknown_query_keys_error(where, unknown)};
     const json& ofj = get(q, "of");
     if (ofj.is_null()) return {};  // absent -> "face" at compile time
     if (!ofj.is_string())

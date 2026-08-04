@@ -884,7 +884,7 @@ def test_live_a_bare_face_sid_works_as_a_sketch_plane(live):
         "params": {"entities": [{"id": "e0", "type": "circle", "construction": False,
                                  "center": [0, 0], "radius": 22}]}}}]))
     assert r["ok"], r
-    assert any("bare face/edge sid" in n and sid in n for n in r["interpreted"])
+    assert any("resolved face/edge sid" in n and sid in n for n in r["interpreted"])
 
 
 @enginetest
@@ -899,7 +899,7 @@ def test_live_a_bare_sid_is_wrapped_in_a_non_plane_slot_too(live):
         "refs": {"face": sid}}}]))
     assert r["ok"], r
     assert r["changes"]["volume_delta_mm3"] < 0
-    assert any("bare face/edge sid" in n for n in r["interpreted"])
+    assert any("resolved face/edge sid" in n and sid in n for n in r["interpreted"])
 
 
 @enginetest

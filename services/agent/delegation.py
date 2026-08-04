@@ -292,7 +292,19 @@ class DelegationTree:
         self,
         *,
         run_id: str = "",
-        orchestrator_budget: int = 50_000,
+        # Measured 2026-08-04: ONE real feature_modeler subagent building a single
+        # part costs ~100k tokens (a live claude-sonnet-5 part build was 101,772 for
+        # 8 completions — modern providers resend the whole context every call). The
+        # old 50_000 default was therefore blown by the FIRST child every time, and
+        # since accrue() revokes any ancestor whose remaining budget hits zero
+        # (contract §12), the ROOT was revoked after one delegation — so a second
+        # sibling delegate always came back "parent node is in status 'revoked'".
+        # Live run lane-delegate-2 hit exactly that asking for two parts: Part A was
+        # delegated, Part B was refused. The §12 revocation mechanism is right (it
+        # still halts runaway children, and max_agents / max_subagent_depth / kill()
+        # still bound the tree) — the GRANT was simply two orders of magnitude below
+        # one subagent's real cost. Sized for a realistic multi-subagent session.
+        orchestrator_budget: int = 2_000_000,
         ledger: Any | None = None,
         routing: RoutingTable | None = None,
         soft_depth_limit: int = DEFAULT_SOFT_DEPTH_LIMIT,

@@ -6022,3 +6022,32 @@ that reconciliation is the missing piece.
 Gotcha: `forkConversation` must read `st.chat` — not `conversations[idx].msgs` — when forking
 the ACTIVE session, and must zero `step.thumb.id` on the copy or the fork and its source share
 a GL texture handle.
+
+## 2026-08-03 — T-X7b: vendor registry key fix + scraped price into bom_price
+
+Files: `core/api/libchudware.cpp`, `core/sourcing/{vendorreg,sourcing,specmatch,providers}.cpp`,
+`core/sourcing/sourcing.h`, `core/tests/test_sourcing.cpp`, `services/mcp/parts_tools.py`,
+`services/browser/queue.py`, `services/mcp/test_parts_tools_v2.py`,
+`contracts/sourcing_schema.md`, `work/tasks/T-X7b.md`.
+
+The headline is a latent bug, not the feature. `vendorreg.cpp` wrote index entries keyed
+`slug(supplier)::slug(part_number)`; the production `Seams::vendor_lookup` glue in
+`libchudware.cpp` looked up a bare `slug(mpn)`. They never agreed, so a registered vendor part
+was invisible to `bom_rollup`/`bom_price` — DoD item 2 could not have worked no matter what fed
+it. Both paths now call one shared `sourcing::vendor_index_lookup(index, component)`; keep it
+that way, and keep the two-supplier regression test, or they will drift again.
+
+`register_local_cad` is now a merge-preserving upsert over a `fields` json object rather than
+seven positional args. `cad_path` is optional — a price-only record is legitimate and must never
+blank an existing CAD file. A malformed `price_breaks` entry throws instead of being silently
+skipped by `unit_price_for_qty` (bom.cpp:442), which would otherwise read as a missing price.
+
+Anti-fabrication rule worth preserving: a scraped display price is parsed ONLY when unambiguous.
+`"$12.34"` → 12.34; `"$10.00 / pack of 50"` and `"$5.00 - $9.00"` leave `unit_price` null and
+return the raw string as `price_unparsed`. A wrong price silently entering a BOM is far worse
+than a missing one. Every registered price carries `provenance.scraped: true`,
+`provenance.method: "cef_browser_scrape"` and a `fetched_ts`.
+
+Gotcha for future probes: `core/build-linux` was 3 days stale while `core/build-occt-linux`
+(which takes precedence in `core_bridge`'s search order) was fresh — a live measurement can pass
+against one tree and fail in CI against the other. Rebuild both.

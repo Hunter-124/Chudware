@@ -2109,8 +2109,18 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             pass
         try:
             from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
+            # The tier MUST ride along. This re-render replaces the whole tools
+            # block mid-turn, and omitting `tier` silently falls back to
+            # DEFAULT_TOOLS_BUDGET_TOKENS (2500, the local-24k floor) instead of
+            # the caller's tier budget (frontier = 10000). Measured on
+            # add_features: 12792 chars delivered at tier=frontier vs 335
+            # untiered — 2.8% of the authored guidance. Since general_agent only
+            # reaches the modeling family THROUGH enable_tools, that regression
+            # landed on exactly the turn where the model first needs the schema,
+            # and it is the documented cause of the add_features failure cluster
+            # (62 of 86 tool failures across 59 live user runs, 2026-08-04).
             new_text, _meta = render_tools_block(
-                sorted(allow), resolver=resolver_for(mission_dispatch))
+                sorted(allow), resolver=resolver_for(mission_dispatch), tier=tier)
             if new_text:
                 if tools_text and tools_text in system:
                     system = system.replace(tools_text, new_text, 1)

@@ -593,3 +593,92 @@ def test_the_delegate_check_does_not_touch_other_tools():
 
     assert at._did_real_work([{"tool": "add_features", "ok": True,
                                "result": {"executed": False}}]) is True
+
+
+# ---------------------------------------------------------------------------
+# Tier survives the enable_tools re-render (2026-08-04)
+# ---------------------------------------------------------------------------
+#
+# `_apply_categories` replaces the ENTIRE §9.1 tools block mid-turn. It used to
+# call render_tools_block() without `tier=`, silently taking
+# DEFAULT_TOOLS_BUDGET_TOKENS (2500, the local-24k floor) instead of the turn's
+# own tier budget (frontier = 10000). Measured on add_features: 12792 chars of
+# schema+guidance at tier=frontier vs 335 untiered — 2.8% of the 11886-char
+# authored docstring.
+#
+# That lands on precisely the wrong turn. `general_agent` starts WITHOUT the
+# modeling family and can only reach add_features THROUGH enable_tools, so the
+# model received the thinnest possible schema at the exact moment it first
+# needed the full one. In 59 genuine user runs, add_features accounted for 62 of
+# 86 tool failures (72%), and every observed failure class — boolean operands,
+# already-merged operands, zero-volume revolves, buried extrudes, pattern
+# params — is documented in the guidance that was being discarded.
+
+
+class _SystemRecordingProvider:
+    """Scripted replies that also records the SYSTEM prompt per completion."""
+
+    name = "scripted"
+
+    def __init__(self, replies):
+        self._replies = list(replies)
+        self.seen_systems: list[str] = []
+
+    def complete(self, system, messages, max_tokens=8000):
+        self.seen_systems.append(str(system))
+        return self._replies.pop(0) if self._replies else "no more"
+
+
+def _run_enable_tools_turn(tier):
+    """Drive one turn that pulls the modeling pack, and return the systems seen."""
+    from services.agent import agent_turn as at
+
+    p = _SystemRecordingProvider([
+        '```json\n{"tool": "enable_tools", "args": {"categories": ["modeling"]}}\n```',
+        '```json\n{"tool": "ledger_note", "args": {"kind": "note", "text": "ok"}}\n```',
+        "Pulled the modeling pack and noted it.",
+    ])
+    at.run_turn(
+        "add a 5mm fillet to the bracket",
+        p,
+        allowed_tools=list(_GENERAL_ALLOW),
+        max_tool_calls=8,
+        tool_dispatch=_dispatch_ok,
+        actor="general_agent",
+        run_id=f"t-tier-{tier or 'none'}",
+        tier=tier,
+    )
+    return p.seen_systems
+
+
+def test_enable_tools_rerender_keeps_the_frontier_tier_budget():
+    """After enable_tools, add_features must arrive with its EXPANDED guidance.
+
+    'params.a' / 'centred' only survive the expansion pass that the frontier
+    budget (10000) pays for; the 2500 floor trims them away.
+    """
+    systems = _run_enable_tools_turn("frontier")
+    assert len(systems) >= 2, systems
+    after = systems[-1]
+    assert "add_features" in after, after[:2000]
+    assert "params.a" in after, (
+        "add_features lost its expanded guidance after enable_tools — the "
+        "re-render dropped back to the 2500-token floor")
+    assert "centred" in after or "centered" in after, (
+        "the buried-extrude rule (the single most common live failure) is "
+        "missing from the re-rendered block")
+
+
+def test_the_tier_assertion_actually_discriminates():
+    """Guard the guard: at local-24k the same phrases must be ABSENT.
+
+    Without this, a render change that always emitted 'params.a' would make the
+    test above pass while the regression it defends silently returned.
+    """
+    systems = _run_enable_tools_turn("local-24k")
+    assert systems, systems
+    after = systems[-1]
+    assert "add_features" in after, after[:2000]
+    assert "params.a" not in after, (
+        "local-24k unexpectedly carries the expanded add_features guidance; "
+        "the frontier test above no longer proves the tier was honoured")

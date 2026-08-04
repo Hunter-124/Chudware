@@ -2,8 +2,8 @@
 id: T-DP16
 title: AI-Agent workspace — full-screen comprehensive copilot (DAG + worker steering + session mgmt)
 workstream: DP
-owner: unassigned
-status: review
+owner: hunter
+status: done
 branch: task/T-DP16-ai-agent-workspace
 depends_on: [T-DP15, T-DP17]
 lane: app-gui

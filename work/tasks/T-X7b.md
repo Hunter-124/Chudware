@@ -2,8 +2,8 @@
 id: T-X7b
 title: Vendor wave-2 follow-ups — McMaster STEP import + structured price to bom_price seam
 workstream: X
-owner: unassigned
-status: review
+owner: hunter
+status: done
 branch: task/T-X7b-vendor-wave2-followups
 depends_on: [T-X7]
 lane: parts-sourcing

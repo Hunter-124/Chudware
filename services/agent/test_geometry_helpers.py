@@ -286,6 +286,8 @@ if __name__ == "__main__":  # pragma: no cover
 def test_canonical_process_strict_maps_the_words_models_use():
     from services.agent.geometry_helpers import canonical_process_strict as c
     assert c("machining") == "cnc_mill"
+    assert c("cnc_milling") == "cnc_mill"
+    assert c("milling") == "cnc_mill"
     assert c("machined") == "cnc_mill"
     assert c("turned") == "lathe"
     assert c("3d printed") == "fdm"

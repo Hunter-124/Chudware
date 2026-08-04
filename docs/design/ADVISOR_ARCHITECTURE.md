@@ -384,3 +384,98 @@ Wave 1 (launched 2026-07-04): T-W1, T-W2, T-W3, T-W6. Wave 1b (no deps): T-W12, 
 5. **Same advisory bus for the human GUI.** The foreman's advisory blocks are
    render-able as in-app hints (the existing overlay/PropertyManager). One engine,
    two audiences.
+
+---
+
+# Appendix A — T-W11 end-to-end results (2026-08-04)
+
+Measured, not projected. Everything below came from
+`tools/flywheel/bench/benches/advisor_e2e.py` against live subscription models;
+the raw per-leg JSON is under `training/benches/advisor_e2e/results/`.
+
+## What ran
+
+One frozen mission — *bearing mount bracket: 20 mm g6 sliding-fit bore, 4x M5
+clearance holes, aluminium, machined, survives a 500 N side load* — through both
+loops on two paid tiers:
+
+* **baseline** — one linear `general_agent` turn (`run_linear_role_turn`)
+* **advisory** — the orchestrator role over a compiled `aicad.dag/1` mission
+  graph with role nodes and the T-W5 foreman on (`dag.executor.run`)
+
+Scoring is deterministic, no LLM judges: bore diameter through `fit_calc`
+(clearance fit on 20 g6), hole pattern by counting `concavity == "bore"` faces
+near Ø5.5 in `query_geometry`, `is_manifold` from the verifier battery, and
+`min_fos` from `run_fea_static` under the 500 N load.
+
+**Honest scope: ONE seed, not the three the card asks for.** Each advisory leg
+runs the full DAG (intake → plan → spec → build → verify → deliver) at
+~17–30 min, and Hunter's instruction was to come in under the authorized quota.
+Seeds 2 and 3 were not run. The matrix is seed-major precisely so the executed
+subset is a complete loop x tier block; the remaining seeds are one command:
+`CHUDWARE_BENCH_LIVE=1 python -m tools.flywheel.bench.runner advisor_e2e`.
+
+## Comparison
+
+| loop | tier | ok | stop | tool calls | tool fails | score | tokens | wall s |
+|---|---|---|---|---|---|---|---|---|
+| baseline | claude-opus-5 | yes | confirmed | 23 | 3 | **1.00** | 700,916 | 236 |
+| advisory | claude-opus-5 | yes | done | 94 | 11 | **1.00** | 367,231 | 1001 |
+| baseline | k3-256k | yes | confirmed | 32 | 1 | **0.00** | 397,821 | 704 |
+| advisory | k3-256k | yes | done | 48 | 9 | **0.00** | 198,257 | 1778 |
+
+| loop | mean score | tool calls | tool failures | fail rate | tokens |
+|---|---|---|---|---|---|
+| advisory | 0.50 | 142 | 20 | 14.1% | 565,488 |
+| baseline | 0.50 | 55 | 4 | 7.3% | 1,098,737 |
+
+Per-criterion: both opus-5 legs passed all four checks (bore 20.021 mm measured,
+clearance fit; 4/4 Ø5.5 holes; manifold; FoS 15.0). Both k3-256k legs failed all
+four — no bore face of the right size ever reached the document.
+
+## What this does and does not show
+
+**It does not show the advisory loop winning on quality.** At n=1 per cell the
+outcome is decided by the TIER, not the loop: opus-5 satisfied the mission on
+both loops, k3-256k on neither. That is a real finding and it is not the one the
+pillar's thesis predicted.
+
+**The token result is the interesting one.** The advisory loop used roughly HALF
+the tokens of the linear loop on both tiers (367k vs 701k on opus-5; 198k vs 398k
+on k3-256k) while making 2–4x MORE tool calls. Role-scoped context packs cost far
+less per turn than one linear conversation that re-sends a growing transcript on
+every iteration. If it holds across seeds, the advisory architecture's case is
+economic — more actions per token — rather than higher single-shot quality.
+
+**Do not read the failure rates as loop quality.** The advisory loop's higher
+rate (14.1% vs 7.3%) is dominated by mission-scoped tools its nodes are
+advertised but cannot resolve in a bench harness (`delegate`, `dag_status`,
+`buildgraph_status`) — see the gap ledger. That is a harness-shaped artifact of
+how the bench drives the DAG, not evidence about the loop.
+
+## Measurement caveats found the hard way
+
+* **Scoring must be isolated per leg.** Every leg shares one engine, and the
+  engine restarts document numbering, so `doc-cpp00000001` is genuinely reissued.
+  A first pass that scored "the best open document" had every advisory leg
+  grading the BASELINE leg's finished bracket and reported 1.00 across the board.
+  The corrected scorer only considers documents that did not exist when the leg
+  started. The k3-256k 0.00 rows are what that contamination was hiding.
+* **Legs must hold a private daemon** (`private_hostd.private_daemon()`), or a
+  concurrent pytest run shares the engine and destroys the leg's document
+  mid-run — observed, open-doc count climbing 2 → 15 under a leg.
+* **Doc-GC must be pinned off** (`CHUDWARE_DOC_GC=0`); hostd was logging
+  `doc-gc: retire doc_save(doc-cpp00000010) failed` against a live leg's own doc.
+* **Per-leg token totals are approximate for the DAG loop.** `get_turn_usage()`
+  is a process-global accumulator reset per turn, so a multi-node run can lose a
+  node's usage (one discarded leg reported 0 tokens across 72 calls).
+
+## Advisory triples
+
+Not delivered. `dag.node.done` carried an `advisory` block on **zero** nodes
+across all four legs (`advisories = 0` in every leg record), so there were no
+advisory-shown → action → check-outcome triples to log. The T-W5 foreman is
+gated on `CHUDWARE_ADVISOR` (default on) AND on the node carrying a `doc_id`;
+`node_runner._run_advisory` no-ops without one. Establishing why no node
+qualified is prerequisite work for the Pillar-16 next-action dataset, and it is
+the first thing to chase before spending more quota on seeds 2 and 3.

@@ -345,27 +345,53 @@ def score_doc(doc_id: str) -> dict:
     return scores
 
 
-def score_mission(preferred_doc: str) -> dict:
-    """Score the document the mission actually BUILT.
-
-    The bound document is only a hint. The advisory loop's BUILD node calls
-    `new_part` and works in a document of its own, so grading the bound doc
-    would report 0.00 for every advisory leg — a bench artifact, not a result.
-    The question worth answering is "did this loop produce a conforming part",
-    so score every candidate document in the session and keep the best, and
-    record WHICH document was graded so the number stays auditable.
-    """
-    candidates: list[str] = [preferred_doc] if preferred_doc else []
+def _open_docs() -> list[dict]:
     listing = _dispatch("list_parts", {})
-    for row in (listing or {}).get("docs") or []:
-        did = row.get("doc_id") if isinstance(row, dict) else None
-        # An empty document cannot satisfy any criterion; skip it so a stray
-        # scratch doc never outranks the real one on a tie.
-        if did and did not in candidates and not row.get("empty"):
+    rows = (listing or {}).get("docs") or []
+    return [r for r in rows if isinstance(r, dict) and r.get("doc_id")]
+
+
+def doc_fingerprints() -> set[tuple]:
+    """Identity of every currently-open document.
+
+    Keyed on (doc_id, name), NOT doc_id alone: the engine restarts its document
+    numbering, so leg N+1's fresh document is genuinely handed the same
+    `doc-cpp00000001` an earlier leg used. Measured 2026-08-04 — four legs in
+    one matrix were assigned two distinct ids between them.
+    """
+    return {(r.get("doc_id"), r.get("name")) for r in _open_docs()}
+
+
+def score_mission(preferred_doc: str, before: set[tuple] | None = None) -> dict:
+    """Score the document THIS leg built.
+
+    The bound document is only a hint: the advisory loop's BUILD node calls
+    `new_part` and works somewhere of its own, so grading the bound doc alone
+    reports 0.00 for every advisory leg.
+
+    But widening to "every open document" is worse than useless, because all
+    legs share one engine. Measured 2026-08-04: every advisory leg scored
+    `doc-cpp00000001` — the BASELINE leg's finished bracket — and the matrix
+    read 1.00 across the board. A bench that grades another run's work is not a
+    lenient bench, it is a broken one.
+
+    So candidates are restricted to documents that did not exist when this leg
+    started (`before`), plus the leg's own bound doc. The best-scoring candidate
+    wins and the graded doc id is recorded so the number stays auditable.
+    """
+    before = before or set()
+    candidates: list[str] = [preferred_doc] if preferred_doc else []
+    for row in _open_docs():
+        did, name = row.get("doc_id"), row.get("name")
+        if (did, name) in before:
+            continue          # pre-existing: belongs to an earlier leg
+        if row.get("empty"):
+            continue          # an empty doc satisfies nothing; never let it tie
+        if did and did not in candidates:
             candidates.append(did)
     if not candidates:
         return {"fraction": 0.0, "graded_count": 0, "passed_count": 0,
-                "reason": "no documents open at scoring time", "doc_id": ""}
+                "reason": "this leg left no scorable document", "doc_id": ""}
 
     scored = []
     for did in candidates:
@@ -481,8 +507,13 @@ def run_leg(
     sink = EventSink()
     t0 = time.time()
 
+    # Snapshot BEFORE anything is created: every leg shares one engine, so this
+    # is what separates "the part this leg built" from "a part an earlier leg
+    # left lying around".
+    before = doc_fingerprints()
+
     try:
-        leg.doc_id = _new_doc(f"tw11_{loop}_s{seed}")
+        leg.doc_id = _new_doc(f"tw11_{loop}_s{seed}_{uuid.uuid4().hex[:4]}")
         tu.begin_turn_usage()
         if loop == "baseline":
             res = md.run_linear_role_turn(
@@ -525,7 +556,7 @@ def run_leg(
             leg.usage = {}
 
     try:
-        leg.scores = score_mission(leg.doc_id)
+        leg.scores = score_mission(leg.doc_id, before)
     except Exception as exc:  # noqa: BLE001
         leg.scores = {"error": f"{type(exc).__name__}: {exc}", "fraction": 0.0}
     return leg

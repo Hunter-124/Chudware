@@ -34,6 +34,10 @@ from typing import Any, Optional
 _PROCESS_ALIASES: dict[str, str] = {
     "machined": "cnc_mill", "machining": "cnc_mill", "cnc": "cnc_mill",
     "milled": "cnc_mill", "mill": "cnc_mill", "cnc_mill": "cnc_mill",
+    # -ing forms: observed live 2026-08-04 (opus-5 called dfm_check("cnc_milling")
+    # in the same run where "machining" had just been accepted).
+    "milling": "cnc_mill", "cnc_milling": "cnc_mill", "cnc milling": "cnc_mill",
+    "cnc machining": "cnc_mill", "cnc_machining": "cnc_mill",
     "turned": "lathe", "lathe": "lathe",
     "printed": "fdm", "3d printed": "fdm", "3dp": "fdm", "fdm": "fdm",
     "fff": "fdm", "additive": "fdm", "sla": "fdm",

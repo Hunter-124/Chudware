@@ -6236,10 +6236,66 @@ which skips the `-wal` file — it saw a long-expired access token, got HTTP 401
 fail-safe-stopped every run; plain `mode=ro` with an immutable fallback. `component`
 inside a query dict never scoped anything (`doc_query` reads only `body_id` before
 handing the dict to `resolve_geom_query`) and a test had been asserting through it.
-`benchmarks/simsuite/fea_static_cases.py:531` still calls `doc_query` with
+`benchmarks/simsuite/fea_static_cases.py:531` calls `doc_query` with
 `{"of":"face","curved":True}` — `curved` is not a key, so that "inner bore" selection
-is really every face; it bypasses the Python guard (direct `cb.call`) and is NOT
-fixed here. `services/mcp/test_modeling_repertoire.py` is the free canary: it drives
+is really every face; it bypasses the Python guard (direct `cb.call`) and is fixed in
+the entry below, at the engine. `services/mcp/test_modeling_repertoire.py` is the free
+canary: it drives
 the whole ordinary repertoire through `_dispatch_tool` and asserts hand-computable
 volumes — three of this session's findings were visible there before a token was
 spent.
+
+## 2026-08-04 — the dead query key, and a budget made of imaginary money
+
+Two follow-ups from the sweep above, both "the code was lying about what it did".
+
+**A geometry-query key the engine ignores is now an error.** `resolve_geom_query`
+reads nine keys and silently drops everything else, so a predicate it has no concept
+of does not narrow — it matches every candidate. Measured on an annulus (Ro=40,
+Ri=20): `{"of":"face","curved":true}` returned all 4 faces, identical to a bare
+`{"of":"face"}`. The Python guard added above only covers the MCP tool functions; a
+direct `core_bridge`/C++ `doc_query` bypasses it. The check now lives in the engine at
+the two EXTERNAL surfaces — `doc_query` (session.cpp) and `validate_geom_query`
+(validate.cpp) — and deliberately NOT inside `resolve_geom_query`, whose 15+ internal
+callers feed it synthesized queries and resolved selector objects that a strict check
+would break. Vocabulary mirrors `cad_common.py`, including the readback fields
+(`sid`/`centroid`/`normal`/…), because a `describe_part` match object is legitimately
+pasted back into a query slot, and `doc_id`/`query`, because `libchudware.cpp`
+dispatches `params.contains("query") ? params["query"] : params`.
+
+Both riders of the dead key turned out NOT to be broken, which is why it survived. The
+Lamé bore selection scanned all 4 faces and let a Python-side `|radius − Ri|` test do
+the narrowing the query claimed to do — proven equivalent before touching it (old and
+new select a byte-identical faceset: cylinder r=20, axis +Z, 310 points; the case
+still solves at 1.97% of analytic `u_r(Ri)` against its own 8% self-fail threshold).
+`test_curved_faceset_covers_cylinder_exactly` took `matches[0]` of an unnarrowed
+3-face result and passed only because the barrel enumerates first. Same shape as the
+`component` key above: a test asserting through a key that never did anything. So the
+feared "the benchmark is pressurising the wrong faces" did NOT reproduce — the key was
+dead weight (3 wasted `doc_face_points` round-trips) and one refactor from being wrong.
+
+**The Eng. Firm dollar budget is gone.** It was fictional money.
+`estimate_task_tokens` is a word count (`domain_overhead + words*1.4 + tier/2` in,
+`tier_base + words*2` out), `tokens_to_usd` priced it at a hardcoded $3/1k, and
+`spent_usd` never saw a real token — `run.cpp` did `spent_usd += task_bid_usd`,
+accumulating the same estimates it checked against. On a subscription the number meant
+nothing. Against the shipped $25 default: "design a mounting plate with four holes"
+estimated $39.07, "two brackets that bolt together" $114.05, "route a PCB for an
+ESP32" $117.08 — each returning `status:"failed", stop_reason:"budget_exceeded"`
+BEFORE any task ran. Only a trivial request ("a simple washer", $18.79) got through.
+
+Firm selection stays (the winner seeds role prompts and per-task provider config, and
+a specialist wins on efficiency < 1); every dollar and every cost-based refusal goes —
+`Bid::usd`, `within_budget`, `tokens_to_usd`, `budget_usd`, `spent_usd`,
+`awarded_usd`, the mission-level and per-task aborts, the overspend check, the
+`companyBudgetUsd` setting with its Settings row, and the `budget_exceeded` stop
+reason. Bids rank in estimated TOKENS — a real unit of the thing estimated. The same
+five requests now all run and each picks the right specialist. `budget_exceeded`
+survives only in `core/solver`/`core/sketch`, an unrelated 10 ms solve deadline.
+
+Not touched: `tools/flywheel/bench/spend_guard.py`. It is a dev-only gate on Hunter's
+real subscription during live-model bench matrices, never in the product path, so it
+never stopped a user session — and its false-UNREADABLE bug was the WAL fix above.
+`services/agent/providers/token_usage.py` was checked and is pure accounting: it never
+raises and nothing enforces a cap from it. `max_tool_calls`/step caps are loop bounds,
+not token budgets, and are left alone.

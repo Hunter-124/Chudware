@@ -354,6 +354,46 @@ def test_extract_score_no_gouges_key_falls_through():
     assert score == pytest.approx(0.88)
 
 
+# ── Scalar metrics nested under `summary` (2026-08-04) ───────────────────────
+#
+# run_fea_static / _modal / the CFD tools return
+# {ok, doc_id, material, summary:{min_fos, max_von_mises_mpa, …}}. _extract_score
+# scanned ONLY the top level, matched nothing, and fell through to
+# `1.0 if ok else 0.0` — grading "the solver ran" instead of "the part passed".
+# Measured live: an 80x50x4 aluminium plate at 50 kN solves ok=True with
+# min_fos 0.9944 (a FAILING margin) and scored a perfect 1.0.
+
+
+def test_extract_score_reads_min_fos_nested_under_summary():
+    """A failing FoS must score on the FoS, not on "the solver returned ok"."""
+    from services.verify.battery import _extract_score
+    score, _ = _extract_score(
+        "run_fea_static", "scalar",
+        json.dumps({"ok": True, "doc_id": "doc-1",
+                    "summary": {"min_fos": 0.9944,
+                                "max_von_mises_mpa": 277.5624}}))
+    assert score == pytest.approx(0.9944 / 2.0)
+    assert score < 1.0, "a part below FoS 2.0 must not score a clean 1.0"
+
+
+def test_extract_score_top_level_metric_still_wins():
+    """Top level keeps precedence — tools that already flatten are untouched."""
+    from services.verify.battery import _extract_score
+    score, _ = _extract_score(
+        "run_fea_static", "scalar",
+        json.dumps({"ok": True, "min_fos": 4.0, "summary": {"min_fos": 0.5}}))
+    assert score == pytest.approx(1.0)
+
+
+def test_extract_score_string_summary_is_not_treated_as_metrics():
+    """`summary` is a human string on several checks — it must not be indexed."""
+    from services.verify.battery import _extract_score
+    score, _ = _extract_score(
+        "run_fea_static", "scalar",
+        json.dumps({"ok": True, "summary": "solved in 3 s"}))
+    assert score == pytest.approx(1.0)   # bare-ok fallback, no crash
+
+
 # ── T-BL23: _gap_is_manifold issues-list fix ─────────────────────────────────
 
 def test_gap_is_manifold_issues_free_edges_fails(monkeypatch):

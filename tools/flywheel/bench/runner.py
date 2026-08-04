@@ -54,7 +54,7 @@ def register(driver: BenchDriver) -> None:
 # Self-wiring: each bench module exposes a module-level `DRIVER = BenchDriver(...)`. Import
 # them tolerantly so the runner works whether or not every bench has landed yet (and so a
 # broken bench module never takes down the others).
-_BENCH_MODULES = ("elicitation", "spec_sketch", "cam", "vlm")
+_BENCH_MODULES = ("elicitation", "spec_sketch", "cam", "vlm", "advisor_e2e")
 for _name in _BENCH_MODULES:
     try:
         _mod = __import__(f"tools.flywheel.bench.benches.{_name}", fromlist=["DRIVER"])

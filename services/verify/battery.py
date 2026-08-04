@@ -1182,10 +1182,22 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tupl
                 except (TypeError, ValueError):
                     pass
             if not found:
+                # Scalar metrics may sit at the top level OR nested under
+                # `summary`. The sim tools (run_fea_static / _modal / cfd)
+                # return {ok, doc_id, material, summary:{min_fos, …}}, so a
+                # top-level-only scan matched NOTHING for them and fell through
+                # to the `ok` fallback below — scoring 1.0 for any solve that
+                # merely COMPLETED. Measured 2026-08-04: an 80x50x4 aluminium
+                # plate at 50 kN solves ok=True with min_fos 0.9944 (the part
+                # FAILS) and scored a perfect 1.0. That is the fabricated-success
+                # shape in the very check that gates mission done-ness.
+                _nested = r.get("summary")
+                _sources = [r, _nested] if isinstance(_nested, dict) else [r]
                 for key in ("match_pct", "score", "min_fos", "cd", "max_von_mises_mpa",
                             "coverage_ratio", "machined_fraction"):
-                    if key in r:
-                        val = r[key]
+                    src = next((s for s in _sources if key in s), None)
+                    if src is not None:
+                        val = src[key]
                         if key == "match_pct":
                             score = min(float(val) / 100.0, 1.0)
                         elif key == "min_fos":

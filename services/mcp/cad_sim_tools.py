@@ -749,7 +749,12 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         background : if True, return a job_id immediately and solve on a worker thread — poll
                      get_job(job_id). Use it for fine meshes that may exceed the call timeout.
 
-        Returns {max_von_mises_mpa, max_disp_mm, min_fos}. min_fos = yield / max stress; > 1 holds.
+        Returns {ok, doc_id, material, n_nodes, n_elems, mesh, summary:{...}} — the
+        scalars live under "summary", NOT at the top level: summary.min_fos,
+        summary.max_von_mises_mpa, summary.max_disp_mm (plus tresca/rankine/principal
+        variants). min_fos = yield / max stress; > 1 holds. min_fos saturates at a
+        15.0 cap, reported in "fos_note" — a capped value means "at least this", not
+        "exactly this".
         Tip: query_geometry(...) first to confirm your fixture/load faces resolve.
         """
         try:

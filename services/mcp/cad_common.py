@@ -2175,6 +2175,58 @@ def _resolve_material_name(material: Optional[str]) -> dict:
     )
 
 
+# The mechanical-property schema is {E_mpa, nu, density_g_cm3, yield_mpa} — one
+# capitalized key among lowercase siblings, which is a trap of our own making.
+# A model that writes the obvious `e_mpa` used to be told
+# "E_mpa must be > 0 (got 0.0)" about a material dict that was completely
+# correct. Observed live 2026-08-04 (k3-256k, T-W11 bracket):
+# {"name": "6061-T6", "e_mpa": 68900, "nu": 0.33, "yield_mpa": 276}.
+#
+# Case-fold every supplied key onto its canonical spelling, plus the handful of
+# unambiguous long-form aliases. Unknown keys are passed through untouched —
+# guessing at them is how you silently solve with the wrong modulus.
+_MATERIAL_KEY_ALIASES = {
+    "e": "E_mpa",
+    "e_mpa": "E_mpa",
+    "empa": "E_mpa",
+    "youngs_modulus_mpa": "E_mpa",
+    "young_modulus_mpa": "E_mpa",
+    "elastic_modulus_mpa": "E_mpa",
+    "nu": "nu",
+    "poisson": "nu",
+    "poissons_ratio": "nu",
+    "poisson_ratio": "nu",
+    "yield_mpa": "yield_mpa",
+    "yield_strength_mpa": "yield_mpa",
+    "sigma_y_mpa": "yield_mpa",
+    "density_g_cm3": "density_g_cm3",
+    "density": "density_g_cm3",
+    "rho_g_cm3": "density_g_cm3",
+}
+
+
+def _canonical_material_keys(material: dict) -> dict:
+    """Copy *material* with its property keys mapped to canonical spellings.
+
+    A caller-supplied dict is always copied so the shared table can never be
+    mutated. An explicit canonical key already present WINS over an alias, so a
+    dict carrying both never silently flips to the alias's value.
+    """
+    out: dict = {}
+    aliased: dict = {}
+    for key, value in material.items():
+        canon = _MATERIAL_KEY_ALIASES.get(str(key).strip().lower())
+        if canon is None:
+            out[key] = value
+        elif canon == key:
+            out[canon] = value
+        else:
+            aliased[canon] = value
+    for canon, value in aliased.items():
+        out.setdefault(canon, value)
+    return out
+
+
 def _resolve_material(material: Union[str, dict, None]) -> dict:
     """Resolve a material name or explicit dict to a validated properties dict.
 
@@ -2184,7 +2236,7 @@ def _resolve_material(material: Union[str, dict, None]) -> dict:
     entry is caught here rather than inside the C++ solver.
     """
     if isinstance(material, dict):
-        mat = dict(material)  # copy: caller-supplied dicts are returned as a new copy too
+        mat = _canonical_material_keys(material)
     else:
         mat = _resolve_material_name(material)
     # F4: validate that the resolved dict has physically plausible mechanical properties.

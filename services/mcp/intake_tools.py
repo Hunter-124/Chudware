@@ -43,6 +43,22 @@ def _dfm(method: str, params: dict):
     return r.get("result")
 
 
+def _canon_process(process: Optional[str]) -> Optional[str]:
+    """Accept the process words a human (or model) actually writes.
+
+    Delegates to the single alias table in ``services.agent.geometry_helpers``
+    rather than keeping a second copy here. Unknown words pass through so the
+    C++ "Unknown process 'x'. Known processes: [...]" teaching error still fires.
+    """
+    try:
+        from services.agent.geometry_helpers import (  # noqa: PLC0415
+            canonical_process_strict,
+        )
+        return canonical_process_strict(process)
+    except Exception:  # noqa: BLE001 — never let an alias lookup break a tool
+        return process
+
+
 # The oracle's DEFAULT_PROCESS (engine_oracle/dfm/process_profiles.py) — FDM is the prior.
 _DEFAULT_PROCESS = "fdm"
 
@@ -412,6 +428,7 @@ def register_intake_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            process = _canon_process(process)
             prof = _dfm("dfm_get_profile", {"process": process,
                                             "overrides": printer_overrides})
             if material:
@@ -432,7 +449,7 @@ def register_intake_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            proc = process or _process_id(d)
+            proc = _canon_process(process) or _process_id(d)
             prof = _dfm("dfm_get_profile", {"process": proc})
             params = prof.get("params", {})
             issues = []

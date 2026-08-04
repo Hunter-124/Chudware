@@ -273,3 +273,44 @@ class TestGeometryGateReadsLedger(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# ── Strict process aliasing (2026-08-04) ─────────────────────────────────────
+#
+# The mission said the bracket "will be machined". BOTH opus-5 and k3-256k
+# called set_process("machining") / dfm_check(process="machining") and were
+# refused with "Unknown process 'machining'" — while _PROCESS_ALIASES had known
+# that exact word all along. Nothing consulted it on the tool path.
+
+
+def test_canonical_process_strict_maps_the_words_models_use():
+    from services.agent.geometry_helpers import canonical_process_strict as c
+    assert c("machining") == "cnc_mill"
+    assert c("machined") == "cnc_mill"
+    assert c("turned") == "lathe"
+    assert c("3d printed") == "fdm"
+    assert c("MACHINING") == "cnc_mill"      # case/whitespace insensitive
+    assert c("  machining ") == "cnc_mill"
+
+
+def test_canonical_process_strict_passes_unknowns_through():
+    """Unlike canonical_process, an unknown word must NOT become 'fdm'.
+
+    Silently manufacturing for the wrong process is worse than refusing: the
+    caller's "Unknown process 'x'. Known processes: [...]" error has to survive.
+    """
+    from services.agent.geometry_helpers import (
+        canonical_process,
+        canonical_process_strict,
+    )
+    assert canonical_process_strict("bogus_process") == "bogus_process"
+    assert canonical_process_strict(None) is None
+    assert canonical_process_strict("") == ""
+    # the lenient variant still defaults, which is why the strict one exists
+    assert canonical_process("bogus_process") == "fdm"
+
+
+def test_canonical_ids_are_idempotent():
+    from services.agent.geometry_helpers import canonical_process_strict as c
+    for pid in ("fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"):
+        assert c(pid) == pid, pid

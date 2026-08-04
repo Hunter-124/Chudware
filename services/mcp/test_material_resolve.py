@@ -357,3 +357,45 @@ def test_family_word_needs_a_whole_word_match(monkeypatch):
     monkeypatch.setattr(_cc, "_ALLOY_DESIGNATIONS", {})
     with pytest.raises(ValueError):
         _cc._resolve_appearance("alloy of unknown type")
+
+
+# ── Material dict key spelling (2026-08-04) ──────────────────────────────────
+#
+# The schema is {E_mpa, nu, density_g_cm3, yield_mpa} — one capitalized key
+# among lowercase siblings. A model writing the obvious `e_mpa` was told
+# "E_mpa must be > 0 (got 0.0)" about a dict that was entirely correct.
+# Observed live (k3-256k, T-W11 bracket):
+#   {"name": "6061-T6", "e_mpa": 68900, "nu": 0.33, "yield_mpa": 276}
+
+
+def test_lowercase_e_mpa_is_accepted():
+    from services.mcp.cad_common import _resolve_material
+    mat = _resolve_material(
+        {"name": "6061-T6", "e_mpa": 68900, "nu": 0.33, "yield_mpa": 276})
+    assert mat["E_mpa"] == 68900
+    assert mat["nu"] == 0.33
+    assert mat["yield_mpa"] == 276
+    assert mat["name"] == "6061-T6"          # unknown keys pass through
+
+
+def test_longform_property_aliases_are_accepted():
+    from services.mcp.cad_common import _resolve_material
+    mat = _resolve_material({"youngs_modulus_mpa": 70000,
+                             "poissons_ratio": 0.33, "density": 2.7})
+    assert mat["E_mpa"] == 70000
+    assert mat["nu"] == 0.33
+    assert mat["density_g_cm3"] == 2.7
+
+
+def test_canonical_key_wins_over_an_alias():
+    """A dict carrying both spellings must never silently flip to the alias."""
+    from services.mcp.cad_common import _resolve_material
+    mat = _resolve_material({"E_mpa": 70000, "e_mpa": 1.0, "nu": 0.33})
+    assert mat["E_mpa"] == 70000
+
+
+def test_a_genuinely_zero_modulus_is_still_rejected():
+    """Canonicalizing keys must not soften the physical validation."""
+    from services.mcp.cad_common import _resolve_material
+    with pytest.raises(ValueError, match="E_mpa must be > 0"):
+        _resolve_material({"e_mpa": 0, "nu": 0.33})

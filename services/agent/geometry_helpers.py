@@ -53,6 +53,26 @@ def canonical_process(process: Optional[str]) -> str:
     return _PROCESS_ALIASES.get(key, key if key in _KNOWN_PROFILE_IDS() else "fdm")
 
 
+def canonical_process_strict(process: Optional[str]) -> Optional[str]:
+    """Map a known process alias to its canonical id; pass anything else through.
+
+    :func:`canonical_process` defaults an unrecognized word to ``fdm``, which is
+    right for a profile lookup that must always produce something but WRONG for
+    a tool argument: silently manufacturing for the wrong process is worse than
+    refusing. This variant maps only what it actually knows and returns the
+    input untouched otherwise, so the caller's existing "Unknown process 'x'.
+    Known processes: [...]" teaching error still fires for a genuine typo.
+
+    Live 2026-08-04 (T-W11 bracket, BOTH opus-5 and k3-256k): the mission says
+    the part "will be machined", and both models called
+    ``set_process("machining")`` / ``dfm_check(process="machining")``. The alias
+    table below already knew that word — nothing consulted it.
+    """
+    if not process:
+        return process
+    return _PROCESS_ALIASES.get(process.strip().lower(), process)
+
+
 def _KNOWN_PROFILE_IDS() -> set[str]:
     """The DfM process ids, from the C++ core (core/dfm, ``dfm_known_processes``);
     the literal set is the offline fallback when no engine bridge is up."""

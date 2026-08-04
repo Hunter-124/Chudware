@@ -2,8 +2,8 @@
 id: T-R5
 title: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)
 workstream: R
-owner: fable-quill
-status: todo
+owner: hunter
+status: done
 branch: task/T-R5-plm-editor-gui
 depends_on: [T-R2, T-R3, T-U1]
 lane: plm-projects
@@ -11,16 +11,16 @@ kind: new
 priority: 3
 ---
 
-> **2026-08-04 reality check.** This card read `doing` with an owner, but no work is
-> in flight and the panel is NOT in the tree. It shipped into the legacy `ui/imgui`
-> shell (`c51030e7` "in-editor PLM strip at the bottom of the Feature Manager",
-> plus `19c10666` and the `f5a7b876` merge) and was destroyed on 2026-07-06 by
-> `14d7e85f`, which deleted `ui/imgui` in favour of `host/`. It was never ported.
->
-> This is a PORT, not a rewrite: recover the strip with
-> `git show c51030e7` and re-land it against the `host/` Feature Manager. Re-check
-> the T-U1 style-conformance requirements below against `host/`'s current theme
-> helpers before starting — the glass/elevation API changed with the move.
+> **2026-08-04 closed.** Delivered in `host/`. An earlier audit today looked for the
+> legacy `ui/imgui` PLM strip, found it gone, and wrongly reported the whole card
+> unbuilt — the deleted shell's implementation is not the only implementation. It
+> was rebuilt natively under `host/src/ui/plm/`:
+> `plm_quickbar.{h,cpp}` is the per-document in-editor control for EVERY workspace
+> (revision + lifecycle chip with unsaved dot in the status bar, popover to
+> Checkpoint / Release / open the Project Hub, silent auto-branch to a new-revision
+> draft when a Released document is edited, with a "Discard draft" toast);
+> `plm_compare.{h,cpp}` is the compare view; `plm_overview.cpp` renders the history
+> timeline off the `plm_history` / `plm_timeline` RPCs, including AI checkpoints.
 
 ## Context
 

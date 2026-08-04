@@ -123,7 +123,7 @@ graph TD
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
     T_G10["T-G10: Chudware rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::done
     T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code — CLOSED AS REVERSED"]:::done
-    T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::blocked
+    T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::dropped
     T_G13["T-G13: Fix issue 7 (scenario deadlock) - ScenarioRunner step-machine scenarios deadlock offscreen"]:::done
     T_G14["T-G14: Dark-mode readability + popup/subwindow correctness (black-on-black text, transparent borders, evaluate window sizing)"]:::done
     T_G15["T-G15: Screenshot-based icon pipeline + broken/missing icon fixes (ribbon-wide icon regeneration)"]:::done
@@ -183,7 +183,7 @@ graph TD
     T_R2["T-R2: PLM vault core - services/plm/ engine, auto-history, checkpoint/release/restore, plm_* MCP tools"]:::done
     T_R3["T-R3: PLM change intelligence - plain-language summaries, AI-assist/AI-managed tiers, compare views"]:::done
     T_R4["T-R4: PLM items & releases - part numbers, rev letters, release pinning + BOM freeze, where-used"]:::done
-    T_R5["T-R5: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)"]:::todo
+    T_R5["T-R5: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)"]:::done
     T_R6["T-R6: PLM Project Hub - full-screen master workspace (item grid, activity, release board, where-used, Copilot dock)"]:::todo
     T_R7["T-R7: PLM sharing & team sync v1 - remote profiles, one-button Sync, advisory locks, copy-as-variant conflicts"]:::todo
     T_R8["T-R8: Self-hosted PLM server + live co-editing — two people in the same part, no locks"]:::todo
@@ -365,7 +365,7 @@ graph TD
     T_BL33["T-BL33: Dark-mode GUI residual — FM plane-row text + hover-action tooltips black-on-black (issue"]:::done
     T_BL34["T-BL34: Icon pipeline v2 — color the preview-render models + annotate operation intent over the tiles"]:::review
     T_BL35["T-BL35: Surfaces — surf_revolve axis well rejects datum axis (K_EDGE→K_EDGEAXIS) + gate readyForPreview on the axis well"]:::review
-    T_BL36["T-BL36: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted"]:::todo
+    T_BL36["T-BL36: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted"]:::done
     T_BL37["T-BL37: Origin as a selectable, renderable reference point — FM selectable + viewport point render + engine ref-resolution"]:::done
     T_BL38["T-BL38: Copilot context bar — auto-track selected model's context window, place between model picker and send, constrain picker width, k-token count + click-through breakdown"]:::done
     T_BL39["T-BL39: Copilot messages — remove the 'Assistant'/'Hi! Describe a part…' greeting, show the generating model(s) as attribution, compact the user/model display"]:::done

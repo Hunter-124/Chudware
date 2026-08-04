@@ -2,8 +2,8 @@
 id: T-BL36
 title: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted
 workstream: backlog
-owner: opus-sweep
-status: todo
+owner: hunter
+status: done
 priority: 3
 lane: app-gui
 kind: overhaul
@@ -11,18 +11,16 @@ depends_on: []
 branch: task/T-BL36-fm-animated-selection-border
 ---
 
-> **2026-08-04 reality check.** This card read `review`, but the feature is NOT in
-> the tree. It genuinely shipped in `e17cad0e` (2026-07-06) as `fmAnimatedBorder()`
-> in `ui/imgui/src/ui/feature_tree.cpp` — and `14d7e85f`, later the same day,
-> deleted the whole legacy `ui/imgui` shell in favour of `host/`. The
-> implementation went with it. `grep fmAnimatedBorder` across `host/` and `core/`
-> returns zero hits today; `host/src/ui/feature_tree.cpp` still paints the old
-> static hover-only row.
->
-> This is a PORT, not a rewrite: recover the implementation with
-> `git show e17cad0e -- ui/imgui/src/ui/feature_tree.cpp` and re-land it against
-> `host/src/ui/feature_tree.cpp`. Reference screenshots are also in that commit
-> (`docs/sessions/assets/bl36_*.png`).
+> **2026-08-04 closed.** Delivered in `host/`. An earlier audit today searched for
+> the legacy symbol `fmAnimatedBorder` (from the deleted `ui/imgui` shell), found
+> nothing, and wrongly reported the feature missing — absence of the old NAME is
+> not absence of the feature. It was rebuilt natively: `fmRowPill()` at
+> `host/src/ui/feature_tree.cpp:224` paints the frosted row pill and
+> `host/src/ui/feature_tree.cpp:237-238` states the deliverable outright —
+> "selection is now the glow border below (never the old blue accent card/vertical
+> bar)" — with `fmRowHoverPaint()` (:188) drawing the rounded border on hover.
+> That is exactly this card: left vertical bar gone, animated border around the row
+> background pill.
 
 ## Context
 

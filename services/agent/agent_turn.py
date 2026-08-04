@@ -809,6 +809,17 @@ def _delegate_actually_ran(call: dict) -> bool:
         return True
     if res.get("executed") is False or res.get("subagent_status") == "not_run":
         return False
+    # A REFUSED spawn is not work either. Live 2026-08-04 (run lane-delegate-2): the
+    # second of two requested parts came back
+    #   {"error": "parent node 'dg_…' is in status 'revoked'; can only delegate from
+    #    approved/running nodes", "status": "failed"}
+    # with no `executed` key at all, so this returned True and a spawn that never
+    # happened counted towards the turn having done real work. That run survived
+    # because the model went on to build the part itself, but a turn whose ONLY call
+    # is a refused delegate could still close `confirmed` on a fabricated summary —
+    # exactly the hole the executed/not_run checks above were added to plug.
+    if res.get("status") == "failed" or res.get("error"):
+        return False
     return True
 
 
@@ -4313,6 +4324,15 @@ def _normalize_directive(obj: dict) -> dict:
     """
     if not isinstance(obj, dict) or obj.get("done") or "handoff" in obj:
         return obj
+    # Live 2026-08-04 (claude-sonnet-5, run lane-delegate-1): the model published
+    # its plan as the BARE payload `{"task_list": {"items": [...], "title": ...}}`
+    # rather than the `{"tool": "task_list", "args": {...}}` wrapper — the same
+    # flat-dialect slip this function already absorbs for ordinary calls. Left
+    # unfolded it is not a directive at all, so the turn ended on it and the real
+    # tool call in the NEXT fence was discarded (see _parse_directive). The inner
+    # dict is already exactly task_list's kwargs (items/title/summary/shape).
+    if len(obj) == 1 and isinstance(obj.get("task_list"), dict):
+        return {"tool": "task_list", "args": dict(obj["task_list"])}
     tool = None
     for key in ("tool", "tool_name", "toolname", "name", "function"):
         value = obj.get(key)
@@ -4369,11 +4389,39 @@ def _parse_directive(reply: str) -> dict | None:
             brace = stripped.find("{", fence)
             if brace != -1:
                 candidates.append(stripped[brace:])
+    # Scan EVERY fenced candidate for a real directive rather than stopping at the
+    # first block that merely parses as JSON. Live 2026-08-04 (claude-sonnet-5, run
+    # lane-delegate-1): the reply was a plan block followed by a second fence
+    # carrying `{"tool": "delegate", ...}` for the second of two requested parts.
+    # The plan block parsed, carried no `tool`, and was returned as-is — so the
+    # delegate never ran, half the deliverable was silently dropped, and the turn
+    # still closed `success=confirmed`. A non-directive object is still returned
+    # (last resort) so the junk-JSON floor keeps its behaviour, but never in
+    # preference to an actual tool call or finish envelope that follows it.
+    fallback: dict | None = None
     for cand in candidates:
         obj = _loads_first_object(cand)
-        if obj is not None:
-            return _normalize_directive(obj)
+        if obj is None:
+            continue
+        norm = _normalize_directive(obj)
+        if _is_directive(norm):
+            return norm
+        if fallback is None:
+            fallback = norm
+    if fallback is not None:
+        return fallback
     return _parse_text_tool_call(reply)
+
+
+def _is_directive(obj: Any) -> bool:
+    """True when *obj* is an actionable directive: a tool call or a finish
+    envelope (``done``/``handoff``, or the role handoff's ``status``)."""
+    if not isinstance(obj, dict):
+        return False
+    tool = obj.get("tool")
+    if isinstance(tool, str) and tool.strip():
+        return True
+    return bool(obj.get("done")) or "handoff" in obj or "status" in obj
 
 
 _TEXT_TOOL_CALL_RE = re.compile(

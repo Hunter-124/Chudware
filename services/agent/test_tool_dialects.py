@@ -74,6 +74,76 @@ class TestDirectiveDialects:
         assert _normalize_directive({"status": "thinking"}) == {"status": "thinking"}
 
 
+class TestDirectiveIsNotDroppedByALeadingPlanBlock:
+    """Found live 2026-08-04 with claude-sonnet-5 on the general lane (run
+    ``lane-delegate-1``), asked to delegate TWO parts to modelling sub-agents.
+
+    The model replied with its plan as a bare ``{"task_list": {...}}`` fence
+    followed by a second fence carrying ``{"tool": "delegate", ...}`` for the
+    second part. ``_parse_directive`` returned the FIRST block that merely parsed
+    as JSON — the plan — which carries no ``tool``, so the delegate never ran.
+    One of the two parts was silently dropped and the turn still closed
+    ``success=True stop_reason=confirmed`` while its own task list still read
+    ``"Delegate Part B" : running``.
+    """
+
+    #: The reply shape, reduced from the live trace.
+    LIVE_REPLY = (
+        '```json\n'
+        '{"task_list": {"items": ['
+        '{"id": "1", "text": "Publish task list", "status": "done"},'
+        '{"id": "3", "text": "Delegate Part B", "status": "running"}'
+        '], "title": "Bolted joint"}}\n'
+        '```\n\n'
+        '```json\n'
+        '{"tool": "delegate", "args": {"role": "model3d", "brief": "Create CoverB"}}\n'
+        '```\n'
+    )
+
+    def test_a_later_tool_call_is_not_lost_behind_a_non_directive_block(self):
+        """A non-directive first fence must never shadow a real call after it."""
+        reply = (
+            '```json\n{"note": "thinking about the plate"}\n```\n\n'
+            '```json\n{"tool": "delegate", "args": {"role": "model3d"}}\n```\n'
+        )
+        d = _parse_directive(reply)
+        assert d["tool"] == "delegate"
+        assert d["args"] == {"role": "model3d"}
+
+    def test_a_later_finish_envelope_is_not_lost_either(self):
+        reply = ('```json\n{"note": "n"}\n```\n\n'
+                 '```json\n{"done": true, "handoff": {"summary": "s"}}\n```\n')
+        d = _parse_directive(reply)
+        assert d.get("done") is True
+
+    def test_the_live_reply_yields_an_actionable_directive(self):
+        """Whatever we do with the plan, the turn must not end on a block that
+        cannot be dispatched — the failure mode was a non-directive finish."""
+        from services.agent.agent_turn import _is_directive
+
+        d = _parse_directive(self.LIVE_REPLY)
+        assert _is_directive(d), d
+
+    def test_a_bare_task_list_payload_becomes_a_task_list_call(self):
+        """The plan itself is not lost: the bare payload is the flat dialect of a
+        ``task_list`` call, and its inner dict is already that tool's kwargs."""
+        d = _parse_directive(self.LIVE_REPLY)
+        assert d["tool"] == "task_list"
+        assert [i["id"] for i in d["args"]["items"]] == ["1", "3"]
+        assert d["args"]["title"] == "Bolted joint"
+
+    def test_junk_only_reply_still_reaches_the_junk_json_floor(self):
+        """No regression for mega-24c: with no directive anywhere, the first
+        parsed object is still returned so the floor can classify it."""
+        d = _parse_directive('```json\n{"foo": 1}\n```')
+        assert d == {"foo": 1}
+
+    def test_task_list_key_inside_a_finish_envelope_is_not_hijacked(self):
+        d = _parse_directive(
+            '```json\n{"done": true, "task_list": {"items": []}}\n```')
+        assert d.get("done") is True and "tool" not in d
+
+
 class TestMissingArgumentErrors:
     def test_empty_call_names_the_tool_and_the_missing_field(self):
         r = _dispatch_tool("fs_read", {})

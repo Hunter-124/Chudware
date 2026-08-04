@@ -2943,6 +2943,32 @@ def test_malformed_vector_selector_for_axis_also_snaps():
     assert feat["refs"]["axis"] == "axis.z"
 
 
+@pytest.mark.parametrize("wrapper", [
+    {"origin": [0, 0, 0], "direction": [0, 0, 1]},
+    {"direction": [0, 0, 1]},
+    {"vector": [0, 0, 1]},
+    {"kind": "axis", "axis": [0, 0, 1]},
+])
+def test_a_direction_wrapper_for_axis_also_snaps(wrapper):
+    """Live 2026-08-04: a revolve arrived with refs.axis={"origin":…,"direction":[0,0,1]}
+    and died on «refs.axis.kind: absent not in […]», which says nothing about the
+    direction it DID supply. `origin` is ignored on purpose — a reserved axis passes
+    through the world origin, so honouring an offset would be a lie."""
+    feat = M._normalize_feature_refs(
+        {"type": "revolve", "name": "R",
+         "refs": {"profile": [{"kind": "region", "sketch": "f1"}], "axis": dict(wrapper)},
+         "params": {"angle": 360}}, "revolve", [])
+    assert feat["refs"]["axis"] == "axis.z", feat
+
+
+def test_an_origin_with_no_direction_is_left_for_the_engine():
+    feat = {"type": "revolve", "name": "R",
+            "refs": {"profile": [{"kind": "region", "sketch": "f1"}],
+                     "axis": {"origin": [0, 0, 0]}},
+            "params": {"angle": 360}}
+    assert M._normalize_feature_refs(feat, "revolve", []) is feat
+
+
 def test_zero_vector_axis_is_left_for_the_engine():
     """No dominant component -> nothing unambiguous to snap to; leave the engine's error."""
     feat = {"type": "circular_pattern", "name": "P",

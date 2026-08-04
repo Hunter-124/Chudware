@@ -4426,9 +4426,17 @@ def _axis_vector_to_datum(v: Any) -> Optional[str]:
         if all(_is_num(v.get(k)) for k in ("x", "y", "z")):
             vec = [float(v["x"]), float(v["y"]), float(v["z"])]
         else:
-            c = v.get("centroid")
-            if isinstance(c, (list, tuple)) and len(c) == 3 and all(_is_num(x) for x in c):
-                vec = [float(x) for x in c]
+            # The wrappers a model actually writes around a direction. `centroid` is the
+            # pseudo-selector shape; the rest are the plain-English ones — live
+            # 2026-08-04 a revolve arrived with refs.axis={"origin":[…],"direction":[0,0,1]}
+            # and died on «refs.axis.kind: absent not in [...]», which says nothing about
+            # the direction it did supply. `origin` is IGNORED on purpose: a reserved axis
+            # passes through the world origin, so honouring an offset would be a lie.
+            for key in ("centroid", "direction", "dir", "vector", "axis"):
+                c = v.get(key)
+                if isinstance(c, (list, tuple)) and len(c) == 3 and all(_is_num(x) for x in c):
+                    vec = [float(x) for x in c]
+                    break
     if vec is None or not any(vec):
         return None
     dominant = max(range(3), key=lambda i: abs(vec[i]))

@@ -281,3 +281,52 @@ def test_a_failed_registry_import_is_never_cached(monkeypatch):
     second = at._server_tools()          # import now succeeds
     assert second, "the retry must repopulate the registry"
     assert "new_part" in second
+
+
+# ---------------------------------------------------------------------------
+# verify_battery CHECK names are not tools, and are not harness bugs either
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", [
+    "is_manifold", "eval_check", "round_trip", "groundedness",
+    "dim_coverage", "layout_coverage", "unit_sanity", "req_join",
+])
+def test_battery_only_check_redirects_to_verify_battery(name):
+    """These eight live in ``battery.CHECKS`` and nowhere in the tool registry.
+
+    ``_known_tool_names()`` unions the check table in so an invented name can be
+    told from a real one, which used to route every one of them into the
+    "ADVERTISED to you but could not be resolved" branch with
+    ``harness_bug: True``. That is wrong twice over: nothing advertises them as
+    tools, and the capability is one ``verify_battery`` call away — so the model
+    was told to stop trying, and the bench corpus collected a fake harness gap.
+    """
+    from services.verify.battery import CHECKS
+
+    assert name in CHECKS and at._bind_tool(name) is None
+    err = at._unresolved_tool_error(name)
+    assert err["status"] == "unknown_tool"
+    assert err.get("harness_bug") is None
+    assert "could not be resolved" not in err["error"]
+    assert f"checks=['{name}']" in err["hint"]
+    assert "verify_battery" in err["error"]
+
+
+def test_battery_check_alias_names_the_canonical_check():
+    """``watertight``/``manifold`` are battery aliases for ``is_manifold``."""
+    err = at._unresolved_tool_error("watertight")
+    assert err["status"] == "unknown_tool"
+    assert "is_manifold" in err["hint"]
+
+
+def test_a_check_that_is_also_a_real_tool_is_left_alone():
+    """``measure_part`` is both a battery check and a bindable tool.
+
+    The redirect must never fire for those — it would talk a model out of a
+    tool that works.
+    """
+    from services.verify.battery import CHECKS
+
+    assert "measure_part" in CHECKS
+    assert at._bind_tool("measure_part") is not None
+    assert at._battery_only_check("measure_part") is None

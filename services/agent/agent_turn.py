@@ -4776,6 +4776,28 @@ def _is_mission_scoped_tool(tool: str) -> bool:
     return False
 
 
+def _battery_only_check(tool: str) -> str | None:
+    """The verify_battery check *tool* names, when it is a check and NOT a tool.
+
+    ``_known_tool_names()`` unions the battery's check table in so an invented
+    name can be told apart from a real one. Eight of those checks
+    (is_manifold, eval_check, round_trip, groundedness, dim_coverage,
+    layout_coverage, unit_sanity, req_join) have no tool of their own — they
+    only run inside ``verify_battery``. Dispatching one used to fall into the
+    "advertised but unbound" branch and answer ``harness_bug: True``, which
+    tells the model to stop trying and files a fake harness gap in the bench
+    corpus. It is neither: the capability exists, under one call away.
+    """
+    try:
+        from services.verify.battery import CHECKS, CHECK_ALIASES  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    name = CHECK_ALIASES.get(tool, tool)
+    if name not in CHECKS:
+        return None
+    return None if name in _server_tools() else name
+
+
 def _unresolved_tool_error(tool: str) -> dict:
     """Teaching error for a tool nothing could bind.
 
@@ -4796,6 +4818,21 @@ def _unresolved_tool_error(tool: str) -> dict:
     # pointed at an unrelated tool is worse than no suggestion.
     strong = difflib.get_close_matches(folded, pool, n=1, cutoff=0.8)
     redirect = _CONCEPT_REDIRECTS.get(folded)
+    check = _battery_only_check(tool)
+    if check is not None:
+        return {
+            "ok": False,
+            "status": "unknown_tool",
+            "error": (
+                f"there is no '{tool}' tool — the call was NOT made. '{check}' is "
+                f"a verify_battery CHECK, not a tool of its own. Run it with "
+                f"verify_battery(doc_id=…, checks=['{check}']), which returns "
+                f"{{scores, findings}} for exactly that check. "
+                f"check_metadata() lists every check name."
+            ),
+            "closest_tools": close,
+            "hint": f"verify_battery(doc_id=…, checks=['{check}'])",
+        }
     if tool in server and server[tool] is None:
         return {
             "ok": False,

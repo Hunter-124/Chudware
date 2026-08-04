@@ -6299,3 +6299,64 @@ never stopped a user session — and its false-UNREADABLE bug was the WAL fix ab
 `services/agent/providers/token_usage.py` was checked and is pure accounting: it never
 raises and nothing enforces a cap from it. `max_tool_calls`/step caps are loop bounds,
 not token budgets, and are left alone.
+
+## 2026-08-04 — standard agent + role sub-agent lane, live on Claude
+
+Live sweep of the general lane (`agent_admin_turn` → `run_linear_role_turn`) with
+claude-sonnet-5, deliberately NOT eng_firm. Whole session cost ~1% of the weekly
+subscription (8% → 9%), because every defect below was reduced to a free repro before
+anything was changed.
+
+Inline lane is healthy: "40 mm cube, 10 mm through hole, tell me the volume" ran
+`enable_tools → new_part → add_features → measure_part → verify_battery`, streamed 45
+deltas, and reported 60858.4073464102 mm³ against an analytic 60858.4073465 — 9 s.f.
+
+**A plan block swallowed the tool call after it.** Asked for two parts via sub-agents,
+the model replied with a bare ```json {"task_list": …} fence THEN a second fence with
+`{"tool":"delegate"}` for Part B. `_parse_directive` returned the first candidate that
+merely parsed as a dict — the plan, which carries no `tool` — so Part B never ran and the
+turn still closed `success=confirmed` while its own handoff read "Delegate Part B":
+running. Fixed twice over: the parser now scans EVERY fence for an actionable directive
+(tool call or done/handoff/status envelope), falling back to a non-directive object only
+as a last resort so the mega-24c junk floor is unchanged; and `_normalize_directive`
+folds the bare `{"task_list": {…}}` payload onto a real `task_list` call, since its inner
+dict is already that tool's kwargs and the lane does grant the tool
+(`_apply_session_preferences`, default preference "encourage"). Re-run: 17 calls instead
+of 2, four task_list revisions tracking pending→running→done, a `feature_modeler`
+sub-agent spawned and built Part A, both parts delivered at 18652.61 mm³ (exact).
+
+**One sub-agent spent the entire delegation budget.** That re-run then exposed the next
+layer: the second delegate returned "parent node … is in status 'revoked'". `accrue()`
+charges a child's spend to every ancestor and revokes any whose remaining budget hits
+zero (contract §12) — and the root grant was 50_000 tokens while ONE real sub-agent part
+build costs ~100k (measured 101,772 for 8 completions; providers resend the whole context
+every call). So the first child always revoked the root and every sibling delegation was
+refused; multi-sub-agent work was structurally impossible. Reproduced offline for free.
+The §12 mechanism is right and is untouched — the three tests asserting root revocation
+still pass, and an explicit 50_000 grant still revokes on a 60_000 spend — the GRANT was
+simply two orders of magnitude too small. Also `_delegate_actually_ran` counted that
+refusal as real work (the envelope was `{"error": …, "status": "failed"}` with no
+`executed` key), so a turn whose only call is a refused spawn could have closed
+`confirmed`.
+
+**doc_bbox measured the display mesh.** The inline run reported `bbox_mm: [40.0, 40.0,
+40.012]` for a 40 mm cube. `BRepBndLib::AddOptimal` defaults `useTriangulation` to TRUE,
+so the box came from the cached tessellation plus its deflection: a cylinder r5 h40 read
+[10.0062156, 10.0093228, 40.012431] while its volume was exact to 1e-11 — x != y is the
+tell. Not cosmetic: doc_bbox also supplies make_standard_part's placement datum.
+`sim_bbox_diag` fixes the same problem with `BRepTools::Clean`, but that MUTATES the
+shape and doc_bbox is on hostd's read-only RPC allowlist, so we ignore the mesh instead
+(analytic bounds are exact for plane/cylinder/cone/sphere/torus) and `SetGap(0)` drops
+the residual 2e-7. Now exact on box/cylinder/sphere/blind-hole/through-hole, asserted at
+epsilon 1e-12 — deliberately tight, since a loose epsilon is what let this through.
+
+Checked and deliberately NOT changed: `doc_apply_ops`'s `volume` is ~0.003–0.009% off the
+analytic value, but `document.cpp` documents that as a profiled 3× speedup with error
+≪0.1%, "display/stats only; mass eval still uses exact VolumeProperties", and
+test_document.cpp already asserts it at epsilon 0.02. Real remaining nit, for a future
+card: the `add_features` response calls that field `volume_mm3` with nothing marking it
+approximate, so a model can report it as a measurement — the inline run's own
+`add_features` said 60863.61 where the truth was 60858.41. Also seen once and left alone:
+`interface_check` rejecting `other_doc_id` (dialect gap; the harness named it correctly
+and the model recovered), and a child node that outspends its grant being labelled
+`revoked` after finishing its work rather than `done` (audit-trail cosmetics).

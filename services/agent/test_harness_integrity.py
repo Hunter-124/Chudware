@@ -48,9 +48,16 @@ def _role_ids() -> list[str]:
 def test_every_role_card_tool_actually_resolves():
     """The anti-drift gate for the whole 'advertised but dead' bug class.
 
-    Resolution is checked through the REAL dispatch path (reviewer_exec).
-    A glob over services/mcp/*_tools.py is not evidence: org_tools.py matched
-    such a glob for months while nothing ever registered it, so
+    Resolution is checked through the REAL dispatch path — ``agent_turn._bind_tool``,
+    which is what an agent turn actually calls. It has three tiers:
+    ``reviewer_exec._resolve_fn`` (battery singleton + curated modules), the full
+    MCP server registry, and the two in-process tools that are not MCP callables
+    (``ask_user``, ``design_recipe``). Asserting on tier 1 alone under-reports
+    resolution and flagged ``design_recipe`` as dead while every real call to it
+    succeeded.
+
+    A glob over services/mcp/*_tools.py is not evidence either: org_tools.py
+    matched such a glob for months while nothing ever registered it, so
     channel_send/request_resolve/council_convene were advertised to
     department_manager and failed every call. Same for general_agent's own
     mission_start, cam_programmer's cam_audit, and orchestrator's dag_run.
@@ -64,7 +71,7 @@ def test_every_role_card_tool_actually_resolves():
         for tool in card.concrete_tools:
             if tool in _MISSION_SCOPED or tool in _META_TOOLS:
                 continue
-            if rx._resolve_fn(tool) is None:
+            if at._bind_tool(tool) is None:
                 dead.setdefault(tool, []).append(rid)
     assert not dead, (
         "role cards advertise tools that resolve nowhere — every call fails "

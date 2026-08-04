@@ -4,12 +4,24 @@ goal: Handle general work directly in ONE free turn — file/disk organization, 
 stage_scope: [deliver]
 playbook_default: null
 tool_allowlist:
-  - tool: run_shell
+  # SEAT BUDGET (MAX_TOOLS_PER_ROLE = 14) — this list is exactly 14.
+  #
+  # `family: plm` used to sit at the tail here, and family expansion fills the
+  # remaining seats ALPHABETICALLY: plm_checkpoint, plm_init, plm_item_add,
+  # plm_item_set, plm_link_repo, plm_open, plm_plan, plm_release, plm_save. With
+  # only three seats left it granted plm_init/plm_open/plm_save and silently
+  # dropped plm_item_add and plm_checkpoint — while the prompt below told the
+  # model to register and checkpoint its work and the handoff schema demanded
+  # plm_registered / checkpoint_commit as evidence. Naming the four PLM tools
+  # this role actually promises makes the grant deterministic instead of a
+  # side effect of alphabetical order.
+  #
+  # run_shell and the fs_* tools are NOT listed: they come from the always-on
+  # main-agent floor (copilot_mode_tools.AGENT_DEFAULT_TOOLS), which
+  # run_linear_role_turn unions into the offered set. Do not spend a seat on a
+  # floor tool — check contracts/copilot_modes.json first.
+  # task_list is granted by mission_dispatch._apply_session_preferences.
   - tool: ask_user
-  # task_list is granted by mission_dispatch._apply_session_preferences, not a
-  # seat here: MAX_TOOLS_PER_ROLE is 14 and explicit tool: entries win seats
-  # before family expansions, so a seat for it evicted plm_checkpoint off the
-  # tail of family: plm (the model could plan but no longer checkpoint).
   - tool: enable_tools
   - tool: list_tool_categories
   - tool: design_recipe
@@ -19,7 +31,10 @@ tool_allowlist:
   - tool: describe_project
   - tool: list_parts
   - tool: research_web_search
-  - family: plm
+  - tool: plm_open
+  - tool: plm_item_add
+  - tool: plm_save
+  - tool: plm_checkpoint
 context_recipe:
   ledger_tokens: 400
   describers: []
@@ -52,8 +67,8 @@ system_prompt: |
     `mkdir -p`, `cp`, …). Every path stays inside the project's
     CHUDWARE_FS_ROOT jail — a path outside it is refused by the tool; do not
     improvise around it.
-  - PLM / project history: plm_open, plm_status, plm_item_add, plm_save,
-    plm_checkpoint — register and checkpoint what you changed so it is tracked.
+  - PLM / project history: plm_open, plm_item_add, plm_save, plm_checkpoint —
+    register and checkpoint what you changed so it is tracked.
   - Inspect & orient: describe_project, list_parts, workspace_status.
   - Research: research_web_search (and the shared research/fetch floor).
   - ask_user when a choice is genuinely ambiguous or could destroy work.

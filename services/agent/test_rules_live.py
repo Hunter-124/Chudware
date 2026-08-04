@@ -207,7 +207,8 @@ def test_request_keyword_fires_rule_and_emits_one_event(user_dir, monkeypatch):
     p = fires[0]
     assert p["source"] == "rule"
     assert p["rule_id"] == "thread_mention"
-    assert p["label"] == "Thread mention"
+    # Curated title from triggers._RULE_METADATA, not the id-as-prose fallback.
+    assert p["label"] == "Thread sizing"
     assert p["matched"]
     assert p["matched"].lower() in first.lower()
     assert isinstance(p["token_est"], int) and p["token_est"] > 0

@@ -2281,10 +2281,22 @@ def run_linear_role_turn(
     """
     from services.agent import agent_turn as _at
     from services.agent.roles import load_role
-    from services.agent.copilot_mode_tools import SUBAGENT_DEFAULT_TOOLS
+    from services.agent.copilot_mode_tools import (
+        AGENT_DEFAULT_TOOLS,
+        SUBAGENT_DEFAULT_TOOLS,
+    )
 
     card = load_role(role)
-    allowed = sorted(set(card.concrete_tools) | SUBAGENT_DEFAULT_TOOLS)
+    # Union the MAIN-agent file/shell floor too, not just the sub-agent one.
+    # `Role.set_policy` already permits AGENT_DEFAULT_TOOLS at the dispatch gate,
+    # so advertising only SUBAGENT_DEFAULT_TOOLS left this lane able to call
+    # run_shell but never TOLD about it — the mirror of the "advertised but dead"
+    # bug: permitted but unoffered. SHARED_DEFAULT_TOOLS is deliberately NOT
+    # unioned: it carries the doc-lifecycle/modeling tools (new_part, save_part,
+    # …) and the general lane must stay non-modeling until the model pulls a pack
+    # with enable_tools.
+    allowed = sorted(set(card.concrete_tools) | SUBAGENT_DEFAULT_TOOLS
+                     | AGENT_DEFAULT_TOOLS)
     try:
         from services.agent.config import bugreport_floor  # noqa: PLC0415
         allowed = sorted(set(allowed) | bugreport_floor())

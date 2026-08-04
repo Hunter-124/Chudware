@@ -698,8 +698,9 @@ def _deep_copy_trigger(t: dict) -> dict:
 
 
 def _label_for(raw: dict) -> str:
-    """Human title for a rule — an explicit ``label`` when the author set one,
-    else the id read as prose (``thread_mention`` -> ``Thread mention``).
+    """Human title for a rule, in precedence order: an explicit ``label`` when the
+    author set one, then the curated title in ``_RULE_METADATA``, and finally the
+    id read as prose (``some_rule`` -> ``Some rule``).
 
     Used by the Rules settings tab and by the transcript chip the GUI draws when
     a rule fires, so a firing is never labelled with a bare identifier.

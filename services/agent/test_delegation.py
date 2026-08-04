@@ -21,6 +21,8 @@ Offline discipline: mock providers, no network, no LLM, no all-skip.
 """
 from __future__ import annotations
 
+import os
+import time
 import unittest
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -472,6 +474,138 @@ class TestDelegationApprovalMatrix(unittest.TestCase):
     def test_depth_cap_constant_still_exported(self):
         """DEPTH_CAP is kept as a module constant for backward-compat with artifact readers."""
         self.assertEqual(DEPTH_CAP, 3)  # value must not change
+
+
+
+class TestRegistryTreeReconciliation(unittest.TestCase):
+    """The durable registry decision and the in-process tree must agree (T-DP16).
+
+    `routing.yaml` sets `approval_policy.deeper: overseer`, and nothing in the
+    codebase ever called `DelegationTree.approve()` — so every depth>1 node was
+    stranded `pending` forever. The human decision arrives through the registry;
+    these tests pin that it reaches the tree.
+    """
+
+    def setUp(self):
+        from services.agent import subagent_registry as reg
+        self.reg = reg
+        # The watcher heartbeat is a shared file in the (session-scoped) registry
+        # dir — clear it so each case starts genuinely unattended.
+        try:
+            reg._watcher_path().unlink()
+        except FileNotFoundError:
+            pass
+        self.tree = DelegationTree(
+            run_id="r_reconcile",
+            orchestrator_budget=100_000,
+            ledger=_MockLedger(),
+            routing=_two_source_routing(),
+            max_subagent_depth=8,
+        )
+        d1 = self.tree.request_delegation("orchestrator", "Plan", 5000, kind="worker")
+        self.node = self.tree.request_delegation("sketcher", "Sub", 1000,
+                                                 parent_id=d1.id, kind="worker")
+        # The stranded case this whole seam exists for.
+        self.assertEqual(self.node.status, "pending")
+
+    def test_deep_spawn_is_registered_awaiting_approval(self):
+        session = self.reg.get_session(self.node.id)
+        self.assertIsNotNone(session, "a deep spawn must appear in the registry")
+        self.assertTrue(session["awaiting_approval"],
+                        "a non-auto approval policy must raise the GUI approval gate")
+
+    def test_registry_approval_reaches_the_tree(self):
+        from services.agent.delegation import reconcile_registry_decision
+        self.reg.decide_spawn(self.node.id, approve=True, by="user")
+        self.assertEqual(reconcile_registry_decision(self.tree, self.node.id), "approved")
+        self.assertEqual(self.node.status, "approved")
+        self.assertEqual(self.node.approval.approved_by, "human")
+        # And the node can now actually start — the point of the whole exercise.
+        self.tree.start(self.node.id)
+        self.assertEqual(self.node.status, "running")
+
+    def test_registry_denial_revokes_the_subtree(self):
+        from services.agent.delegation import reconcile_registry_decision
+        self.reg.decide_spawn(self.node.id, approve=False, by="user")
+        self.assertEqual(reconcile_registry_decision(self.tree, self.node.id), "denied")
+        self.assertEqual(self.node.status, "revoked")
+
+    def test_reconcile_is_idempotent(self):
+        from services.agent.delegation import reconcile_registry_decision
+        self.reg.decide_spawn(self.node.id, approve=True, by="user")
+        for _ in range(3):
+            self.assertEqual(
+                reconcile_registry_decision(self.tree, self.node.id), "approved")
+        self.assertEqual(self.node.status, "approved")
+
+    def test_no_decision_yet_leaves_the_node_pending(self):
+        from services.agent.delegation import reconcile_registry_decision
+        self.assertEqual(reconcile_registry_decision(self.tree, self.node.id), "")
+        self.assertEqual(self.node.status, "pending")
+
+    def test_await_returns_immediately_on_an_existing_decision(self):
+        from services.agent.delegation import await_registry_decision
+        self.reg.decide_spawn(self.node.id, approve=True, by="user")
+        self.assertEqual(
+            await_registry_decision(self.tree, self.node.id, timeout_s=5.0), "approved")
+
+    def test_await_timeout_denies_fail_safe(self):
+        # An unapproved spawn must NEVER run; the tree is revoked to match the
+        # registry so the two views cannot disagree after the hold expires.
+        from services.agent.delegation import await_registry_decision
+        out = await_registry_decision(self.tree, self.node.id,
+                                      timeout_s=0.0, poll_s=0.01)
+        self.assertEqual(out, "timeout")
+        self.assertEqual(self.reg.spawn_decision(self.node.id), "denied")
+        self.assertEqual(self.node.status, "revoked")
+
+    def test_await_yields_to_a_pending_terminate(self):
+        from services.agent.delegation import await_registry_decision
+        self.reg.request_terminate(self.node.id)
+        out = await_registry_decision(self.tree, self.node.id,
+                                      timeout_s=5.0, poll_s=0.01)
+        self.assertEqual(out, "terminated")
+        self.assertEqual(self.node.status, "pending",
+                         "a terminate hands control back; it is not a denial")
+
+    def test_unattended_run_does_not_block(self):
+        """A headless mission must behave exactly as it did before the gate.
+
+        The default (no explicit timeout) path holds ONLY while a GUI is
+        polling the registry. With no watcher it returns immediately and the
+        node stays pending — a bench/CI run can never hang for 15 minutes
+        waiting for an approval nobody is there to give.
+        """
+        from services.agent.delegation import await_registry_decision
+        self.assertFalse(self.reg.watcher_active(),
+                         "no GUI has polled; the fixture must start unattended")
+        started = time.monotonic()
+        out = await_registry_decision(self.tree, self.node.id)
+        self.assertEqual(out, "")
+        self.assertLess(time.monotonic() - started, 1.0,
+                        "an unattended hold must return immediately, not park")
+        self.assertEqual(self.node.status, "pending")
+
+    def test_watcher_heartbeat_enables_the_hold(self):
+        # A live watcher flips the same call into a real (here: instantly
+        # expiring) hold rather than the immediate unattended bail-out.
+        from services.agent.delegation import await_registry_decision
+        self.reg.note_watcher("test")
+        self.assertTrue(self.reg.watcher_active())
+        os.environ["CHUDWARE_SUBAGENT_HOLD_MAX_S"] = "0"
+        try:
+            self.assertEqual(
+                await_registry_decision(self.tree, self.node.id, poll_s=0.01),
+                "timeout")
+        finally:
+            os.environ.pop("CHUDWARE_SUBAGENT_HOLD_MAX_S", None)
+        self.assertEqual(self.node.status, "revoked")
+
+    def test_stale_watcher_does_not_count(self):
+        self.reg.note_watcher("test")
+        self.assertTrue(self.reg.watcher_active(within_s=30.0))
+        self.assertFalse(self.reg.watcher_active(within_s=0.0),
+                         "a watcher outside the TTL must not hold a mission")
 
 
 class TestBudgetInheritanceRevocation(unittest.TestCase):

@@ -2123,7 +2123,11 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         transcript_line=(
                             "Sub-agent spawn denied by the user at a turn boundary."),
                     )
-                if _sreg.awaiting_approval(subagent_id) and not decision:
+                # Only hold when a human is actually watching the registry —
+                # an unattended bench/CI run must not park for an approval
+                # nobody will give (subagent_registry.watcher_active).
+                if (_sreg.awaiting_approval(subagent_id) and not decision
+                        and _sreg.watcher_active()):
                     hold_outcome, held_s = _park_subagent(_sreg, "approval")
                     if hold_outcome == "terminate":
                         _sreg.append_transcript(

@@ -32,6 +32,11 @@ from typing import Callable
 def _subagent_list(params: dict, _emit: Callable) -> dict:
     try:
         from services.agent import subagent_registry as reg
+        # This poll IS the "a human is watching" signal: only while it keeps
+        # arriving will a spawn approval gate actually hold a mission (see
+        # delegation.await_registry_decision). An unattended run must never
+        # block on an approval nobody is there to give.
+        reg.note_watcher("gui")
         limit = int((params or {}).get("limit", 50))
         return {"ok": True, "sessions": reg.list_sessions(limit=limit)}
     except Exception as exc:  # noqa: BLE001

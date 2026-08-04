@@ -768,6 +768,57 @@ class MissionDispatch:
             # Observable, not silent: this mission had no tree until this call.
             node["delegation_tree_autobound"] = True
 
+        # T-DP16 follow-up: a node whose routing approval policy is not `auto`
+        # (routing.yaml `approval_policy.deeper: overseer`, i.e. every depth>1
+        # spawn) comes back `pending`. Nothing in the codebase ever called
+        # DelegationTree.approve(), so such a node used to be returned to the
+        # model as "pending" and simply never ran — stranded forever. The human
+        # decision arrives through the registry (subagent_control approve/deny);
+        # park for it here, and reconcile the in-process tree to match so the
+        # durable and in-memory views never disagree.
+        if (isinstance(node, dict) and node.get("status") == "pending"
+                and self.delegation_tree is not None):
+            node_id = str(node.get("id", ""))
+            outcome = ""
+            try:
+                from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                if node_id and _sreg.awaiting_approval(node_id):
+                    from services.agent.delegation import (  # noqa: PLC0415
+                        await_registry_decision as _await,
+                    )
+                    if self.ledger is not None:
+                        try:
+                            self.ledger.append("agent", "note", {
+                                "event": "delegation_awaiting_human_approval",
+                                "node_id": node_id, "role": role_resolved,
+                                "depth": node.get("depth")})
+                        except Exception:  # noqa: BLE001
+                            pass
+                    outcome = _await(self.delegation_tree, node_id)
+            except Exception:  # noqa: BLE001 — the hold never breaks a mission
+                outcome = ""
+            if outcome == "approved":
+                # Re-read the reconciled node so the caller sees the real status.
+                try:
+                    approved = self.delegation_tree._nodes.get(node_id)  # noqa: SLF001
+                    if approved is not None:
+                        node = approved.to_dict()
+                except Exception:  # noqa: BLE001
+                    pass
+            elif outcome in ("denied", "timeout", "terminated"):
+                node["status"] = ("revoked" if outcome != "terminated"
+                                  else node.get("status", "pending"))
+                node["executed"] = False
+                node["approval_outcome"] = outcome
+                node["note"] = {
+                    "denied": "sub-agent spawn DENIED by the user; nothing ran.",
+                    "timeout": ("sub-agent spawn was never approved within "
+                                "CHUDWARE_SUBAGENT_HOLD_MAX_S and was denied "
+                                "fail-safe; nothing ran."),
+                    "terminated": ("sub-agent was terminated by the user while "
+                                   "awaiting approval; nothing ran."),
+                }[outcome]
+
         # Phase 4 (M11): run the approved sub-agent NOW (synchronous, bounded).
         # HONESTY: without a bound provider nothing executes — the node is returned
         # spawned-but-not-run with an explicit note (never a fabricated result).

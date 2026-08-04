@@ -71,6 +71,7 @@ Doc leases
 """
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -919,6 +920,116 @@ def delegate(
     except DelegationError as exc:
         return {"error": str(exc), "status": "failed"}
 
+
+# ---------------------------------------------------------------------------
+# Registry <-> tree reconciliation (T-DP16 follow-up, 2026-08-03)
+# ---------------------------------------------------------------------------
+#
+# The DelegationTree lives in-process for the duration of a mission; the
+# sub-agent registry is the DURABLE, cross-process mirror the GUI speaks to.
+# A human approve/deny arrives through the registry (``subagent_control``), so
+# the tree must be told about it or ``DelegationNode.status`` drifts away from
+# the decision that actually gates execution.  These two helpers are the only
+# sanctioned bridge — do not reach into ``tree._nodes`` from the dispatch layer.
+
+#: Both holds (here and at agent_turn's sub-agent turn boundary) share one cap.
+_HOLD_ENV = "CHUDWARE_SUBAGENT_HOLD_MAX_S"
+_HOLD_DEFAULT_S = 900.0
+
+
+def _hold_max_s() -> float:
+    try:
+        return max(0.0, float(os.environ.get(_HOLD_ENV, str(_HOLD_DEFAULT_S))))
+    except (TypeError, ValueError):
+        return _HOLD_DEFAULT_S
+
+
+def reconcile_registry_decision(tree: DelegationTree, node_id: str) -> str:
+    """Apply the registry's human approve/deny decision to the in-process *tree*.
+
+    Returns ``"approved"``, ``"denied"`` or ``""`` (no decision recorded yet).
+    Idempotent: a node already approved/revoked is reported without a second
+    transition, so this is safe to call on every poll.
+    """
+    if tree is None or not node_id:
+        return ""
+    try:
+        from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+        decision = _sreg.spawn_decision(node_id)
+    except Exception:  # noqa: BLE001 — a registry read never breaks a mission
+        return ""
+    if decision not in ("approved", "denied"):
+        return ""
+    node = tree._nodes.get(node_id)  # noqa: SLF001 — this module owns the tree
+    if node is None:
+        return ""
+    try:
+        if decision == "approved":
+            if node.status == "pending":
+                tree.approve(node_id, approved_by="human")
+        elif node.status not in ("revoked", "failed", "done"):
+            tree.revoke(node_id, reason="spawn denied by the user")
+    except DelegationError:
+        # Lost a race with another transition — the registry decision still
+        # stands, and the caller reads it as the authoritative answer.
+        pass
+    return decision
+
+
+def await_registry_decision(tree: DelegationTree, node_id: str, *,
+                            timeout_s: float | None = None,
+                            poll_s: float = 0.5) -> str:
+    """Park until a human approve/deny lands in the registry for *node_id*.
+
+    Mirrors the sub-agent turn-boundary hold in ``agent_turn.run_turn``: polls
+    rather than blocking on a primitive, yields immediately to a pending
+    terminate, and is bounded by ``CHUDWARE_SUBAGENT_HOLD_MAX_S``.
+
+    Returns ``"approved"`` | ``"denied"`` | ``"terminated"`` | ``"timeout"``,
+    or ``""`` when there is nothing to wait for.
+
+    **Unattended runs never block.** Holding only makes sense when a human can
+    see the request, so an already-recorded decision is applied but an OPEN gate
+    with no live registry watcher (`subagent_registry.watcher_active`) returns
+    ``""`` immediately — a bench/CI/headless mission behaves exactly as it did
+    before the approval gate existed. Pass an explicit *timeout_s* to force a
+    hold regardless (the tests do this).
+    """
+    cap = _hold_max_s() if timeout_s is None else max(0.0, float(timeout_s))
+    if timeout_s is None:
+        decided = reconcile_registry_decision(tree, node_id)
+        if decided:
+            return decided
+        try:
+            from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+            if not _sreg.watcher_active():
+                return ""
+        except Exception:  # noqa: BLE001
+            return ""
+    started = time.monotonic()
+    while True:
+        decision = reconcile_registry_decision(tree, node_id)
+        if decision:
+            return decision
+        try:
+            from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+            if _sreg.terminate_requested(node_id):
+                return "terminated"
+            if not _sreg.awaiting_approval(node_id):
+                # The gate was cleared without an explicit decision (e.g. the
+                # session was rewritten). Treat it as released, not approved.
+                return ""
+        except Exception:  # noqa: BLE001
+            return ""
+        if time.monotonic() - started >= cap:
+            try:
+                from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                _sreg.decide_spawn(node_id, approve=False, by="approval_timeout")
+            except Exception:  # noqa: BLE001
+                pass
+            reconcile_registry_decision(tree, node_id)
+            return "timeout"
+        time.sleep(poll_s)
 
 
 # ---------------------------------------------------------------------------

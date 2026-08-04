@@ -139,6 +139,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
         ),
         "timeout_s": 360,
     },
+    "vendor_part_register": {
+        "prompt_note": (
+            "Registers a completed scrape's price/availability so bom_price can "
+            "resolve that supplier + part number — import_artifact handles the "
+            "geometry, this handles the money. The price is a SCRAPED figure "
+            "stamped with provenance and a fetch timestamp, never a vendor "
+            "quote; an ambiguous display price (a range, 'per pack of N') "
+            "leaves unit_price null and returns price_unparsed rather than "
+            "guessing — pass unit_price= explicitly to resolve it."
+        ),
+    },
     "vendor_status": {
         "prompt_note": (
             "Fast local read (no network) of adapter keys + login state — "

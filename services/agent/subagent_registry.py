@@ -332,6 +332,63 @@ def consume_steers(subagent_id: str) -> list[dict]:
     return pending
 
 
+# ---------------------------------------------------------------------------
+# Watcher heartbeat — "is anyone actually there to answer?"
+# ---------------------------------------------------------------------------
+#
+# An approval hold is only honest when a human can see the request. The GUI's
+# AI workspace polls ``subagent_list`` every few seconds while it is open, so
+# that poll IS the liveness signal. A headless/batch run (bench, CI, a mission
+# with no GUI attached) has no watcher, and must NOT block waiting for an
+# approval nobody will give — it keeps the pre-approval-gate behaviour of
+# returning the node still pending.
+
+#: A watcher counts as live for this long after its last poll. Comfortably more
+#: than the GUI's ~4 s `pollSubagentList` interval, short enough that a closed
+#: workspace stops blocking spawns within one window.
+WATCHER_TTL_S = 30.0
+
+
+def _watcher_path() -> Path:
+    return subagents_dir() / "watchers.json"
+
+
+def note_watcher(kind: str = "gui") -> None:
+    """Record that an interactive watcher just polled the registry."""
+    try:
+        path = _watcher_path()
+        data: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, ValueError):
+                data = {}
+        data[str(kind)] = time.time()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a heartbeat failure must never break a list call
+
+
+def watcher_active(within_s: float = WATCHER_TTL_S) -> bool:
+    """True when some interactive watcher polled within *within_s* seconds."""
+    try:
+        path = _watcher_path()
+        if not path.exists():
+            return False
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return False
+        cutoff = time.time() - max(0.0, float(within_s))
+        return any(isinstance(ts, (int, float)) and ts >= cutoff
+                   for ts in data.values())
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def request_terminate(subagent_id: str) -> bool:
     """Flag a session for termination — honored at the next turn boundary.
 

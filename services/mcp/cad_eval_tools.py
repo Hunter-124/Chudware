@@ -35,6 +35,10 @@ from .cad_common import (
     _target_bbox,
     _tmp,
     _vnorm,
+    already_resolved_selector,
+    is_geom_query,
+    resolve_readback_selector,
+    normalize_geom_query,
     cb,
 )
 
@@ -139,6 +143,23 @@ def _reject_unknown(tool: str, kwargs: dict, accepted: str) -> None:
         f"{tool}() got unknown argument(s) "
         + ", ".join(f"{k}={kwargs[k]!r}" for k in sorted(kwargs))
         + f" — {accepted}")
+
+
+def _measure_ref(doc_id: str, target):
+    """One measure target -> the ref eval_measure wants, refusing a query that cannot select.
+
+    A `sid` names one element and is resolved against the live document — that is the whole
+    point of query_geometry handing sids out. Anything else that is already an engine
+    selector goes straight through. A geometry QUERY is guarded first, because picks.cpp
+    ignores keys it does not know and a query whose only predicate was a misspelled `shape`
+    silently matched every face.
+    """
+    resolved = resolve_readback_selector(doc_id, target) or already_resolved_selector(target)
+    if resolved is not None:
+        return resolved
+    if is_geom_query(target):
+        target, _notes = normalize_geom_query(target, where="measure_between()")
+    return _resolve_one_selector(doc_id, target)
 
 
 def _interpreted(out: dict, notes: list) -> dict:
@@ -386,6 +407,11 @@ def _read_query(tool: str, query, kwargs: dict, notes: list) -> tuple:
     for name, value, q in readable:
         if name != "query":
             notes.append(f"{name}={value!r} read as query={json.dumps(q, sort_keys=True)}")
+    # A dict query never went through _QUERY_KEY_CANON, and the engine ignores a key it
+    # does not know — so `shape` silently stopped filtering and `sid` silently matched the
+    # whole body. Canonicalise and refuse a query that cannot select.
+    merged, guard_notes = normalize_geom_query(merged, where=f"{tool}()")
+    notes.extend(guard_notes)
     return merged, subjects
 
 # --------------------------------------------------------------- datum plane / direction words
@@ -1118,10 +1144,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                     'a_query="top", or a_query={"of":"edge","pick":"longest"}). Add b_query= to '
                     "get the distance/angle between two of them.")
             d = _doc(doc_id)
-            ref_a = _resolve_one_selector(d, a_query)
+            ref_a = _measure_ref(d, a_query)
             refs = [ref_a]
             if b_query is not None:
-                refs.append(_resolve_one_selector(d, b_query))
+                refs.append(_measure_ref(d, b_query))
             res = cb.call("eval_measure", {"doc_id": d, "refs": refs})
             kind = res.get("kind")
             out = {"ok": True, "doc_id": d, "a_query": a_query, **res}

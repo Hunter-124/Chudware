@@ -4988,21 +4988,60 @@ def _emphasis_color_name(rgb) -> str:
     return _EMPHASIS_COLOR_NAMES.get(t, f"#{t[0]:02X}{t[1]:02X}{t[2]:02X}")
 
 
+def already_resolved_selector(target: Any) -> Optional[dict]:
+    """*target* when it is an ENGINE-produced topology selector, else None.
+
+    A readback selector names one element outright and must go to eval_measure as-is.
+    Routing it through the query resolver instead is how
+    ``measure_between(a_query={"sid": "F1b1b80"})`` came back "matched 7 candidates":
+    picks.cpp reads no `sid` predicate, so the query degenerated to every face.
+    Only the COMPLETE shape passes here — eval_measure wants kind+centroid, and a bare
+    ``{"sid": …}`` reached it as «measure ref kind '' unsupported». Completing a partial
+    one needs the document, so that is ``resolve_readback_selector``'s job.
+    """
+    if not isinstance(target, dict):
+        return None
+    has_geom_pred = any(k in target for k in (
+        "of", "side", "surf", "pick", "parallel", "near", "index", "count",
+        "concave", "convex", "owner_feature"))
+    if has_geom_pred:
+        return None
+    if target.get("kind") in ("face", "edge", "vertex") and target.get("centroid") is not None:
+        return target
+    return None
+
+
+def resolve_readback_selector(doc_id: str, target: Any) -> Optional[dict]:
+    """A selector carrying a `sid` -> the live match for it. None when there is no sid.
+
+    query_geometry / describe_part hand out a stable sid per element and the docs tell the
+    model to address that element by it, so the sid has to actually select. A sid that no
+    longer exists is a real error (the tree moved under it), never a silent widening.
+    """
+    if not isinstance(target, dict):
+        return None
+    sid = target.get("sid")
+    if not isinstance(sid, str) or not sid.strip():
+        return None
+    match = _sid_match(doc_id, sid.strip())
+    if match is None:
+        raise ValueError(
+            f"no face or edge in this document carries the sid {sid!r} — a sid is stable "
+            f"only while the geometry is: rebuild the tree and it moves. Re-run "
+            f"query_geometry/describe_part and use a sid from THAT reply, or name the "
+            f"element with a query ({_QVOCAB_HELP}).")
+    return match
+
+
 def _resolve_measure_target(doc_id: str, target: Union[str, dict]) -> tuple:
     """Resolve one measure target → (ref_dict, label).
 
     Prefer the single-selector path (measure_between / eval_measure). Fall back to the
     inspect_part resolver for feature ids / multi-match queries, taking the first match.
     """
-    # Already-resolved selector (sid / kind+centroid) — pass straight to eval_measure.
-    if isinstance(target, dict):
-        has_geom_pred = any(k in target for k in (
-            "of", "side", "surf", "pick", "parallel", "near", "index", "count",
-            "concave", "convex", "owner_feature"))
-        if not has_geom_pred and (
-                target.get("sid") or target.get("kind") in ("face", "edge", "vertex")):
-            label = str(target.get("sid") or target.get("kind") or "ref")
-            return target, label
+    resolved = resolve_readback_selector(doc_id, target) or already_resolved_selector(target)
+    if resolved is not None:
+        return resolved, str(resolved.get("sid") or resolved.get("kind") or "ref")
 
     try:
         ref = _resolve_one_selector(doc_id, target)
@@ -5364,3 +5403,98 @@ def _first_temperature(faces: list, label: str) -> float:
             return float(f["temperature"])
     raise ValueError(f"{label} needs at least one entry with a 'temperature' (°C), "
                      f"e.g. [{{\"face\": \"+x\", \"temperature\": 100}}]")
+
+
+# ── geometry-query key guard ─────────────────────────────────────────────────
+# core/doc/picks.cpp::resolve_geom_query reads the keys it knows and IGNORES the
+# rest, so a predicate the engine has no concept of selects EVERYTHING silently.
+# Measured 2026-08-04 on a 50 mm cube with one bore:
+#   query_geometry({"of":"face","shape":"cylinder"})   -> 7 faces (shape is the
+#       documented spelling of surf; the flat-kwargs path canonicalises it, the
+#       dict path never did)
+#   query_geometry({"of":"face","sid":"F1b1b80"})      -> 7 faces (a sid comes
+#       straight out of the readback and does not narrow anything)
+#   add_features(fillet, refs.edges=[{"of":"edge","sid":"NOPE_NOT_A_SID"}])
+#       -> succeeded and rounded EVERY edge on the body.
+# The last one is the reason this exists: a model asking for one edge got the
+# whole part filleted, with no error anywhere. A key that does not select must
+# say so.
+
+#: Keys that actually NARROW a geometry query (picks.cpp predicates).
+GEOM_QUERY_NARROWING_KEYS = frozenset({
+    "side", "surf", "parallel", "perpendicular", "pick", "near", "index",
+    "count", "body_id",
+})
+#: The domain keys — which topology the query runs over. They pick the pool,
+#: they do not narrow it, so they never satisfy the "must select something" rule.
+GEOM_QUERY_DOMAIN_KEYS = frozenset({"of", "kind"})
+#: Spellings of a narrowing key. Same table the flat-kwargs path already applied,
+#: now applied inside a query DICT too.
+GEOM_QUERY_ALIASES = {
+    "surface": "surf", "shape": "surf",
+    "limit": "count", "max": "count", "max_results": "count",
+}
+#: Fields query_geometry / describe_part put ON a match. Handing a whole match
+#: object back as a query is a documented workflow, so they are tolerated — but
+#: only alongside a real predicate, because on their own they select nothing.
+GEOM_QUERY_READBACK_KEYS = frozenset({
+    "sid", "centroid", "normal", "axis", "radius", "area_or_len", "concavity",
+    "hint_index", "owner_feature",
+})
+
+GEOM_QUERY_VOCAB_HELP = (
+    'of ("face"/"edge"), side (top/bottom/left/right/front/back or ±x/±y/±z), '
+    'surf (flat/round/cylindrical/conical/spherical/toroidal; edges: '
+    'straight/round/circular/elliptical), parallel/perpendicular ("x"/"y"/"z"), '
+    'pick (largest/smallest/longest/shortest/inner/outer), near [x,y,z], '
+    "count, index"
+)
+
+
+def is_geom_query(value: Any) -> bool:
+    """Mirror of core/doc/picks.cpp::is_geom_query — what the engine resolves as a query."""
+    return isinstance(value, dict) and (value.get("kind") == "query" or "of" in value)
+
+
+def normalize_geom_query(query: dict, *, where: str) -> tuple:
+    """Canonicalise a geometry-query dict's keys; reject one that cannot select.
+
+    Returns ``(query, notes)``. Raises ``ValueError`` with the real vocabulary for
+    an unknown key, and for a query whose only non-domain keys came off a readback
+    (sid/centroid/…) — that query matches the entire body, which is never what the
+    caller meant by naming one element.
+    """
+    out: dict = {}
+    notes: list = []
+    unknown: list = []
+    for key, value in query.items():
+        canon = GEOM_QUERY_ALIASES.get(key, key)
+        if (canon not in GEOM_QUERY_NARROWING_KEYS
+                and canon not in GEOM_QUERY_DOMAIN_KEYS
+                and canon not in GEOM_QUERY_READBACK_KEYS):
+            unknown.append(key)
+            continue
+        if canon != key:
+            if canon in query and query[canon] != value:
+                raise ValueError(
+                    f"{where}: the query key {canon!r} arrived twice with different "
+                    f"values ({query[canon]!r} as {canon!r}, {value!r} as {key!r}) — "
+                    f"that is one key, so pass it once.")
+            notes.append(f"{where}: read the query key {key!r} as {canon!r}")
+        out[canon] = value
+    if unknown:
+        raise ValueError(
+            f"{where}: the geometry query has no key(s) "
+            + ", ".join(repr(k) for k in sorted(unknown))
+            + " — the engine ignores a key it does not know, so this query would have "
+              f"matched EVERY candidate instead of the one you named. Query keys: "
+              f"{GEOM_QUERY_VOCAB_HELP}")
+    readback = sorted(k for k in out if k in GEOM_QUERY_READBACK_KEYS)
+    if readback and not (set(out) & GEOM_QUERY_NARROWING_KEYS):
+        raise ValueError(
+            f"{where}: " + ", ".join(repr(k) for k in readback)
+            + " name a match in a READBACK; they are not query predicates, so this query "
+              "selects every candidate instead of the one element you meant. Narrow it "
+              f"with {GEOM_QUERY_VOCAB_HELP}, or hand back the whole selector object "
+              "query_geometry/describe_part returned.")
+    return out, notes

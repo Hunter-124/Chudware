@@ -39,6 +39,8 @@ from .cad_common import (
     _tmp,
     _unpublish,
     _write_diff,
+    is_geom_query,
+    normalize_geom_query,
     cb,
     recover_autosaved,
     recover_skipped,
@@ -4554,6 +4556,25 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
                     f"{label}: read refs.{src} as refs.sections ({len(canon)} region "
                     f"selector(s)) — a loft's profiles are a LIST of "
                     f'{{"kind":"region","sketch":…}} selectors under refs.sections')
+    # Every ref member the engine will resolve as a QUERY, checked before it gets there:
+    # picks.cpp ignores a key it does not know, so {"of":"edge","sid":"…"} in refs.edges
+    # filleted the entire body instead of one edge, silently. Runs last so the repairs
+    # above have already put `of` where it belongs.
+    for slot, v in list(out_refs.items()):
+        members = v if isinstance(v, list) else [v]
+        fixed: list = []
+        touched = False
+        for m in members:
+            if not is_geom_query(m):
+                fixed.append(m)
+                continue
+            q, qnotes = normalize_geom_query(m, where=f"{label}: refs.{slot}")
+            notes.extend(qnotes)
+            fixed.append(q)
+            touched = touched or q != m
+        if touched:
+            out_refs[slot] = fixed if isinstance(v, list) else fixed[0]
+            changed = True
     if not changed:
         return feat
     out = dict(feat)

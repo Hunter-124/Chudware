@@ -2484,8 +2484,12 @@ def test_assembly_tools_end_to_end(tmp_path):
     # BRepBndLib::Add on the placed shape, whose triangulation-based deflection enlargement is
     # rotation-dependent and drifts the centre by ~2.5e-3 for a free-to-spin round pin. That is
     # a measurement artefact — the solver itself lands the pin axis on the bore axis to ~1e-9.
+    # NB: no "component" key — session.cpp::doc_query reads only body_id before handing the
+    # dict to resolve_geom_query, so a component inside a QUERY never scoped anything (the
+    # documented shape puts it beside the query, as asm_mate's operands do above). The match
+    # set is identical without it; the guard in cad_common now refuses the inert spelling.
     q, _ = _call("query_geometry", {"doc_id": asm,
-                                    "query": {"component": "k2", "of": "face", "surf": "round"}})
+                                    "query": {"of": "face", "surf": "round"}})
     assert q.get("matches"), q
     cx, cy, _cz = q["matches"][0]["centroid"]
     assert abs(cx - 15.0) < 1e-6 and abs(cy - 5.0) < 1e-6, q["matches"][0]

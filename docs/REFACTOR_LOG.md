@@ -6051,3 +6051,38 @@ than a missing one. Every registered price carries `provenance.scraped: true`,
 Gotcha for future probes: `core/build-linux` was 3 days stale while `core/build-occt-linux`
 (which takes precedence in `core_bridge`'s search order) was fresh — a live measurement can pass
 against one tree and fail in CI against the other. Rebuild both.
+
+## 2026-08-03 — delegation/registry reconciliation + three red gates
+
+Files: `services/agent/{delegation,mission_dispatch,subagent_registry,subagent_rpc,agent_turn}.py`,
+`services/agent/roles/general_agent.yaml`, `services/agent/advisor/triggers.py`,
+`services/agent/tool_guidance/parts.py`, `host/src/ui/tool_panel_tables.{h,snapshot.json}`,
+tests in `services/agent/`.
+
+Closes the item deferred from T-DP16. `reconcile_registry_decision` /
+`await_registry_decision` in `delegation.py` are the ONLY sanctioned bridge between the durable
+registry and the in-process tree — do not reach into `tree._nodes` from the dispatch layer.
+`mission_dispatch` now parks on the decision instead of returning a stranded `pending` node.
+
+**The trap to remember: an approval hold must never fire unattended.** A headless bench/CI run
+has nobody to approve, so a naive hold turns every depth>1 spawn into a 15-minute stall. The
+registry therefore carries a watcher heartbeat — `subagent_list` (the GUI's ~4 s poll) stamps it,
+and both holds check `watcher_active()` first. Measured: unattended returns in 0.2 s and leaves
+the node pending exactly as before; attended parks and releases on the human decision. If you add
+a third hold anywhere, gate it the same way.
+
+Three gates were red on master before this work (proven pre-existing by stashing). The
+substantive one: `general_agent` ended its card with `family: plm`, and family expansion fills
+leftover seats **alphabetically** — with three seats left it granted plm_init/plm_open/plm_save
+and dropped plm_item_add and plm_checkpoint, while the prompt told the model to checkpoint and
+the handoff schema demanded `checkpoint_commit` as evidence. Never end a card with a `family:`
+entry whose tail you depend on; name the tools. The seats came from
+`run_linear_role_turn`, which advertised only `SUBAGENT_DEFAULT_TOOLS` — so the main lane could
+call `run_shell` but was never told about it (permitted-but-unoffered, the mirror of
+advertised-but-dead). It now unions `AGENT_DEFAULT_TOOLS`; deliberately NOT
+`SHARED_DEFAULT_TOOLS`, which carries `new_part`/`save_part` and would make the general lane
+modeling-capable by default against the card's whole design.
+
+Also: `test_harness_integrity` was checking `reviewer_exec._resolve_fn` (tier 1) while the real
+dispatcher is `agent_turn._bind_tool` (three tiers) — it now uses `_bind_tool`, which is a
+strictly stronger gate.

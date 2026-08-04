@@ -6185,3 +6185,61 @@ OCCT `ChFi3d_Builder::PerformFilletOnVertex` (coredump + full backtrace on the c
 `geom::blend_drop_failing` cannot contain it — OCCT segfaults rather than throwing,
 and a catch block cannot catch a signal. No deterministic reproducer yet; a bare box
 and a bored plate both survive every radius tried.
+
+## 2026-08-04 — basic-modeling live sweep: silent selection bugs and unearned finishes
+
+Broad "does the ordinary stuff work" pass over the baseline linear loop
+(`mission_dispatch.run_linear_role_turn` / `general_agent`), Claude only
+(sonnet-5 primary, opus-5 breadth, fable-5 spot check), seven ordinary modelling
+requests per model against a private hostd. Nine fixes landed; every one is a
+defect a live model actually hit, and each has a fail-then-pass regression test.
+
+The load-bearing find is a whole CLASS: **`core/doc/picks.cpp::resolve_geom_query`
+reads the query keys it knows and ignores the rest**, so a key the engine has no
+concept of widens a query to every candidate instead of narrowing it. Measured on
+a 50 mm cube with one bore: `{"of":"face","shape":"cylinder"}` (`shape` is the
+spelling `query_geometry`'s own docstring advertises) matched all 7 faces, and
+`add_features(fillet, refs.edges=[{"of":"edge","sid":"NOPE_NOT_A_SID"}])`
+succeeded and rounded EVERY edge — ok:true, 22 faces added, 620 mm³ gone, no
+error anywhere. `cad_common.normalize_geom_query` now canonicalises the alias keys
+inside a query DICT (the flat-kwargs path always did), refuses an unknown key with
+the real vocabulary, and refuses a query whose only non-domain keys came off a
+readback. It is wired into `_read_query` (query_geometry / measure_between) and
+into `_normalize_feature_refs` (every `add_features` ref). Both opus-5 and
+sonnet-5 tripped it in production the same afternoon — on `convexity`,
+`orientation`, `which`, `at` and `normal` — and recovered every time.
+
+The sibling defect: a `sid` never selected anything. `_resolve_sid_refs` only
+recognised a BARE sid string, so `refs.edges=[{"kind":"edge","sid":"E6b9abd"}]`
+was rejected for a missing centroid — and the model answered by INVENTING
+`centroid:[0,0,0]`, which was accepted and chamfered the rim at z=0 instead of the
+one at z=100 the sid named. A sid is now read out of a selector or query dict too
+and replaced with the engine's own live match, so the identity wins over anything
+guessed beside it; `measure_between` and `query_geometry` resolve one the same way
+(`cad_common.resolve_readback_selector`), and a stale sid gets the live roster.
+
+Also: `_META_TOOLS_NOT_WORK` held only the capability/plan tools, so a turn made of
+`enable_tools` + `get_part` on an empty document closed as `success=confirmed` with
+nothing built; the workspace-describing readbacks joined the set (tools that can BE
+the answer — measure/render/query/export — deliberately stayed out). `set_material`
+is the VISUAL material and never touched the density `measure_part` computes mass
+from, while `measure_part` refused `material=` with "use set_material instead" — an
+aluminium-coloured bar reported a steel mass; `measure_part` now resolves a material
+NAME, and both docstrings were corrected. One empty completion killed 2 of 8 legs
+mid-build (only kimi-code resampled; everyone does now), and a `stopReason:"length"`
+with no text is reported as truncation with the budget and effort named rather than
+as "no completion" — that is why every `claude-fable-5` leg died in a second at the
+default `reasoningEffort="high"`.
+
+Gotchas. The spend guard read the bridge's WAL-mode auth store with `immutable=1`,
+which skips the `-wal` file — it saw a long-expired access token, got HTTP 401 and
+fail-safe-stopped every run; plain `mode=ro` with an immutable fallback. `component`
+inside a query dict never scoped anything (`doc_query` reads only `body_id` before
+handing the dict to `resolve_geom_query`) and a test had been asserting through it.
+`benchmarks/simsuite/fea_static_cases.py:531` still calls `doc_query` with
+`{"of":"face","curved":True}` — `curved` is not a key, so that "inner bore" selection
+is really every face; it bypasses the Python guard (direct `cb.call`) and is NOT
+fixed here. `services/mcp/test_modeling_repertoire.py` is the free canary: it drives
+the whole ordinary repertoire through `_dispatch_tool` and asserts hand-computable
+volumes — three of this session's findings were visible there before a token was
+spent.

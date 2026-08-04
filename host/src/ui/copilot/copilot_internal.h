@@ -325,6 +325,7 @@ void drawChatLogWindowed(AppState& st);
 // Sessions are first-class + document-independent (v2 flat store); Conversation::docLink is
 // only a reference. st.chatDocKey = the CURRENT document's key (run launches, prompt drafts).
 std::string chatHistoryPath();
+std::string chatSessionsDir();
 void        savePromptDraft(AppState& st, bool force = false);
 void        clearPromptDraft(AppState& st);
 std::string convDocKey(AppState& st);

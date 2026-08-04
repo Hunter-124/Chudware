@@ -523,49 +523,74 @@ Enforcement lives in exactly one place — the `if subagent_id:` block at the to
 
 | method | params → result |
 |---|---|
-| `subagent_list` | `{}` → `{ok, sessions[]}` |
-| `subagent_transcript` | `{subagent_id}` → `{ok, session, messages[], pending_steers[]}` |
+| `subagent_list` | `{session_id?: string}` → `{ok, sessions[]}` — a non-empty `session_id` returns only sub-agents owned by that conversation |
+| `subagent_transcript` | `{subagent_id, raw?: bool}` → `{ok, session, messages[], pending_steers[]}` — `raw` defaults to `false`; when `true`, `messages` contains the lossless raw-log records from §6.4 |
 | `subagent_steer` | `{subagent_id, text}` → `{ok, queued, steer_id, session_status, note}` |
 | `subagent_terminate` | `{subagent_id, confirm}` → `{ok, terminate_requested, note}` — refuses without `confirm:true` |
 | `subagent_control` | `{subagent_id, op, …}` → see below |
 
 ### 6.1 `subagent_control`
 
-`op` is one of `pause` · `resume` · `approve` · `deny` · `set_runtime`.
+`op` is exactly one of `pause` · `resume` · `set_runtime`.
 `set_runtime` also takes `model`, `provider`, `effort` (`low`\|`medium`\|`high`); `""` clears an
-override, an absent key leaves it unchanged. `deny` requires `confirm:true` and otherwise returns
-`{ok:false, reason, requires_confirm:true}` — the same M16 gate `subagent_terminate` uses.
+override, and an absent key leaves it unchanged.
 
 Success shape:
 
 ```json
 {"ok": true, "note": "<honest semantics>", "session_status": "…",
- "paused": false, "awaiting_approval": false, "spawn_decision": "",
- "model_override": "", "provider_override": "", "effort_override": ""}
+ "paused": false, "model_override": "", "provider_override": "",
+ "effort_override": ""}
 ```
 
 ### 6.2 Session object fields (added to `subagent_list[].sessions` and `subagent_transcript.session`)
 
-`paused` (bool) · `awaiting_approval` (bool) · `spawn_decision` (`""`\|`"approved"`\|`"denied"`) ·
-`model_override` · `provider_override` · `effort_override`. All six are **always present** with
-their defaults, including for registry meta files written before this amendment.
+`paused` (bool) · `model_override` · `provider_override` · `effort_override`. All four are
+**always present** with their defaults, including for registry meta files written before this
+amendment.
 
 ### 6.3 Turn-boundary semantics
 
-Checked in this order, once per completion:
+**2026-08-03 amendment:** The human spawn-decision control and its approval hold were removed
+end to end. Every delegation now auto-approves at every depth.
+
+Controls are checked in this order, once per completion:
 
 1. **Terminate** — unchanged, and still wins over every other hold.
-2. **Approval hold** — a session with `awaiting_approval` and no decision parks (0.5 s poll).
-   `delegation.request_delegation` now sets `awaiting_approval` whenever the routing approval
-   policy is not `auto`, which is what releases the previously stranded depth>1 delegations
-   (`routing.yaml` `approval_policy.deeper: overseer`, and nothing ever called
-   `DelegationTree.approve()`). A denial returns `TurnResult(stop_reason="denied_by_user")`.
-3. **Pause hold** — same park loop, status `paused`.
-4. **Steer drain** — unchanged.
-5. **Runtime override** — `effort` scales the per-completion cap off the turn's ORIGINAL base
+2. **Pause hold** — parks the sub-agent with status `paused`.
+3. **Runtime override** — `effort` scales the per-completion cap off the turn's ORIGINAL base
    (low 0.5× · medium 1.0× · high 2.0×, clamped to `[512, 16384]`); `model`/`provider` rebuild the
    provider via `config.get_provider`. A failed rebuild logs `subagent_model_override_failed` and
    keeps the current provider — an override never breaks a turn.
+4. **Steer drain** — unchanged.
 
-Both holds are capped by `CHUDWARE_SUBAGENT_HOLD_MAX_S` (default 900 s). On expiry a **pause
-auto-resumes**; an **approval hold denies, fail-safe** — an unapproved spawn never runs.
+There is no cap and no wall-clock timer. A pause parks until resume or terminate. The only
+automatic release is controller liveness: if no controller has polled the registry within
+`CONTROLLER_GRACE_S` (120 s), the pause releases because the only party that could ever resume
+it is provably gone.
+
+### 6.4 Lossless raw transcript (`chudware.subagent.raw/1`)
+
+Each sub-agent has a true append-only JSONL log beside its owning conversation:
+`<Sessions>/<conversation_id>.subagents/<subagent_id>.jsonl`. When no conversation transcript
+directory is bound, the registry uses `<subagents_dir>/<subagent_id>.raw.jsonl` so the raw log
+always exists.
+
+Line 1 is written once:
+
+```json
+{"kind":"header","schema":"chudware.subagent.raw/1","subagent_id":"...","session_id":"...","role":"...","parent_id":"...","run_id":"...","created_ts":0.0}
+```
+
+Every subsequent line is one record with a monotonically increasing `seq`, starting at 1:
+
+```json
+{"ts":0.0,"seq":1,"kind":"message","message":{"role":"assistant","content":"..."}}
+{"ts":0.0,"seq":2,"kind":"lifecycle","event":"started|paused|resumed|terminated|finished|steer","note":"..."}
+{"ts":0.0,"seq":3,"kind":"compaction","before":0,"after":0,"messages":[{"role":"user","content":"..."}]}
+```
+
+The `message` value and every entry in a compaction's `messages` array are the verbatim,
+uncapped provider message dictionaries. Nothing in this raw log is ever truncated, summarized,
+or pruned. It is distinct from the display transcript, `<id>.transcript.jsonl`, which remains a
+human-readable lifecycle-and-reply stream.

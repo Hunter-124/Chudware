@@ -43,9 +43,5 @@
       "warnings": []
     }
   },
-  "approval_policy": {
-    "depth_1": "auto",
-    "deeper": "overseer"
-  },
   "validation_error": "overseer wants 'cheap_local' but no local (llamacpp/lmstudio/ollama) source is configured \u2014 add one or change the preference"
 }

@@ -79,10 +79,6 @@ assignments:
   project_organizer:      [strong, cheap_local]
   default:                [cheap_local, strong]
 
-approval_policy:
-  depth_1: auto       # depth-1 from the orchestrator: auto-approved
-  deeper: overseer    # deeper sub-agents: requires the mission overseer's approval
-  # ponder nodes are auto-approved at ANY depth (read-only + hard token budget)
 
 # T-DP9: Hierarchical delegation rails — no hard depth cap.
 # These are advisory soft limits; reaching them emits a warning ledger event

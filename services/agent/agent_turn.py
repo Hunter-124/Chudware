@@ -908,6 +908,97 @@ def _drop_oldest_tool_results(messages: list[dict], *, keep_recent: int = 6) -> 
     return len(drop)
 
 
+class _RawMirroredMessages(list):
+    """``run_turn``'s provider conversation, mirrored into the lossless raw log.
+
+    The messages list is otherwise a local that dies when ``run_turn`` returns,
+    which is why a sub-agent's real conversation never reached disk: the only
+    model output that was ever persisted was a 4000-char slice of the final
+    reply. Subclassing the list captures every mutation at ONE seam instead of
+    at the ~60 call sites that build it.
+
+    Every record is verbatim and uncapped — see ``contracts/worker_rpc.md``,
+    schema ``chudware.subagent.raw/1``. Mirroring is best-effort: a failing
+    raw log must never break the turn it is recording.
+    """
+
+    __slots__ = ("_sid", "_sreg")
+
+    def __init__(self, subagent_id: str, sreg: Any, initial: Any = ()) -> None:
+        super().__init__(initial)
+        self._sid = subagent_id
+        self._sreg = sreg
+        for message in list(self):
+            self._mirror(message)
+
+    def _mirror(self, message: Any) -> None:
+        try:
+            self._sreg.append_raw(
+                self._sid, {"kind": "message", "message": message})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _mirror_compaction(self, before: int) -> None:
+        """Record an in-place rewrite verbatim — compaction must not lose text."""
+        try:
+            self._sreg.append_raw(self._sid, {
+                "kind": "compaction",
+                "before": before,
+                "after": len(self),
+                "messages": list(self),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
+    def append(self, message: Any) -> None:
+        super().append(message)
+        self._mirror(message)
+
+    def extend(self, items: Any) -> None:
+        items = list(items)
+        super().extend(items)
+        for message in items:
+            self._mirror(message)
+
+    def insert(self, index: int, message: Any) -> None:
+        super().insert(index, message)
+        self._mirror(message)
+
+    def __iadd__(self, items: Any) -> "_RawMirroredMessages":
+        self.extend(items)
+        return self
+
+    def __delitem__(self, index: Any) -> None:
+        before = len(self)
+        super().__delitem__(index)
+        self._mirror_compaction(before)
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        before = len(self)
+        super().__setitem__(index, value)
+        self._mirror_compaction(before)
+
+    def pop(self, index: int = -1) -> Any:
+        before = len(self)
+        out = super().pop(index)
+        self._mirror_compaction(before)
+        return out
+
+    def clear(self) -> None:
+        before = len(self)
+        super().clear()
+        self._mirror_compaction(before)
+
+
+def _raw_lifecycle(sreg: Any, subagent_id: str, event: str, note: str = "") -> None:
+    """Best-effort lifecycle record into a sub-agent's lossless raw log."""
+    try:
+        sreg.append_raw(
+            subagent_id, {"kind": "lifecycle", "event": event, "note": note})
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
     """Classify a provider exception → ``(stop_reason, retryable)``.
 
@@ -2033,63 +2124,42 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     _subagent_last_effort = ""
     _subagent_last_runtime: tuple[str, str] = ("", "")
 
-    def _park_subagent(_sreg, hold_kind: str) -> tuple[str, float]:
-        """Park one approval/pause hold and return its boundary outcome."""
+    def _park_paused_subagent(_sreg) -> tuple[str, float]:
+        """Park a paused sub-agent at this turn boundary until it is released.
+
+        There is no deadline. A pause means paused: the loop exits on resume, on
+        a pending terminate, or when the controller that paused it stops polling
+        the registry (``CONTROLLER_GRACE_S``). That last case is LIVENESS, not a
+        timeout — it fires only because nobody is left who could ever send the
+        resume, so parking on would strand the sub-agent forever.
+        """
         started = time.monotonic()
-        status = "pending" if hold_kind == "approval" else "paused"
-        _sreg.set_status(subagent_id, status, note=f"{hold_kind} hold active")
-        _sreg.append_transcript(
-            subagent_id, "system",
-            (
-                "Approval hold entered; waiting for a human approve/deny at "
-                "turn-boundary polls."
-                if hold_kind == "approval"
-                else "Pause hold entered; work already in flight finished before "
-                     "parking at this turn boundary."
-            ),
-        )
-        hold_max_s = max(
-            0.0,
-            float(os.environ.get("CHUDWARE_SUBAGENT_HOLD_MAX_S", "900")),
-        )
+        _sreg.set_status(subagent_id, "paused", note="pause hold active")
+        note = ("Pause hold entered; work already in flight finished before "
+                "parking at this turn boundary.")
+        _sreg.append_transcript(subagent_id, "system", note)
+        _raw_lifecycle(_sreg, subagent_id, "paused", note)
         while True:
             elapsed = time.monotonic() - started
             if _sreg.terminate_requested(subagent_id):
                 return "terminate", elapsed
-            if hold_kind == "approval":
-                decision = _sreg.spawn_decision(subagent_id)
-                if decision or not _sreg.awaiting_approval(subagent_id):
-                    return decision or "released", elapsed
-            elif not _sreg.is_paused(subagent_id):
+            if not _sreg.is_paused(subagent_id):
                 return "released", elapsed
-            if elapsed >= hold_max_s:
-                return "timeout", elapsed
+            if not _sreg.controller_alive():
+                return "controller_gone", elapsed
             time.sleep(0.5)
 
-    def _spawn_denied_result(
-        _sreg,
-        *,
-        detail: str,
-        transcript_line: str,
-        timed_out: bool = False,
-    ) -> TurnResult:
-        _sreg.set_status(
-            subagent_id, "revoked",
-            note="spawn approval hold expired" if timed_out else "spawn denied by user",
-        )
-        _sreg.append_transcript(subagent_id, "system", transcript_line)
-        _log(ledger, actor, {
-            "event": "subagent_spawn_denied",
-            "subagent_id": subagent_id,
-            "stop_reason": "denied_by_user",
-            "error_detail": detail,
-            "timed_out": timed_out,
-        })
-        return TurnResult(False, "denied_by_user",
-                          {"calls": calls,
-                           "tool_calls": tool_calls_made,
-                           "stop_reason": "denied_by_user",
-                           "error_detail": detail})
+    # Lossless capture: mirror the provider conversation into the sub-agent's
+    # append-only raw log for the rest of this run. Everything above this point
+    # (history, request, skills) is replayed into the log by the constructor.
+    if subagent_id:
+        try:
+            from services.agent import subagent_registry as _sreg_raw  # noqa: PLC0415
+            messages = _RawMirroredMessages(subagent_id, _sreg_raw, messages)
+            _raw_lifecycle(_sreg_raw, subagent_id, "started",
+                           f"Sub-agent turn started (actor={actor}).")
+        except Exception:  # noqa: BLE001
+            pass
 
     for _ in range(budget + 1):
         # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  Cross-process
@@ -2115,75 +2185,24 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                        "stop_reason": "terminated_by_user",
                                        "error_detail": "Run cancelled by user."})
 
-                decision = _sreg.spawn_decision(subagent_id)
-                if decision == "denied":
-                    return _spawn_denied_result(
-                        _sreg,
-                        detail="Spawn denied by user.",
-                        transcript_line=(
-                            "Sub-agent spawn denied by the user at a turn boundary."),
-                    )
-                # Only hold when a human is actually watching the registry —
-                # an unattended bench/CI run must not park for an approval
-                # nobody will give (subagent_registry.watcher_active).
-                if (_sreg.awaiting_approval(subagent_id) and not decision
-                        and _sreg.watcher_active()):
-                    hold_outcome, held_s = _park_subagent(_sreg, "approval")
-                    if hold_outcome == "terminate":
-                        _sreg.append_transcript(
-                            subagent_id, "system",
-                            f"Approval hold left after {held_s:.1f}s; a pending "
-                            "termination will be honored at the next boundary.")
-                        continue
-                    if hold_outcome == "timeout":
-                        _sreg.decide_spawn(
-                            subagent_id, approve=False, by="approval_timeout")
-                        return _spawn_denied_result(
-                            _sreg,
-                            detail=(
-                                f"Approval hold timed out after {held_s:.1f}s; "
-                                "unapproved spawn denied fail-safe."
-                            ),
-                            transcript_line=(
-                                f"Approval hold expired after {held_s:.1f}s; "
-                                "the unapproved spawn was denied fail-safe."),
-                            timed_out=True,
-                        )
-                    if hold_outcome == "denied":
-                        return _spawn_denied_result(
-                            _sreg,
-                            detail="Spawn denied by user.",
-                            transcript_line=(
-                                f"Approval hold left after {held_s:.1f}s: "
-                                "spawn denied by the user."),
-                        )
-                    _sreg.set_status(
-                        subagent_id, "running",
-                        note="spawn approved; approval hold released")
-                    _sreg.append_transcript(
-                        subagent_id, "system",
-                        f"Approval hold left after {held_s:.1f}s: spawn approved; "
-                        "continuing at this turn boundary.")
-                    _log(ledger, actor, {
-                        "event": "subagent_approval_hold_released",
-                        "subagent_id": subagent_id,
-                        "duration_s": held_s,
-                        "outcome": hold_outcome,
-                    })
-
-                if _sreg.is_paused(subagent_id):
-                    hold_outcome, held_s = _park_subagent(_sreg, "pause")
+                # A pause parks until a human resumes or terminates — no clock.
+                # The one automatic release is controller liveness: with nothing
+                # polling the registry inside CONTROLLER_GRACE_S, the only party
+                # that could resume this sub-agent is provably gone. An
+                # unattended bench/CI run therefore never parks at all.
+                if _sreg.is_paused(subagent_id) and _sreg.controller_alive():
+                    hold_outcome, held_s = _park_paused_subagent(_sreg)
                     if hold_outcome == "terminate":
                         _sreg.append_transcript(
                             subagent_id, "system",
                             f"Pause hold left after {held_s:.1f}s; a pending "
                             "termination will be honored at the next boundary.")
                         continue
-                    if hold_outcome == "timeout":
+                    if hold_outcome == "controller_gone":
                         _sreg.set_paused(subagent_id, False)
                         outcome_note = (
-                            f"Pause hold expired after {held_s:.1f}s and "
-                            "auto-resumed; continuing at this turn boundary.")
+                            f"Pause hold released after {held_s:.1f}s: no "
+                            "controller left that could resume this sub-agent.")
                     else:
                         outcome_note = (
                             f"Pause hold left after {held_s:.1f}s; resumed at "
@@ -2193,18 +2212,16 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         note="pause hold released")
                     _sreg.append_transcript(
                         subagent_id, "system", outcome_note)
+                    _raw_lifecycle(_sreg, subagent_id, "resumed", outcome_note)
                     _log(ledger, actor, {
                         "event": (
-                            "subagent_pause_hold_expired"
-                            if hold_outcome == "timeout"
+                            "subagent_pause_hold_orphaned"
+                            if hold_outcome == "controller_gone"
                             else "subagent_pause_hold_released"
                         ),
                         "subagent_id": subagent_id,
                         "duration_s": held_s,
-                        "outcome": (
-                            "auto_resumed"
-                            if hold_outcome == "timeout" else "resumed"
-                        ),
+                        "outcome": hold_outcome,
                     })
 
                 for _steer in _sreg.consume_steers(subagent_id):
@@ -2541,12 +2558,13 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                            else "(no visible output)")})
         _trig_prev_text = reply
         _trig_prev_calls_idx = len(calls)
-        # Phase 4: sub-agent transcripts capture every model reply so the GUI viewer
-        # shows the real conversation (never fabricated).
+        # Sub-agent transcripts capture every model reply in full so the GUI
+        # viewer shows the real conversation (never fabricated, never clipped);
+        # the raw log alongside it carries the tool traffic too.
         if subagent_id:
             try:
                 from services.agent import subagent_registry as _sreg  # noqa: PLC0415
-                _sreg.append_transcript(subagent_id, "subagent", str(reply)[:4000])
+                _sreg.append_transcript(subagent_id, "subagent", str(reply))
             except Exception:  # noqa: BLE001
                 pass
         parsed = _parse_directive(reply)

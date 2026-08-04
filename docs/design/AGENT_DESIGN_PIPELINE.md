@@ -125,9 +125,9 @@ When multiple model sources exist, councils prefer **diverse models** over tempe
 diversity. Council policy is per-stage, per-tier, and overridable in Advanced mode.
 
 ### 3.4 Hierarchical delegation  *(contract: aicad.delegation/1 + routing; T-DP9)*
-An overseer/lead spawns lesser sub-agents; **sub-agents may spawn their own sub-agents with
-approval from the overseer that called them, recursively** (Hunter: *overseer discretion, no
-hard cap*). The only rails are a **human-visible budget meter and a kill-switch** (runaway
+An overseer/lead spawns lesser sub-agents; **sub-agents may spawn their own sub-agents
+recursively with no hard cap**, and every delegation auto-approves at every depth. The only
+rails are a **human-visible budget meter and a kill-switch** (runaway
 protection), plus per-role model routing. Sub-agent **model preferences are a GUI setting**
 (T-DP12). Each agent may hold **multiple open documents** so the user can watch every
 sub-agent build its part of an assembly simultaneously (T-DP13).
@@ -275,8 +275,7 @@ agent system. **The glass copilot overlay stays exactly as it is in the modeling
 surface you switch to when you want to see and steer the whole operation. It contains:
 - **The interactive DAG as the centerpiece** (§9.3) — the live mission/build graph.
 - **Worker steering**: pause/resume/redirect/kill any agent or sub-agent; adjust a role's
-  model or effort on the fly; approve/deny a pending sub-agent spawn (ties to the
-  overseer-discretion delegation, T-DP9).
+  model or effort on the fly.
 - **Session management**: list, switch, fork, and resume agent sessions; the multi-file view
   (T-DP13) so several parts under concurrent work are visible at once.
 - **The transparency stream** (T-DP11): helpers/advisories/councils/tool-calls, inline.

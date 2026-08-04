@@ -153,6 +153,9 @@ static std::string chatSessionFileStem(const std::string& id) {
 static std::string chatSessionFilePath(const std::string& id) {
     return chatSessionsDir() + "/" + chatSessionFileStem(id) + ".json";
 }
+static std::string chatSubagentsDirPath(const std::string& id) {
+    return chatSessionsDir() + "/" + chatSessionFileStem(id) + ".subagents";
+}
 
 // File STEMS of sessions this process has verifiably held LIVE (loaded successfully, or
 // written by us this run). The prune step in persistChatHistory may ONLY remove transcripts
@@ -653,7 +656,13 @@ void persistChatHistory(AppState& st) {
             std::string stem = name.substr(0, name.size() - 5);
             if (keep.count(stem) || !s_pruneableSessionStems.count(stem)) continue;
             fs::remove(de.path(), ec);
-            if (!ec) s_pruneableSessionStems.erase(stem);
+            if (!ec) {
+                // The raw sub-agent transcript tree is owned by the same vouched-for session.
+                // Best-effort removal must remain behind the exact JSON prune safety gate.
+                std::error_code rawEc;
+                fs::remove_all(chatSubagentsDirPath(stem), rawEc);
+                s_pruneableSessionStems.erase(stem);
+            }
         }
         appstatePersistSync();  // WASM: flush IDBFS; no-op on desktop
 #ifdef __EMSCRIPTEN__
@@ -1504,6 +1513,16 @@ int forkConversation(AppState& st, int idx) {
 
     Conversation fork;
     fork.id = newConvId(st);
+    {
+        // A fork owns a full snapshot of the source's lossless sub-agent logs. Raw-log copy is
+        // best effort: conversation forking must still succeed if the filesystem refuses it.
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path sourceRaw = chatSubagentsDirPath(source.id);
+        if (fs::exists(sourceRaw, ec) && !ec) {
+            fs::copy(sourceRaw, chatSubagentsDirPath(fork.id), fs::copy_options::recursive, ec);
+        }
+    }
     fork.title = std::move(title);
     fork.docLink = source.docLink;
     fork.scopeClass = source.scopeClass;

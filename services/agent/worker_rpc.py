@@ -1499,7 +1499,8 @@ _ATTACH_MAX = 32
 
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     """``agent_admin_turn {request, run_id?, role?, provider?, model?, api_key?,
-    base_url?, reasoning_effort?, workspace_dir?, history?, attachments?} ->
+    base_url?, reasoning_effort?, workspace_dir?, history?, attachments?,
+    session_id?, sessions_dir?} ->
     {ok, turn:{success, stop_reason, result, role, allowed_tools}}
     | {ok:false, reason}``.
 
@@ -1567,6 +1568,24 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 _os.chdir(project_root)
     except Exception:  # noqa: BLE001 — a bad workspace path must never break a turn
         project_root = ""
+
+    # Sub-agent raw transcripts belong to the conversation that spawned them, so
+    # they fork and prune with it instead of piling up in a global cache. The GUI
+    # owns the Sessions directory layout and passes both keys down (composer.cpp
+    # -> run.cpp); binding them here means session identity never has to thread
+    # through delegation/mission_dispatch. Absent keys == the registry's own
+    # cache-dir fallback, i.e. exactly the previous behaviour.
+    try:
+        from services.agent import subagent_registry as _sreg_bind  # noqa: PLC0415
+        _sessions_dir = _param_str("sessions_dir")
+        _session_id = _param_str("session_id")
+        if _sessions_dir and _session_id:
+            from pathlib import Path as _BindPath  # noqa: PLC0415
+            _sreg_bind.bind_session(
+                _session_id,
+                str(_BindPath(_sessions_dir) / f"{_session_id}.subagents"))
+    except Exception:  # noqa: BLE001 — never break a turn over transcript paths
+        pass
 
     try:
         from services.agent import config as agent_config  # noqa: PLC0415

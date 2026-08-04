@@ -258,11 +258,6 @@ def load_routing(path: Path | None = None) -> "RoutingTable":
     assignments: dict[str, list[str]] = {}
     for role, pref_raw in raw_assignments.items():
         assignments[str(role)] = _parse_preference_list(str(role), pref_raw)
-    raw_policy = data.get("approval_policy") or {}
-    approval_policy = {
-        "depth_1": str(raw_policy.get("depth_1", "auto")),
-        "deeper": str(raw_policy.get("deeper", "overseer")),
-    }
     # T-DP9: parse the delegation: block for soft rails config.
     raw_delegation = data.get("delegation") or {}
     delegation_config: dict[str, int] = {
@@ -270,7 +265,6 @@ def load_routing(path: Path | None = None) -> "RoutingTable":
         "max_agents": int(raw_delegation.get("max_agents", 64)),
     }
     return RoutingTable(sources=sources, assignments=assignments,
-                        approval_policy=approval_policy,
                         delegation_config=delegation_config)
 
 
@@ -285,13 +279,11 @@ class RoutingTable:
         self,
         sources: list[Source],
         assignments: dict[str, list[str]],
-        approval_policy: dict[str, str],
         delegation_config: dict[str, int] | None = None,
     ) -> None:
         self._sources: list[Source] = list(sources)
         self._by_id: dict[str, Source] = {s.id: s for s in sources}
         self._assignments: dict[str, list[str]] = dict(assignments)
-        self.approval_policy: dict[str, str] = dict(approval_policy)
         # T-DP9: soft rails from routing.yaml delegation: block.
         _dc = delegation_config or {}
         self.soft_depth_limit: int = int(_dc.get("soft_depth_limit", 8))
@@ -450,20 +442,6 @@ class RoutingTable:
             for role in self._assignments
         }
 
-    # -- approval policy helpers ---------------------------------------------
-
-    def approval_for_depth(self, depth: int, kind: str = "worker") -> str:
-        """Return the approval policy for a delegation at *depth*.
-
-        *kind* = 'ponder': auto-approved at ANY depth.
-        *depth* <= 1: auto.
-        *depth* > 1 and kind != 'ponder': overseer (or human, per policy).
-        """
-        if kind == "ponder":
-            return "auto"
-        if depth <= 1:
-            return self.approval_policy.get("depth_1", "auto")
-        return self.approval_policy.get("deeper", "overseer")
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +503,6 @@ def validate(data: dict[str, Any]) -> None:
       * assignments: role->non-empty preference list; each token is a known
         symbolic token OR a ``<model_id>@<source_id>`` pin whose source exists
       * a ``default`` assignment is required (fallback for unlisted roles)
-      * approval_policy: {depth_1, deeper} with allowed values
     """
     if data.get("schema") != SCHEMA:
         raise RoutingError(f"schema must be '{SCHEMA}', got {data.get('schema')!r}")
@@ -590,16 +567,6 @@ def validate(data: dict[str, Any]) -> None:
                 f"({', '.join(SYMBOLIC_TOKENS)}) nor a '<model_id>@<source_id>' pin"
             )
 
-    policy = data.get("approval_policy", {})
-    if not isinstance(policy, dict):
-        raise RoutingError("'approval_policy' must be a mapping")
-    for key, allowed in (("depth_1", ("auto", "overseer", "human")),
-                         ("deeper", ("auto", "overseer", "human"))):
-        if key in policy and policy[key] not in allowed:
-            raise RoutingError(
-                f"approval_policy.{key} '{policy[key]}' invalid; "
-                f"use one of {', '.join(allowed)}"
-            )
 
 
 def loads(text: str) -> dict[str, Any]:
@@ -727,7 +694,6 @@ def view(data: dict[str, Any]) -> dict[str, Any]:
           "sources": [...],
           "assignments": {role: [prefs]},
           "resolved": {role: {"model": "...", "source": "...", "warnings": [...]}},
-          "approval_policy": {...}
         }
 
     ``resolved`` shows the concrete consequence of each preference list given
@@ -746,7 +712,6 @@ def view(data: dict[str, Any]) -> dict[str, Any]:
         "sources": data.get("sources", []),
         "assignments": data.get("assignments", {}),
         "resolved": resolved,
-        "approval_policy": data.get("approval_policy", {}),
     }
 
 
@@ -803,8 +768,6 @@ def _cli(argv: list[str]) -> int:
             "sources": obj.get("sources", []),
             "assignments": obj.get("assignments", {}),
         }
-        if "approval_policy" in obj:
-            doc["approval_policy"] = obj["approval_policy"]
         validate(doc)
         save(doc, args.path)
         print(json.dumps(view(doc)))

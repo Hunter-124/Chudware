@@ -418,6 +418,15 @@ static nlohmann::json chatHistoryForAgent(AppState& st) {
     return hist;
 }
 
+// Attach the active conversation context shared by every agent-turn launch. The worker uses
+// session_id + sessions_dir to bind lossless sub-agent transcripts beside this chat session.
+static void attachAgentConversationOptions(AppState& st, nlohmann::json& opts) {
+    opts["session_id"] = st.activeConvId();
+    opts["sessions_dir"] = chatSessionsDir();
+    if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
+        opts["history"] = std::move(hist);
+}
+
 // `extra` is merged on top of the provider override (attachments / context_refs / …).
 void launchDesignRun(AppState& st, const std::string& request,
                             nlohmann::json extra) {
@@ -463,8 +472,7 @@ void launchDesignRun(AppState& st, const std::string& request,
         if (!opts.contains("mode")) opts["mode"] = "agent";
         if (!opts.contains("advisor")) opts["advisor"] = true;
         opts["corporate_mode"] = st.settings.corporateMode;
-        if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
-            opts["history"] = std::move(hist);
+        attachAgentConversationOptions(st, opts);
         payload["options"] = std::move(opts);
     }
     // T-RF5: single agent entry — every Design send goes to agent_run_v2. (The legacy
@@ -536,8 +544,7 @@ void launchMissionRunChat(AppState& st, const std::string& request, bool needFre
         }
         if (!opts.contains("advisor")) opts["advisor"] = true;
         opts["corporate_mode"] = st.settings.corporateMode;
-        if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
-            opts["history"] = std::move(hist);
+        attachAgentConversationOptions(st, opts);
         payload["options"] = std::move(opts);
     }
     launchMissionRun(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, request,
@@ -1694,8 +1701,7 @@ void submitTurn(AppState& st, const std::string& text) {
         nlohmann::json opts = {{"mode", "edit"}, {"advisor", true},
                                {"corporate_mode", st.settings.corporateMode},
                                {"scope", buildEditScope()}};
-        if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
-            opts["history"] = std::move(hist);
+        attachAgentConversationOptions(st, opts);
         extra["options"] = std::move(opts);
         launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, sendText,
                          st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture, extra);
@@ -1740,8 +1746,7 @@ void submitTurn(AppState& st, const std::string& text) {
                 nlohmann::json opts = {{"mode", "agent"}, {"advisor", true},
                                        {"corporate_mode", st.settings.corporateMode},
                                        {"scope", buildEditScope()}};
-                if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
-                    opts["history"] = std::move(hist);
+                attachAgentConversationOptions(st, opts);
                 extra["options"] = std::move(opts);
                 launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey,
                                  sendText, st.docMirror.docId(),
@@ -1879,8 +1884,7 @@ void submitTurn(AppState& st, const std::string& text) {
             extra[it.key()] = it.value();
         extra["options"] = {{"mode", "plan"}, {"plan_only", true}, {"advisor", true},
                             {"corporate_mode", st.settings.corporateMode}};
-        if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
-            extra["options"]["history"] = std::move(hist);
+        attachAgentConversationOptions(st, extra["options"]);
         std::string err;
         if (!st.docMirror.hasDoc()) {
             if (!st.docMirror.newPart(st.worker, err)) {
@@ -1980,8 +1984,7 @@ void submitTurn(AppState& st, const std::string& text) {
             nlohmann::json opts = {{"mode", "agent"}, {"advisor", true},
                                    {"corporate_mode", st.settings.corporateMode},
                                    {"scope", buildEditScope()}};
-            if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
-                opts["history"] = std::move(hist);
+            attachAgentConversationOptions(st, opts);
             extra["options"] = std::move(opts);
             launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, sendText,
                              st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture,

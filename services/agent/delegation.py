@@ -1,4 +1,4 @@
-"""services/agent/delegation.py — Hierarchical delegation tree + approval chain.
+"""services/agent/delegation.py — Hierarchical delegation tree + execution rails.
 
 Contract: contracts/advisor.md §12 (aicad.delegation/1).
 
@@ -14,7 +14,7 @@ What this module provides
 
 ``DelegationNode``
     One spawned sub-agent slot: role + model (resolved via routing) + brief +
-    budget + docs lease requests (T-W16) + approval state.
+    budget + docs lease requests (T-W16).
 
 ``BudgetMeter``
     Human-visible tree-wide meter: tokens spent vs granted across ALL nodes, plus
@@ -22,11 +22,9 @@ What this module provides
     node.  Serialised in every ledger artifact flush so the GUI always has the
     current meter state.
 
-Approval chain (contract §12)
-    - depth-1 from the orchestrator: auto-approved.
-    - kind='ponder' at any depth: auto-approved (read-only + hard token budget).
-    - deeper worker: requires the mission overseer's approval (trigger=manual,
-      scope=delegation) or human, per approval_policy in routing.yaml.
+Automatic spawn transition
+    Every valid delegation is created as pending, then immediately auto-approved
+    before ``request_delegation`` returns.
 
 Recursion rails
     Hard nesting cap is ``agent.max_subagent_depth`` (config.json, default 2;
@@ -36,7 +34,6 @@ Recursion rails
       1. ``soft_depth_limit`` (config, default 8): reaching or exceeding this depth
          emits a ``delegation_depth_warning`` advisory event and allows the spawn
          (until the hard nesting cap refuses).
-         The overseer-approval requirement at depth>1 is the human-visible gate.
       2. ``max_agents`` (config, default 64): reaching this count emits a
          ``delegation_agent_limit_warning`` event and allows the spawn.  The kill-
          switch is the human-controlled stop.
@@ -71,7 +68,6 @@ Doc leases
 """
 from __future__ import annotations
 
-import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -117,12 +113,6 @@ class DocLease:
         return {"doc_id": self.doc_id, "lease": self.lease}
 
 
-@dataclass
-class ApprovalState:
-    """Approval record for one delegation node."""
-    policy: str          # "auto" | "overseer" | "human"
-    approved_by: str     # role id / "auto" / "human" / ""
-    ts: str              # ISO timestamp or ""
 
 
 @dataclass
@@ -237,7 +227,7 @@ class DelegationNode:
     requested_by: str
     kind: str              # "worker" | "ponder"
     depth: int             # 0 = orchestrator root
-    approval: ApprovalState
+    approved_ts: str
     model: ModelAssignment
     budget: Budget
     docs: list[DocLease] = field(default_factory=list)
@@ -253,11 +243,7 @@ class DelegationNode:
             "requested_by": self.requested_by,
             "kind": self.kind,
             "depth": self.depth,
-            "approval": {
-                "policy": self.approval.policy,
-                "approved_by": self.approval.approved_by,
-                "ts": self.approval.ts,
-            },
+            "approved_ts": self.approved_ts,
             "model": self.model.to_dict(),
             "budget": self.budget.to_dict(),
             "docs": [d.to_dict() for d in self.docs],
@@ -309,7 +295,6 @@ class DelegationTree:
         orchestrator_budget: int = 50_000,
         ledger: Any | None = None,
         routing: RoutingTable | None = None,
-        overseer: Any | None = None,
         soft_depth_limit: int = DEFAULT_SOFT_DEPTH_LIMIT,
         max_agents: int = DEFAULT_MAX_AGENTS,
         max_subagent_depth: int | None = None,
@@ -318,7 +303,6 @@ class DelegationTree:
         self._run_id = run_id or f"r_{uuid.uuid4().hex[:8]}"
         self._ledger = ledger
         self._routing = routing
-        self._overseer = overseer
         self._nodes: dict[str, DelegationNode] = {}
         self._pending_events: list[dict] = []
         # M20: optional live event sink (GUI stream). When set, request_delegation
@@ -363,7 +347,7 @@ class DelegationTree:
             requested_by="harness",
             kind="worker",
             depth=0,
-            approval=ApprovalState(policy="auto", approved_by="auto", ts=_now()),
+            approved_ts=_now(),
             model=ModelAssignment.unresolved(),
             budget=Budget(tokens_granted=orchestrator_budget),
             status="approved",
@@ -399,7 +383,7 @@ class DelegationTree:
         """Request a new sub-agent delegation.
 
         *parent_id*: defaults to the root orchestrator node.
-        *kind*: "worker" (default) or "ponder" (read-only, auto-approved at any depth).
+        *kind*: "worker" (default) or "ponder" (read-only).
         *docs*: list of ``{"doc_id": str, "lease": "write"|"read"}`` requests (T-W16
                 request shape only — actual leasing lives in T-W16).
         *availability*: passed to routing for source availability probing.
@@ -418,8 +402,7 @@ class DelegationTree:
           - depth >= soft_depth_limit  → ``delegation_depth_warning`` event.
           - agents_spawned >= max_agents → ``delegation_agent_limit_warning`` event.
 
-        Returns the newly created node (status pending, then transitioned to approved
-        or awaiting overseer approval).
+        Returns the newly created node after its pending → approved transition.
         """
         if kind not in ("worker", "ponder"):
             raise DelegationError(f"kind must be 'worker' or 'ponder', got {kind!r}")
@@ -473,8 +456,7 @@ class DelegationTree:
                     "max_subagent_depth": max_depth,
                     "message": (
                         f"Delegation at depth {depth} reached soft limit "
-                        f"{self._meter.soft_depth_limit}. "
-                        "Overseer approval required; spawn is proceeding. "
+                        f"{self._meter.soft_depth_limit}; spawn is proceeding. "
                         "Use kill() to halt the tree if this is runaway."
                     ),
                 },
@@ -499,11 +481,6 @@ class DelegationTree:
         model_assign = (ModelAssignment.from_resolution(res)
                         if res is not None else ModelAssignment.unresolved())
 
-        # Build approval state.
-        approval_policy_str = (
-            "auto" if self._routing is None
-            else self._routing.approval_for_depth(depth, kind=kind)
-        )
 
         node_id = _fresh_id()
         doc_leases = [DocLease(doc_id=d["doc_id"], lease=d["lease"])
@@ -524,8 +501,7 @@ class DelegationTree:
             requested_by=parent.role,
             kind=kind,
             depth=depth,
-            approval=ApprovalState(policy=approval_policy_str,
-                                   approved_by="", ts=""),
+            approved_ts="",
             model=model_assign,
             budget=Budget(tokens_granted=budget_tokens),
             docs=doc_leases,
@@ -559,8 +535,7 @@ class DelegationTree:
                 parent_run_id=self._run_id, parent_node_id=parent_id,
                 requested_by=parent.role,
                 model=(model_assign.id or ""), budget_tokens=budget_tokens,
-                status="pending",
-                awaiting_approval=(approval_policy_str != "auto"))
+                status="pending")
         except Exception:  # noqa: BLE001
             pass
 
@@ -583,31 +558,12 @@ class DelegationTree:
                 },
             )
 
-        # Approve or route to overseer.
-        if approval_policy_str == "auto":
-            self._approve(node, approved_by="auto")
-        else:
-            self._request_overseer_approval(node)
+        # Every valid delegation advances through pending to approved automatically.
+        self._approve(node)
 
         self._flush_artifact()
         return node
 
-    def approve(self, node_id: str, *, approved_by: str = "overseer") -> DelegationNode:
-        """Externally approve a pending delegation (overseer or human approval).
-
-        Only pending nodes can be approved.  The caller (mission loop or human relay)
-        calls this after the overseer has approved the delegation request.
-        """
-        node = self._nodes.get(node_id)
-        if node is None:
-            raise DelegationError(f"node {node_id!r} not found")
-        if node.status != "pending":
-            raise DelegationError(
-                f"node {node_id!r} is in status {node.status!r}; only pending nodes can be approved"
-            )
-        self._approve(node, approved_by=approved_by)
-        self._flush_artifact()
-        return node
 
     def start(self, node_id: str) -> DelegationNode:
         """Transition a node from approved → running."""
@@ -761,34 +717,10 @@ class DelegationTree:
             cur = parent
         return result
 
-    def _approve(self, node: DelegationNode, *, approved_by: str) -> None:
-        node.approval.approved_by = approved_by
-        node.approval.ts = _now()
-        self._transition(node, "approved", f"approved by {approved_by}")
+    def _approve(self, node: DelegationNode) -> None:
+        node.approved_ts = _now()
+        self._transition(node, "approved", "delegation auto-approved")
 
-    def _request_overseer_approval(self, node: DelegationNode) -> None:
-        """Emit a ledger event requesting overseer approval.
-
-        The overseer (or human relay) calls ``approve(node_id)`` when it grants.
-        The requesting node stays 'pending' — it blocks only itself, not siblings.
-        """
-        self._emit_event(
-            actor=node.role,
-            kind="delegation_approval_request",
-            payload={
-                "schema": DELEGATION_SCHEMA,
-                "node_id": node.id,
-                "role": node.role,
-                "depth": node.depth,
-                "kind": node.kind,
-                "policy": node.approval.policy,
-                "brief": node.brief,
-                "message": (
-                    f"Delegation approval requested: role={node.role!r} depth={node.depth} "
-                    f"kind={node.kind!r}. Awaiting {node.approval.policy} approval."
-                ),
-            },
-        )
 
     def _revoke_subtree(self, node_id: str, *, reason: str) -> None:
         """Revoke *node_id* and all its active descendants."""
@@ -904,8 +836,6 @@ def delegate(
         result = delegate(role="sketcher", brief="...", budget=4000, tree=mission_tree)
         if result.get("status") == "approved":
             ...  # proceed with the sub-agent
-        elif result.get("status") == "pending":
-            ...  # surfaced in the GUI approval queue; a human approve/deny releases it
     """
     try:
         node = tree.request_delegation(
@@ -921,115 +851,6 @@ def delegate(
         return {"error": str(exc), "status": "failed"}
 
 
-# ---------------------------------------------------------------------------
-# Registry <-> tree reconciliation (T-DP16 follow-up, 2026-08-03)
-# ---------------------------------------------------------------------------
-#
-# The DelegationTree lives in-process for the duration of a mission; the
-# sub-agent registry is the DURABLE, cross-process mirror the GUI speaks to.
-# A human approve/deny arrives through the registry (``subagent_control``), so
-# the tree must be told about it or ``DelegationNode.status`` drifts away from
-# the decision that actually gates execution.  These two helpers are the only
-# sanctioned bridge — do not reach into ``tree._nodes`` from the dispatch layer.
-
-#: Both holds (here and at agent_turn's sub-agent turn boundary) share one cap.
-_HOLD_ENV = "CHUDWARE_SUBAGENT_HOLD_MAX_S"
-_HOLD_DEFAULT_S = 900.0
-
-
-def _hold_max_s() -> float:
-    try:
-        return max(0.0, float(os.environ.get(_HOLD_ENV, str(_HOLD_DEFAULT_S))))
-    except (TypeError, ValueError):
-        return _HOLD_DEFAULT_S
-
-
-def reconcile_registry_decision(tree: DelegationTree, node_id: str) -> str:
-    """Apply the registry's human approve/deny decision to the in-process *tree*.
-
-    Returns ``"approved"``, ``"denied"`` or ``""`` (no decision recorded yet).
-    Idempotent: a node already approved/revoked is reported without a second
-    transition, so this is safe to call on every poll.
-    """
-    if tree is None or not node_id:
-        return ""
-    try:
-        from services.agent import subagent_registry as _sreg  # noqa: PLC0415
-        decision = _sreg.spawn_decision(node_id)
-    except Exception:  # noqa: BLE001 — a registry read never breaks a mission
-        return ""
-    if decision not in ("approved", "denied"):
-        return ""
-    node = tree._nodes.get(node_id)  # noqa: SLF001 — this module owns the tree
-    if node is None:
-        return ""
-    try:
-        if decision == "approved":
-            if node.status == "pending":
-                tree.approve(node_id, approved_by="human")
-        elif node.status not in ("revoked", "failed", "done"):
-            tree.revoke(node_id, reason="spawn denied by the user")
-    except DelegationError:
-        # Lost a race with another transition — the registry decision still
-        # stands, and the caller reads it as the authoritative answer.
-        pass
-    return decision
-
-
-def await_registry_decision(tree: DelegationTree, node_id: str, *,
-                            timeout_s: float | None = None,
-                            poll_s: float = 0.5) -> str:
-    """Park until a human approve/deny lands in the registry for *node_id*.
-
-    Mirrors the sub-agent turn-boundary hold in ``agent_turn.run_turn``: polls
-    rather than blocking on a primitive, yields immediately to a pending
-    terminate, and is bounded by ``CHUDWARE_SUBAGENT_HOLD_MAX_S``.
-
-    Returns ``"approved"`` | ``"denied"`` | ``"terminated"`` | ``"timeout"``,
-    or ``""`` when there is nothing to wait for.
-
-    **Unattended runs never block.** Holding only makes sense when a human can
-    see the request, so an already-recorded decision is applied but an OPEN gate
-    with no live registry watcher (`subagent_registry.watcher_active`) returns
-    ``""`` immediately — a bench/CI/headless mission behaves exactly as it did
-    before the approval gate existed. Pass an explicit *timeout_s* to force a
-    hold regardless (the tests do this).
-    """
-    cap = _hold_max_s() if timeout_s is None else max(0.0, float(timeout_s))
-    if timeout_s is None:
-        decided = reconcile_registry_decision(tree, node_id)
-        if decided:
-            return decided
-        try:
-            from services.agent import subagent_registry as _sreg  # noqa: PLC0415
-            if not _sreg.watcher_active():
-                return ""
-        except Exception:  # noqa: BLE001
-            return ""
-    started = time.monotonic()
-    while True:
-        decision = reconcile_registry_decision(tree, node_id)
-        if decision:
-            return decision
-        try:
-            from services.agent import subagent_registry as _sreg  # noqa: PLC0415
-            if _sreg.terminate_requested(node_id):
-                return "terminated"
-            if not _sreg.awaiting_approval(node_id):
-                # The gate was cleared without an explicit decision (e.g. the
-                # session was rewritten). Treat it as released, not approved.
-                return ""
-        except Exception:  # noqa: BLE001
-            return ""
-        if time.monotonic() - started >= cap:
-            try:
-                from services.agent import subagent_registry as _sreg  # noqa: PLC0415
-                _sreg.decide_spawn(node_id, approve=False, by="approval_timeout")
-            except Exception:  # noqa: BLE001
-                pass
-            reconcile_registry_decision(tree, node_id)
-            return "timeout"
-        time.sleep(poll_s)
 
 
 # ---------------------------------------------------------------------------
@@ -1097,8 +918,7 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
                 "Nesting is hard-capped by agent.max_subagent_depth (default 2; "
                 "root chat = depth 0). Spawns past the limit refuse with "
                 "'max subagent nesting depth (N) reached'. "
-                "depth-1 sub-agents are auto-approved; deeper ones require overseer approval. "
-                "'ponder' kind is auto-approved at any allowed depth (read-only + budget-bounded). "
+                "Every valid delegation is auto-approved before this tool returns. "
                 "A depth_warning or agent_limit_warning advisory is emitted when soft limits "
                 "are reached, but the spawn still proceeds (until the hard nesting cap). "
                 "Optional 'effort' (low|medium|high): when the subagent role's Thinking is "

@@ -13,8 +13,8 @@ Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 �
   routes to orchestrator + overseer audit.
 - §12 delegation nodes gain `kind: worker|ponder`. `ponder` = a read-only,
   budget-bounded spin-off of the requesting role for deep-diving one question
-  ("what's the best datum scheme here?"); auto-approved at ANY depth (read-only
-  tools + hard token budget make it safe), result lands as a ledger note.
+  ("what's the best datum scheme here?"); like every delegation kind, it auto-approves
+  at every depth, and its result lands as a ledger note.
 - §8 tier profiles gain `deliberation: full|standard|minimal`. INVERTED DIAL
   (Hunter 2026-07-04): local tiers default `full` (tokens are free — councils,
   ponders, trigger packs all on), frontier defaults `minimal` (tokens cost money;
@@ -326,10 +326,13 @@ dispatch rows (a user "thicker wall" re-enters GEOMETRY on the wall's geometry_s
 
 ## §12 Delegation tree (`aicad.delegation/1`)
 
-**T-DP9 additive amendment (1.5 → 1.6):** Removed hard depth cap; added recursive
-overseer-discretion spawn, human-visible budget meter, and kill-switch.  All new fields
-are additive; `depth_cap` is retained for backward compatibility with artifact readers
-but is NO LONGER enforced as a hard limit.
+**T-DP9 amendment (1.5 → 1.6):** Removed hard depth cap; added recursive spawn,
+human-visible budget meter, and kill-switch. `depth_cap` is retained for backward
+compatibility with artifact readers but is NO LONGER enforced as a hard limit.
+
+**2026-08-03 control-plane amendment:** Human/overseer spawn approval was removed end to end.
+The delegation-node `approval` object is deleted; every request immediately transitions from
+`pending` to `approved` and records `approved_ts`.
 
 ```json
 {
@@ -341,7 +344,7 @@ but is NO LONGER enforced as a hard limit.
     "requested_by": "orchestrator",
     "kind": "worker|ponder",
     "depth": 0,
-    "approval": {"policy": "auto|overseer|human", "approved_by": "", "ts": ""},
+    "approved_ts": 0.0,
     "model": {"provider": "", "id": "", "tier": "local-24k"},
     "budget": {"tokens_granted": 0, "tokens_spent": 0, "attempts": 0},
     "docs": [{"doc_id": "", "lease": "write|read"}],
@@ -366,11 +369,10 @@ but is NO LONGER enforced as a hard limit.
 ```
 
 Rules:
-- depth-1 from the orchestrator auto-approves; deeper requires the mission overseer's
-  approval (or human, per policy). **`kind=ponder` is auto-approved at ANY depth.**
+- Every delegation auto-approves at every depth.
 - **No hard depth cap (T-DP9, Hunter directive).** An overseer/lead may spawn
-  sub-agents; those sub-agents may spawn their own with approval from the overseer that
-  called them, recursively, with NO hard cap. The only rails are:
+  sub-agents; those sub-agents may spawn their own recursively, with NO hard cap. The only
+  rails are:
   1. `soft_depth_limit` (config, default 8): reaching this depth emits a
      `delegation_depth_warning` advisory event; spawn still proceeds.
   2. `max_agents` (config, default 64): reaching this count emits a
@@ -435,7 +437,6 @@ assignments:                  # role -> ordered preference list, first available
   fixer:         [strong]
   sketcher:      [cheap_local, strong]   # fall through if local source offline
   default:       [cheap_local, strong]
-approval_policy: {depth_1: auto, deeper: overseer}
 ```
 
 Rules: routing changes are ledger events (troubleshooting: "which model did that").

@@ -38,7 +38,11 @@ def _tmp_registry(tmp_path, monkeypatch):
                         lambda *a, **k: None)
     monkeypatch.setattr("services.agent.role_models.resolve_role_model",
                         lambda *a, **k: None)
+    # bind_session is a process-level global: clear it so a session-bound raw
+    # path from one test can never leak into the next one's fallback assertions.
+    reg.bind_session("", "")
     yield
+    reg.bind_session("", "")
 
 
 class RecordingProvider(MockProvider):
@@ -278,52 +282,6 @@ def test_rpc_control_pause_resume_roundtrip():
     assert not reg.is_paused("dg_ctl_pause")
 
 
-def test_rpc_control_deny_requires_confirm_and_records_decision():
-    reg.register_session(
-        "dg_ctl_deny", role="worker", awaiting_approval=True)
-
-    refused = _rpc(
-        "subagent_control",
-        {"subagent_id": "dg_ctl_deny", "op": "deny"},
-    )
-    assert not refused["ok"] and refused.get("requires_confirm") is True
-    assert reg.spawn_decision("dg_ctl_deny") == ""
-
-    denied = _rpc(
-        "subagent_control",
-        {"subagent_id": "dg_ctl_deny", "op": "deny", "confirm": True},
-    )
-    assert denied["ok"] and denied["spawn_decision"] == "denied"
-    assert reg.spawn_decision("dg_ctl_deny") == "denied"
-
-
-def test_rpc_control_approve_refuses_non_pending_session():
-    reg.register_session("dg_ctl_not_waiting", role="worker", status="running")
-
-    refused = _rpc(
-        "subagent_control",
-        {"subagent_id": "dg_ctl_not_waiting", "op": "approve"},
-    )
-    assert not refused["ok"]
-    assert "not awaiting" in refused["reason"]
-    assert reg.spawn_decision("dg_ctl_not_waiting") == ""
-
-
-def test_rpc_control_approve_releases_pending_spawn():
-    reg.register_session(
-        "dg_ctl_approve", role="worker", awaiting_approval=True)
-
-    approved = _rpc(
-        "subagent_control",
-        {"subagent_id": "dg_ctl_approve", "op": "approve"},
-    )
-    assert approved["ok"] and approved["spawn_decision"] == "approved"
-    assert approved["awaiting_approval"] is False
-    session = reg.get_session("dg_ctl_approve")
-    assert session["status"] == "approved"
-    assert session["awaiting_approval"] is False
-
-
 def test_rpc_control_runtime_effort_validation_and_list_roundtrip():
     reg.register_session("dg_ctl_runtime", role="worker", status="running")
 
@@ -375,17 +333,183 @@ def test_rpc_list_defaults_control_keys_for_legacy_meta():
         key: session[key]
         for key in (
             "paused",
-            "awaiting_approval",
-            "spawn_decision",
             "model_override",
             "provider_override",
             "effort_override",
         )
     } == {
         "paused": False,
-        "awaiting_approval": False,
-        "spawn_decision": "",
         "model_override": "",
         "provider_override": "",
         "effort_override": "",
     }
+
+
+# ---------------------------------------------------------------------------
+# Lossless raw transcript (contracts/worker_rpc.md §6.4, chudware.subagent.raw/1)
+#
+# The display transcript is a human-readable lifecycle+reply stream. The raw log
+# is the archive: verbatim provider traffic, never truncated, never pruned. Before
+# this existed a sub-agent's real conversation died with run_turn's local list.
+# ---------------------------------------------------------------------------
+
+def test_raw_log_lands_beside_the_owning_conversation(tmp_path):
+    """A bound session puts the raw log in the conversation's sidecar dir."""
+    sessions = tmp_path / "Sessions"
+    reg.bind_session("conv_42", str(sessions / "conv_42.subagents"))
+    reg.register_session("dg_raw_bound", role="worker", status="running")
+
+    path = reg.raw_path("dg_raw_bound")
+    assert path is not None
+    assert path.parent == sessions / "conv_42.subagents"
+    assert path.name == "dg_raw_bound.jsonl"
+    assert reg.get_session("dg_raw_bound")["session_id"] == "conv_42"
+
+
+def test_raw_log_falls_back_to_the_registry_cache_when_unbound():
+    """No conversation bound (headless/bench) still gets a raw log, not none."""
+    reg.register_session("dg_raw_unbound", role="worker", status="running")
+
+    path = reg.raw_path("dg_raw_unbound")
+    assert path is not None
+    assert path.parent == reg.subagents_dir()
+
+
+def test_raw_log_is_verbatim_and_uncapped():
+    """The whole point: nothing in the raw log is clipped or summarized.
+
+    The display transcript used to be the ONLY record and it stored
+    ``str(reply)[:4000]``, so any longer reply was unrecoverable.
+    """
+    reg.register_session("dg_raw_big", role="worker", status="running")
+    payload = "x" * 25000
+    reg.append_raw("dg_raw_big", {
+        "kind": "message",
+        "message": {"role": "assistant", "content": payload,
+                    "tool_calls": [{"name": "fs_write", "args": {"body": payload}}]},
+    })
+
+    records = reg.read_raw("dg_raw_big")
+    body = [r for r in records if r.get("kind") == "message"]
+    assert len(body) == 1
+    message = body[0]["message"]
+    assert message["content"] == payload
+    assert message["tool_calls"][0]["args"]["body"] == payload
+
+
+def test_raw_log_header_identifies_the_session_and_seq_is_monotonic():
+    reg.bind_session("conv_hdr", "")
+    reg.register_session("dg_raw_seq", role="sketcher", status="running",
+                         parent_run_id="run_7")
+    for i in range(3):
+        reg.append_raw("dg_raw_seq", {"kind": "lifecycle", "event": "steer",
+                                      "note": f"n{i}"})
+
+    records = reg.read_raw("dg_raw_seq")
+    header = records[0]
+    assert header["kind"] == "header"
+    assert header["schema"] == "chudware.subagent.raw/1"
+    assert header["subagent_id"] == "dg_raw_seq"
+    assert header["session_id"] == "conv_hdr"
+    assert header["role"] == "sketcher"
+    assert [r["seq"] for r in records[1:]] == [1, 2, 3]
+
+
+def test_raw_log_seq_survives_a_process_restart():
+    """seq is derived from the file, not from in-memory state.
+
+    A sub-agent outlives the process that spawned it; a counter kept only in
+    memory would silently restart at 1 and make the archive unorderable.
+    """
+    reg.register_session("dg_raw_restart", role="worker", status="running")
+    reg.append_raw("dg_raw_restart", {"kind": "lifecycle", "event": "started"})
+    reg.append_raw("dg_raw_restart", {"kind": "lifecycle", "event": "paused"})
+
+    import importlib  # noqa: PLC0415
+    importlib.reload(reg)
+    reg.append_raw("dg_raw_restart", {"kind": "lifecycle", "event": "resumed"})
+
+    assert [r["seq"] for r in reg.read_raw("dg_raw_restart")[1:]] == [1, 2, 3]
+
+
+def test_raw_log_never_raises_into_the_agent_loop():
+    """A broken archive must not take the run down with it."""
+    reg.register_session("dg_raw_bad", role="worker", status="running")
+
+    class _Unserializable:
+        pass
+
+    reg.append_raw("dg_raw_bad", {"kind": "message",
+                                  "message": {"o": _Unserializable()}})
+    reg.append_raw("dg_raw_bad", {"kind": "lifecycle", "event": "finished"})
+
+    kinds = [r.get("kind") for r in reg.read_raw("dg_raw_bad")]
+    assert "lifecycle" in kinds
+
+
+def test_rpc_transcript_raw_flag_returns_raw_records():
+    reg.register_session("dg_raw_rpc", role="worker", status="running")
+    reg.append_transcript("dg_raw_rpc", "subagent", "display copy")
+    reg.append_raw("dg_raw_rpc", {
+        "kind": "message",
+        "message": {"role": "assistant", "content": "raw copy"}})
+
+    display = _rpc("subagent_transcript", {"subagent_id": "dg_raw_rpc"})
+    assert display["ok"]
+    assert any(m.get("text") == "display copy" for m in display["messages"])
+
+    raw = _rpc("subagent_transcript", {"subagent_id": "dg_raw_rpc", "raw": True})
+    assert raw["ok"]
+    assert any(
+        m.get("message", {}).get("content") == "raw copy"
+        for m in raw["messages"]
+    )
+
+
+def test_rpc_list_filters_by_owning_conversation():
+    reg.bind_session("conv_a", "")
+    reg.register_session("dg_in_a", role="worker", status="running")
+    reg.bind_session("conv_b", "")
+    reg.register_session("dg_in_b", role="worker", status="running")
+
+    listed = _rpc("subagent_list", {"session_id": "conv_a"})
+    ids = {item["id"] for item in listed["sessions"]}
+    assert "dg_in_a" in ids
+    assert "dg_in_b" not in ids
+
+
+# ---------------------------------------------------------------------------
+# Controller liveness — the ONLY automatic release of a pause hold.
+# ---------------------------------------------------------------------------
+
+def test_controller_heartbeat_marks_a_controller_alive():
+    reg.note_controller("gui")
+    assert reg.controller_alive()
+
+
+def test_a_stale_controller_does_not_count_as_alive():
+    """Liveness, not a deadline: an old poll is not a live controller."""
+    reg.note_controller("gui")
+    assert not reg.controller_alive(within_s=0.0)
+
+
+def test_no_controller_has_ever_polled_reads_as_dead():
+    """An unattended bench/CI run must never look like someone is watching."""
+    assert not reg.controller_alive()
+
+
+def test_subagent_list_stamps_the_controller_heartbeat():
+    """The GUI's ~4s poll IS the heartbeat — nothing else writes it."""
+    assert not reg.controller_alive()
+    _rpc("subagent_list", {})
+    assert reg.controller_alive()
+
+
+def test_removed_approval_ops_are_rejected():
+    """Spawn approval is automatic now; the ops are gone, not defaulted to yes."""
+    reg.register_session("dg_no_approval", role="worker", status="running")
+    for op in ("approve", "deny"):
+        refused = _rpc("subagent_control",
+                       {"subagent_id": "dg_no_approval", "op": op})
+        assert not refused["ok"]
+        assert "pause, resume, set_runtime" in refused["reason"]

@@ -3,7 +3,7 @@
 Contract: contracts/advisor.md §12 (aicad.delegation/1) + §14 (aicad.routing/1).
 
 Test coverage:
-  * Approval matrix: auto (depth-1), overseer (deeper), ponder (any depth).
+  * Every valid delegation auto-approves at every depth and for every kind.
   * Budget accrual + revocation at exact exhaustion.
   * Routing fallthrough when a source is offline.
   * Resolution ledger events emitted on every resolve.
@@ -21,15 +21,12 @@ Offline discipline: mock providers, no network, no LLM, no all-skip.
 """
 from __future__ import annotations
 
-import os
-import time
 import unittest
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 from services.agent.delegation import (
     DEPTH_CAP,
-    DEFAULT_SOFT_DEPTH_LIMIT,
     DEFAULT_MAX_AGENTS,
     DEFAULT_MAX_SUBAGENT_DEPTH,
     DELEGATION_SCHEMA,
@@ -80,7 +77,6 @@ def tearDownModule() -> None:
 def _make_routing(
     sources: list[dict] | None = None,
     assignments: dict | None = None,
-    approval_policy: dict | None = None,
 ) -> RoutingTable:
     """Build a RoutingTable from raw dicts (test helper)."""
     cfg: dict = {
@@ -91,10 +87,6 @@ def _make_routing(
             "orchestrator": ["strongest"],
             "sketcher": ["cheap_local", "strong"],
             "default": ["cheap_local", "strong"],
-        },
-        "approval_policy": approval_policy or {
-            "depth_1": "auto",
-            "deeper": "overseer",
         },
     }
     return load_routing(cfg)
@@ -287,27 +279,6 @@ class TestResolveAssignments(unittest.TestCase):
             self.assertIsNone(res, f"role {role!r} should be None with no sources")
 
 
-class TestApprovalPolicy(unittest.TestCase):
-    """approval_for_depth() — ponder special case + depth rules."""
-
-    def test_ponder_auto_at_any_depth(self):
-        """T-DP9: ponder is auto-approved at any depth — well past the old DEPTH_CAP."""
-        rt = _make_routing()
-        for depth in range(1, DEFAULT_SOFT_DEPTH_LIMIT + 3):
-            self.assertEqual(rt.approval_for_depth(depth, kind="ponder"), "auto",
-                             f"ponder at depth {depth} should be auto")
-
-    def test_depth1_worker_auto(self):
-        rt = _make_routing()
-        self.assertEqual(rt.approval_for_depth(1, kind="worker"), "auto")
-
-    def test_depth2_worker_overseer(self):
-        rt = _make_routing()
-        self.assertEqual(rt.approval_for_depth(2, kind="worker"), "overseer")
-
-    def test_depth3_worker_overseer(self):
-        rt = _make_routing()
-        self.assertEqual(rt.approval_for_depth(3, kind="worker"), "overseer")
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +321,8 @@ class TestDelegationTreeBasics(unittest.TestCase):
         self.assertEqual(ev["status"], "approved")
 
 
-class TestDelegationApprovalMatrix(unittest.TestCase):
-    """Approval chain: auto (depth-1), overseer (deeper), ponder (any depth)."""
+class TestDelegationAutoApproval(unittest.TestCase):
+    """Every valid delegation is approved immediately, regardless of depth or kind."""
 
     def setUp(self):
         self.routing = _two_source_routing()
@@ -372,20 +343,20 @@ class TestDelegationApprovalMatrix(unittest.TestCase):
             kind="worker",
         )
         self.assertEqual(node.status, "approved")
-        self.assertEqual(node.approval.approved_by, "auto")
+        self.assertTrue(node.approved_ts)
         self.assertEqual(node.depth, 1)
 
-    def test_depth2_worker_pending_overseer(self):
-        # First create a depth-1 node.
-        d1 = self.tree.request_delegation("orchestrator", "Plan phase", 5000, kind="worker")
-        self.assertEqual(d1.status, "approved")
-        # Now depth-2.
+    def test_deep_worker_auto_approved_without_human_involvement(self):
+        d1 = self.tree.request_delegation(
+            "orchestrator", "Plan phase", 5000, kind="worker",
+        )
         d2 = self.tree.request_delegation(
             "sketcher", "Sketch sub-task", 1000,
             parent_id=d1.id, kind="worker",
         )
-        self.assertEqual(d2.status, "pending")
-        self.assertEqual(d2.approval.policy, "overseer")
+        self.assertEqual(d2.depth, 2)
+        self.assertEqual(d2.status, "approved")
+        self.assertTrue(d2.approved_ts)
 
     def test_depth2_ponder_auto_approved(self):
         d1 = self.tree.request_delegation("orchestrator", "Plan phase", 5000, kind="worker")
@@ -395,43 +366,11 @@ class TestDelegationApprovalMatrix(unittest.TestCase):
         )
         self.assertEqual(d2.status, "approved",
                          "ponder must be auto-approved at any depth")
-        self.assertEqual(d2.approval.approved_by, "auto")
+        self.assertTrue(d2.approved_ts)
 
-    def test_depth3_ponder_auto_approved(self):
-        d1 = self.tree.request_delegation("orchestrator", "Phase", 10000, kind="worker")
-        # d2 is pending (depth=2 worker) — approve it externally.
-        d2 = self.tree.request_delegation("sketcher", "Sub", 2000,
-                                          parent_id=d1.id, kind="worker")
-        self.tree.approve(d2.id, approved_by="overseer")
-        # Start d2 so it can delegate.
-        self.tree.start(d2.id)
-        # Now depth-3 ponder.
-        d3 = self.tree.request_delegation(
-            "feature_modeler", "Deepest ponder", 400,
-            parent_id=d2.id, kind="ponder",
-        )
-        self.assertEqual(d3.status, "approved")
 
-    def test_overseer_approve_transitions_to_approved(self):
-        d1 = self.tree.request_delegation("orchestrator", "Plan", 5000, kind="worker")
-        d2 = self.tree.request_delegation("sketcher", "Sub", 1000,
-                                          parent_id=d1.id, kind="worker")
-        self.assertEqual(d2.status, "pending")
-        self.tree.approve(d2.id, approved_by="overseer")
-        self.assertEqual(d2.status, "approved")
 
-    def test_approving_non_pending_raises(self):
-        d1 = self.tree.request_delegation("sketcher", "Auto-approved", 500, kind="worker")
-        self.assertEqual(d1.status, "approved")
-        with self.assertRaises(DelegationError):
-            self.tree.approve(d1.id)
 
-    def test_approval_request_event_emitted(self):
-        d1 = self.tree.request_delegation("orchestrator", "Plan", 5000, kind="worker")
-        self.tree.request_delegation("sketcher", "Sub-task needing approval", 500,
-                                     parent_id=d1.id, kind="worker")
-        approval_events = self.ledger.events_of_kind("delegation_approval_request")
-        self.assertEqual(len(approval_events), 1)
 
     def test_invalid_kind_raises(self):
         with self.assertRaises(DelegationError):
@@ -477,135 +416,6 @@ class TestDelegationApprovalMatrix(unittest.TestCase):
 
 
 
-class TestRegistryTreeReconciliation(unittest.TestCase):
-    """The durable registry decision and the in-process tree must agree (T-DP16).
-
-    `routing.yaml` sets `approval_policy.deeper: overseer`, and nothing in the
-    codebase ever called `DelegationTree.approve()` — so every depth>1 node was
-    stranded `pending` forever. The human decision arrives through the registry;
-    these tests pin that it reaches the tree.
-    """
-
-    def setUp(self):
-        from services.agent import subagent_registry as reg
-        self.reg = reg
-        # The watcher heartbeat is a shared file in the (session-scoped) registry
-        # dir — clear it so each case starts genuinely unattended.
-        try:
-            reg._watcher_path().unlink()
-        except FileNotFoundError:
-            pass
-        self.tree = DelegationTree(
-            run_id="r_reconcile",
-            orchestrator_budget=100_000,
-            ledger=_MockLedger(),
-            routing=_two_source_routing(),
-            max_subagent_depth=8,
-        )
-        d1 = self.tree.request_delegation("orchestrator", "Plan", 5000, kind="worker")
-        self.node = self.tree.request_delegation("sketcher", "Sub", 1000,
-                                                 parent_id=d1.id, kind="worker")
-        # The stranded case this whole seam exists for.
-        self.assertEqual(self.node.status, "pending")
-
-    def test_deep_spawn_is_registered_awaiting_approval(self):
-        session = self.reg.get_session(self.node.id)
-        self.assertIsNotNone(session, "a deep spawn must appear in the registry")
-        self.assertTrue(session["awaiting_approval"],
-                        "a non-auto approval policy must raise the GUI approval gate")
-
-    def test_registry_approval_reaches_the_tree(self):
-        from services.agent.delegation import reconcile_registry_decision
-        self.reg.decide_spawn(self.node.id, approve=True, by="user")
-        self.assertEqual(reconcile_registry_decision(self.tree, self.node.id), "approved")
-        self.assertEqual(self.node.status, "approved")
-        self.assertEqual(self.node.approval.approved_by, "human")
-        # And the node can now actually start — the point of the whole exercise.
-        self.tree.start(self.node.id)
-        self.assertEqual(self.node.status, "running")
-
-    def test_registry_denial_revokes_the_subtree(self):
-        from services.agent.delegation import reconcile_registry_decision
-        self.reg.decide_spawn(self.node.id, approve=False, by="user")
-        self.assertEqual(reconcile_registry_decision(self.tree, self.node.id), "denied")
-        self.assertEqual(self.node.status, "revoked")
-
-    def test_reconcile_is_idempotent(self):
-        from services.agent.delegation import reconcile_registry_decision
-        self.reg.decide_spawn(self.node.id, approve=True, by="user")
-        for _ in range(3):
-            self.assertEqual(
-                reconcile_registry_decision(self.tree, self.node.id), "approved")
-        self.assertEqual(self.node.status, "approved")
-
-    def test_no_decision_yet_leaves_the_node_pending(self):
-        from services.agent.delegation import reconcile_registry_decision
-        self.assertEqual(reconcile_registry_decision(self.tree, self.node.id), "")
-        self.assertEqual(self.node.status, "pending")
-
-    def test_await_returns_immediately_on_an_existing_decision(self):
-        from services.agent.delegation import await_registry_decision
-        self.reg.decide_spawn(self.node.id, approve=True, by="user")
-        self.assertEqual(
-            await_registry_decision(self.tree, self.node.id, timeout_s=5.0), "approved")
-
-    def test_await_timeout_denies_fail_safe(self):
-        # An unapproved spawn must NEVER run; the tree is revoked to match the
-        # registry so the two views cannot disagree after the hold expires.
-        from services.agent.delegation import await_registry_decision
-        out = await_registry_decision(self.tree, self.node.id,
-                                      timeout_s=0.0, poll_s=0.01)
-        self.assertEqual(out, "timeout")
-        self.assertEqual(self.reg.spawn_decision(self.node.id), "denied")
-        self.assertEqual(self.node.status, "revoked")
-
-    def test_await_yields_to_a_pending_terminate(self):
-        from services.agent.delegation import await_registry_decision
-        self.reg.request_terminate(self.node.id)
-        out = await_registry_decision(self.tree, self.node.id,
-                                      timeout_s=5.0, poll_s=0.01)
-        self.assertEqual(out, "terminated")
-        self.assertEqual(self.node.status, "pending",
-                         "a terminate hands control back; it is not a denial")
-
-    def test_unattended_run_does_not_block(self):
-        """A headless mission must behave exactly as it did before the gate.
-
-        The default (no explicit timeout) path holds ONLY while a GUI is
-        polling the registry. With no watcher it returns immediately and the
-        node stays pending — a bench/CI run can never hang for 15 minutes
-        waiting for an approval nobody is there to give.
-        """
-        from services.agent.delegation import await_registry_decision
-        self.assertFalse(self.reg.watcher_active(),
-                         "no GUI has polled; the fixture must start unattended")
-        started = time.monotonic()
-        out = await_registry_decision(self.tree, self.node.id)
-        self.assertEqual(out, "")
-        self.assertLess(time.monotonic() - started, 1.0,
-                        "an unattended hold must return immediately, not park")
-        self.assertEqual(self.node.status, "pending")
-
-    def test_watcher_heartbeat_enables_the_hold(self):
-        # A live watcher flips the same call into a real (here: instantly
-        # expiring) hold rather than the immediate unattended bail-out.
-        from services.agent.delegation import await_registry_decision
-        self.reg.note_watcher("test")
-        self.assertTrue(self.reg.watcher_active())
-        os.environ["CHUDWARE_SUBAGENT_HOLD_MAX_S"] = "0"
-        try:
-            self.assertEqual(
-                await_registry_decision(self.tree, self.node.id, poll_s=0.01),
-                "timeout")
-        finally:
-            os.environ.pop("CHUDWARE_SUBAGENT_HOLD_MAX_S", None)
-        self.assertEqual(self.node.status, "revoked")
-
-    def test_stale_watcher_does_not_count(self):
-        self.reg.note_watcher("test")
-        self.assertTrue(self.reg.watcher_active(within_s=30.0))
-        self.assertFalse(self.reg.watcher_active(within_s=0.0),
-                         "a watcher outside the TTL must not hold a mission")
 
 
 class TestBudgetInheritanceRevocation(unittest.TestCase):
@@ -821,7 +631,7 @@ class TestArtifactShape(unittest.TestCase):
         node = tree.request_delegation("sketcher", "Brief", 500, kind="ponder")
         d = node.to_dict()
         for key in ("id", "parent", "role", "brief", "requested_by", "kind",
-                    "depth", "approval", "model", "budget", "docs", "status"):
+                    "depth", "approved_ts", "model", "budget", "docs", "status"):
             self.assertIn(key, d, f"missing required field {key!r} in node dict")
 
 
@@ -1041,20 +851,20 @@ class TestKillSwitch(unittest.TestCase):
         self.assertIn("error", result)
         self.assertEqual(result["status"], "failed")
 
-    def test_kill_with_pending_nodes(self):
-        """Pending nodes (awaiting overseer approval) are also revoked by kill()."""
+    def test_kill_revokes_deep_approved_nodes(self):
+        """Approved nodes at multiple depths are revoked by kill()."""
         ledger = _MockLedger()
         tree = DelegationTree(run_id="r_kill4", orchestrator_budget=50_000,
                               ledger=ledger, routing=_two_source_routing(),
                               max_subagent_depth=8)
         d1 = tree.request_delegation("orchestrator", "phase", 5000, kind="worker")
-        # d2 is depth-2 worker → pending, awaiting overseer.
         d2 = tree.request_delegation("sketcher", "sub-task", 1000,
                                      parent_id=d1.id, kind="worker")
-        self.assertEqual(d2.status, "pending")
+        self.assertEqual(d1.status, "approved")
+        self.assertEqual(d2.status, "approved")
         tree.kill()
-        self.assertEqual(d2.status, "revoked",
-                         "pending nodes must be revoked by kill()")
+        self.assertEqual(d1.status, "revoked")
+        self.assertEqual(d2.status, "revoked")
 
 
 # ---------------------------------------------------------------------------
@@ -1150,7 +960,6 @@ class TestRoutingDelegationConfig(unittest.TestCase):
             "schema": "aicad.routing/1",
             "sources": [],
             "assignments": {"default": ["strongest"]},
-            "approval_policy": {"depth_1": "auto", "deeper": "overseer"},
             "delegation": {"soft_depth_limit": 12, "max_agents": 128},
         }
         rt = load_routing(cfg)
@@ -1162,7 +971,6 @@ class TestRoutingDelegationConfig(unittest.TestCase):
             "schema": "aicad.routing/1",
             "sources": [],
             "assignments": {"default": ["strongest"]},
-            "approval_policy": {"depth_1": "auto", "deeper": "overseer"},
         }
         rt = load_routing(cfg)
         self.assertEqual(rt.soft_depth_limit, 8)   # DEFAULT_SOFT_DEPTH_LIMIT

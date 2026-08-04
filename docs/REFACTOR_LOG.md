@@ -6086,3 +6086,46 @@ modeling-capable by default against the card's whole design.
 Also: `test_harness_integrity` was checking `reviewer_exec._resolve_fn` (tier 1) while the real
 dispatcher is `agent_turn._bind_tool` (three tiers) — it now uses `_bind_tool`, which is a
 strictly stronger gate.
+
+## 2026-08-04 — Sub-agent lifetimes: no timers, automatic spawn, lossless transcripts
+
+Four Hunter decisions, one cutover. **(1) Spawn approval is gone**, not defaulted to yes:
+`routing.yaml approval_policy`, `RoutingTable.approval_for_depth`, `ApprovalState`, the node
+`approval` object, `DelegationTree.approve`, `_request_overseer_approval`,
+`reconcile_registry_decision`/`await_registry_decision`, the `subagent_control`
+`approve`/`deny` ops, and the ai_workspace Approve/Deny widgets + nav badge are all deleted.
+`request_delegation` auto-approves at every depth and records `approved_ts`. **(2) No
+lifetime timers**: `CHUDWARE_SUBAGENT_HOLD_MAX_S` and both 900 s caps are deleted; a pause
+parks until resume or terminate. **(3) The watcher heartbeat became a controller-liveness
+detector** — `note_watcher`/`watcher_active`/`WATCHER_TTL_S=30` -> `note_controller`/
+`controller_alive`/`CONTROLLER_GRACE_S=120`, `controllers.json`. It no longer answers "should
+I ask a human", it answers "could anyone ever release this hold": a pause whose GUI died
+releases because the only party that could resume it is provably gone, and an unattended run
+never parks at all. **(4) Sub-agent transcripts are now genuinely lossless.** Previously the
+only model output that reached disk was `str(reply)[:4000]`; the real `messages` list was a
+local that died when `run_turn` returned. `agent_turn._RawMirroredMessages` (a list subclass,
+so all ~60 append sites are captured at one seam) mirrors every message verbatim into an
+append-only JSONL (`chudware.subagent.raw/1`) at
+`<Sessions>/<conversation_id>.subagents/<subagent_id>.jsonl`, with header/message/lifecycle/
+compaction records and a restart-safe monotonic `seq`. `worker_rpc._agent_admin_turn` binds
+the path from new `session_id`/`sessions_dir` params (composer.cpp -> run.cpp), so identity
+never threads through delegation; `forkConversation` copies the sidecar dir and the session
+prune removes it under the existing `s_pruneableSessionStems` guard.
+
+Gotchas for the next person: the raw log is lossless *with respect to the conversation* —
+tool output is still budget-capped on its way INTO the messages list, and the log honestly
+records what the provider was actually sent. `bind_session` is a process-level global, so
+tests must clear it (the registry suite's autouse fixture does). The turn boundary had ZERO
+direct coverage before this; `test_subagent_turn_boundary.py` is new and drives real
+`run_turn(subagent_id=...)` state, including a fake-clock test proving ten simulated hours
+cannot resume a pause.
+
+Files: `services/agent/{agent_turn,worker_rpc,subagent_registry,subagent_rpc,delegation,
+mission_dispatch,routing}.py`, `routing.yaml`, `host/src/ui/ai/ai_workspace.cpp`,
+`host/src/ui/copilot/{composer,conversations}.cpp`, `copilot_internal.h`,
+`core/agent/run.cpp`, `contracts/{worker_rpc,advisor}.md`,
+`docs/design/AGENT_DESIGN_PIPELINE.md`, `docs/contracts/fixtures/routing/*.json`, tests.
+Verified: agent suite 3142->3169 passed (0 failed), `scripts/check.py` all 8 gates PASS,
+`./build.sh` links, headless `CHUDWARE_SHOT=chat` and `workspaces` (8 captures incl.
+`workspace_08_ai`) both exit 0, and a depth-2 delegation smoke landed 35 mirrored messages
+in the conversation's sidecar where one truncated reply used to be the entire record.

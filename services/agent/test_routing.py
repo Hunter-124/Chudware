@@ -19,7 +19,7 @@ from services.agent import routing
 REPO = Path(__file__).resolve().parents[2]
 
 
-def _doc(sources=None, assignments=None, policy=None):
+def _doc(sources=None, assignments=None):
     d = {
         "schema": routing.SCHEMA,
         "sources": sources if sources is not None else [
@@ -33,8 +33,6 @@ def _doc(sources=None, assignments=None, policy=None):
             "default": ["cheap_local", "strong"],
         },
     }
-    if policy is not None:
-        d["approval_policy"] = policy
     return d
 
 
@@ -130,9 +128,6 @@ def test_bad_tier_rejected():
         routing.validate(d)
 
 
-def test_bad_approval_policy_rejected():
-    with pytest.raises(routing.RoutingError):
-        routing.validate(_doc(policy={"depth_1": "sometimes"}))
 
 
 # --- resolution ------------------------------------------------------------
@@ -257,7 +252,6 @@ def test_cli_set_writes_and_echoes_view(tmp_path):
         "sources": [{"id": "local", "kind": "llamacpp",
                      "models": [{"id": "qwen-7b", "tier": "local"}]}],
         "assignments": {"overseer": ["strongest"], "default": ["cheap_local"]},
-        "approval_policy": {"depth_1": "auto", "deeper": "overseer"},
     }
     r = _run_cli(["set", "--path", str(p)], stdin=json.dumps(model))
     assert r.returncode == 0, r.stdout + r.stderr

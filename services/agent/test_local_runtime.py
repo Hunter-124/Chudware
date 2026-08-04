@@ -275,7 +275,6 @@ class TestRegisterRoutingSource(unittest.TestCase):
             "schema": "aicad.routing/1",
             "sources": [],
             "assignments": {"default": ["cheap_local"]},
-            "approval_policy": {"depth_1": "auto", "deeper": "overseer"},
         }
         path.write_text(yaml.safe_dump(data), encoding="utf-8")
         return path

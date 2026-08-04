@@ -1,41 +1,36 @@
-"""subagent_registry.py — live sub-agent session registry + steering queue (Phase 4, M11/M15–M17).
+"""File-backed sub-agent registry, display transcript, and lossless raw log.
 
-The GUI's subagent chat viewer/steerer needs an enumerable, cross-process view of
-sub-agent sessions: who was spawned, by which run, what they've said, and a way to
-inject a human steering message into a RUNNING sub-agent's loop.
+Sub-agents can run in a different process from the worker serving the GUI's
+``subagent_*`` RPCs, so session state and control requests must be visible
+across process boundaries.  The registry keeps these records on disk:
 
-Why file-backed
----------------
-Sub-agents run in whatever process hosts the mission (the MCP server or the
-engine worker's mission path), while the GUI's ``subagent_list`` /
-``subagent_steer`` RPCs are served by the engine worker process
-(``engine_oracle/worker.py``).  An in-memory registry would be invisible across
-that boundary, so every record lives on disk:
+    <subagents_dir>/<subagent_id>.json              — session metadata
+    <subagents_dir>/<subagent_id>.transcript.jsonl  — user-facing display log
+    <subagents_dir>/<subagent_id>.steer.jsonl       — steering queue
+    <transcript_dir>/<subagent_id>.jsonl            — lossless raw log
 
-    <subagents_dir>/<subagent_id>.json              — session metadata (atomic rewrite)
-    <subagents_dir>/<subagent_id>.transcript.jsonl  — append-only conversation transcript
-    <subagents_dir>/<subagent_id>.steer.jsonl       — append-only steering queue
+The display transcript contains concise lifecycle and UI notes.  It is not the
+conversation record.  The separate raw JSONL stores uncapped provider messages,
+compactions, and lifecycle events append-only beside the owning chat session so
+it travels with that conversation.  If no owning session directory is bound,
+the raw file falls back to the registry cache and still always exists.
 
-``subagents_dir`` defaults to ``~/.local/share/Chudware/cache/subagents`` (the same
-cache subtree as the agent-events journal); ``CHUDWARE_SUBAGENTS_DIR`` overrides it
-(tests point it at a tmpdir).
+``subagents_dir`` defaults to ``~/.local/share/Chudware/cache/subagents``;
+``CHUDWARE_SUBAGENTS_DIR`` overrides it.
 
-Steering (injection) semantics — HONEST
----------------------------------------
-``queue_steer`` only appends to the queue file; nothing is interrupted.  The
-consumption point is the sub-agent's turn boundary: ``agent_turn.run_turn``
-(when called with ``subagent_id=``) drains ``consume_steers()`` before EACH
-model completion, so a queued steer lands as a user-role message at the
-sub-agent's next model call.  A steer queued after the sub-agent finished stays
-pending forever (the GUI shows the session status so the user can tell).
-``request_terminate`` is the same shape: a flag honored at the next turn
-boundary — never a hard kill.  Pause, approval holds, and runtime overrides
-are also polled only at turn boundaries: work already in flight finishes first,
-and a model/provider or effort change starts with the next model completion.
+Spawning is automatic; there is no human spawn gate.  Steering and termination
+are observed at turn boundaries, so work already in flight finishes first.
+A pause is likewise a turn-boundary hold with no wall-clock deadline: it lasts
+until resume or termination, except that a paused runner releases the hold when
+no controller remains alive that could ever resume it.
 
-Concurrency model: one writer per sub-agent for meta/transcript (the runner);
-the steer queue is append-only from any process and consumed only by the runner.
-POSIX O_APPEND line writes keep the queue safe under concurrent steers.
+``queue_steer`` only appends to the queue file.  ``agent_turn.run_turn`` drains
+``consume_steers`` before each model completion, placing queued text into the
+next provider call.  A steer queued after completion remains pending.
+
+Metadata is atomically replaced.  Display, raw, and steer records use append
+writes; POSIX ``O_APPEND`` keeps complete raw records and concurrent steering
+writes from overwriting one another.
 """
 from __future__ import annotations
 
@@ -49,6 +44,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 SCHEMA = "aicad.subagent_session/1"
+RAW_SCHEMA = "chudware.subagent.raw/1"
 
 #: Session statuses mirror delegation node statuses plus "terminated".
 STATUSES = (
@@ -58,12 +54,14 @@ STATUSES = (
 
 _CONTROL_DEFAULTS = {
     "paused": False,
-    "awaiting_approval": False,
-    "spawn_decision": "",
     "model_override": "",
     "provider_override": "",
     "effort_override": "",
 }
+
+_BOUND_SESSION_ID = ""
+_BOUND_TRANSCRIPT_DIR = ""
+_RAW_SEQUENCE_CACHE: dict[str, tuple[int, int]] = {}
 
 
 def _default_control_state(meta: dict) -> dict:
@@ -90,6 +88,19 @@ def subagents_dir() -> Path:
         p = Path(xdg) / "Chudware" / "cache" / "subagents"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def bind_session(session_id: str, transcript_dir: str) -> None:
+    """Bind new sub-agents to an owning chat session in this process.
+
+    Passing empty strings clears the binding.
+    """
+    global _BOUND_SESSION_ID, _BOUND_TRANSCRIPT_DIR
+    _BOUND_SESSION_ID = str(session_id or "").strip()
+    directory = str(transcript_dir or "").strip()
+    _BOUND_TRANSCRIPT_DIR = (
+        str(Path(directory).expanduser().resolve()) if directory else ""
+    )
 
 
 def _meta_path(subagent_id: str) -> Path:
@@ -167,11 +178,20 @@ def register_session(
     model: str = "",
     budget_tokens: int = 0,
     status: str = "pending",
-    awaiting_approval: bool = False,
+    session_id: str = "",
+    transcript_dir: str = "",
 ) -> dict:
     """Create (or refresh) a session record.  Returns the stored metadata dict."""
     sid = _safe_id(subagent_id)
     existing = get_session(sid) or {}
+    owner_session_id = str(session_id or _BOUND_SESSION_ID).strip()
+    owner_dir = str(transcript_dir or _BOUND_TRANSCRIPT_DIR).strip()
+    if owner_dir:
+        raw_transcript_path = (
+            Path(owner_dir).expanduser().resolve() / f"{sid}.jsonl"
+        )
+    else:
+        raw_transcript_path = (subagents_dir() / f"{sid}.raw.jsonl").resolve()
     meta = {
         "schema": SCHEMA,
         "id": sid,
@@ -186,12 +206,11 @@ def register_session(
         "status": status if status in STATUSES else "pending",
         "terminate_requested": bool(existing.get("terminate_requested", False)),
         "paused": bool(existing.get("paused", False)),
-        "awaiting_approval": bool(
-            existing.get("awaiting_approval", awaiting_approval)),
-        "spawn_decision": str(existing.get("spawn_decision", "")),
         "model_override": str(existing.get("model_override", "")),
         "provider_override": str(existing.get("provider_override", "")),
         "effort_override": str(existing.get("effort_override", "")),
+        "session_id": owner_session_id,
+        "raw_transcript_path": str(raw_transcript_path),
         "created_ts": existing.get("created_ts") or _now(),
         "updated_ts": _now(),
     }
@@ -280,6 +299,110 @@ def get_transcript(subagent_id: str, limit: int = 200) -> list[dict]:
     return recs[-max(1, int(limit)):]
 
 
+def raw_path(subagent_id: str) -> Path | None:
+    """Return the absolute lossless-log path for a registered sub-agent."""
+    meta = get_session(subagent_id)
+    if meta is None:
+        return None
+    value = str(meta.get("raw_transcript_path", "")).strip()
+    return Path(value) if value else None
+
+
+def append_raw(subagent_id: str, record: dict) -> None:
+    """Append an uncapped raw record, creating its schema header when needed.
+
+    This is deliberately best-effort: persistence failures never escape into
+    the agent loop.  The next sequence number is recovered from disk on every
+    append, so it remains monotonic across process restarts.
+    """
+    try:
+        sid = _safe_id(subagent_id)
+        path = raw_path(sid)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file_size = path.stat().st_size if path.exists() else 0
+        cache_key = str(path)
+        cached = _RAW_SEQUENCE_CACHE.get(cache_key)
+        if cached is not None and cached[0] == file_size:
+            next_seq = cached[1]
+        else:
+            complete_lines = 0
+            if file_size:
+                with open(path, "rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        complete_lines += chunk.count(b"\n")
+            # The first complete line is the header.  Thus the number of
+            # complete lines is also the next data-record sequence number.
+            next_seq = max(1, complete_lines)
+        needs_separator = False
+        if file_size:
+            with open(path, "rb") as stream:
+                stream.seek(-1, os.SEEK_END)
+                needs_separator = stream.read(1) != b"\n"
+        lines: list[dict] = []
+        if file_size == 0:
+            meta = get_session(sid) or {}
+            lines.append({
+                "kind": "header",
+                "schema": RAW_SCHEMA,
+                "subagent_id": sid,
+                "session_id": str(meta.get("session_id", "")),
+                "role": str(meta.get("role", "")),
+                "parent_id": str(meta.get("parent_node_id", "")),
+                "run_id": str(meta.get("parent_run_id", "")),
+                "created_ts": time.time(),
+            })
+        payload = dict(record)
+        try:
+            payload["ts"] = float(payload.get("ts", time.time()))
+        except (TypeError, ValueError):
+            payload["ts"] = time.time()
+        payload["seq"] = next_seq
+        lines.append(payload)
+        encoded = (
+            (b"\n" if needs_separator else b"")
+            + "".join(
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+                for item in lines
+            ).encode("utf-8")
+        )
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            remaining = memoryview(encoded)
+            while remaining:
+                written = os.write(fd, remaining)
+                if written <= 0:
+                    raise OSError("raw transcript append made no progress")
+                remaining = remaining[written:]
+        finally:
+            os.close(fd)
+        _RAW_SEQUENCE_CACHE[cache_key] = (
+            file_size + len(encoded),
+            next_seq + 1,
+        )
+    except Exception:  # noqa: BLE001 — raw persistence must not break the turn
+        return
+
+
+def read_raw(
+    subagent_id: str,
+    limit: int = 0,
+    offset: int = 0,
+) -> list[dict]:
+    """Read raw records in append order; zero *limit* means no limit."""
+    try:
+        path = raw_path(subagent_id)
+        if path is None:
+            return []
+        records = _read_lines(path)
+        start = max(0, int(offset))
+        count = int(limit)
+        return records[start:] if count <= 0 else records[start:start + count]
+    except Exception:  # noqa: BLE001 — registry reads are best-effort
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Steering queue (injection), terminate flag, and turn-boundary controls
 # ---------------------------------------------------------------------------
@@ -333,30 +456,28 @@ def consume_steers(subagent_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Watcher heartbeat — "is anyone actually there to answer?"
+# Controller heartbeat — "could anyone ever release a pause?"
 # ---------------------------------------------------------------------------
 #
-# An approval hold is only honest when a human can see the request. The GUI's
-# AI workspace polls ``subagent_list`` every few seconds while it is open, so
-# that poll IS the liveness signal. A headless/batch run (bench, CI, a mission
-# with no GUI attached) has no watcher, and must NOT block waiting for an
-# approval nobody will give — it keeps the pre-approval-gate behaviour of
-# returning the node still pending.
+# The GUI polls ``subagent_list`` every few seconds while it can control the
+# runner.  That poll is only a controller-liveness signal.  It is not a human
+# attention or approval signal.  A paused runner uses it to avoid parking
+# forever after the GUI process that could resume or terminate it has died.
 
-#: A watcher counts as live for this long after its last poll. Comfortably more
-#: than the GUI's ~4 s `pollSubagentList` interval, short enough that a closed
-#: workspace stops blocking spawns within one window.
-WATCHER_TTL_S = 30.0
+#: A controller remains live for 120 seconds after its last poll.  At the GUI's
+#: roughly four-second polling interval this tolerates about 30 missed polls,
+#: making expiry evidence of unambiguous controller death rather than a hiccup.
+CONTROLLER_GRACE_S = 120.0
 
 
-def _watcher_path() -> Path:
-    return subagents_dir() / "watchers.json"
+def _controller_path() -> Path:
+    return subagents_dir() / "controllers.json"
 
 
-def note_watcher(kind: str = "gui") -> None:
-    """Record that an interactive watcher just polled the registry."""
+def note_controller(kind: str = "gui") -> None:
+    """Record that a controller capable of releasing a pause just polled."""
     try:
-        path = _watcher_path()
+        path = _controller_path()
         data: dict[str, Any] = {}
         if path.exists():
             try:
@@ -373,10 +494,10 @@ def note_watcher(kind: str = "gui") -> None:
         pass  # a heartbeat failure must never break a list call
 
 
-def watcher_active(within_s: float = WATCHER_TTL_S) -> bool:
-    """True when some interactive watcher polled within *within_s* seconds."""
+def controller_alive(within_s: float = CONTROLLER_GRACE_S) -> bool:
+    """True when some pause-capable controller polled within *within_s* seconds."""
     try:
-        path = _watcher_path()
+        path = _controller_path()
         if not path.exists():
             return False
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -468,32 +589,3 @@ def runtime_override(subagent_id: str) -> dict:
     }
 
 
-def decide_spawn(
-    subagent_id: str,
-    *,
-    approve: bool,
-    by: str = "user",
-) -> bool:
-    """Record a pending spawn decision for the runner's next boundary poll."""
-    meta = get_session(subagent_id)
-    if meta is None:
-        return False
-    meta["spawn_decision"] = "approved" if approve else "denied"
-    meta["awaiting_approval"] = False
-    meta["spawn_decided_by"] = str(by)
-    meta["spawn_decided_ts"] = _now()
-    meta["updated_ts"] = _now()
-    _write_meta(meta["id"], meta)
-    if approve:
-        set_status(meta["id"], "approved", note=f"spawn approved by {by}")
-    return True
-
-
-def spawn_decision(subagent_id: str) -> str:
-    meta = get_session(subagent_id)
-    return str(meta.get("spawn_decision", "")) if meta else ""
-
-
-def awaiting_approval(subagent_id: str) -> bool:
-    meta = get_session(subagent_id)
-    return bool(meta and meta.get("awaiting_approval"))

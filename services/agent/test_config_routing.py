@@ -41,7 +41,6 @@ def _write_routing_yaml(path: Path, assignments: dict) -> None:
         "schema": "aicad.routing/1",
         "sources": [],
         "assignments": assignments,
-        "approval_policy": {"depth_1": "auto", "deeper": "overseer"},
     }), encoding="utf-8")
 
 

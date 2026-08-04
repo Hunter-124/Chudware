@@ -577,11 +577,11 @@ std::string admin_worker_repo_root() {
     return home_c ? std::string(home_c) + "/Repositories/CAD" : std::string(".");
 }
 
-// Spawns `python -m services.worker_main`, sends ONE {"id":1,"method":
-// "agent_admin_turn",...} line carrying the request text, run_id, resolved
-// provider descriptor, workspace_dir, the prior-turn `history`, and the turn's
-// `attachments` array (pasted images / attached files, as built by the GUI
-// composer's consumeAttachments), relays every streamed {"event":...,"data":...}
+// Spawns `python -m services.worker_main`, sends ONE
+// {"id":1,"method":"agent_admin_turn",...} line carrying the request text, run_id,
+// resolved provider descriptor, workspace_dir, session identity, the prior-turn
+// `history`, and the turn's `attachments` array (pasted images / attached files, as
+// built by the GUI composer's consumeAttachments), then relays every streamed
 // notification onto `events` as it arrives (same live stream the rest of the
 // run uses), and fills `turn_out` with the handler's `turn` object on success.
 // Returns false (with `err` set) on ANY transport failure, timeout, or a
@@ -602,8 +602,9 @@ std::string admin_worker_repo_root() {
 // stop_reason instead of filing a timeout under "non_modeling_request".
 bool call_admin_worker_turn(const std::string& request, const std::string& run_id,
                             const json& provider_cfg, const std::string& workspace_dir,
-                            const json& history, const json& attachments,
-                            RunEvents& events, json& turn_out,
+                            const std::string& session_id, const std::string& sessions_dir,
+                            const json& history, const json& attachments, RunEvents& events,
+                            json& turn_out,
                             std::string& err, bool& crashed, bool& timed_out) {
     const std::string python = admin_worker_python_bin();
     if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
@@ -736,6 +737,10 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     // worker jails fs_* on CHUDWARE_FS_ROOT and chdirs here so file work lands in
     // the user's folder instead of the CAD source repo checkout.
     if (!workspace_dir.empty()) params["workspace_dir"] = workspace_dir;
+    // Bind the python worker's lossless sub-agent raw transcripts to the owning GUI
+    // conversation. Empty identity is omitted, matching workspace/history semantics.
+    if (!session_id.empty()) params["session_id"] = session_id;
+    if (!sessions_dir.empty()) params["sessions_dir"] = sessions_dir;
     // Prior conversation turns from the GUI's session store (options.history), oldest
     // first — the worker forks fresh per turn, so without this every follow-up was a
     // cold start. Absent/empty array == previous behaviour (no key sent at all).
@@ -918,8 +923,9 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
 }
 #else   // _WIN32
 bool call_admin_worker_turn(const std::string&, const std::string&, const json&,
-                            const std::string&, const json&, const json&, RunEvents&,
-                            json&, std::string& err, bool&, bool&) {
+                            const std::string&, const std::string&, const std::string&,
+                            const json&, const json&, RunEvents&, json&, std::string& err,
+                            bool&, bool&) {
     err = "admin worker bridge unavailable on this platform";
     return false;
 }
@@ -1160,11 +1166,13 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // RPC params into (request, doc_id, provider, options) and run_design never sees
         // the top-level payload, so a top-level `attachments` field must be relayed into
         // options by the caller to arrive.
+        const std::string session_id = options.value("session_id", std::string());
+        const std::string sessions_dir = options.value("sessions_dir", std::string());
         const json history = options.value("history", json::array());
         const json attachments = options.value("attachments", json::array());
-        if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, history,
-                                    attachments, events,
-                                    turn, worker_err, worker_crashed, worker_timed_out)) {
+        if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, session_id,
+                                    sessions_dir, history, attachments, events, turn,
+                                    worker_err, worker_crashed, worker_timed_out)) {
             if (worker_err == "cancelled" || run_ctl.cancelled()) {
                 events.emit("run_finished", json{{"status", "cancelled"},
                                                  {"stop_reason", "cancelled"}});

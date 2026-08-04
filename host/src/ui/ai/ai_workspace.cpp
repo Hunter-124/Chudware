@@ -453,9 +453,9 @@ struct SubMsg {
 struct SubagentSession {
     std::string id, role, brief, status, model, spawnKind;
     std::string createdTs, updatedTs;   // ISO-8601 UTC (registry created_ts / updated_ts)
-    std::string spawnDecision, modelOverride, providerOverride, effortOverride;
+    std::string modelOverride, providerOverride, effortOverride;
     int budgetTokens = 0, pendingSteers = 0, transcriptLen = 0;
-    bool paused = false, awaitingApproval = false;
+    bool paused = false;
 };
 
 // Registry snapshot (the Agent Hub row list) — global, one poll loop.
@@ -544,8 +544,6 @@ static SubagentSession parseSubSession(const nlohmann::json& s) {
     o.pendingSteers = s.value("pending_steers", 0);
     o.transcriptLen = s.value("transcript_len", 0);
     o.paused          = s.value("paused", false);
-    o.awaitingApproval = s.value("awaiting_approval", false);
-    o.spawnDecision   = s.value("spawn_decision", "");
     o.modelOverride   = s.value("model_override", "");
     o.providerOverride = s.value("provider_override", "");
     o.effortOverride  = s.value("effort_override", "");
@@ -646,8 +644,6 @@ static void fetchSubagentTranscript(AppState& st, SubChatState& cs, bool force =
 static void applySubagentControlResult(SubagentSession& s, const nlohmann::json& result) {
     s.status           = result.value("session_status", s.status);
     s.paused           = result.value("paused", s.paused);
-    s.awaitingApproval = result.value("awaiting_approval", s.awaitingApproval);
-    s.spawnDecision    = result.value("spawn_decision", s.spawnDecision);
     s.modelOverride    = result.value("model_override", s.modelOverride);
     s.providerOverride = result.value("provider_override", s.providerOverride);
     s.effortOverride   = result.value("effort_override", s.effortOverride);
@@ -1424,50 +1420,18 @@ static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float li
                         ImGui::ColorConvertFloat4ToU32(surf.textTertiary), meta.c_str());
         }
 
-        // line 2: dim brief (or status), truncated around queue/approval controls
+        // line 2: dim brief (or status), truncated around the queued-steer badge
         y += lineH;
-        const float approvalReserve = s.awaitingApproval ? 132.0f * S : 90.0f * S;
+        const float trailingReserve = s.pendingSteers > 0 ? 90.0f * S : 0.0f;
         std::string sub = s.brief.empty() ? s.status : s.brief;
-        const float subMaxW = rw - ui::metrics::cpMenuRowPadX() * 2.0f - approvalReserve;
+        const float subMaxW = rw - ui::metrics::cpMenuRowPadX() * 2.0f - trailingReserve;
         while (!sub.empty() && ImGui::CalcTextSize(sub.c_str()).x > subMaxW)
             sub.pop_back();
         if (sub.size() < (s.brief.empty() ? s.status : s.brief).size())
             sub += "\xE2\x80\xA6";
         dl->AddText(ImVec2(r0.x + ui::metrics::cpMenuRowPadX(), y),
                     ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub.c_str());
-        if (s.awaitingApproval) {
-            const bool ctlPending = s_subControlPending.count(s.id) > 0;
-            const float denyW = ImGui::CalcTextSize("Deny").x + 12.0f * S;
-            const float approveW = ImGui::CalcTextSize("Approve").x + 12.0f * S;
-            const float bx = r1.x - ui::metrics::cpMenuRowPadY() - denyW -
-                             approveW - 4.0f * S;
-            ImGui::SetCursorScreenPos(ImVec2(bx, y - 2.0f * S));
-            ImGui::BeginDisabled(!st.workerStarted || ctlPending);
-            if (ImGui::SmallButton("Approve"))
-                sendSubagentControlById(st, s.id, "approve", nlohmann::json::object());
-            ImGui::SameLine(0.0f, 4.0f * S);
-            if (ImGui::SmallButton("Deny\xE2\x80\xA6"))
-                ImGui::OpenPopup("##subagent_deny_confirm");
-            ImGui::EndDisabled();
-            if (ImGui::BeginPopupModal("##subagent_deny_confirm", nullptr,
-                                       ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::TextUnformatted("Deny this pending sub-agent?");
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-                ImGui::TextWrapped("The denial is recorded at the next turn boundary. "
-                                   "No sub-agent will be spawned.");
-                ImGui::PopStyleColor();
-                ImGui::Spacing();
-                if (ImGui::Button("Deny")) {
-                    sendSubagentControlById(
-                        st, s.id, "deny", nlohmann::json{{"confirm", true}});
-                    ImGui::CloseCurrentPopup();
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Keep pending")) ImGui::CloseCurrentPopup();
-                ImGui::EndPopup();
-            }
-        } else if (s.pendingSteers > 0) {
+        if (s.pendingSteers > 0) {
             char badge[24];
             std::snprintf(badge, sizeof(badge), "%d queued", s.pendingSteers);
             const float bw = ImGui::CalcTextSize(badge).x + ui::metrics::cpMenuRowPadX();
@@ -1657,15 +1621,11 @@ static void drawNavColumn(AppState& st, float navW) {
         if (s.status == "running" || s.status == "pending" ||
             s.status == "in_progress" || s.status == "waiting")
             ++live;
-    int awaitingApproval = 0;
-    for (const auto& s : s_sub.sessions)
-        if (s.awaitingApproval) ++awaitingApproval;
     int wip = 0;
     for (const auto& t : st.docTabs)
         if (t.aiHandoff || t.aiPulse || t.agentDone) ++wip;
 
-    if (navRow(0, "Agent Hub",    s_ai.view == 0, surf,
-               awaitingApproval > 0 ? awaitingApproval : live)) s_ai.view = 0;
+    if (navRow(0, "Agent Hub",    s_ai.view == 0, surf, live)) s_ai.view = 0;
     if (navRow(1, "Session Plan", s_ai.view == 1, surf))       s_ai.view = 1;
     if (navRow(2, "Active Work",  s_ai.view == 2, surf, wip))  s_ai.view = 2;
     if (navRow(3, "Documents",    s_ai.view == 3, surf))       s_ai.view = 3;

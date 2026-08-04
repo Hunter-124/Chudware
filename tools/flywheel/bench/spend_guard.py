@@ -71,6 +71,32 @@ def bridge_auth_db() -> Path:
     return appdata_dir() / "omp-bridge-auth.db"
 
 
+def _open_auth_db(db: Path) -> sqlite3.Connection | None:
+    """Read-only handle on the bridge's credential store.
+
+    The store is WAL-mode and the bridge rotates the access token roughly every
+    eight hours. ``immutable=1`` tells SQLite the file cannot change, so it
+    skips the ``-wal`` file entirely and hands back the last *checkpointed*
+    snapshot — i.e. a long-expired access token, which the usage endpoint
+    answers with HTTP 401 and the guard reports as UNREADABLE (fail-safe stop).
+    Open plain ``mode=ro`` so the WAL is honoured, and only fall back to the
+    immutable snapshot when the WAL side files are unreadable (no bridge
+    running, no ``-shm``).
+    """
+    for uri in (f"file:{db}?mode=ro", f"file:{db}?mode=ro&immutable=1"):
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            # Force a read so a WAL-open failure surfaces here, not later.
+            conn.execute("SELECT 1 FROM auth_credentials LIMIT 1").fetchone()
+            return conn
+        except sqlite3.Error:
+            try:
+                conn.close()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+    return None
+
+
 def _load_bridge_credential(provider: str) -> dict | None:
     """Newest non-disabled OAuth credential for *provider* from the bridge store.
 
@@ -81,11 +107,8 @@ def _load_bridge_credential(provider: str) -> dict | None:
     db = bridge_auth_db()
     if not db.exists():
         return None
-    # immutable=1: never take a write lock on a store the bridge owns.
-    uri = f"file:{db}?mode=ro&immutable=1"
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-    except sqlite3.Error:
+    conn = _open_auth_db(db)
+    if conn is None:
         return None
     try:
         row = conn.execute(

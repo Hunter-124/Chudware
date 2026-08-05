@@ -224,8 +224,16 @@ class OmpBridgeProvider(Provider):
         # Live-stream seam: when the calling thread installed a provider delta
         # sink (agent_turn does for GUI turns), ask the bridge to stream and
         # forward each fragment to the sink. Deltas are DISPLAY-ONLY — the
-        # final result still carries the full text and is what we return.
+        # final result normally carries the full text and is what we return.
+        #
+        # Keep a private per-attempt copy too. The pi-ai stream can emit real
+        # fragments and then resolve to an AssistantMessage with empty content;
+        # the transport can also die before its final response line. In either
+        # case the display sink is not a parse buffer, so without this copy the
+        # already-paid reply is irretrievably lost.
         sink = _base.provider_delta_sink()
+        streamed_text: list[str] = []
+        streamed_thinking: list[str] = []
         on_event = None
         if sink is not None:
             def on_event(kind: str, data: dict) -> None:  # noqa: F811
@@ -234,9 +242,14 @@ class OmpBridgeProvider(Provider):
                 frag_text = data.get("text")
                 frag_think = data.get("thinking")
                 if frag_text:
-                    sink(str(frag_text), "text")
+                    chunk = str(frag_text)
+                    streamed_text.append(chunk)
+                    sink(chunk, "text")
                 if frag_think:
-                    sink(str(frag_think), "thinking")
+                    chunk = str(frag_think)
+                    streamed_thinking.append(chunk)
+                    sink(chunk, "thinking")
+
         # K3 dialect re-anchor: see _KIMI_CODE_DIALECT_NOTE. Applies to the system prompt
         # only; user/assistant history stays verbatim.
         system_text = system or ""
@@ -260,71 +273,131 @@ class OmpBridgeProvider(Provider):
         if sink is not None:
             params["stream"] = True
 
-        try:
-            # Textless resample. A completion with NO text and NO thinking is unusable to
-            # the harness: agent_turn sees nothing to parse and the turn dies as
-            # `provider_error`, losing every tool call it had already made. Measured
-            # 2026-08-04 on the basic-modeling sweep: TWO of eight claude-sonnet-5 legs
-            # ended that way mid-build, and an immediate replay of the same history
-            # completed normally — so one resample is the difference between a lost turn
-            # and a finished part. Every provider gets it.
-            #
-            # kimi-code additionally gets a cache-busting nudge that restates the dialect:
-            # its thinking-then-stop empties correlate through the endpoint's prompt cache
-            # (measured 3 consecutive empties on one history), so an identical replay
-            # returns the identical nothing. The nudge rides only the wire copy — the
-            # harness history stays verbatim.
-            # Cost control: a resample is a FULLY BILLED completion that re-sends the whole
-            # prompt, so it only ever fires on a wholly empty sample, and only once. Before
-            # spending it, check whether the model wrote the directive into its reasoning
-            # channel (k3 frequently does) — that costs nothing and is the common case.
-            attempts = 2
-            result: dict[str, Any] = {}
-            wire_messages = params["messages"]
-            for attempt in range(attempts):
-                if attempt:
-                    # Resampling: the previous attempt's streamed fragments are
-                    # dead — tell the sink to drop what it buffered so the user
-                    # never sees a half reply followed by the retry's text.
-                    if sink is not None:
-                        discard = getattr(sink, "discard", None)
-                        if callable(discard):
-                            try:
-                                discard()
-                            except Exception:  # noqa: BLE001
-                                pass
-                    if self.wire_provider == "kimi-code":
-                        params["messages"] = wire_messages + [
-                            {"role": "user", "content": _KIMI_RESAMPLE_NUDGE}
-                        ]
+        # A resample is a FULLY BILLED completion that re-sends the whole prompt,
+        # so the bound is deliberately one retry. Stream salvage always wins:
+        # it costs nothing and preserves the model's actual reply. The retry
+        # remains for a genuinely content-free final envelope or a transport
+        # failure before the final response line.
+        attempts = 2
+        result: dict[str, Any] = {}
+        wire_messages = params["messages"]
+        last_transport_exc: BaseException | None = None
+        effort_degraded = False
+
+        def _discard_dead_attempt() -> None:
+            streamed_text.clear()
+            streamed_thinking.clear()
+            if sink is None:
+                return
+            discard = getattr(sink, "discard", None)
+            if callable(discard):
+                try:
+                    discard()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def _salvage_stream() -> tuple[str, str]:
+            text = "".join(streamed_text)
+            thinking = "".join(streamed_thinking)
+            # Visible text is the intended answer. If it never reached the text
+            # channel, a complete fenced directive in reasoning is still safe
+            # to parse; arbitrary chain-of-thought is not.
+            if text.strip():
+                return text, thinking
+            directive = _directive_from_thinking(thinking)
+            return (directive, thinking) if directive else ("", thinking)
+
+        for attempt in range(attempts):
+            if attempt:
+                _discard_dead_attempt()
+                if self.wire_provider == "kimi-code":
+                    params["messages"] = wire_messages + [
+                        {"role": "user", "content": _KIMI_RESAMPLE_NUDGE}
+                    ]
+            try:
                 if sink is not None:
                     result = bridge.call("complete", params, timeout=self.timeout,
                                          on_event=on_event)
                 else:
-                    # No sink: send EXACTLY what we send today (no `stream` key,
-                    # no on_event kwarg) — behaviour is byte-identical.
+                    # No sink: omit both `stream` and on_event so non-GUI lanes
+                    # remain byte-identical.
                     result = bridge.call("complete", params, timeout=self.timeout)
-                if str(result.get("stopReason") or "") in ("error", "length"):
-                    # "error" carries its own status; "length" is DETERMINISTIC — the same
-                    # prompt under the same budget truncates identically, so a resample is
-                    # a fully billed no-op. Both are surfaced below.
+                last_transport_exc = None
+            except bridge.BridgeUnavailable as call_exc:
+                salvaged_text, salvaged_thinking = _salvage_stream()
+                if salvaged_text:
+                    # No terminal line means the stream may be partial. Preserve
+                    # it for parsing but mark it truncated so bare prose cannot
+                    # masquerade as a completed turn; a complete fenced directive
+                    # still parses and executes without another provider call.
+                    result = {
+                        "text": salvaged_text,
+                        "thinking": salvaged_thinking,
+                        "stopReason": "length",
+                    }
+                    last_transport_exc = call_exc
                     break
-                if str(result.get("text") or ""):
-                    break  # usable reply
-                salvaged = _directive_from_thinking(str(result.get("thinking") or ""))
-                if salvaged:
-                    result["text"] = salvaged
-                    break  # free: the block was in the reasoning channel
-                if (self.wire_provider != "kimi-code"
-                        and str(result.get("thinking") or "")):
-                    # Reasoning with no text is still a completion everywhere but the k3
-                    # text dialect, and it is accepted below — don't pay for a resample.
+                result = {}
+                last_transport_exc = call_exc
+                status = getattr(call_exc, "status", None)
+                # Permanent request/auth failures are not resample candidates.
+                if attempt + 1 >= attempts or status in (400, 401, 403):
                     break
-            # attempts exhausted with empty text: result holds the last sample and the
-            # no-completion raise below still applies when thinking is empty too.
-        except bridge.BridgeUnavailable as exc:
-            raise bridge.BridgeUnavailable(f"omp-bridge {self.name}: {exc}",
-                                           status=exc.status) from exc
+                continue
+
+            stop_reason = str(result.get("stopReason") or "")
+            if stop_reason == "error":
+                break
+            if str(result.get("text") or ""):
+                break
+
+            # Prefer a complete directive from either the authoritative final
+            # thinking or the fragments. This is the zero-cost K3 recovery.
+            final_thinking = str(result.get("thinking") or "")
+            salvaged = _directive_from_thinking(final_thinking)
+            if not salvaged:
+                salvaged = _directive_from_thinking("".join(streamed_thinking))
+            if salvaged:
+                result["text"] = salvaged
+                break
+
+            streamed_reply, streamed_reasoning = _salvage_stream()
+            if streamed_reply:
+                # Do NOT send it to the sink again. The fragments were already
+                # displayed; this copy exists only for the parser/final result.
+                result["text"] = streamed_reply
+                if not final_thinking and streamed_reasoning:
+                    result["thinking"] = streamed_reasoning
+                break
+
+            if stop_reason == "length":
+                # Measured failure: high effort can consume the entire output
+                # budget before content. Replaying the identical budget is
+                # deterministic, but removing reasoning effort is not.
+                if (attempt + 1 < attempts
+                        and "reasoningEffort" in params):
+                    params.pop("reasoningEffort", None)
+                    effort_degraded = True
+                    continue
+                break
+
+            if (self.wire_provider != "kimi-code"
+                    and (final_thinking or streamed_reasoning)):
+                # Reasoning with no text is accepted outside the K3 text dialect.
+                if not final_thinking:
+                    result["thinking"] = streamed_reasoning
+                break
+            # Otherwise this was a content-free final envelope; the loop performs
+            # its one bounded retry.
+
+        if last_transport_exc is not None and not result:
+            raise bridge.BridgeUnavailable(
+                f"omp-bridge {self.name}: stream ended before the final response "
+                f"line ({type(last_transport_exc).__name__}: {last_transport_exc}); "
+                f"no usable text or fenced directive arrived in {attempts} bounded "
+                "attempts. Retry the provider or lower reasoning effort.",
+                status=getattr(last_transport_exc, "status", None),
+            ) from last_transport_exc
 
         if str(result.get("stopReason") or "") == "error":
             text = str(result.get("errorMessage") or "provider error")
@@ -336,26 +409,22 @@ class OmpBridgeProvider(Provider):
         reply = str(result.get("text") or "")
         thinking = str(result.get("thinking") or "")
         if not reply and not thinking:
-            # The endpoint already SAID why. Measured 2026-08-04: claude-fable-5 with the
-            # harness's default reasoningEffort="high" spends the whole maxTokens budget
-            # reasoning and answers stopReason "length" with no text and no thinking —
-            # every leg died in a second as an unexplained `provider_error`. The same call
-            # with no reasoningEffort replies normally, so the fix is in the caller's
-            # hands; say so instead of reporting a blank.
             if str(result.get("stopReason") or "") == "length":
                 effort = f' at reasoningEffort="{self.reasoning_effort}"' if self.reasoning_effort else ""
+                retried = (" A bounded retry without reasoning effort also returned "
+                           "no content." if effort_degraded else "")
                 raise bridge.BridgeUnavailable(
                     f"omp-bridge {self.name}: {self.model} spent the whole max_tokens "
                     f"budget ({max_tokens}) before writing anything{effort} — the reply was "
-                    f"TRUNCATED, not missing (stopReason=length). Raise max_tokens or lower "
-                    f"the reasoning effort for this model.")
+                    f"TRUNCATED, not missing (stopReason=length).{retried} Raise max_tokens "
+                    "or lower the reasoning effort for this model.")
             raise bridge.BridgeUnavailable(
-                f"omp-bridge {self.name}: endpoint returned no completion")
+                f"omp-bridge {self.name}: final response contained no text or thinking "
+                f"after {attempts} bounded attempts; no usable streamed content arrived. "
+                "Retry the provider or lower reasoning effort.")
         self._record_usage(result.get("usage"))
-        # The AUTHORITATIVE truncation signal. Measured 2026-07-30 against the live
-        # sidecar: maxTokens=16 -> stopReason "length", maxTokens=4000 -> "stop".
-        # agent_turn had to guess at this textually because it never arrived; see
-        # base.set_last_stop_reason for what that guess cost.
+        # A salvaged stream with no terminal line is marked "length" above so
+        # agent_turn's existing compact re-emit guard handles incomplete prose.
         _base.set_last_stop_reason(result.get("stopReason"))
         return reply, thinking
 

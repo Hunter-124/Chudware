@@ -9,10 +9,11 @@ Proves (no network — fake bridge/provider):
       and flushes the trailing partial at the end;
   (d) the returned reply is the provider's full text exactly once (deltas are
       display-only, never concatenated);
-  (e) a kimi-code resample discards the first attempt's buffered fragments;
-  (f) a raising on_event callback never breaks the bridge RPC;
-  (g) run_turn installs/restores the sink around the turn and emits
-      assistant_delta through on_event.
+  (e) streamed content survives an empty final envelope or missing response line
+      without being emitted to the display sink twice;
+  (f) empty replies resample once and length-with-effort retries without effort;
+  (g) a raising on_event callback never breaks the bridge RPC;
+  (h) run_turn installs/restores the sink and emits assistant_delta through on_event.
 """
 from __future__ import annotations
 
@@ -60,12 +61,16 @@ def _fake_bridge(monkeypatch, script):
     steps = list(script)
 
     def fake_call(method, params=None, timeout=120, **kwargs):
+        if method != "complete":
+            return {}
         calls.append({"method": method, "params": dict(params or {}), "kwargs": kwargs})
         events, result = steps.pop(0)
         cb = kwargs.get("on_event")
         for kind, data in events:
             if cb is not None:
                 cb(kind, data)
+        if isinstance(result, BaseException):
+            raise result
         return result
 
     monkeypatch.setattr(omp_bridge, "call", fake_call)
@@ -117,7 +122,7 @@ def test_no_sink_sends_exactly_todays_params(monkeypatch):
     assert reply == "plain"
 
 
-# --- (c) coalescing: thresholds + trailing flush -------------------------------
+# --- (c) coalescing: thresholds, channel order, and trailing flush --------------
 
 def test_coalescer_batches_and_flushes_trailing():
     events = []
@@ -133,14 +138,94 @@ def test_coalescer_batches_and_flushes_trailing():
     assert events == [("assistant_delta",
                        {"text": "aaabbbccc" + "x" * 40, "channel": "text"})]
 
-    coal.feed("tail", "text")  # trailing partial: no flush until flush_all
-    coal.feed("think-frag", "thinking")
-    assert len(events) == 1
-    coal.flush_all()
+    coal.feed("tail", "text")
+    coal.feed("think-frag", "thinking")  # channel switch flushes the older tail first
     assert events[1:] == [
         ("assistant_delta", {"text": "tail", "channel": "text"}),
+    ]
+    coal.flush_all()
+    assert events[2:] == [
         ("assistant_delta", {"text": "think-frag", "channel": "thinking"}),
     ]
+
+
+def test_live_run_19873622099184_seams_stay_in_arrival_order():
+    """Faithful reduction of the three corrupt seams in the 227-line live log.
+
+    The old per-channel buffers emitted these as ``batch them.The user``,
+    ``saved file.The harness``, and ``guide.Stop``.  The leading fragments are
+    exact buffered tails from events.jsonl lines 97, 205, and 224; each arrived
+    before the intervening text/context record but was written after it.
+    """
+    events = []
+    coal = agent_turn._AssistantDeltaCoalescer(
+        lambda kind, payload: events.append((kind, payload)))
+
+    def external(kind):
+        # run_turn's ordered on_event wrapper does this before every non-delta
+        # event (agent.context, context injection, tools, terminal records).
+        coal.flush_all()
+        events.append((kind, {}))
+
+    coal.feed("The user wants a brand new 3D model of", "thinking")
+    coal.feed(" from task_list, so batch them.", "thinking")
+    coal.feed("I'll build this as a fresh parametric part", "text")
+    external("agent.context")
+
+    coal.feed("The user wants an IWB holster for Ruger LCP .380.", "thinking")
+    coal.feed(" saved file.", "thinking")
+    coal.feed("A holster is a self-contained single-part build", "text")
+    external("agent.context")
+    external("agent.context_injected")
+
+    coal.feed("The harness wants direct action.", "thinking")
+    coal.feed(" independent. Then add_features based on guide.", "thinking")
+    coal.feed("Building it directly now.", "text")
+    external("agent.context")
+    coal.feed("Stop announcing, emit tool calls.", "thinking")
+    coal.flush_all()
+
+    observed = []
+    for kind, payload in events:
+        row = (kind, payload.get("channel"), payload.get("text", ""))
+        if (observed and kind == "assistant_delta"
+                and observed[-1][0] == kind and observed[-1][1] == row[1]):
+            observed[-1] = (kind, row[1], observed[-1][2] + row[2])
+        else:
+            observed.append(row)
+    assert observed == [
+        ("assistant_delta", "thinking",
+         "The user wants a brand new 3D model of from task_list, so batch them."),
+        ("assistant_delta", "text", "I'll build this as a fresh parametric part"),
+        ("agent.context", None, ""),
+        ("assistant_delta", "thinking",
+         "The user wants an IWB holster for Ruger LCP .380. saved file."),
+        ("assistant_delta", "text", "A holster is a self-contained single-part build"),
+        ("agent.context", None, ""),
+        ("agent.context_injected", None, ""),
+        ("assistant_delta", "thinking",
+         "The harness wants direct action. independent. Then add_features based on guide."),
+        ("assistant_delta", "text", "Building it directly now."),
+        ("agent.context", None, ""),
+        ("assistant_delta", "thinking", "Stop announcing, emit tool calls."),
+    ]
+    joined_thinking = "".join(
+        payload["text"] for kind, payload in events
+        if kind == "assistant_delta" and payload["channel"] == "thinking"
+    )
+    assert joined_thinking == (
+        "The user wants a brand new 3D model of from task_list, so batch them."
+        "The user wants an IWB holster for Ruger LCP .380. saved file."
+        "The harness wants direct action. independent. Then add_features based on guide."
+        "Stop announcing, emit tool calls."
+    )
+    thinking_chunks = [
+        payload["text"] for kind, payload in events
+        if kind == "assistant_delta" and payload["channel"] == "thinking"
+    ]
+    assert all("batch them.The user" not in chunk for chunk in thinking_chunks)
+    assert all("saved file.The harness" not in chunk for chunk in thinking_chunks)
+    assert all("guide.Stop" not in chunk for chunk in thinking_chunks)
 
 
 def test_coalescer_newline_and_elapsed_flush():
@@ -174,7 +259,92 @@ def test_reply_not_duplicated_by_deltas(monkeypatch):
     assert reply == full  # not full+full, not empty
 
 
-# --- (e) kimi-code resample discards attempt 1's buffered fragments ------------
+# --- (e) stream salvage: final-envelope gaps never discard paid content --------
+
+
+def test_live_220_delta_shape_salvages_plain_text_once(monkeypatch):
+    """The exact live count and non-directive text, then empty final content."""
+    streamed_reply = "Building it directly now. First, the op vocabulary"
+    text_chunks = list(streamed_reply[:17]) + [streamed_reply[17:]]
+    thinking_chunks = ["x"] * 202
+    streamed = (
+        [("delta", {"thinking": chunk}) for chunk in thinking_chunks]
+        + [("delta", {"text": chunk}) for chunk in text_chunks]
+    )
+    calls = _fake_bridge(monkeypatch, [
+        (streamed,
+         {"text": "", "thinking": "", "stopReason": "stop", "usage": {}}),
+    ])
+    sink = _RecordingSink()
+    pbase.set_provider_delta_sink(sink)
+
+    prov = OmpBridgeProvider(provider="kimi-code", model="k3-256k")
+    reply, thinking = prov.complete_ex(
+        "sys", [{"role": "user", "content": "measure it"}])
+
+    assert len(calls) == 1, "stream salvage must precede a billed resample"
+    assert reply == streamed_reply
+    assert thinking == "x" * 202
+    # DISPLAY got all 220 incremental fragments exactly once. The returned copy
+    # is PARSE-only: it was not concatenated back into the sink.
+    assert len(sink.feeds) == 220
+    assert sum(channel == "thinking" for _, channel in sink.feeds) == 202
+    assert sum(channel == "text" for _, channel in sink.feeds) == 18
+    assert "".join(text for text, channel in sink.feeds if channel == "text") == reply
+
+
+def test_missing_final_response_line_salvages_streamed_directive(monkeypatch):
+    """Transport EOF/timeout after deltas is distinct from an empty final envelope."""
+    directive = '```json\n{"done": true, "handoff": {"summary": "ok"}}\n```'
+    calls = _fake_bridge(monkeypatch, [
+        ([("delta", {"thinking": "finished"}),
+          ("delta", {"text": directive})],
+         omp_bridge.BridgeUnavailable("bridge process closed stdout")),
+    ])
+    sink = _RecordingSink()
+    pbase.set_provider_delta_sink(sink)
+
+    prov = OmpBridgeProvider(provider="kimi-code", model="k3-256k")
+    reply, _ = prov.complete_ex("sys", [{"role": "user", "content": "finish"}])
+
+    assert len(calls) == 1
+    assert agent_turn._parse_directive(reply)["done"] is True
+    assert sink.feeds.count((directive, "text")) == 1
+
+
+def test_fenced_directive_in_streamed_thinking_precedes_resample(monkeypatch):
+    directive = '```json\n{"tool": "measure_part", "args": {}}\n```'
+    calls = _fake_bridge(monkeypatch, [
+        ([("delta", {"thinking": directive})],
+         {"text": "", "thinking": "final summary omitted the fence",
+          "stopReason": "stop", "usage": {}}),
+    ])
+    sink = _RecordingSink()
+    pbase.set_provider_delta_sink(sink)
+    prov = OmpBridgeProvider(provider="kimi-code", model="k3-256k")
+
+    reply, _ = prov.complete_ex("sys", [{"role": "user", "content": "measure"}])
+
+    assert len(calls) == 1
+    assert agent_turn._parse_directive(reply)["tool"] == "measure_part"
+
+
+def test_missing_final_response_without_content_retries_then_names_cause(monkeypatch):
+    calls = _fake_bridge(monkeypatch, [
+        ([], omp_bridge.BridgeUnavailable("bridge process closed stdout")),
+        ([], omp_bridge.BridgeUnavailable("bridge process closed stdout")),
+    ])
+    prov = OmpBridgeProvider(provider="kimi-code", model="k3-256k")
+
+    with pytest.raises(omp_bridge.BridgeUnavailable) as ei:
+        prov.complete_ex("sys", [{"role": "user", "content": "finish"}])
+
+    assert len(calls) == 2
+    message = str(ei.value)
+    assert "stream ended before the final response line" in message
+    assert "no usable text or fenced directive" in message
+
+# --- (f) kimi-code resample discards attempt 1's buffered fragments ------------
 
 def test_resample_discards_first_attempt_buffer(monkeypatch):
     calls = _fake_bridge(monkeypatch, [
@@ -199,7 +369,7 @@ def test_resample_discards_first_attempt_buffer(monkeypatch):
     assert len(calls[1]["params"]["messages"]) == 2
 
 
-# --- (e2) a wholly empty sample is resampled on EVERY provider ----------------
+# --- (f2) a wholly empty sample is resampled on EVERY provider ----------------
 # Live 2026-08-04 basic-modeling sweep: two of eight claude-sonnet-5 legs died
 # mid-build on a single completion that carried no text and no thinking. The
 # harness has nothing to parse, so the turn ended `provider_error` and every tool
@@ -233,21 +403,22 @@ def test_reasoning_without_text_is_not_paid_for_twice(monkeypatch):
 
 
 def test_two_empty_samples_still_surface_the_real_error(monkeypatch):
-    _fake_bridge(monkeypatch, [
+    calls = _fake_bridge(monkeypatch, [
         ([], {"text": "", "thinking": "", "stopReason": "stop", "usage": {}}),
         ([], {"text": "", "thinking": "", "stopReason": "stop", "usage": {}}),
     ])
     prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-sonnet-5")
-    with pytest.raises(omp_bridge.BridgeUnavailable, match="no completion"):
+    with pytest.raises(
+            omp_bridge.BridgeUnavailable,
+            match="final response contained no text or thinking"):
         prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
+    assert len(calls) == 2, "empty completion retry must stay bounded at one"
 
 
 def test_a_length_stop_is_reported_as_truncation_not_a_missing_reply(monkeypatch):
-    """Live 2026-08-04: claude-fable-5 at the harness default reasoningEffort="high"
-    burns the whole max_tokens budget reasoning and answers stopReason "length" with no
-    text and no thinking. Every leg died in a second as an unexplained provider_error,
-    while the same call with no reasoning effort replies normally."""
-    _fake_bridge(monkeypatch, [
+    """If effort degradation also returns empty, the residual error names both facts."""
+    calls = _fake_bridge(monkeypatch, [
+        ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
         ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
     ])
     prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-fable-5",
@@ -256,6 +427,28 @@ def test_a_length_stop_is_reported_as_truncation_not_a_missing_reply(monkeypatch
         prov.complete_ex("sys", [{"role": "user", "content": "hi"}], max_tokens=16)
     msg = str(ei.value)
     assert "TRUNCATED" in msg and "16" in msg and "high" in msg, msg
+    assert "retry without reasoning effort" in msg
+    assert len(calls) == 2
+    assert calls[0]["params"]["reasoningEffort"] == "high"
+    assert "reasoningEffort" not in calls[1]["params"]
+
+
+def test_length_stop_degrades_effort_and_recovers(monkeypatch):
+    calls = _fake_bridge(monkeypatch, [
+        ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
+        ([], {"text": "recovered", "thinking": "", "stopReason": "stop",
+              "usage": {}}),
+    ])
+    prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-fable-5",
+                             reasoning_effort="high")
+
+    reply, _ = prov.complete_ex(
+        "sys", [{"role": "user", "content": "hi"}], max_tokens=16)
+
+    assert reply == "recovered"
+    assert len(calls) == 2
+    assert calls[0]["params"]["reasoningEffort"] == "high"
+    assert "reasoningEffort" not in calls[1]["params"]
 
 
 def test_a_length_stop_is_never_resampled(monkeypatch):
@@ -272,7 +465,7 @@ def test_a_length_stop_is_never_resampled(monkeypatch):
     assert len(calls) == 1, "a deterministic truncation must not be paid for twice"
 
 
-# --- (f) raising callback never breaks the bridge RPC --------------------------
+# --- (g) raising callback never breaks the bridge RPC --------------------------
 
 def test_raising_callback_does_not_break_call():
     client = omp_bridge.OmpBridgeClient()
@@ -303,7 +496,28 @@ def test_raising_callback_does_not_break_call():
     client._proc = None
 
 
-# --- (g) run_turn installs/restores the sink and emits assistant_delta ---------
+def test_unrecoverable_empty_completion_reaches_turn_error_detail(monkeypatch):
+    calls = _fake_bridge(monkeypatch, [
+        ([], {"text": "", "thinking": "", "stopReason": "stop", "usage": {}}),
+        ([], {"text": "", "thinking": "", "stopReason": "stop", "usage": {}}),
+    ])
+    provider = OmpBridgeProvider(provider="kimi-code", model="k3-256k")
+
+    result = agent_turn.run_turn(
+        "answer the question", provider,
+        on_event=lambda _kind, _payload: None,
+    )
+
+    assert len(calls) == 2
+    assert result.success is False
+    assert result.stop_reason == "provider_error"
+    detail = result.result["error_detail"]
+    assert "final response contained no text or thinking" in detail
+    assert "2 bounded attempts" in detail
+    assert result.result["retryable"] is True
+
+
+# --- (h) run_turn installs/restores the sink and emits assistant_delta ---------
 
 def test_run_turn_streams_and_restores_sink():
     class _StreamingProvider:

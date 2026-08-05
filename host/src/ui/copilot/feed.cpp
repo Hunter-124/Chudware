@@ -624,18 +624,29 @@ static ActivityItem* findOrCreateRoutingCard(ChatMsg& m) {
     return &m.activity.front();
 }
 
-// Finalize the live streamed-thinking box ("thought:stream") when the model
-// ACTS — prose/output text, a tool call, a stage boundary, or a completed
-// agent.thought block landing. The box stops pulsing, and because the
-// assistant_delta think branch only coalesces into a STILL-STREAMING box, the
-// next reasoning burst opens a fresh Thinking block instead of two boxes
-// updating at once.
+// Finalize the live streamed-thinking box ("thought:stream") when a visible
+// timeline boundary arrives — a context chip, tool call, stage boundary, or
+// completed agent.thought block. Text-channel deltas and agent.context usage
+// telemetry are not visible timeline rows, so neither fragments the box.
+// Once finalized, the next reasoning burst opens below the intervening row.
 static void finalizeLiveStreamThought(ChatMsg& m) {
     for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it) {
         if (it->rowKind == 2 && it->stage == "thought:stream" && it->streaming) {
             finalizeThoughtBox(*it);
             return;
         }
+    }
+}
+
+// agent.context is emitted after each provider completion. It is not a visible
+// row, but it is the original boundary between two reasoning buffers; retain
+// that boundary as paragraph whitespace when the next completion continues the
+// same visible Thinking box.
+static void separateLiveStreamThoughtParagraph(ChatMsg& m) {
+    for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it) {
+        if (it->rowKind != 2 || it->stage != "thought:stream" || !it->streaming) continue;
+        if (!it->detail.empty() && it->detail.back() != '\n') it->detail += "\n\n";
+        return;
     }
 }
 
@@ -1584,6 +1595,10 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
     // timeline, interleaving naturally with the stage rows. Span-id keys ("ctx:"/"thought:"/
     // "tool:" + id) can never collide with the orchestrator stage keys.
     else if (kind == "agent.context_injected") {                     // M12 — context chip
+        // A context chip is a visible timeline row.  Close any thinking that
+        // arrived before it so later deltas cannot be appended into a box that
+        // renders above the chip.
+        finalizeLiveStreamThought(m);
         ActivityItem ni;
         ni.rowKind = 1;
         ni.stage   = "ctx:" + jstr(data, "id");
@@ -1642,14 +1657,10 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             if (!txt.empty() || a->detail.empty()) a->detail = txt;
             finalizeThoughtBox(*a);
         }
-    } else if (kind == "assistant_delta") {  // live token stream (C++ SSE deltas)
-        // Both channels coalesce into ONE growing collapsible box each in the timeline
-        // (Thinking = reasoning, Output = the model's generated ops/prose), so the user
-        // sees continuous output while working. Boxes finalize at stage/run end.
-        // channel=="text" ALSO appends into the primary chat bubble (m.text waterfall) —
-        // UNLESS the stream is classified as ops/tool JSON (F1): then m.text is left alone
-        // (and any already-appended JSON blob is stripped from its tail).
-        // channel=="thinking" stays in the Thinking activity box only.
+    } else if (kind == "assistant_delta") {  // live provider token stream
+        // Each channel grows continuously until a visible timeline row or run end.
+        // Output is a hidden raw-log twin of the primary prose bubble, so switching
+        // to it must not manufacture an extra visible Thinking box.
         const std::string chan = jstr(data, "channel");
         const std::string txt = jstr(data, "text");
         const bool think = (chan == "thinking");
@@ -1692,8 +1703,6 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             a->status    = "running";
             if (!a->userToggled) a->expanded = true;
         } else {
-            // Action output (ops/prose) — the reasoning burst is over.
-            finalizeLiveStreamThought(m);
             // Text channel: append into the Output box always (collapsed raw log), AND
             // stream prose into the primary bubble (m.text) live — see the prose branch below.
             if (!txt.empty()) a->detail += txt;
@@ -2368,6 +2377,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             m.liveStatus = purpose + (stt.empty() ? std::string() : (" (" + stt + ")"));
         }
     } else if (kind == "agent.context") {
+        separateLiveStreamThoughtParagraph(m);
         // Per-completion usage telemetry (Python general lane). app.cpp feeds the
         // composer meter from the same event; HERE we keep the turn's prompt-cache
         // reads for the assistant bubble's meta row. The DISPLAYED figure is the

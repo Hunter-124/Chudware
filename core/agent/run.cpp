@@ -483,8 +483,11 @@ std::vector<std::string> status_errors(const json& feature_status) {
 // The final assistant message is persisted separately, so a trailing sub-flush
 // buffer is not authoritative.
 struct DeltaCoalescer {
+    // Mirrored by services/agent/agent_turn.py::_AssistantDeltaCoalescer.
+    // Keep cross-channel ordering and flush rules identical in both lanes.
     RunEvents* ev = nullptr;
     std::string buf_text, buf_think;
+    std::string active_channel;
     std::chrono::steady_clock::time_point last_flush_text =
         std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point last_flush_think =
@@ -503,15 +506,27 @@ struct DeltaCoalescer {
         last_flush(kind) = std::chrono::steady_clock::now();
     }
     void push(const std::string& d, const std::string& kind) {
-        std::string& b = chan(kind);
+        const std::string channel = kind == "thinking" ? "thinking" : "text";
+        // A tail from the prior channel arrived first and must be emitted first.
+        // Keeping both buffers open reordered the transcript and glued an old
+        // tail directly onto a later completion's opening text.
+        if (!active_channel.empty() && active_channel != channel)
+            flush(active_channel);
+        active_channel = channel;
+        std::string& b = chan(channel);
         b += d;
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - last_flush(kind))
+                            std::chrono::steady_clock::now() - last_flush(channel))
                             .count();
         if (b.size() >= 48 || b.find('\n') != std::string::npos || ms >= 60)
-            flush(kind);
+            flush(channel);
     }
-    void flush_all() { flush("text"); flush("thinking"); }
+    void flush_all() {
+        if (!active_channel.empty()) flush(active_channel);
+        if (active_channel != "text") flush("text");
+        if (active_channel != "thinking") flush("thinking");
+        active_channel.clear();
+    }
 };
 
 // Install `coalescer` as this thread's provider delta sink, restoring the

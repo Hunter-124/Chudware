@@ -1232,6 +1232,18 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
             return "provider_error", False
         if status_i == 400:
             return _PROVIDER_AUTH, False
+    # A response-gap is neither authentication nor an opaque generic failure.
+    # OmpBridgeProvider has already exhausted its bounded stream-salvage/resample
+    # policy before raising; keep the cause named so error_detail reaches the
+    # GUI card verbatim and higher-level callers may choose a fresh turn.
+    response_gap_markers = (
+        "final response contained no text or thinking",
+        "stream ended before the final response line",
+        "endpoint returned no completion",
+        "spent the whole max_tokens budget",
+    )
+    if any(m in text for m in response_gap_markers):
+        return "provider_error", True
     if status_i == 429 or "rate limit" in text or "too many requests" in text:
         return _FAILED, True
     if status_i is not None and status_i >= 500:
@@ -1392,15 +1404,19 @@ def _maybe_inject_trigger_advisory(
 
 
 class _AssistantDeltaCoalescer:
-    """Python mirror of core/agent/run.cpp's DeltaCoalescer: coalesce streamed
-    provider fragments per channel and emit ``assistant_delta`` events with
-    payload {"text": chunk, "channel": "text"|"thinking"} — byte-identical in
-    shape to what the C++ engine emits, so the GUI needs no new event type.
+    """Coalesce streamed provider fragments without changing their arrival order.
 
-    Flush rules per channel (exact C++ mirror): buffer reaches 48 chars,
-    contains a newline, or >=60 ms elapsed since that channel's last flush.
-    ``flush_all()`` drains both channels (completion return / turn end).
-    ``discard()`` drops buffered-but-unflushed fragments (resample path).
+    Mirrored by ``core/agent/run.cpp::DeltaCoalescer``.  Keep cross-channel
+    ordering and flush rules identical in both lanes.
+
+    The provider can alternate ``thinking`` and ``text``.  A per-channel tail
+    must therefore be flushed before accepting the other channel; otherwise an
+    older tail is emitted after newer content and can be concatenated directly
+    onto the next completion's opening fragment.  Non-delta events call
+    ``flush_all()`` through :func:`run_turn`'s ordered event wrapper for the same
+    reason.
+
+    ``discard()`` drops buffered-but-unflushed fragments from a dead resample.
     """
 
     FLUSH_CHARS = 48
@@ -1411,6 +1427,7 @@ class _AssistantDeltaCoalescer:
         self._buf: dict[str, list[str]] = {"text": [], "thinking": []}
         now = time.monotonic()
         self._last: dict[str, float] = {"text": now, "thinking": now}
+        self._active_channel: str | None = None
         self._lock = threading.Lock()
 
     def __call__(self, delta: str, channel: str) -> None:
@@ -1421,6 +1438,12 @@ class _AssistantDeltaCoalescer:
         if channel not in self._buf or not delta:
             return
         with self._lock:
+            # Preserve cross-channel arrival order.  In the live failure this is
+            # what kept " from task_list..." behind newer text, then glued it to
+            # the next completion's "The user...".
+            if self._active_channel is not None and self._active_channel != channel:
+                self._flush_locked(self._active_channel)
+            self._active_channel = channel
             buf = self._buf[channel]
             buf.append(str(delta))
             joined = "".join(buf)
@@ -1443,14 +1466,22 @@ class _AssistantDeltaCoalescer:
 
     def flush_all(self) -> None:
         with self._lock:
-            self._flush_locked("text")
-            self._flush_locked("thinking")
+            # Channel switches flush the previous tail, so normally only the
+            # active channel can be non-empty.  Drain it first; the second loop
+            # is a defensive fallback for restored/legacy state.
+            if self._active_channel is not None:
+                self._flush_locked(self._active_channel)
+            for channel in ("text", "thinking"):
+                if channel != self._active_channel:
+                    self._flush_locked(channel)
+            self._active_channel = None
 
     def discard(self) -> None:
         """Drop unflushed fragments from a dead attempt (kimi resample)."""
         with self._lock:
             self._buf["text"].clear()
             self._buf["thinking"].clear()
+            self._active_channel = None
 
 
 def run_turn(request: str, provider: Any, *, name: str = "dag_node",
@@ -1512,9 +1543,17 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     from services.agent.providers import base as _pbase  # noqa: PLC0415
 
     def _emit_delta(kind: str, payload: dict) -> None:
+        # Bypass the ordered wrapper below: the coalescer already owns the lock
+        # while calling this function, so re-entering flush_all() would deadlock.
         _ae.emit_event(kind, payload, live=on_event, journal=None)
 
     coalescer = _AssistantDeltaCoalescer(_emit_delta)
+
+    def _ordered_event(kind: str, payload: dict) -> None:
+        # Usage, context, tool, and terminal events share the same event stream.
+        # No buffered delta that arrived first may land after one of them.
+        coalescer.flush_all()
+        _ae.emit_event(kind, payload, live=on_event, journal=None)
     # Task-list sink: the `task_list` tool publishes `plan_state` events that
     # drive the copilot's live Task-list panel, but the tool is dispatched deep
     # under the loop with no on_event of its own. Same contextvar idiom as the
@@ -1524,7 +1563,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     _tl_tok = None
     try:
         from services.agent import task_list as _tl  # noqa: PLC0415
-        _tl_tok = _tl.set_event_sink(on_event, run_id)
+        _tl_tok = _tl.set_event_sink(_ordered_event, run_id)
     except Exception:  # noqa: BLE001
         _tl = None
     try:
@@ -1534,7 +1573,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 system_prompt=system_prompt, max_tool_calls=max_tool_calls,
                 max_tokens=max_tokens, ledger=ledger, actor=actor,
                 tool_dispatch=tool_dispatch, mission_dispatch=mission_dispatch,
-                tools_text=tools_text, on_event=on_event, run_id=run_id,
+                tools_text=tools_text, on_event=_ordered_event, run_id=run_id,
                 node_id=node_id, parent_id=parent_id, subagent_id=subagent_id,
                 capability=capability, tier=tier, model_id=model_id, phase=phase,
                 task_class=task_class, msg_idx=msg_idx, doc_id=doc_id,

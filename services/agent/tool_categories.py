@@ -25,6 +25,10 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     "modeling": [
         "family:cad",
         "add_features",
+        # Schema vocabulary must be callable where schema failures happen. In live run
+        # run-135571474839343 (2026-08-04), modeling+sketch resolved add_features but
+        # not this zero-risk guide, so the model could not inspect the canonical shape.
+        "cad_guide",
         "new_part",
         "new_assembly",
         "save_part",

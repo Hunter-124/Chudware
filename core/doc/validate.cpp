@@ -1692,8 +1692,33 @@ vector<string> validate_feature(const json& f, const string& where,
     }
     for (auto it = refs.begin(); it != refs.end(); ++it) {
         if (known_slots.find(it.key()) == known_slots.end()) {
-            errs.push_back(where + ".refs." + it.key() + ": unknown ref slot for " +
-                           ftype + " — " + accepted);
+            const bool object_array =
+                it.value().is_array() && !it.value().empty() &&
+                std::all_of(it.value().begin(), it.value().end(),
+                            [](const json& value) { return value.is_object(); });
+            // A 2026-08-04 holster run wrote params.profile=[{line...}]. The generic
+            // params-to-refs migration moved it to refs.profile before validation and
+            // erased its source-container provenance. Do not falsely claim the model
+            // authored refs.profile; name the slot without a container and teach the
+            // canonical sketch-geometry location in the same one-line rejection.
+            string err = object_array
+                             ? where + ": unknown ref slot for " + ftype + " ('" +
+                                   it.key() + "') — " + accepted
+                             : where + ".refs." + it.key() +
+                                   ": unknown ref slot for " + ftype + " — " + accepted;
+            if (object_array) {
+                // Only a sketch keeps its geometry in params.entities. For any
+                // other feature type say what is actually true — an inline
+                // object list is never a ref — rather than misfiling it as
+                // sketch advice the model cannot act on.
+                err += ftype == "sketch"
+                           ? "; sketch entity geometry belongs in "
+                             "params.entities, e.g. "
+                             "{\"type\":\"line\",\"p1\":[0,0],\"p2\":[10,0]}"
+                           : "; a ref names another feature — inline object "
+                             "lists belong in params";
+            }
+            errs.push_back(std::move(err));
         }
     }
     return errs;

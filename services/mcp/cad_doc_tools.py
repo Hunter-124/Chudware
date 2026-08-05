@@ -208,6 +208,7 @@ def _normalize_arc_entity(ne: dict, label: str, sink: set) -> None:
     Canonical (validate.cpp): center + radius + start/end ANGLES IN DEGREES + ccw.
     Accepted here, because each is a complete and unambiguous specification:
       * endpoints as POINTS plus the centre  — the endpoint/centre arc every CAD UI draws;
+      * endpoints plus a non-zero bulge (tan(signed sweep/4));
       * three points (start, a point on the arc, end) — the 3-point arc, incl. `arc3`;
       * start_angle / end_angle spellings of the canonical angles.
     Anything under-specified or self-contradictory raises a teaching ValueError naming
@@ -252,7 +253,13 @@ def _normalize_arc_entity(ne: dict, label: str, sink: set) -> None:
     e_pt = _pt2(ne.get(e_key)) if e_key else None
     m_key = _first_key(ne, _ARC_MID_KEYS)
     m_pt = _pt2(ne.get(m_key)) if m_key else None
+    has_bulge = "bulge" in ne
     if s_pt is None and e_pt is None:
+        if has_bulge:
+            raise ValueError(
+                f"{label}: arc bulge={ne.get('bulge')!r} needs point endpoints "
+                f'from=[x,y] and to=[x,y] (or start/end). Canonical arcs use '
+                f"center/radius/start/end angles.")
         return  # already angular (or nothing to work with) — engine reports the rest
     if s_pt is None or e_pt is None:
         raise ValueError(
@@ -260,7 +267,51 @@ def _normalize_arc_entity(ne: dict, label: str, sink: set) -> None:
             f"{s_key}={ne.get(s_key)!r}, {e_key}={ne.get(e_key)!r}.")
 
     center = _pt2(ne.get("center"))
-    if m_pt is not None:
+    if has_bulge and m_pt is not None:
+        raise ValueError(
+            f"{label}: arc gives both bulge={ne.get('bulge')!r} and {m_key}="
+            f"{ne.get(m_key)!r}. Use from/to plus bulge, OR start/mid/end.")
+    if has_bulge:
+        # A bulge is tan(signed sweep/4), the standard polyline-arc spelling. Endpoints
+        # plus any non-zero bulge determine one circle and direction exactly. The live
+        # 2026-08-04 IWB-holster run used this complete form; dropping it left an open
+        # profile that could only fail later with "profile sketch has no closed face".
+        raw_bulge = ne["bulge"]
+        if not isinstance(raw_bulge, (int, float)) or isinstance(raw_bulge, bool):
+            raise ValueError(
+                f"{label}: arc bulge={raw_bulge!r} must be a non-zero number "
+                f"(tan(signed sweep/4)); or use center=[x,y] with point endpoints.")
+        bulge = float(raw_bulge)
+        if bulge == 0.0:
+            raise ValueError(
+                f"{label}: arc bulge=0 describes a straight line. Use "
+                f'{{"type":"line","p1":[x,y],"p2":[x,y]}} or a non-zero bulge.')
+        dx, dy = e_pt[0] - s_pt[0], e_pt[1] - s_pt[1]
+        chord = math.hypot(dx, dy)
+        if chord == 0.0:
+            raise ValueError(
+                f"{label}: arc bulge endpoints are identical at {list(s_pt)}; "
+                f"from/to must be distinct points.")
+        offset = chord * (1.0 - bulge * bulge) / (4.0 * bulge)
+        implied = ((s_pt[0] + e_pt[0]) / 2.0 - dy / chord * offset,
+                   (s_pt[1] + e_pt[1]) / 2.0 + dx / chord * offset)
+        if center is not None and math.dist(center, implied) > 1e-6 * max(
+                1.0, math.dist(s_pt, implied)):
+            raise ValueError(
+                f"{label}: arc center={list(center)} disagrees with bulge={bulge}, "
+                f"which implies {[round(v, 6) for v in implied]}. Give from/to plus "
+                f"bulge, OR the centre, not both.")
+        implied_ccw = bulge > 0.0
+        if isinstance(ne.get("ccw"), bool) and ne["ccw"] != implied_ccw:
+            raise ValueError(
+                f"{label}: arc ccw={ne['ccw']} conflicts with bulge={bulge}; "
+                f"{'positive' if implied_ccw else 'negative'} bulge means "
+                f"{'counter-clockwise' if implied_ccw else 'clockwise'}.")
+        center = implied
+        ne["ccw"] = implied_ccw
+        ne.pop("bulge")
+        sink.add("arc_bulge")
+    elif m_pt is not None:
         # Circumcentre of the three points.
         ax, ay = s_pt
         bx, by = m_pt
@@ -289,9 +340,9 @@ def _normalize_arc_entity(ne: dict, label: str, sink: set) -> None:
         sink.add("arc_three_point")
     elif center is None:
         raise ValueError(
-            f"{label}: an arc through {list(s_pt)} and {list(e_pt)} needs either a "
-            f"center=[x,y] or a third point on the arc "
-            f"(mid=[x,y]) — two endpoints alone describe infinitely many arcs.")
+            f"{label}: an arc through {list(s_pt)} and {list(e_pt)} needs a "
+            f"center=[x,y], a third point on the arc (mid=[x,y]), or a non-zero "
+            f"bulge — two endpoints alone describe infinitely many arcs.")
 
     r_start = math.dist(center, s_pt)
     r_end = math.dist(center, e_pt)
@@ -954,6 +1005,8 @@ def _sketch_needs_norm(feat: dict, params: dict) -> bool:
             return True
         if e.get("type") in ("circle", "arc") and "radius" not in e:
             return True
+        if e.get("type") == "arc" and "bulge" in e:
+            return True
         if e.get("type") == "point" and "p" not in e:
             return True
         # A rectangle whose corners are flat numbers: canonical in every other respect,
@@ -1115,7 +1168,15 @@ def _stray_geometry_key(feat: dict, params: dict) -> Optional[str]:
     A list of strings, ids or numbers is NOT claimed — only a shape the caller clearly
     meant as entities, so this can reject without ever eating a legitimate param.
     """
-    geom_fields = ("type", "points", "center", "p1", "p2", "start", "radius")
+    # Include every endpoint spelling the entity normalizer reads. In particular, the
+    # live 2026-08-04 holster entities had `kind` plus from/to (no canonical `type`/p1/p2),
+    # so omitting those fields let an unread list leak through to the engine.
+    geom_fields = (
+        "type", "points", "center", "radius",
+        "p1", "p2", "start", "end", "from", "to", "a", "b",
+        "start_point", "startpoint", "end_point", "endpoint",
+        "x1", "y1", "x2", "y2",
+    )
     for src in (params, feat):
         for key, val in src.items():
             if key in _SKETCH_NON_GEOM_LISTS or not isinstance(val, list) or not val:
@@ -1143,12 +1204,16 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     ents_in = _pick("entities")
     ents_key = "entities"
     if ents_in is None:
-        # Aliases for the entity list. `shapes` is the big one: a whole sketch written as
-        # params.shapes=[{polygon…},{polyline…}] used to survive normalization untouched,
-        # so the sketch was created with entities:[] — a SUCCESSFUL call that produced an
-        # empty sketch, and every extrude referencing it then died on the baffling
-        # "profile sketch has no closed face" (live 2026-07-28 kimi-keychain run).
-        for alias in ("shapes", "profiles", "geometry", "curves", "elements"):
+        # Aliases for the entity list. `_pick` only accepts LIST values, so the singular
+        # shape/profile/curve/element/entity/segment spellings are unambiguously entity
+        # collections too. `outline` and `sketch` are deliberately excluded: an outline
+        # may be a raw point chain, while sketch commonly names a profile reference.
+        # `profile` is the verbatim live 2026-08-04 IWB-holster spelling; before this it
+        # leaked into refs and the validator taught the model the wrong layer.
+        for alias in (
+                "shape", "shapes", "profile", "profiles", "geometry",
+                "curve", "curves", "element", "elements", "entity",
+                "segment", "segments"):
             alt = _pick(alias)
             if alt is not None:
                 ents_in, ents_key = alt, alias
@@ -1355,6 +1420,16 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             rewrites.append('is_construction/for_construction/reference -> construction')
         if "construction_word" in used_shorthand:
             rewrites.append('construction:"true"/"false" -> a real boolean')
+        if "arc_bulge" in used_shorthand:
+            rewrites.append("from/to + bulge -> arc center/radius/start/end/ccw")
+        elif "arc_endpoints" in used_shorthand:
+            rewrites.append("arc point endpoints -> start/end angles")
+        if "arc_three_point" in used_shorthand:
+            rewrites.append("start/mid/end -> arc center/radius/start/end/ccw")
+        if "arc_angle_key" in used_shorthand:
+            rewrites.append("start_angle/end_angle -> start/end")
+        if "arc_sweep_word" in used_shorthand:
+            rewrites.append("arc sweep word -> ccw")
         sink.append(
             f'{_feat_label(feat, "sketch")}: expanded flat entity shorthand '
             f'({"; ".join(rewrites)}) into the engine\'s canonical entity fields '

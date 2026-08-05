@@ -89,6 +89,27 @@ _CLOSED_FIXED_ADD_FEATURES = _CLOSED_MALFORMED_ADD_FEATURES.replace(
     "]}\n```", "]}}\n```"
 )
 
+#: The re-emit nudge's marker. One marker covers both shapes the guard sees —
+#: a directive cut off mid-JSON and a complete-but-invalid one — because the
+#: message body names which it was (and, when the decoder complained, why).
+_NUDGE = "[TOOL CALL NOT PARSED]"
+
+# Live 2026-08-04, run-135571474839343 (k3-256k, IWB-holster build): after an
+# add_features schema rejection the model re-authored the ops list under
+# `entities` and left ONE stray `}` from the shape it was editing. The intent
+# was complete and correct; only the closer count was wrong. The harness read
+# it as truncated, asked for a verbatim re-emit, got the identical bytes back,
+# and killed the run with no_code and zero geometry.
+_STRAY_BRACE_ADD_FEATURES = (
+    '```json\n{"tool": "add_features", "args": {"doc_id": "doc-cpp00000002", '
+    '"ops": [{"op": "add_feature", "feature": {"type": "sketch", '
+    '"name": "HolsterOutline", "plane": "XY", "entities": ['
+    '{"kind": "line", "from": [-6, 0], "to": [132, 0]}, '
+    '{"kind": "line", "from": [132, 0], "to": [132, 58]}, '
+    '{"kind": "arc", "from": [72, 95], "to": [30, 90], "bulge": -0.35}, '
+    '{"kind": "line", "from": [-6, 80], "to": [-6, 0]}]}}}]}}\n```'
+)
+
 
 # ---------------------------------------------------------------------------
 # _looks_truncated: unit precision
@@ -209,7 +230,7 @@ def test_truncated_directive_after_real_work_is_not_success():
     assert ho.get("status") != "done", ho
     # The re-emit request went out exactly once — a second truncation must not
     # loop the budget away.
-    assert _nudges(p, "[TRUNCATED]") == 1, _flat(p)
+    assert _nudges(p, _NUDGE) == 1, _flat(p)
 
 
 def test_truncated_directive_recovers_when_model_re_emits():
@@ -234,7 +255,7 @@ def test_truncated_directive_recovers_when_model_re_emits():
     assert res.success is True, (res.stop_reason, res.result)
     tools = [c.get("tool") for c in (res.result or {}).get("calls") or []]
     assert "workspace_status" in tools, tools
-    assert _nudges(p, "[TRUNCATED]") == 1, _flat(p)
+    assert _nudges(p, _NUDGE) == 1, _flat(p)
 
 def test_closed_malformed_live_add_features_is_reemitted_and_runs():
     """run-77308371568450 must retry the dropped call, not confirm the prose."""
@@ -258,7 +279,7 @@ def test_closed_malformed_live_add_features_is_reemitted_and_runs():
     assert res.success is True, (res.stop_reason, res.result)
     tools = [c.get("tool") for c in (res.result or {}).get("calls") or []]
     assert tools.count("add_features") == 1, tools
-    assert _nudges(p, "[TRUNCATED]") == 1, _flat(p)
+    assert _nudges(p, _NUDGE) == 1, _flat(p)
 
 
 def test_complete_directive_and_prose_finish_unaffected():
@@ -279,7 +300,75 @@ def test_complete_directive_and_prose_finish_unaffected():
         run_id="t-trunc-3",
     )
     assert res.success is True, (res.stop_reason, res.result)
-    assert "[TRUNCATED]" not in _flat(p)
+    assert _NUDGE not in _flat(p)
+
+
+def test_stray_closer_directive_dispatches_without_a_nudge():
+    """run-135571474839343: one miscounted `}` must not cost the run.
+
+    The model's intent was complete — 4 sketch entities, the right tool, the
+    right doc — and only the closer count was wrong. Before the repair this
+    reply parsed as None, burned the single re-emit nudge, came back byte
+    identical, and ended the turn `no_code` with nothing built.
+    """
+    from services.agent import agent_turn as at
+
+    p = _ScriptedProvider([
+        _STRAY_BRACE_ADD_FEATURES,
+        "Done - the holster outline sketch is in.",
+    ])
+    res = at.run_turn(
+        "build me a printable IWB holster",
+        p,
+        allowed_tools=[*_GENERAL_ALLOW, "add_features"],
+        max_tool_calls=8,
+        tool_dispatch=_dispatch_ok,
+        actor="general_agent",
+        run_id="run-135571474839343-replay",
+    )
+    assert res.success is True, (res.stop_reason, res.result)
+    calls = (res.result or {}).get("calls") or []
+    assert [c.get("tool") for c in calls].count("add_features") == 1, calls
+    # No correction round-trip was needed: the model never saw a nudge.
+    assert _NUDGE not in _flat(p)
+
+
+def test_stray_closer_repair_keeps_every_entity():
+    """The repair must recover the model's ARGUMENTS, not just a bare call."""
+    from services.agent import agent_turn as at
+
+    parsed = at._parse_directive(_STRAY_BRACE_ADD_FEATURES)
+    assert parsed is not None
+    assert parsed["tool"] == "add_features"
+    feat = parsed["args"]["ops"][0]["feature"]
+    assert feat["name"] == "HolsterOutline"
+    assert [e["kind"] for e in feat["entities"]] == ["line", "line", "arc", "line"]
+    assert feat["entities"][2]["bulge"] == -0.35
+
+
+def test_missing_closer_is_never_synthesised():
+    """The repair drops stray closers; it must NEVER invent absent ones.
+
+    Completing a cut-off directive would dispatch arguments the model never
+    sent. `_CLOSED_MALFORMED_ADD_FEATURES` (run-77308371568450) omitted the
+    outer `}` — that stays unparseable so the re-emit path still owns it.
+    """
+    from services.agent import agent_turn as at
+
+    assert at._parse_directive(_CLOSED_MALFORMED_ADD_FEATURES) is None
+    assert at._parse_directive(_TRUNCATED) is None
+    assert at._balanced_json_prefix('{"tool": "x", "args": {"a": 1') is None
+
+
+def test_parse_error_clause_names_the_defect():
+    """The nudge must carry the decoder's own complaint, not a shrug."""
+    from services.agent import agent_turn as at
+
+    why = at._directive_parse_error(_CLOSED_MALFORMED_ADD_FEATURES)
+    assert why, "a complete-but-invalid directive must produce a complaint"
+    assert "balance" in why or "delimiter" in why or "Expecting" in why, why
+    # A clean directive has nothing to complain about.
+    assert at._directive_parse_error(_CALL % "describe_project") == ""
 
 
 # ---------------------------------------------------------------------------

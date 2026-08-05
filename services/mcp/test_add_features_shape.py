@@ -2053,15 +2053,93 @@ def test_live_kimi_keychain_hex_batch_builds(profile_ref):
     assert min(xs) > 5 and max(xs) > 25, (min(xs), max(xs))
 
 
+# ------------------------------------------------------------------ live IWB holster (2026-08-04)
+# Ledger: ~/.local/share/Chudware/cache/runs/run-135571474839343/events.jsonl. The model's
+# VERBATIM sketch op used three coherent dialect spellings together: a singular `profile`
+# entity-list alias, `kind` plus `from`/`to` lines, and a bulge-defined arc.
+_HOLSTER_OUTLINE_OPS = [{"op": "add_feature", "feature": {
+    "type": "sketch", "name": "HolsterOutline", "plane": "XY", "params": {"profile": [
+        {"kind": "line", "from": [-6, 0], "to": [132, 0]},
+        {"kind": "line", "from": [132, 0], "to": [132, 58]},
+        {"kind": "line", "from": [132, 58], "to": [72, 58]},
+        {"kind": "line", "from": [72, 58], "to": [72, 95]},
+        {"kind": "arc", "from": [72, 95], "to": [30, 90], "bulge": -0.35},
+        {"kind": "line", "from": [30, 90], "to": [-6, 80]},
+        {"kind": "line", "from": [-6, 80], "to": [-6, 0]},
+    ]}}}]
+
+
+def test_live_holster_profile_from_to_and_bulge_normalize_without_losing_a_segment():
+    feat = M._normalize_sketch_ops(_HOLSTER_OUTLINE_OPS, [])[0]["feature"]
+    ents = feat["params"]["entities"]
+    assert [e["type"] for e in ents] == [
+        "line", "line", "line", "line", "arc", "line", "line"]
+    assert [e["id"] for e in ents] == [f"e{i}" for i in range(1, 8)]
+    assert all(e["construction"] is False for e in ents)
+    assert ents[:4] == [
+        {"type": "line", "p1": [-6, 0], "p2": [132, 0],
+         "id": "e1", "construction": False},
+        {"type": "line", "p1": [132, 0], "p2": [132, 58],
+         "id": "e2", "construction": False},
+        {"type": "line", "p1": [132, 58], "p2": [72, 58],
+         "id": "e3", "construction": False},
+        {"type": "line", "p1": [72, 58], "p2": [72, 95],
+         "id": "e4", "construction": False},
+    ]
+    assert ents[5:] == [
+        {"type": "line", "p1": [30, 90], "p2": [-6, 80],
+         "id": "e6", "construction": False},
+        {"type": "line", "p1": [-6, 80], "p2": [-6, 0],
+         "id": "e7", "construction": False},
+    ]
+    arc = ents[4]
+    assert set(arc) == {"type", "id", "construction", "center", "radius",
+                        "start", "end", "ccw"}
+    assert arc["center"] == pytest.approx([47.86607142857143, 118.825])
+    assert arc["radius"] == pytest.approx(33.91278716488541)
+    assert arc["start"] == pytest.approx(315.36906701281623)
+    assert arc["end"] == pytest.approx(238.20888213606133)
+    assert arc["ccw"] is False
+
+    # Recover the canonical arc's endpoints and prove every segment meets the next,
+    # including the last-to-first closure. This catches a silently dropped/reordered arc.
+    def endpoints(entity):
+        if entity["type"] == "line":
+            return entity["p1"], entity["p2"]
+        center, radius = entity["center"], entity["radius"]
+        point = lambda angle: [
+            center[0] + radius * math.cos(math.radians(angle)),
+            center[1] + radius * math.sin(math.radians(angle))]
+        return point(entity["start"]), point(entity["end"])
+
+    pairs = [endpoints(e) for e in ents]
+    for (_, end), (start, _) in zip(pairs, pairs[1:] + pairs[:1]):
+        assert end == pytest.approx(start)
+
+
+@pytest.mark.parametrize("alias", [
+    "shape", "shapes", "profile", "profiles", "geometry",
+    "curve", "curves", "element", "elements", "entity", "segment", "segments",
+])
+def test_unambiguous_entity_list_aliases_are_consumed(alias):
+    feat = M._normalize_sketch_feature({
+        "type": "sketch", "name": "AliasSk", "params": {
+            alias: [{"kind": "line", "from": [0, 0], "to": [5, 0]}]}}, [])
+    assert feat["params"]["entities"] == [{
+        "type": "line", "p1": [0, 0], "p2": [5, 0],
+        "id": "e1", "construction": False}]
+    assert alias not in feat["params"]
+
+
 def test_geometry_under_an_unreadable_key_is_rejected_not_silently_dropped():
     """A sketch created EMPTY reports success and then poisons the extrude that
     references it with "profile sketch has no closed face" — an error naming neither
-    the cause nor a fix. Reject at the sketch instead, naming the key."""
+    the cause nor a fix. `from`/`to` still make these unmistakably line entities."""
     with pytest.raises(ValueError) as ei:
         M._normalize_sketch_ops([{"op": "add_feature", "feature": {
             "type": "sketch", "name": "Sk",
             "params": {"plane": "top",
-                       "loops": [{"type": "circle", "center": [0, 0], "radius": 5}]}}}], [])
+                       "loops": [{"kind": "line", "from": [0, 0], "to": [5, 0]}]}}}], [])
     assert "params.loops" in str(ei.value)
     assert "params.entities" in str(ei.value)
 

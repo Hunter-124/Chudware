@@ -311,6 +311,45 @@ def _looks_truncated(reply: str, stop_reason: Any = None) -> bool:
     return depth > 0 or brack > 0 or in_str
 
 
+def _directive_parse_error(reply: str) -> str:
+    """The JSON decoder's own complaint about the reply's best directive
+    candidate, as a short clause to hand back to the model.
+
+    Live 2026-08-04 (run-135571474839343): the malformed-directive nudge said
+    only "cut off or contained malformed JSON" and asked for a verbatim
+    re-emit — so the model re-sent the same stray brace and the run died. A
+    model cannot fix what it is not told; naming the decoder's position and
+    message turns one wasted completion into a targeted correction.
+    """
+    text = reply or ""
+    bodies = [m.group(1) for m in _FENCE_RE.finditer(text)]
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        bodies.append(stripped)
+    else:
+        fence = stripped.find("```")
+        if fence != -1:
+            brace = stripped.find("{", fence)
+            if brace != -1:
+                bodies.append(stripped[brace:])
+    for body in reversed(bodies):
+        body = body.strip()
+        if not body.startswith("{") or not _TRUNC_OPENER_RE.search(body):
+            continue
+        try:
+            json.JSONDecoder().raw_decode(body)
+        except (json.JSONDecodeError, ValueError) as exc:
+            depth, brack, in_str = _json_balance(body)
+            detail = str(exc)
+            if in_str:
+                detail += " (a string literal is still open)"
+            elif depth or brack:
+                detail += (f" (brace balance {depth:+d}, bracket balance "
+                           f"{brack:+d})")
+            return detail
+    return ""
+
+
 def _attach_typed_refusal_if_needed(handoff: dict, calls: list) -> dict:
     """mega-24 a2: multi-domain gate needs typed_refusal OR delegate.
 
@@ -378,6 +417,16 @@ def _tool_category_catalog_result() -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+#: Geometry vocabulary that makes the modeling+sketch packs the obviously right
+#: forced opener. Deliberately narrow: a false positive costs two enabled packs
+#: (prompt tokens), a false negative just falls back to the category menu.
+_GEOMETRY_REQUEST_RE = re.compile(
+    r"\b(model|remodel|part|sketch|extrude|revolve|fillet|chamfer|shell|"
+    r"loft|sweep|pocket|boss|hole|thread|bracket|housing|enclosure|holster|"
+    r"mount|clip|adapter|gear|flange|plate|printable|3d[- ]?print|stl|step "
+    r"file|geometry|cad)\b", re.IGNORECASE)
+
+
 def _force_first_tool(
     *,
     allow: set[str] | None,
@@ -389,6 +438,8 @@ def _force_first_tool(
     tool_calls_made: int,
     budget: int,
     emit_call: Callable | None = None,
+    request: str = "",
+    apply_categories: Callable[[list], list] | None = None,
 ) -> tuple[list, int, bool]:
     """mega-24 a2/c: zero-tool no_code floor — force ledger_get (or first allow).
 
@@ -400,12 +451,26 @@ def _force_first_tool(
     if tool_calls_made >= budget or not callable(dispatch):
         return calls, tool_calls_made, False
     allow_set = set(allow or [])
-    # Prefer the category menu when the turn can self-serve more packs: on the
-    # general lane (enable_tools + list_tool_categories on the floor) a blind
-    # forced read taught the model nothing — handing it the pack menu is the
-    # on-ramp the role card itself prescribes (2026-07-27 zero-step run).
+    # On the general lane (enable_tools + list_tool_categories on the floor) a
+    # blind forced read taught the model nothing, so this used to hand back the
+    # pack MENU. But the full menu — every pack name and its one-line
+    # description — is already rendered into the system prompt by
+    # tool_schemas.render_tools_block whenever the meta tools are allowed, so
+    # the forced menu re-delivered what the model was already looking at.
+    # Live 2026-08-04 (run-135571474839343): the model read the forced catalog,
+    # spent a completion reasoning "the harness forced list_tool_categories",
+    # then called enable_tools itself — one whole round trip to obtain a
+    # capability the harness could have granted outright. When the request is
+    # unmistakably geometry, force the ENABLE instead: the next completion can
+    # build. The menu stays the fallback for everything else.
+    forced_cats: list[str] = []
     if {"enable_tools", "list_tool_categories"} <= allow_set:
-        tool = "list_tool_categories"
+        if (callable(apply_categories)
+                and _GEOMETRY_REQUEST_RE.search(request or "")):
+            forced_cats = ["modeling", "sketch"]
+            tool = "enable_tools"
+        else:
+            tool = "list_tool_categories"
     else:
         # Prefer ledger_get as universal floor; then domain openers.
         candidates = (
@@ -421,7 +486,7 @@ def _force_first_tool(
             tool = pick[0] if pick else None
     if not tool:
         return calls, tool_calls_made, False
-    args: dict = {}
+    args: dict = {"categories": forced_cats} if forced_cats else {}
     if tool == "ledger_get":
         args = {"budget_tokens": 1500}
     elif tool == "ledger_note":
@@ -441,7 +506,12 @@ def _force_first_tool(
     except Exception:  # noqa: BLE001
         pass
     _force_extra = ""
-    if "enable_tools" in allow_set:
+    if forced_cats:
+        _force_extra = (
+            " The modeling and sketch tools are now live for the rest of this "
+            "turn: go straight to new_part(name) then add_features(ops)."
+        )
+    elif "enable_tools" in allow_set:
         _force_extra = (
             " If the request asks you to build or edit geometry: call "
             "enable_tools(categories=[\"modeling\", \"sketch\"]) next, then "
@@ -453,7 +523,16 @@ def _force_first_tool(
         f"a done handoff.{_force_extra}"
     )})
     tool_calls_made += 1
-    if tool == "list_tool_categories":
+    if tool == "enable_tools":
+        # Same trap as the menu below: enable_tools is executed BY the loop, so
+        # dispatching it through the registry returns known_but_unbound. Widen
+        # the allow-set through the caller's closure, which also re-renders the
+        # tools block so the model sees real schemas for what it can now call.
+        newly = apply_categories(list(forced_cats)) if apply_categories else []
+        result = {"ok": True, "enabled": list(forced_cats),
+                  "newly_available": list(newly)}
+        ok = True
+    elif tool == "list_tool_categories":
         # Loop-executed meta tool: dispatching it would hit the registry and
         # come back known_but_unbound, handing the model a harness-gap error
         # as the on-ramp it was supposed to learn its capabilities from.
@@ -2646,20 +2725,31 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             from services.agent.providers import base as _pb  # noqa: PLC0415
             _stop = _pb.take_last_stop_reason()
             if _looks_truncated(reply, _stop):
+                _complaint = _directive_parse_error(reply)
                 if tool_calls_made < budget and _trunc_nudge[0] < 1:
                     _trunc_nudge[0] += 1
                     _log(ledger, actor, {
                         "event": "reply_truncated_retry",
                         "tool_calls": tool_calls_made,
+                        "parse_error": _complaint,
                         "tail": (reply or "")[-160:],
                     })
+                    # Naming the decoder's actual complaint is the difference
+                    # between a fix and a verbatim repeat: live 2026-08-04
+                    # (run-135571474839343) the old blanket "cut off or
+                    # malformed" text plus "re-emit ONLY that single tool call"
+                    # got the same stray brace back, and the run died no_code.
+                    _why = (f"The JSON parser reported: {_complaint}. "
+                            if _complaint else
+                            "It was cut off before the JSON closed. ")
                     messages.append({"role": "user", "content": _parts(
-                        "[TRUNCATED] Your previous tool-call message was cut "
-                        "off or contained malformed JSON, so nothing ran. "
-                        "Re-emit ONLY that single tool call as compact JSON "
-                        "in one ```json fence - no "
-                        "prose, no restated long text, and keep every string "
-                        "argument short. If the call genuinely needs a long "
+                        "[TOOL CALL NOT PARSED] Your previous tool-call "
+                        f"message did not parse, so nothing ran. {_why}"
+                        "REBUILD the call from scratch - do not resend the same "
+                        "bytes - as compact JSON in one ```json fence, no prose "
+                        "around it. Count your closing brackets against the "
+                        "structure you actually wrote. Keep every string "
+                        "argument short; if the call genuinely needs a long "
                         "body, do smaller steps instead."
                     )})
                     last_reason = _RETRY
@@ -2816,6 +2906,8 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     tool_calls_made=tool_calls_made,
                     budget=budget,
                     emit_call=_emit_forced_call,
+                    request=request,
+                    apply_categories=_apply_categories,
                 )
                 if forced:
                     last_reason = _RETRY
@@ -3047,6 +3139,8 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     tool_calls_made=tool_calls_made,
                     budget=budget,
                     emit_call=_emit_forced_call,
+                    request=request,
+                    apply_categories=_apply_categories,
                 )
                 if forced:
                     last_reason = _RETRY
@@ -4453,9 +4547,66 @@ def _parse_text_tool_call(reply: str) -> dict | None:
     return {"tool": match.group(1), "args": args}
 
 
+def _balanced_json_prefix(text: str) -> str | None:
+    """Rebuild *text* up to the end of its first top-level object, DROPPING any
+    closer that does not match the innermost open container.
+
+    Live 2026-08-04 (run-135571474839343, k3-256k, IWB-holster build): after an
+    `add_features` schema rejection the model re-authored the ops list and left
+    ONE stray `}` behind from the shape it was editing — `…"entities":[…]}}}]}}`
+    where the new nesting needs `…]}}]}}`. `raw_decode` died at the stray brace
+    ("Expecting ',' delimiter"), `_parse_directive` returned None, the harness
+    read that as a truncated reply, nudged for a verbatim re-emit, got the SAME
+    stray brace back, and killed a 12-completion run with `no_code` and zero
+    geometry. A miscounted closer on a deeply nested ops payload is the single
+    most common way a model's correct INTENT fails to reach dispatch.
+
+    Only mismatched CLOSERS are dropped. Missing closers are deliberately NOT
+    synthesised: a genuinely truncated directive must stay unparseable, because
+    completing it would fabricate arguments the model never sent — and the
+    truncation path exists to ask for a re-emit instead.
+    """
+    stack: list[str] = []
+    out: list[str] = []
+    in_str = False
+    esc = False
+    pairs = {"}": "{", "]": "["}
+    for ch in text:
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack:
+                break
+            if stack[-1] != pairs[ch]:
+                continue  # stray closer for a container that is not open — drop it
+            stack.pop()
+            if not stack:
+                out.append(ch)
+                return "".join(out)
+        out.append(ch)
+    return None  # never closed: truncated, not merely miscounted
+
+
 def _loads_first_object(text: str) -> dict | None:
     """Parse the first complete JSON object at the start of *text* (trailing
-    prose/junk tolerated); None when it isn't a dict or doesn't parse."""
+    prose/junk tolerated); None when it isn't a dict or doesn't parse.
+
+    A strict parse always wins. Only when that fails is the mismatched-closer
+    repair tried, and its output must itself parse cleanly — so this can never
+    return an object the JSON grammar would not have produced from the model's
+    own bytes.
+    """
     text = text.strip()
     if not text.startswith("{"):
         return None
@@ -4463,7 +4614,15 @@ def _loads_first_object(text: str) -> dict | None:
         obj, _end = json.JSONDecoder().raw_decode(text)
         return obj if isinstance(obj, dict) else None
     except (json.JSONDecodeError, ValueError):
+        pass
+    repaired = _balanced_json_prefix(text)
+    if repaired is None:
         return None
+    try:
+        obj = json.loads(repaired)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def resolver_for(mission_dispatch: Any | None = None) -> Callable[[str], Any]:
@@ -5583,6 +5742,49 @@ def _as_text(result: Any, limit: int = _TOOL_RESULT_CHARS) -> str:
 _OP_VOCAB_INJECTED_RUNS: set[str] = set()
 
 
+#: A feature-schema rejection, as distinct from an unknown OP name: the op was
+#: right, the feature body was not. Live 2026-08-04 (run-135571474839343):
+#: `features[0](f1).refs.profile: unknown ref slot for sketch — sketch accepts
+#: refs: plane, offset`. The unknown-op cheatsheet does not fire on these, so
+#: the model got no vocabulary help at the one moment it needed it, guessed
+#: three more spellings, and the run died. Matched on the engine's own
+#: validation phrasing.
+_FEATURE_SCHEMA_RE = re.compile(
+    r"unknown ref slot|failed validation|unknown (?:param|feature type)|"
+    r"features\[\d+\]", re.IGNORECASE)
+
+
+def _is_feature_schema_error(result: Any) -> bool:
+    """True when a feature batch was rejected for its SHAPE, not its op name."""
+    try:
+        text = json.dumps(result, default=str) if not isinstance(result, str) \
+            else result
+    except Exception:  # noqa: BLE001
+        text = str(result or "")
+    if not text or "unknown op" in text.lower():
+        return False  # the op-name cheatsheet owns that one
+    return bool(_FEATURE_SCHEMA_RE.search(text))
+
+
+def _feature_schema_assist() -> str:
+    """The once-per-mission authoring reminder for a rejected feature body."""
+    return (
+        "[feature schema assist - once per mission] The op name was fine; the "
+        "FEATURE BODY was rejected. A feature carries `params` (its own "
+        "values) and `refs` (pointers to other features). Sketch geometry is "
+        "params, never a ref:\n"
+        '{"op":"add_feature","feature":{"type":"sketch","name":"Outline",'
+        '"plane":"XY","params":{"entities":['
+        '{"type":"line","p1":[0,0],"p2":[10,0]},'
+        '{"type":"arc","p1":[10,0],"p2":[10,8],"bulge":0.4},'
+        '{"type":"circle","center":[5,4],"radius":2}],"constraints":[]}}}\n'
+        "Then reference that sketch BY NAME from the extrude: "
+        '{"op":"add_feature","feature":{"type":"extrude","name":"Body",'
+        '"refs":{"profile":"Outline"},"params":{"distance":27}}}. '
+        "Call cad_guide(topic=\"sketch\") for the full parameter list rather "
+        "than guessing another spelling."
+    )
+
 def _maybe_inject_op_vocab_cheatsheet(
     tool: str,
     result: Any,
@@ -5590,14 +5792,20 @@ def _maybe_inject_op_vocab_cheatsheet(
     run_id: str | None = None,
     force_key: str | None = None,
 ) -> str | None:
-    """Return a one-shot allowed-ops cheatsheet after an unknown-op failure.
+    """Return a one-shot authoring cheatsheet after a rejected feature batch.
 
-    Middleware seam (mega-8 OpVocab / mega-7 TOP-2): when ``add_features`` (or
-    ``doc_apply_ops``) rejects with ``unknown op '…'``, append a compact registry
-    snippet so the model stops inventing ``box``/``cylinder``/``sketch`` as ops.
-    Injects at most once per mission (``run_id``); subsequent failures rely on the
-    rich engine error (closest suggestions + cad_guide pointer). NO silent alias
-    mapping — the model must re-emit the correct op name.
+    Middleware seam (mega-8 OpVocab / mega-7 TOP-2). Two disjoint arms, each
+    injecting at most once per mission (``run_id``):
+
+    * unknown OP name (``unknown op '…'``) — the allowed-ops registry snippet,
+      so the model stops inventing ``box``/``cylinder``/``sketch`` as ops.
+    * rejected feature BODY (``unknown ref slot``, ``failed validation``) — the
+      params-vs-refs authoring reminder. This arm was missing until
+      2026-08-04: run-135571474839343 hit `unknown ref slot for sketch`, got no
+      assist at all, guessed three more spellings and died with zero geometry.
+
+    Subsequent failures rely on the rich engine error (closest suggestions +
+    cad_guide pointer). NO silent alias mapping — the model re-emits the call.
 
     Returns the inject text, or None when no inject is warranted / already done.
     """
@@ -5608,10 +5816,17 @@ def _maybe_inject_op_vocab_cheatsheet(
     except Exception:  # noqa: BLE001
         return None
     try:
-        if not _ov.is_unknown_op_error(result):
-            return None
+        unknown_op = _ov.is_unknown_op_error(result)
     except Exception:  # noqa: BLE001
-        return None
+        unknown_op = False
+    if not unknown_op:
+        if not _is_feature_schema_error(result):
+            return None
+        key = (force_key or run_id or "_standalone") + "#feature_schema"
+        if key in _OP_VOCAB_INJECTED_RUNS:
+            return None
+        _OP_VOCAB_INJECTED_RUNS.add(key)
+        return _feature_schema_assist()
 
     key = force_key or run_id or "_standalone"
     if key in _OP_VOCAB_INJECTED_RUNS:

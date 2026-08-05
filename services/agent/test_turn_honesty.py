@@ -294,6 +294,74 @@ def test_force_first_legacy_floor_without_enable_tools():
     assert seen == ["ledger_get"], seen
 
 
+
+def test_force_first_enables_modeling_on_a_geometry_request():
+    """A geometry request gets CAPABILITY, not a menu it already has.
+
+    Live 2026-08-04 (run-135571474839343): the forced opener handed back the
+    pack catalog, which render_tools_block had already put in the system
+    prompt. The model spent a completion reasoning about the forced menu and
+    then called enable_tools itself — a round trip for something the harness
+    could grant outright.
+    """
+    from services.agent import agent_turn as at
+
+    seen = []
+    applied = []
+
+    def dispatch(tool, args):
+        seen.append(tool)
+        return {"ok": True}
+
+    emitted = []
+    messages: list = []
+    calls, n, forced = at._force_first_tool(
+        allow={"enable_tools", "list_tool_categories", "describe_project",
+               "ledger_get"},
+        dispatch=dispatch,
+        ledger=None,
+        actor="test",
+        messages=messages,
+        calls=[],
+        tool_calls_made=0,
+        budget=8,
+        emit_call=lambda t, a, r, ok: emitted.append((t, ok)),
+        request="build me a brand new 3D printable IWB holster for a Ruger LCP",
+        apply_categories=lambda cats: applied.append(cats) or ["new_part"],
+    )
+    assert forced is True
+    assert seen == [], "enable_tools is loop-executed, never dispatched"
+    assert applied == [["modeling", "sketch"]], applied
+    rec = calls[0]
+    assert rec["tool"] == "enable_tools"
+    assert rec["forced"] is True and rec["ok"] is True, rec
+    assert emitted == [("enable_tools", True)], emitted
+    # The model is pointed at the build, not at another discovery call.
+    nudge = "\n".join(str(m.get("content")) for m in messages)
+    assert "new_part" in nudge and "add_features" in nudge, nudge
+
+
+def test_force_first_keeps_menu_for_non_geometry_requests():
+    """Non-geometry work must not silently pull in the modeling packs."""
+    from services.agent import agent_turn as at
+
+    applied = []
+    calls, n, forced = at._force_first_tool(
+        allow={"enable_tools", "list_tool_categories", "ledger_get"},
+        dispatch=lambda tool, args: {"ok": True},
+        ledger=None,
+        actor="test",
+        messages=[],
+        calls=[],
+        tool_calls_made=0,
+        budget=8,
+        request="tidy up the loose files in this project folder",
+        apply_categories=lambda cats: applied.append(cats) or [],
+    )
+    assert forced is True
+    assert applied == [], "no pack may be enabled for non-geometry work"
+    assert calls[0]["tool"] == "list_tool_categories"
+
 # ---------------------------------------------------------------------------
 # Meta-tool visibility: enable_tools / list_tool_categories emit agent.tool_call
 # ---------------------------------------------------------------------------

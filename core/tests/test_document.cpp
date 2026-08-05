@@ -4099,6 +4099,40 @@ TEST_CASE("validate: unknown ref slot names every accepted slot") {
               std::string::npos);
     }
 
+    // The 2026-08-04 holster run authored this geometry as params.profile. The MCP
+    // ref-slot migration then moved the globally ref-shaped key into refs.profile
+    // before validation, losing the source-container provenance. The validator must
+    // therefore name the slot neutrally and teach the canonical geometry container.
+    {
+        json sketch =
+            json{{"id", "f1"}, {"type", "sketch"}, {"name", "HolsterOutline"},
+                 {"suppressed", false},
+                 {"params",
+                  {{"profile",
+                    json::array({
+                        {{"kind", "line"}, {"from", {-6, 0}}, {"to", {132, 0}}},
+                        {{"kind", "line"}, {"from", {132, 0}}, {"to", {132, 95}}},
+                    })},
+                   {"constraints", json::array()}}},
+                 {"refs", {{"plane", "plane.top"}}}};
+        REQUIRE(sketch.at("params").contains("profile"));
+        sketch["refs"]["profile"] = sketch["params"]["profile"];
+        sketch["params"].erase("profile");
+
+        const std::vector<std::string> errs =
+            chudware::doc::validate_document(canon_doc(json::array({sketch})));
+        const std::string e = find_err(errs, "unknown ref slot");
+        REQUIRE_MESSAGE(!e.empty(), "params.profile geometry must get a teaching rejection");
+        for (const auto& x : errs) MESSAGE("  " << x);
+        CHECK(e ==
+              "features[0](f1): unknown ref slot for sketch ('profile') — "
+              "sketch accepts refs: plane, offset; sketch entity geometry belongs in "
+              "params.entities, e.g. "
+              "{\"type\":\"line\",\"p1\":[0,0],\"p2\":[10,0]}");
+        CHECK(e.find(".refs.profile") == std::string::npos);
+        CHECK(e.find("params.entities") != std::string::npos);
+    }
+
     // A feature with NO ref slots says so explicitly instead of listing nothing.
     {
         json canon = canon_doc(json::array({

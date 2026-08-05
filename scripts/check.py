@@ -6,8 +6,8 @@ non-zero if any fail. One command for pre-commit / CI.
 
 Gates (all stdlib-only — they parse source/docs, so they need NO engine/OCCT deps and run fast):
   - gui_lint icons+theme  : icon names exist in the atlas; no applyTheme(.,1.0f) HiDPI-collapse bug.
-                            (The heuristic `scale` rule ratchets separately via a baseline — see
-                            docs/TESTING_STANDARDS.md — and is NOT part of this gate.)
+                            (The heuristic `scale` rule is a manual ratchet against
+                            scripts/gui_lint_baseline.json; it is not wired into any gate.)
   - feature_surface_audit : every visible ribbon command routes to a real handler (no dead buttons).
   - parity_audit          : every machine-checkable SW_PARITY_SPEC done/beyond claim resolves to real
                             code (no spec<->code drift).

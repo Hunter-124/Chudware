@@ -132,6 +132,10 @@ bool& assistantThoughtsVisible();
 int  loadMaxSubagentDepth();
 void saveMaxSubagentDepth(int depth);
 
+// agent.subagent_tool_call_budget in config.json (0–64). 0 derives it from the token grant.
+int  loadSubagentToolCallBudget();
+void saveSubagentToolCallBudget(int budget);
+
 // Persist the active document's conversations (the active one synced from state.chat) to
 // %APPDATA%/Chudware/chat_history.json. Safe to call any time; no-op if nothing to save.
 void persistChatHistory(AppState& state);

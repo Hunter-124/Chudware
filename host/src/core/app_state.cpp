@@ -556,7 +556,6 @@ void loadSettings(Settings& s) {
             if (cm < 0 || cm > 5) cm = 0;
             s.copilotMode = cm;
         }
-        s.maxIters = j.value("max_iters", 0);
         s.maxTokens = j.value("max_output_tokens", 0);
         s.contextWindow = j.value("context_window", 0);
         s.systemPrompt = j.value("system_prompt", "");
@@ -778,7 +777,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // after the user clears them or switches provider. Unknown top-level keys survive untouched.
     // "keys" / "experimental" are re-emitted via merge-overlay (not a full replace).
     for (const char* k : {"provider", "model", "api_key", "openai", "llamacpp", "freellmapi",
-                          "keys", "reasoning_effort", "max_iters", "max_output_tokens",
+                          "keys", "reasoning_effort", "max_output_tokens",
                           "context_window", "system_prompt", "appearance", "workspace_dir",
                           "hidden_models", "disabled_providers", "experimental"})
         j.erase(k);
@@ -936,7 +935,6 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         if (cm < 0 || cm > 5) cm = 0;
         j["copilot_mode"] = kModeNames[cm];
     }
-    if (s.maxIters > 0) j["max_iters"] = s.maxIters;
     if (s.maxTokens > 0) j["max_output_tokens"] = s.maxTokens;
     if (s.contextWindow > 0) j["context_window"] = s.contextWindow;
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;

@@ -1032,6 +1032,39 @@ void saveMaxSubagentDepth(int depth) {
     });
 }
 
+int loadSubagentToolCallBudget() {
+    // agent.subagent_tool_call_budget is a soft convergence warning for delegated subagents.
+    // Default 0 lets the harness derive today's 4-16 call range from each token grant; the
+    // 0-64 GUI range preserves automatic behavior while leaving deliberate manual headroom.
+    int budget = 0;
+    try {
+        std::ifstream in(configPath());
+        if (in) {
+            nlohmann::json j;
+            in >> j;
+            if (j.is_object()) {
+                auto agent = j.value("agent", nlohmann::json::object());
+                if (agent.is_object() && agent.contains("subagent_tool_call_budget") &&
+                    agent["subagent_tool_call_budget"].is_number_integer()) {
+                    budget = agent["subagent_tool_call_budget"].get<int>();
+                }
+            }
+        }
+    } catch (...) {}
+    if (budget < 0) budget = 0;
+    if (budget > 64) budget = 64;
+    return budget;
+}
+void saveSubagentToolCallBudget(int budget) {
+    if (budget < 0) budget = 0;
+    if (budget > 64) budget = 64;
+    updateConfigJson([&](nlohmann::json& j) {
+        if (!j.contains("agent") || !j["agent"].is_object())
+            j["agent"] = nlohmann::json::object();
+        j["agent"]["subagent_tool_call_budget"] = budget;
+    });
+}
+
 void drawAISettingsBody(AppState& st, bool busy) {
     Settings& s = st.settings;
     const auto& pal = ui::palette;
@@ -1155,20 +1188,6 @@ void drawAISettingsBody(AppState& st, bool busy) {
     popField();
 
     cpMenuSection("Limits");
-    // Both limit sliders get the SAME chrome (rounding, full width, unit inside the value): the
-    // cap used to render as a left-edge grab and the nesting one as a centred filled pill purely
-    // because their ranges and formats differed. 0 passes stays the "agent decides" sentinel and
-    // spells itself out rather than showing a bare 0.
-    cpMenuLabel("Refine-pass cap");
-    ImGui::SetNextItemWidth(-1);
-    pushField();
-    int iters = s.maxIters;
-    if (ImGui::SliderInt("##q_miters", &iters, 0, 64, iters == 0 ? "automatic" : "%d passes")) {
-        s.maxIters = (iters < 0) ? 0 : iters;
-        changed = true;
-    }
-    popField();
-    ctlGap();
 
     static int s_maxDepth = -1;
     if (s_maxDepth < 0) s_maxDepth = loadMaxSubagentDepth();

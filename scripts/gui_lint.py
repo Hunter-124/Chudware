@@ -6,12 +6,9 @@ exact bug classes the 2026-06 GUI audit found, so they cannot silently ship agai
 backlog can be cleared (and kept clear) deterministically:
 
   rule=icons  every getIcon/treeIcon/asmIcon/hasIcon/huBtn("name") and every ribbon_def.cpp row icon
-              field (host/src) must name an icon in host/assets/icons/atlas.json.
-              NOTE: the Liquid Glass v2 N3 SDF icon pipeline (icons::draw/inlineIcon/drawGlass)
-              was part of ui/imgui, which is retired (see docs/PORT_LEDGER.md). That branch of
-              this rule is now dead and will be removed when host/ adopts its own SDF pipeline.
-              This is the bug that rendered the PM OK/Cancel buttons as a magenta "?": names
-              'ok'/'cancel' that the atlas never had.
+              field (host/src) must name an icon in assets/icons/atlas.json. This is the bug that
+              rendered the PM OK/Cancel buttons as a magenta "?": names 'ok'/'cancel' that the
+              atlas never had.
   rule=theme  flags applyTheme(..., 1.0f) literal scale (collapses padding to 100% on HiDPI and
               clobbers ui::uiScale) and any io.FontGlobalScale assignment (runtime font blur).
   rule=scale  flags raw pixel literals passed to ImGui geometry calls that are NOT multiplied by a
@@ -41,47 +38,13 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ATLAS = os.path.join(REPO, "assets", "icons", "atlas.json")  # T-G11 de-dup: icons moved host/assets -> shared assets/
-DEFAULT_ROOTS = [os.path.join(REPO, "ui", "imgui", "src")]  # T-G11: host/ deleted; lint the live tree
-
-# ui/imgui (Liquid Glass v2) icon pipeline — separate atlas + namespaced call forms (contract §3).
-UI_ATLAS = os.path.join(REPO, "ui", "imgui", "resources", "icons", "atlas.json")
-UI_IMGUI_ROOT = os.path.join(REPO, "ui", "imgui", "src")
-
-# Hand-drawn glyph names rendered by icons::drawGlyph() (ui/imgui/src/theme/icons.cpp) — these
-# never appear in atlas.json but are valid icons::draw()/drawGlass() names. Keep in sync manually.
-ICONS_HAND_DRAWN = {
-    "ok_check", "success", "cancel_x", "win_close", "failure", "tab_close",
-    "win_min", "win_max", "win_restore", "menu", "search", "rail_search",
-    "tab_add", "plus", "chevron_down", "expand", "agent_send", "agent_stop",
-    "agent", "sparkles", "thinking", "running", "action",
-}
-
-# Alias names accepted by icons::draw()/drawGlass() via resolveAtlasName()'s aliasMap()
-# (ui/imgui/src/theme/icons.cpp) — the LHS "friendly" name resolves to a different atlas cell.
-# Keep in sync manually.
-ICONS_ALIAS_NAMES = {
-    "extrude", "revolve", "hole", "coil", "pattern_linear", "pattern_circular",
-    "prim_box", "prim_cylinder", "prim_sphere", "prim_cone",
-    "analyze_thickness", "analyze_draft", "analyze_curvature",
-    "sk_line", "sk_rect", "sk_circle", "sk_arc", "sk_polygon", "sk_slot", "sk_spline",
-    "sk_ellipse", "sk_point", "sk_text", "sk_trim", "sk_extend", "sk_offset", "sk_convert",
-    "sk_construction",
-    "ws_sketch", "ws_model", "ws_assemble", "ws_simulate", "ws_draft", "ws_schematic",
-    "ws_board", "ws_sheetmetal", "ws_weldment", "ws_surface",
-    "sim_static", "sim_modal", "sim_flow", "sim_thermal", "sim_fatigue",
-    "std_parts", "dwg_view", "dwg_projected", "dwg_section", "dwg_detail",
-    "gdt", "datum", "balloon", "note", "title_block",
-    "sch_symbol", "sch_wire", "net_label", "power_port", "pcb_route", "via", "copper_zone",
-    "autoroute", "drc", "gerber", "board_3d", "ai_design",
-    "file_part", "file_assembly", "file_drawing", "file_schematic", "file_pcb", "folder",
-    "rail_tree", "rail_bodies", "rail_files", "rail_configs",
-}
-
-# Icon-name literal violations pre-dating this lint extension, kept green with a TODO rather than
-# failing the gate (contract §3). Empty for now — add {"rel/path.cpp:line"} entries here if a
-# future scan surfaces a pre-existing bad name; see finding text for the exact key to add.
-# TODO(icons-lint): populate if/when a legitimate pre-existing violation is found.
-ICONS_UI_ALLOWLIST: set[str] = set()
+DEFAULT_ROOTS = [
+    os.path.join(REPO, "host", "src"),
+    os.path.join(REPO, "ui", "viewport"),
+]
+# Keep unscoped runs on the production GUI trees: the retired ui/imgui root made iter_source_files()
+# yield nothing, so both scripts/check.py GUI gates stayed green without opening a source file.
+DEFAULT_BASELINE = os.path.join(REPO, "scripts", "gui_lint_baseline.json")
 
 # ---- helpers --------------------------------------------------------------------------------------
 
@@ -216,17 +179,9 @@ RIBBON_ROW_RE = re.compile(r'^\s*\{\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*"([^"]*)"\s*,'
 APPLY_THEME_RE = re.compile(r'applyTheme\s*\([^,]+,\s*1(?:\.0*)?f?\s*\)')
 FONT_GLOBAL_RE = re.compile(r'FontGlobalScale\s*=')
 
-# Liquid Glass v2 N3 icon call forms (was ui/imgui; that tree is retired — is_ui_imgui is now
-# always False so these are dead; kept for reference until host/ adopts the SDF icon pipeline).
-# See extract_call_args() for paren-balanced arg extraction; icon name is the first quoted literal.
-UI_ICON_FUNCS = ("icons::draw", "icons::inlineIcon", "icons::drawGlass")
-FIRST_STR_RE = re.compile(r'"([^"]*)"')
-
-
-def lint_file(path: str, atlas: set[str], ui_names: set[str], rules: set[str], findings: list):
+def lint_file(path: str, atlas: set[str], rules: set[str], findings: list):
     rel = os.path.relpath(path, REPO).replace(os.sep, "/")
     is_ribbon_def = rel.endswith("ribbon_def.cpp")
-    is_ui_imgui = False  # ui/imgui retired (docs/PORT_LEDGER.md) — SDF icon path is dead
     # World-space / base-style files report scale findings under the non-gating "scale-ws" rule.
     scale_rule = "scale-ws" if rel in SCALE_WORLDSPACE_FILES else "scale"
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -237,36 +192,18 @@ def lint_file(path: str, atlas: set[str], ui_names: set[str], rules: set[str], f
         suppressed = bool(SUPPRESS_RE.search(line))
 
         if "icons" in rules:
-            if is_ui_imgui:
-                # Liquid Glass v2 N3: icons::draw/inlineIcon/drawGlass against the ui/imgui atlas
-                # union hand-drawn glyphs union alias names (NOT the legacy host atlas — a
-                # different, unrelated icon set lives at the same free-function names here, e.g.
-                # ui::getIcon/treeIcon/asmIcon, which this rule intentionally does not re-validate;
-                # contract §3 scopes the new check to icons::draw/inlineIcon/drawGlass only).
-                for func in UI_ICON_FUNCS:
-                    for args in extract_call_args(code, func):
-                        sm = FIRST_STR_RE.search(args)
-                        if not sm:
-                            continue
-                        name = sm.group(1)
-                        key = f"{rel}:{n}"
-                        if name and name not in ui_names and key not in ICONS_UI_ALLOWLIST:
-                            findings.append((rel, n, "icons",
-                                             f'icon "{name}" not in SDF icon atlas '
-                                             f'\u222a hand-drawn \u222a alias names', line.strip()))
-            else:
-                for m in ICON_CALL_RE.finditer(code):
-                    name = m.group(1)
+            for m in ICON_CALL_RE.finditer(code):
+                name = m.group(1)
+                if name and name not in atlas:
+                    findings.append((rel, n, "icons", f'icon "{name}" not in atlas.json',
+                                     line.strip()))
+            if is_ribbon_def:
+                rm = RIBBON_ROW_RE.match(code)
+                if rm:
+                    name = rm.group(1)
                     if name and name not in atlas:
-                        findings.append((rel, n, "icons", f'icon "{name}" not in atlas.json',
-                                         line.strip()))
-                if is_ribbon_def:
-                    rm = RIBBON_ROW_RE.match(code)
-                    if rm:
-                        name = rm.group(1)
-                        if name and name not in atlas:
-                            findings.append((rel, n, "icons",
-                                             f'ribbon row icon "{name}" not in atlas.json', line.strip()))
+                        findings.append((rel, n, "icons",
+                                         f'ribbon row icon "{name}" not in atlas.json', line.strip()))
 
         if "theme" in rules and not suppressed:
             if APPLY_THEME_RE.search(code):
@@ -321,7 +258,10 @@ def main(argv) -> int:
     ap.add_argument("roots", nargs="*", default=None)
     ap.add_argument("--rule", default="all", choices=["all", "icons", "theme", "scale"])
     ap.add_argument("--report", default="text", choices=["text", "md"])
-    ap.add_argument("--baseline", default=None, help="JSON baseline to ignore known findings")
+    ap.add_argument("--baseline", default=DEFAULT_BASELINE,
+                    help="JSON baseline to ignore known findings (default: %(default)s)")
+    ap.add_argument("--no-baseline", action="store_true",
+                    help="ignore --baseline and show every finding")
     ap.add_argument("--update-baseline", default=None, help="write current findings as baseline")
     args = ap.parse_args(argv)
 
@@ -329,9 +269,6 @@ def main(argv) -> int:
         print(f"gui_lint: atlas not found at {ATLAS}", file=sys.stderr)
         return 2
     atlas = load_atlas_names(ATLAS)
-    ui_names: set[str] = set()
-    if os.path.exists(UI_ATLAS):
-        ui_names = load_atlas_names(UI_ATLAS) | ICONS_HAND_DRAWN | ICONS_ALIAS_NAMES
     rules = {"icons", "theme", "scale"} if args.rule == "all" else {args.rule}
 
     explicit_roots = bool(args.roots)
@@ -339,9 +276,7 @@ def main(argv) -> int:
 
     findings: list = []
     for path in iter_source_files(roots):
-        lint_file(path, atlas, ui_names, rules, findings)
-    # TODO: ui/imgui SDF icon scan (Liquid Glass v2 N3) was here; ui/imgui is retired.
-    # Re-add when host/ adopts the SDF icon pipeline (docs/PORT_LEDGER.md).
+        lint_file(path, atlas, rules, findings)
     findings.sort(key=lambda f: (f[2], f[0], f[1]))
 
     if args.update_baseline:
@@ -351,7 +286,7 @@ def main(argv) -> int:
         print(f"gui_lint: wrote baseline with {len(keys)} keys -> {args.update_baseline}")
         return 0
 
-    baseline = load_baseline(args.baseline)
+    baseline = None if args.no_baseline else load_baseline(args.baseline)
     if baseline is not None:
         findings = [f for f in findings if finding_key(f) not in baseline]
 

@@ -2,6 +2,7 @@
 // Prompts / Agent / Experimental tabs) and the About modal.
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -200,10 +201,11 @@ static void helpMarker(const char* desc) {
 }
 // Match chatCopyContext's proven row treatment: Selectable owns input/focus/close semantics,
 // while its header colors stay transparent and the current window draw list paints the wash
-// after the item. Popup rows use a stable label-width fallback because an auto-sizing combo
-// reports a tiny window width on its measuring frame.
-static bool settingsManualRowSelectable(const char* label, bool selected, float height,
-                                        bool popupRow) {
+// after the item. Popup rows are sized only to the pinned popup interior so a long label can
+// never make the popup grow on its next auto-fit frame.
+static bool settingsManualRowSelectable(
+    const char* label, bool selected, float height, bool popupRow,
+    ImDrawFlags cornerRound = ImDrawFlags_RoundCornersNone) {
     const ImGuiStyle& style = ImGui::GetStyle();
     const ImVec2 windowPos = ImGui::GetWindowPos();
     const float windowWidth = ImGui::GetWindowWidth();
@@ -211,10 +213,7 @@ static bool settingsManualRowSelectable(const char* label, bool selected, float 
     const ImVec2 rowPos = ImGui::GetCursorScreenPos();
     float rowWidth = 0.0f;
     if (popupRow) {
-        const float textWidth = ImGui::CalcTextSize(label).x + 2.0f * style.FramePadding.x;
-        const float widthToInnerRight =
-            windowPos.x + windowWidth - border - rowPos.x;
-        rowWidth = ImMax(widthToInnerRight, textWidth);
+        rowWidth = ImMax(0.0f, windowPos.x + windowWidth - border - rowPos.x);
     }
 
     ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
@@ -231,14 +230,16 @@ static bool settingsManualRowSelectable(const char* label, bool selected, float 
             ImVec2(windowPos.x + border, rowPos.y),
             ImVec2(windowPos.x + windowWidth - border, rowPos.y + rowHeight),
             ImGui::GetColorU32(ImVec4(ui::palette.accent[0], ui::palette.accent[1],
-                                     ui::palette.accent[2], 0.30f)));
+                                     ui::palette.accent[2], 0.30f)),
+            style.PopupRounding, cornerRound);
     }
     return clicked;
 }
 
-static bool settingsPopupRowSelectable(const char* label, bool selected,
-                                       float height = 0.0f) {
-    return settingsManualRowSelectable(label, selected, height, true);
+static bool settingsPopupRowSelectable(
+    const char* label, bool selected, float height = 0.0f,
+    ImDrawFlags cornerRound = ImDrawFlags_RoundCornersNone) {
+    return settingsManualRowSelectable(label, selected, height, true, cornerRound);
 }
 
 static bool settingsChildRowSelectable(const char* label, bool selected,
@@ -246,19 +247,56 @@ static bool settingsChildRowSelectable(const char* label, bool selected,
     return settingsManualRowSelectable(label, selected, height, false);
 }
 
+static float settingsWidestComboLabel(const char* const* labels, int count) {
+    float widest = 0.0f;
+    for (int i = 0; i < count; ++i)
+        widest = ImMax(widest, ImGui::CalcTextSize(labels[i]).x);
+    return widest;
+}
+
+static bool settingsBeginPopupRowCombo(
+    const char* id, const char* preview, float widestLabel,
+    ImGuiComboFlags flags = ImGuiComboFlags_None) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float requestedWidth = ImGui::CalcItemWidth();
+    // A stretched table cell can leave almost no width after an inline label/help chip.
+    // Clamp both the closed box and popup to the widest label plus frame padding; otherwise
+    // pin min == max, following the model-picker precedent in copilot/composer.cpp.
+    const float width = ImMax(requestedWidth, widestLabel + 2.0f * style.FramePadding.x);
+    ImGui::SetNextItemWidth(width);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0.0f), ImVec2(width, FLT_MAX));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 6.0f * ui::uiScale);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
+    // Nonzero popup padding is dead space the edge-to-edge row wash cannot paint over.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    if (ImGui::BeginCombo(id, preview, flags)) return true;
+    ImGui::PopStyleVar(4);
+    return false;
+}
+
+static void settingsEndPopupRowCombo() {
+    ImGui::EndCombo();
+    ImGui::PopStyleVar(4);
+}
+
 static bool settingsPopupRowCombo(const char* id, int* current,
                                   const char* const* labels, int count) {
     bool changed = false;
-    if (ImGui::BeginCombo(id, labels[*current])) {
+    if (settingsBeginPopupRowCombo(id, labels[*current],
+                                   settingsWidestComboLabel(labels, count))) {
         for (int i = 0; i < count; ++i) {
             const bool selected = (i == *current);
-            if (settingsPopupRowSelectable(labels[i], selected)) {
+            ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
+            if (i == 0) corners |= ImDrawFlags_RoundCornersTop;
+            if (i == count - 1) corners |= ImDrawFlags_RoundCornersBottom;
+            if (settingsPopupRowSelectable(labels[i], selected, 0.0f, corners)) {
                 *current = i;
                 changed = true;
             }
             if (selected) ImGui::SetItemDefaultFocus();
         }
-        ImGui::EndCombo();
+        settingsEndPopupRowCombo();
     }
     return changed;
 }
@@ -1909,22 +1947,45 @@ static void drawOmpProviderManager(AppState& st) {
         for (const auto& r : s_omp.rows)
             if (r.id == s_omp.selectedId) { preview = r.label; break; }
         ImGui::SetNextItemWidth(-1);
-        if (ImGui::BeginCombo("##omp_prov_pick", preview.c_str())) {
-            for (const auto* rp : filteredRows) {
-                const OmpProviderRow& r = *rp;
+        const float badgeSide = ImGui::GetFontSize() * 1.1f;
+        float widestProviderRow = 0.0f;
+        for (const auto* rp : filteredRows) {
+            const float labelWidth = ImGui::CalcTextSize(rp->label.c_str()).x;
+            const float statusWidth = ImGui::CalcTextSize(ompStateLabel(*rp)).x;
+            widestProviderRow = ImMax(widestProviderRow,
+                badgeSide + 10.0f * sc + labelWidth + statusWidth);
+        }
+        if (settingsBeginPopupRowCombo("##omp_prov_pick", preview.c_str(),
+                                       widestProviderRow)) {
+            for (int i = 0; i < (int)filteredRows.size(); ++i) {
+                const OmpProviderRow& r = *filteredRows[i];
                 ImGui::PushID(r.id.c_str());
-                const float badgeSide = ImGui::GetFontSize() * 1.1f;
-                ui::drawProviderLogo(ImGui::GetWindowDrawList(), ImGui::GetCursorScreenPos(),
-                                     badgeSide, r.id);
-                ImGui::Dummy(ImVec2(badgeSide, badgeSide));
-                ImGui::SameLine(0, 4.0f * sc);
-                if (ImGui::Selectable(r.label.c_str(), r.id == s_omp.selectedId))
+                ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
+                if (i == 0) corners |= ImDrawFlags_RoundCornersTop;
+                if (i == (int)filteredRows.size() - 1)
+                    corners |= ImDrawFlags_RoundCornersBottom;
+                const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+                const float rowHeight = ImMax(ImGui::GetFrameHeight(), badgeSide);
+                if (settingsPopupRowSelectable("##provider_row",
+                                               r.id == s_omp.selectedId,
+                                               rowHeight, corners))
                     s_omp.selectedId = r.id;
+
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const float textY =
+                    rowPos.y + (rowHeight - ImGui::GetTextLineHeight()) * 0.5f;
+                const ImVec2 badgePos(
+                    rowPos.x + ImGui::GetStyle().FramePadding.x,
+                    rowPos.y + (rowHeight - badgeSide) * 0.5f);
+                ui::drawProviderLogo(dl, badgePos, badgeSide, r.id);
+                const float labelX = badgePos.x + badgeSide + 4.0f * sc;
+                dl->AddText(ImVec2(labelX, textY), ImGui::GetColorU32(ImGuiCol_Text),
+                            r.label.c_str());
                 const float* c = ompStateColor(r.state);
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
-                ImGui::TextUnformatted(ompStateLabel(r));
-                ImGui::PopStyleColor();
+                dl->AddText(
+                    ImVec2(labelX + ImGui::CalcTextSize(r.label.c_str()).x + 6.0f * sc, textY),
+                    ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], 1.0f)),
+                    ompStateLabel(r));
                 ImGui::PopID();
             }
             if (filteredRows.empty()) {
@@ -1932,7 +1993,7 @@ static void drawOmpProviderManager(AppState& st) {
                 ImGui::TextUnformatted("No providers match your search.");
                 ImGui::PopStyleColor();
             }
-            ImGui::EndCombo();
+            settingsEndPopupRowCombo();
         }
     } else {
         // Both halves of the split view share one inner padding — they used to run 8/6 on the
@@ -2749,10 +2810,10 @@ static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
         "C1 smoke",
     };
     ImGui::SetNextItemWidth(220.0f * sc);
-    ImGui::Combo("##bench_src", &s_bench.source, kSources, 3);
+    settingsPopupRowCombo("##bench_src", &s_bench.source, kSources, 3);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(140.0f * sc);
-    ImGui::Combo("##bench_mode", &s_bench.mode, kModes, 2);
+    settingsPopupRowCombo("##bench_mode", &s_bench.mode, kModes, 2);
 
     if (benchSourceIsPaid(st.settings, s_bench.source)) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
@@ -2934,7 +2995,11 @@ static void drawModelRolesSection(AppState& st, float sc) {
             const bool ro = s_roles.rolesRpcMissing || s_roles.rolesSaveInFlight;
             if (ro) ImGui::BeginDisabled();
             ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##role_pick", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+            float widestPick = 0.0f;
+            for (const auto& pick : picks)
+                widestPick = ImMax(widestPick, ImGui::CalcTextSize(pick.label.c_str()).x);
+            if (settingsBeginPopupRowCombo("##role_pick", preview.c_str(), widestPick,
+                                           ImGuiComboFlags_HeightLarge)) {
                 // Type-to-filter — list is already filtered to keyed/signed-in providers.
                 static char s_roleFilt[64] = "";
                 if (ImGui::IsWindowAppearing()) {
@@ -2949,13 +3014,26 @@ static void drawModelRolesSection(AppState& st, float sc) {
                     return s;
                 };
                 const std::string fq = lc(s_roleFilt);
+                auto visible = [&](int pi) {
+                    if (fq.empty()) return true;
+                    const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
+                    return hay.find(fq) != std::string::npos;
+                };
+                int firstVisible = -1;
+                int lastVisible = -1;
                 for (int pi = 0; pi < (int)picks.size(); ++pi) {
-                    if (!fq.empty()) {
-                        const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
-                        if (hay.find(fq) == std::string::npos) continue;
-                    }
+                    if (!visible(pi)) continue;
+                    if (firstVisible < 0) firstVisible = pi;
+                    lastVisible = pi;
+                }
+                for (int pi = 0; pi < (int)picks.size(); ++pi) {
+                    if (!visible(pi)) continue;
                     const bool selected = (pi == sel);
-                    if (settingsPopupRowSelectable(picks[pi].label.c_str(), selected)) {
+                    ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
+                    if (pi == firstVisible) corners |= ImDrawFlags_RoundCornersTop;
+                    if (pi == lastVisible) corners |= ImDrawFlags_RoundCornersBottom;
+                    if (settingsPopupRowSelectable(picks[pi].label.c_str(), selected,
+                                                   0.0f, corners)) {
                         RoleAssign next = a;  // preserve thinking
                         next.mode = picks[pi].mode;
                         if (picks[pi].mode == RoleMode::Fixed) {
@@ -2982,7 +3060,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
                     }
                     if (selected) ImGui::SetItemDefaultFocus();
                 }
-                ImGui::EndCombo();
+                settingsEndPopupRowCombo();
             }
             if (ro) ImGui::EndDisabled();
 
@@ -2996,17 +3074,10 @@ static void drawModelRolesSection(AppState& st, float sc) {
             }
             if (ro) ImGui::BeginDisabled();
             ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##role_think", kThinkLabels[thinkSel])) {
-                for (int ti = 0; ti < 4; ++ti) {
-                    const bool selT = (ti == thinkSel);
-                    if (settingsPopupRowSelectable(kThinkLabels[ti], selT)) {
-                        RoleAssign next = a;
-                        next.thinking = kThinkValues[ti];
-                        setRoleAssign(st, key, next);
-                    }
-                    if (selT) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
+            if (settingsPopupRowCombo("##role_think", &thinkSel, kThinkLabels, 4)) {
+                RoleAssign next = a;
+                next.thinking = kThinkValues[thinkSel];
+                setRoleAssign(st, key, next);
             }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                 if (std::strcmp(key, "default") == 0) {
@@ -3225,7 +3296,11 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
             preview = a.model.empty() ? kRoleModeDefaultLabel : a.model;
     }
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::BeginCombo("##ef_pick", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+    float widestPick = 0.0f;
+    for (const auto& pick : picks)
+        widestPick = ImMax(widestPick, ImGui::CalcTextSize(pick.label.c_str()).x);
+    if (settingsBeginPopupRowCombo("##ef_pick", preview.c_str(), widestPick,
+                                   ImGuiComboFlags_HeightLarge)) {
         static char s_efFilt[64] = "";
         if (ImGui::IsWindowAppearing()) {
             s_efFilt[0] = 0;
@@ -3239,13 +3314,26 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
             return s;
         };
         const std::string fq = lc(s_efFilt);
+        auto visible = [&](int pi) {
+            if (fq.empty()) return true;
+            const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
+            return hay.find(fq) != std::string::npos;
+        };
+        int firstVisible = -1;
+        int lastVisible = -1;
         for (int pi = 0; pi < (int)picks.size(); ++pi) {
-            if (!fq.empty()) {
-                const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
-                if (hay.find(fq) == std::string::npos) continue;
-            }
+            if (!visible(pi)) continue;
+            if (firstVisible < 0) firstVisible = pi;
+            lastVisible = pi;
+        }
+        for (int pi = 0; pi < (int)picks.size(); ++pi) {
+            if (!visible(pi)) continue;
             const bool selected = (pi == sel);
-            if (settingsPopupRowSelectable(picks[pi].label.c_str(), selected)) {
+            ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
+            if (pi == firstVisible) corners |= ImDrawFlags_RoundCornersTop;
+            if (pi == lastVisible) corners |= ImDrawFlags_RoundCornersBottom;
+            if (settingsPopupRowSelectable(picks[pi].label.c_str(), selected,
+                                           0.0f, corners)) {
                 if (picks[pi].mode == RoleMode::Fixed) {
                     a.isDefault = false;
                     a.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
@@ -3261,7 +3349,7 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
             }
             if (selected) ImGui::SetItemDefaultFocus();
         }
-        ImGui::EndCombo();
+        settingsEndPopupRowCombo();
     }
 
     ImGui::TableNextColumn();
@@ -3273,16 +3361,9 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
     }
     if (a.isDefault) ImGui::BeginDisabled();
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::BeginCombo("##ef_think", kThinkLabels[thinkSel])) {
-        for (int ti = 0; ti < 3; ++ti) {
-            const bool selT = (ti == thinkSel);
-            if (settingsPopupRowSelectable(kThinkLabels[ti], selT)) {
-                a.thinking = kThinkValues[ti];
-                saveEngFirmModelsUi();
-            }
-            if (selT) ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
+    if (settingsPopupRowCombo("##ef_think", &thinkSel, kThinkLabels, 3)) {
+        a.thinking = kThinkValues[thinkSel];
+        saveEngFirmModelsUi();
     }
     if (a.isDefault) ImGui::EndDisabled();
 
@@ -3553,7 +3634,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             static const char* kChatDetail[] = {"Simplified", "Normal", "Diagnostic"};
             int detail = ui::chatToolDetail();
             if (detail < 0 || detail > 2) detail = 1;
-            if (ImGui::Combo("##h_chat_detail", &detail, kChatDetail, 3))
+            if (settingsPopupRowCombo("##h_chat_detail", &detail, kChatDetail, 3))
                 ui::setChatToolDetail(detail);
         }
 
@@ -3602,15 +3683,28 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Refine-pass cap");
-        ImGui::SameLine();
-        helpMarker("0 = automatic (stops once the render matches).");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(-1.0f);
-        if (ImGui::SliderInt("##h_miters", &settings.maxIters, 0, 64,
-                             settings.maxIters == 0 ? "automatic" : "%d passes"))
-            changed = true;
+        {
+            static int s_toolCallBudget = -1;
+            if (s_toolCallBudget < 0)
+                s_toolCallBudget = ui::loadSubagentToolCallBudget();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Subagent tool-call budget");
+            ImGui::SameLine();
+            helpMarker("A delegated subagent gets a soft warning to converge at this many "
+                       "tool calls. 0 = automatic based on its token grant. The main chat "
+                       "has no tool-call budget. Saved to config.json "
+                       "agent.subagent_tool_call_budget.");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1.0f);
+            int budget = s_toolCallBudget;
+            if (ImGui::SliderInt("##h_subagent_calls", &budget, 0, 64,
+                                 budget == 0 ? "automatic" : "%d calls")) {
+                if (budget < 0) budget = 0;
+                if (budget > 64) budget = 64;
+                s_toolCallBudget = budget;
+                ui::saveSubagentToolCallBudget(budget);
+            }
+        }
 
         ImGui::TableNextColumn();
         {
@@ -3705,7 +3799,8 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
     ImGui::TextUnformatted("Vision / spatial model");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::Combo("##expvispreset", &vsel, vlabels.data(), (int)vlabels.size()) && vsel > 0 &&
+    if (settingsPopupRowCombo("##expvispreset", &vsel, vlabels.data(),
+                              (int)vlabels.size()) && vsel > 0 &&
         vps[vsel]) {
         const ui::LocalPreset* p = vps[vsel];
         std::strncpy(settings.expVisionModel, p->id.c_str(), sizeof(settings.expVisionModel) - 1);
@@ -3926,7 +4021,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                        "memory. Saved to config.json agent.memory_backend.");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::Combo("##mem_backend", &s_memBackend, kMemBackends, 2))
+            if (settingsPopupRowCombo("##mem_backend", &s_memBackend, kMemBackends, 2))
                 saveAgentConfigValue("memory_backend", s_memBackend == 1 ? "mnemopi" : "sqlite");
         }
         ImGui::TableNextColumn();
@@ -3940,7 +4035,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                        "recap. Writes agent.compaction_strategy + agent.compaction_backend.");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::Combo("##comp_mode", &s_compMode, kCompModes, 5))
+            if (settingsPopupRowCombo("##comp_mode", &s_compMode, kCompModes, 5))
                 saveCompMode(s_compMode);
         }
 
@@ -4016,7 +4111,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             if (s_memBackend != 1) ImGui::BeginDisabled();
-            if (ImGui::Combo("##mem_model", &s_memModel, kMemModels, 2))
+            if (settingsPopupRowCombo("##mem_model", &s_memModel, kMemModels, 2))
                 saveAgentConfigValue("memory_model", s_memModel == 1 ? "local" : "online");
             if (s_memBackend != 1) ImGui::EndDisabled();
         }
@@ -4040,7 +4135,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                        "Full = op tickers, counts, token/latency detail (default).");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::Combo("##ws_verbosity", &s_verbosity, kVerbosity, 3))
+            if (settingsPopupRowCombo("##ws_verbosity", &s_verbosity, kVerbosity, 3))
                 ui::setAiUiVerbosity(s_verbosity);
         }
         ImGui::TableNextColumn();
@@ -5267,9 +5362,9 @@ const SettingsEntry kSettingsEntries[] = {
     { "Proactive advisor",        "AI",           2 },
     { "Project memory",           "AI",           2 },
     { "Memory budget",            "AI",           2 },
-    { "Refine-pass cap",          "AI",           2 },
-    { "Max iters",                "AI",           2 },
-    { "Iteration budget",         "AI",           2 },
+    { "Subagent tool-call budget", "AI",           2 },
+    { "Tool call budget",          "AI",           2 },
+    { "Subagent convergence warning", "AI",        2 },
     { "Eng. Firm budget",         "AI",           2 },
     { "Company budget",           "AI",           2 },
     { "Run behavior",             "AI",           2 },
@@ -5585,7 +5680,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                                     "Regular", "Thick"};
                     int lv = res.glassLevel + 1;  // -1 (auto) .. 3 -> 0 .. 4
                     if (lv < 0 || lv > 4) lv = 0;
-                    if (ImGui::Combo("##glasslevel", &lv, kLevels, 5)) {
+                    if (settingsPopupRowCombo("##glasslevel", &lv, kLevels, 5)) {
                         g.glassLevel = lv - 1;
                         glassChanged = true;
                     }
@@ -6807,7 +6902,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     };
                                     // Map stored -1/0/1 -> combo 0/1/2
                                     int trimSel = (trimMode < 0) ? 0 : (trimMode == 0 ? 1 : 2);
-                                    if (ImGui::Combo("##schema_trim", &trimSel, trimLabels, 3)) {
+                                    if (settingsPopupRowCombo("##schema_trim", &trimSel,
+                                                             trimLabels, 3)) {
                                         s_toolSchemaTrim[tn] =
                                             (trimSel == 0) ? -1 : (trimSel == 1 ? 0 : 1);
                                         s_toolOptDirty = true;

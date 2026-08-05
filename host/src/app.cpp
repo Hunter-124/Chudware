@@ -1471,7 +1471,7 @@ static void wasmApplyMobileLayout(AppState &st, float &scale, bool mobile) {
     scale = mscale;
     st.scale = mscale;
     ui::applyTheme(ui::activeTheme, mscale);
-    ImGui::GetIO().FontGlobalScale = kWasmMobileScaleBump;
+    ImGui::GetIO().FontGlobalScale = kWasmMobileScaleBump;  // gui-lint: allow — wasm mobile only; applyTheme above carries the real HiDPI scale
     // Collapse both pinned columns into their header strips so the 3D surface
     // dominates.
     st.settings.fmCollapsed = true;
@@ -1484,7 +1484,7 @@ static void wasmApplyMobileLayout(AppState &st, float &scale, bool mobile) {
     scale = g_wasmBaseScale;
     st.scale = g_wasmBaseScale;
     ui::applyTheme(ui::activeTheme, g_wasmBaseScale);
-    ImGui::GetIO().FontGlobalScale = 1.0f;
+    ImGui::GetIO().FontGlobalScale = 1.0f;  // gui-lint: allow — wasm mobile only; resets the bump above
     st.showFeatureTree = true;
     st.showAIPanel = true;
     std::fprintf(stderr, "[wasm-mobile] desktop layout restored (scale=%.2f)\n",
@@ -2178,10 +2178,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       scale = mscale;
       st.scale = mscale;
       ui::applyTheme(ui::activeTheme, mscale);
-      ImGui::GetIO().FontGlobalScale = kWasmMobileScaleBump;
+      ImGui::GetIO().FontGlobalScale = kWasmMobileScaleBump;  // gui-lint: allow — wasm mobile only
     } else {
       st.scale = scale;
-      ImGui::GetIO().FontGlobalScale = kWasmMobileScaleBump;
+      ImGui::GetIO().FontGlobalScale = kWasmMobileScaleBump;  // gui-lint: allow — wasm mobile only
     }
   }
 #endif

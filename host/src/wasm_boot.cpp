@@ -149,8 +149,11 @@ bool initImGui() {
     io.IniFilename = nullptr;
 
     const std::string assets = "/assets";
-    ui::applyTheme(ui::Theme::Dark, 1.0f);
-    gFonts = ui::loadFonts(assets, 1.0f);
+    float xScale = 1.0f, yScale = 1.0f;
+    glfwGetWindowContentScale(gWin, &xScale, &yScale);
+    const float scale = xScale > yScale ? xScale : yScale;
+    ui::applyTheme(ui::Theme::Dark, scale);
+    gFonts = ui::loadFonts(assets, scale);
 
     ImGui_ImplGlfw_InitForOpenGL(gWin, true);
     // WebGL2 expects GLSL ES 300; desktop #version 330 core is next-wave shim work.

@@ -136,12 +136,48 @@ judgment).
   build is never counted however many features it takes. Do NOT add describe_part /
   measure_part / render_part to the settlers — models interleave them, and A's limit of 1
   would then cap a normal part at one feature.
-- **One design is one document:** an iteration is a REVISION, never another doc. A version
-  bump (`part_v4`, `-rev2`, `gen3`) RESUMES the series in `new_part` / `new_assembly` /
-  the `add_features` `{"op":"new_part"}` batch head (`_docs_in_version_series` in
-  `services/mcp/cad_common.py`); `fresh=True` is the only escape. Every extra mint costs a
-  tab, a project `.step+`, its own AI-VC chain (keyed by `doc_id`), its own auto-registered
-  vault item (`services/plm/vault.py` rglobs the project on save), and a recovery row.
+- **One design is one document, and its name never carries a version.** An iteration is a
+  REVISION, never another doc. A version bump (`part_v4`, `-rev2`, `gen3`) RESUMES the
+  series in `new_part` / `new_assembly` / the `add_features` `{"op":"new_part"}` batch head
+  (`_docs_in_version_series`); `fresh=True` is the only escape. And since 2026-08-05 the
+  token never reaches a document at all: `cad_common._strip_version_suffix` normalizes the
+  name in all three `doc_new` MINT payloads, so `new_part("holster_v1")` mints `holster`
+  even on a first-ever call and even with `fresh=True`. Two rules bind any change here:
+  the resume/series lookups must keep seeing the RAW requested name, and the strip is
+  SKIPPED when a doc of that EXACT name is already open — that call is the engine's own
+  `resume_if_open` match, which keys on the name verbatim, so stripping there mints a
+  duplicate instead of resuming (pinned by
+  `test_exact_name_match_still_goes_through_the_engine_mint_lock` and two twins).
+  `core/agent/run.cpp`'s `sanitize_part_name` (in `run_stop.cpp`) mirrors the same token
+  set for the mission lane — keep the two in lockstep. Every extra mint costs a tab, a
+  project `.step+`, its own AI-VC chain (keyed by `doc_id`), its own auto-registered vault
+  item (`services/plm/vault.py` rglobs the project on save), and a recovery row.
+- **The main chat has NO tool-call budget** (2026-08-05). It had one — 30 — and it killed a
+  finished build one dispatch before the `plm_checkpoint` the model had composed, then
+  reported the forced stop as `stop_reason=confirmed`. `agent_turn`'s enforcement site
+  branches on `subagent_id is None`: main chat gets only a runaway backstop, subagents get a
+  ONE-SHOT injected soft warning plus a separate hard ceiling. The threshold is
+  config.json `agent.subagent_tool_call_budget` (`0` = derive from the token grant), read by
+  `config.get_subagent_tool_call_budget()`, set by a Settings slider. Do NOT reintroduce a
+  main-chat cap, and do NOT let a forced stop claim success.
+- **Delegated subagents need an explicit `max_tokens`.** `agent_turn`'s default completion
+  cap is 2048; `_run_subagent_turn` omitted the kwarg and every delegate silently inherited
+  it, so a `feature_modeler` burned a 60,000-token grant on two `reply_truncated` turns with
+  zero tool calls. It now passes `LINEAR_ROLE_MAX_OUTPUT_TOKENS` like the parent lane.
+  `services/dag/node_runner.py` still reaches the 2048 default when no tier profile exists.
+- **`plm_item_add` is for NON-design files only.** `.step+`/`.ecad+` are auto-registered by
+  `vault._explode_project_into_shadow` on every save/checkpoint, so `Vault.add_item` can
+  never succeed on one — that rejection now runs FIRST and points at `plm_checkpoint`. Its
+  `path` is the PROJECT ROOT (unlike every sibling tool, where `path` is the target); the
+  thing being tracked goes in `file_path`/`folder_path`. Role cards must not tell a model to
+  register "what you changed" without that carve-out; that phrasing cost four dead calls.
+- **The agent's in-process doc ops publish** (2026-08-05). `core/agent/run.cpp` calls
+  `doc::doc_new`/`doc::doc_apply_ops` directly, bypassing `Server::dispatch` and therefore
+  `DocRegistry` — so nothing it built was visible to any client until the run ended. Every
+  such call site now invokes the `chudware_set_doc_publish_sink` callback (armed by
+  `Server::dispatch` for `agent_*`), which drives the same `registry_.postCall` a socket
+  `doc_new` would. Add a publish call beside any NEW direct doc op you introduce there, or
+  it is invisible again. `internal:true` must keep propagating (preflight shadow clone).
 - **config.json keys:** `saveSettings` merge-overlays `keys`/`experimental` — never
   full-replace them (harness `keys.openrouter` must survive a GUI save).
 - **agent_turn edits:** standing mega-24 offline planning-node repro gate

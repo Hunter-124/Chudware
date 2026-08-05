@@ -6493,3 +6493,97 @@ returns comments, docstrings and tests only. The mission-terminal vocabulary
 C++ never reimplemented it — `core/agent/machine.cpp` treats only pass/fail/skip/cancelled
 as terminal. Whoever owns mission terminals should decide whether that classification comes
 back in C++ or is retired from the docs; it is currently asserted on neither side.
+## 2026-08-05 — a revision is not a name, a budget is not a leash, a lint that read nothing
+
+Second pass on run `run-12211675717239` (`ruger_lcp380_iwb_holster`), driven by the
+event log rather than the GUI cards. Six defects, three commits: `5841479e` (Python
+harness), `a462d93f` (core/hostd), `ae965af5` (GUI + scripts).
+
+**Version tokens never reach a document name.** The 2026-08-05 series-resume work made
+an ITERATION resume, but nothing stopped the model coining `holster_v1` on the very
+first call — and that string became the tab title, the project `.step+` filename and,
+through `vault.py`'s rglob auto-registration, the PLM item path. New
+`cad_common._strip_version_suffix` (the series base, else the name) now normalizes the
+payload of all three `doc_new` mint sites: `new_part`, the `add_features`
+`{"op":"new_part"}` head, `new_assembly`. The resume/series lookups still see the RAW
+requested name, and the strip is SKIPPED when a document of that exact name is already
+open — that call is the engine's own `resume_if_open` match and it keys on the name
+verbatim, so stripping there hands `doc_new` a name nothing is open under and the
+"resume" mints a duplicate. `test_exact_name_match_still_goes_through_the_engine_mint_lock`
+caught that in the full suite before it shipped; two twins now cover the batch head and
+`new_assembly`. `core/agent/run.cpp`'s `sanitize_part_name` (the mission lane's own,
+independent naming surface) mirrors the same rule token for token — it moved to
+`run_stop.cpp` so `test_agent` can link it without pulling `doc::`/OCCT. Accepted cost,
+documented at both definitions: `Intake_Manifold_V8` normalizes to `Intake_Manifold`. A
+second, divergent definition of "version token" would be worse.
+
+**`plm_item_add` was a four-call dead end.** Its `path` is the PROJECT ROOT while every
+sibling tool's `path` is the target; `kind` had no synonym for `doc_type`; each error
+revealed only the next problem; and once the shape was finally right, `Vault.add_item`
+hard-blocks `.step+`/`.ecad+` because `_explode_project_into_shadow` auto-registers
+containers on every save — a call that could never succeed, checked LAST. Now: the
+container rejection runs FIRST and names `plm_checkpoint`, a file passed as `path` gets a
+hint quoting the whole corrected call, re-registering an already-tracked non-container is
+idempotent (`already_tracked`), `kind`→`doc_type` is in `TOOL_ARG_SYNONYMS`, and both
+`general_agent.yaml` and `project_organizer.yaml` stop telling the model to register
+design docs by hand. The per-tool `prompt_note` had been correct all along; the role card
+outranked it.
+
+**Main chat has no tool-call budget.** `LINEAR_ROLE_MAX_TOOL_CALLS = 30` hard-broke the
+loop at `agent_turn.py`'s single enforcement site, one dispatch before the
+`plm_checkpoint` the model had already composed, and the salvage block returned
+`stop_reason=confirmed` for that forced stop — a fabricated success. Main chat
+(`subagent_id is None`) now has only a runaway backstop; the budget is a SUBAGENT soft
+warning, injected once through the same nudge idiom the loop already uses for half a
+dozen other conditions, with a separate hard ceiling. Configurable: config.json
+`agent.subagent_tool_call_budget`, `0` = derive from the token grant, read by
+`config.get_subagent_tool_call_budget()` and surfaced by a Settings slider that replaced
+the dead `max_iters` knob (a GUI control persisting a key no Python has ever read).
+Forced stops report honestly.
+
+**Delegated subagents were truncating at 2048 tokens.** `_run_subagent_turn` never passed
+`max_tokens=`, so every delegate fell to `agent_turn`'s hardcoded default — the
+`feature_modeler` in this run burned its whole 60,000-token grant on two `reply_truncated`
+turns with ZERO tool calls, then the parent did the entire build itself under its own
+30-call ceiling. The parent lane got `LINEAR_ROLE_MAX_OUTPUT_TOKENS = 8192` on 2026-07-28;
+the delegate path never did. It does now. Highest-severity item in the autopsy by wasted
+budget.
+
+**The agent's documents now exist before its first feature.** `core/agent/run.cpp` mints
+and mutates with direct in-process `doc::doc_new`/`doc::doc_apply_ops` calls that never
+re-enter `Server::dispatch`, so `DocRegistry` never saw them: `postCall` fires once, after
+the whole `agent_run_v2` returns. Assemblies, sub-parts and reverse-engineering documents
+did not exist for any client until the run ended, and features landed in one end-of-run
+resync. New `chudware_set_doc_publish_sink` (appended to the C ABI, dlsym'd, missing-symbol
+tolerant) mirrors `chudware_set_event_sink`: `Server::dispatch` arms it for `agent_*`,
+`run.cpp` publishes after each of the 3 `doc_new` and 2 `doc_apply_ops` sites outside the
+per-document lock, and the callback drives the SAME `registry_.postCall` Path A uses.
+`internal:true` propagates, so the preflight shadow clone stays silent. No GUI change was
+needed — `openMirrorTab`/`applyChangedActive` were already gate-free, and an empty document
+already draws its origin planes (`renderer.cpp` `planeQuad`'s `kEmptySceneRadius`
+fallback). **Path A was measured, not assumed**: a real MCP `new_part` against a real
+daemon with a subscribed spectator gave `doc.opened` at mint in 0.7 ms with a revision-0
+snapshot, then `doc.changed` at the first `add_features`. It was left alone.
+
+**Settings drew combos three ways and its lint read zero files.** `ImGui::Combo`,
+hand-rolled `BeginCombo` loops and `settingsPopupRowCombo` coexisted; none called
+`SetNextWindowSizeConstraints`, so popups grew wider than their closed box, and
+`settingsManualRowSelectable`'s `ImMax(widthToInnerRight, textWidth)` could widen them
+further on the next frame. Every combo now goes through one begin/end pair that pins
+min==max width (the composer model-picker pattern), pushes zero popup
+`WindowPadding`/`ItemSpacing` so the wash reaches the edge, and rounds the first/last row
+— the treatment `copilot/ui_common.cpp`'s `chatCopyContext` already had. Zero
+`ImGui::Combo(` calls remain in the file. Separately, `scripts/gui_lint.py`'s
+`DEFAULT_ROOTS` pointed at `ui/imgui/src`, retired and absent: both gui_lint gates in
+`scripts/check.py` had been walking ZERO files and reporting green. They now lint
+`host/src` + `ui/viewport` (279 files), the dead ui/imgui SDF branch is gone, and the
+newly-live theme rule immediately found a real bug (`wasm_boot.cpp` passing a hardcoded
+`1.0f` to `applyTheme` instead of the GLFW content scale). 18 pre-existing icon findings
+are baselined in `scripts/gui_lint_baseline.json`.
+
+**Deferred, not done.** `services/plm/worker_rpc.py` has its own empty-target hint for
+`plm_item_add` that still reads the old way (the `Vault` layer beneath it does carry the
+new container behavior). `agent_turn`'s bare 2048 completion default is still reachable
+from `services/dag/node_runner.py` when no tier profile exists. A `gui_lint --rule scale`
+gate was deliberately NOT wired into `gate.sh`: a new gate starting life with 110
+baselined findings is theater, and the baseline file makes manual runs ratchet anyway.

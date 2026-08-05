@@ -1,9 +1,14 @@
 """mega-3 harness fixes — unit coverage.
 
 Defects (live mega-2-fc-rocket + MegaRun3 gap-2 probe):
-1. phase gate vs DAG progress: specify_incomplete while BUILD/DELIVER done
 2. child_spawns=0: delegate missing from specify/plan/build tools_slot
 3. xAI parallel read-timeout storm: unbounded concurrent complete_ex
+
+Defect 1 of that list, "phase gate vs DAG progress: specify_incomplete while
+BUILD/DELIVER done", is NOT covered here and no longer can be: its subject
+`services/agent/loop.py::_drive_phases_from_dag` was deleted by T-RF5 and nothing
+re-implemented it. The `_drive` helper that monkeypatched it, and the manifest fixture
+only that helper used, were never reached — removed 2026-08-05.
 """
 from __future__ import annotations
 
@@ -12,67 +17,6 @@ import threading
 import time
 
 import pytest
-
-
-# ---------------------------------------------------------------------------
-# 1. Phase gate reconciles with DAG join / downstream progress
-# ---------------------------------------------------------------------------
-
-
-def _valid_manifest():
-    return {
-        "schema": "aicad.deliverables/1",
-        "request": "test part",
-        "deliverables": [
-            {
-                "id": "DL1",
-                "name": "part",
-                "kind": "part",
-                "acceptance_criteria": [
-                    {
-                        "id": "AC1",
-                        "text": "exists",
-                        "check": {"tool": "describe_part", "params": {}},
-                    }
-                ],
-            },
-            {
-                "id": "DL2",
-                "name": "assy",
-                "kind": "assembly",
-                "acceptance_criteria": [
-                    {
-                        "id": "AC2",
-                        "text": "mates",
-                        "check": {"tool": "check_interference", "params": {}},
-                    }
-                ],
-            },
-        ],
-        "ambiguities": [],
-    }
-
-
-def _drive(manifest, graph, dag_result, completed=None):
-    from services.agent import loop
-    from services.agent.pipeline.phases import Phase, PhaseMachine, PipelineFlags
-
-    machine = PhaseMachine(flags=PipelineFlags(org_layer=False))
-    machine.enter(Phase.INTAKE)
-    machine.exit(
-        Phase.INTAKE,
-        machine.run_gate(Phase.INTAKE, {"manifest_findings": []}),
-    )
-    completed = list(completed or ["intake"])
-    events = []
-
-    def _emit(phase, text):
-        events.append((phase.value if hasattr(phase, "value") else phase, text))
-
-    reached, status, stop_reason = loop._drive_phases_from_dag(
-        machine, manifest, graph, dag_result, completed, _emit, Phase, ledger=None
-    )
-    return reached, status, stop_reason, completed, events
 
 
 # ---------------------------------------------------------------------------

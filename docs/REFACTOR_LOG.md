@@ -6472,10 +6472,24 @@ never ran out. Tests in `test_scaffolds.py` include the regression control that 
 six-feature build under A with `describe_part` between every feature is NOT truncated —
 plus A trips on the first re-work, B allows one, C/frontier never trip.
 
-**Dead scaffolding removed.** `test_mega28_terminal.py::_drive` monkeypatched
-`loop._terminal_autosave_close_docs` / `loop._drive_phases_from_dag` (both deleted by
-T-RF5) and was never called — 124 lines that read as coverage for a mechanism nothing
-exercised. The file keeps its one real test, the archived mega-28 fingerprint, and now says
-plainly that the terminal classifier lives in `core/agent/` and needs a ctest. That ctest
-does not exist: `grep -r 'mission_complete\|deliver_partial' core/` returns nothing, so the
-classification contract is currently unasserted on either side.
+**Dead scaffolding removed — four files, not one.** `_drive` helpers monkeypatching
+`loop._drive_phases_from_dag` / `loop._terminal_autosave_close_docs` (both deleted by
+T-RF5) existed in `test_mega28_terminal.py`, `test_mega8_rolesurface.py`,
+`test_mega3_fixes.py` and `test_mega7_fixes.py`. NONE of the four was ever called: 192
+lines that read as coverage for a mechanism nothing exercised, and three of those files
+listed the uncovered item in their own docstring's "Covers …" header. Each docstring now
+says plainly which item is NOT covered and why.
+
+`test_mega21_fixes.py::test_loop_deliver_gate_blocks_zero_mech` went with them, for a worse
+reason: it could not fail. It monkeypatched `mech_deliver_gate` to return
+`allow_deliver=False`, re-implemented the status mapping inside its own body
+(`status = "blocked"`), then asserted `status == "blocked"` — while importing `loop`,
+`PhaseMachine`, a graph, a `dag_result` and a `fake_phase_completion` it never used. The
+real gate is covered three times in the same file plus once in `test_mega22_fixes.py`.
+
+`deliver_partial` now provably has NO producer: `grep -rn deliver_partial services/ core/`
+returns comments, docstrings and tests only. The mission-terminal vocabulary
+(`deliver_partial` / `mission_complete` / `needs_correction`) died with the Python loop and
+C++ never reimplemented it — `core/agent/machine.cpp` treats only pass/fail/skip/cancelled
+as terminal. Whoever owns mission terminals should decide whether that classification comes
+back in C++ or is retired from the docs; it is currently asserted on neither side.

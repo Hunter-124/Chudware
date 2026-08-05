@@ -249,67 +249,17 @@ def test_airframe_ops_cover_brief_dims():
     assert sum(1 for n in names if n and n.startswith("fin_")) >= 3
 
 
-def test_loop_deliver_gate_blocks_zero_mech(monkeypatch):
-    """loop._drive_phases_from_dag path: zero mech → blocked + refusal reason."""
-    from services.agent import agent_turn as at
-    from services.agent import loop as loop_mod
-    from services.agent.pipeline.phases import Phase, PhaseMachine
-
-    at._MECH_FORCE_ONCE.clear()
-    monkeypatch.setenv("CHUDWARE_ADVISOR", "0")
-
-    # Force gate to refuse (simulates force already spent / failed).
-    monkeypatch.setattr(
-        at, "mech_deliver_gate",
-        lambda *a, **k: {
-            "allow_deliver": False,
-            "had_mech": False,
-            "forced": True,
-            "ok": False,
-            "refusal": "mech_leg_missing_after_force: relaunch",
-            "doc_id": None,
-            "calls": [],
-        },
-    )
-
-    machine = PhaseMachine()
-    # Minimal graph already past build with deliver soft-partial.
-    graph = {"nodes": {}}
-    dag_result = {
-        "status": "done",
-        "nodes": {
-            "n_deliver_DL5": {"status": "done", "output": {"ok": True}},
-        },
-    }
-    # Patch phase prefixes walk to treat deliver as soft-complete.
-    led = _FakeLedger(run_id="loop-m21")
-    man = {
-        "deliverables": [{
-            "id": "DL1",
-            "acceptance_criteria": [{"id": "AC1", "check": {"tool": "manual"}}],
-        }],
-    }
-
-    # Directly exercise the terminal block by calling helper via a thin wrap:
-    # inject into _drive_phases_from_dag with all phases complete via monkeypatch.
-    def fake_phase_completion(phase_name, prefixes):
-        if phase_name == "deliver":
-            return True, False, True  # advanced, not reconciled, soft partial
-        return True, False, False
-
-    # Build a minimal driver context by calling the private function pieces.
-    # Instead, call mech_deliver_gate integration through the public path used
-    # at end of _drive_phases_from_dag — unit-test the gate result mapping.
-    status = "done"
-    stop_reason = "deliver_partial"
-    gate = at.mech_deliver_gate(led, run_id="loop-m21", force=True)
-    # With monkeypatched refuse:
-    assert gate["allow_deliver"] is False
-    if not gate.get("allow_deliver"):
-        status = "blocked"
-        stop_reason = gate.get("refusal") or "mech_leg_missing"
-    assert status == "blocked"
-    assert "mech" in stop_reason
+# The mech deliver gate's own contract is covered three times above
+# (test_mech_deliver_gate_fires_on_mega20_ledger / _caps_one_force_then_refuses /
+# _noop_when_mech_present) and once in test_mega22_fixes. A fourth test,
+# `test_loop_deliver_gate_blocks_zero_mech`, claimed to cover the loop's terminal status
+# MAPPING and was removed 2026-08-05: its subject
+# (`services/agent/loop.py::_drive_phases_from_dag`) was deleted by T-RF5, and what it
+# actually asserted was a tautology — it monkeypatched `mech_deliver_gate` to return
+# allow_deliver=False, re-implemented the status mapping inside the test body
+# (`status = "blocked"`), then asserted `status == "blocked"`. It imported `loop`,
+# `PhaseMachine`, a graph, a dag_result and a `fake_phase_completion` and used none of
+# them, so no plausible bug in any product code could have failed it.
 
 
 # ---------------------------------------------------------------------------

@@ -5,8 +5,14 @@ Covers mega-7 TOP-5 items owned by RoleSurface:
   2. Typed-refusal soft gate — free-form ledger_note does NOT satisfy;
      valid {reason, domains_considered, why_flat} does; delegate call does.
   3. Cheap-leaf one-shot envelope — validates, falls back, increments leaf_miss.
-  4. Clean terminal status — soft-join deliver → done|blocked + stop_reason
-     deliver_partial (never running + empty).
+
+Item 4 of that list, "clean terminal status — soft-join deliver → done|blocked +
+stop_reason deliver_partial", is NOT covered here and no longer can be: T-RF5 deleted
+``services/agent/loop.py::_drive_phases_from_dag`` and nothing re-implemented it, so
+``deliver_partial`` has no producer anywhere in the tree (grep services/ core/: comments,
+docstrings and tests only). A ``_drive`` helper here monkeypatched that deleted function
+and was itself never called — removed 2026-08-05 so this file's coverage claim matches
+what it actually asserts.
 """
 from __future__ import annotations
 
@@ -623,45 +629,3 @@ def test_context_pack_and_graph_seed_run_id():
     }
     pack2 = assemble(node2, {"retry_remaining": 1, "run_id": "from-state"})
     assert pack2.get("run_id") == "from-state"
-
-
-# ---------------------------------------------------------------------------
-# 4. Clean terminal status (soft-join deliver)
-# ---------------------------------------------------------------------------
-
-
-def _drive(manifest, graph, dag_result, completed=None):
-    from services.agent import loop
-
-    completed = list(completed or [])
-    events = []
-
-    def _emit(phase, text):
-        events.append((getattr(phase, "value", phase), text))
-
-    class Phase:
-        PLAN = type("P", (), {"value": "plan"})()
-        SPECIFY = type("P", (), {"value": "specify"})()
-        BUILD = type("P", (), {"value": "build"})()
-        VERIFY = type("P", (), {"value": "verify"})()
-        DELIVER = type("P", (), {"value": "deliver"})()
-        CORRECT = type("P", (), {"value": "correct"})()
-
-        def __init__(self, v):
-            self.value = v
-
-        def __eq__(self, other):
-            return getattr(other, "value", other) == self.value
-
-    # Re-bind Phase enum used inside loop to simple stand-ins via the real one.
-    from services.agent.pipeline.phases import Phase as RealPhase
-    from services.agent.pipeline.phases import PhaseMachine
-
-    machine = PhaseMachine()
-    reached, status, stop_reason = loop._drive_phases_from_dag(
-        machine, manifest, graph, dag_result, completed, _emit, RealPhase,
-        ledger=None,
-    )
-    return reached, status, stop_reason, completed, events
-
-

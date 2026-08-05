@@ -1,21 +1,27 @@
 """Mega-7 live harness-fix regressions (Fixer7 = HomelessBadger).
 
 Watch-list from mega-6 findings (owner cycle-7):
-  1. DELIVER phase mortality — deliver_incomplete with partial n_deliver_* done
-     (same soft-join class as specify_incomplete / mega-2–3).
   2. Delegation regression — mega-5: 2 calls, mega-6: 0; role prompts must still
      prefer delegate and children route cheap (not suppress spawn).
   3. new_part empty solids — add_features must follow; thrash ≠ product success.
   4. live cheap-share 0% — mission nodes must stamp task_class so leaf/verify/
      deliver can auto_pick low-rank models at depth 0.
+
+Item 1 of that list, DELIVER-phase soft-join mortality, is NOT covered here and no longer
+can be: its subject `services/agent/loop.py::_drive_phases_from_dag` was deleted by T-RF5
+and nothing re-implemented it, so `deliver_partial` has no producer left in the tree. The
+`_drive` helper that monkeypatched it was never called — removed 2026-08-05. The
+`_valid_manifest` fixture below survives because the task_class test at the bottom of this
+file uses it.
 """
 from __future__ import annotations
 
 import pytest
 
 
+
 # ---------------------------------------------------------------------------
-# 1. DELIVER soft-join (deliver_incomplete class)
+# Shared manifest fixture (used by the task_class stamping test below)
 # ---------------------------------------------------------------------------
 
 
@@ -68,28 +74,6 @@ def _valid_manifest():
             },
         ],
     }
-
-
-def _drive(manifest, graph, dag_result, completed=None):
-    from services.agent import loop
-    from services.agent.pipeline.phases import Phase, PhaseMachine, PipelineFlags
-
-    machine = PhaseMachine(flags=PipelineFlags(org_layer=False))
-    machine.enter(Phase.INTAKE)
-    machine.exit(
-        Phase.INTAKE,
-        machine.run_gate(Phase.INTAKE, {"manifest_findings": []}),
-    )
-    completed = list(completed or ["intake"])
-    events = []
-
-    def _emit(phase, text):
-        events.append((phase.value if hasattr(phase, "value") else phase, text))
-
-    reached, status, stop_reason = loop._drive_phases_from_dag(
-        machine, manifest, graph, dag_result, completed, _emit, Phase, ledger=None
-    )
-    return reached, status, stop_reason, completed, events
 
 
 # ---------------------------------------------------------------------------

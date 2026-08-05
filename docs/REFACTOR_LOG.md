@@ -6587,3 +6587,78 @@ new container behavior). `agent_turn`'s bare 2048 completion default is still re
 from `services/dag/node_runner.py` when no tier profile exists. A `gui_lint --rule scale`
 gate was deliberately NOT wired into `gate.sh`: a new gate starting life with 110
 baselined findings is theater, and the baseline file makes manual runs ratchet anyway.
+
+## 2026-08-05 — second pass: the split thinking box, the discarded stream, and three tail-of-run dead ends
+
+Driven by a live headless replay of the user's exact request (`agent_admin_turn`,
+kimi-code/k3-256k, 539 s, 26 tool calls, `stop=confirmed`) plus the raw 227-record event
+log of the run that failed on his machine. Commits `42d33c75`, `08a82d1c`.
+
+**One reasoning stream rendered as four out-of-order boxes.** `_AssistantDeltaCoalescer`
+held independent `text`/`thinking` tails and drained them only at turn exit, text first,
+so a tail crossed channel switches and non-delta events and glued itself to the NEXT
+completion's opening — the seams `batch them.The user`, `saved file.The harness` and
+`guide.Stop` are in the log verbatim. `core/agent/run.cpp`'s coalescer had drifted into
+the identical bug independently; both now track the active channel, flush on switch,
+drain the active channel first, and NAME EACH OTHER in comments so the mirror is not
+rediscovered a third time. `feed.cpp` compounded it by treating every hidden
+text-channel flush as a visible thinking boundary and by not closing a live thought
+before a context chip. Replaying all 227 records under the corrected rules gives
+context@2, thinking@3-194, context@204, thinking@205-226 — two boxes, split only at the
+one real chip.
+
+**220 deltas then no completion killed a turn.** The user's run streamed 202 thinking +
+18 text deltas and died `provider_error` with nothing salvaged; the same fault reproduced
+headlessly in a delegated child as `omp-bridge kimi-code: endpoint returned no
+completion`. A resample existed but only inspected the FINAL result's text/thinking —
+fragments went to the display sink and were never retained, so paid output was discarded
+even when the predicate fired; and a stream cut before its final response line raised
+`BridgeUnavailable` straight past the loop. `complete_ex` now retains per-attempt
+fragments privately (still forwarding each to the display sink exactly once — the
+display contract that forbids concatenating deltas into the reply is untouched) and
+recovers streamed text, or a validated fenced directive from streamed reasoning, at zero
+extra provider cost. An empty `length` reply carrying `reasoningEffort` retries once
+without the effort; the code had DOCUMENTED that the same call succeeds without it and
+never acted on it. Two-attempt bound unchanged, 400/401/403 still never resampled, and
+an unrecoverable failure now distinguishes "final response contained no text or thinking"
+from "stream ended before the final response line" all the way to the GUI card.
+
+**`delegate` failed with the brief as its own error message.** The spawn had succeeded
+and the child really ran; mission_dispatch merged the failed child result after the spawn
+record with no top-level error, so the model, the GUI and the ledger's ~999-char result
+clip all showed the brief. Success is now explicitly `ok:true`, refusals carry a stable
+`reason`, and a failed child's stop reason and provider detail are promoted into a
+top-level `error` ordered FIRST so it survives the clip.
+
+**Three tail-of-run PLM dead ends, one root cause.** `plm_open()` bare, then
+`plm_item_add(path=<a file>)`, now `plm_checkpoint()` bare — every `plm_*` tool demanded
+a PROJECT ROOT the model has no way to know, at the exact moment a clean build wants to
+record itself. 19 vault-backed tools now default `path` from `CHUDWARE_PROJECT_DIR` →
+`CHUDWARE_FS_ROOT` → `project_context.resolve_project_root()`, explicit argument still
+authoritative, named `project_root_unavailable` when nothing resolves. A released item's
+rejection now quotes the exact recovery call rather than stating a fact with no verb;
+checkpoint deliberately does not auto-reopen a release.
+
+**A bare `save_part` wrote to /tmp** — and `chudware_mcp_*` basenames are exactly what
+the artifact allowlist drops as internal scratch, so the save was misplaced AND invisible
+and the model had to notice and re-call. `save_part`/`export_part` now default to
+`CHUDWARE_PROJECT_SAVE_DIR`, keeping the temp fallback only for headless external MCP
+clients with no project.
+
+**Measured and NOT fixed: there is no first-token latency regression.** A live A/B with
+the pre-session tree reconstructed under `scratch/` (no checkout, shared tree) gave 4.648 s
+to first delta at HEAD vs 4.837 s at `c8b8e3a3`. Worker import is 105 ms including spawn
+at both revisions. This session added ~66 tokens to the assembled prefix (25593 → 25857
+chars); the tools block and pack menu did not grow. The user's slow first turn was a
+one-time prompt-cache miss: the failing trace reports `cache_read=0`, and a controlled
+probe measured 8.139 s cold vs 5.027 s on the immediate repeat (+3.1 s), recurring only
+when the prompt prefix changes again or the provider cache expires. Removing correct PLM
+guidance to preserve an old cache key would trade correctness for a one-time warmup, so
+nothing was changed. Noted for whoever optimizes later: ~2.08 s of the interval is local
+pre-provider work — tool-schema render 365-388 ms, project-memory recall 297-336 ms, and
+~1.2 s of first-use imports / delegation-and-skills setup / resolver construction, most
+of which is per-process rather than per-turn.
+
+**Deferred.** The ledger clips every tool result at ~999 chars, which is why the delegate
+failure could not be diagnosed from disk at all; delegate now front-loads its cause to
+survive that, but the clip itself is untouched observability debt.

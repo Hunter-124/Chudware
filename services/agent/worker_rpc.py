@@ -1667,6 +1667,16 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         return {"ok": True, "turn": turn}
     except Exception as exc:  # noqa: BLE001 — never raise across the worker seam
         return {"ok": False, "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}"}
+    finally:
+        # A turn that CRASHED still built geometry, and the same "part potentially lost"
+        # recovery row is waiting for it. run_linear_role_turn sweeps on every normal
+        # outcome (it has no try/except of its own), so this covers exactly the escaping
+        # exception; the sweep is idempotent, skipping anything already saved and clean.
+        try:
+            from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
+            save_touched_docs()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 ADMIN_METHODS: dict[str, Callable] = {

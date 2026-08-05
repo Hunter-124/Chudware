@@ -1,14 +1,19 @@
-"""Mega-28 terminal classification — all-AC-PASS => done/mission_complete.
+"""Mega-28 live fingerprint: the run graded 9/9 PASS yet reported a blocked terminal.
 
-Live mega-28 (reports/runs/mega-28/) graded 9/9 PASS yet the mission terminal
-reported ``status=blocked, phase=deliver, stop_reason=deliver_partial`` because
-soft-join deliver treated incomplete sibling deliver nodes as partial even
-after every acceptance criterion passed.
+Live mega-28 (reports/runs/mega-28/) graded 9/9 PASS while the mission terminal said
+``status=blocked, phase=deliver, stop_reason=deliver_partial`` — soft-join deliver
+treated incomplete sibling deliver nodes as partial even after every acceptance
+criterion passed. This file pins that FINGERPRINT against the archived run artifacts, so
+the historical shape stays readable and a future reader can tell the grade from the
+terminal.
 
-Contract:
-  * all declared ACs gate-ok (PASS|SKIP|waived) + soft-join deliver_partial
-    → status=done, stop_reason=mission_complete
-  * any FAIL / NOT-CHECKED → keep deliver_partial semantics (mega-8)
+It does NOT test the terminal classifier. T-RF5 deleted the Python mission loop
+(``services/agent/loop.py`` ``run``/``run_mission``/``_drive_phases_from_dag``) and the
+C++ ``agent_mission_v1`` is the only live mission entry, so the classifier is no longer
+reachable from Python. A ``_drive`` helper here used to monkeypatch those deleted
+functions and was itself never called — dead scaffolding that read as coverage for a
+mechanism nothing exercised. Removed 2026-08-05; the classification contract belongs to
+``core/agent/`` and needs a ctest, not a Python fixture.
 """
 from __future__ import annotations
 
@@ -27,132 +32,6 @@ def _load_json(path: Path) -> dict:
     if not path.is_file():
         pytest.skip(f"fixture missing: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-class _MemLedger:
-    def __init__(self):
-        self.events: list[dict] = []
-        self.state = {"criterion_results": [], "artifacts": []}
-
-    def append(self, actor, kind, payload):
-        ev = {"actor": actor, "kind": kind, "payload": payload}
-        self.events.append(ev)
-        return ev
-
-    def log_stage(self, *a, **k):
-        return None
-
-    def features(self):
-        return []
-
-    def geometry_specs(self):
-        return []
-
-    def add_criterion_result(self, actor, ac_id, result, **kw):
-        return self.append(actor, "criterion_result", {
-            "id": ac_id, "result": result, **kw,
-        })
-
-
-def _rocket_manifest():
-    from services.agent.mission_criteria import apply_rocket_plane_checks
-
-    base = {
-        "request_verbatim": "flight computer rocket plane",
-        "ambiguities": [],
-        "deliverables": [
-            {"id": "DL1", "name": "Airframe", "kind": "part",
-             "description": "a", "acceptance_criteria": [],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-            {"id": "DL2", "name": "Asm", "kind": "assembly",
-             "description": "b", "acceptance_criteria": [],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-            {"id": "DL3", "name": "FC", "kind": "analysis",
-             "description": "c", "acceptance_criteria": [],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-            {"id": "DL4", "name": "FW", "kind": "analysis",
-             "description": "d", "acceptance_criteria": [],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-            {"id": "DL5", "name": "Report", "kind": "report",
-             "description": "e", "acceptance_criteria": [],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-        ],
-        "assumptions": [],
-    }
-    return apply_rocket_plane_checks(base)
-
-
-def _soft_join_dag(manifest, graph, *, dag_status: str = "blocked"):
-    """Replay mega-28 shape: all non-deliver done; soft-join deliver partial."""
-    node_states = {}
-    for n in graph["nodes"]:
-        nid = n["id"]
-        if nid.startswith("n_deliver_"):
-            # One deliver report done, siblings failed/skipped (soft-join).
-            if "DL1" in nid or nid.endswith("DL5"):
-                node_states[nid] = {"status": "done", "output": {"status": "done"}}
-            else:
-                node_states[nid] = {
-                    "status": "failed", "output": {"status": "failed"},
-                }
-        else:
-            node_states[nid] = {"status": "done", "output": {"status": "done"}}
-    return {"status": dag_status, "nodes": node_states}
-
-
-def _seed_all_ac_pass(led: _MemLedger, ac_ids: list[str] | None = None) -> None:
-    ids = ac_ids or [f"AC{i}" for i in range(1, 10)]
-    for ac in ids:
-        led.add_criterion_result(
-            "reviewer", ac, "PASS",
-            check_tool="fixture",
-            pass_rule="mega-28 all-pass fixture",
-            detail=f"seeded PASS for {ac}",
-            evidence={"source": "mega28_fixture"},
-        )
-
-
-def _drive(manifest, graph, dag_result, ledger, monkeypatch):
-    from services.agent import loop
-    from services.agent.pipeline.phases import Phase, PhaseMachine
-
-    # Keep terminal grading from re-running live tools; seeded PASS must stick.
-    monkeypatch.setattr(
-        "services.agent.reviewer_exec.run_acceptance_checks",
-        lambda *a, **k: None,
-    )
-    monkeypatch.setattr(
-        "services.agent.reviewer_exec.run_verify_battery",
-        lambda *a, **k: {
-            "verdict": "PASS", "ok": True, "checks": [], "detail": "fixture",
-        },
-    )
-    # Product gates must not hard-block the classification fixture.
-    monkeypatch.setattr(
-        "services.agent.agent_turn.ecad_product_gate",
-        lambda *a, **k: {"forced": False, "ok": True},
-    )
-    monkeypatch.setattr(
-        "services.agent.agent_turn.mech_deliver_gate",
-        lambda *a, **k: {"allow_deliver": True, "forced": False, "ok": True},
-    )
-    monkeypatch.setattr(
-        "services.agent.loop._terminal_autosave_close_docs",
-        lambda **k: {"ok": True, "saved": [], "closed": []},
-    )
-
-    machine = PhaseMachine()
-    completed: list = []
-    events: list = []
-
-    def _emit(phase, text):
-        events.append((getattr(phase, "value", phase), text))
-
-    reached, status, stop_reason = loop._drive_phases_from_dag(
-        machine, manifest, graph, dag_result, completed, _emit, Phase,
-        ledger=ledger, run_id="mega-28-terminal-fixture",
-    )
-    return reached, status, stop_reason, completed, events
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +56,3 @@ def test_mega28_live_fingerprint_all_ac_pass_but_deliver_partial():
     for i in range(1, 10):
         ac = _load_json(_MEGA28 / f"criterion_AC{i}.json")
         assert ac.get("result") == "PASS", (i, ac.get("result"))
-
-
-# ---------------------------------------------------------------------------
-# Fix: all-AC-PASS soft-join deliver => done / mission_complete
-# ---------------------------------------------------------------------------
-
-

@@ -2328,6 +2328,31 @@ def run_linear_role_turn(
         # leave this off, so their allow-list stays a hard boundary.
         auto_enable_packs=(role == "general_agent"),
     )
+    # TERMINAL SAVE SWEEP. Nothing closes the documents a run builds (T-RF5 deleted
+    # loop._terminal_autosave_close_docs; the C++ mission path only doc_saves the doc a
+    # DAG node is on), so an agent doc with no real backing file sat abandoned until the
+    # 30-min agent GC grace, was retired to hostd's crash-recovery ORPHAN tier, and came
+    # back as a "part potentially lost" row in the GUI's "Recover unsaved parts?" prompt
+    # — eight of them in one second on the reporting user's machine (2026-08-05).
+    # Saving, not closing: a close would fan out doc.closed and destroy the GUI mirror
+    # tab the user browses after the run, which is the very reason agent-origin docs get
+    # the long GC floor. Saved + clean means hostd just closes them, leaving nothing to
+    # recover. Scoped to docs this worker built (never origin_kind=gui), and a no-op
+    # without CHUDWARE_PROJECT_SAVE_DIR. Best-effort — never raises into the turn path.
+    try:
+        from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
+        _swept = save_touched_docs()
+        if _swept.get("saved") and ledger is not None:
+            try:
+                ledger.append(role, "terminal_autosave", {
+                    "run_id": run_id,
+                    "saved": _swept["saved"],
+                    "errors": _swept.get("errors") or [],
+                })
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
     # OMP Auto-Learn capture-at-stop (agent.autolearn_*). Main-chat / linear
     # entry only — never raises into the turn path.
     try:

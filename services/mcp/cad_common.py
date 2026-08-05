@@ -1430,6 +1430,102 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
         return None
 
 
+# ---------------------------------------------------------------------------
+# Terminal save sweep — nothing the agent built is left "potentially lost".
+# ---------------------------------------------------------------------------
+# hostd retires an abandoned doc to the crash-recovery ORPHAN tier when
+# `path.empty() || dirty || isAutosavePath(path)` (core/hostd/server.cpp::gcCloseDoc), and
+# everything in that tier is offered back through the GUI's "Recover unsaved parts?"
+# prompt. Nothing closes the documents a run built — T-RF5 deleted
+# services/agent/loop.py's `_terminal_autosave_close_docs` and the C++ mission path only
+# doc_saves the one doc a DAG node is on — so every agent doc without a real backing file
+# eventually became a "part potentially lost" row. Measured on the reporting user's
+# machine 2026-08-05: eight retired in the same second at the 30-min agent GC grace
+# (`CHUDWARE_DOC_GC_AGENT_GRACE_S`), then all eight opened as tabs when he accepted.
+#
+# The fix is to SAVE, not to close. Closing would fan out doc.closed and destroy the GUI
+# mirror tab the user browses after a run — the whole reason agent-origin docs get the
+# long GC floor in the first place. A doc saved to a real project file is simply closed
+# when its grace expires, with nothing left behind to "recover".
+_TOUCHED_DOCS: list = []
+
+
+def note_touched_doc(doc_id: Optional[str]) -> None:
+    """Record a doc this process created or resumed, for the terminal sweep.
+
+    A list, not a set: order is the order the run built them, which is the order the
+    sweep reports and the order a human reads. Cheap — a turn touches a handful.
+    """
+    if doc_id and doc_id not in _TOUCHED_DOCS:
+        _TOUCHED_DOCS.append(doc_id)
+
+
+def _needs_project_save(entry: dict) -> bool:
+    """True when this doc holds content that is NOT yet in a real user file.
+
+    Mirrors hostd's own retire test (`gcCloseDoc`): no path, unsaved edits, or a path
+    that is only a crash-recovery autosave. An `empty` doc is skipped — hostd purges
+    those instead of retiring them, so saving one would create a file for nothing.
+    """
+    if entry.get("empty"):
+        return False
+    if not ((entry.get("feature_count") or 0) or (entry.get("component_count") or 0)):
+        return False
+    path = entry.get("path") or ""
+    if not isinstance(path, str) or not path.strip():
+        return True
+    if entry.get("dirty"):
+        return True
+    try:
+        return os.path.realpath(os.path.dirname(path)).startswith(
+            os.path.realpath(str(_autosave_dir())))
+    except OSError:
+        return False
+
+
+def save_touched_docs() -> dict:
+    """Save every doc this run built that has no real user file yet. Never raises.
+
+    Scope is deliberately narrow: docs this process created/resumed (`_TOUCHED_DOCS`)
+    plus open docs the engine attributes to an agent/mcp client. A doc whose
+    `origin_kind` is `gui` is the USER's own and is never touched, however unsaved it
+    looks — that is exactly the work the recovery prompt exists to protect.
+
+    No-op without `CHUDWARE_PROJECT_SAVE_DIR`: with no project folder there is nowhere
+    a human would find the file, and the recovery tier is then the honest safety net.
+    """
+    out: dict = {"saved": [], "skipped": [], "errors": []}
+    if not os.environ.get("CHUDWARE_PROJECT_SAVE_DIR"):
+        out["skipped"].append({"reason": "no_project_save_dir"})
+        return out
+    try:
+        rows = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                if isinstance(e, dict) and e.get("doc_id")]
+    except Exception as exc:  # noqa: BLE001 — a terminal sweep never fails a turn
+        out["errors"].append(f"doc_list: {type(exc).__name__}: {exc}")
+        return out
+    for e in rows:
+        did = e["doc_id"]
+        origin = e.get("origin_kind")
+        ours = did in _TOUCHED_DOCS or origin in ("mcp", "agent")
+        if not ours or origin == "gui":
+            continue
+        if not _needs_project_save(e):
+            out["skipped"].append({"doc_id": did, "name": e.get("name"),
+                                   "reason": "already_saved"})
+            continue
+        try:
+            written = _project_save(did, e.get("name"))
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"{did}: {type(exc).__name__}: {exc}")
+            continue
+        if written:
+            out["saved"].append({"doc_id": did, "name": e.get("name"), "path": written})
+        else:
+            out["errors"].append(f"{did}: doc_save wrote nothing")
+    return out
+
+
 # doc_id -> engine revision at the doc's last autosave. Each autosave serializes the
 # full doc to disk; skipping unchanged docs turns the idle 60s sweep into a no-op.
 _AUTOSAVE_LAST_REV: dict = {}

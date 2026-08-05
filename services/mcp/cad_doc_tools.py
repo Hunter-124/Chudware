@@ -44,6 +44,7 @@ from .cad_common import (
     _write_diff,
     is_geom_query,
     normalize_geom_query,
+    note_touched_doc,
     cb,
     recover_autosaved,
     recover_skipped,
@@ -6482,6 +6483,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         body)" failures (docs/REFACTOR_LOG.md ~5309), so the count always travels."""
         did = entry["doc_id"]
         _CUR["doc_id"] = did
+        note_touched_doc(did)
         # Never seed a FAKE baseline. `setdefault` alone only protected a baseline this
         # process had already built, and neither doc_new(resume_if_open=True) nor doc_list
         # reports a `volume` key — so every resume from a process that had not itself built
@@ -6747,6 +6749,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                     f"of the same name ({', '.join(dropped)})")
                 return _dumps(out)
             _CUR["doc_id"] = did
+            note_touched_doc(did)
             # Seed the write-diff baseline: an empty part has zero volume, so the FIRST
             # add_features reports a real volume delta ("0.0 -> X (+X)") instead of degrading
             # to the volume-only "volume now X" branch of _write_diff.
@@ -7001,6 +7004,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 if series is not None:
                     created = series["doc_id"]
                     _CUR["doc_id"] = created
+                    note_touched_doc(created)
                     interpreted.append(
                         f'"{head_name}" is the next VERSION of the open part '
                         f'"{series.get("name")}" (doc_id={created}, '
@@ -7012,6 +7016,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                         "name": head_name})
                 created = r.get("doc_id")
                 _CUR["doc_id"] = created
+                note_touched_doc(created)
                 if r.get("reused"):
                     # NEVER seed a fake 0.0 baseline on a part that already carries
                     # geometry — the next write-diff would report "0.0 -> X" instead of

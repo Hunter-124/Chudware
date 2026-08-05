@@ -114,14 +114,28 @@ judgment).
 - **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
   with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
   (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
-- **Mission docs are NEVER closed** (verified 2026-08-05). T-RF5 deleted
-  `services/agent/loop.py`'s `_terminal_autosave_close_docs` / `_drive_phases_from_dag` and
-  C++ never re-implemented them: `core/agent/run.cpp` only `doc_save`s at milestones and
-  terminal, with zero `doc_close`/`doc_discard`. `test_mega28_terminal.py::_drive` still
-  monkeypatches those names but is never called. So every mission-minted doc stays open,
-  the GUI only *detaches* un-adopted AI mirror tabs on exit (`host/src/app.cpp` ~7069), and
-  hostd's crash-only retire tier turns each one into a "Recover unsaved parts?" row. Keep
-  the mint count down (see below) rather than assuming a terminal sweep exists.
+- **Mission docs are never CLOSED, only SAVED** (2026-08-05). T-RF5 deleted
+  `services/agent/loop.py`'s `_terminal_autosave_close_docs` and C++ never re-implemented
+  it: `core/agent/run.cpp` only `doc_save`s the doc a DAG node is on, with zero
+  `doc_close`/`doc_discard`. So every doc a run builds stays open, the GUI only *detaches*
+  un-adopted AI mirror tabs on exit (`host/src/app.cpp` ~7069), and hostd's retire tier
+  turned each unsaved one into a "Recover unsaved parts?" row (eight in one second on a
+  real machine). Closing them is NOT the fix — it destroys the mirror tab the user browses
+  after a run, which is why agent-origin docs get the 30-min GC floor. Instead
+  `cad_common.save_touched_docs()` runs at every turn terminal
+  (`mission_dispatch.run_linear_role_turn`) and in a `finally` on the crash path
+  (`worker_rpc._agent_admin_turn`), writing anything hostd would retire
+  (`path.empty() || dirty || autosave path`) into `CHUDWARE_PROJECT_SAVE_DIR`. It NEVER
+  touches `origin_kind=gui` and never writes a file for an empty doc. Only `new_part` and
+  `add_features` project-save on their own — every assembly and every `edit_feature` /
+  `set_material` / `asm_*` mutation depends on this sweep.
+- **Refine cap (WI-10) is live** for non-frontier tiers: `scaffolds.should_stop_refine` is
+  called at the tail of `agent_turn.run_turn`'s loop and stops with the `refine_cap`
+  stop_reason. A "round" is geometry re-worked AFTER the model itself declared the build
+  finished (`_GEOMETRY_SETTLERS` = verify_battery / save_part / export_part), so a first
+  build is never counted however many features it takes. Do NOT add describe_part /
+  measure_part / render_part to the settlers — models interleave them, and A's limit of 1
+  would then cap a normal part at one feature.
 - **One design is one document:** an iteration is a REVISION, never another doc. A version
   bump (`part_v4`, `-rev2`, `gen3`) RESUMES the series in `new_part` / `new_assembly` /
   the `add_features` `{"op":"new_part"}` batch head (`_docs_in_version_series` in

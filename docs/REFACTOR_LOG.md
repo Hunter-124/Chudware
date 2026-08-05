@@ -6412,11 +6412,70 @@ reads — both need it), `roles/feature_modeler.yaml`, and the `new_part` prompt
 with `tools/gen_tool_panel_tables.py`). Those geometry roles previously had zero mention
 of PLM versioning — the roles doing the iterating did not know history existed.
 
-Deferred, found while tracing and left alone: `services/agent/scaffolds.py`
-`refine_pass_limit`/`should_stop_refine` (WI-10) are dead — only their own unit tests call
-them, so nothing bounds how many times a mission re-mints geometry; and
-`services/agent/test_mega28_terminal.py::_drive` monkeypatches
-`loop._terminal_autosave_close_docs` / `loop._drive_phases_from_dag`, which T-RF5 deleted
-and C++ never re-implemented — `_drive` is defined but never called, so the mission-terminal
-close it claims to test does not exist. `.claude/skills/chudware-dev/SKILL.md` still
-describes that mechanism as live.
+Two dead-code gaps found while tracing and deferred at the time — WI-10's
+`refine_pass_limit`/`should_stop_refine` (never called by anything but their own unit
+tests) and `test_mega28_terminal.py::_drive` (monkeypatching functions T-RF5 deleted, and
+itself never called) — are both closed in the entry below.
+
+## 2026-08-05 — terminal save sweep + the refine cap stops being dead code
+
+**Why agent parts were "potentially lost".** hostd retires an abandoned doc to its
+crash-recovery orphan tier when `path.empty() || dirty || isAutosavePath(path)`
+(`core/hostd/server.cpp::gcCloseDoc`), and every orphan is offered through the GUI's
+"Recover unsaved parts?" prompt. Nothing closes the docs a run builds — T-RF5 deleted
+`services/agent/loop.py::_terminal_autosave_close_docs`, C++ never re-implemented it, and
+`core/agent/run.cpp` only `doc_save`s the one doc a DAG node is on. Read off the user's
+`hostd.log`: eight docs retired in the SAME second at the 30-min agent GC grace
+(`CHUDWARE_DOC_GC_AGENT_GRACE_S`), matching the `id_remap` the daemon reported at hello.
+
+**Save, do not close.** The deleted mechanism closed those docs; that is why it should not
+come back as it was. A close fans out `doc.closed` and destroys the GUI mirror tab the user
+browses after a run — the exact thing the long agent GC floor exists to protect.
+`cad_common.save_touched_docs()` instead writes anything hostd would retire into
+`CHUDWARE_PROJECT_SAVE_DIR`, so the doc stays open AND has nothing left to recover. Hooked
+at `mission_dispatch.run_linear_role_turn` (every normal outcome — it has no try/except of
+its own) and in a `finally` at `worker_rpc._agent_admin_turn` (the escaping exception);
+idempotent, so running twice is free. Scope: docs this worker created/resumed
+(`note_touched_doc`, called wherever `_CUR["doc_id"]` is set) plus open docs the engine
+attributes to an `mcp`/`agent` client — a per-turn worker fork cannot remember an earlier
+turn's doc, and those were the ones that flooded the prompt. `origin_kind=gui` is NEVER
+touched: a dirty unsaved user document is precisely the work the prompt protects. Empty
+docs are skipped (hostd purges those anyway, and a stub `.step+` is the clutter being
+fixed), and with no project folder the whole sweep is a no-op because there is nowhere a
+human would find the file.
+
+This matters most for work that had NO save path at all: only `new_part` and `add_features`
+call `_project_save`, so every agent-built **assembly** (`new_assembly` +
+`asm_add_component` + `asm_mate`) and every `edit_feature` / `delete_feature` /
+`set_material` reached hostd unsaved. Measured A/B on the real engine, one scripted
+assembly turn:
+
+| | before | after |
+|---|---|---|
+| assembly's backing file | `mcp_autosave/…-doc-cpp00000002.step+` (an appdata crash snapshot) | `<project>/rig_after.step+` |
+| `gcCloseDoc` would retire it | **yes** → a "part potentially lost" row | **no** → plain close |
+
+**WI-10 refine cap, wired.** `scaffolds.refine_pass_limit`/`should_stop_refine` had been
+dead since they were written (only their own two unit tests called them), and the risk in
+wiring them was the input: `stable_geometry_count` had no producer and no definition.
+Counting successful `add_features` — the obvious reading, and the one a naive wiring would
+pick — would cap a capability-A part at ONE FEATURE, because A's limit is 1. So a "refine
+round" is defined as geometry re-worked AFTER the model itself declared the build finished:
+`_GEOMETRY_SETTLERS` is exactly `verify_battery` / `save_part` / `export_part`. A first
+build therefore cannot be counted at all, however many features it takes, and the cap is
+structurally incapable of truncating construction. Mid-build inspection
+(`describe_part`/`measure_part`/`render_part`) deliberately does not settle — models
+interleave it constantly — and the WI-2 auto-verify inject never appears as the loop's
+`tool` because it dispatches directly. New `refine_cap` stop_reason with its own
+`error_detail_for_stop` branch: reusing `max_iters` would blame a tool-call budget that
+never ran out. Tests in `test_scaffolds.py` include the regression control that matters — a
+six-feature build under A with `describe_part` between every feature is NOT truncated —
+plus A trips on the first re-work, B allows one, C/frontier never trip.
+
+**Dead scaffolding removed.** `test_mega28_terminal.py::_drive` monkeypatched
+`loop._terminal_autosave_close_docs` / `loop._drive_phases_from_dag` (both deleted by
+T-RF5) and was never called — 124 lines that read as coverage for a mechanism nothing
+exercised. The file keeps its one real test, the archived mega-28 fingerprint, and now says
+plainly that the terminal classifier lives in `core/agent/` and needs a ctest. That ctest
+does not exist: `grep -r 'mission_complete\|deliver_partial' core/` returns nothing, so the
+classification contract is currently unasserted on either side.

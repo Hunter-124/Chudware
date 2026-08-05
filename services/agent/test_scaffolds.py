@@ -491,6 +491,109 @@ def test_wi10_c_refine_untouched():
     assert sc.should_stop_refine(cap, 100) is False
 
 
+# --- WI-10 wiring into the live turn loop ----------------------------------
+# The dial was dead for its whole life: only the two tests above called it. Wiring it
+# needed a definition of "refine pass" that CANNOT truncate a build in progress, so a
+# round is only counted when geometry is re-worked AFTER the model itself declared the
+# build finished (verify_battery / save_part / export_part). These pin that.
+
+def _fence(tool, **args):
+    import json as _json
+    return "```json\n" + _json.dumps({"tool": tool, "args": args}) + "\n```"
+
+
+def _refine_turn(letter, replies, ledger=None):
+    led = ledger if ledger is not None else ListLedger()
+    seen = []
+    res = agent_turn.run_turn(
+        "build a holster", ScriptedProvider(replies),
+        allowed_tools=["new_part", "add_features", "describe_part",
+                       "verify_battery", "save_part"],
+        tool_dispatch=lambda t, a: seen.append(t) or {"ok": True, "doc_id": "d1"},
+        ledger=led, capability=profile_for_letter(letter), phase="build",
+        task_class="simple_part", max_tool_calls=24,
+    )
+    return res, seen, led
+
+
+def test_wi10_a_multi_feature_first_build_is_never_truncated():
+    """The regression this cap must never cause: A allows ONE stable pass, and a part
+    that takes six features to build is still ONE pass. Interleaved describe_part is
+    mid-build inspection, not a finished build, so it must not settle the geometry."""
+    replies = []
+    replies.append(_fence("new_part", name="holster"))
+    for i in range(6):
+        replies.append(_fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]))
+        replies.append(_fence("describe_part", doc_id="d1"))
+    replies.append('{"done":true,"handoff":{"status":"done","summary":"built"}}')
+    res, seen, led = _refine_turn("A", replies)
+
+    assert seen.count("add_features") == 6, seen
+    assert res.stop_reason != agent_turn._REFINE_CAP, res.stop_reason
+    assert _dials(led, "refine_passes") == []
+
+
+def test_wi10_a_rework_after_a_declared_finish_trips_the_cap():
+    """A (refine_passes=0): verify the build, then go back and re-cut it -> capped."""
+    replies = [
+        _fence("new_part", name="holster"),
+        _fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]),
+        _fence("verify_battery", doc_id="d1"),
+        _fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]),
+        _fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]),
+    ]
+    res, seen, led = _refine_turn("A", replies)
+
+    assert res.stop_reason == agent_turn._REFINE_CAP, res.stop_reason
+    # The re-work that tripped it still ran; the one after it never did.
+    assert seen.count("add_features") == 2, seen
+    dial = _dials(led, "refine_passes")
+    assert len(dial) == 1, dial
+    assert dial[0]["payload"]["reason"] == "refine_cap"
+    assert dial[0]["payload"]["limit"] == 1
+
+
+def test_wi10_b_allows_one_rework_before_capping():
+    """B (refine_passes=1): one re-do after a declared finish is the budget."""
+    replies = [
+        _fence("new_part", name="holster"),
+        _fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]),
+        _fence("save_part", doc_id="d1"),
+        _fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]),
+        _fence("save_part", doc_id="d1"),
+        _fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]),
+        _fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]),
+    ]
+    res, seen, led = _refine_turn("B", replies)
+
+    assert res.stop_reason == agent_turn._REFINE_CAP, res.stop_reason
+    assert seen.count("add_features") == 3, seen
+    assert _dials(led, "refine_passes")[0]["payload"]["limit"] == 2
+
+
+def test_wi10_c_rework_is_never_capped():
+    """C / frontier keeps its existing budget-only bounds — the dial must be inert."""
+    replies = [_fence("new_part", name="holster")]
+    for _ in range(5):
+        replies.append(_fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]))
+        replies.append(_fence("verify_battery", doc_id="d1"))
+    replies.append('{"done":true,"handoff":{"status":"done","summary":"built"}}')
+    res, seen, led = _refine_turn("C", replies)
+
+    assert res.stop_reason != agent_turn._REFINE_CAP, res.stop_reason
+    assert seen.count("add_features") == 5, seen
+    assert _dials(led, "refine_passes") == []
+
+
+def test_wi10_refine_cap_has_its_own_error_detail():
+    """Reusing max_iters would blame a tool-call budget that never ran out."""
+    detail = agent_turn.error_detail_for_stop(
+        agent_turn._REFINE_CAP, tool_calls_made=4, budget=24).lower()
+    assert "refine budget" in detail
+    assert "tool call" not in detail, "a refine cap is not a tool-call budget"
+    assert "24" not in detail, "the tool-call budget was never reached"
+
+
 # ===========================================================================
 # C-freedom snapshot (WI-18)
 # ===========================================================================

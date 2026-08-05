@@ -55,6 +55,11 @@ _CONTEXT_OVERFLOW = "context_overflow"
 # that hides which guardrail fired and sends retry/escalation down the wrong
 # branch — the fix is on the guardrail's terms, not the model's.
 _GUARD_BLOCKED = "guardrail_blocked"
+# The build LANDED and was verified/saved, then the model went back to re-work the
+# geometry more times than its capability tier allows (scaffolds.refine_pass_limit,
+# non-frontier tiers only). Not a budget exhaustion and not a failure: the product
+# exists. Reporting it as max_iters would blame a tool-call budget that never ran out.
+_REFINE_CAP = "refine_cap"
 
 # Human-facing error_detail scrubbers (never leak keys/tokens to the GUI).
 _SECRET_RE = re.compile(
@@ -194,6 +199,11 @@ def error_detail_for_stop(
             f"Phase step-cap budget exhausted after {tool_calls_made}"
             + (f" of {budget}" if budget else "")
             + " tool call(s)."
+        )
+    if stop_reason == _REFINE_CAP:
+        return format_error_detail(
+            extra or "Refine budget for this capability tier exhausted — the verified "
+                     "build is kept; further re-work needs a new request."
         )
     if stop_reason == _NOCODE:
         return format_error_detail(
@@ -1632,6 +1642,17 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     budget = int(_budget_in)
     completion_cap = int(max_tokens) if max_tokens else 2048
     _tool_call_counts: dict[str, int] = {}
+    # WI-10 refine cap. A "refine round" is geometry re-worked AFTER the model itself
+    # declared the build finished — it verified it (verify_battery) or delivered it
+    # (save_part / export_part). A first build is therefore NEVER counted, however many
+    # features it takes: `_refine_rounds` cannot leave 0 until a settle has happened, so
+    # the cap physically cannot truncate a part mid-construction. Mid-build inspection
+    # (describe_part / measure_part / render_part) deliberately does NOT settle — models
+    # interleave it constantly, and treating it as "done" would cap a normal build at one
+    # feature. Neither does the WI-2 auto-verify inject, which dispatches directly and
+    # never appears as this loop's `tool`.
+    _refine_rounds = 0
+    _geo_settled = False
     from services.agent.tool_loop_guard import ToolCallLoopGuard  # noqa: PLC0415
     _loop_guard = None
     try:
@@ -4199,6 +4220,25 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     messages.append({"role": "user", "content": _parts(
                         f"[auto-verify] Result of {_vtool}:\n{_as_text(_vres)}")})
             except Exception:  # noqa: BLE001 — inject never breaks the turn
+                pass
+
+        # WI-10 refine cap (non-frontier tiers only; scaffolds.refine_pass_limit returns
+        # None for C and for every frontier profile, so this is a no-op there).
+        if ok:
+            if tool in _GEOMETRY_MUTATORS:
+                if _geo_settled:
+                    # Re-working geometry the model had already declared finished.
+                    _refine_rounds += 1
+                    _geo_settled = False
+            elif tool in _GEOMETRY_SETTLERS:
+                _geo_settled = True
+        if _sc is not None and _cap is not None and _refine_rounds:
+            try:
+                if _sc.should_stop_refine(_cap, _refine_rounds,
+                                          ledger=ledger, actor=actor or name):
+                    last_reason = _REFINE_CAP
+                    break
+            except Exception:  # noqa: BLE001 — a cost dial never breaks the turn
                 pass
 
     # No clean finish. Historically this returned max_iters / no_code →
@@ -9943,6 +9983,24 @@ _DELIVERED_PRODUCT_TOOLS: frozenset[str] = frozenset({
 
 _BOOTSTRAP_OPENERS = frozenset({
     "new_part", "ecad_new_schematic", "fw_new_project",
+})
+
+
+# WI-10 refine cap. MUTATORS re-shape geometry; SETTLERS are the model's own statement
+# that the build is finished — it ran the acceptance battery, or it delivered the file.
+# Kept deliberately narrow: describe_part / measure_part / render_part / query_geometry
+# are MID-BUILD inspection that models interleave between features, so counting them as
+# "settled" would make the very next feature a refine round and cap a normal part at one
+# feature. The WI-2 auto-verify inject also never lands here — it dispatches directly and
+# is not this loop's `tool`.
+_GEOMETRY_MUTATORS: frozenset[str] = frozenset({
+    "add_features", "doc_apply_ops", "edit_feature", "delete_feature",
+    "remove_feature", "part_place", "set_material", "regen_resolve",
+    "asm_add_component", "asm_mate", "solve_mates",
+})
+
+_GEOMETRY_SETTLERS: frozenset[str] = frozenset({
+    "verify_battery", "save_part", "export_part",
 })
 
 

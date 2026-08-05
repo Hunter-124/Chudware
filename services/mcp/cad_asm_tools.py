@@ -27,6 +27,7 @@ from .cad_common import (
     _version_series_base,
     cb,
     coerce_json_or_repr,
+    note_touched_doc,
     require_list,
     sh,
 )
@@ -104,6 +105,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             if series is not None:
                 did = series["doc_id"]
                 _CUR["doc_id"] = did
+                note_touched_doc(did)
                 actual = series.get("name") or name
                 return _dumps({
                     "ok": True, "doc_id": did, "name": actual, "kind": "assembly",
@@ -124,6 +126,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                                     "resume_if_open": True})
             did = r.get("doc_id")
             _CUR["doc_id"] = did
+            note_touched_doc(did)
             # doc_new UNIQUIFIES a colliding name; report what the document is really
             # called, never the ask, or every later name-based lookup repeats the lie.
             out = {"ok": True, "doc_id": did, "name": r.get("name") or name,

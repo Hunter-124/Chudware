@@ -603,6 +603,26 @@ CHUDWARE_API void chudware_set_event_sink(void (*cb)(const char* event_json, voi
     }
 }
 
+// Direct document calls inside run.cpp do not re-enter hostd's outer RPC dispatcher. Bridge them
+// to a second thread-local callback so the daemon can feed each completed call through the same
+// DocRegistry::postCall path as a socket-level doc_new/doc_apply_ops. Publication happens only
+// after the document operation returns, so no per-document engine mutex is held here.
+CHUDWARE_API void chudware_set_doc_publish_sink(
+    void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
+    void* ud) {
+    if (cb) {
+        chudware::agent::set_doc_publish_sink(
+            [cb, ud](const std::string& method, const nlohmann::json& params,
+                     const nlohmann::json& result) {
+                const std::string p = params.dump();
+                const std::string r = result.dump();
+                cb(method.c_str(), p.c_str(), r.c_str(), ud);
+            });
+    } else {
+        chudware::agent::set_doc_publish_sink({});
+    }
+}
+
 // ---- CAM program recipe (deterministic, request-aware, no LLM) ------------------
 // Build a complete CAM machining JOB from the CURRENT PART and post it to G-code,
 // reusing the exact cam_* engine the GUI and MCP drive. This is the offline "make me a

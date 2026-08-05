@@ -53,6 +53,13 @@ public:
     // Callers use this to decide whether live events will fire (else fall back to batched).
     bool hasEventSink();
 
+    // Live document publication for direct doc calls nested inside an opaque agent RPC. Optional
+    // export, thread-local, and scoped exactly like setEventSink.
+    void setDocPublishSink(
+        void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
+        void* ud);
+    bool hasDocPublishSink();
+
     // Best-effort, idempotent shutdown of sidecar processes owned by the loaded engine
     // (currently the OmpBridgeClient bun bridge; core/agent/omp_bridge_client.h). No-op when
     // the engine was never loaded or predates the chudware_agent_sidecars_shutdown export
@@ -73,6 +80,8 @@ private:
     void (*free_)(char*) = nullptr;
     const char* (*abi_fn_)(void) = nullptr;
     void (*set_event_sink_)(void (*)(const char*, void*), void*) = nullptr;  // optional export
+    void (*set_doc_publish_sink_)(
+        void (*)(const char*, const char*, const char*, void*), void*) = nullptr;
     void (*shutdown_sidecars_)(void) = nullptr;  // optional export
 };
 

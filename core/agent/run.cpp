@@ -13,6 +13,7 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <utility>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -48,6 +49,37 @@
 
 namespace chudware {
 namespace agent {
+
+namespace {
+thread_local DocPublishFn t_doc_publish_sink;
+}
+
+void set_doc_publish_sink(DocPublishFn sink) {
+    t_doc_publish_sink = std::move(sink);
+}
+
+namespace {
+
+void publish_doc_call(const std::string& method, const json& params, const json& result) {
+    if (!t_doc_publish_sink) return;
+    try {
+        t_doc_publish_sink(method, params, result);
+    } catch (...) {
+        // A spectator that disconnects while an agent is building must never break the build.
+        // This matches RunEvents' live-stream sink: publication is best-effort, document commits
+        // remain authoritative.
+    }
+}
+
+json doc_publish_params(std::initializer_list<std::pair<const char*, json>> fields,
+                        const json& options) {
+    json params = json::object();
+    for (const auto& [key, value] : fields) params[key] = value;
+    if (options.value("internal", false)) params["internal"] = true;
+    return params;
+}
+
+}
 
 namespace {
 
@@ -225,43 +257,8 @@ std::string default_step(const DesignState& state) {
 
 // ----------------------------------------------------------------- part naming
 
-// Sanitize a model-chosen part name into a short filename-safe display title.
-// Illegal path chars stripped; whitespace collapsed; capped at 48 chars.
-std::string sanitize_part_name(std::string name) {
-    // Trim ends.
-    auto not_ws = [](unsigned char c) { return !std::isspace(c); };
-    name.erase(name.begin(), std::find_if(name.begin(), name.end(), not_ws));
-    name.erase(std::find_if(name.rbegin(), name.rend(), not_ws).base(), name.end());
-    // Strip illegal filename characters: / \ : * ? " < > |
-    std::string cleaned;
-    cleaned.reserve(name.size());
-    for (unsigned char c : name) {
-        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
-            c == '>' || c == '|')
-            continue;
-        cleaned.push_back(static_cast<char>(c));
-    }
-    // Collapse whitespace runs to a single space.
-    std::string out;
-    out.reserve(cleaned.size());
-    bool prev_ws = false;
-    for (unsigned char c : cleaned) {
-        if (std::isspace(c)) {
-            if (!prev_ws && !out.empty()) out.push_back(' ');
-            prev_ws = true;
-        } else {
-            out.push_back(static_cast<char>(c));
-            prev_ws = false;
-        }
-    }
-    // Trailing space from collapse (shouldn't, but belt+suspenders).
-    while (!out.empty() && out.back() == ' ') out.pop_back();
-    if (out.size() > 48) {
-        out.resize(48);
-        while (!out.empty() && out.back() == ' ') out.pop_back();
-    }
-    return out;
-}
+
+
 
 // Deterministic fallback name from the user request: first ~4 words, title-cased.
 std::string fallback_part_name(const std::string& request) {
@@ -1812,7 +1809,14 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // plus a live doc.preview so the host viewport can paint intermediate geometry.
     auto apply_ops = [&](DesignState& st, const json& ops) -> std::vector<std::string> {
         auto t0 = std::chrono::steady_clock::now();
-        json resp = doc::doc_apply_ops(doc_id, st.revision, ops, /*coalesce=*/false);
+        const int base_revision = st.revision;
+        json resp = doc::doc_apply_ops(doc_id, base_revision, ops, /*coalesce=*/false);
+        publish_doc_call(
+            "doc_apply_ops",
+            doc_publish_params({{"doc_id", doc_id}, {"base_revision", base_revision},
+                                {"ops", ops}, {"coalesce", false}},
+                               options),
+            resp);
         auto t1 = std::chrono::steady_clock::now();
         int lat = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -2582,12 +2586,16 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         const std::string directive =
             want_notes
                 ? "INSTRUCTION: name the part AND record durable notes for a future session. "
-                  "Reply with EXACTLY one json block: {\"name\": \"<2-5 word name, no dimensions>\", "
+                  "The name must carry no version, revision, or iteration token because revisions "
+                  "are tracked in PLM. Reply with EXACTLY one json block: "
+                  "{\"name\": \"<2-5 word name, no dimensions>\", "
                   "\"summary\": \"one sentence: what this part is\", "
                   "\"decisions\": [\"key committed dimensions / design decisions\"], "
                   "\"open_issues\": [\"unresolved problems, [] if none\"]}."
-                : "INSTRUCTION: just name the part — no notes needed. Reply with EXACTLY one json "
-                  "block: {\"name\": \"<2-5 word name, no dimensions, no file extension>\"}.";
+                : "INSTRUCTION: just name the part — no notes needed. The name must carry no "
+                  "version, revision, or iteration token because revisions are tracked in PLM. "
+                  "Reply with EXACTLY one json block: "
+                  "{\"name\": \"<2-5 word name, no dimensions, no file extension>\"}.";
         AgentCall ac = agent_call(provider, st, "memory", prompts_dir, call_budget, vision, ctx_cap,
                                   directive);
         StageOutcome o;
@@ -3369,6 +3377,9 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
         std::string child;
         try {
             json nd = doc::doc_new("part", name);
+            publish_doc_call("doc_new",
+                             doc_publish_params({{"kind", "part"}, {"name", name}}, options),
+                             nd);
             child = jstr(nd, "doc_id");
         } catch (const std::exception& e) {
             events.emit("part_skipped",
@@ -3545,6 +3556,9 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     std::string asm_id;
     try {
         json nd = doc::doc_new("assembly", asm_name);
+        publish_doc_call("doc_new",
+                         doc_publish_params({{"kind", "assembly"}, {"name", asm_name}}, options),
+                         nd);
         asm_id = jstr(nd, "doc_id");
     } catch (const std::exception& e) {
         events.emit("assembly_failed", json{{"reason", e.what()}});
@@ -3593,7 +3607,14 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
         std::filesystem::absolute(run_dir(run_id) / (asm_name + ".step+")).string();
     try {
         json before = doc::doc_tree(asm_id);
-        json resp = doc::doc_apply_ops(asm_id, before.value("revision", 0), comp_ops, false);
+        const int base_revision = before.value("revision", 0);
+        json resp = doc::doc_apply_ops(asm_id, base_revision, comp_ops, false);
+        publish_doc_call(
+            "doc_apply_ops",
+            doc_publish_params({{"doc_id", asm_id}, {"base_revision", base_revision},
+                                {"ops", comp_ops}, {"coalesce", false}},
+                               options),
+            resp);
         asm_rev = resp.value("revision", 0);
         doc::doc_save(asm_id, asm_path);
     } catch (const std::exception& e) {
@@ -4543,6 +4564,11 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
             std::string new_doc_id;
             try {
                 json nd = doc::doc_new("part", "Reverse-Engineered");
+                publish_doc_call(
+                    "doc_new",
+                    doc_publish_params({{"kind", "part"}, {"name", "Reverse-Engineered"}},
+                                       options),
+                    nd);
                 new_doc_id = nd.value("doc_id", std::string());
             } catch (const std::exception& e) {
                 summary = std::string("could not create reconstruction doc: ") + e.what();

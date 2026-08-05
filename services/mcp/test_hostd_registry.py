@@ -7,6 +7,7 @@ Skips when no chudware-hostd binary is built (mirrors test_daemon_bridge.py).
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import threading
@@ -262,6 +263,208 @@ def test_doc_snapshot_mint_seed_yields_to_real_geometry(scratch_daemon):
     assert live["method"] == "doc_apply_ops"
     assert len(live["tree"]["features"]) == 1
     assert live["aicm_path"] != seed["aicm_path"]
+
+def _configure_full_mock_agent(monkeypatch, tmp_path) -> None:
+    """Keep agent_run_v2 on the full in-process run.cpp path, never the micro lane."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    cfg_dir = tmp_path / "Chudware"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"micro_mode": False}), encoding="utf-8")
+
+
+def _agent_assembly_provider(assembly_name: str) -> dict:
+    # Child runs intentionally receive an unparseable modeler reply. They remain at revision 0,
+    # giving the spectator a stable mint-time snapshot to inspect after the opaque RPC returns.
+    plan = {
+        "assembly": True,
+        "name": assembly_name,
+        "parts": [
+            {"name": assembly_name + "_A", "purpose": "probe child A",
+             "dimensions": {}, "features": ["box"],
+             "placement": {"pos": [0, 0, 0], "rot": [0, 0, 0]}},
+            {"name": assembly_name + "_B", "purpose": "probe child B",
+             "dimensions": {}, "features": ["box"],
+             "placement": {"pos": [20, 0, 0], "rot": [0, 0, 0]}},
+        ],
+    }
+    return {
+        "name": "mock",
+        "replies": {
+            "intake": [json.dumps({
+                "object": "two-part assembly",
+                "key_dims": {"span": 40},
+                "features": ["two child parts"],
+            })],
+            "planner": [json.dumps(plan)],
+            "modeler": ["not-json"],
+        },
+    }
+
+
+def _run_agent_assembly(runner: DaemonClient, assembly_name: str, *,
+                        internal: bool = False) -> dict:
+    seed = runner.call(
+        "doc_new", {"name": "RegistrySeed" + uuid.uuid4().hex[:8]})["doc_id"]
+    return runner.call("agent_run_v2", {
+        "request": "Build a two-part mechanical assembly with separate child parts",
+        "doc_id": seed,
+        "provider": _agent_assembly_provider(assembly_name),
+        "options": {
+            "offline": True,
+            "complexity": "complex",
+            "advisor": False,
+            "internal": internal,
+            "run_id": "registry-" + uuid.uuid4().hex[:8],
+        },
+    })
+
+
+def _agent_spectator(scratch_daemon) -> tuple[DaemonClient, DaemonClient]:
+    runner, spectator = DaemonClient(), DaemonClient()
+    runner.connect()
+    scratch_daemon.append(_pid(runner))
+    runner.call("subscribe", {"doc_ids": "*"})
+    spectator.connect()
+    spectator.call("subscribe", {"doc_ids": "*"})
+    return runner, spectator
+
+
+def _drain_all(c: DaemonClient) -> list:
+    c.call("ping")
+    return c.poll_events()
+
+
+def test_inprocess_agent_mint_reaches_spectator(scratch_daemon, monkeypatch, tmp_path):
+    """A child doc created inside opaque agent_run_v2 is announced before its first mutation."""
+    _configure_full_mock_agent(monkeypatch, tmp_path)
+    runner, spectator = _agent_spectator(scratch_daemon)
+    name = "AgentMint" + uuid.uuid4().hex[:6]
+    _run_agent_assembly(runner, name)
+    time.sleep(0.2)
+    events = _drain_all(spectator)
+
+    child = name + "_A"
+    opened_at = next(i for i, e in enumerate(events)
+                     if e.get("event") == "doc.opened" and
+                     e.get("data", {}).get("name") == child)
+    child_doc = events[opened_at]["data"]["doc_id"]
+    changed_at = [i for i, e in enumerate(events)
+                  if e.get("event") == "doc.changed" and
+                  e.get("data", {}).get("doc_id") == child_doc]
+    assert not changed_at or opened_at < changed_at[0], events
+    assert events[opened_at]["data"]["source_kind"] == "agent"
+    assert events[opened_at]["data"]["revision"] == 0
+    source_events = _drain_all(runner)
+    assert any(e.get("event") == "doc.opened" and
+               e.get("data", {}).get("doc_id") == child_doc
+               for e in source_events), source_events
+
+
+def test_inprocess_agent_mint_seeds_revision_zero_snapshot(
+        scratch_daemon, monkeypatch, tmp_path):
+    """The bare child remains spectatable at revision 0 without taking its engine lock."""
+    _configure_full_mock_agent(monkeypatch, tmp_path)
+    runner, spectator = _agent_spectator(scratch_daemon)
+    name = "AgentSnap" + uuid.uuid4().hex[:6]
+    _run_agent_assembly(runner, name)
+    time.sleep(0.2)
+    events = _drain_all(spectator)
+    opened = next(e for e in events
+                  if e.get("event") == "doc.opened" and
+                  e.get("data", {}).get("name") == name + "_A")
+
+    snap = spectator.call("doc_snapshot", {"doc_id": opened["data"]["doc_id"]})
+    assert snap.get("has_snapshot") is True, snap
+    assert snap["revision"] == 0
+    assert snap["method"] == "doc_new"
+    assert snap["source_kind"] == "agent"
+    assert snap["tree"]["features"] == []
+    assert snap["tree"]["name"] == name + "_A"
+
+
+def test_inprocess_agent_apply_publishes_each_feature_batch(
+        scratch_daemon, monkeypatch, tmp_path):
+    """Two modeler commits are two live doc.changed pushes, not one terminal resync."""
+    _configure_full_mock_agent(monkeypatch, tmp_path)
+    runner, spectator = _agent_spectator(scratch_daemon)
+    doc = runner.call("doc_new", {"name": "AgentBatches"})["doc_id"]
+    time.sleep(0.1)
+    _drain_all(spectator)  # discard the ordinary socket-level mint
+
+    first = [{"op": "add_feature", "feature": {
+        "type": "box", "name": "Base",
+        "params": {"length": 10, "width": 10, "height": 10}, "refs": {}}}]
+    second = [{"op": "add_feature", "feature": {
+        "type": "box", "name": "Second",
+        "params": {"length": 5, "width": 5, "height": 5, "at": [20, 0, 0]},
+        "refs": {}}}]
+    provider = {
+        "name": "mock",
+        "replies": {
+            "intake": [json.dumps({
+                "object": "two-box probe", "key_dims": {"size": 10},
+                "features": ["base", "second box"]})],
+            "planner": [json.dumps({
+                "parts": [{
+                    "name": "probe", "purpose": "registry publication",
+                    "dimensions": {"base": 10},
+                    "features": ["add the second box"],
+                }]
+            })],
+            "modeler": [json.dumps(first), json.dumps(second)],
+            "reviewer": [json.dumps({"done": True, "issues": []})],
+            "memory": [json.dumps({
+                "name": "Agent Batch Probe",
+                "summary": "two-box registry probe",
+                "decisions": [], "open_issues": [],
+            })],
+        },
+    }
+    result = runner.call("agent_run_design", {
+        "request": "Build a simple two-box probe",
+        "doc_id": doc,
+        "provider": provider,
+        "options": {
+            "offline": True, "complexity": "standard", "advisor": False,
+            "run_id": "registry-batches-" + uuid.uuid4().hex[:6],
+        },
+    })
+    assert result.get("_is_error") is None, result
+    time.sleep(0.2)
+    changed = [e for e in _drain_all(spectator)
+               if e.get("event") == "doc.changed" and
+               e.get("data", {}).get("doc_id") == doc]
+    snap = spectator.call("doc_snapshot", {"doc_id": doc})
+    assert [e["data"]["revision"] for e in changed] == [1, 2], {
+        "changed": changed, "result": result, "snapshot": snap,
+        "tree": spectator.call("doc_tree", {"doc_id": doc}),
+    }
+    assert all(e["data"]["method"] == "doc_apply_ops" for e in changed)
+    assert [len(e["data"]["tree"]["features"]) for e in changed] == [1, 2]
+
+
+def test_inprocess_internal_agent_docs_are_registered_but_silent(
+        scratch_daemon, monkeypatch, tmp_path):
+    """The preflight-style internal flag keeps nested mints out of every subscriber feed."""
+    _configure_full_mock_agent(monkeypatch, tmp_path)
+    runner, spectator = _agent_spectator(scratch_daemon)
+    name = "AgentShadow" + uuid.uuid4().hex[:6]
+    result = _run_agent_assembly(runner, name, internal=True)
+    time.sleep(0.2)
+    events = _drain_all(spectator)
+    internal_doc = result["doc_id"]
+    assert not [e for e in events
+                if e.get("event") in {"doc.opened", "doc.changed"} and
+                (e.get("data", {}).get("doc_id") == internal_doc or
+                 str(e.get("data", {}).get("name", "")).startswith(name))], events
+
+    # Internal registration is observable by ABSENCE from doc_list: annotateDocList filters a
+    # document only when DocRegistry::postCall recorded DocState::internal. If the nested hook is
+    # reverted, the engine still holds this assembly but the registry first sees it in the outer
+    # agent_run_v2 result as a normal doc, so it leaks into this list and the control fails.
+    listed = {d["doc_id"] for d in spectator.call("doc_list", {})["docs"]}
+    assert internal_doc not in listed, {"result": result, "listed": sorted(listed)}
 
 
 def test_doc_snapshot_skips_internal_doc(scratch_daemon):

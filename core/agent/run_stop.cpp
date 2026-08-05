@@ -1,17 +1,73 @@
-// core/agent/run_stop.cpp — how a general-work turn whose python worker never
-// answered is reported to the user.
+// core/agent/run_stop.cpp — pure run helpers kept separate from document execution.
 //
-// This lives in its OWN translation unit on purpose. The rule belongs to run.cpp,
-// but run.cpp pulls in the whole chudware::doc::* session API, and the agent tests
-// (core/tests/test_agent.cpp) deliberately link only `chudware_agent` — no doc, no
-// OCCT. Defining the rule here lets that test LINK the shipped implementation
-// instead of restating it in a mirrored lambda, which is how the older stop_reason
-// cases in test_agent.cpp were written and exactly how a rule and its test drift.
+// These rules belong to run.cpp, but run.cpp pulls in the whole chudware::doc::* session
+// API, and the agent tests (core/tests/test_agent.cpp) deliberately link only
+// `chudware_agent` — no doc, no OCCT. Defining the helpers here lets that test LINK the
+// shipped implementation instead of restating it in a mirrored lambda, which is how the
+// older stop_reason cases in test_agent.cpp were written and exactly how a rule and its
+// test drift.
 
 #include "agent/run.h"
 
+#include <algorithm>
+#include <cctype>
+#include <regex>
+
 namespace chudware {
 namespace agent {
+// Sanitize a model-chosen part name into a short filename-safe display title.
+// Illegal path chars stripped; whitespace collapsed; capped at 48 chars.
+std::string sanitize_part_name(std::string name) {
+    // Trim ends.
+    auto not_ws = [](unsigned char c) { return !std::isspace(c); };
+    name.erase(name.begin(), std::find_if(name.begin(), name.end(), not_ws));
+    name.erase(std::find_if(name.rbegin(), name.rend(), not_ws).base(), name.end());
+
+    // One design is one document: a version token in the name creates a second tab, a second
+    // .step+, its own vault item, and a recovery row; revisions belong in PLM. Keep this in
+    // lockstep with services/mcp/cad_common.py::_strip_version_suffix. Accepted false positive:
+    // a genuine designator such as Intake_Manifold_V8 becomes Intake_Manifold; a second,
+    // divergent definition of "version token" would be worse than that known cost.
+    static const std::regex version_suffix(
+        R"([\s._-]+(?:v|ver|vers|version|rev|revision|mk|mark|gen|iter|iteration|attempt|try|pass|round)\s*(\d{1,4})$)",
+        std::regex_constants::icase);
+    std::smatch version_match;
+    if (std::regex_search(name, version_match, version_suffix)) {
+        std::string base = name.substr(0, static_cast<size_t>(version_match.position()));
+        const size_t last = base.find_last_not_of(" ._-");
+        if (last != std::string::npos) name = base.substr(0, last + 1);
+    }
+
+    // Strip illegal filename characters: / \ : * ? " < > |
+    std::string cleaned;
+    cleaned.reserve(name.size());
+    for (unsigned char c : name) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
+            c == '>' || c == '|')
+            continue;
+        cleaned.push_back(static_cast<char>(c));
+    }
+    // Collapse whitespace runs to a single space.
+    std::string out;
+    out.reserve(cleaned.size());
+    bool prev_ws = false;
+    for (unsigned char c : cleaned) {
+        if (std::isspace(c)) {
+            if (!prev_ws && !out.empty()) out.push_back(' ');
+            prev_ws = true;
+        } else {
+            out.push_back(static_cast<char>(c));
+            prev_ws = false;
+        }
+    }
+    // Trailing space from collapse (shouldn't, but belt+suspenders).
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (out.size() > 48) {
+        out.resize(48);
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+    }
+    return out;
+}
 
 WorkerStop classify_worker_stop(bool crashed, bool timed_out, bool reached_worker) {
     // A crash and a silence are BOTH Chudware failing, not the user asking for

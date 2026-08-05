@@ -131,6 +131,9 @@ if (auto bid = reinterpret_cast<const char* (*)(void)>(dlsym(h, "chudware_build_
 // Optional streaming export (older engines predate it): resolved best-effort, no-op if absent.
 set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
     dlsym(h, "chudware_set_event_sink"));
+set_doc_publish_sink_ = reinterpret_cast<
+    void (*)(void (*)(const char*, const char*, const char*, void*), void*)>(
+    dlsym(h, "chudware_set_doc_publish_sink"));
 // Optional sidecar-shutdown export (older engines predate it): resolved best-effort, no-op if
 // absent — hostd's clean-shutdown tail tolerates missing sidecars support entirely.
 shutdown_sidecars_ = reinterpret_cast<void (*)(void)>(dlsym(h, "chudware_agent_sidecars_shutdown"));
@@ -233,6 +236,9 @@ return true;
     // Optional streaming export (older engines predate it): resolved best-effort.
     set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
         GetProcAddress(h, "chudware_set_event_sink"));
+    set_doc_publish_sink_ = reinterpret_cast<
+        void (*)(void (*)(const char*, const char*, const char*, void*), void*)>(
+        GetProcAddress(h, "chudware_set_doc_publish_sink"));
     // Optional sidecar-shutdown export (older engines predate it): resolved best-effort.
     shutdown_sidecars_ = reinterpret_cast<void (*)(void)>(
         GetProcAddress(h, "chudware_agent_sidecars_shutdown"));
@@ -278,6 +284,19 @@ void CppCore::setEventSink(void (*cb)(const char* event_json, void* ud), void* u
 bool CppCore::hasEventSink() {
     std::string e;
     return ensureLoaded(e) && set_event_sink_ != nullptr;
+}
+
+void CppCore::setDocPublishSink(
+    void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
+    void* ud) {
+    std::string e;
+    if (!ensureLoaded(e)) return;
+    if (set_doc_publish_sink_) set_doc_publish_sink_(cb, ud);
+}
+
+bool CppCore::hasDocPublishSink() {
+    std::string e;
+    return ensureLoaded(e) && set_doc_publish_sink_ != nullptr;
 }
 
 void CppCore::shutdownSidecars() {

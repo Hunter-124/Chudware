@@ -81,7 +81,8 @@ public:
     // Records lastWriterUser{Id,Display} on writes and includes them on doc.changed.
     void postCall(int clientId, const std::string& kind, const std::string& userId,
                   const std::string& userDisplay, const std::string& method,
-                  const nlohmann::json& params, nlohmann::json& result);
+                  const nlohmann::json& params, nlohmann::json& result,
+                  bool fanoutToSource = false);
 
     // Fan out doc.history_cleared to ALL subscribers of `docId` (including the
     // saver — exceptClient is -1 so every GUI greys undo/redo).

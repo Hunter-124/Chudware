@@ -518,8 +518,12 @@ static json snapshotPayload(const std::string& docId, long rev, int clientId,
 
 void DocRegistry::postCall(int clientId, const std::string& kind, const std::string& userId,
                            const std::string& userDisplay, const std::string& method,
-                           const json& params, json& result) {
+                           const json& params, json& result, bool fanoutToSource) {
     std::vector<PendingEvent> pending;
+    // A nested in-process agent call originates on the GUI's RPC connection but behaves as a
+    // separate AI writer: the GUI is precisely the subscriber that must see it. Keep attachment
+    // ownership on the real client id while allowing that same connection into fanout.
+    const int fanoutExclude = fanoutToSource ? -1 : clientId;
     {
         std::lock_guard<std::mutex> lk(mtx_);
 
@@ -536,7 +540,7 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                                 {"data", {{"doc_id", docId},
                                           {"reason", "closed"},
                                           {"source_kind", kind}}}};
-                    fanoutLocked(docId, evt, clientId, pending);
+                    fanoutLocked(docId, evt, fanoutExclude, pending);
                 }
                 docs_.erase(it);
             }
@@ -628,7 +632,7 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                          {"user", {{"id", userId}, {"display", userDisplay}}}};
             if (const std::string nm = sniffName(result); !nm.empty()) data["name"] = nm;
             json evt = {{"event", "doc.opened"}, {"data", data}};
-            fanoutLocked(docId, evt, clientId, pending);
+            fanoutLocked(docId, evt, fanoutExclude, pending);
             flush(pending);
             return;
         }
@@ -668,7 +672,7 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                     // still be populated without a doc_activate (see DocState::lastPush).
                     d.lastPush = data;
                     fanoutLocked(docId, json{{"event", "doc.changed"}, {"data", data}},
-                                 clientId, pending);
+                                 fanoutExclude, pending);
                 }
             }
         } else if (a.lastSeenRev < 0) {

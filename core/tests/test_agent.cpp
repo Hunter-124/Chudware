@@ -17,6 +17,19 @@
 
 using namespace chudware::agent;
 
+
+TEST_CASE("sanitize_part_name keeps revision identity in PLM") {
+    CHECK(sanitize_part_name("holster_v1") == "holster");
+    CHECK(sanitize_part_name("bracket-rev2") == "bracket");
+    CHECK(sanitize_part_name("arm gen3") == "arm");
+    CHECK(sanitize_part_name("PN-1234") == "PN-1234");
+    CHECK(sanitize_part_name("v1") == "v1");
+
+    // Version stripping happens before the existing illegal-character removal and length cap.
+    CHECK(sanitize_part_name(
+              "Very/Long:Part*Name?With<Illegal>|Characters_and_more_characters_rev12") ==
+          "VeryLongPartNameWithIllegalCharacters_and_more_c");
+}
 TEST_CASE("base64 standard encoding") {
     CHECK(base64_encode("") == "");
     CHECK(base64_encode("f") == "Zg==");

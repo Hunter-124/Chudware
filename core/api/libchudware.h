@@ -81,6 +81,14 @@ CHUDWARE_API const char* chudware_build_id(void);
 // core/hostd/main.cpp's clean-shutdown tail).
 CHUDWARE_API void chudware_agent_sidecars_shutdown(void);
 
+// Live document publication for doc_new/doc_apply_ops calls made synchronously inside an opaque
+// agent RPC. Like chudware_set_event_sink, this callback is THREAD-LOCAL and valid only for the
+// surrounding chudware_call. JSON strings are borrowed for the callback duration. Pass cb=NULL
+// to clear. Optional for hosts: older hosts simply retain end-of-run document synchronization.
+CHUDWARE_API void chudware_set_doc_publish_sink(
+    void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
+    void* ud);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

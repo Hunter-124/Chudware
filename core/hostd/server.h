@@ -128,6 +128,11 @@ private:
     // with the engine (chudware_set_event_sink); its `ud` is a StreamCtx{this, clientId}.
     void sendAgentEvent(int clientId, const char* eventJson);
     static void streamThunk(const char* eventJson, void* ud);
+    // Direct doc_new/doc_apply_ops calls nested inside an opaque agent RPC arrive here only
+    // after the engine operation returns. Feed them through DocRegistry::postCall so the normal
+    // lock-free snapshot + doc.opened/doc.changed fanout path remains the single implementation.
+    static void docPublishThunk(const char* method, const char* paramsJson,
+                                const char* resultJson, void* ud);
 
     chudware_ipc::IpcListener listener_;
     std::string buildId_;

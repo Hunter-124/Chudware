@@ -103,9 +103,17 @@ void Server::sendEventTo(int clientId, const std::string& line) {
     if (wlk.owns_lock()) c->conn.writeLine(line);
 }
 
-// Live agent-event streaming context: the C sink `ud`. Thread-local per dispatch thread; the
-// StreamCtx lives on the dispatch stack for the duration of the (synchronous) engine call.
-namespace { struct StreamCtx { hostd::Server* srv; int clientId; }; }
+// Live callback contexts. They live on the dispatch stack for the duration of the synchronous
+// engine call; both C sinks are thread-local and cleared before these objects leave scope.
+namespace {
+struct StreamCtx { hostd::Server* srv; int clientId; };
+struct DocPublishCtx {
+    hostd::Server* srv;
+    int clientId;
+    std::string userId;
+    std::string userDisplay;
+};
+}
 
 void Server::sendAgentEvent(int clientId, const char* eventJson) {
     if (!eventJson) return;
@@ -118,6 +126,27 @@ void Server::sendAgentEvent(int clientId, const char* eventJson) {
 void Server::streamThunk(const char* eventJson, void* ud) {
     auto* ctx = static_cast<StreamCtx*>(ud);
     if (ctx && ctx->srv) ctx->srv->sendAgentEvent(ctx->clientId, eventJson);
+}
+
+void Server::docPublishThunk(const char* method, const char* paramsJson,
+                             const char* resultJson, void* ud) {
+    auto* ctx = static_cast<DocPublishCtx*>(ud);
+    if (!ctx || !ctx->srv || !method || !paramsJson || !resultJson) return;
+    try {
+        json params = json::parse(paramsJson);
+        json result = json::parse(resultJson);
+        // The nested operation is an AI writer even when the outer agent_run RPC arrived on the
+        // GUI connection. fanoutToSource=true is essential: that GUI is the viewer waiting to
+        // open/update the mirror tab, while the real client id still owns the registry attach.
+        ctx->srv->registry_.postCall(ctx->clientId, "agent", ctx->userId, ctx->userDisplay,
+                                     method, params, result, /*fanoutToSource=*/true);
+    } catch (const std::exception& e) {
+        log().line("agent doc publication failed method=%s: %s", method, e.what());
+    } catch (...) {
+        // Publication is transparency, not the commit. A malformed optional callback payload
+        // must not convert already-committed modeling work into an agent failure.
+        log().line("agent doc publication failed method=%s: unknown error", method);
+    }
 }
 
 std::string Server::detachSocketForFlockRelease() {
@@ -726,19 +755,26 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     json result;
     std::string err;
     beginInflight(c.id, method);
-    // Live streaming (transparency): for agent-turn methods, push each emitted run event to THIS
-    // client as it happens instead of only the batched result. The thread-local sink fires on
-    // this dispatch thread during the synchronous engine call; cleared immediately after.
+    // Live streaming (transparency): agent events go back to the requesting client while nested
+    // document commits enter the shared registry and fan out to every subscribed GUI. Both
+    // thread-local sinks fire synchronously on this dispatch thread and are cleared by RAII.
     const bool streamThis = method.rfind("agent_", 0) == 0 ||
                             method == "session_btw" || method == "session_handoff";
+    const bool publishDocsThis = method.rfind("agent_", 0) == 0;
     StreamCtx sctx{this, c.id};
-    // RAII: clear the thread-local sink on ANY exit (incl. a throw from call()), before sctx
-    // leaves scope — sctx is declared first so it outlives this guard's destructor.
+    DocPublishCtx dctx{this, c.id, c.userId, c.userDisplay};
+    // Contexts are declared before the guard so they outlive its destructor on every exit.
     struct SinkGuard {
-        bool on;
-        ~SinkGuard() { if (on) core::cpp_core().setEventSink(nullptr, nullptr); }
-    } sinkGuard{streamThis};
+        bool eventsOn;
+        bool docsOn;
+        ~SinkGuard() {
+            if (docsOn) core::cpp_core().setDocPublishSink(nullptr, nullptr);
+            if (eventsOn) core::cpp_core().setEventSink(nullptr, nullptr);
+        }
+    } sinkGuard{streamThis, publishDocsThis};
     if (streamThis) core::cpp_core().setEventSink(&Server::streamThunk, &sctx);
+    if (publishDocsThis)
+        core::cpp_core().setDocPublishSink(&Server::docPublishThunk, &dctx);
     const bool engineOk = core::cpp_core().call(method, p, result, err);
     endInflight(c.id);
     if (!engineOk) {

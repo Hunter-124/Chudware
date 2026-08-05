@@ -34,6 +34,16 @@ using nlohmann::json;
 // bookends) is delivered here. The libchudware wiring captures them into a vector.
 using EmitFn = std::function<void(const json&)>;
 
+// Synchronous notification for document calls performed inside an opaque agent RPC. The hostd
+// registers this thread-locally before chudware_call, just like the live event sink, so direct
+// doc_new/doc_apply_ops calls can enter its normal document registry at commit boundaries.
+using DocPublishFn =
+    std::function<void(const std::string& method, const json& params, const json& result)>;
+void set_doc_publish_sink(DocPublishFn sink);
+
+// Pure filename/display-title normalization used by the mission naming lane.
+std::string sanitize_part_name(std::string name);
+
 // run_design — drive the orchestrator against a LIVE doc session.
 //
 // request       the natural-language design request.

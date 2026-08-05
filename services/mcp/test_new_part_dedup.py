@@ -9,8 +9,9 @@ duplicate existed, the next call fell through to doc_new, whose uniquifier minte
 another document. Duplicates therefore bred.
 
 These pin the resolution rule against a fake doc_list: any number of name matches RESUMES
-the best one, a lone file-stem match RESUMES too, ambiguous stems are never guessed, and
-fresh=True is the only way to force a second document.
+the best one, a lone file-stem match RESUMES too, a bumped VERSION name resumes the series
+it belongs to, ambiguous stems are never guessed, and fresh=True is the only way to force a
+second document. new_assembly answers to the same contract.
 
 Run:  python3 -m pytest services/mcp/test_new_part_dedup.py -q -p no:randomly
 """
@@ -208,3 +209,190 @@ def test_fresh_true_still_mints_over_a_collision(engine):
     assert r["doc_id"] == "doc-cppMINTED"
     assert r.get("reused") is not True
     assert r["name"] == "mudbucket2", "doc_new's uniquified name is reported, not the ask"
+
+
+# ---------------------------------------------------------------------------
+# Version series — "the next version" is a REVISION, not another document.
+# ---------------------------------------------------------------------------
+# Live 2026-08-05: one "make me an IWB holster for a Ruger LCP" request left NINE
+# documents open in the daemon at once — ruger_lcp_iwb_holster_v3 … _v11, 2-6 features
+# each, every one a successive iteration of the SAME design. The name-keyed resume
+# contract above never fired because the model asked for a NEW name each time. The cost
+# per extra document: a tab, a .step+ in the user's project folder, its own AI-VC delta
+# chain (services/plm/ai_vc.py keys chains by doc_id), its own auto-registered PLM item
+# (services/plm/vault.py registers every *.step+ under the project), and its own row in
+# the next launch's "Recover unsaved parts?" prompt.
+
+
+_HOLSTER = [
+    {"doc_id": "doc-cpp0000000a", "name": "ruger_lcp_iwb_holster_v3", "revision": 0,
+     "feature_count": 2},
+    {"doc_id": "doc-cpp00000009", "name": "ruger_lcp_iwb_holster_v4", "revision": 1,
+     "feature_count": 6},
+    {"doc_id": "doc-cpp00000003", "name": "ruger_lcp_iwb_holster_v10", "revision": 0,
+     "feature_count": 6},
+]
+
+
+def test_bumped_version_resumes_the_series_instead_of_minting(engine):
+    """The reported bug, pinned: v11 lands in the most-built open member of the series."""
+    fake = engine(_HOLSTER)
+    r = _new_part(name="ruger_lcp_iwb_holster_v11")
+
+    assert fake.new_calls == [], "a version bump must never MINT a tenth document"
+    assert r["resumed"] is True and r["reused"] is True
+    assert r["resumed_by"] == "version_series"
+    assert r["version_series"] == "ruger_lcp_iwb_holster"
+    assert r["requested_name"] == "ruger_lcp_iwb_holster_v11"
+    # Ties on feature_count break toward the higher revision, so v4 (rev 1) beats
+    # v10 (rev 0) — both carry 6 features.
+    assert r["doc_id"] == "doc-cpp00000009"
+    assert r["name"] == "ruger_lcp_iwb_holster_v4", "the REAL doc name, not the ask"
+    assert C._CUR["doc_id"] == "doc-cpp00000009"
+    # The reply has to teach the rule, or the model bumps again next turn.
+    assert "plm_timeline" in r["note"] and "plm_rollback" in r["note"]
+    assert "fresh=True" in r["note"]
+
+
+def test_first_version_of_a_new_design_still_mints(engine):
+    """Nothing in the series is open: "holster_v1" is a brand-new part and must mint.
+    Without this the fix would refuse to start a design whose name carries a version."""
+    fake = engine([
+        {"doc_id": "doc-cpp00000001", "name": "unrelated_bracket", "feature_count": 8},
+    ])
+    r = _new_part(name="holster_v1")
+
+    assert fake.new_calls == ["holster_v1"]
+    assert r.get("resumed") is not True
+
+
+def test_unversioned_base_doc_absorbs_the_first_bump(engine):
+    """The common shape: the model builds "holster", then asks for "holster_v2". The base
+    document IS the series, so v2 is a revision of it."""
+    fake = engine([
+        {"doc_id": "doc-cpp00000004", "name": "holster", "revision": 2,
+         "feature_count": 5},
+    ])
+    r = _new_part(name="holster_v2")
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-cpp00000004"
+    assert r["resumed_by"] == "version_series"
+    assert "ALREADY CARRIES 5 feature(s)" in r["note"]
+
+
+def test_a_trailing_part_number_is_not_a_version(engine):
+    """PN-1235 is a DIFFERENT part from PN-1234, and 8 in "engine_v8" is a configuration
+    only because the token says so. A bare trailing number carries no version claim, so
+    it must mint — the whole reason the version token is required and separated."""
+    fake = engine([
+        {"doc_id": "doc-cpp00000007", "name": "PN-1234", "revision": 4,
+         "feature_count": 11},
+    ])
+    r = _new_part(name="PN-1235")
+
+    assert fake.new_calls == ["PN-1235"], "a part number must not be read as a version"
+    assert r.get("resumed") is not True
+
+
+def test_an_empty_series_sibling_is_never_the_resume_target(engine):
+    """A zero-geometry leftover is not the design. Resuming one would hand the model an
+    empty document while its real work sat in another tab; the built member wins and the
+    empty one is swept."""
+    fake = engine([
+        {"doc_id": "doc-cpp00000011", "name": "holster_v2", "revision": 0,
+         "feature_count": 0, "empty": True, "kind": "part"},
+        {"doc_id": "doc-cpp00000012", "name": "holster_v3", "revision": 0,
+         "feature_count": 4, "kind": "part"},
+    ])
+    r = _new_part(name="holster_v4")
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-cpp00000012"
+    assert r.get("discarded_orphans") == ["doc-cpp00000011"]
+
+
+def test_an_assembly_is_never_a_version_of_a_part(engine):
+    """kind is part of the identity: new_part must not steer a part build into an
+    assembly document that happens to sit in the same name series."""
+    fake = engine([
+        {"doc_id": "doc-cpp00000021", "name": "gearbox_v1", "revision": 3,
+         "feature_count": 0, "component_count": 6, "kind": "assembly"},
+    ])
+    r = _new_part(name="gearbox_v2")
+
+    assert fake.new_calls == ["gearbox_v2"]
+    assert r.get("resumed") is not True
+
+
+def test_fresh_true_overrides_the_version_series_resume(engine):
+    """A deliberate variant ALONGSIDE the current one stays possible — the single escape
+    hatch the note points the model at."""
+    fake = engine(_HOLSTER)
+    r = _new_part(name="ruger_lcp_iwb_holster_v11", fresh=True)
+
+    assert fake.new_calls == ["ruger_lcp_iwb_holster_v11"]
+    assert r.get("reused") is not True
+
+
+def test_exact_name_match_still_goes_through_the_engine_mint_lock(engine):
+    """The version path must not shadow the engine's own resume. Asking for a name that
+    IS open takes doc_new(resume_if_open) — the unlocked check-then-mint pair it replaced
+    is what produced three tabs for one part (run-42508173312214)."""
+    fake = engine(_HOLSTER)
+    r = _new_part(name="ruger_lcp_iwb_holster_v10")
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-cpp00000003", "the engine's exact-name resume, not a sibling"
+    assert "resumed_by" not in r
+
+
+# ---------------------------------------------------------------------------
+# new_assembly answers to the same contract.
+# ---------------------------------------------------------------------------
+
+
+def _new_assembly(**kw):
+    return json.loads(_tool("new_assembly")(**kw))
+
+
+def test_new_assembly_resumes_an_open_assembly_of_the_same_name(engine):
+    """It used to call doc_new with no resume at all, so a retried brief left
+    "motor_mount" and "motor_mount2" side by side."""
+    fake = engine([
+        {"doc_id": "doc-cpp00000031", "name": "motor_mount", "kind": "assembly",
+         "revision": 2, "component_count": 3},
+    ])
+    r = _new_assembly(name="motor_mount")
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-cpp00000031"
+    assert r["resumed"] is True and r["kind"] == "assembly"
+
+
+def test_new_assembly_bumped_version_resumes_the_series(engine):
+    """An assembly iteration costs the user the same duplicate tab, file, PLM item and
+    recovery row as a part iteration."""
+    fake = engine([
+        {"doc_id": "doc-cpp00000032", "name": "motor_mount", "kind": "assembly",
+         "revision": 4, "component_count": 5},
+    ])
+    r = _new_assembly(name="motor_mount_v2")
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-cpp00000032"
+    assert r["resumed_by"] == "version_series"
+    assert r["name"] == "motor_mount", "the REAL doc name, not the ask"
+    assert C._CUR["doc_id"] == "doc-cpp00000032"
+
+
+def test_new_assembly_is_never_steered_into_a_part(engine):
+    """A part in the same name series must not absorb an assembly build."""
+    fake = engine([
+        {"doc_id": "doc-cpp00000033", "name": "motor_mount", "kind": "part",
+         "revision": 4, "feature_count": 9},
+    ])
+    r = _new_assembly(name="motor_mount_v2")
+
+    assert fake.new_calls == ["motor_mount_v2"]
+    assert r.get("resumed") is not True

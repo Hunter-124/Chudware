@@ -1162,7 +1162,7 @@ static const ToolGuidance kToolGuidance[] = {
     {"mission_status", "Phase-level view (stage_log, open questions) from the run's ledger; use dag_status for raw topology. Fails if the run has no ledger.", 0, 0, ""},
     {"motion_fea_handoff", "One-call worst-frame stress check on an assembly link (needs mates). dry_run=True shows the loads before you pay for the FEA solve.", 600, 0, ""},
     {"new_assembly", "Components come from FILES: build parts, save_part each, then new_assembly → asm_add_component → asm_mate → solve_mates.", 0, 0, ""},
-    {"new_part", "Returns the new doc_id and makes it current — follow with add_features; record a layout_plan first if the design has critical dims/interfaces.", 0, 0, ""},
+    {"new_part", "Returns the new doc_id and makes it current — follow with add_features. ONE DESIGN IS ONE DOCUMENT: iterate on an existing part IN PLACE, never bump the name (holster_v2, bracket-rev4) — versions live in history (plm_timeline/plm_rollback), and a bumped name is resumed, not minted.", 0, 0, ""},
     {"office_edit_csv", "Full rewrite — you must send the ENTIRE dataset every call; rows is data rows only, pass header separately. office_read_csv first to preserve what you don't change.", 0, 0, ""},
     {"office_edit_doc", "Lossy soffice round-trip (.doc→.docx→.doc) with office_edit_docx ops in the middle — legacy .doc features may not survive. Prefer office_edit_docx whenever a .docx exists.", 0, 0, ""},
     {"office_edit_docx", "paragraph_index is 0-based over body paragraphs only (no table cells); text goes into the first run and the rest are blanked — per-run formatting in the paragraph is lost.", 0, 0, ""},

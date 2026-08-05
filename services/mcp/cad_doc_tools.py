@@ -23,11 +23,13 @@ from .cad_common import (
     _SID_RE,
     _autosave,
     _doc,
-    _docs_named,
     _doc_revision,
+    _docs_in_version_series,
+    _docs_named,
     _dumps,
     _err,
     _face_hist,
+    _pick_best_doc,
     _publish_current,
     _project_save,
     _resolve_alias,
@@ -38,6 +40,7 @@ from .cad_common import (
     _start_job,
     _tmp,
     _unpublish,
+    _version_series_base,
     _write_diff,
     is_geom_query,
     normalize_geom_query,
@@ -6468,7 +6471,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             base = base.rsplit(".", 1)[0]
         return base.strip().casefold()
 
-    def _resumed_reply(entry: dict, name: str, *, by_stem: str = "") -> dict:
+    def _resumed_reply(entry: dict, name: str, *, by_stem: str = "",
+                       version_of: str = "") -> dict:
         """The new_part reply for a document RESUMED instead of minted.
 
         `entry` is either the engine's doc_new(resume_if_open=True) reply or a doc_list
@@ -6517,6 +6521,24 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 f'resumed the open part imported from "{src}" (doc_id={did}), '
                 f'whose file stem is "{name}", instead of minting a duplicate '
                 f"document" + carries)
+        elif version_of:
+            # The user's own report: nine `_v3…_v11` tabs for one holster, offered back
+            # as "parts potentially lost" on the next launch. A bumped version suffix is
+            # a REVISION of the design, and this product keeps revisions in history, not
+            # in extra documents — so say what happened and where the old state went.
+            actual = out["name"]
+            out["resumed_by"] = "version_series"
+            out["version_series"] = version_of
+            out["requested_name"] = name
+            out["note"] = (
+                f'"{name}" is the next VERSION of the open part "{actual}" '
+                f'(doc_id={did}), not a separate part — resumed it so the design stays '
+                f"ONE document, ONE file and ONE version history. Edit it IN PLACE; the "
+                f"state before this call is already checkpointed (plm_timeline lists the "
+                f"history, plm_rollback returns to an earlier point). Keep calling this "
+                f'part "{actual}" — do NOT bump the name again. Only call '
+                f"new_part(fresh=True) if you genuinely need a second variant to exist "
+                f"ALONGSIDE this one." + carries)
         else:
             others = [str(o) for o in (entry.get("duplicate_doc_ids") or [])]
             if others:
@@ -6643,6 +6665,17 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             `doc_id=` to a modeling tool to work in a specific one. The decision is made
             INSIDE doc_new (resume_if_open), under the engine's mint lock — two callers
             racing on the same name get one document, not two.
+          * NO name match, but the name is the NEXT VERSION of an open part — "holster_v4"
+            when "holster" or "holster_v3" is open and built -> resume THAT part; the reply
+            carries `resumed_by="version_series"`. A version bump is a REVISION of one
+            design, and revisions live in this product's version history (plm_timeline /
+            plm_rollback), never in extra documents: keep using the name the reply hands
+            back and edit the part in place. (Live 2026-08-05: one holster request left
+            NINE tabs — ruger_lcp_iwb_holster_v3 through _v11 — nine .step+ files in the
+            user's project folder, nine separate PLM items, and nine rows in the next
+            launch's "Recover unsaved parts?" prompt.) An explicit token is required:
+            "_v4"/"-rev2"/" gen3" are versions; a trailing bare number is not, because
+            "PN-1235" is a different part from "PN-1234".
           * NO name match, but exactly ONE open part whose FILE STEM is `name`
             (import_part("Projects/Testing/mudbucket.step+") often leaves the doc named
             after the file) -> resume that one; the reply carries `resumed_by="path_stem"`.
@@ -6674,6 +6707,23 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     # part edited is worse than one extra document.
                     if len(stemmed) == 1:
                         return _dumps(_resumed_reply(stemmed[0], name, by_stem="path_stem"))
+                    # "holster_v4" while "holster_v3" is open and built: the model is on
+                    # its next iteration, not its next part. Resume the most-built member
+                    # of the series so the design stays one document with one history.
+                    # Checked AFTER the stem match — a file the user actually opened is a
+                    # stronger identification than a name pattern.
+                    series = _docs_in_version_series(docs, name)
+                    best = _pick_best_doc(series)
+                    if best is not None:
+                        out = _resumed_reply(
+                            best, name, version_of=_version_series_base(name))
+                        dropped = _discard_unbuilt_orphans(name, best["doc_id"])
+                        if dropped:
+                            out["discarded_orphans"] = dropped
+                            out["note"] += (
+                                f"; closed {len(dropped)} empty leftover document(s) of "
+                                f"the same series ({', '.join(dropped)})")
+                        return _dumps(out)
             # The NAME check is NOT made here. It used to be — an unlocked doc_list
             # "is it open?" followed by a separate doc_new mint, with nothing holding
             # across the two. When the user retried a request whose first worker was still
@@ -6940,8 +6990,26 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 # got a SECOND document, "fkey_live2", carrying 2 of the part's features
                 # while the other 7 stayed behind. One requested part, two tabs. The
                 # atomic-mint fix landed on the tool; this is its batch-op twin.
+                head_name = head.get("name") or head.get("part") or "part"
+                # …and its version-series twin: a batch head that bumps the version
+                # ("holster_v4" while "holster_v3" is open and built) is the next
+                # REVISION of one design, not a second part. Same rule as the tool, so a
+                # model cannot dodge it by opening a batch with the create instead.
+                series = _pick_best_doc(_docs_in_version_series(
+                    [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                     if isinstance(e, dict) and e.get("doc_id")], head_name))
+                if series is not None:
+                    created = series["doc_id"]
+                    _CUR["doc_id"] = created
+                    interpreted.append(
+                        f'"{head_name}" is the next VERSION of the open part '
+                        f'"{series.get("name")}" (doc_id={created}, '
+                        f'{series.get("feature_count")} feature(s)) — built this batch '
+                        f"into it so the design stays ONE document with ONE version "
+                        f"history; keep using that name")
+                    continue
                 r = cb.call("doc_new", {"kind": "part", "resume_if_open": True,
-                                        "name": head.get("name") or head.get("part") or "part"})
+                                        "name": head_name})
                 created = r.get("doc_id")
                 _CUR["doc_id"] = created
                 if r.get("reused"):
@@ -6949,7 +7017,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     # geometry — the next write-diff would report "0.0 -> X" instead of
                     # the true delta (same hazard _resumed_reply documents).
                     interpreted.append(
-                        f'resumed the open part "{r.get("name") or head.get("name")}" '
+                        f'resumed the open part "{r.get("name") or head_name}" '
                         f'(doc_id={created}, {r.get("feature_count")} feature(s)) for this '
                         f"batch instead of minting a duplicate document")
                 else:

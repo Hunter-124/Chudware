@@ -1678,7 +1678,7 @@
    "prompt_note": "Components come from FILES: build parts, save_part each, then new_assembly → asm_add_component → asm_mate → solve_mates."
   },
   "new_part": {
-   "prompt_note": "Returns the new doc_id and makes it current — follow with add_features; record a layout_plan first if the design has critical dims/interfaces."
+   "prompt_note": "Returns the new doc_id and makes it current — follow with add_features. ONE DESIGN IS ONE DOCUMENT: iterate on an existing part IN PLACE, never bump the name (holster_v2, bracket-rev4) — versions live in history (plm_timeline/plm_rollback), and a bumped name is resumed, not minted."
   },
   "office_edit_csv": {
    "prompt_note": "Full rewrite — you must send the ENTIRE dataset every call; rows is data rows only, pass header separately. office_read_csv first to preserve what you don't change."

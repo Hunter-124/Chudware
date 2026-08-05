@@ -398,8 +398,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "new_part": {
         "prompt_note": (
-            "Returns the new doc_id and makes it current — follow with add_features; "
-            "record a layout_plan first if the design has critical dims/interfaces."
+            "Returns the new doc_id and makes it current — follow with add_features. "
+            "ONE DESIGN IS ONE DOCUMENT: iterate on an existing part IN PLACE, never "
+            "bump the name (holster_v2, bracket-rev4) — versions live in history "
+            "(plm_timeline/plm_rollback), and a bumped name is resumed, not minted."
         ),
     },
     "preflight_ops": {

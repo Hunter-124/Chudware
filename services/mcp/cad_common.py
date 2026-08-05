@@ -382,6 +382,92 @@ def _docs_named(docs: list, value: str) -> list:
     return [e for e in docs if (e.get("name") or "").strip().casefold() == folded]
 
 
+# ---------------------------------------------------------------------------
+# Version-series resolution — "the next version" is a REVISION, not a new part.
+# ---------------------------------------------------------------------------
+# Live 2026-08-05: one holster request left NINE documents open at once —
+# ruger_lcp_iwb_holster_v3 … _v11, each 2-6 features, each a successive iteration of
+# the SAME design. new_part's resume contract is keyed on the NAME, so it only catches
+# a model that asks for the same name twice; a model that bumps a version suffix every
+# iteration sails straight past it and mints. Each mint then costs a tab, a .step+ in
+# the user's project folder, its own AI-VC delta chain (services/plm/ai_vc.py keys the
+# chain by doc_id), its own auto-registered PLM item (services/plm/vault.py
+# _explode_project_into_shadow registers every *.step+ it finds under the project as a
+# fresh item), and — because nothing closes mission docs — its own row in the next
+# launch's "Recover unsaved parts?" prompt.
+#
+# A trailing EXPLICIT version token is an unambiguous statement of "version N of the
+# thing I already have". A trailing bare NUMBER is not (PN-1235 is a different part from
+# PN-1234, and 8 in "engine_v8" is a configuration), so the token is REQUIRED and must
+# be separated: "holster_v4"/"bracket-rev2"/"arm gen3" are versions, "PN-1235" and
+# "holster4" are not (the latter is already the engine uniquifier's own series — see
+# _in_name_series in cad_doc_tools).
+_VERSION_SUFFIX_RE = re.compile(
+    r"[\s._\-]+(?:v|ver|vers|version|rev|revision|mk|mark|gen|iter|iteration"
+    r"|attempt|try|pass|round)\s*(\d{1,4})$",
+    re.IGNORECASE,
+)
+
+
+def _version_series_base(name: Optional[str]) -> str:
+    """`name` with a trailing explicit version token stripped, or "" when it carries none.
+
+    "holster_v4" -> "holster"; "bracket-rev2" -> "bracket"; "arm gen 3" -> "arm";
+    "PN-1235" -> "" (a part number, not a version); "holster" -> "".
+    """
+    n = (name or "").strip()
+    m = _VERSION_SUFFIX_RE.search(n)
+    if not m:
+        return ""
+    return n[: m.start()].strip(" ._-")
+
+
+def _docs_in_version_series(docs: list, name: str, kind: str = "part") -> list:
+    """Open, non-empty `kind` docs that are an EARLIER VERSION of `name`.
+
+    Membership is base-to-base, so "holster", "holster_v3" and "holster-rev7" are one
+    series. Excluded deliberately:
+      * the exact name asked for — that is the engine's own resume_if_open path, decided
+        under its mint lock, and second-guessing it here reintroduces the unlocked
+        check-then-mint race that produced three tabs for one part (run-42508173312214);
+      * a different `kind` — a part is never a version of an assembly;
+      * EMPTY siblings — a zero-content leftover is not the design. Resuming one would
+        hand the model an empty document while its real work sat in another tab;
+        _discard_unbuilt_orphans closes those instead.
+    """
+    base = _version_series_base(name)
+    if not base:
+        return []
+    folded = base.casefold()
+    asked = (name or "").strip().casefold()
+    out = []
+    for e in docs:
+        if not isinstance(e, dict) or not e.get("doc_id"):
+            continue
+        if (e.get("kind") or "part") != kind:
+            continue
+        n = (e.get("name") or "").strip()
+        if not n or n.casefold() == asked:
+            continue
+        if n.casefold() != folded and _version_series_base(n).casefold() != folded:
+            continue
+        if not ((e.get("feature_count") or 0) or (e.get("component_count") or 0)):
+            continue
+        out.append(e)
+    return out
+
+
+def _pick_best_doc(rows: list) -> Optional[dict]:
+    """The document a resume should land on: most features, then highest revision, then
+    latest in `doc_list` (which is oldest-first, so the newest wins a tie). Mirrors the
+    engine's own resume_if_open ranking (core/doc/session.cpp resume_open_doc)."""
+    if not rows:
+        return None
+    return max(enumerate(rows),
+               key=lambda t: ((t[1].get("feature_count") or 0),
+                              (t[1].get("revision") or 0), t[0]))[1]
+
+
 def _doc_near_misses(docs: list, value: str) -> list:
     """Docs whose name is CLOSE to `value` ("flanged_bushing" for "flanged_bushing_design").
     Only ever offered as a hint, never auto-resolved: editing the wrong part is worse than

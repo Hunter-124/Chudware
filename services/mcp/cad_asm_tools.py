@@ -12,16 +12,19 @@ from .cad_common import (
     _autosave_all_open,
     _describe_type,
     _doc,
+    _docs_in_version_series,
     _dumps,
     _err,
     _is_empty_slot_word,
     _merge_face_sets,
     _normalize_optional_slot,
     _persist_study,
+    _pick_best_doc,
     _publish_current,
     _resolve_face_points,
     _resolve_material,
     _tmp,
+    _version_series_base,
     cb,
     coerce_json_or_repr,
     require_list,
@@ -86,13 +89,51 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         For a quick static stack-up WITHOUT mates, a multi-body part (import_part into= +
         transform features) also works — but only an assembly gives you mates, motion
         (simulate_motion) and per-component BOM identity.
+
+        ONE DESIGN IS ONE DOCUMENT, exactly as for new_part: an assembly of that name that
+        is already open is RESUMED, and so is the assembly this one is the next VERSION of
+        ("motor_mount_v2" while "motor_mount" is open with components). Iterating by
+        bumping the name gives the user a duplicate tab, a duplicate file, a duplicate PLM
+        item and a "Recover unsaved parts?" row per round; the versions of one design live
+        in its history (plm_timeline / plm_rollback). Reuse the name the reply hands back.
         """
         try:
-            r = cb.call("doc_new", {"kind": "assembly", "name": name})
+            docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                    if isinstance(e, dict) and e.get("doc_id")]
+            series = _pick_best_doc(_docs_in_version_series(docs, name, kind="assembly"))
+            if series is not None:
+                did = series["doc_id"]
+                _CUR["doc_id"] = did
+                actual = series.get("name") or name
+                return _dumps({
+                    "ok": True, "doc_id": did, "name": actual, "kind": "assembly",
+                    "revision": series.get("revision", 0),
+                    "reused": True, "resumed": True, "resumed_by": "version_series",
+                    "version_series": _version_series_base(name),
+                    "requested_name": name,
+                    "component_count": series.get("component_count"),
+                    "note": f'"{name}" is the next VERSION of the open assembly '
+                            f'"{actual}" (doc_id={did}), not a separate assembly — '
+                            f"resumed it so the design stays ONE document with ONE "
+                            f"version history (plm_timeline / plm_rollback). Edit it in "
+                            f'place and keep calling it "{actual}".'})
+            # resume_if_open makes the engine decide check-and-mint under its mint lock,
+            # so two callers racing on one name get one document (the same contract
+            # new_part relies on — see cad_doc_tools.new_part and core/doc/session.cpp).
+            r = cb.call("doc_new", {"kind": "assembly", "name": name,
+                                    "resume_if_open": True})
             did = r.get("doc_id")
             _CUR["doc_id"] = did
-            return _dumps({"ok": True, "doc_id": did, "name": name, "kind": "assembly",
-                           "revision": r.get("revision", 0)})
+            # doc_new UNIQUIFIES a colliding name; report what the document is really
+            # called, never the ask, or every later name-based lookup repeats the lie.
+            out = {"ok": True, "doc_id": did, "name": r.get("name") or name,
+                   "kind": "assembly", "revision": r.get("revision", 0)}
+            if r.get("reused"):
+                out.update(reused=True, resumed=True,
+                           component_count=r.get("component_count"),
+                           note=f'resumed the open assembly "{out["name"]}" '
+                                f"(doc_id={did}) instead of minting a duplicate document")
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

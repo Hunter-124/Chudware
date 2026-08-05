@@ -6360,3 +6360,63 @@ approximate, so a model can report it as a measurement — the inline run's own
 `interface_check` rejecting `other_doc_id` (dialect gap; the harness named it correctly
 and the model recovered), and a child node that outspends its grant being labelled
 `revoked` after finishing its work rather than `done` (audit-trail cosmetics).
+
+
+## 2026-08-05 — one design is one document: version bumps resume instead of minting
+
+Reported with a screenshot of nine tabs — `AI: ruger_lcp_iwb_holster_v3` … `_v11` — after
+accepting a "Recover unsaved parts?" prompt on launch. Read off the user's live daemon
+(`hostd-d01409dcb94e6cb5.sock`, `doc_list`): nine part documents, 2–6 features each,
+successive iterations of ONE holster; `recovery_pending: 0` because the prompt had already
+been accepted and every row opened as a tab.
+
+No code produced the `_vN` suffix — the MODEL picks the name. `new_part`'s duplicate guard
+is keyed on the NAME (`doc_new(resume_if_open)`, decided under the engine's mint lock), so
+a model that bumps a version every iteration never collides and mints every time. Each
+extra mint costs a tab, a `.step+` in the user's project folder, its own AI-VC delta chain
+(`services/plm/ai_vc.py` keys chains by `doc_id`), its own auto-registered PLM item
+(`services/plm/vault.py::_explode_project_into_shadow` rglobs every `*.step+` under the
+project and registers any unknown path as a NEW item, not a revision), and — nothing closes
+mission docs, and `host/src/app.cpp` deliberately only *detaches* un-adopted AI mirror tabs
+on exit — its own row in the next launch's recovery prompt. That chain is the whole reported
+symptom; the recovery flood is a consequence of the mint count, not a separate bug.
+
+Fix at the one seam that mints: `_version_series_base` / `_docs_in_version_series` /
+`_pick_best_doc` in `services/mcp/cad_common.py`, wired into `new_part`, its `add_features`
+batch-head twin (`{"op":"new_part",…}`), and `new_assembly` (which had no resume contract at
+all and would uniquify to `motor_mount2`). A trailing EXPLICIT, separated version token —
+`_v4`, `-rev2`, ` gen3`, `_iter7`, `_mk3`, `_attempt2` — means "the next version of what I
+already have": resume the most-built member of the series. A trailing bare NUMBER does not
+(`PN-1235` is a different part from `PN-1234`), so the token is required. Checked AFTER the
+path-stem match (a file the user actually opened is the stronger identification) and never
+for the exact name asked for (that stays the engine's locked resume). Empty siblings are
+never the resume target and get swept by `_discard_unbuilt_orphans`; `fresh=True` still
+forces a deliberate variant alongside. Reply carries `resumed_by="version_series"` and a
+note pointing at `plm_timeline`/`plm_rollback`.
+
+Measured live against the real engine (`CHUDWARE_ENGINE_DAEMON=0`), replaying
+holster → holster_v2 → holster_v3 → holster_v4 with a feature per round:
+
+| | before | after |
+|---|---|---|
+| open documents / tabs | 4 | 1 |
+| `.step+` in the project folder | 4 | 1 |
+| AI-VC chains (version histories) | 4 | 1 |
+| checkpoints in the surviving chain | 2 | 8 |
+
+The model side too, since the harness guard should be the backstop and not the teacher:
+`ONE DESIGN IS ONE DOCUMENT` in `services/agent/roles/model3d.yaml` +
+`prompts/model3d.md` (YAML wins for the Python path, `.md` is what C++ `agent_run_v2`
+reads — both need it), `roles/feature_modeler.yaml`, and the `new_part` prompt_note in
+`services/agent/tool_guidance/cad.py` (regenerate `tool_panel_tables.h`/`.snapshot.json`
+with `tools/gen_tool_panel_tables.py`). Those geometry roles previously had zero mention
+of PLM versioning — the roles doing the iterating did not know history existed.
+
+Deferred, found while tracing and left alone: `services/agent/scaffolds.py`
+`refine_pass_limit`/`should_stop_refine` (WI-10) are dead — only their own unit tests call
+them, so nothing bounds how many times a mission re-mints geometry; and
+`services/agent/test_mega28_terminal.py::_drive` monkeypatches
+`loop._terminal_autosave_close_docs` / `loop._drive_phases_from_dag`, which T-RF5 deleted
+and C++ never re-implemented — `_drive` is defined but never called, so the mission-terminal
+close it claims to test does not exist. `.claude/skills/chudware-dev/SKILL.md` still
+describes that mechanism as live.

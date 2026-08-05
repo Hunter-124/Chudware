@@ -114,9 +114,20 @@ judgment).
 - **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
   with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
   (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
-- **Mission terminal:** loop autosaves mission-minted geometry as `.step+` into the run
-  `parts/` dir + GUI workspace, then closes those docs (GUI-adopted exempt)
-  (`services/agent/loop.py` `_terminal_autosave_close_docs`).
+- **Mission docs are NEVER closed** (verified 2026-08-05). T-RF5 deleted
+  `services/agent/loop.py`'s `_terminal_autosave_close_docs` / `_drive_phases_from_dag` and
+  C++ never re-implemented them: `core/agent/run.cpp` only `doc_save`s at milestones and
+  terminal, with zero `doc_close`/`doc_discard`. `test_mega28_terminal.py::_drive` still
+  monkeypatches those names but is never called. So every mission-minted doc stays open,
+  the GUI only *detaches* un-adopted AI mirror tabs on exit (`host/src/app.cpp` ~7069), and
+  hostd's crash-only retire tier turns each one into a "Recover unsaved parts?" row. Keep
+  the mint count down (see below) rather than assuming a terminal sweep exists.
+- **One design is one document:** an iteration is a REVISION, never another doc. A version
+  bump (`part_v4`, `-rev2`, `gen3`) RESUMES the series in `new_part` / `new_assembly` /
+  the `add_features` `{"op":"new_part"}` batch head (`_docs_in_version_series` in
+  `services/mcp/cad_common.py`); `fresh=True` is the only escape. Every extra mint costs a
+  tab, a project `.step+`, its own AI-VC chain (keyed by `doc_id`), its own auto-registered
+  vault item (`services/plm/vault.py` rglobs the project on save), and a recovery row.
 - **config.json keys:** `saveSettings` merge-overlays `keys`/`experimental` — never
   full-replace them (harness `keys.openrouter` must survive a GUI save).
 - **agent_turn edits:** standing mega-24 offline planning-node repro gate

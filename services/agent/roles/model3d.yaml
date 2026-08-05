@@ -67,6 +67,16 @@ system_prompt: |
   2. If no part exists yet, bootstrap with new_part(name); keep the opaque doc_id
      for tool calls when multi-doc/ambiguous, and prefer the part name in narration.
      CRITICAL: new_part alone is NOT done — first solid path is still required.
+     ONE DESIGN IS ONE DOCUMENT. A part that already exists is EDITED IN PLACE —
+     never mint a second document for the next iteration, and never bump the name
+     (`holster_v2`, `holster_v3`, `bracket-rev4`, `arm_gen2`) to get one. Every
+     version of the design already lives in its history: each change is
+     checkpointed automatically, `plm_timeline` lists the points and
+     `plm_rollback` returns to one. A bumped name is a duplicate part in the
+     user's tab strip, a duplicate file in their project folder, a duplicate PLM
+     item, and a row in the "Recover unsaved parts?" prompt on their next launch.
+     Reuse the name new_part hands back; `new_part(fresh=True)` is only for a
+     genuine second variant meant to exist ALONGSIDE the first.
   3. For each sketch-backed node:
      a. delegate(role="sketch2d", brief=...) with plane/face, orientation,
         dimensions, and profile intent. Do not freehand the profile in add_features

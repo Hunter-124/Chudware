@@ -297,7 +297,8 @@ def _appearance_family(name: str) -> str:
     ("grade 5 titanium", "titanium"),
     # copper alloys and polymers
     ("C360", "brass"), ("C360 brass", "brass"), ("C110", "copper"),
-    ("PLA", "plastic"), ("ABS", "abs"), ("nylon", "nylon"), ("polyamide", "nylon"),
+    ("PETG", "plastic"), ("pla", "plastic"), ("ABS", "abs"), ("nylon", "nylon"),
+    ("polyamide", "nylon"),
 ])
 def test_appearance_designation_lands_on_the_right_family(spelling, family):
     assert _appearance_family(spelling) == family

@@ -1,7 +1,7 @@
-"""test_agent_turn.py — T-W30 bounded tool-executing agent turn.
+"""test_agent_turn.py — T-W30 tool-executing agent turn.
 
-Proves the turn parses model tool calls, dispatches them, feeds results back, is
-bounded by the tool budget, and never fabricates success on an empty turn.
+Proves tool dispatch, finish handling, sub-agent soft warnings and runaway
+ceilings, and that empty/forced turns never fabricate success.
 """
 from __future__ import annotations
 import json
@@ -67,13 +67,18 @@ def test_turn_denies_out_of_allowlist_tool():
     assert any(c.get("error") for c in res.result["calls"])
 
 
-def test_turn_bounded_by_budget():
-    # Always asks for another tool; must stop at the budget with a retry verdict.
+def test_subagent_turn_stops_at_hard_ceiling(monkeypatch):
+    # The soft threshold warns at three; only the separate hard ceiling stops.
+    monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 6)
     provider = _ScriptedProvider(
         ['```json\n{"tool": "measure_part", "args": {}}\n```'] * 20)
-    res = agent_turn.run_turn("loop", provider, allowed_tools=["measure_part"],
-                              max_tool_calls=3, tool_dispatch=lambda t, a: {"ok": True})
-    assert res.result["tool_calls"] == 3
+    res = agent_turn.run_turn(
+        "loop", provider, allowed_tools=["measure_part"],
+        max_tool_calls=3, tool_dispatch=lambda t, a: {"ok": True},
+        subagent_id="dg_test_hard_ceiling",
+    )
+    assert res.result["tool_calls"] == 6
+    assert res.result["forced_stop"] == "subagent_hard_ceiling"
     assert res.stop_reason == "max_iters"
 
 
@@ -220,11 +225,9 @@ def test_role_schema_handoff_counts_as_done():
     assert res.result["handoff"]["outputs"]["spec"]["deliverable_id"] == "DL1"
 
 
-def test_budget_exhaust_after_ledger_note_auto_completes():
-    """Grok-4.5 SPECIFY: 7–8 productive tool calls ending in ledger_note, no
-    formal done envelope → max_iters → escalate → specify_incomplete. A write
-    to the ledger is enough evidence to complete the node."""
-    # budget=3: three tool calls then the loop stops mid-turn.
+def test_no_formal_handoff_after_ledger_note_auto_completes():
+    """Productive ledger work may still be salvaged when the model drifts into
+    no-code without a formal handoff; this is not a forced-stop path."""
     provider = _ScriptedProvider([
         '```json\n{"tool": "fit_calc", "args": {"nominal": 20, "fit": "H7/h7"}}\n```',
         '```json\n{"tool": "ledger_note", "args": {"kind": "dimension", '
@@ -248,8 +251,9 @@ def test_budget_exhaust_after_ledger_note_auto_completes():
     assert res.result["handoff"]["outputs"]["wrote_ledger"] is True
 
 
-def test_budget_exhaust_without_ledger_write_still_retries():
-    """Research-only budget burn must still return max_iters (no silent success)."""
+def test_hard_ceiling_without_ledger_write_still_retries(monkeypatch):
+    """Research-only runaway work must return max_iters (no silent success)."""
+    monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 6)
     provider = _ScriptedProvider(
         ['```json\n{"tool": "fit_calc", "args": {"nominal": 20}}\n```'] * 10
     )
@@ -259,8 +263,10 @@ def test_budget_exhaust_without_ledger_write_still_retries():
         allowed_tools=["fit_calc"],
         max_tool_calls=3,
         tool_dispatch=lambda t, a: {"ok": True},
+        subagent_id="dg_research_hard_ceiling",
     )
     assert res.stop_reason == "max_iters"
+    assert res.result["forced_stop"] == "subagent_hard_ceiling"
 
 
 def test_no_code_after_ledger_note_auto_completes():
@@ -468,7 +474,7 @@ def test_provider_error_carries_stop_reason_and_error_detail():
     assert res.result.get("stop_reason") == "provider_auth"
 
 
-def test_no_code_and_budget_carry_error_detail():
+def test_no_code_and_hard_ceiling_carry_error_detail(monkeypatch):
     empty = agent_turn.run_turn(
         "go", _ScriptedProvider(["I am not sure what to do."]),
         tool_dispatch=lambda t, a: {},
@@ -477,6 +483,7 @@ def test_no_code_and_budget_carry_error_detail():
     assert empty.stop_reason == "no_code"
     assert empty.result.get("error_detail")
 
+    monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 6)
     budget = agent_turn.run_turn(
         "loop",
         _ScriptedProvider(
@@ -484,10 +491,11 @@ def test_no_code_and_budget_carry_error_detail():
         allowed_tools=["measure_part"],
         max_tool_calls=3,
         tool_dispatch=lambda t, a: {"ok": True},
+        subagent_id="dg_error_detail_ceiling",
     )
     assert budget.stop_reason == "max_iters"
     assert budget.result.get("error_detail")
-    assert "call" in budget.result["error_detail"].lower()
+    assert "hard runaway ceiling" in budget.result["error_detail"].lower()
 
 
 def test_provider_raises_not_budget_exhausted():
@@ -531,8 +539,9 @@ def test_provider_raises_not_budget_exhausted():
     assert res.result.get("error_detail")
 
 
-def test_tool_budget_path_names_tool_call_budget():
-    """Genuine tool-budget exhaustion still names the tool-call budget + limit."""
+def test_subagent_hard_ceiling_names_forced_stop(monkeypatch):
+    """A forced stop names the hard runaway ceiling, not the soft budget."""
+    monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 6)
     budget = agent_turn.run_turn(
         "loop",
         _ScriptedProvider(
@@ -540,12 +549,12 @@ def test_tool_budget_path_names_tool_call_budget():
         allowed_tools=["measure_part"],
         max_tool_calls=3,
         tool_dispatch=lambda t, a: {"ok": True},
+        subagent_id="dg_named_ceiling",
     )
     assert budget.stop_reason == "max_iters"
     detail = budget.result.get("error_detail") or ""
-    assert "tool-call budget" in detail.lower()
-    assert "3" in detail  # limit visible
-    assert "budget exhausted" in detail.lower()
+    assert "hard runaway ceiling" in detail.lower()
+    assert "soft" not in detail.lower()
 
 
 def test_scrub_secrets_redacts_keys():

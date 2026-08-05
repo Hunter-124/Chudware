@@ -61,6 +61,14 @@ _GUARD_BLOCKED = "guardrail_blocked"
 # exists. Reporting it as max_iters would blame a tool-call budget that never ran out.
 _REFINE_CAP = "refine_cap"
 
+# Interactive main-chat turns have no work budget. This is only a runaway
+# billing backstop for a model that never converges; normal builds must never
+# reach it (the 2026-08-05 holster build was still ordinary work at 30 calls).
+MAIN_CHAT_RUNAWAY_TOOL_CALL_BACKSTOP = 256
+# Sub-agent budgets are soft convergence warnings. This separate ceiling is the
+# last-resort runaway stop and stays above the Settings slider's 64-call maximum.
+SUBAGENT_HARD_TOOL_CALL_CEILING = 128
+
 # Human-facing error_detail scrubbers (never leak keys/tokens to the GUI).
 _SECRET_RE = re.compile(
     r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|authorization)"
@@ -1631,15 +1639,21 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         getattr(mission_dispatch, "phase", None) if mission_dispatch is not None else None
     )
     _budget_in = max_tool_calls if max_tool_calls is not None else 16
-    _capped = False
     if _sc is not None and _cap is not None:
-        _budget_in, _capped = _sc.apply_phase_cap(
+        _budget_in, _ = _sc.apply_phase_cap(
             _cap, _phase, int(_budget_in) if max_tool_calls is not None else None,
             ledger=ledger, actor=actor or name,
         )
         if _budget_in is None:
             _budget_in = 16
-    budget = int(_budget_in)
+    _soft_tool_call_budget = max(1, int(_budget_in))
+    # max_tool_calls is a convergence warning for sub-agents, never a main-chat
+    # work budget. Both lanes retain a separate high runaway ceiling.
+    budget = (
+        max(SUBAGENT_HARD_TOOL_CALL_CEILING, _soft_tool_call_budget * 2)
+        if subagent_id
+        else MAIN_CHAT_RUNAWAY_TOOL_CALL_BACKSTOP
+    )
     completion_cap = int(max_tokens) if max_tokens else 2048
     _tool_call_counts: dict[str, int] = {}
     # WI-10 refine cap. A "refine round" is geometry re-worked AFTER the model itself
@@ -2144,6 +2158,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     # knob is lane-scoped and `auto_enable_packs` already marks the one lane it
     # applies to (the interactive general_agent turn), so no caller changes.
     _tasklist_nudge = [0]
+    # One soft-budget convergence warning per sub-agent turn. It deliberately
+    # does not stop dispatch; only the separate runaway ceiling can do that.
+    _tool_budget_nudge = [0]
+    _forced_tool_stop: str | None = None
     _tasklist_pref = "off"
     if auto_enable_packs:
         try:
@@ -2334,7 +2352,9 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     # the moment a call fails or is refused, so the model always reacts to bad
     # news itself instead of the harness pushing on through a broken state.
     pending_directives: list[dict] = []
-    for _ in range(budget + 1):
+    # Warning/corrective iterations may deliberately dispatch no tool. Give
+    # those bounded nudges room without lowering the separate tool-call ceiling.
+    for _ in range((budget * 2) + 1):
         queued: dict | None = (
             pending_directives.pop(0) if pending_directives else None)
         # Phase 4 (M11/M16/M17): the sub-agent turn boundary. Cross-process
@@ -2937,8 +2957,13 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     "status": "done",
                     "summary": (reply or "")[:600],
                     "outputs": {
+                        "auto_complete": True,
                         "text": reply[:2000],
                         "tool_calls": tool_calls_made,
+                        "wrote_ledger": any(
+                            c.get("ok") and c.get("tool") == "ledger_note"
+                            for c in calls
+                        ),
                         "reasoning_summary": (
                             "Bare natural-language finish after tool calls; "
                             "accepted as role handoff (plan/build/specify class)."
@@ -2956,10 +2981,18 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 bare_handoff = _attach_typed_refusal_if_needed(
                     bare_handoff, calls,
                 )
-                return TurnResult(True, _DONE,
-                                  _with_usage(
-                                      {"handoff": bare_handoff, "calls": calls},
-                                      _tu))
+                return TurnResult(
+                    True,
+                    _DONE,
+                    _with_usage(
+                        {
+                            "handoff": bare_handoff,
+                            "calls": calls,
+                            "auto_complete": True,
+                        },
+                        _tu,
+                    ),
+                )
             # mega-24 a2: zero-tool no_code — force one tool then continue once.
             if tool_calls_made == 0 and not _force_once[0]:
                 _force_once[0] = True
@@ -3169,8 +3202,13 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     "status": "done",
                     "summary": (reply or "")[:600],
                     "outputs": {
+                        "auto_complete": True,
                         "text": (reply or "")[:2000],
                         "tool_calls": tool_calls_made,
+                        "wrote_ledger": any(
+                            c.get("ok") and c.get("tool") == "ledger_note"
+                            for c in calls
+                        ),
                         "reasoning_summary": (
                             "Non-tool JSON after tool calls; accepted as "
                             "role handoff (mega-24c junk-JSON floor)."
@@ -3190,10 +3228,18 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 bare_handoff = _attach_typed_refusal_if_needed(
                     bare_handoff, calls,
                 )
-                return TurnResult(True, _DONE,
-                                  _with_usage(
-                                      {"handoff": bare_handoff, "calls": calls},
-                                      _tu))
+                return TurnResult(
+                    True,
+                    _DONE,
+                    _with_usage(
+                        {
+                            "handoff": bare_handoff,
+                            "calls": calls,
+                            "auto_complete": True,
+                        },
+                        _tu,
+                    ),
+                )
             if not _force_once[0]:
                 _force_once[0] = True
                 calls, tool_calls_made, forced = _force_first_tool(
@@ -3548,10 +3594,32 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
 
 
         if tool_calls_made >= budget:
-            last_reason = (
-                "phase_step_cap" if _capped else _RETRY
+            _forced_tool_stop = (
+                "subagent_hard_ceiling"
+                if subagent_id else "main_chat_runaway_backstop"
             )
+            last_reason = _RETRY
             break
+        if (
+            subagent_id
+            and tool_calls_made >= _soft_tool_call_budget
+            and _tool_budget_nudge[0] < 1
+        ):
+            _tool_budget_nudge[0] += 1
+            messages.append({"role": "user", "content": _parts(
+                f"[TOOL-CALL BUDGET] You have made {tool_calls_made} tool "
+                "calls, reaching this sub-agent's soft warning threshold. "
+                "Converge now: complete only essential remaining work and emit "
+                "a formal handoff. This is a warning, not a stop."
+            )})
+            _log(ledger, actor, {
+                "event": "subagent_tool_budget_warning",
+                "tool_calls": tool_calls_made,
+                "soft_threshold": _soft_tool_call_budget,
+                "hard_ceiling": budget,
+            })
+            last_reason = _RETRY
+            continue
 
         tool_calls_made += 1
         import time as _time  # noqa: PLC0415
@@ -4246,7 +4314,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     # researched thoroughly but never emitted a formal done envelope —
     # observed on grok-4.5 and locals alike (tool syntax perfect, 7–8 calls,
     # zero handoff). Two failure modes:
-    #   * budget exhaust (max_iters / phase_step_cap)
+    #   * forced runaway stop (max_iters)
     #   * post-write junk JSON / prose that is neither tool nor done (no_code)
     # Strong signal: a successful WRITE / BUILD tool means the node did its job;
     # synthesise a done handoff so the phase can exit. Research-only tools
@@ -4367,14 +4435,15 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     except Exception:  # noqa: BLE001 — force never breaks the turn
         pass
     if (tool_calls_made > 0
+            and _forced_tool_stop is None
             and last_reason in (_RETRY, "phase_step_cap", _NOCODE, _GUARD_BLOCKED)
             and wrote):
         synth = {
             "status": "done",
             "summary": (
                 f"auto-completed after {tool_calls_made} tool calls "
-                f"(budget={budget}, reason={last_reason}); model did not "
-                f"emit a formal handoff envelope"
+                f"(reason={last_reason}); model did not emit a formal "
+                "handoff envelope"
             ),
             "outputs": {
                 "auto_complete": True,
@@ -4411,9 +4480,9 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     "plan", "geometry", "assembly", "ecad", "firmware",
                 ],
                 "why_flat": (
-                    "Node exhausted tool budget after productive ledger/plan "
-                    "reads or product writes; staying flat for this attempt "
-                    "with synthesised typed refusal (mega-24)."
+                    "Node ended after productive ledger/plan reads or product "
+                    "writes; staying flat for this attempt with synthesised "
+                    "typed refusal (mega-24)."
                 ),
             }
         _log(ledger, actor, {"event": "turn", "kind": "done",
@@ -4429,8 +4498,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         # Empty bootstrap (new_part / ecad_new_schematic / fw_new_project without
         # product mutators) is NOT product success — return non-success so the
         # node can retry instead of auto-done.
-        status = "blocked" if bootstrapped_only else "done"
-        ok_turn = not bootstrapped_only
+        status = (
+            "blocked" if bootstrapped_only or _forced_tool_stop else "done"
+        )
+        ok_turn = not bootstrapped_only and _forced_tool_stop is None
         if not boot_why and bootstrapped_only:
             boot_why = (
                 "bootstrap opener without product mutator — not BUILD product "
@@ -4438,18 +4509,31 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             )
         if not bootstrapped_only:
             boot_why = ""
-        detail = error_detail_for_stop(
-            last_reason,
-            tool_calls_made=tool_calls_made,
-            budget=budget,
-            calls=calls,
-            extra=boot_why or "",
-        )
+        if _forced_tool_stop == "main_chat_runaway_backstop":
+            detail = format_error_detail(
+                "Main-chat runaway backstop reached after "
+                f"{tool_calls_made} tool calls; the turn was forced to stop."
+            )
+        elif _forced_tool_stop == "subagent_hard_ceiling":
+            detail = format_error_detail(
+                "Sub-agent hard runaway ceiling reached after "
+                f"{tool_calls_made} tool calls; the turn was forced to stop."
+            )
+        else:
+            detail = error_detail_for_stop(
+                last_reason,
+                tool_calls_made=tool_calls_made,
+                budget=budget,
+                calls=calls,
+                extra=boot_why or "",
+            )
         synth_partial = {
             "status": status,
             "summary": (
                 f"turn ended with {tool_calls_made} tool calls "
-                f"(reason={last_reason})"
+                f"(reason={last_reason}"
+                + (f", forced_stop={_forced_tool_stop}" if _forced_tool_stop else "")
+                + ")"
                 + (f"; {boot_why}" if bootstrapped_only else
                    "; no formal handoff envelope")
             ),
@@ -4460,6 +4544,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     for c in calls[:20]
                 ],
                 "bootstrapped_only": bootstrapped_only,
+                "forced_stop": _forced_tool_stop,
                 "reasoning_summary": (
                     boot_why
                     if bootstrapped_only else
@@ -4472,20 +4557,33 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             {"handoff": synth_partial, "calls": calls,
              "tool_calls": tool_calls_made,
              "bootstrapped_only": bootstrapped_only,
+             "forced_stop": _forced_tool_stop,
              "stop_reason": last_reason,
              "error_detail": detail}, _tu))
-    detail = error_detail_for_stop(
-        last_reason,
-        tool_calls_made=tool_calls_made,
-        budget=budget,
-        calls=calls,
-        extra=(f"Every finish attempt was rejected by a HARD guardrail: "
-               f"{last_guard_block}" if last_guard_block else ""),
-    )
+    if _forced_tool_stop == "main_chat_runaway_backstop":
+        detail = format_error_detail(
+            "Main-chat runaway backstop reached after "
+            f"{tool_calls_made} tool calls; the turn was forced to stop."
+        )
+    elif _forced_tool_stop == "subagent_hard_ceiling":
+        detail = format_error_detail(
+            "Sub-agent hard runaway ceiling reached after "
+            f"{tool_calls_made} tool calls; the turn was forced to stop."
+        )
+    else:
+        detail = error_detail_for_stop(
+            last_reason,
+            tool_calls_made=tool_calls_made,
+            budget=budget,
+            calls=calls,
+            extra=(f"Every finish attempt was rejected by a HARD guardrail: "
+                   f"{last_guard_block}" if last_guard_block else ""),
+        )
     return TurnResult(False, last_reason, _with_usage(
         {"calls": calls, "tool_calls": tool_calls_made,
          "stop_reason": last_reason,
          "guardrail_block": last_guard_block,
+         "forced_stop": _forced_tool_stop,
          "error_detail": detail}, _tu))
 
 

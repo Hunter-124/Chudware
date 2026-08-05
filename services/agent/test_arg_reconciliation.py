@@ -139,6 +139,43 @@ def test_export_part_type_synonym_survives_extraction_on_both_paths():
     assert payload.get("interpreted") == ["interpreted 'type' as 'fmt'"], payload
 
 
+def test_plm_item_add_kind_synonym_accepted_on_both_paths(tmp_path):
+    """Live run-12211675717239 used the natural ``kind`` discriminator."""
+    (tmp_path / "spec.md").write_text("# Requirements\n")
+    supplied = {
+        "path": str(tmp_path),
+        "file_path": "spec.md",
+        "kind": "spec",
+    }
+
+    kwargs, notes, err = _agent_reconcile("plm_item_add", **supplied)
+    assert err is None, err
+    assert kwargs == {
+        "path": str(tmp_path),
+        "file_path": "spec.md",
+        "doc_type": "spec",
+    }
+    assert notes == ["interpreted 'kind' as 'doc_type'"]
+
+    payload = _server_call("plm_item_add", supplied)
+    assert payload["ok"] is True, payload
+    assert payload["item"]["doc_type"] == "spec"
+    assert payload.get("interpreted") == ["interpreted 'kind' as 'doc_type'"]
+
+    container = tmp_path / "Bracket.step+"
+    container.write_bytes(b"container shape is rejected before content is read")
+    first_live_shape = _server_call(
+        "plm_item_add",
+        {"path": str(container), "kind": "part"},
+    )
+    assert first_live_shape["ok"] is False
+    assert first_live_shape["reason"] == "invalid_mode"
+    assert "plm_checkpoint" in first_live_shape["hint"]
+    assert first_live_shape.get("interpreted") == [
+        "interpreted 'kind' as 'doc_type'"
+    ]
+
+
 # --------------------------------------------------------------------- the real deliverable:
 # the SAME bad call teaches equivalently through BOTH dispatch paths.
 

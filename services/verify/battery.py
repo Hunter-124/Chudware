@@ -1301,24 +1301,23 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
         if canonical not in normalized:
             normalized.append(canonical)
     checks = normalized
+    valid_checks = [entry["name"] for entry in check_metadata()]
+    valid_check_set = set(valid_checks)
+    unknown_checks = sorted(name for name in checks if name not in valid_check_set)
+    if unknown_checks:
+        raise ValueError(
+            "verify_battery() got unknown check(s) "
+            + ", ".join(repr(name) for name in unknown_checks)
+            + f" — it takes checks= containing only names from {valid_checks} "
+            "(see check_metadata())."
+        )
+
 
     scores: dict[str, float] = {}
     findings: list[dict] = []
     skipped: list[str] = []
 
     for name in sorted(checks):  # deterministic order
-        if name not in CHECKS:
-            if name in ("self_intersection", "self_intersections"):
-                detail = (
-                    "self-intersection is not a deterministic battery check yet. "
-                    "check_geometry_health reports self_intersection.checked=false explicitly; "
-                    "do not substitute eval_check/is_manifold because neither proves this."
-                )
-            else:
-                detail = f"unknown check {name!r}"
-            findings.append({"check": name, "ok": False, "detail": detail})
-            scores[name] = 0.0
-            continue
 
         module_key, fn_name, cost, platform_req, reward_shape = CHECKS[name]
 

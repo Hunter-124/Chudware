@@ -422,6 +422,22 @@ def _version_series_base(name: Optional[str]) -> str:
     return n[: m.start()].strip(" ._-")
 
 
+def _strip_version_suffix(name: str) -> str:
+    """Return the one-document mint name, with any explicit version token removed.
+
+    One design is one document: leaving a version token in the mint name creates a
+    second tab, a second .step+ file, a second vault item, and a recovery row, so the
+    mint name is always the series base and the revision lives in PLM.
+
+    This deliberately carries the shared version regex's known false-positive class:
+    a genuine designator such as ``Intake_Manifold_V8`` is minted as
+    ``Intake_Manifold``. That tradeoff is accepted rather than forking a second
+    definition of "version token"; the tool reply reports the normalization so the
+    caller can see it.
+    """
+    return _version_series_base(name) or (name or "").strip()
+
+
 def _docs_in_version_series(docs: list, name: str, kind: str = "part") -> list:
     """Open, non-empty `kind` docs that are an EARLIER VERSION of `name`.
 
@@ -2457,7 +2473,8 @@ _APPEARANCE_PRESETS = {
 }
 _APPEARANCE_ALIASES = {
     "aluminium": "aluminum", "al": "aluminum", "ss": "stainless",
-    "stainless steel": "stainless", "pla": "plastic", "abs plastic": "abs",
+    "stainless steel": "stainless", "pla": "plastic", "petg": "plastic",
+    "abs plastic": "abs",
     "dark metal": "black", "ti": "titanium", "pa": "nylon", "nylon 6": "nylon",
     "polyamide": "nylon", "mild steel": "steel", "carbon steel": "steel",
     "tool steel": "steel",
@@ -2560,7 +2577,8 @@ def _resolve_appearance(material: Union[str, dict, list, tuple]) -> dict:
             key = _APPEARANCE_ALIASES.get(best[1], best[1])
     if key not in _APPEARANCE_PRESETS:
         raise ValueError(
-            f"Unknown appearance material {material!r}. Known: {sorted(_APPEARANCE_PRESETS)}; "
+            f"Unknown appearance material {material!r}. Known: "
+            f"{sorted(set(_APPEARANCE_PRESETS) | set(_APPEARANCE_ALIASES))}; "
             f"common alloy designations (6061, A36, 304, 4140, Ti-6Al-4V, C360, …) resolve to "
             f"their family. Or pass an explicit look: "
             f"{{'color':[r,g,b], 'metallic':0..1, 'roughness':0..1}}."

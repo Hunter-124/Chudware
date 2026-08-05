@@ -35,7 +35,8 @@ def register_verify_tools(mcp: FastMCP) -> None:
 
         Returns a stable {scores, findings} dict usable as an RL reward vector or CI gate.
         checks: list of check names (see check_metadata for available checks + cost/platform).
-               Empty or omitted → run all subsecond/any-platform checks.
+               Empty or omitted → run all subsecond/any-platform checks. Any unknown name
+               rejects the whole call with {ok:false, error}; no partial battery is run.
         doc_id: target document (default = current part).
 
         power_budget check (T-FIN23, system energy budget): pass power_source

@@ -62,9 +62,9 @@ class _FakeEngine:
         if method == "doc_new":
             want = p.get("name") or "part"
             kind = p.get("kind") or "part"
+            hits = [e for e in self.docs
+                    if e.get("name") == want and (e.get("kind") or "part") == kind]
             if p.get("resume_if_open"):
-                hits = [e for e in self.docs
-                        if e.get("name") == want and (e.get("kind") or "part") == kind]
                 if hits:
                     best = max(hits, key=lambda e: (e.get("feature_count") or 0,
                                                     e.get("revision") or 0))
@@ -76,7 +76,12 @@ class _FakeEngine:
                         resp["duplicate_doc_ids"] = others
                     return resp
             self.new_calls.append(want)
-            return {"doc_id": "doc-cppMINTED", "name": want + "2", "revision": 0}
+            actual = want + "2" if hits else want
+            self.docs.append({
+                "doc_id": "doc-cppMINTED", "name": actual, "kind": kind,
+                "revision": 0, "feature_count": 0,
+            })
+            return {"doc_id": "doc-cppMINTED", "name": actual, "revision": 0}
         if method == "doc_save":
             return {}
         return {}
@@ -112,6 +117,10 @@ def engine(monkeypatch):
 
 def _new_part(**kw):
     return json.loads(_tool("new_part")(**kw))
+
+
+def _add_features(ops):
+    return json.loads(_tool("add_features")(ops=ops))
 
 
 def test_two_docs_of_the_same_name_resume_the_built_one(engine):
@@ -254,15 +263,17 @@ def test_bumped_version_resumes_the_series_instead_of_minting(engine):
     assert "fresh=True" in r["note"]
 
 
-def test_first_version_of_a_new_design_still_mints(engine):
-    """Nothing in the series is open: "holster_v1" is a brand-new part and must mint.
-    Without this the fix would refuse to start a design whose name carries a version."""
+def test_first_version_of_a_new_design_mints_the_bare_series_name(engine):
+    """Nothing in the series is open: the first document mints under the series base,
+    while the reply preserves the requested spelling so the normalization is visible."""
     fake = engine([
         {"doc_id": "doc-cpp00000001", "name": "unrelated_bracket", "feature_count": 8},
     ])
     r = _new_part(name="holster_v1")
 
-    assert fake.new_calls == ["holster_v1"]
+    assert fake.new_calls == ["holster"]
+    assert r["name"] == "holster"
+    assert r["requested_name"] == "holster_v1"
     assert r.get("resumed") is not True
 
 
@@ -321,17 +332,20 @@ def test_an_assembly_is_never_a_version_of_a_part(engine):
     ])
     r = _new_part(name="gearbox_v2")
 
-    assert fake.new_calls == ["gearbox_v2"]
+    assert fake.new_calls == ["gearbox"]
+    assert r["requested_name"] == "gearbox_v2"
     assert r.get("resumed") is not True
 
 
-def test_fresh_true_overrides_the_version_series_resume(engine):
-    """A deliberate variant ALONGSIDE the current one stays possible — the single escape
-    hatch the note points the model at."""
+def test_fresh_true_overrides_resume_but_still_mints_the_bare_series_name(engine):
+    """A deliberate second document is still possible, but PLM revision identity never
+    leaks into that new document's name."""
     fake = engine(_HOLSTER)
     r = _new_part(name="ruger_lcp_iwb_holster_v11", fresh=True)
 
-    assert fake.new_calls == ["ruger_lcp_iwb_holster_v11"]
+    assert fake.new_calls == ["ruger_lcp_iwb_holster"]
+    assert r["name"] == "ruger_lcp_iwb_holster"
+    assert r["requested_name"] == "ruger_lcp_iwb_holster_v11"
     assert r.get("reused") is not True
 
 
@@ -394,5 +408,114 @@ def test_new_assembly_is_never_steered_into_a_part(engine):
     ])
     r = _new_assembly(name="motor_mount_v2")
 
-    assert fake.new_calls == ["motor_mount_v2"]
+    assert fake.new_calls == ["motor_mount"]
+    assert r["requested_name"] == "motor_mount_v2"
     assert r.get("resumed") is not True
+
+
+# ---------------------------------------------------------------------------
+# Version tokens are normalized before the first document is minted.
+# ---------------------------------------------------------------------------
+
+
+def test_new_part_first_mint_drops_the_version_suffix(engine):
+    fake = engine([])
+    r = _new_part(name="widget_v1")
+
+    assert fake.new_calls == ["widget"]
+    assert r["name"] == "widget"
+    assert r["requested_name"] == "widget_v1"
+    assert "plm_checkpoint" in r["note"] and "plm_timeline" in r["note"]
+
+
+def test_new_part_fresh_mint_also_drops_the_version_suffix(engine):
+    fake = engine([])
+    r = _new_part(name="widget_v1", fresh=True)
+
+    assert fake.new_calls == ["widget"]
+    assert r["name"] == "widget"
+    assert r["requested_name"] == "widget_v1"
+
+
+def test_new_part_unversioned_name_is_unchanged(engine):
+    fake = engine([])
+    r = _new_part(name="widget")
+
+    assert fake.new_calls == ["widget"]
+    assert r["name"] == "widget"
+    assert "requested_name" not in r
+
+
+def test_new_assembly_first_mint_drops_the_version_suffix(engine):
+    fake = engine([])
+    r = _new_assembly(name="rig-rev2")
+
+    assert fake.new_calls == ["rig"]
+    assert r["name"] == "rig"
+    assert r["requested_name"] == "rig-rev2"
+    assert "plm_checkpoint" in r["note"] and "plm_timeline" in r["note"]
+
+
+def test_add_features_new_part_head_drops_the_version_suffix(engine):
+    fake = engine([])
+    r = _add_features([
+        {"op": "new_part", "name": "bracket_gen3"},
+        {"op": "add_feature", "feature": {
+            "type": "box", "name": "Base",
+            "params": {"length": 40, "width": 30, "height": 20}}},
+    ])
+
+    assert fake.new_calls == ["bracket"]
+    assert r["doc_id"] == "doc-cppMINTED"
+    assert r["requested_name"] == "bracket_gen3"
+    assert "plm_checkpoint" in r["note"] and "plm_timeline" in r["note"]
+
+
+def test_bumped_version_still_resumes_an_open_bare_document(engine):
+    fake = engine([
+        {"doc_id": "doc-cpp00000044", "name": "widget", "revision": 3,
+         "feature_count": 5},
+    ])
+    r = _new_part(name="widget_v4")
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-cpp00000044"
+    assert r["resumed_by"] == "version_series"
+    assert r["name"] == "widget"
+
+
+# ---------------------------------------------------------------------------
+# …but a document that is ALREADY open under the version-suffixed name is that
+# document, and the engine's resume matches it on the name VERBATIM. Stripping
+# the token on that call hands doc_new a name nothing is open under, and the
+# "resume" mints instead — the very duplication the strip exists to prevent.
+# ---------------------------------------------------------------------------
+
+
+def test_add_features_head_keeps_a_name_that_is_already_open_verbatim(engine):
+    fake = engine([
+        {"doc_id": "doc-cpp00000051", "name": "bracket_v2", "revision": 2,
+         "feature_count": 4},
+    ])
+    r = _add_features([
+        {"op": "new_part", "name": "bracket_v2"},
+        {"op": "add_feature", "feature": {
+            "type": "box", "name": "Base",
+            "params": {"length": 40, "width": 30, "height": 20}}},
+    ])
+
+    assert fake.new_calls == [], "the open bracket_v2 is the document, not a new bracket"
+    assert r["doc_id"] == "doc-cpp00000051"
+
+
+def test_new_assembly_keeps_a_name_that_is_already_open_verbatim(engine):
+    fake = engine([
+        {"doc_id": "doc-cpp00000052", "name": "rig_v2", "kind": "assembly",
+         "revision": 2, "component_count": 3},
+    ])
+    r = _new_assembly(name="rig_v2")
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-cpp00000052"
+    assert r["reused"] is True
+    assert "requested_name" not in r

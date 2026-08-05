@@ -844,7 +844,7 @@ class MissionDispatch:
             # a card (services/agent/roles/<role>.yaml) it gets the card's
             # system_prompt + tool allowlist, real tool schemas rendered against
             # THIS dispatch layer, this MissionDispatch as its mission-scoped
-            # resolver, and a budget-derived tool-call cap. Unknown roles keep
+            # resolver, and a budget-derived soft warning threshold. Unknown roles keep
             # the old bare behavior (no card = no constraints to apply).
             card = None
             try:
@@ -982,7 +982,7 @@ class MissionDispatch:
                 granted = 0
             derived = (granted // 2000) if granted > 0 else 10
             max_calls = max(4, min(12, derived))
-            # WI-4: capability phase caps (A/B HARD) override soft derived budget.
+            # WI-4 capability phase caps tune the derived soft threshold.
             _cap = self.capability
             if _cap is None and self.tier:
                 try:
@@ -1017,6 +1017,18 @@ class MissionDispatch:
                         max_calls = max(int(max_calls or 0), _BUILD_MIN_CALLS)
                 except Exception:  # noqa: BLE001
                     pass
+            # Settings override is intentionally last: max_calls is now a SOFT
+            # convergence warning, so a user's explicit threshold must not be
+            # silently raised by producer floors or token-grant derivation.
+            try:
+                from services.agent.config import (  # noqa: PLC0415
+                    get_subagent_tool_call_budget,
+                )
+                _configured_calls = get_subagent_tool_call_budget()
+                if _configured_calls > 0:
+                    max_calls = _configured_calls
+            except Exception:  # noqa: BLE001 — automatic derivation is the fallback
+                pass
             # WS2/WS4 + mega-5: always attempt per-spawn model assignment with
             # depth-aware min_rank. resolve_for_node returns None when ai_roles
             # is unset (legacy path) — fall through to resolve_role_model so
@@ -1300,6 +1312,10 @@ class MissionDispatch:
                     tools_text=tools_text,
                     mission_dispatch=self,
                     ledger=self._ledger(), max_tool_calls=max_calls,
+                    # The delegate path missed the 2026-07-28 parent-lane fix:
+                    # falling through to agent_turn's 2048 default truncated
+                    # feature_modeler twice before its first tool call.
+                    max_tokens=LINEAR_ROLE_MAX_OUTPUT_TOKENS,
                     on_event=self.on_event, run_id=self.run_id,
                     node_id=node_id, subagent_id=node_id,
                     capability=_cap, tier=self.tier, phase=_phase,
@@ -2078,14 +2094,6 @@ class MissionDispatch:
 # machinery MissionDispatch._run_subagent uses for sub-agent spawns — instead
 # of a new executor.
 
-# A file-org/PLM cleanup pass touches MANY files in ONE turn (fs_list -> N x
-# fs_write/fs_edit/run_shell -> N x plm_item_add -> plm_checkpoint). A DAG
-# node's per-node budget tops out at 12 (BUILD-role floor 8, see
-# MissionDispatch._run_subagent's derived cap 4-12) because a DAG node only
-# ever handles ONE deliverable; a linear organizer turn handles the WHOLE
-# project in one turn, so it needs more headroom than any single DAG node
-# ever gets.
-LINEAR_ROLE_MAX_TOOL_CALLS = 30
 
 # 2048 output tokens (agent_turn's `completion_cap` default) truncated the live
 # 2026-07-28 general-lane turn mid-`mission_start` directive: the reply was cut
@@ -2209,7 +2217,6 @@ def run_linear_role_turn(
     ledger: Any | None = None,
     mission_dispatch: MissionDispatch | None = None,
     capability: Any | None = None,
-    max_tool_calls: int | None = None,
     max_tokens: int | None = None,
     tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
     options: dict | None = None,
@@ -2279,6 +2286,15 @@ def run_linear_role_turn(
         except Exception:  # noqa: BLE001 — dispatcher is best-effort
             mission_dispatch = None
 
+    # The dispatch lazily binds the run's on-disk ledger. Use that SAME object
+    # for the main agent loop so its tool calls and terminal events reach
+    # ledger.jsonl too; previously only delegated sub-agent events were visible.
+    if ledger is None and mission_dispatch is not None:
+        try:
+            ledger = mission_dispatch._ledger()
+        except Exception:  # noqa: BLE001 — ledger observability never blocks a turn
+            ledger = None
+
     system_prompt = card.system_prompt
     try:
         from services.agent.prompt_tiers import (  # noqa: PLC0415
@@ -2310,7 +2326,6 @@ def run_linear_role_turn(
         system_prompt=system_prompt,
         allowed_tools=allowed,
         tools_text=tools_text,
-        max_tool_calls=max_tool_calls or LINEAR_ROLE_MAX_TOOL_CALLS,
         max_tokens=max_tokens or LINEAR_ROLE_MAX_OUTPUT_TOKENS,
         ledger=ledger,
         mission_dispatch=mission_dispatch,
@@ -2419,7 +2434,6 @@ def route_request(
     ledger: Any | None = None,
     mission_dispatch: MissionDispatch | None = None,
     capability: Any | None = None,
-    max_tool_calls: int | None = None,
     tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
     tuning: dict | None = None,
 ) -> dict[str, Any]:
@@ -2457,7 +2471,7 @@ def route_request(
         request, "general_agent", provider,
         on_event=on_event, run_id=run_id, ledger=ledger,
         mission_dispatch=mission_dispatch, capability=capability,
-        max_tool_calls=max_tool_calls, tool_dispatch=tool_dispatch,
+        tool_dispatch=tool_dispatch,
     )
     return {
         "ok": True,

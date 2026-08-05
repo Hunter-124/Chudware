@@ -192,7 +192,7 @@ def test_a_finish_envelope_after_calls_still_finishes():
     assert res.success is True, (res.stop_reason, res.result)
 
 
-def test_the_batch_cannot_outrun_the_call_budget():
+def test_main_chat_batch_is_not_cut_by_old_call_budget():
     seen = []
     p = _ScriptedProvider([
         _batch(*[_fence("ledger_note", text=str(i)) for i in range(6)]),
@@ -201,4 +201,4 @@ def test_the_batch_cannot_outrun_the_call_budget():
     at.run_turn("note all six", p, allowed_tools=_ALLOW, max_tool_calls=3,
                 tool_dispatch=lambda t, a: seen.append(t) or {"ok": True},
                 actor="general_agent")
-    assert len(seen) <= 4, seen
+    assert len(seen) == 6, seen

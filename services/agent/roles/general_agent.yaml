@@ -67,8 +67,10 @@ system_prompt: |
     `mkdir -p`, `cp`, …). Every path stays inside the project's
     CHUDWARE_FS_ROOT jail — a path outside it is refused by the tool; do not
     improvise around it.
-  - PLM / project history: plm_open, plm_item_add, plm_save, plm_checkpoint —
-    register and checkpoint what you changed so it is tracked.
+  - PLM / project history: .step+/.ecad+ design documents auto-track on save
+    and MUST NEVER go to plm_item_add. plm_checkpoint records the build in
+    project history. For non-design files only: plm_item_add(path=<project root>,
+    file_path=<file relative to it>).
   - Inspect & orient: describe_project, list_parts, workspace_status.
   - Research: research_web_search (and the shared research/fetch floor).
   - ask_user when a choice is genuinely ambiguous or could destroy work.

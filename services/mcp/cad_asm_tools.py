@@ -12,6 +12,7 @@ from .cad_common import (
     _autosave_all_open,
     _describe_type,
     _doc,
+    _docs_named,
     _docs_in_version_series,
     _dumps,
     _err,
@@ -23,6 +24,7 @@ from .cad_common import (
     _publish_current,
     _resolve_face_points,
     _resolve_material,
+    _strip_version_suffix,
     _tmp,
     _version_series_base,
     cb,
@@ -122,15 +124,28 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             # resume_if_open makes the engine decide check-and-mint under its mint lock,
             # so two callers racing on one name get one document (the same contract
             # new_part relies on — see cad_doc_tools.new_part and core/doc/session.cpp).
-            r = cb.call("doc_new", {"kind": "assembly", "name": name,
+            # Verbatim when an assembly of that exact name is already open — that is the
+            # engine's resume_if_open match and it keys on the name as given, so stripping
+            # the token would miss it and mint a duplicate (same guard as new_part).
+            exact_open = [e for e in _docs_named(docs, name)
+                          if (e.get("kind") or "part") == "assembly"]
+            mint_name = name if exact_open else _strip_version_suffix(name)
+            r = cb.call("doc_new", {"kind": "assembly", "name": mint_name,
                                     "resume_if_open": True})
             did = r.get("doc_id")
             _CUR["doc_id"] = did
             note_touched_doc(did)
             # doc_new UNIQUIFIES a colliding name; report what the document is really
             # called, never the ask, or every later name-based lookup repeats the lie.
-            out = {"ok": True, "doc_id": did, "name": r.get("name") or name,
+            actual = r.get("name") or mint_name
+            out = {"ok": True, "doc_id": did, "name": actual,
                    "kind": "assembly", "revision": r.get("revision", 0)}
+            if not r.get("reused") and mint_name != name:
+                out["requested_name"] = name
+                out["note"] = (
+                    f'dropped the version token from "{name}" because revisions are '
+                    f'tracked in PLM (plm_checkpoint / plm_timeline); this assembly was '
+                    f'minted as "{actual}", so keep calling it "{actual}" from now on')
             if r.get("reused"):
                 out.update(reused=True, resumed=True,
                            component_count=r.get("component_count"),

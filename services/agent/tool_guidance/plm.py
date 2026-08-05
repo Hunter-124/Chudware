@@ -46,9 +46,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "plm_item_add": {
         "prompt_note": (
-            "Only for non-design files (specs, datasheets, sim folders) — "
-            "design docs auto-track on save. Pass file_path or folder_path; "
-            "file_path wins if both are set."
+            "Only for non-design files (specs, datasheets, sim folders): use "
+            "plm_item_add(path=<project root>, file_path=<file relative to it>) "
+            "or folder_path for a folder. .step+/.ecad+ design documents "
+            "auto-track on save; never add them by hand — call plm_checkpoint."
         ),
     },
     "plm_link_repo": {

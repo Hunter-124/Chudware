@@ -302,6 +302,41 @@ def get_max_subagent_depth(cfg: dict | None = None) -> int:
         return DEFAULT_MAX_SUBAGENT_DEPTH
     return max(0, depth)
 
+
+# GUI Settings → Agents writes ``agent.subagent_tool_call_budget`` (int,
+# default 0, GUI clamp 0–64). Zero keeps token-grant-derived automatic sizing;
+# a positive value is the sub-agent's soft convergence-warning threshold.
+DEFAULT_SUBAGENT_TOOL_CALL_BUDGET: int = 0
+SUBAGENT_TOOL_CALL_BUDGET_KEY = "subagent_tool_call_budget"
+
+
+def get_subagent_tool_call_budget(cfg: dict | None = None) -> int:
+    """Return ``agent.subagent_tool_call_budget`` (int ≥ 0, default 0).
+
+    Nested config shape written by the copilot Agents tab::
+
+        {"agent": {"subagent_tool_call_budget": 0}}
+
+    Non-int / missing values fall back to
+    :data:`DEFAULT_SUBAGENT_TOOL_CALL_BUDGET`. Negative values clamp to 0
+    (automatic token-grant-derived sizing).
+    """
+    c = cfg if cfg is not None else load_config()
+    if not isinstance(c, dict):
+        return DEFAULT_SUBAGENT_TOOL_CALL_BUDGET
+    agent = c.get(AGENT_CONFIG_KEY)
+    if not isinstance(agent, dict):
+        return DEFAULT_SUBAGENT_TOOL_CALL_BUDGET
+    raw = agent.get(
+        SUBAGENT_TOOL_CALL_BUDGET_KEY,
+        DEFAULT_SUBAGENT_TOOL_CALL_BUDGET,
+    )
+    try:
+        budget = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SUBAGENT_TOOL_CALL_BUDGET
+    return max(0, budget)
+
 # --------------------------------------------------------------------------- corporate org mode
 # GUI Settings → Agents writes ``agent.corporate_mode`` (bool) and
 # ``agent.corporate`` object. When on, complex missions organize as a company

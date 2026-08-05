@@ -68,6 +68,70 @@ def test_plm_open_zero_config(tmp_path, tools):
     assert len(res["manifest"]["items"]) == 1
 
 
+def test_plm_item_add_file_as_project_root_teaches_complete_call(tmp_path, tools):
+    target = tmp_path / "spec.md"
+    target.write_text("# Requirements\n")
+
+    res = _j(tools["plm_item_add"](str(target), doc_type="spec"))
+
+    assert res["ok"] is False
+    assert res["reason"] == "invalid_project"
+    assert (
+        f'plm_item_add(path="{tmp_path}", file_path="spec.md")'
+        in res["hint"]
+    )
+    assert "path is the PROJECT ROOT" in res["hint"]
+
+
+def test_plm_item_add_empty_target_teaches_both_modes_and_example(tmp_path, tools):
+    res = _j(tools["plm_item_add"](str(tmp_path)))
+
+    assert res["ok"] is False
+    assert res["reason"] == "invalid_mode"
+    assert "file_path" in res["hint"]
+    assert "folder_path" in res["hint"]
+    assert (
+        f'plm_item_add(path="{tmp_path}", file_path="documents/spec.md")'
+        in res["hint"]
+    )
+
+
+def test_plm_item_add_already_tracked_is_success(tmp_path, tools):
+    (tmp_path / "spec.md").write_text("# Requirements\n")
+    first = _j(tools["plm_item_add"](str(tmp_path), file_path="spec.md"))
+    second = _j(tools["plm_item_add"](str(tmp_path), file_path="spec.md"))
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second["item"]["item_id"] == first["item"]["item_id"]
+    assert second["item"]["already_tracked"] is True
+
+
+def test_plm_item_add_container_is_terminal_for_every_argument_shape(tmp_path, tools):
+    target = tmp_path / "Bracket.step+"
+    target.write_bytes(_container(_part()))
+    calls = [
+        {"path": str(target), "doc_type": "part"},
+        {
+            "path": str(target),
+            "file_path": str(target),
+            "doc_type": "part",
+        },
+        {
+            "path": str(tmp_path),
+            "file_path": "Bracket.step+",
+            "doc_type": "part",
+        },
+    ]
+
+    for supplied in calls:
+        res = _j(tools["plm_item_add"](**supplied))
+        assert res["ok"] is False, supplied
+        assert res["reason"] == "invalid_mode", supplied
+        assert "plm_checkpoint" in res["hint"], supplied
+        assert "do not register them by hand" in res["hint"], supplied
+
+
 def test_plm_save_and_history(tmp_path, tools):
     (tmp_path / "Bracket.step+").write_bytes(_container(_part()))
     tools["plm_open"](str(tmp_path))

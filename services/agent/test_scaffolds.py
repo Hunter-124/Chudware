@@ -219,43 +219,44 @@ def test_wi3_a_prompt_contains_rigid_marker():
 # WI-4 — phase caps
 # ===========================================================================
 
-def test_wi4_a_build_stops_at_phase_cap():
+def test_wi4_a_phase_cap_is_subagent_soft_warning():
     ledger = ListLedger()
     cap = profile_for_letter("A")
-    # Infinite tool loop; A build cap = 20 but we use a tiny override via profile
-    # by calling apply_phase_cap directly + agent_turn with phase=build and
-    # max_tool_calls larger than cap.
-    # Use intake cap=2 for a short test.
+    # A intake derives a soft threshold of 2. A third proposal is replaced by
+    # the convergence warning, then the sub-agent still dispatches later work.
     provider = ScriptedProvider([
-        _tool_json("measure_part", {}) for _ in range(10)
-    ] + [_done_json()])
+        _tool_json("measure_part", {}),
+        _tool_json("measure_part", {}),
+        _tool_json("measure_part", {}),  # replaced by the one warning
+        _tool_json("measure_part", {}),
+        _done_json(),
+    ])
 
     def dispatch(tool, args):
         return {"ok": True}
 
     res = agent_turn.run_turn(
-        "measure forever", provider,
+        "measure then converge", provider,
         allowed_tools=["measure_part"],
         tool_dispatch=dispatch, ledger=ledger, actor="reviewer",
-        capability=cap, phase="intake",  # A intake cap = 2
+        capability=cap, phase="intake",
         max_tool_calls=50,
+        subagent_id="dg_phase_soft",
     )
-    assert res.stop_reason == "phase_step_cap"
-    assert res.result["tool_calls"] == 2
+    assert res.stop_reason == "confirmed"
+    assert len(res.result["calls"]) == 3
     dials = _dials(ledger, "phase_caps")
     assert dials
     assert dials[0]["payload"].get("forced") is True
-    assert dials[0]["payload"].get("extra", {}).get("reason") == "phase_step_cap" or \
-        dials[0]["payload"].get("reason") == "phase_step_cap" or \
-        True  # reason may be nested under extra from emit
 
-def test_wi4_c_no_phase_cap():
+def test_wi4_c_has_only_derived_soft_warning():
     ledger = ListLedger()
     cap = profile_for_letter("C")
-    # Always request another tool — exhaust the soft budget, never phase_step_cap.
-    provider = ScriptedProvider(
-        [_tool_json("measure_part", {}) for _ in range(20)]
-    )
+    provider = ScriptedProvider([
+        *[_tool_json("measure_part", {}) for _ in range(6)],
+        _tool_json("measure_part", {}),  # first proposal after warning
+        _done_json(),
+    ])
 
     def dispatch(tool, args):
         return {"ok": True}
@@ -265,10 +266,11 @@ def test_wi4_c_no_phase_cap():
         allowed_tools=["measure_part"],
         tool_dispatch=dispatch, ledger=ledger, actor="reviewer",
         capability=cap, phase="build", max_tool_calls=5,
+        subagent_id="dg_no_phase_cap",
     )
-    assert res.stop_reason == "max_iters"
+    assert res.stop_reason == "confirmed"
     assert _dials(ledger, "phase_caps") == []
-    assert res.result["tool_calls"] == 5
+    assert len(res.result["calls"]) == 6
 
 
 # ===========================================================================

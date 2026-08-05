@@ -102,6 +102,18 @@ def test_add_file_item_and_dirty(tmp_path):
     v.close()
 
 
+def test_add_item_already_tracked_is_idempotent(tmp_path):
+    (tmp_path / "spec.md").write_text("v1\n")
+    v = Vault.open(tmp_path)
+    first = v.add_item("spec.md")
+    second = v.add_item("spec.md")
+
+    assert second["item_id"] == first["item_id"]
+    assert second["already_tracked"] is True
+    assert len(v.manifest()["items"]) == 1
+    v.close()
+
+
 def test_file_item_byte_exact_restore(tmp_path):
     payload = b"\x00\x01binary-\xff-content"
     (tmp_path / "data.bin").write_bytes(payload)
@@ -261,13 +273,28 @@ def test_worker_untrack_and_link(tmp_path):
     assert link["item"]["doc_type"] == "linked_repo"
 
 
-def test_add_container_via_item_add_rejected(tmp_path):
-    (tmp_path / "Bracket.step+").write_bytes(_container(_part()))
-    v = Vault.open(tmp_path)
+def test_add_container_via_item_add_rejected_before_other_checks(tmp_path):
+    target = tmp_path / "Bracket.step+"
+    target.write_bytes(_container(_part()))
+
     try:
-        v.add_item("Bracket.step+")
+        Vault.open(target)
     except VaultError as e:
         assert e.reason == "invalid_mode"
+        assert "plm_checkpoint" in e.hint
     else:
-        raise AssertionError("expected a container add to be rejected")
+        raise AssertionError("expected a container project path to be rejected")
+
+    v = Vault.open(tmp_path)
+    for supplied_type in (None, "part", "report"):
+        try:
+            v.add_item("Bracket.step+", doc_type=supplied_type)
+        except VaultError as e:
+            assert e.reason == "invalid_mode"
+            assert "plm_checkpoint" in e.hint
+            assert "do not register them by hand" in e.hint
+        else:
+            raise AssertionError(
+                f"expected a container add with doc_type={supplied_type!r} to be rejected"
+            )
     v.close()

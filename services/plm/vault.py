@@ -29,6 +29,11 @@ from services.plm import permissions, planning, summarize
 
 # document containers we version (contract §2)
 _CONTAINER_SUFFIXES = (".step+", ".ecad+")
+CONTAINER_ITEM_ADD_HINT = (
+    "design documents (.step+/.ecad+) are versioned automatically by "
+    "plm_save/plm_checkpoint; do not register them by hand — call "
+    "plm_checkpoint instead"
+)
 
 # versioned shadow-tree top-level dirs the container explode does not itself
 # own but that MUST survive every whole-tree commit (carry-forward law). The
@@ -151,6 +156,9 @@ class Vault:
         """
         pdir = Path(project_dir)
         if not pdir.is_dir():
+            if (pdir.is_file()
+                    and doctypes.detect_doc_type(str(pdir)) in doctypes.CONTAINER_DOC_TYPES):
+                raise VaultError("invalid_mode", CONTAINER_ITEM_ADD_HINT)
             raise VaultError("invalid_project", f"not a folder: {project_dir}")
         fresh = not gitbind.GitBinding.exists(pdir)
         binding = gitbind.open_binding(pdir)
@@ -464,15 +472,19 @@ class Vault:
         ``doc_type`` is auto-detected (:mod:`doctypes`) when omitted and is
         always user-retaggable. Returns the item view.
         """
-        m = self.manifest()
         rel = str(rel_path).replace("\\", "/").lstrip("/")
-        if manifest.find_item_by_path(m, rel) is not None:
-            raise VaultError("invalid_mode", "that file is already tracked")
         abs_path = self.project_dir / rel
-        dt = doc_type or doctypes.detect_doc_type(str(abs_path))
-        if dt in doctypes.CONTAINER_DOC_TYPES:
-            raise VaultError("invalid_mode",
-                             "design documents are tracked automatically when saved")
+        detected_type = doctypes.detect_doc_type(str(abs_path))
+        dt = doc_type or detected_type
+        if (detected_type in doctypes.CONTAINER_DOC_TYPES
+                or dt in doctypes.CONTAINER_DOC_TYPES):
+            raise VaultError("invalid_mode", CONTAINER_ITEM_ADD_HINT)
+        m = self.manifest()
+        existing = manifest.find_item_by_path(m, rel)
+        if existing is not None:
+            view = items_mod.item_view(existing)
+            view["already_tracked"] = True
+            return view
         if not abs_path.exists():
             raise VaultError("not_found", f"there is nothing to track at {rel}")
         item = manifest.register_item(

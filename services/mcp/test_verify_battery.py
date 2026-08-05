@@ -212,33 +212,46 @@ def test_verify_skips_posix_on_windows(monkeypatch):
     assert "run_cfd_accurate" not in result["scores"]
 
 
-def test_verify_unknown_check(monkeypatch):
-    """Unknown check names produce score=0 finding."""
+def test_verify_rejects_mixed_valid_and_unknown_before_running(monkeypatch):
+    """One bad name rejects the whole MCP call and teaches the canonical registry."""
     import services.verify.battery as bat
-    result = bat.verify(doc_id="x", checks=["nonexistent_check"])
-    assert result["scores"]["nonexistent_check"] == 0.0
-    assert any("nonexistent_check" in f.get("check", "") for f in result["findings"])
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp.verify_tools import register_verify_tools
+
+    calls = []
+    monkeypatch.setitem(
+        bat.GAP_FNS, "is_manifold",
+        lambda **_: calls.append("is_manifold") or json.dumps({"ok": True}),
+    )
+    mcp = FastMCP("verify-battery-contract")
+    register_verify_tools(mcp)
+    tool = mcp._tool_manager._tools["verify_battery"]
+
+    result = json.loads(tool.fn(
+        checks=["is_manifold", "min_wall_thickness"], doc_id="x",
+    ))
+
+    assert result["ok"] is False
+    assert "verify_battery() got unknown check(s) 'min_wall_thickness'" in result["error"]
+    valid_names = [entry["name"] for entry in bat.check_metadata()]
+    assert str(valid_names) in result["error"]
+    assert calls == []
 
 
-def test_verify_aliases_watertight_but_does_not_fake_self_intersection(monkeypatch):
-    """The live holster vocabulary gets exact rewrites and an honest capability boundary."""
+def test_verify_aliases_watertight_without_changing_success_shape(monkeypatch):
+    """An accepted alias still runs the canonical check and returns the normal battery."""
     import services.verify.battery as bat
 
     monkeypatch.setitem(
         bat.GAP_FNS, "is_manifold",
         lambda **_: json.dumps({"ok": True, "summary": "manifold"}),
     )
-    result = bat.verify(
-        doc_id="x", checks=["watertight", "self_intersection"],
-    )
-    assert result["scores"] == {"is_manifold": 1.0, "self_intersection": 0.0}
+    result = bat.verify(doc_id="x", checks=["watertight"])
+    assert result["scores"] == {"is_manifold": 1.0}
     assert result["interpreted"] == [
         {"from": "watertight", "to": "is_manifold"},
     ]
-    assert len(result["findings"]) == 1
-    assert result["findings"][0]["check"] == "self_intersection"
-    assert result["findings"][0]["ok"] is False
-    assert "do not substitute eval_check/is_manifold" in result["findings"][0]["detail"]
+    assert result["findings"] == []
 
 
 def test_extract_score_dfm_uses_dfm_pass_and_failed_checks():

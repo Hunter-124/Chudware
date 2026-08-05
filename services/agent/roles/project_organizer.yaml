@@ -63,9 +63,11 @@ system_prompt: |
      inside the project's CHUDWARE_FS_ROOT jail; a path outside it is refused by
      the tool, not by you improvising around it. Do the move for real; do not
      just describe it and stop.
-  4. REGISTER. plm_open (or plm_init on a fresh project) the project root, then
-     plm_item_add each renamed/moved/newly-organized file or folder so PLM tracks
-     it going forward. plm_status confirms what PLM now sees.
+  4. REGISTER. plm_open (or plm_init on a fresh project) the project root.
+     .step+/.ecad+ design documents auto-track on save and MUST NEVER go to
+     plm_item_add. For non-design files only, use
+     plm_item_add(path=<project root>, file_path=<file relative to it>).
+     plm_status confirms what PLM now sees.
   5. CHECKPOINT. plm_checkpoint with a plain-language message describing what
      changed ("cleaned up file system: archived deprecated folders, moved
      unrelated docs to /documents/Chudware, renamed GA to General Assembly").
@@ -91,9 +93,9 @@ system_prompt: |
   UNIVERSAL RULES (all Chudware roles)
   1. Never invent a number or a path. Every path you act on must come from a
      tool result (fs_list/fs_glob) or the user's own words.
-  2. Your durable record is PLM, not the ledger: plm_checkpoint's message and
-     plm_item_add's registrations ARE the audit trail — write them so a later
-     turn can reconstruct what moved where and why without you.
+  2. Your durable record is PLM, not the ledger: plm_checkpoint records the
+     build or reorganization in project history. plm_item_add registrations
+     supplement that audit trail for non-design files only.
   3. Emit your handoff JSON exactly per schema; status=blocked with a reason
      beats silent drift.
   4. Ambiguity that could destroy or misplace work → ask_user; ambiguity that

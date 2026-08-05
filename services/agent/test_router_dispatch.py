@@ -20,7 +20,6 @@ Run: pytest services/agent/test_router_dispatch.py -q
 from __future__ import annotations
 
 from services.agent.mission_dispatch import (
-    LINEAR_ROLE_MAX_TOOL_CALLS,
     route_request,
     run_linear_role_turn,
 )
@@ -42,8 +41,7 @@ class _ScriptedProvider:
 
 
 class _LoopingProvider:
-    """Always proposes the same tool call — never finishes on its own, so a
-    turn runs to its max_tool_calls budget."""
+    """Always proposes the same tool call and never finishes on its own."""
 
     name = "looping"
 
@@ -140,18 +138,117 @@ class TestRouteRequestGeneralAgent:
         for t in ("mission_start", "delegate", "enable_tools"):
             assert t in allowed, f"{t} (escalation lever) missing"
 
-    def test_linear_turn_max_tool_calls_generous_for_multi_step_work(self):
-        """A DAG BUILD node's floor is 8 (mega-6). A linear general turn handles
-        the whole task in one turn, so its budget clears that floor widely."""
-        assert LINEAR_ROLE_MAX_TOOL_CALLS > 12
+    def test_main_chat_runs_past_old_thirty_call_limit(self):
+        """The old linear budget killed a composed 31st dispatch. Main chat now
+        runs until the model itself emits a finish envelope."""
+        from services.agent import agent_turn
 
-        provider = _LoopingProvider()
-        turn = run_linear_role_turn(
-            _CLEANUP_REQUEST, "general_agent", provider,
-            tool_dispatch=lambda t, a: {"ok": True},
+        tool = '```json\n{"tool": "fs_list", "args": {"path": "."}}\n```'
+        done = (
+            '```json\n{"done": true, "handoff": {"status": "done", '
+            '"summary": "all work finished", "outputs": {}}}\n```'
         )
-        assert turn["stop_reason"] == "max_iters"
-        assert turn["result"]["tool_calls"] == LINEAR_ROLE_MAX_TOOL_CALLS
+        provider = _ScriptedProvider(([tool] * 31) + [done])
+        turn = agent_turn.run_turn(
+            _CLEANUP_REQUEST,
+            provider,
+            allowed_tools=["fs_list"],
+            max_tool_calls=30,
+            tool_dispatch=lambda t, a: {"ok": True},
+            subagent_id=None,
+        )
+
+        assert turn.stop_reason == "confirmed"
+        assert len(turn.result["calls"]) == 31
+
+    def test_subagent_soft_warning_fires_once_and_dispatch_continues(self):
+        from services.agent import agent_turn
+
+        tool = '```json\n{"tool": "fs_list", "args": {"path": "."}}\n```'
+        done = (
+            '```json\n{"done": true, "handoff": {"status": "done", '
+            '"summary": "converged", "outputs": {}}}\n```'
+        )
+
+        class _WarningProvider(_ScriptedProvider):
+            def __init__(self):
+                super().__init__([tool, tool, tool, tool, done])
+                self.warning_counts: list[int] = []
+
+            def complete(self, system, messages, max_tokens=8000):
+                self.warning_counts.append(
+                    str(messages).count("[TOOL-CALL BUDGET]")
+                )
+                return super().complete(system, messages, max_tokens=max_tokens)
+
+        provider = _WarningProvider()
+        turn = agent_turn.run_turn(
+            "do the delegated work",
+            provider,
+            allowed_tools=["fs_list"],
+            max_tool_calls=2,
+            tool_dispatch=lambda t, a: {"ok": True},
+            subagent_id="dg_soft_budget",
+        )
+
+        assert turn.stop_reason == "confirmed"
+        assert len(turn.result["calls"]) == 3
+        assert max(provider.warning_counts) == 1
+
+    def test_subagent_stops_at_separate_hard_ceiling(self, monkeypatch):
+        from services.agent import agent_turn
+
+        monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 6)
+        provider = _LoopingProvider()
+        turn = agent_turn.run_turn(
+            "loop",
+            provider,
+            allowed_tools=["fs_list"],
+            max_tool_calls=1,
+            tool_dispatch=lambda t, a: {"ok": True},
+            subagent_id="dg_hard_ceiling",
+        )
+
+        assert turn.stop_reason == "max_iters"
+        assert turn.success is False
+        assert turn.result["tool_calls"] == 6
+        assert turn.result["forced_stop"] == "subagent_hard_ceiling"
+
+    def test_linear_turn_threads_lazy_dispatch_ledger(self, monkeypatch):
+        from services.agent import agent_turn
+        from services.agent.mission_dispatch import MissionDispatch
+
+        bound_ledger = object()
+        seen: dict = {}
+
+        monkeypatch.setattr(
+            MissionDispatch, "_ledger", lambda self: bound_ledger
+        )
+
+        def _fake_run_turn(*args, **kwargs):
+            seen["ledger"] = kwargs.get("ledger")
+            return agent_turn.TurnResult(
+                True,
+                "confirmed",
+                {"handoff": {"status": "done", "summary": "ok"}},
+            )
+
+        monkeypatch.setattr(agent_turn, "run_turn", _fake_run_turn)
+        run_linear_role_turn(
+            "organize the project", "general_agent", provider=object()
+        )
+        assert seen["ledger"] is bound_ledger
+
+    def test_subagent_budget_config_value_and_fallbacks(self):
+        from services.agent.config import get_subagent_tool_call_budget
+
+        assert get_subagent_tool_call_budget(
+            {"agent": {"subagent_tool_call_budget": 27}}
+        ) == 27
+        assert get_subagent_tool_call_budget({}) == 0
+        assert get_subagent_tool_call_budget(
+            {"agent": {"subagent_tool_call_budget": "garbage"}}
+        ) == 0
 
 
 class TestBuildSwarmCompilerUnchanged:

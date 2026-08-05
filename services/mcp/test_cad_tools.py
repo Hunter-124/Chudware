@@ -344,10 +344,21 @@ def test_set_material_preset_and_explicit():
     assert info2["tess"]["bodies"][0]["color"][2] > 0.25  # ~0.3 blue channel
 
 
+@pytest.mark.parametrize("material", ["PETG", "pla"])
+def test_set_material_print_filaments_use_plastic_appearance(material):
+    doc = _new_plate_with_hole()
+    r, _ = _call("set_material", {"material": material, "doc_id": doc})
+
+    assert r["ok"], r
+    from mcp_server import cad_common
+    assert r["appearance"] == cad_common._resolve_appearance("plastic")
+
+
 def test_set_material_unknown_name_errors():
     doc = _new_plate_with_hole()
     r, _ = _call("set_material", {"material": "unobtanium", "doc_id": doc})
     assert not r.get("ok"), r  # _err envelope on an unknown preset
+    assert "'petg'" in r["error"] and "'pla'" in r["error"], r
 
 
 def test_fea_static_cantilever():

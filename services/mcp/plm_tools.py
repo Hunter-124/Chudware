@@ -26,6 +26,7 @@ strictly.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -187,9 +188,38 @@ def register_plm_tools(mcp: FastMCP) -> None:
             Vault, VaultError = _vault_module()
         except ImportError:
             return _err("no_vault", "version history is not available on this machine")
+        project_path = Path(path)
+        if project_path.is_file():
+            from services.plm import doctypes
+            from services.plm.vault import CONTAINER_ITEM_ADD_HINT
+
+            if doctypes.detect_doc_type(str(project_path)) in doctypes.CONTAINER_DOC_TYPES:
+                return _err("invalid_mode", CONTAINER_ITEM_ADD_HINT)
+            ancestor = project_path.parent
+            while not ancestor.is_dir() and ancestor != ancestor.parent:
+                ancestor = ancestor.parent
+            rel_to_ancestor = project_path.relative_to(ancestor).as_posix()
+            corrected = (
+                f"plm_item_add(path={json.dumps(str(ancestor))}, "
+                f"file_path={json.dumps(rel_to_ancestor)})"
+            )
+            return _err(
+                "invalid_project",
+                f"{corrected}; path is the PROJECT ROOT for every plm_* tool, "
+                "while file_path/folder_path is the thing being tracked",
+            )
         rel = file_path or folder_path
         if not rel:
-            return _err("invalid_mode", "give a file or folder to track")
+            worked = (
+                f"plm_item_add(path={json.dumps(str(path))}, "
+                'file_path="documents/spec.md")'
+            )
+            return _err(
+                "invalid_mode",
+                f"choose file_path or folder_path for the thing being tracked; "
+                f"for example, {worked}. path is the PROJECT ROOT for every "
+                "plm_* tool, while file_path/folder_path is the thing being tracked",
+            )
         try:
             v = Vault.open(path)
             try:

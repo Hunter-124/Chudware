@@ -54,6 +54,8 @@ _N_MODES_SPELLINGS: dict[str, str] = {
 # an honest refusal into a silently wrong call, which is strictly worse.
 TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
     "export_part": {"type": "fmt"},
+    # Live run-12211675717239: kind="part" is the unambiguous doc_type selector.
+    "plm_item_add": {"kind": "doctype"},
     # run_cfd_flow(velocity, aoa, fluid, cells, n_steps, doc_id, background).
     # Live 2026-07-29 (claude-sonnet-4-5): inlet_velocity_mps=5.0 was refused.
     # `velocity` is the only speed slot, so every inlet/free-stream spelling of

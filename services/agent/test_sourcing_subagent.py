@@ -2,10 +2,10 @@
 the sub-agent runs with its ROLE CARD (system_prompt + tool allowlist + rendered
 tool schemas + this mission's dispatch layer), walks parts_taxonomy → part_search,
 and hands off recommendations the parent sees.
-
 Also pins the _run_subagent fix contract: no more BARE sub-agents (hardcoded
-max_tool_calls=4, no role prompt, no allowlist) — budget-derived call caps,
-allowlist denial for out-of-scope tools, and bare fallback for unknown roles.
+max_tool_calls=4, no role prompt, no allowlist), token-derived soft warning
+thresholds with a separate runaway ceiling, allowlist denial for out-of-scope
+tools, and bare fallback for unknown roles.
 
 MockProvider-scripted; no network, no LLM, no libchudware.
 """
@@ -67,9 +67,11 @@ class _CapturingProvider:
     def __init__(self, replies: list[str]):
         self._replies = list(replies)
         self.systems: list[str] = []
+        self.max_tokens: list[int | None] = []
 
     def complete(self, system, messages, max_tokens=None):
         self.systems.append(system)
+        self.max_tokens.append(max_tokens)
         return self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
 
 
@@ -170,6 +172,7 @@ class TestSourcingSubagent:
         calls = node["result"]["calls"]
         assert [c["tool"] for c in calls] == ["parts_taxonomy", "part_search"]
         assert all(c["ok"] for c in calls)
+        assert set(provider.max_tokens) == {8192}
 
     def test_allowlist_denies_out_of_scope_tool(self, env):
         provider = _CapturingProvider([
@@ -186,24 +189,29 @@ class TestSourcingSubagent:
         assert "not in allowed list" in calls[0]["error"]
         assert calls[1]["tool"] == "parts_taxonomy" and calls[1]["ok"]
 
-    def test_budget_derived_tool_call_cap(self, env):
-        # 16000 granted → 16000//2000 = 8 calls; clamp window is [4, 12].
+    def test_budget_derives_soft_threshold_not_hard_stop(self, env, monkeypatch):
+        # 16000 granted → soft warning at 8; the separate ceiling remains 20.
+        from services.agent import agent_turn
+        monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 20)
         looping = _fence({"tool": "parts_taxonomy", "args": {}})
         provider = _CapturingProvider([looping])  # never finishes
         tree = _FakeTree(tokens_granted=16000)
         md = _dispatch(env, provider, tree)
         node = md.delegate(role="sourcing_specialist", brief="loop",
                            budget_tokens=16000)
-        assert node["result"]["tool_calls"] == 8
+        assert node["result"]["tool_calls"] == 20
+        assert node["result"]["forced_stop"] == "subagent_hard_ceiling"
 
-    def test_budget_cap_clamps_low_and_high(self, env):
+    def test_hard_ceiling_stays_above_derived_threshold(self, env, monkeypatch):
+        from services.agent import agent_turn
+        monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 20)
         looping = _fence({"tool": "parts_taxonomy", "args": {}})
-        for granted, expected in ((2000, 4), (100000, 12), (0, 10)):
+        for granted, soft in ((2000, 4), (100000, 12), (0, 10)):
             tree = _FakeTree(tokens_granted=granted)
             md = _dispatch(env, _CapturingProvider([looping]), tree)
             node = md.delegate(role="sourcing_specialist", brief="loop",
                                budget_tokens=granted)
-            assert node["result"]["tool_calls"] == expected, granted
+            assert node["result"]["tool_calls"] == max(20, soft * 2), granted
 
     def test_unknown_role_keeps_bare_behavior(self, env):
         provider = _CapturingProvider([

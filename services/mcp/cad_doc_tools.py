@@ -38,6 +38,7 @@ from .cad_common import (
     _sid_match,
     _solve_sync_or_handoff,
     _start_job,
+    _strip_version_suffix,
     _tmp,
     _unpublish,
     _version_series_base,
@@ -6696,13 +6697,22 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         tree (undo/redo, editable parameters), not a one-shot mesh.
         """
         try:
+            # A document under the EXACT requested name is already open. That case is the
+            # engine's own resume_if_open path (below), and the engine keys it on the name
+            # VERBATIM — so the mint payload must stay verbatim too. Stripping the version
+            # token here would hand doc_new a name nothing is open under, and the "resume"
+            # would mint a tenth document: precisely the duplication this whole path exists
+            # to stop. A document already CALLED "..._v10" is existing state, not a new name
+            # being coined; renaming it is plm's business, not new_part's.
+            exact_open = False
             if not fresh:
                 # The PATH-STEM resume still needs the doc list: the engine keys documents
                 # by name, not by the file they were imported from. It never mints, so two
                 # racing callers both land on the same imported document.
                 docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                         if isinstance(e, dict) and e.get("doc_id")]
-                if not _docs_named(docs, name):
+                exact_open = bool(_docs_named(docs, name))
+                if not exact_open:
                     folded = (name or "").strip().casefold()
                     stemmed = [e for e in docs if folded and _doc_path_stem(e) == folded]
                     # Exactly one is an identification; several is a guess, and the wrong
@@ -6734,7 +6744,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # three tabs (live 2026-07-29, run-42508173312214 — lexus_f_keychain, ...2,
             # ...3). resume_if_open makes the engine do check-and-mint under its mint lock,
             # so a concurrent loser resumes the winner's document instead of minting.
-            r = cb.call("doc_new", {"kind": "part", "name": name,
+            mint_name = name if exact_open else _strip_version_suffix(name)
+            r = cb.call("doc_new", {"kind": "part", "name": mint_name,
                                     "resume_if_open": not fresh})
             did = r.get("doc_id")
             if r.get("reused"):
@@ -6757,9 +6768,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # doc_new UNIQUIFIES a colliding name. Returning the requested name would be a
             # lie the caller then repeats in every later name-based lookup, so report what
             # the document is actually called.
-            actual = r.get("name") or name
+            actual = r.get("name") or mint_name
             out = {"ok": True, "doc_id": did, "name": actual,
                    "revision": r.get("revision", 0)}
+            if mint_name != name:
+                out["requested_name"] = name
+                out["note"] = (
+                    f'dropped the version token from "{name}" because revisions are '
+                    f'tracked in PLM (plm_checkpoint / plm_timeline); this document was '
+                    f'minted as "{actual}", so keep calling it "{actual}" from now on')
             # Land the (still empty) part in the user's project folder immediately so it
             # exists as a real, openable file; add_features refreshes it as geometry grows.
             saved = _project_save(did, actual)
@@ -6971,6 +6988,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # the bare "No current part" that follows) burns a turn for nothing, so honour
             # the intent: mint the document here and apply the remaining ops to it.
             created: Optional[str] = None
+            mint_requested_name: Optional[str] = None
+            mint_actual_name: Optional[str] = None
             def _is_new_part_head(el: Any) -> bool:
                 if not isinstance(el, dict):
                     return False
@@ -6998,9 +7017,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 # ("holster_v4" while "holster_v3" is open and built) is the next
                 # REVISION of one design, not a second part. Same rule as the tool, so a
                 # model cannot dodge it by opening a batch with the create instead.
-                series = _pick_best_doc(_docs_in_version_series(
-                    [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
-                     if isinstance(e, dict) and e.get("doc_id")], head_name))
+                head_docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                             if isinstance(e, dict) and e.get("doc_id")]
+                series = _pick_best_doc(_docs_in_version_series(head_docs, head_name))
                 if series is not None:
                     created = series["doc_id"]
                     _CUR["doc_id"] = created
@@ -7012,8 +7031,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         f"into it so the design stays ONE document with ONE version "
                         f"history; keep using that name")
                     continue
+                # Verbatim when a part of that exact name is already open — that is the
+                # engine's resume_if_open match, and it keys on the name as given (see the
+                # same guard in the new_part tool).
+                head_mint_name = (head_name if _docs_named(head_docs, head_name)
+                                  else _strip_version_suffix(head_name))
                 r = cb.call("doc_new", {"kind": "part", "resume_if_open": True,
-                                        "name": head_name})
+                                        "name": head_mint_name})
                 created = r.get("doc_id")
                 _CUR["doc_id"] = created
                 note_touched_doc(created)
@@ -7027,12 +7051,24 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         f"batch instead of minting a duplicate document")
                 else:
                     _LAST_VOLUME[created] = 0.0
+                    if head_mint_name != head_name:
+                        mint_requested_name = head_name
+                        mint_actual_name = r.get("name") or head_mint_name
             if created and not doc_id:
                 doc_id = created
             d = _doc(doc_id)
             if created and not ops:
-                return _dumps({"ok": True, "doc_id": d, "created_doc": created,
-                               "note": "created the part; send its build ops in the next call"})
+                out = {"ok": True, "doc_id": d, "created_doc": created,
+                       "note": "created the part; send its build ops in the next call"}
+                if mint_requested_name is not None:
+                    out["requested_name"] = mint_requested_name
+                    out["note"] = (
+                        f'dropped the version token from "{mint_requested_name}" because '
+                        f'revisions are tracked in PLM (plm_checkpoint / plm_timeline); '
+                        f'this document was minted as "{mint_actual_name}", so keep '
+                        f'calling it "{mint_actual_name}" from now on; send its build ops '
+                        f"in the next call")
+                return _dumps(out)
             # A flat face-pocket spec ({"op":"pocket","face":"top","shape":"rect",…}) is
             # two features, so it expands BEFORE the op-element pass aliases it onto a
             # bare, profile-less extrude.
@@ -7202,6 +7238,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         # The batch failed, so the rewrite is now a SUSPECT: say what we
                         # read the ops as before the model re-sends the same spelling.
                         fail_result["interpreted"] = interpreted
+                    if mint_requested_name is not None:
+                        fail_result["requested_name"] = mint_requested_name
+                        fail_result["note"] = (
+                            f'dropped the version token from "{mint_requested_name}" '
+                            f'because revisions are tracked in PLM '
+                            f'(plm_checkpoint / plm_timeline); this document was minted '
+                            f'as "{mint_actual_name}", so keep calling it '
+                            f'"{mint_actual_name}" from now on')
                     # T-BL22: rebuild failure -> IP-18 regen_diagnose fix-preview card
                     # (T-H11 seam). Diagnoses the FAILED tree from the ops response (the
                     # doc itself was already rolled back above), logs the model call as an
@@ -7239,6 +7283,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 }
                 if interpreted:
                     out["interpreted"] = interpreted
+                if mint_requested_name is not None:
+                    out["requested_name"] = mint_requested_name
+                    out["note"] = (
+                        f'dropped the version token from "{mint_requested_name}" because '
+                        f'revisions are tracked in PLM (plm_checkpoint / plm_timeline); '
+                        f'this document was minted as "{mint_actual_name}", so keep '
+                        f'calling it "{mint_actual_name}" from now on')
                 # GSL Stage 1a — SEMANTIC write-confirmation (W2): say what the op actually did
                 # ("added 2 faces (+2 cylinder); 2 new bore/hole(s); volume 24000→23435") or warn
                 # "no geometry change" so the model isn't left diffing a bare volume number.
@@ -7373,16 +7424,37 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
             if background:
                 jid = _start_job("add_features", _apply)
-                return _dumps({"ok": True, "doc_id": d, "job_id": jid, "status": "running",
-                               "created_doc": created,
-                               "note": f"applying {len(ops)} op(s) in the background — "
-                                       f"poll get_job('{jid}')."})
+                out = {"ok": True, "doc_id": d, "job_id": jid, "status": "running",
+                       "created_doc": created,
+                       "note": f"applying {len(ops)} op(s) in the background — "
+                               f"poll get_job('{jid}')."}
+                if mint_requested_name is not None:
+                    out["requested_name"] = mint_requested_name
+                    out["note"] = (
+                        f'dropped the version token from "{mint_requested_name}" because '
+                        f'revisions are tracked in PLM (plm_checkpoint / plm_timeline); '
+                        f'this document was minted as "{mint_actual_name}", so keep '
+                        f'calling it "{mint_actual_name}" from now on; applying '
+                        f"{len(ops)} op(s) in the background — poll get_job('{jid}').")
+                return _dumps(out)
             # Run on a worker thread with auto-handoff: a fast batch returns inline exactly as
             # before; a heavy one that overruns the budget keeps running and returns a job_id so
             # the transport call returns in time and the session survives.
             raw = _solve_sync_or_handoff("add_features", _apply)
             if created and isinstance(raw, dict):
                 raw["created_doc"] = created
+            if (mint_requested_name is not None and isinstance(raw, dict)
+                    and "requested_name" not in raw):
+                raw["requested_name"] = mint_requested_name
+                normalized_note = (
+                    f'dropped the version token from "{mint_requested_name}" because '
+                    f'revisions are tracked in PLM (plm_checkpoint / plm_timeline); '
+                    f'this document was minted as "{mint_actual_name}", so keep '
+                    f'calling it "{mint_actual_name}" from now on')
+                if raw.get("note"):
+                    raw["note"] = normalized_note + "; " + str(raw["note"])
+                else:
+                    raw["note"] = normalized_note
             # _solve_sync_or_handoff CATCHES an engine throw and hands it back as
             # {"ok":false,"error":…}, so the outer `except` never sees a rejected batch. Echo
             # the rewrites here too: a validation rejection is exactly when the model needs to

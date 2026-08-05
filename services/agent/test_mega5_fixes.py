@@ -643,6 +643,7 @@ def test_delegate_executes_child_on_full_brief_not_the_record_summary(tmp_path):
     from services.agent.mission_dispatch import MissionDispatch
     import services.agent.delegation as dlg
     import services.agent.agent_turn as at
+    import services.agent.config as agent_config
 
     ledger = Ledger("mega5_fullbrief", path=tmp_path / "ledger.json")
 
@@ -691,22 +692,30 @@ def test_delegate_executes_child_on_full_brief_not_the_record_summary(tmp_path):
 
     def _spy_run_turn(brief, provider, **kw):
         seen["exec_brief"] = brief
+        seen["max_tokens"] = kw.get("max_tokens")
+        seen["max_tool_calls"] = kw.get("max_tool_calls")
         return _Turn()
 
     real_delegate, real_run = dlg.delegate, at.run_turn
+    real_budget_get = agent_config.get_subagent_tool_call_budget
     dlg.delegate, at.run_turn = _spy_delegate, _spy_run_turn
+    agent_config.get_subagent_tool_call_budget = lambda: 23
     try:
         # budget_tokens as a STRING: models send "12000" and the bare
         # `budget_tokens <= 0` comparison used to raise TypeError.
         md.delegate(role="model3d", brief=long_brief, budget_tokens="12000")
     finally:
         dlg.delegate, at.run_turn = real_delegate, real_run
+        agent_config.get_subagent_tool_call_budget = real_budget_get
 
     # Record row stays contract-compliant...
     assert len(seen["record_brief"]) <= 500
     # ...but the child runs on the WHOLE spec, tail included.
     assert seen["exec_brief"] == long_brief
     assert tail in seen["exec_brief"]
+    from services.agent.mission_dispatch import LINEAR_ROLE_MAX_OUTPUT_TOKENS
+    assert seen["max_tokens"] == LINEAR_ROLE_MAX_OUTPUT_TOKENS
+    assert seen["max_tool_calls"] == 23
 
 
 def test_delegate_role_alias_part_fixer_to_feature_modeler():

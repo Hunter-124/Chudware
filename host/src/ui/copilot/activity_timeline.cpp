@@ -730,34 +730,44 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     }
 }
 
+// A plain-prose "Output" box is a raw-log carrier, not a display surface: every byte it
+// accumulates is ALSO appended to the primary chat bubble (feed.cpp's assistant_delta prose
+// branch), and run_finished promotes the box into m.text when nothing streamed. Drawing the
+// row therefore printed the model's answer twice. Ops-JSON streams are the exception — their
+// text is stripped back out of m.text on classification flip, so the box is the sole surface.
+static bool isProseOutputRow(const ActivityItem& a) {
+    if (a.rowKind != 2) return false;
+    if (a.stage != "stream:out" && a.title != "Output") return false;
+    return a.opsCount <= 0 && a.title.find("Building ops") == std::string::npos;
+}
+
 // M13 — the model's thoughts in a collapsible textbox. While deltas stream (a.streaming) or the
 // box is the live frontier of the turn it stays open so tokens appear live; once a later row
 // lands or the turn ends it auto-collapses to a one-line preview unless the user pinned it
 // (userToggled always wins). `showThinking` off -> a single dim one-liner.
-// stream:out classified as ops JSON ("Building ops…") always shows a one-line summary by default;
-// raw JSON lives only inside the expander (never expanded-by-default mid-stream).
+// The only stream:out box that reaches here is ops JSON ("Building ops…"): it always shows a
+// one-line summary by default, with the raw JSON inside the expander (never expanded-by-default
+// mid-stream). Plain prose Output rows are skipped upstream by isProseOutputRow.
 static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThinking,
                            bool liveFrontier) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
-    // Ops-JSON Output box OR plain prose Output — never hide behind the "show thinking" switch.
+    // The ops-JSON Output box never hides behind the "show thinking" switch.
     const bool isOpsJson = (a.stage == "stream:out" && a.opsCount > 0) ||
                            (a.title.find("Building ops") != std::string::npos);
-    const bool isOutput = isOpsJson || a.stage == "stream:out" || a.title == "Output";
-    if (!showThinking && !isOutput) {
+    if (!showThinking && !isOpsJson) {
         ImGui::PushFont(fonts.body);
         ImGui::TextColored(surf.textSecondary, "Thinking");
         ImGui::PopFont();
         return;
     }
     // Ops JSON: only open when the user expanded it (never auto-opens, even mid-stream).
-    // Thinking: open while streaming OR the live frontier OR user-expanded; a plain stream:out
-    // "Output" box still collapses when the stream stops. A user's explicit toggle always wins.
+    // Thinking: open while streaming OR the live frontier OR user-expanded. A user's explicit
+    // toggle always wins.
     const bool open = isOpsJson ? a.expanded
                                 : (a.userToggled ? a.expanded
-                                                 : (a.expanded || a.streaming ||
-                                                    (!isOutput && liveFrontier)));
+                                                 : (a.expanded || a.streaming || liveFrontier));
     // Collapse animation: the body eases shut over kCollapseSecs instead of vanishing.
     const ImGuiID animKey = ImGui::GetID("##thoughtbox_anim");
     const float   openE = ui::chatCollapseAnim() ? collapseEase(animKey, open)
@@ -812,11 +822,6 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
             if (isOpsJson) {
                 // Raw JSON only inside the expander.
                 drawProseBox("##opsraw", a.detail, ui::metrics::copilotProseMaxH());
-            } else if (isOutput && a.streaming) {
-                // Live prose stream: render inline so the box grows with the text.
-                ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-                ImGui::TextWrapped("%s", stripMdMarks(a.detail).c_str());
-                ImGui::PopStyleColor();
             } else {
                 // Grow to fit while the text is still arriving (or this box is the live
                 // frontier just after streaming stopped) instead of scrolling inside a small
@@ -1486,6 +1491,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         const ActivityItem& a = m.activity[i];
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
         if (a.rowKind == 10 && a.stage == "class:pending") continue;
+        if (isProseOutputRow(a)) continue;
         lastVisible = i;
     }
     // Tool-call ordinal within the turn — the `i` of an AI-VC "call:<turn>:<i>" target.
@@ -1499,8 +1505,11 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         // Provider-call rows (rowKind 9) aggregate into the collapsible Provider log.
         // Pending routing rows (rowKind 10, "class:pending") stay hidden until a real
         // role change (agent.role) reveals them — first-turn default routing shows no card.
+        // Plain-prose Output boxes are the raw-log twin of the primary bubble — see
+        // isProseOutputRow.
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
         if (a.rowKind == 10 && a.stage == "class:pending") continue;
+        if (isProseOutputRow(a)) continue;
         const bool liveFrontier = turnRunning && (i == lastVisible);
         ImGui::PushID((int)i);
         if (a.rowKind == 1) {

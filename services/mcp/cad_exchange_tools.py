@@ -12,13 +12,13 @@ from .cad_common import (
     _LAST_DELIVER_REV,
     _LAST_VOLUME,
     _autosave,
+    _default_deliverable_path,
     _doc,
     _doc_revision,
     _dumps,
     _err,
     _publish_current,
     _sanitize_output_path,
-    _tmp,
     cb,
 )
 
@@ -32,8 +32,10 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         """Export the current part to an interchange/mesh file; returns the written path.
 
         fmt: "step+" (native) | "step" | "stl" | "3mf" | "iges" | "brep" | "obj" | "ply" |
-             "gltf" | "glb" | "3dm". If `path` is omitted, a temp file with the right extension is
-             written. STEP/IGES/BREP are exact B-rep; STL/OBJ/PLY/glTF are tessellated meshes.
+             "gltf" | "glb" | "3dm". If `path` is omitted, the file is named from the document
+             in CHUDWARE_PROJECT_SAVE_DIR; only clients with no configured project folder fall
+             back to a temp file. STEP/IGES/BREP are exact B-rep; STL/OBJ/PLY/glTF are
+             tessellated meshes.
 
         NOTE: plain STEP/STL/etc. carry geometry only — NO editable feature tree or simulation
         studies. To hand the user a part they can keep editing, use save_part() (native .step+).
@@ -47,7 +49,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                 # K3: canonicalise caller-supplied path before passing to the engine — expanduser
                 # first so "~/…" doesn't collapse to "<cwd>/~/…" under abspath, and abspath so a
                 # relative destination lands in THIS cwd, not the engine daemon's.
-                out = _sanitize_output_path(os.path.expanduser(path)) if path else _tmp(".step+")
+                out = (_sanitize_output_path(os.path.expanduser(path)) if path
+                       else _default_deliverable_path(d, ".step+"))
                 if not out.lower().endswith(".step+"):
                     out += ".step+"
                 r = cb.call("doc_save", {"doc_id": d, "path": out})
@@ -61,7 +64,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                "exists": os.path.exists(written)})
             # K3: canonicalise caller-supplied path before passing to the engine (expanduser +
             # abspath — same reasoning as the step+ branch above).
-            out = _sanitize_output_path(os.path.expanduser(path)) if path else _tmp("." + fmt)
+            out = (_sanitize_output_path(os.path.expanduser(path)) if path
+                   else _default_deliverable_path(d, "." + fmt))
             # The engine round-trips B-rep formats (re-reads + BRepCheck) and THROWS if the file is
             # truncated/malformed, so a returned ok:True means it actually re-opens. It echoes real
             # metadata (solid_count, valid_solids, bytes, validated) — surface it so the caller can

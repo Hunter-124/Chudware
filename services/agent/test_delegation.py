@@ -561,15 +561,19 @@ class TestDelegateTool(unittest.TestCase):
         self.assertIn("status", result)
         self.assertTrue(result["id"].startswith("dg_"))
         self.assertEqual(result["status"], "approved")
+        self.assertIs(result["ok"], True)
 
     def test_depth1_auto_approved_in_result(self):
         result = delegate("sketcher", "Brief text", 200, tree=self.tree)
         self.assertEqual(result["status"], "approved")
 
-    def test_error_returns_error_dict(self):
+    def test_refusal_returns_named_actionable_reason(self):
         result = delegate("sketcher", "Bad budget", -1, tree=self.tree)
-        self.assertIn("error", result)
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["reason"], "invalid_budget")
         self.assertEqual(result["status"], "failed")
+        self.assertIn("budget_tokens must be positive", result["error"])
+        self.assertNotIn("brief", result)
 
     def test_depth_past_old_cap_via_tool_succeeds(self):
         """Soft-limit advisory events fire; spawn succeeds when under hard cap.
@@ -601,6 +605,82 @@ class TestDelegateTool(unittest.TestCase):
         # Warning events must exist for depths >= soft_depth_limit.
         warn_events = ledger.events_of_kind("delegation_depth_warning")
         self.assertGreater(len(warn_events), 0)
+
+    def test_dispatched_success_is_reported_ok_true(self):
+        from services.agent.agent_turn import _dispatch_tool
+        from services.agent.mission_dispatch import MissionDispatch
+
+        mission = MissionDispatch(
+            run_id="r_delegate_success",
+            delegation_tree=self.tree,
+            provider=object(),
+        )
+        mission._run_subagent = MagicMock(return_value={
+            "ok": True,
+            "subagent_status": "done",
+            "handoff": {"status": "done", "summary": "cube built"},
+            "result": {"calls": [{"tool": "new_part", "ok": True}]},
+            "tokens_used": 100,
+        })
+        result = _dispatch_tool(
+            "delegate",
+            {
+                "role": "feature_modeler",
+                "brief": "Build a small test cube from scratch.",
+                "budget_tokens": 500,
+            },
+            _inner=lambda name, args: mission.resolve(name)(**args),
+        )
+
+        self.assertIs(result["ok"], True)
+        self.assertEqual(result["status"], "approved")
+        self.assertEqual(result["subagent_status"], "done")
+        self.assertTrue(result["id"].startswith("dg_"))
+
+    def test_child_failure_surfaces_cause_before_spawn_record(self):
+        """Reproduce the live holster path through the normal dispatch wrapper."""
+        from services.agent.agent_events import tool_call_event
+        from services.agent.agent_turn import _dispatch_tool
+        from services.agent.mission_dispatch import MissionDispatch
+
+        mission = MissionDispatch(
+            run_id="r_delegate_provider_failure",
+            delegation_tree=self.tree,
+            provider=object(),
+        )
+        mission._run_subagent = MagicMock(return_value={
+            "ok": False,
+            "subagent_status": "failed",
+            "stop_reason": "provider_error",
+            "result": {
+                "error": "provider error: endpoint returned no completion",
+                "error_detail": (
+                    "kimi-code: BridgeUnavailable: endpoint returned no completion"
+                ),
+                "stop_reason": "provider_error",
+            },
+        })
+        result = _dispatch_tool(
+            "delegate",
+            {
+                "role": "feature_modeler",
+                "brief": "Build a small test cube from scratch.",
+                "budget_tokens": 500,
+            },
+            _inner=lambda name, args: mission.resolve(name)(**args),
+        )
+
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["reason"], "subagent_provider_error")
+        self.assertIn("stop_reason='provider_error'", result["error"])
+        self.assertIn("endpoint returned no completion", result["error"])
+        self.assertEqual(list(result)[:3], ["ok", "reason", "error"])
+        self.assertIn(result["error"], str(result)[:999])
+
+        _, event = tool_call_event(
+            "parent", "delegate", {}, result, ok=False, latency_ms=1.0,
+        )
+        self.assertEqual(event["error_preview"], result["error"])
 
 
 class TestArtifactShape(unittest.TestCase):
@@ -1043,6 +1123,8 @@ class TestMaxSubagentDepth(unittest.TestCase):
         self.assertIn("error", r2)
         self.assertEqual(r2["status"], "failed")
         self.assertIn("max subagent nesting depth (1) reached", r2["error"])
+        self.assertIs(r2["ok"], False)
+        self.assertEqual(r2["reason"], "max_subagent_depth")
 
     def test_artifact_includes_max_subagent_depth(self):
         tree = DelegationTree(

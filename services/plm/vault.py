@@ -137,6 +137,15 @@ class VaultError(Exception):
         self.reason = reason
         self.hint = hint
 
+def _released_edit_hint(error: Any, item_id: str) -> str:
+    """Turn the released-revision lock into the exact next PLM action."""
+    if error.reason != "locked":
+        return error.hint
+    return (
+        f"{error.hint}; call plm_item_set(path='<project-root>', "
+        f"item_id={item_id!r}, start_new_rev=True)"
+    )
+
 
 class Vault:
     """An open project vault (contract §2)."""
@@ -974,7 +983,7 @@ class Vault:
                 try:
                     items_mod.guard_released_edit(m, [iid])
                 except items_mod.ItemRuleError as e:
-                    raise VaultError(e.reason, e.hint)
+                    raise VaultError(e.reason, _released_edit_hint(e, iid))
             summary = self._item_summary(prev_raw, exploded.document_json, rel)
             files.update(snapshot.item_paths(
                 iid, exploded, meta_json=meta_json,
@@ -999,7 +1008,7 @@ class Vault:
                 try:
                     items_mod.guard_released_edit(m, [iid])
                 except items_mod.ItemRuleError as e:
-                    raise VaultError(e.reason, e.hint)
+                    raise VaultError(e.reason, _released_edit_hint(e, iid))
             summary = generic_snapshot.summarize(it, old_content, content)
             meta_json = hist.make_meta(
                 item_id=iid, entry_kind=kind, authored_at=_now_iso(),

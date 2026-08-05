@@ -195,6 +195,26 @@ def test_generic_release_stamps_rev_no_geometry(tmp_path):
     _no_git_vocab(res["entry"]["summary"])
     v.close()
 
+def test_released_edit_lock_names_new_revision_tool(tmp_path):
+    (tmp_path / "report.pdf").write_bytes(b"%PDF-1.4 first")
+    v = Vault.open(tmp_path)
+    item = v.add_item("report.pdf")
+    v.release(item["item_id"], "First release")
+    (tmp_path / "report.pdf").write_bytes(b"%PDF-1.4 changed")
+
+    try:
+        v.checkpoint("edit after release")
+    except VaultError as error:
+        assert error.reason == "locked"
+        assert (
+            f"plm_item_set(path='<project-root>', item_id={item['item_id']!r}, "
+            "start_new_rev=True)"
+        ) in error.hint
+    else:
+        assert False, "editing a released item should be locked"
+    finally:
+        v.close()
+
 
 def test_untrack_keeps_history(tmp_path):
     (tmp_path / "spec.md").write_text("keep me\n")

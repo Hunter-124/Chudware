@@ -6,9 +6,9 @@ from typing import Any
 ENTRIES: dict[str, dict[str, Any]] = {
     "plm_init": {
         "prompt_note": (
-            "First call on a project folder — every other plm_* tool takes "
-            "the same path. Idempotent: safe to re-call just to fetch the "
-            "manifest."
+            "Vault-backed plm_* tools take the project root as path; omit it "
+            "to use CHUDWARE_PROJECT_DIR/CHUDWARE_FS_ROOT through the shared "
+            "outermost-marker resolver. plm_init is idempotent."
         ),
     },
     "plm_open": {
@@ -27,7 +27,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "plm_checkpoint": {
         "prompt_note": (
             "Always pass a plain-language message — it is how the point is "
-            "found later. item_id scopes the checkpoint to one item."
+            "found later. item_id scopes the checkpoint to one item. On "
+            "reason='locked', call plm_item_set(item_id=<id>, "
+            "start_new_rev=True), then retry."
         ),
     },
     "plm_release": {

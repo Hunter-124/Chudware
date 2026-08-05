@@ -224,7 +224,12 @@ def test_delegate_without_provider_is_honest_not_executed():
     tree = DelegationTree(run_id="r_np")
     md = MissionDispatch(run_id="r_np", delegation_tree=tree)  # no provider
     out = md.delegate(role="sketcher", brief="do a thing", budget_tokens=1000)
-    assert out.get("executed") is False and "NOT" in out.get("note", "")
+    # The "nothing ran" text moved from `note` to `ok`/`reason`/`error`, which are
+    # emitted FIRST so the cause survives the ledger's ~999-char result clip and
+    # reaches both the model and the GUI card (it used to show the brief instead).
+    assert out.get("executed") is False and out.get("ok") is False
+    assert out.get("reason") == "subagent_not_run"
+    assert "NOT" in (out.get("error") or "")
     assert reg.get_session(out["id"])["status"] == "approved"  # spawned, not run
 
 

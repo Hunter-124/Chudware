@@ -26,6 +26,8 @@ strictly.
 from __future__ import annotations
 
 import json
+import os
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,43 @@ def _err(reason: str, hint: str = "") -> str:
 def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields}, indent=2, sort_keys=True)
 
+# A live general-lane replay ended with bare plm_checkpoint(), after earlier bare
+# plm_open() and file-as-path plm_item_add() calls. ``path`` means the project root
+# for this vault-backed family, so resolve the harness-owned context once here
+# instead of making each model guess it.
+
+def _resolve_project_path(path: str = "") -> tuple[str | None, str | None]:
+    """Resolve an omitted vault path from the active agent project context."""
+    if str(path).strip():
+        return str(path), None
+    from services.agent.project_context import resolve_project_root
+
+    for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
+        start = os.environ.get(key, "").strip()
+        if not start:
+            continue
+        root = resolve_project_root(start)
+        if root.is_dir():
+            return str(root), None
+    return None, _err(
+        "project_root_unavailable",
+        "path was omitted and no project root could be resolved; pass "
+        "path='<project-root>' or set CHUDWARE_PROJECT_DIR/CHUDWARE_FS_ROOT so "
+        "services.agent.project_context.resolve_project_root() can resolve it",
+    )
+
+
+def _with_project_path(fn: Any) -> Any:
+    """Default the first (project ``path``) argument without hiding tool errors."""
+    @wraps(fn)
+    def wrapped(path: str = "", *args: Any, **kwargs: Any) -> str:
+        resolved, error = _resolve_project_path(path)
+        if error is not None:
+            return error
+        return fn(resolved, *args, **kwargs)
+
+    return wrapped
+
 
 def register_plm_tools(mcp: FastMCP) -> None:
     """Register the plm_* tool family onto *mcp* (contract §7)."""
@@ -53,7 +92,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return Vault, VaultError
 
     @mcp.tool()
-    def plm_init(path: str) -> str:
+    @_with_project_path
+    def plm_init(path: str = "") -> str:
         """Create a project vault at *path* (a folder), registering existing
         documents. Zero-config and idempotent: re-init on an existing vault just
         opens it. Returns ``{ok, project_id, manifest}``."""
@@ -70,13 +110,15 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(project_id=m["project"]["id"], manifest=m)
 
     @mcp.tool()
-    def plm_open(path: str) -> str:
+    @_with_project_path
+    def plm_open(path: str = "") -> str:
         """Open a project folder, auto-creating history if absent (zero-config).
         Returns ``{ok, project_id, manifest}``."""
         return plm_init(path)  # open == init (both zero-config, idempotent)
 
     @mcp.tool()
-    def plm_save(path: str, kind: str = "auto") -> str:
+    @_with_project_path
+    def plm_save(path: str = "", kind: str = "auto") -> str:
         """Record a history entry over the whole project (an explicit save).
         ``kind`` ∈ ``auto`` | ``checkpoint``. Returns ``{ok, commit, entry}``.
         (Releases go through ``plm_release``.)"""
@@ -95,7 +137,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(commit=res["commit"], entry=res["entry"])
 
     @mcp.tool()
-    def plm_checkpoint(path: str, message: str = "", item_id: str = "") -> str:
+    @_with_project_path
+    def plm_checkpoint(path: str = "", message: str = "", item_id: str = "") -> str:
         """Save a named checkpoint the user can return to. ``message`` describes
         the change in plain language. Returns ``{ok, commit, entry}``."""
         try:
@@ -111,7 +154,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(commit=res["commit"], entry=res["entry"])
 
     @mcp.tool()
-    def plm_release(path: str, item_id: str, message: str = "",
+    @_with_project_path
+    def plm_release(path: str = "", item_id: str = "", message: str = "",
                     confirm: bool = False) -> str:
         """Release an item: checks first (unsaved changes, out-of-date
         component references, never-released components), then stamps the
@@ -146,7 +190,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
                    stamp_orders=res["stamp_orders"])
 
     @mcp.tool()
-    def plm_item_set(path: str, item_id: str, part_number: str = "",
+    @_with_project_path
+    def plm_item_set(path: str = "", item_id: str = "", part_number: str = "",
                      start_new_rev: bool = False) -> str:
         """Edit an item's registry entry: give it a new part number (kept
         unique within the project) and/or start a new revision of a released
@@ -176,7 +221,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**fields)
 
     @mcp.tool()
-    def plm_item_add(path: str, file_path: str = "", folder_path: str = "",
+    @_with_project_path
+    def plm_item_add(path: str = "", file_path: str = "", folder_path: str = "",
                      doc_type: str = "", part_number: str = "") -> str:
         """Track a non-design file or folder as a versioned item — a
         specification, report, datasheet, spreadsheet, image, simulation folder
@@ -232,7 +278,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(item=item)
 
     @mcp.tool()
-    def plm_link_repo(path: str, url: str, name: str = "",
+    @_with_project_path
+    def plm_link_repo(path: str = "", url: str = "", name: str = "",
                       checkout_path: str = "") -> str:
         """Link an external source-code repository to the project by reference
         (the code is never copied in — only a pointer, pinned to a version at
@@ -252,7 +299,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(item=item)
 
     @mcp.tool()
-    def plm_plan(path: str, op: str = "list", entity: str = "task",
+    @_with_project_path
+    def plm_plan(path: str = "", op: str = "list", entity: str = "task",
                  data: dict | str | None = None, id: str = "") -> str:
         """Plan the work: read or change the project's tasks, issues and
         milestones (stored with the project, so they version and restore with
@@ -293,7 +341,9 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**fields)
 
     @mcp.tool()
-    def plm_where_used(path: str, item_id: str, transitive: bool = False) -> str:
+    @_with_project_path
+    def plm_where_used(path: str = "", item_id: str = "",
+                       transitive: bool = False) -> str:
         """Answer "where is this used?": the assemblies, drawings and CAM jobs
         that consume an item (directly, or the whole chain with
         ``transitive``). Derived live from the project — never stale.
@@ -321,7 +371,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(consumers=consumers)
 
     @mcp.tool()
-    def plm_history(path: str, item_id: str = "", limit: int = 0) -> str:
+    @_with_project_path
+    def plm_history(path: str = "", item_id: str = "", limit: int = 0) -> str:
         """Return the timeline (newest first), optionally filtered to one item.
         Each entry: ``{commit, kind, authored_at, author, message, thumbnail_ref,
         summary}``. Returns ``{ok, entries}``."""
@@ -338,7 +389,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(entries=entries)
 
     @mcp.tool()
-    def plm_restore(path: str, commit: str, item_id: str = "") -> str:
+    @_with_project_path
+    def plm_restore(path: str = "", commit: str = "", item_id: str = "") -> str:
         """Return the project (or one item) to an earlier point. This never
         erases anything: it records the earlier state as a new, latest entry, so
         the restore itself can be undone. Returns ``{ok, commit, entry}``."""
@@ -355,7 +407,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(commit=res["commit"], entry=res["entry"])
 
     @mcp.tool()
-    def plm_status(path: str) -> str:
+    @_with_project_path
+    def plm_status(path: str = "") -> str:
         """Return project state for the Hub/badges: items (with revision +
         lifecycle), which have unsaved changes, and the current mode.
         Returns ``{ok, items, head, dirty, ai_mode, remotes, locks}``."""
@@ -372,8 +425,9 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**st)
 
     @mcp.tool()
-    def plm_compare(path: str, commit_a: str, commit_b: str, item_id: str,
-                    visual: bool = False, out_dir: str = "",
+    @_with_project_path
+    def plm_compare(path: str = "", commit_a: str = "", commit_b: str = "",
+                    item_id: str = "", visual: bool = False, out_dir: str = "",
                     views: str = "") -> str:
         """Compare an item between two history points — including a RENDERED
         GRAPHICAL DIFF of the geometry that changed.
@@ -433,7 +487,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**fields)
 
     @mcp.tool()
-    def plm_set_ai_mode(path: str, mode: str) -> str:
+    @_with_project_path
+    def plm_set_ai_mode(path: str = "", mode: str = "") -> str:
         """Set how much the AI helps with this project's history:
         ``manual`` (buttons only), ``assisted`` (drafts messages, suggests
         checkpoints, flags out-of-date references — the default), or
@@ -538,7 +593,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def plm_add_remote(path: str, kind: str = "folder", name: str = "origin",
+    @_with_project_path
+    def plm_add_remote(path: str = "", kind: str = "folder", name: str = "origin",
                        url: str = "") -> str:
         """Register a remote profile for team sync. ``kind`` ∈ ``folder`` |
         ``ssh`` | ``https`` | ``chudware-cloud`` (config-only). Folder remotes use
@@ -555,7 +611,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**{k: v for k, v in out.items() if k != "ok"})
 
     @mcp.tool()
-    def plm_sync(path: str, remote_id: str = "origin") -> str:
+    @_with_project_path
+    def plm_sync(path: str = "", remote_id: str = "origin") -> str:
         """One-button team sync: pull others' changes, publish yours. Same-item
         collisions become a copy under a new name (never a merge). Returns
         ``{ok, pulled, pushed, conflicts_copied}``."""
@@ -570,7 +627,9 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**{k: v for k, v in out.items() if k != "ok"})
 
     @mcp.tool()
-    def plm_lock(path: str, item_id: str, remote_id: str = "origin") -> str:
+    @_with_project_path
+    def plm_lock(path: str = "", item_id: str = "",
+                 remote_id: str = "origin") -> str:
         """Advisory lock on an item via the shared project (compare-and-swap).
         Returns ``{ok, lock}`` or ``{ok:false, reason:"locked"}`` when held."""
         try:
@@ -584,7 +643,9 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**{k: v for k, v in out.items() if k != "ok"})
 
     @mcp.tool()
-    def plm_unlock(path: str, item_id: str, remote_id: str = "origin") -> str:
+    @_with_project_path
+    def plm_unlock(path: str = "", item_id: str = "",
+                   remote_id: str = "origin") -> str:
         """Release an advisory lock you hold. Returns ``{ok, item_id,
         remote_id}`` confirming which lock was released."""
         try:

@@ -259,6 +259,10 @@ class DelegationNode:
 class DelegationError(ValueError):
     """A delegation request is invalid or cannot be granted."""
 
+    def __init__(self, message: str, *, reason: str = "delegation_refused") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 # ---------------------------------------------------------------------------
 # DelegationTree
@@ -417,13 +421,19 @@ class DelegationTree:
         Returns the newly created node after its pending → approved transition.
         """
         if kind not in ("worker", "ponder"):
-            raise DelegationError(f"kind must be 'worker' or 'ponder', got {kind!r}")
+            raise DelegationError(
+                f"kind must be 'worker' or 'ponder', got {kind!r}",
+                reason="invalid_kind",
+            )
         if not role:
-            raise DelegationError("role must be non-empty")
+            raise DelegationError("role must be non-empty", reason="invalid_role")
         if not brief:
-            raise DelegationError("brief must be non-empty")
+            raise DelegationError("brief must be non-empty", reason="invalid_brief")
         if budget_tokens <= 0:
-            raise DelegationError(f"budget_tokens must be positive, got {budget_tokens}")
+            raise DelegationError(
+                f"budget_tokens must be positive, got {budget_tokens}",
+                reason="invalid_budget",
+            )
         # The ≤500 cap is the RECORD shape (contract §12). Hard-rejecting the
         # whole spawn over it burned a turn and lost the spec; truncate the
         # stored row instead — the same soft-truncate precedent MissionDispatch
@@ -433,16 +443,23 @@ class DelegationTree:
 
         # Kill-switch guard (T-DP9): reject all spawns after kill().
         if self._meter.killed:
-            raise DelegationError("delegation tree has been killed; no new sub-agents can be spawned")
+            raise DelegationError(
+                "delegation tree has been killed; no new sub-agents can be spawned",
+                reason="delegation_tree_killed",
+            )
 
         parent_id = parent_id or self._root_id
         parent = self._nodes.get(parent_id)
         if parent is None:
-            raise DelegationError(f"parent node {parent_id!r} not found in tree")
+            raise DelegationError(
+                f"parent node {parent_id!r} not found in tree",
+                reason="parent_not_found",
+            )
         if parent.status not in ("approved", "running"):
             raise DelegationError(
                 f"parent node {parent_id!r} is in status {parent.status!r}; "
-                "can only delegate from approved/running nodes"
+                "can only delegate from approved/running nodes",
+                reason="parent_not_spawnable",
             )
 
         depth = parent.depth + 1
@@ -453,7 +470,8 @@ class DelegationTree:
         if depth > max_depth:
             raise DelegationError(
                 f"max subagent nesting depth ({max_depth}) reached "
-                f"(attempted depth {depth}; root chat is depth 0)"
+                f"(attempted depth {depth}; root chat is depth 0)",
+                reason="max_subagent_depth",
             )
 
         # Soft depth advisory (T-DP9): emit warning event but allow the spawn.
@@ -482,7 +500,8 @@ class DelegationTree:
             if budget_tokens > anc.budget.tokens_granted:
                 raise DelegationError(
                     f"ancestor node {anc.id!r} (role={anc.role}) total grant "
-                    f"({anc.budget.tokens_granted}) < requested child budget ({budget_tokens})"
+                    f"({anc.budget.tokens_granted}) < requested child budget ({budget_tokens})",
+                    reason="insufficient_budget",
                 )
 
         # Resolve model via routing.
@@ -835,9 +854,9 @@ def delegate(
 ) -> dict:
     """The ``delegate`` tool exposed to role cards per contract §12 + roles.py allowlist.
 
-    Validates and delegates via *tree*.  Returns a serialised node dict on success or
-    an error dict on failure (the tool never raises — errors surface in the result so
-    the calling role can decide to retry, replan, or escalate).
+    Validates and delegates via *tree*. Returns ``ok=True`` with the serialised
+    node on success, or ``ok=False`` with a stable refusal reason and actionable
+    error text (the tool never raises).
 
     *effort* (optional): low|medium|high — when the subagent role's Settings thinking
     is Auto, the dispatcher uses this as the assigned reasoning effort. Omit to let
@@ -846,7 +865,7 @@ def delegate(
     Usage by a role card::
 
         result = delegate(role="sketcher", brief="...", budget=4000, tree=mission_tree)
-        if result.get("status") == "approved":
+        if result.get("ok"):
             ...  # proceed with the sub-agent
     """
     try:
@@ -858,9 +877,14 @@ def delegate(
             availability=availability,
             effort=effort,
         )
-        return node.to_dict()
+        return {"ok": True, **node.to_dict()}
     except DelegationError as exc:
-        return {"error": str(exc), "status": "failed"}
+        return {
+            "ok": False,
+            "reason": exc.reason,
+            "error": str(exc),
+            "status": "failed",
+        }
 
 
 

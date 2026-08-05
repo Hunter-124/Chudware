@@ -22,6 +22,7 @@ from .cad_common import (
     _LAST_VOLUME,
     _SID_RE,
     _autosave,
+    _default_deliverable_path,
     _doc,
     _doc_revision,
     _docs_in_version_series,
@@ -39,7 +40,6 @@ from .cad_common import (
     _solve_sync_or_handoff,
     _start_job,
     _strip_version_suffix,
-    _tmp,
     _unpublish,
     _version_series_base,
     _write_diff,
@@ -6777,6 +6777,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     f'dropped the version token from "{name}" because revisions are '
                     f'tracked in PLM (plm_checkpoint / plm_timeline); this document was '
                     f'minted as "{actual}", so keep calling it "{actual}" from now on')
+            if fresh and actual != name and actual != mint_name:
+                collision_note = (
+                    f'a document named "{mint_name}" was already open, so the engine '
+                    f'numbered this fresh document "{actual}"; to iterate on the existing '
+                    f'design instead of making a numbered sibling, use plm_checkpoint / '
+                    f'plm_timeline')
+                out["note"] = (f'{out["note"]}; {collision_note}'
+                               if out.get("note") else collision_note)
             # Land the (still empty) part in the user's project folder immediately so it
             # exists as a real, openable file; add_features refreshes it as geometry grows.
             saved = _project_save(did, actual)
@@ -7741,9 +7749,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         this to deliver a part the user will keep working on. (export_part writes flat interchange
         or mesh files: a plain STEP/STL has geometry only, no feature history or studies.)
 
-        path : where to write. If omitted, a temp .step+ is written. A ".step+" extension is added
-               when the name carries none; a DIFFERENT CAD extension (".step", ".stl", …) is
-               REPLACED, so save_part("bracket.step") writes "bracket.step+" and never
+        path : where to write. If omitted, writes to CHUDWARE_PROJECT_SAVE_DIR using the
+               document name; only external/headless clients with no configured project folder
+               fall back to a temp .step+. A ".step+" extension is added when the name carries
+               none; a DIFFERENT CAD extension (".step", ".stl", …) is REPLACED, so
+               save_part("bracket.step") writes "bracket.step+" and never
                "bracket.step.step+". Returns the written path and bytes so you can confirm a
                real save, plus a note whenever the extension was rewritten.
 
@@ -7756,7 +7766,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # K3: canonicalise the caller-supplied path so any '..' traversal sequences are
             # fully resolved before we pass them to the engine.  This means the caller sees
             # exactly where the file will be written (no hidden navigation).
-            out = _sanitize_output_path(path) if path else _tmp(".step+")
+            out = (_sanitize_output_path(path) if path
+                   else _default_deliverable_path(d, ".step+"))
             note = None
             if not out.lower().endswith(".step+"):
                 # A caller who wrote "bracket.step" asked for a CAD file by name and gets the

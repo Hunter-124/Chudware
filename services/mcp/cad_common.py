@@ -1410,6 +1410,33 @@ def _project_save_stem(name: Optional[str], doc_id: str) -> str:
     return stem or doc_id
 
 
+def _default_deliverable_path(doc_id: str, suffix: str) -> str:
+    """Choose the destination for a save/export whose caller omitted ``path``.
+
+    Agent turns configure ``CHUDWARE_PROJECT_SAVE_DIR`` to the user's working folder.
+    A live 2026-08-05 replay instead let bare save_part fall through to ``_tmp``; that
+    misplaced the deliverable and also made it invisible to GUI artifacts because the
+    ``chudware_mcp_`` basename is deliberately classified as internal scratch. External
+    headless MCP clients do not configure a project folder, so only that case keeps the
+    historical temp-file fallback.
+    """
+    root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR")
+    if not root:
+        return _tmp(suffix)
+
+    directory = Path(os.path.abspath(os.path.expanduser(root)))
+    directory.mkdir(parents=True, exist_ok=True)
+    name = None
+    try:
+        for entry in (cb.call("doc_list", {}) or {}).get("docs", []):
+            if isinstance(entry, dict) and entry.get("doc_id") == doc_id:
+                name = entry.get("name") or ""
+                break
+    except Exception:  # noqa: BLE001 — the doc_id remains a stable filename fallback
+        pass
+    return str(directory / f"{_project_save_stem(name, doc_id)}{suffix}")
+
+
 def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional[str]:
     """Save the doc as a DELIVERABLE native .step+ in the user's project folder
     (<CHUDWARE_PROJECT_SAVE_DIR>/<safe_stem>.step+) and return the written path.

@@ -32,6 +32,7 @@ class _FakeEngine:
     def __init__(self):
         self.names: dict = {}
         self.saves: list = []
+        self.exports: list = []
 
     def call(self, method, params=None):
         p = params or {}
@@ -46,6 +47,12 @@ class _FakeEngine:
             self.saves.append(path)
             Path(path).write_text("STEP+ fake payload")
             return {"path": path}
+        if method == "export_file":
+            path = p.get("path")
+            self.exports.append(path)
+            Path(path).write_text("flat export fake payload")
+            return {"path": path, "bytes": Path(path).stat().st_size,
+                    "solid_count": 1, "valid_solids": 1, "validated": True}
         if method == "doc_checkpoint":
             return {"checkpoint": "ck1"}
         if method == "doc_apply_ops":
@@ -100,6 +107,38 @@ def test_new_part_lands_in_project_dir_and_reports_saved_path(engine, monkeypatc
     assert written.is_file()
     assert r["saved_path"] == str(written)
 
+
+
+def test_bare_save_and_export_land_in_project_dir(engine, monkeypatch, tmp_path):
+    """Replay defect: a pathless delivery must not disappear into chudware_mcp_ scratch."""
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    _new_part("project widget")
+    engine.saves.clear()  # discard new_part's eager project-save call from this assertion
+
+    saved = json.loads(_tool("save_part")(doc_id=_DOC))
+    exported = json.loads(_tool("export_part")(fmt="step", doc_id=_DOC))
+
+    assert saved["path"] == str(tmp_path / "project_widget.step+")
+    assert exported["path"] == str(tmp_path / "project_widget.step")
+    assert Path(saved["path"]).is_file() and Path(exported["path"]).is_file()
+    assert engine.saves == [saved["path"]]
+    assert engine.exports == [exported["path"]]
+    assert not Path(saved["path"]).name.startswith("chudware_mcp_")
+    assert not Path(exported["path"]).name.startswith("chudware_mcp_")
+
+
+def test_bare_save_and_export_keep_temp_fallback_without_project(engine, monkeypatch):
+    """External MCP clients have no project folder, so their historical temp default stays."""
+    monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
+    _new_part("headless_widget")
+
+    saved = json.loads(_tool("save_part")(doc_id=_DOC))
+    exported = json.loads(_tool("export_part")(fmt="step", doc_id=_DOC))
+
+    assert Path(saved["path"]).name.startswith("chudware_mcp_")
+    assert Path(exported["path"]).name.startswith("chudware_mcp_")
+    Path(saved["path"]).unlink()
+    Path(exported["path"]).unlink()
 
 def test_stem_sanitization_matches_host_rule(engine, monkeypatch, tmp_path):
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))

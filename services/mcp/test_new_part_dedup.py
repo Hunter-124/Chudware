@@ -349,6 +349,24 @@ def test_fresh_true_overrides_resume_but_still_mints_the_bare_series_name(engine
     assert r.get("reused") is not True
 
 
+def test_fresh_version_mint_explains_engine_uniquifier_and_plm_alternative(engine):
+    """The replay's version strip can expose the engine's older collision numbering."""
+    base = "ruger_lcp380_iwb_holster"
+    fake = engine([
+        {"doc_id": "doc-cpp00000041", "name": base, "revision": 6,
+         "feature_count": 18},
+    ])
+    requested = f"{base}_v2"
+    r = _new_part(name=requested, fresh=True)
+
+    assert fake.new_calls == [base]
+    assert r["requested_name"] == requested
+    assert r["name"] == f"{base}2"
+    assert f'document named "{base}" was already open' in r["note"]
+    assert f'numbered this fresh document "{base}2"' in r["note"]
+    assert "plm_checkpoint" in r["note"] and "plm_timeline" in r["note"]
+
+
 def test_exact_name_match_still_goes_through_the_engine_mint_lock(engine):
     """The version path must not shadow the engine's own resume. Asking for a name that
     IS open takes doc_new(resume_if_open) — the unlocked check-then-mint pair it replaced

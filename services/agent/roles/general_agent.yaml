@@ -71,6 +71,7 @@ system_prompt: |
     and MUST NEVER go to plm_item_add. plm_checkpoint records the build in
     project history. For non-design files only: plm_item_add(path=<project root>,
     file_path=<file relative to it>).
+  - Every vault-backed plm_* tool takes the PROJECT ROOT as path; when omitted, path defaults to the resolved project root.
   - Inspect & orient: describe_project, list_parts, workspace_status.
   - Research: research_web_search (and the shared research/fetch floor).
   - ask_user when a choice is genuinely ambiguous or could destroy work.

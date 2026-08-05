@@ -145,6 +145,64 @@ def _delegation_execution_verdict(node: dict) -> dict:
     }
 
 
+def _actionable_delegate_failure(node: dict) -> dict:
+    """Put the sub-agent failure first so the model and clipped ledger see why.
+
+    The live 2026-08-05 holster replay spawned and ran a ``feature_modeler`` whose
+    provider then returned no completion. ``_run_subagent_turn`` correctly set
+    ``ok=False``, but the merged node started with its id and 500-character brief
+    and carried the provider error only inside ``result``. The 1,000-character
+    ledger clip and the GUI's generic error fallback therefore showed the request
+    echoed back instead of the cause.
+    """
+    if not isinstance(node, dict) or node.get("ok") is not False:
+        return node
+
+    nested = node.get("result") if isinstance(node.get("result"), dict) else {}
+    stop_reason = str(
+        node.get("stop_reason") or nested.get("stop_reason") or ""
+    ).strip()
+    subagent_status = str(node.get("subagent_status") or "").strip()
+    reason = str(node.get("reason") or "").strip()
+    if not reason:
+        if stop_reason:
+            reason = f"subagent_{stop_reason}"
+        elif subagent_status:
+            reason = f"subagent_{subagent_status}"
+        else:
+            reason = "subagent_failed"
+
+    error = str(node.get("error") or "").strip()
+    detail = str(
+        nested.get("error_detail") or nested.get("error") or node.get("note") or ""
+    ).strip()
+    if not error:
+        role = str(node.get("role") or "sub-agent")
+        if stop_reason:
+            error = (
+                f"delegate spawned {role!r}, but the sub-agent failed with "
+                f"stop_reason={stop_reason!r}"
+            )
+        elif subagent_status == "not_run":
+            error = f"delegate spawned {role!r}, but the sub-agent did not run"
+        else:
+            error = f"delegate spawned {role!r}, but the sub-agent failed"
+        if detail:
+            error += f": {detail}"
+        error += (
+            ". The delegated work was not completed; retry only if the cause is "
+            "transient, otherwise continue with the concrete tools available here."
+        )
+
+    # Keep these keys first: both agent_events._error_text and the persisted
+    # tool-result clip must expose the cause before the spawn record / brief.
+    rest = {
+        key: value for key, value in node.items()
+        if key not in {"ok", "reason", "error"}
+    }
+    return {"ok": False, "reason": reason, "error": error, **rest}
+
+
 class MissionDispatch:
     """Run-scoped tool dispatcher for ONE mission.
 
@@ -700,7 +758,9 @@ class MissionDispatch:
                 except Exception:  # noqa: BLE001
                     pass
             return {
-                "ok": False, "status": "unavailable",
+                "ok": False,
+                "reason": "delegation_unavailable",
+                "status": "unavailable",
                 "error": (
                     "delegate is not available in this run: no delegation tree and "
                     "no model provider are bound to it, so no sub-agent can execute. "
@@ -741,6 +801,7 @@ class MissionDispatch:
             if not policy.get("ok"):
                 return {
                     "ok": False,
+                    "reason": "spawn_depth_policy",
                     "status": "refused",
                     "error": policy.get("reason") or "spawn depth policy refused",
                     "spawn_depth_policy": policy,
@@ -757,12 +818,16 @@ class MissionDispatch:
                 tree=self.delegation_tree,
                 parent_id=parent_id, kind=kind, docs=docs)
         except Exception as exc:  # noqa: BLE001 — error is data for the model
-            return {"ok": False, "status": "failed",
-                    "error": f"delegate failed: {exc}",
-                    "role_requested": role_raw,
-                    "role_resolved": role_resolved,
-                    "brief_len": len(brief_raw),
-                    "brief_truncated": brief_truncated}
+            return {
+                "ok": False,
+                "reason": "delegation_exception",
+                "status": "failed",
+                "error": f"delegate failed: {exc}",
+                "role_requested": role_raw,
+                "role_resolved": role_resolved,
+                "brief_len": len(brief_raw),
+                "brief_truncated": brief_truncated,
+            }
 
         if isinstance(node, dict) and getattr(self, "_delegation_tree_autobound", False):
             # Observable, not silent: this mission had no tree until this call.
@@ -780,12 +845,17 @@ class MissionDispatch:
                 if brief_truncated:
                     node["brief_truncated"] = True
                     node["brief_len_original"] = len(brief_raw)
-            return node
+            return _actionable_delegate_failure(node)
         if self.provider is None:
             node["executed"] = False
-            node["note"] = ("sub-agent spawned (registry session created) but NOT "
-                            "executed: no provider bound to this mission dispatch")
-            return node
+            node["ok"] = False
+            node["reason"] = "subagent_not_run"
+            node["error"] = (
+                "sub-agent spawned (registry session created) but did NOT execute: "
+                "no provider is bound to this mission dispatch. Do the work directly "
+                "with the concrete tools available in this turn."
+            )
+            return _actionable_delegate_failure(node)
         node["executed"] = True
         if role_raw and role_resolved != role_raw:
             node["role_requested"] = role_raw
@@ -806,7 +876,7 @@ class MissionDispatch:
         # execution it cannot evidence is the worst kind of lie in this harness, because every
         # honesty gate downstream trusts it.
         node.update(_delegation_execution_verdict(node))
-        return node
+        return _actionable_delegate_failure(node)
 
     def _run_subagent(self, node: dict, brief: str) -> dict:
         """Run a sub-agent turn with its OWN current part.

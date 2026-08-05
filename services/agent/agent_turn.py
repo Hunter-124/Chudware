@@ -1254,10 +1254,15 @@ def _with_usage(result: dict, tu_mod: Any = None) -> dict:
 
 _SYSTEM_BASE = (
     "You are a Chudware agent executing a task. You may call "
-    "tools to inspect and modify the engine. To call a tool, reply with a single "
+    "tools to inspect and modify the engine. To call a tool, reply with a "
     "fenced json block:\n"
     "```json\n{\"tool\": \"<tool_name>\", \"args\": {<kwargs>}}\n```\n"
-    "After you see the tool result, either call another tool or, when the task's "
+    "You may send SEVERAL such blocks in one reply when you already know the "
+    "next few steps. They run in order and you get every result back at once, "
+    "which is far cheaper than one reply per call. If any call fails the rest "
+    "are dropped unrun, so only batch steps you are confident about, and never "
+    "batch a step whose arguments depend on a result you have not seen yet.\n"
+    "After you see the tool results, either call more tools or, when the task's "
     "goal is met, finish with ONE of these fenced JSON forms (both accepted):\n"
     "```json\n{\"done\": true, \"handoff\": {<structured summary>}}\n```\n"
     "or the role handoff envelope (preferred when your role card defines one):\n"
@@ -2302,7 +2307,15 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _raw_target, _raw_writer, "started", _raw_started_note)
     except Exception:  # noqa: BLE001
         pass
+    # Directives the CURRENT reply asked for but that have not run yet. A model
+    # may emit several ```json fences in one message; they execute in order, one
+    # per loop iteration, without paying for a completion in between. Cleared
+    # the moment a call fails or is refused, so the model always reacts to bad
+    # news itself instead of the harness pushing on through a broken state.
+    pending_directives: list[dict] = []
     for _ in range(budget + 1):
+        queued: dict | None = (
+            pending_directives.pop(0) if pending_directives else None)
         # Phase 4 (M11/M16/M17): the sub-agent turn boundary. Cross-process
         # controls never interrupt in-flight work; they land before the next
         # model completion. Best-effort: registry failure never breaks a turn.
@@ -2455,25 +2468,36 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         # output + tool calls, and stream one context chip per firing so the
         # injection is visible in the transcript. Effort-gated inside; cheap
         # no-op when nothing matches (mega-25).
-        _trig_tool_names = [
-            c.get("tool") for c in calls[_trig_prev_calls_idx:]
-            if isinstance(c, dict) and c.get("tool")
-        ]
-        _trig_block, _trig_fired = _maybe_inject_trigger_advisory(
-            output_text=_trig_prev_text,
-            tool_names=_trig_tool_names,
-            seq=int(_trig_state["seq"]),
-            cooldown_state=_trig_cooldown_state,
-        )
-        _trig_state["seq"] = int(_trig_state["seq"]) + 1
-        if _trig_block:
-            messages.append({"role": "user", "content": _parts(_trig_block)})
-        for _fire in _trig_fired:
-            _emit_rule_fired(_fire)
+        # Skipped while draining a batch: no completion happened, so there is no
+        # new model output to match rules against, and re-firing them per queued
+        # call would inject the same advisory several times over.
+        if queued is None:
+            _trig_tool_names = [
+                c.get("tool") for c in calls[_trig_prev_calls_idx:]
+                if isinstance(c, dict) and c.get("tool")
+            ]
+            _trig_block, _trig_fired = _maybe_inject_trigger_advisory(
+                output_text=_trig_prev_text,
+                tool_names=_trig_tool_names,
+                seq=int(_trig_state["seq"]),
+                cooldown_state=_trig_cooldown_state,
+            )
+            _trig_state["seq"] = int(_trig_state["seq"]) + 1
+            if _trig_block:
+                messages.append({"role": "user",
+                                 "content": _parts(_trig_block)})
+            for _fire in _trig_fired:
+                _emit_rule_fired(_fire)
         try:
-            reply = provider.complete(system, messages, max_tokens=completion_cap)
+            if queued is not None:
+                reply = ""          # drained directive: nothing was billed
+            else:
+                reply = provider.complete(
+                    system, messages, max_tokens=completion_cap)
             # mega-6: drain last-call usage into ledger so spend is auditable.
-            if _tu is not None and ledger is not None:
+            # `queued` skipped: get_last_usage would re-report the completion
+            # that produced the batch, billing one reply several times over.
+            if queued is None and _tu is not None and ledger is not None:
                 try:
                     last_u = _tu.get_last_usage()
                     if last_u and int(last_u.get("total_tokens") or 0) > 0:
@@ -2680,36 +2704,58 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                    "usage": (_tu.get_turn_usage()
                                              if _tu else None)})
 
-        # Single chokepoint for the context meter: EVERY provider completion in
-        # this loop (the normal call, the context-overflow trim retry, and the
-        # degraded alt-provider call) either falls through to here with a `reply`
-        # or returns above, so one emit here covers all of them — and it runs on
-        # every loop iteration, so the meter tracks live instead of once a turn.
-        # `provider` is read fresh: a degrade rebound it, and the window must be
-        # the model that actually ran.
-        _emit_context_event()
+        if queued is not None:
+            # Drained directive: no completion, so no context event, no
+            # assistant turn to append (the reply that asked for this call is
+            # already in `messages`, and re-appending it would double-print the
+            # model's words), and no transcript line.
+            parsed: dict | None = queued
+        else:
+            # Single chokepoint for the context meter: EVERY provider completion
+            # in this loop (the normal call, the context-overflow trim retry, and
+            # the degraded alt-provider call) either falls through to here with a
+            # `reply` or returns above, so one emit here covers all of them — and
+            # it runs on every billed iteration, so the meter tracks live instead
+            # of once a turn. `provider` is read fresh: a degrade rebound it, and
+            # the window must be the model that actually ran.
+            _emit_context_event()
 
-        # An empty assistant turn is not just useless context — Moonshot/kimi
-        # (and other OpenAI-compatible endpoints) REJECT the next request with
-        # HTTP 400 "the message at position N with role 'assistant' must not be
-        # empty", killing the run two calls in. k3 returns empty `content` when
-        # its output was reasoning-only, so this fires on ordinary turns.
-        # Omitting it instead would break strict alternating-role providers.
-        messages.append({"role": "assistant",
-                         "content": _parts(reply if (reply or "").strip()
-                                           else "(no visible output)")})
-        _trig_prev_text = reply
-        _trig_prev_calls_idx = len(calls)
-        # Sub-agent transcripts capture every model reply in full so the GUI
-        # viewer shows the real conversation (never fabricated, never clipped);
-        # the raw log alongside it carries the tool traffic too.
-        if subagent_id:
-            try:
-                from services.agent import subagent_registry as _sreg  # noqa: PLC0415
-                _sreg.append_transcript(subagent_id, "subagent", str(reply))
-            except Exception:  # noqa: BLE001
-                pass
-        parsed = _parse_directive(reply)
+            # An empty assistant turn is not just useless context —
+            # Moonshot/kimi (and other OpenAI-compatible endpoints) REJECT the
+            # next request with HTTP 400 "the message at position N with role
+            # 'assistant' must not be empty", killing the run two calls in. k3
+            # returns empty `content` when its output was reasoning-only, so
+            # this fires on ordinary turns. Omitting it instead would break
+            # strict alternating-role providers.
+            messages.append({"role": "assistant",
+                             "content": _parts(reply if (reply or "").strip()
+                                               else "(no visible output)")})
+            _trig_prev_text = reply
+            _trig_prev_calls_idx = len(calls)
+            # Sub-agent transcripts capture every model reply in full so the GUI
+            # viewer shows the real conversation (never fabricated, never
+            # clipped); the raw log alongside it carries the tool traffic too.
+            if subagent_id:
+                try:
+                    from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                    _sreg.append_transcript(subagent_id, "subagent", str(reply))
+                except Exception:  # noqa: BLE001
+                    pass
+            _directives = _parse_directives(reply)
+            parsed = _directives[0] if _directives else None
+            # Everything after the first runs on later iterations without a
+            # completion. Only plain tool calls queue: a finish envelope ends
+            # the turn, and anything after it was never going to run.
+            for _extra in _directives[1:]:
+                if not isinstance(_extra.get("tool"), str):
+                    break
+                pending_directives.append(_extra)
+            if pending_directives:
+                _log(ledger, actor, {
+                    "event": "directive_batch",
+                    "first": parsed.get("tool") if parsed else None,
+                    "queued": [d.get("tool") for d in pending_directives],
+                })
 
         if parsed is None:
             # Truncation guard (live 2026-07-28, run asm-152734881473315): a
@@ -3291,6 +3337,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         messages.append({"role": "user", "content": _parts(_sk_body)})
                 except Exception:  # noqa: BLE001 — skill nudge never breaks turn
                     pass
+                # A refusal invalidates the rest of the batch for the same
+                # reason a failure does: the model has to answer for this call
+                # before the ones planned behind it mean anything.
+                pending_directives.clear()
                 continue
 
         # mega-13/14: HARD block thrash tools that skip the ECAD product chain.
@@ -3611,6 +3661,24 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         # mega-19: keep full result in-process so place pin lists survive for
         # force wire/power derivation; ledger still gets a truncated digest.
         call_rec = {"tool": tool, "args": args, "ok": ok, "result": result}
+        if not ok and pending_directives:
+            # Stop-on-first-failure. The queued calls were planned against a
+            # state that no longer holds — a sketch that did not take means the
+            # extrude referencing it is wrong too — and running them would bury
+            # the real error under a cascade the model never asked for. Hand
+            # back what happened and let it re-plan.
+            _log(ledger, actor, {
+                "event": "directive_batch_halted",
+                "failed": tool,
+                "dropped": [d.get("tool") for d in pending_directives],
+            })
+            messages.append({"role": "user", "content": _parts(
+                f"[BATCH HALTED] {tool} failed, so the "
+                f"{len(pending_directives)} call(s) you queued after it "
+                f"({', '.join(str(d.get('tool')) for d in pending_directives)}) "
+                "were NOT run. Fix this failure first, then re-send the rest."
+            )})
+            pending_directives.clear()
         calls.append(call_rec)
         try:
             _log(ledger, actor, {
@@ -4462,49 +4530,76 @@ def _normalize_directive(obj: dict) -> dict:
     return out
 
 
-def _parse_directive(reply: str) -> dict | None:
-    """Extract the first tool/done directive from a model reply.
+#: Most directives a single reply may contribute to the batch queue. A reply
+#: that emits more than this is not planning, it is looping.
+_MAX_BATCH_DIRECTIVES = 8
 
-    JSON is canonical. As a provider-compatibility fallback, also accepts xAI's
-    observed textual ``ethan tool call: NAME with ARG is VALUE`` rendering; only
-    the first call is returned so the normal bounded result-feedback loop remains
-    authoritative.
+
+def _parse_directives(reply: str) -> list[dict]:
+    """Every tool/done directive in *reply*, in emission order.
+
+    A reply may carry several ```json fences; the turn loop dispatches them in
+    order, halting the batch at the first failure. Before 2026-08-04 only the
+    first was ever run and the rest were dropped on the floor, which cost one
+    full billed completion — the whole conversation resent — per tool call.
+
+    JSON is canonical. As a provider-compatibility fallback this also accepts
+    xAI's textual ``ethan tool call: NAME with ARG is VALUE`` rendering.
     """
     if not reply:
-        return None
-    candidates: list[str] = [m.group(1) for m in _FENCE_RE.finditer(reply)]
-    stripped = reply.strip()
-    if stripped.startswith("{"):
-        candidates.append(stripped)
-    else:
-        # Unterminated fence: parse from the first '{' after the opening fence.
-        fence = stripped.find("```")
-        if fence != -1:
-            brace = stripped.find("{", fence)
-            if brace != -1:
-                candidates.append(stripped[brace:])
-    # Scan EVERY fenced candidate for a real directive rather than stopping at the
-    # first block that merely parses as JSON. Live 2026-08-04 (claude-sonnet-5, run
-    # lane-delegate-1): the reply was a plan block followed by a second fence
-    # carrying `{"tool": "delegate", ...}` for the second of two requested parts.
-    # The plan block parsed, carried no `tool`, and was returned as-is — so the
-    # delegate never ran, half the deliverable was silently dropped, and the turn
-    # still closed `success=confirmed`. A non-directive object is still returned
-    # (last resort) so the junk-JSON floor keeps its behaviour, but never in
-    # preference to an actual tool call or finish envelope that follows it.
+        return []
+    # Scan EVERY fenced candidate rather than stopping at the first block that
+    # merely parses as JSON. Live 2026-08-04 (claude-sonnet-5, run
+    # lane-delegate-1): a plan block followed by a fence carrying
+    # `{"tool": "delegate", ...}` for the second of two requested parts. The
+    # plan block parsed, carried no `tool`, and was returned as-is — so the
+    # delegate never ran, half the deliverable was silently dropped, and the
+    # turn still closed `success=confirmed`.
+    found: list[dict] = []
     fallback: dict | None = None
-    for cand in candidates:
-        obj = _loads_first_object(cand)
+    for match in _FENCE_RE.finditer(reply):
+        obj = _loads_first_object(match.group(1))
         if obj is None:
             continue
         norm = _normalize_directive(obj)
         if _is_directive(norm):
-            return norm
-        if fallback is None:
+            found.append(norm)
+        elif fallback is None:
             fallback = norm
+    if found:
+        return found[:_MAX_BATCH_DIRECTIVES]
+    # No closed fence carried a directive. Try a bare object, or an
+    # unterminated fence, reading from the first '{' after the opening fence.
+    stripped = reply.strip()
+    tail: str | None = None
+    if stripped.startswith("{"):
+        tail = stripped
+    else:
+        fence = stripped.find("```")
+        if fence != -1:
+            brace = stripped.find("{", fence)
+            if brace != -1:
+                tail = stripped[brace:]
+    if tail is not None:
+        obj = _loads_first_object(tail)
+        if obj is not None:
+            norm = _normalize_directive(obj)
+            if _is_directive(norm):
+                return [norm]
+            if fallback is None:
+                fallback = norm
+    # A non-directive object is still returned (last resort) so the junk-JSON
+    # floor keeps its behaviour, but never in preference to a real call above.
     if fallback is not None:
-        return fallback
-    return _parse_text_tool_call(reply)
+        return [fallback]
+    text_call = _parse_text_tool_call(reply)
+    return [text_call] if text_call is not None else []
+
+
+def _parse_directive(reply: str) -> dict | None:
+    """The first directive in *reply*, or None. See :func:`_parse_directives`."""
+    found = _parse_directives(reply)
+    return found[0] if found else None
 
 
 def _is_directive(obj: Any) -> bool:

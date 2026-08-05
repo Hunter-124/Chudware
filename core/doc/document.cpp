@@ -32,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -3267,8 +3268,36 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         GProp_GProps gb, ga;
                         BRepGProp::VolumeProperties(target, gb);
                         BRepGProp::VolumeProperties(out, ga);
-                        if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
-                            throw std::runtime_error("primitive cut removed no material");
+                        if (std::abs(ga.Mass() - gb.Mass()) < 1e-9) {
+                            // Bare "primitive cut removed no material" told the model
+                            // WHAT happened and nothing about WHY. Live 2026-08-04
+                            // (replay repro-holster-2) it re-aimed the same drain cut
+                            // five times — a quarter of the turn's step budget — because
+                            // nothing said the tool was sitting outside the body. Report
+                            // both bounding boxes: the overlap is then arithmetic, not a
+                            // guess. Same shape as the boss guard below.
+                            auto box_of = [](const TopoDS_Shape& s) {
+                                Bnd_Box bb;
+                                BRepBndLib::Add(s, bb);
+                                if (bb.IsVoid()) return std::string("(empty)");
+                                double xa, ya, za, xb, yb, zb;
+                                bb.Get(xa, ya, za, xb, yb, zb);
+                                std::ostringstream os;
+                                os.precision(4);
+                                os << "[" << xa << "," << ya << "," << za << "]..["
+                                   << xb << "," << yb << "," << zb << "]";
+                                return os.str();
+                            };
+                            throw std::runtime_error(
+                                type + " cut removed no material — the tool and the body "
+                                "do not overlap. Body bbox " + box_of(target) +
+                                ", cut tool bbox " + box_of(solid) +
+                                ". Primitives are CENTRED on the origin unless you place "
+                                "them: give at:{\"of\":\"face\",\"side\":\"top\"} or an "
+                                "explicit position inside the body bbox above, and make "
+                                "the tool long enough to pass through. Move the tool "
+                                "before changing its size.");
+                        }
                     } else {
                         // Symmetric buried-boss guard: a primitive boss merged into a body
                         // that adds NO volume lies entirely inside it. Report the

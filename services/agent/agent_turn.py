@@ -9835,6 +9835,17 @@ _ARTIFACT_PRODUCT_GATES: tuple[tuple[frozenset, str], ...] = (
 )
 
 
+#: A successful call here means the turn produced a real deliverable in SOME
+#: domain, so the opener-less artifact gates above (which exist to catch a turn
+#: whose only output was ledger/read chatter) must not second-guess it.
+_DELIVERED_PRODUCT_TOOLS: frozenset[str] = frozenset({
+    "add_features", "edit_feature", "export_part",
+    "board_from_schematic", "ecad_run_drc", "ecad_make_board", "fw_build",
+    "cam_generate", "cam_post", "make_drawing", "export_drawing",
+    "run_fea_static", "run_fea_modal", "run_cfd_flow",
+})
+
+
 _BOOTSTRAP_OPENERS = frozenset({
     "new_part", "ecad_new_schematic", "fw_new_project",
 })
@@ -9933,9 +9944,21 @@ def _bootstrap_incomplete(
     # Opener-less artifact roles (CAM / simulation / drawing): the role is
     # granted the product tools but ran none of them, so whatever it wrote was
     # ledger/read chatter, not the deliverable.
-    for product, remedy in _ARTIFACT_PRODUCT_GATES:
-        if (product & allow_set) and not (ok_tools & product):
-            return remedy
+    #
+    # …unless the turn delivered a DIFFERENT domain's product. On the general
+    # lane the model widens its own allow-set mid-turn, so one
+    # enable_tools(["sim"]) used to make an FEA study retroactively mandatory:
+    # live 2026-08-04 replay repro-holster-2 built a holster (add_features ×6,
+    # render_part) and was handed back "no study was run —
+    # run_fea_static/run_fea_modal/run_cfd_flow never ran. A simulation role
+    # cannot declare done…". These gates describe what a ROLE exists to
+    # produce; a pack the model pulled in to finish a build is not a promise to
+    # produce an FEA study.
+    if not any(c.get("ok") and c.get("tool") in _DELIVERED_PRODUCT_TOOLS
+               for c in calls):
+        for product, remedy in _ARTIFACT_PRODUCT_GATES:
+            if (product & allow_set) and not (ok_tools & product):
+                return remedy
     return None
 
 

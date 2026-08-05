@@ -162,6 +162,32 @@ def test_geometry_bootstrap_rule_is_unchanged():
          {"tool": "add_features", "ok": True}], geo) is None
 
 
+def test_artifact_gate_ignores_a_pack_the_build_pulled_in_mid_turn():
+    """A holster build must not be told it owes an FEA study.
+
+    Live 2026-08-04 (replay repro-holster-2): the general lane called
+    enable_tools to finish a geometry build, which put run_fea_static on the
+    allow-set. The simulation gate then fired on a turn that had produced six
+    successful add_features batches and a render, flipping `wrote` to False —
+    so a built part came back `status: blocked`, `no study was run —
+    run_fea_static/run_fea_modal/run_cfd_flow never ran`. These gates describe
+    what a ROLE exists to produce, not every pack in scope.
+    """
+    allow = {"new_part", "add_features", "render_part", "ledger_note",
+             "run_fea_static", "run_fea_modal", "run_cfd_flow"}
+    built = [{"tool": "new_part", "ok": True},
+             {"tool": "add_features", "ok": True},
+             {"tool": "render_part", "ok": True}]
+    assert at._bootstrap_incomplete(built, allow) is None
+
+
+def test_artifact_gate_still_fires_when_nothing_was_delivered():
+    """The gate's real job survives: no product in ANY domain, so it holds."""
+    allow = {"ledger_note", "ledger_get", "run_fea_static", "run_cfd_flow"}
+    why = at._bootstrap_incomplete([{"tool": "ledger_note", "ok": True}], allow)
+    assert why is not None and "no study was run" in why
+
+
 # ---------------------------------------------------------------------------
 # 4. A transient provider hiccup must not burn the node
 # ---------------------------------------------------------------------------

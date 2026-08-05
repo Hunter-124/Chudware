@@ -178,6 +178,37 @@ judgment).
   `Server::dispatch` for `agent_*`), which drives the same `registry_.postCall` a socket
   `doc_new` would. Add a publish call beside any NEW direct doc op you introduce there, or
   it is invisible again. `internal:true` must keep propagating (preflight shadow clone).
+- **The delta coalescer exists TWICE and drifted into the same bug.**
+  `agent_turn._AssistantDeltaCoalescer` and `core/agent/run.cpp`'s `DeltaCoalescer` both
+  buffer `text`/`thinking`. Each MUST flush the active channel before switching and drain
+  the active channel first, and `run_turn` must flush before every non-delta event —
+  otherwise a tail crosses a channel switch and glues onto the next completion's opening
+  (live seams: `batch them.The user`, `saved file.The harness`). Change one, change the
+  other; the comments name each other for that reason. GUI side: `feed.cpp` must NOT treat
+  a hidden text-channel flush as a visible thinking boundary, or one reasoning stream
+  renders as several boxes.
+- **Streamed deltas are a recovery source, not just display.** A provider can emit hundreds
+  of deltas and then an EMPTY final envelope (or no final response line at all). The
+  resample used to inspect only the final result, so paid output was discarded and the turn
+  died `provider_error`. `omp_bridge_provider.complete_ex` now retains per-attempt fragments
+  and recovers streamed text or a fenced directive before spending another completion — but
+  it still forwards each fragment to the display sink exactly once. NEVER concatenate deltas
+  into the displayed reply; that contract is unchanged and text double-prints if you break
+  it. An empty `length` reply with `reasoningEffort` set retries once WITHOUT the effort.
+- **`plm_*` tools default their `path` to the resolved project root** (2026-08-05):
+  `CHUDWARE_PROJECT_DIR` → `CHUDWARE_FS_ROOT` → `project_context.resolve_project_root()`,
+  explicit argument still wins, `project_root_unavailable` when nothing resolves. Three
+  separate live runs died at the tail because the model had no way to know that root. The
+  document-scoped AI-VC ops (`plm_timeline`/`plm_rollback`/`plm_rollback_check`) take no
+  project root and are deliberately excluded.
+- **`save_part`/`export_part` with no path go to `CHUDWARE_PROJECT_SAVE_DIR`.** The temp
+  fallback survives ONLY for headless external MCP clients with no project. A
+  `chudware_mcp_*` basename is also dropped by the artifact allowlist as internal scratch,
+  so a scratch save is invisible in the GUI as well as misplaced.
+- **A failed `delegate` must lead with its cause.** The ledger clips tool results at ~999
+  characters; a failed child's `ok`/`reason`/`error` are emitted FIRST so the reason
+  survives that clip and reaches the model and the GUI card. Before this, a child that died
+  on a provider fault surfaced as its own brief echoed back.
 - **config.json keys:** `saveSettings` merge-overlays `keys`/`experimental` — never
   full-replace them (harness `keys.openrouter` must survive a GUI save).
 - **agent_turn edits:** standing mega-24 offline planning-node repro gate

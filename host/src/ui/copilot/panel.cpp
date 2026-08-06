@@ -893,8 +893,15 @@ static void artiRow(AppState& st, const std::string& label, const std::string& t
 
     ImGui::Selectable("##artifact_row", false, ImGuiSelectableFlags_AllowItemOverlap,
                       ImVec2(rowW, cardH));
-    const bool picked = ImGui::IsItemClicked();
-    if (picked && onOpen) onOpen();
+    // The hover actions sit INSIDE the selectable and are submitted after it, so overlap
+    // normally hands them the click. Exclude their strip explicitly anyway: the first frame a
+    // row becomes hot the buttons were not hovered last frame, and "Folder" would then both
+    // reveal the file AND open the artifact.
+    const bool overActions =
+        actionsW > 0.0f &&
+        ImGui::IsMouseHoveringRect(ImVec2(p1.x - padX - actionsW, p0.y),
+                                   ImVec2(p1.x - padX, p1.y), /*clip=*/false);
+    if (ImGui::IsItemClicked() && !overActions && onOpen) onOpen();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ui::glassRowBackground(dl, p0, p1, ui::metrics::cpMenuRowRound() / S,

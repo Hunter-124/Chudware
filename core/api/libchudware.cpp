@@ -177,8 +177,13 @@ json omp_bridge_proxy(const char* bridge_method, const json& bridge_params) {
             out["status"] = result["status"];
         return out;
     }
+    // `ok` here means "the bridge answered" — but several handlers ALSO return a payload-level
+    // verdict under the same key (auth_validate_key {ok,detail}, auth_oauth_manual, provider_logo),
+    // and stamping ok:true over it told the GUI a rejected API key had validated, which then
+    // saved it as a live credential. Only synthesize the flag when the handler didn't state one.
     json out = result.is_object() ? result : json::object();
-    out["ok"] = true;
+    const auto it = out.find("ok");
+    if (it == out.end() || !it->is_boolean()) out["ok"] = true;
     return out;
 }
 

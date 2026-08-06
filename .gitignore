@@ -54,6 +54,10 @@ scratch/
 # re-pulled by scripts/vendor_omp.py); installed deps + native binaries are not.
 vendor/omp/node_modules/
 vendor/omp/**/node_modules/
+# Per-machine provisioning state written by OmpBridgeClient::ensureBridgeDeps: the fingerprint
+# of the bun.lock node_modules was installed from, plus its cross-process install lock.
+vendor/omp/.chudware-bridge-deps
+vendor/omp/.chudware-bridge-install.lock
 
 # Claude Code project state — CLAUDE.md, settings.json (shared graphify hook),
 # commands/, skills/ ARE tracked (team-shared config); only per-machine state is ignored.

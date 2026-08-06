@@ -35,8 +35,11 @@ Environment=CHUDWARE_PROMPTS_DIR=@PROMPTS@
 # that install_webd.sh never provisions, hard-failing subscription/provider
 # RPCs with "Python runtime not found" the moment someone actually reads
 # this comment and takes it literally. Leave unset; CHUDWARE_REPO still
-# needs stamping so `import services` resolves without a source-tree CWD.
-Environment=CHUDWARE_REPO=%h/Repositories/CAD
+# needs stamping so `import services` resolves without a source-tree CWD — and
+# so core/agent/omp_bridge_client.cpp finds vendor/omp/bridge/src/bridge.ts,
+# the sidecar every provider/auth RPC goes through. install_webd.sh substitutes
+# the checkout it installed FROM, and provisions that same tree's node_modules.
+Environment=CHUDWARE_REPO=@REPO@
 # always — shared webd must come back after clean exits too (binary replace
 # during install_webd without --restart, unexpected idle-exit, etc.). systemctl
 # stop still stays down; only unexpected death auto-recovers.

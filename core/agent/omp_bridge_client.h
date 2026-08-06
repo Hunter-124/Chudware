@@ -112,9 +112,15 @@ private:
         bool detached = false;
     };
 
-    // Resolve bunExe_/bridgeScript_ once (env overrides, else repo-root discovery). Caller
-    // holds mtx_.
+    // Resolve bunExe_/bridgeScript_/vendorOmpDir_ once (env overrides, else repo-root
+    // discovery). Caller holds mtx_.
     bool resolvePaths(std::string& err);
+    // Bring <vendorOmp>/node_modules in line with the committed bun.lock before spawning. Runs
+    // per spawn (not once per process) so a checkout pulled forward under a live daemon heals
+    // on the next respawn instead of dying at import on every call; memoized on the lockfile
+    // fingerprint so one failed install is not retried on every provider poll. Caller holds
+    // mtx_.
+    void provisionDeps();
     bool spawn(std::string& err);  // caller holds mtx_
     // Caller holds mtx_. Tears down process_/fds (fast WNOHANG check, SIGTERM+blocking-wait
     // fallback if still alive) and fails every outstanding Pending with a transport error —
@@ -142,6 +148,13 @@ private:
     // childStdoutRd_/process_, which may already name a newer generation by the time this
     // thread notices its own child died.
     void readerLoop(int fd, pid_t pid);
+    // Background stderr pump for one generation: tees the child's stderr to this process's
+    // stderr (unchanged journal behaviour) while keeping the tail for stderrSummary(). Owns
+    // and closes `fd`. Joined by reap() before it fails outstanding callers, so the tail is
+    // complete by the time a transport error is decorated with it.
+    void stderrLoop(int fd);
+    // Last few non-empty stderr lines of the most recent child, condensed onto one line.
+    std::string stderrSummary();
     void dispatchResponse(const std::string& line);  // caller holds no lock
     void failAllPending(const std::string& reason);   // caller holds no lock
 
@@ -155,11 +168,22 @@ private:
     // $HOME/Repositories/CAD or don't have bun on PATH.
     std::string bunExe_;
     std::string bridgeScript_;
+    // <...>/vendor/omp — the vendored bun workspace provisionDeps() keeps current.
+    std::string vendorOmpDir_;
+    // Lockfile fingerprint provisionDeps() last acted on in this process (see provisionDeps).
+    std::string depsStamp_;
     bool pathsResolved_ = false;
 
     // Background reader for the current generation's child. Joined (never detached) before a
     // respawn (ensureRunning) and on shutdown (stop()) so no thread outlives its stdio fds.
     std::thread reader_;
+    // Owns the current generation's stderr pipe end; joined in reap(). Never detached.
+    std::thread stderrPump_;
+    // Rolling tail of the current generation's stderr, guarded independently of mtx_ (reap()
+    // holds mtx_ while joining the pump, which must never need it).
+    static constexpr size_t kMaxStderrTail = 4096;
+    std::mutex stderrMtx_;
+    std::string stderrTail_;
 
     // Request id -> in-flight caller. Guarded independently of mtx_: the reader thread only
     // ever needs this map plus each Pending's own mutex, never the process/fd state guarded by

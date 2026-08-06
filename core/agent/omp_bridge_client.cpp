@@ -6,6 +6,7 @@
 #include "agent/omp_bridge_client.h"
 #include "agent/providers.h"  // provider_cancel_flag() — abort in-flight bridge complete() on Stop
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -45,6 +46,7 @@ bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -52,6 +54,7 @@ bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& 
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -132,20 +135,68 @@ std::string resolveBunExe() {
     return "bun";
 }
 
+// --- vendored bridge dependency provisioning ----------------------------------------
 // The bridge's runtime deps live in <vendorOmp>/node_modules, which is gitignored — a fresh
 // checkout or a clean build lacks them, and `bun run bridge.ts` then fails to resolve the
-// workspace packages. Materialize them ONCE from the committed bun.lock (frozen) so the core
-// is self-sufficient (no manual `bun install` step for providers to work). Best-effort +
-// idempotent: a present node_modules short-circuits; on install failure we fall through and
-// let spawn() surface bun's own diagnostic. Caller holds mtx_ (first-spawn resolvePaths).
-void ensureBridgeDeps(const std::string& vendorOmpDir, const std::string& bunExe) {
+// workspace packages. Materialize them from the committed bun.lock (frozen) so the core is
+// self-sufficient (no manual `bun install` step for providers to work).
+//
+// Presence alone is NOT a sufficient "already provisioned" test. A checkout that gets pulled
+// forward keeps its OLD node_modules (git never touches it), so a lockfile bump silently
+// leaves the tree half-upgraded: bun then aborts at import with e.g. "SyntaxError: Export
+// named 'vectorIndexTopK' not found in module .../@oh-my-pi/pi-natives/native/index.js", the
+// child dies before answering anything, and every provider RPC degrades to a bare transport
+// error ("No providers reported by the bridge" in Settings -> Providers). That is exactly how
+// the shared web daemon rotted. So we stamp the lockfile fingerprint we installed FROM next to
+// node_modules and reinstall whenever the committed lock no longer matches it.
+
+// FNV-1a over the provisioning inputs (bun.lock + package.json). Content-addressed rather
+// than mtime-based: a git checkout rewrites mtimes for reasons that have nothing to do with
+// the dependency set, and a same-second install would race an mtime comparison.
+std::string bridgeDepsStamp(const std::string& vendorOmpDir) {
+    static const char* kInputs[] = {"/bun.lock", "/bun.lockb", "/package.json"};
+    uint64_t h = 1469598103934665603ull;
+    bool any = false;
+    for (const char* rel : kInputs) {
+        std::ifstream in(vendorOmpDir + rel, std::ios::binary);
+        if (!in) continue;
+        any = true;
+        char chunk[8192];
+        while (in.read(chunk, sizeof(chunk)) || in.gcount() > 0) {
+            const std::streamsize got = in.gcount();
+            for (std::streamsize i = 0; i < got; ++i) {
+                h ^= (unsigned char)chunk[i];
+                h *= 1099511628211ull;
+            }
+            if (!in) break;
+        }
+    }
+    if (!any) return std::string();
+    char out[17];
+    std::snprintf(out, sizeof(out), "%016llx", (unsigned long long)h);
+    return std::string(out);
+}
+
+std::string readStampFile(const std::string& path) {
+    std::ifstream in(path);
+    std::string s;
+    if (in) std::getline(in, s);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+    return s;
+}
+
+// True when node_modules exists AND was installed from the lockfile we are holding.
+bool bridgeDepsCurrent(const std::string& vendorOmpDir, const std::string& stampPath,
+                       const std::string& want) {
     std::error_code ec;
-    if (std::filesystem::is_directory(vendorOmpDir + "/node_modules", ec))
-        return;  // already packed
-    if (!std::filesystem::is_regular_file(vendorOmpDir + "/package.json", ec))
-        return;  // no vendored workspace here — nothing to install
+    if (!std::filesystem::is_directory(vendorOmpDir + "/node_modules", ec)) return false;
+    return !want.empty() && readStampFile(stampPath) == want;
+}
+
+// Run `bun install --frozen-lockfile` in vendorOmpDir; true only on a clean exit.
+bool runBridgeInstall(const std::string& vendorOmpDir, const std::string& bunExe) {
     pid_t pid = fork();
-    if (pid < 0) return;
+    if (pid < 0) return false;
     if (pid == 0) {
         if (::chdir(vendorOmpDir.c_str()) != 0) _exit(127);
         // Install chatter -> stderr so it never contaminates a JSON-RPC stdout stream.
@@ -154,7 +205,46 @@ void ensureBridgeDeps(const std::string& vendorOmpDir, const std::string& bunExe
         _exit(127);
     }
     int status = 0;
-    waitpid(pid, &status, 0);
+    if (waitpid(pid, &status, 0) != pid) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// `want` is the caller's already-computed lockfile fingerprint (bridgeDepsStamp). Best-effort
+// throughout: on install failure we fall through and let spawn() surface bun's own diagnostic
+// (captured from the child's stderr — see stderrLoop).
+void ensureBridgeDeps(const std::string& vendorOmpDir, const std::string& bunExe,
+                      const std::string& want) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(vendorOmpDir + "/package.json", ec))
+        return;  // no vendored workspace here — nothing to install
+    const std::string stampPath = vendorOmpDir + "/.chudware-bridge-deps";
+    if (bridgeDepsCurrent(vendorOmpDir, stampPath, want)) return;
+
+    // Every process sharing this checkout (hostd, the desktop GUI, tests) reaches the same
+    // verdict at the same moment after a pull, and concurrent `bun install`s into one
+    // node_modules corrupt it. Serialize on a lock file, then re-check — the winner's install
+    // makes the others' work unnecessary.
+    const std::string lockPath = vendorOmpDir + "/.chudware-bridge-install.lock";
+    int lockFd = ::open(lockPath.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+    if (lockFd >= 0 && ::flock(lockFd, LOCK_EX) != 0) {
+        ::close(lockFd);
+        lockFd = -1;
+    }
+    if (lockFd >= 0 && bridgeDepsCurrent(vendorOmpDir, stampPath, want)) {
+        ::close(lockFd);
+        return;
+    }
+    const bool installed = runBridgeInstall(vendorOmpDir, bunExe);
+    // Stamp only a clean install: a failed one must be retried by the next process/boot
+    // rather than remembered as provisioned.
+    if (installed && !want.empty()) {
+        std::ofstream out(stampPath, std::ios::trunc);
+        if (out) out << want << "\n";
+    }
+    if (lockFd >= 0) {
+        ::flock(lockFd, LOCK_UN);
+        ::close(lockFd);
+    }
 }
 
 // Blocking single-line reader used only by the background reader thread: pumps `fd` (this
@@ -270,6 +360,10 @@ void OmpBridgeClient::reap() {
         process_ = -1;
     }
     running_ = false;
+    // Join the stderr pump BEFORE failing anyone: the child's write end is gone now, so the
+    // pump is at EOF and about to exit, and only after it does is stderrTail_ guaranteed to
+    // hold the child's dying words. call() decorates the transport error with them.
+    if (stderrPump_.joinable()) stderrPump_.join();
     // Whoever noticed the child is dead (a caller's failed write, or the reader thread's own
     // EOF detection) is the single place that guarantees no in-flight call() is left hanging.
     failAllPending("omp bridge subprocess exited");
@@ -285,21 +379,34 @@ bool OmpBridgeClient::resolvePaths(std::string& err) {
               "containing vendor/omp/)";
         return false;
     }
-    // <...>/vendor/omp/bridge/src/bridge.ts -> <...>/vendor/omp. Self-pack the workspace deps
-    // on first use if they are absent (gitignored node_modules on a fresh checkout).
-    ensureBridgeDeps(
-        std::filesystem::path(bridgeScript_).parent_path().parent_path().parent_path().string(),
-        bunExe_);
+    // <...>/vendor/omp/bridge/src/bridge.ts -> <...>/vendor/omp.
+    vendorOmpDir_ =
+        std::filesystem::path(bridgeScript_).parent_path().parent_path().parent_path().string();
     pathsResolved_ = true;
     return true;
+}
+
+// Provision (or re-provision) the vendored workspace before each spawn, not once per process:
+// a checkout pulled forward under a live daemon leaves node_modules behind its lockfile, and
+// the resulting child dies at import on every call. Re-checking here lets the very next
+// respawn repair it instead of requiring a daemon restart. `depsStamp_` keeps that cheap and
+// stops a hopeless install from re-running on every 3-second provider poll: one attempt per
+// distinct lockfile fingerprint per process. Caller holds mtx_.
+void OmpBridgeClient::provisionDeps() {
+    if (vendorOmpDir_.empty()) return;
+    const std::string want = bridgeDepsStamp(vendorOmpDir_);
+    if (!want.empty() && want == depsStamp_) return;  // this lockfile already handled here
+    ensureBridgeDeps(vendorOmpDir_, bunExe_, want);
+    depsStamp_ = want;
 }
 
 bool OmpBridgeClient::spawn(std::string& err) {
     // Caller holds mtx_. running_ must be false / fds closed.
     if (!resolvePaths(err)) return false;
+    provisionDeps();
 
-    int outPipe[2], inPipe[2];
-    if (pipe(outPipe) != 0 || pipe(inPipe) != 0) {
+    int outPipe[2], inPipe[2], errPipe[2];
+    if (pipe(outPipe) != 0 || pipe(inPipe) != 0 || pipe(errPipe) != 0) {
         err = std::string("pipe() failed: ") + std::strerror(errno);
         return false;
     }
@@ -312,6 +419,8 @@ bool OmpBridgeClient::spawn(std::string& err) {
         ::close(outPipe[1]);
         ::close(inPipe[0]);
         ::close(inPipe[1]);
+        ::close(errPipe[0]);
+        ::close(errPipe[1]);
         return false;
     }
     if (pid == 0) {
@@ -322,14 +431,19 @@ bool OmpBridgeClient::spawn(std::string& err) {
         // Race guard: if hostd died between fork and prctl, PDEATHSIG never fires — re-check
         // the parent is still us.
         if (::getppid() != parentPid) _exit(1);
-        // stdin <- inPipe[0], stdout -> outPipe[1]; stderr stays connected (bridge.ts logs its
-        // own [omp-bridge] lines there — never mixed into the response stream).
+        // stdin <- inPipe[0], stdout -> outPipe[1], stderr -> errPipe[1]. bridge.ts logs its
+        // own [omp-bridge] lines (and bun's import-time diagnostics) on stderr — never mixed
+        // into the response stream. The pump thread tees them straight back out to OUR stderr,
+        // so the journal sees exactly what it saw when stderr was inherited.
         dup2(inPipe[0], STDIN_FILENO);
         dup2(outPipe[1], STDOUT_FILENO);
+        dup2(errPipe[1], STDERR_FILENO);
         ::close(inPipe[0]);
         ::close(inPipe[1]);
         ::close(outPipe[0]);
         ::close(outPipe[1]);
+        ::close(errPipe[0]);
+        ::close(errPipe[1]);
         // Close every other inherited fd (hostd's listen/client sockets etc.) so they never
         // leak into the bun child.
         ::close_range(3, ~0U, 0);
@@ -342,12 +456,78 @@ bool OmpBridgeClient::spawn(std::string& err) {
     ::setpgid(pid, pid);
     ::close(inPipe[0]);
     ::close(outPipe[1]);
+    ::close(errPipe[1]);
     fcntl(outPipe[0], F_SETFL, O_NONBLOCK);
     process_ = pid;
     childStdoutRd_ = outPipe[0];
     childStdinWr_ = inPipe[1];
+    {
+        std::lock_guard<std::mutex> lk(stderrMtx_);
+        stderrTail_.clear();  // this generation's diagnostics only
+    }
+    stderrPump_ = std::thread(&OmpBridgeClient::stderrLoop, this, errPipe[0]);
     running_ = true;
     return true;
+}
+
+// Background stderr pump for one generation: tees the child's stderr to ours (so hostd's
+// journal keeps the [omp-bridge] lines it always had) while retaining the tail in memory.
+// Without this, a child that dies during module resolution — the shape a stale vendored
+// node_modules takes — reaches callers as a bare "omp bridge subprocess exited" and the whole
+// diagnosis lives only in a log nobody running the GUI can see. Owns `fd` and closes it.
+void OmpBridgeClient::stderrLoop(int fd) {
+    char chunk[4096];
+    for (;;) {
+        ssize_t n = ::read(fd, chunk, sizeof(chunk));
+        if (n > 0) {
+            ssize_t off = 0;
+            while (off < n) {
+                ssize_t w = ::write(STDERR_FILENO, chunk + off, (size_t)(n - off));
+                if (w <= 0) {
+                    if (w < 0 && errno == EINTR) continue;
+                    break;
+                }
+                off += w;
+            }
+            std::lock_guard<std::mutex> lk(stderrMtx_);
+            stderrTail_.append(chunk, (size_t)n);
+            if (stderrTail_.size() > kMaxStderrTail)
+                stderrTail_.erase(0, stderrTail_.size() - kMaxStderrTail);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;  // EOF (child gone) or unrecoverable read error
+    }
+    ::close(fd);
+}
+
+// Last few non-empty stderr lines of the most recent child, condensed onto one line for an
+// error string. Empty when the child said nothing.
+std::string OmpBridgeClient::stderrSummary() {
+    std::string tail;
+    {
+        std::lock_guard<std::mutex> lk(stderrMtx_);
+        tail = stderrTail_;
+    }
+    std::vector<std::string> lines;
+    size_t pos = 0;
+    while (pos <= tail.size()) {
+        const size_t nl = tail.find('\n', pos);
+        std::string ln = tail.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+        if (!ln.empty()) lines.push_back(std::move(ln));
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    if (lines.empty()) return std::string();
+    const size_t take = std::min<size_t>(3, lines.size());
+    std::string out;
+    for (size_t i = lines.size() - take; i < lines.size(); ++i) {
+        if (!out.empty()) out += " | ";
+        out += lines[i];
+    }
+    if (out.size() > kMaxStderrTail) out.resize(kMaxStderrTail);
+    return out;
 }
 
 bool OmpBridgeClient::writeLine(const std::string& line) {
@@ -599,19 +779,30 @@ bool OmpBridgeClient::call(const std::string& method, const json& params, json& 
     // Child died (write fail/subprocess exit) -> reap + respawn once (inside the next
     // callOnce's ensureRunning), then fail. Timeouts, cancellation, method-level errors, and
     // anything that already streamed do NOT respawn — they're final for this call.
+    //
+    // A transport failure carries no information on its own ("omp bridge subprocess exited" is
+    // what the Providers tab used to render as an unexplained banner over an empty list), so
+    // every transport-level `err` leaves here with the child's own last stderr lines appended —
+    // bun's module-resolution SyntaxError, a missing runtime, an OOM kill.
+    auto fail = [this](std::string& out, std::string attemptErr) {
+        const std::string why = stderrSummary();
+        out = why.empty() ? std::move(attemptErr) : std::move(attemptErr) + ": " + why;
+        return false;
+    };
     for (int attempt = 0; attempt < 2; ++attempt) {
         std::string attemptErr;
         bool childDead = false;
         if (callOnce(method, params, result, attemptErr, timeoutMs, sink, childDead)) return true;
 
-        // Method-level errors (ok:false with a structured {message,status} object) are final.
+        // Method-level errors (ok:false with a structured {message,status} object) are final,
+        // and already say something useful — never bury them under bridge log noise.
         const bool methodError = result.is_object() && result.contains("message");
-        if (methodError || !childDead || streamed.load(std::memory_order_relaxed)) {
+        if (methodError) {
             err = std::move(attemptErr);
             return false;
         }
-        err = std::move(attemptErr);
-        if (attempt == 1) return false;
+        if (!childDead || streamed.load(std::memory_order_relaxed) || attempt == 1)
+            return fail(err, std::move(attemptErr));
         // loop: ensureRunning() respawns inside the next callOnce attempt.
     }
     return false;

@@ -95,6 +95,31 @@ else
   echo "[webd] WARNING: $PROMPTS_SRC missing — agent_run_v2 will fail (role prompts)"
 fi
 
+# --- vendored OMP bun workspace (the provider/auth sidecar) ------------------
+# Every agent_provider_*/agent_models_list RPC runs through
+# `bun run $ROOT/vendor/omp/bridge/src/bridge.ts` (core/agent/omp_bridge_client.cpp),
+# resolved via CHUDWARE_REPO. Its node_modules is gitignored, so a `git pull` that
+# bumps bun.lock leaves the checkout half-upgraded: bun then aborts at import
+# ("SyntaxError: Export named '...' not found in module .../node_modules/...") and
+# Settings -> Providers goes blank with a bare transport error. That is exactly how
+# this deployment rotted. Re-provision on every install so the sidecar always matches
+# the tree the daemon is pointed at. Cheap no-op when already current; the daemon
+# self-heals too (provisionDeps) but only AFTER a user has already hit the failure.
+VENDOR_OMP="$ROOT/vendor/omp"
+if [ -f "$VENDOR_OMP/package.json" ]; then
+  BUN="${CHUDWARE_BUN:-$HOME/.bun/bin/bun}"
+  [ -x "$BUN" ] || BUN="$(command -v bun || true)"
+  if [ -n "$BUN" ] && [ -x "$BUN" ]; then
+    if (cd "$VENDOR_OMP" && "$BUN" install --frozen-lockfile); then
+      echo "[webd] omp bridge deps provisioned ($VENDOR_OMP/node_modules)"
+    else
+      echo "[webd] WARNING: bun install failed in $VENDOR_OMP — provider/auth RPCs will fail"
+    fi
+  else
+    echo "[webd] WARNING: bun not found — cannot provision $VENDOR_OMP (provider RPCs need it)"
+  fi
+fi
+
 # --- socket path (verbatim instance-key override => deterministic name) ----
 RUNDIR="${XDG_RUNTIME_DIR:-/tmp/chudware-$(id -u)}"
 SOCK="$RUNDIR/chudware/hostd-$KEY.sock"
@@ -124,7 +149,7 @@ echo "[webd] wrote $DST/chudware-shared.sh"
 # --- systemd user unit -------------------------------------------------------
 UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
-sed -e "s|@BIN@|$BIN|g" -e "s|@PROMPTS@|$PROMPTS_DST|g" \
+sed -e "s|@BIN@|$BIN|g" -e "s|@PROMPTS@|$PROMPTS_DST|g" -e "s|@REPO@|$ROOT|g" \
   "$ROOT/Webservice/deploy/chudware-hostd.service" > "$UNIT_DIR/chudware-hostd.service"
 # Auto-reinstall path unit: watches the build-tree chudware-hostd and re-runs
 # this script --restart. Enabling is idempotent; path watches the SOURCE

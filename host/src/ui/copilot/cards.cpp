@@ -2924,7 +2924,7 @@ HeaderBtnHit headerTextButtonHit(const char* id, float w) {
 }
 
 void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active,
-                           const char* iconName) {
+                           const char* iconName, bool withLabel) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 txt = surf.textPrimary;
@@ -2946,8 +2946,15 @@ void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active
                     ImVec4(txt.x, txt.y, txt.z, active ? 0.45f : 0.25f)),
                 round, 0, ui::metrics::stroke(1.0f));
 
-    float x = h.rect.Min.x + padX;
+    // withLabel=false is the narrow-column pill: the icon centres in the box on its own and
+    // the tooltip carries the name. Never squeeze the label in — draw-list text is not clipped
+    // by the pill, so it would spill across its neighbours.
     const float midY = (h.rect.Min.y + h.rect.Max.y) * 0.5f;
+    const float labelW = withLabel ? ImGui::CalcTextSize(label).x : 0.0f;
+    const float contentW = (haveIcon ? iconSz + (withLabel ? iconGap : 0.0f) : 0.0f) + labelW;
+    float x = withLabel ? (h.rect.Min.x + padX)
+                        : std::max(h.rect.Min.x + padX,
+                                   (h.rect.Min.x + h.rect.Max.x) * 0.5f - contentW * 0.5f);
     if (haveIcon) {
         const ImVec4 tint = active ? surf.textPrimary
                                    : ImVec4(surf.textSecondary.x, surf.textSecondary.y,
@@ -2958,10 +2965,10 @@ void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active
                      icon.uv0, icon.uv1, ImGui::ColorConvertFloat4ToU32(tint));
         x += iconSz + iconGap;
     }
+    if (!withLabel) return;
     const ImU32 ink = ImGui::ColorConvertFloat4ToU32(
         active ? surf.textPrimary : surf.textSecondary);
-    const ImVec2 ts = ImGui::CalcTextSize(label);
-    dl->AddText(ImVec2(x, midY - ts.y * 0.5f), ink, label);
+    dl->AddText(ImVec2(x, midY - ImGui::GetTextLineHeight() * 0.5f), ink, label);
 }
 
 // Cancel staged edit: restore chat tail + composer, NO plm_rollback.

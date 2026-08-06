@@ -343,8 +343,9 @@ struct HeaderBtnHit {
     bool   held    = false;
 };
 HeaderBtnHit headerTextButtonHit(const char* id, float w);
+// `withLabel=false` paints an icon-only pill (narrow column); the tooltip carries the name.
 void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active,
-                           const char* iconName = nullptr);
+                           const char* iconName = nullptr, bool withLabel = true);
 void cancelEditStage(AppState& st);
 void beginEditStage(AppState& st, int msgIdx);
 void commitEditStageOnSend(AppState& st);

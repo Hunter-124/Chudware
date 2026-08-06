@@ -73,17 +73,17 @@ static std::string jtab(const nlohmann::json& o, const char* k) {
 }
 
 // Re-resolve a tab index captured earlier THIS FRAME (or a prior frame, for a slow
-// doc_activate) against the CURRENT docTabs vector. The bug this guards: switchToTabCore's
+// doc_activate) against the CURRENT docTabs vector. The bug this guards: switchToTab's
 // async-activation branch closes over a raw index (rebuildTabIdx / pendingActivateTab) when
 // it dispatches doc_activate, but any closeDocTab() that runs before the RPC completes —
-// switchToTab's own sweep of an EMPTY AI mirror the user just left, a real
-// doc.closed(closed/gc/discarded/daemon) for a DIFFERENT background mirror (engine_events.cpp),
-// or the user closing another tab — erases a tab and shifts every LATER index down by one.
+// a real doc.closed(closed/gc/discarded/daemon) for a DIFFERENT background mirror
+// (engine_events.cpp), or the user closing another tab — erases a tab and shifts every LATER
+// index down by one.
 // (A doc.closed(last_writer_detached) no longer closes anything: see engine_events.cpp.) closeDocTab
 // keeps AppState::activeTab itself correct across that shift (its `if (idx < activeTab)
 // --activeTab` fixup), but a value already captured in an in-flight lambda has no way to see
 // the later erase and goes stale. Treating a stale index as "tab closed" silently drops the
-// activation response — the shell already shows the new tab (switchToTabCore set activeTab
+// activation response — the shell already shows the new tab (switchToTab set activeTab
 // and cleared the mesh before the RPC was even sent), so the user just watches the loading
 // toast do nothing and the view never populates, reading as "it kicked me back". Re-resolve
 // by docId (the stable identity) instead of trusting the index; only report "gone" when no
@@ -238,36 +238,23 @@ void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_
     addLog("[tabs] new ECAD " + kind + " tab '" + docTabs[activeTab].title + "' (" + ecadDocId_ + ")");
 }
 
+// Switch the active document to docTabs[idx].
+//
+// NO TAB IS EVER AUTO-CLOSED HERE. Until 2026-08-06 this wrapper swept the tab the user was
+// LEAVING when it was an AI mirror the agent had "finished" (agentDone) and never written to
+// (lastAgentEditAt still default) — meant to clear away a shell the agent opened and ignored.
+// It did the opposite: `agentDone` is set by doc.closed(last_writer_detached), which hostd
+// emits at the END OF EVERY TURN (the general lane spawns a fresh worker per turn), so a part
+// the agent had just minted and not yet built into matched the sweep within seconds of being
+// created. Glancing at another tab then detached the GUI's only view of it, and because
+// detach_doc on a read-only attach reports no surviving-close note, the part vanished from the
+// tab strip AND from Artifacts ▸ Agent Documents — unreachable until the agent's first
+// add_features pushed a doc.changed that re-revealed the mirror. That is exactly the reported
+// "I can't open the new part until the AI adds the first feature to it" (reproduced against an
+// isolated hostd: mint an empty agent doc, switch away, tab gone; apply one feature, tab back).
+// A tab now closes only when the user closes it, when the daemon really closes the doc, or
+// when a reconnect proves it gone.
 void AppState::switchToTab(int idx) {
-    if (idx < 0 || idx >= (int)docTabs.size()) return;
-    // Before leaving the current tab, note whether it's an EMPTY AI mirror — one the agent opened
-    // and finished without ever writing to (lastAgentEditAt still default), which the user never
-    // adopted or dirtied. Only such a never-touched shell is swept on switch-away (detach-only →
-    // recoverable). A mirror the agent actually BUILT into is real work and the user's only handle
-    // on it, so it stays in the tab strip until the user closes it themselves — an agent turn
-    // ending, or the user glancing at another tab, is not consent to throw the part away.
-    std::string leavingAutoCloseId;
-    if (activeTab >= 0 && activeTab < (int)docTabs.size() && activeTab != idx) {
-        const DocTab& lv = docTabs[activeTab];
-        if (lv.aiHandoff && lv.agentDone && !lv.userAdopted && !lv.dirty &&
-            lv.lastAgentEditAt == std::chrono::steady_clock::time_point{} &&
-            lv.docId != docTabs[idx].docId)
-            leavingAutoCloseId = lv.docId;
-    }
-
-    switchToTabCore(idx);
-
-    if (!leavingAutoCloseId.empty()) {
-        for (int i = 0; i < (int)docTabs.size(); ++i)
-            if (docTabs[i].docId == leavingAutoCloseId && i != activeTab) {
-                addLog("[tabs] auto-closing empty AI mirror on switch-away: " + leavingAutoCloseId);
-                closeDocTab(i, /*detachOnly=*/true);
-                break;
-            }
-    }
-}
-
-void AppState::switchToTabCore(int idx) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
     const auto switchStarted = std::chrono::steady_clock::now();
     const bool cacheInvalidated = docTabs[idx].meshCacheInvalidated;
@@ -457,7 +444,7 @@ void AppState::switchToTabCore(int idx) {
                 snapshotPrimeInFlight.erase(rebuildDocId);
                 if (!got) return;   // nothing parked — the doc_activate below still runs
                 const int i = reresolveTabIndex(*this, -1, rebuildDocId);
-                if (i >= 0 && i == activeTab) switchToTabCore(i);
+                if (i >= 0 && i == activeTab) switchToTab(i);
             });
         }
         if (loadingToastInFlight.insert(rebuildDocId).second)   // dedup: one toast per rebuild
@@ -766,10 +753,10 @@ void AppState::closeDocTab(int idx, bool detachOnly) {
     } else if (closing.aiHandoff && engine::daemonMode()) {
         // A daemon mirror tab VIEWS a doc another client (an agent) is building in the
         // SHARED engine. Two close paths:
-        //  * detachOnly (agent-finished auto-close): drop ONLY our ro view (detach_doc).
-        //    The doc goes unattached and the daemon's GC/retire tier preserves it if it
-        //    was dirty — so an abandoned unsaved AI part is recoverable next launch, never
-        //    silently purged. This is the data-safe default for auto-close.
+        //  * detachOnly: drop ONLY our ro view (detach_doc). The doc goes unattached and the
+        //    daemon's GC/retire tier preserves it if it was dirty — so an abandoned unsaved AI
+        //    part is recoverable next launch, never silently purged. This is the data-safe
+        //    default whenever the close was not an explicit user act.
         //  * manual X-click (detachOnly=false): an explicit "I'm done" — doc_discard drops
         //    our view AND, if no other client still holds the doc, closes it for good so a
         //    deliberately-closed part doesn't flood back as unsaved-recovery. If the agent

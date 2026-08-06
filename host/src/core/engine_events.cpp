@@ -222,7 +222,7 @@ void openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     // `tab.session`, so a never-activated mirror (any part after the first: takeFocus is false
     // once one mirror exists) silently dropped every pushed revision while still setting
     // meshCacheInvalidated. Clicking such a tab then found an empty cache, wiped the scene
-    // (switchToTabCore's unloadDocMesh) and issued a doc_activate that queues on the doc's
+    // (switchToTab's unloadDocMesh) and issued a doc_activate that queues on the doc's
     // exclusive per-doc engine mutex behind the agent's write burst — the user got the
     // "Loading" scrim with no geometry and no picking for as long as the agent kept writing.
     // With the session present the switch binds from the parked snapshot instead (no RPC at
@@ -232,7 +232,7 @@ void openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     // Prime the tab from the daemon's last pushed revision BEFORE anything can switch to
     // it. This is the lock-free read (primeMirrorFromSnapshot); it lands within a frame or
     // two and leaves a parked snapshot + prewarmed mesh, so the auto-focus below and any
-    // later user click both take switchToTabCore's pushed/cached path instead of issuing a
+    // later user click both take switchToTab's pushed/cached path instead of issuing a
     // doc_activate that queues on the doc's engine mutex behind the agent writing it.
     if (takeFocus && !crashLoopBraked) {
         core::primeMirrorFromSnapshot(st, docId, [&st, docId](bool) {

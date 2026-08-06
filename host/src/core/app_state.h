@@ -926,8 +926,9 @@ struct AppState {
         // Set once, never cleared (survives save). Meaningless unless aiHandoff.
         bool        userAdopted = false;
         // The agent that was building this mirror has FINISHED (daemon sent doc.closed with
-        // reason "last_writer_detached"). If this is the active tab we keep it on screen; it
-        // becomes eligible for auto-close on the next switch-away (unless adopted/dirty).
+        // reason "last_writer_detached" — hostd emits it at the end of EVERY turn, so this is
+        // "no writer attached right now", NOT "the agent abandoned the part"). Display only:
+        // it drives the Active Work "agent done" chip. It MUST NOT gate closing a tab.
         bool        agentDone = false;
         // True after doc.history_cleared for this doc (human save wiped undo/redo). Greys the
         // undo/redo toolbar until a local edit re-enables history. Cleared on local mutation.
@@ -1100,11 +1101,9 @@ struct AppState {
     // Switch the active document to docTabs[idx]: safely exits any in-progress sketch/PM form,
     // saves the leaving tab's camera, re-points DocMirror at idx's doc (doc_activate → tree+mesh),
     // resets per-doc caches/selection/tree transients, reloads the mesh, restores idx's camera.
+    // Never closes a tab — see the "NO TAB IS EVER AUTO-CLOSED HERE" note in doc_tabs.cpp.
     void switchToTab(int idx);
-    // The switch body. switchToTab() wraps this to auto-close a leaving AI mirror tab whose agent
-    // has finished and that the user never adopted (see switchToTab in doc_tabs.cpp).
-    void switchToTabCore(int idx);
-    // Async engine activation for a tab switch (the cold-cache path of switchToTabCore): issues
+    // Async engine activation for a tab switch (the cold-cache path of switchToTab): issues
     // doc_activate on st.rpc and adopts the ops-response on drain (mirror + mesh + selection +
     // camera). doc_activate serves the engine's warm read-cache compile without recompiling;
     // a stale daemon predating it is translated to doc_rebuild inside engine::call.
@@ -1114,8 +1113,8 @@ struct AppState {
     // was the last tab, returns to the empty start state. Does NOT prompt — the caller decides.
     // detachOnly (aiHandoff tabs, daemon mode): drop only THIS client's view (detach_doc) instead of
     // discarding the doc, so an un-adopted AI doc the agent abandoned survives to the daemon's
-    // GC/retire tier (recoverable) rather than being purged. Used by the agent-finished auto-close;
-    // a manual X-click leaves detachOnly=false (explicit user intent to discard the mirror).
+    // GC/retire tier (recoverable) rather than being purged. A manual X-click leaves
+    // detachOnly=false (explicit user intent to discard the mirror).
     void closeDocTab(int idx, bool detachOnly);
     void closeDocTab(int idx) { closeDocTab(idx, false); }
     // Discard any disposable blank "starter" tab(s) — the launch example doc the user never touched
@@ -1446,21 +1445,21 @@ struct AppState {
     // progress (feature N/M / ops-in-flight); the old viewport "Rebuilding..." HUD is gone.
     // Bump at every st.rpc.call that mutates/evaluates the model; drop in its drain callback.
     int rebuildsInFlight = 0;
-    // Activation coalescing (doc_tabs.cpp switchToTabCore/activateTabDocAsync): a monotonically
+    // Activation coalescing (doc_tabs.cpp switchToTab/activateTabDocAsync): a monotonically
     // increasing generation bumped for every switch that needs an async doc_activate. While one
     // such RPC is already in flight, a newer switch does NOT queue a second one — it overwrites
     // the pending slot below; the in-flight completion dispatches the LATEST pending tab instead
     // of every intermediate one it was superseded by. Net effect: N rapid switches while one
     // activation is in flight produce at most 2 engine activations, never N. GL-thread-only
-    // (touched only from switchToTabCore / the rpc.drain() completion callback).
+    // (touched only from switchToTab / the rpc.drain() completion callback).
     uint64_t activationGeneration = 0;
     bool activationInFlight = false;      // a doc_activate is currently in flight
     int pendingActivateTab = -1;          // -1 = no coalesced switch waiting; else docTabs index
     std::string pendingActivateDocId;     // pendingActivateTab's doc id (staleness check on drain)
     uint64_t pendingActivateGeneration = 0;
-    // doc_ids with a lock-free doc_snapshot prime in flight (switchToTabCore). Dedup only:
+    // doc_ids with a lock-free doc_snapshot prime in flight (switchToTab). Dedup only:
     // a spectator can click the same wedged mirror tab a dozen times while the agent writes,
-    // and each click re-enters switchToTabCore — without this every click would queue another
+    // and each click re-enters switchToTab — without this every click would queue another
     // identical registry read.
     std::set<std::string> snapshotPrimeInFlight;
     // T-PERF3: mesh loader generation — bumped on every loadDocMeshAsync; drain drops

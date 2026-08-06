@@ -600,7 +600,7 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
             // itself through the lock-free doc_snapshot (host/src/core/engine_events.cpp
             // primeMirrorFromSnapshot), served straight out of lastPush — still empty at
             // that moment, so the prime answered has_snapshot=false, the tab took focus
-            // anyway and AppState::switchToTabCore fell through to a real doc_activate.
+            // anyway and AppState::switchToTab fell through to a real doc_activate.
             // doc_activate takes the doc's EXCLUSIVE per-doc engine mutex (core/doc/
             // session.cpp DocLock + require_session), which the agent's add_features batch
             // holds for its entire compile+tessellate — so the user's open returned exactly

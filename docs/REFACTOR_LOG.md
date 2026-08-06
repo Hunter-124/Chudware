@@ -6732,3 +6732,24 @@ a picture nobody sees.  (3) `_target_is_internal` decides the cutaway; a mis-cla
 just gets a less useful (never a wrong) picture.  (4) `_closeup` builds the palette itself and
 reports it even when the tessellation is missing, because the caption's `palette_json` block is
 the machine-readable half of the contract.
+
+## 2026-08-06 — a brand-new AI part is no longer thrown away the moment you look elsewhere
+Reported as "I can't open or select the part the AI just made until it adds the first feature."
+Root cause was `AppState::switchToTab`'s empty-AI-mirror sweep (`host/src/core/doc_tabs.cpp`):
+it auto-closed the tab the user was LEAVING when that tab was an AI mirror with `agentDone` and
+no agent edit stamp. `agentDone` is set by `doc.closed(reason=last_writer_detached)`, which hostd
+emits at the END OF EVERY TURN (the general lane spawns a fresh worker per turn) — so a part the
+agent had just minted and not yet built into matched within seconds of being created. Glancing at
+another tab detached the GUI's only view of it, and because `detach_doc` on a read-only attach
+reports no surviving-close note, `dismissedMirrorDocs` stayed empty and the part vanished from the
+tab strip AND from Artifacts ▸ Agent Documents; only the agent's first `add_features` (a
+`doc.changed`) re-revealed the mirror. Fix: the sweep is gone and `switchToTabCore` merged back
+into `switchToTab` (one function, no auto-close anywhere in the switch path); `agentDone` is now
+documented as display-only ("no writer attached right now", not "abandoned"). Reproduced and
+verified against an isolated hostd + headless GUI on Xvfb (`CHUDWARE_INSTANCE_KEY=guiprobe*`,
+`CHUDWARE_LOG_FILE`): before — mint an empty agent doc, switch away, `[tabs] auto-closing empty AI
+mirror on switch-away` and the tab is gone, coming back only after one `doc_apply_ops`; after —
+the tab survives the switch-away, re-activates on click (`path=gpu-cache`), takes live geometry
+when the agent finally writes, and manual X-close still closes it. Files: `host/src/core/
+doc_tabs.cpp`, `host/src/core/app_state.h`, plus comment-only follow-ups in `host/src/core/
+engine_events.cpp`, `host/src/ui/viewport_panel.cpp`, `core/hostd/doc_registry.cpp`.

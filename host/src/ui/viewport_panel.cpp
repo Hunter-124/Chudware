@@ -349,7 +349,7 @@ static bool tabModelLoading(const AppState& st) {
     // in flight reports through the status-bar rebuild chip instead.
     if (st.hasDocMesh && st.docMirror.docId() == tab.docId) return false;
     // This tab's doc_activate is coalesced behind another in-flight activation
-    // (switchToTabCore's async-rebuild-coalesced branch).
+    // (switchToTab's async-rebuild-coalesced branch).
     if (st.pendingActivateTab == st.activeTab) return true;
     // A doc_activate is in flight and the live mirror is not this tab's doc yet — i.e. the
     // in-flight activation is THIS tab's. A warm/loaded active tab always has a matching mirror,

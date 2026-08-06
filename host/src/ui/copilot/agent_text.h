@@ -80,4 +80,16 @@ bool atlasCovers(unsigned cp);
 // Exists so test_agent_text.cpp can diff it against ui_theme.cpp and FAIL if the two drift.
 const unsigned* atlasCoveredRanges(std::size_t& pairs);
 
+// ---- 3. skip-work predicate ---------------------------------------------------------------
+
+// True when either sanitizer above COULD change *text*: it holds a byte >= 0x80 (the only bytes
+// foldToAtlasGlyphs touches) or a "doc-cpp"/"doc_cpp" prefix. Allocation-free, one pass.
+//
+// The "no-op fast path" both functions document is about the SCRATCH BUFFER — they still return
+// `text` BY VALUE, which copy-constructs a whole new string for anything past SSO. The transcript
+// re-sanitizes every visible row every frame, and nearly every one of those strings is plain
+// ASCII with no doc id, so gating on this turns two heap round-trips per string per row per
+// frame into one linear scan.
+bool agentTextMayChange(const std::string& text);
+
 }  // namespace ui

@@ -101,6 +101,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/agent_text.cpp         # doc-id + atlas-glyph text sanitizers (GL-free; unit-tested)
   src/ui/copilot/text_wrap.cpp          # composer hard-break tracking (GL-free; unit-tested)
   src/ui/copilot/tool_phrase.cpp        # tool-call human phrasing + grouping keys (GL-free; unit-tested)
+  src/ui/copilot/stream_rows.cpp        # streamed-delta row routing/order (GL-free; unit-tested)
   src/ui/clipboard_image.cpp            # system clipboard -> PNG on disk (paste-an-image)
   src/ui/copilot/image_lightbox.cpp     # attachment thumbnails + full-size image viewer
   src/ui/copilot/context_estimate.cpp   # transcript token/cost estimate (GL-free; unit-tested)
@@ -631,6 +632,24 @@ add_test(NAME test_context_estimate
   COMMAND test_context_estimate
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end transcript context estimate ---
+
+# --- streamed-delta row routing (GL-free) ---
+# A turn is ONE ordered column, so which box a streamed delta joins decides where its text
+# lands on screen. Two earlier attempts at "the second thinking block renders above the
+# sentence before it" failed because the rules were eyeballed in the running GUI; they are
+# pinned here instead, including the counter-pressure (an empty channel flush must NOT split
+# one reasoning stream into several boxes).
+add_executable(test_stream_rows
+  src/ui/copilot/stream_rows.cpp
+  tests/test_stream_rows.cpp)
+target_include_directories(test_stream_rows PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_stream_rows PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_stream_rows
+  COMMAND test_stream_rows
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end streamed-delta row routing ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD

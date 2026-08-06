@@ -559,21 +559,14 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     const ui::AdaptiveSurface& turnSurf = chatSurf();
     const float sc = ui::uiScale;
 
-    // The assistant bubble is the largest patch of text the copilot did NOT author in C++:
+    // The assistant reply is the largest patch of text the copilot did NOT author in C++:
     // raw model prose, where an arrow renders as "?" (the atlas stops at U+2027) and a doc
-    // id the model quotes back reads as "doc-cpp00000039" instead of the part's name. Both
-    // sanitizers are idempotent with a no-op fast path, and m.text is mutated in place, so
-    // the cost is paid once per message rather than per frame — and the persisted transcript
-    // and the Copy action carry the cleaned text too.
-    if (!m.text.empty()) {
-        std::string clean = ui::substituteDocIds(m.text, [&st](const std::string& id) {
-            for (const auto& t : st.docTabs)
-                if (t.docId == id) return t.displayTitle();
-            return std::string();
-        });
-        clean = ui::foldToAtlasGlyphs(clean);
-        if (clean != m.text) m.text = std::move(clean);
-    }
+    // id the model quotes back reads as "doc-cpp00000039" instead of the part's name. Runs
+    // through the SAME gated sanitizer drawAgentTimeline applies to the prose rows, so the
+    // two stay byte-identical and timelineProseTail can tell them apart. Idempotent with a
+    // no-op fast path, and m.text is mutated in place, so the cost is paid once per message
+    // rather than per frame — the persisted transcript and Copy carry the cleaned text too.
+    ui::sanitizeAgentTextInPlace(st, m.text);
 
     // Author label. Each card that CAN host it (prose / partial / error) draws the
     // model+age INSIDE itself as the top row (first card wins via metaDrawn).
@@ -582,7 +575,13 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // Prefer the model stamped on the turn at run start; only fall back to the
     // live picker for an in-flight turn that somehow has no stamp. No model →
     // omit label (never bare "Assistant").
-    const bool proseCard = !m.text.empty() && m.errKind == ERR_NONE;
+    //
+    // A turn whose prose streamed has it drawn INSIDE the timeline, at the point the model
+    // said it — so there is no trailing reply card to host the label, and it goes above the
+    // turn like every other activity-led turn. The trailing card survives only for a reply
+    // the timeline never saw (a non-streaming provider, a restored transcript, an RPC answer).
+    const bool proseInline = ui::timelineHasInlineProse(m);
+    const bool proseCard = !proseInline && !m.text.empty() && m.errKind == ERR_NONE;
     // Geometry-mutating turns keep the checkpoint-backed Before/After restore; EVERY
     // other finished turn still offers a chat-only rewind (msg:<idx>) so a revert is
     // reachable at any point in the chat. turnNum > 0 already implies chatMsgMutatedDoc
@@ -667,14 +666,21 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         }
     }
 
-    // (2) Agent timeline — typed blocks: collapsible thinking + glass action cards.
+    // (2) Agent timeline — typed blocks in arrival order: thinking, tool cards, and the
+    // model's prose exactly where it was spoken.
     drawAgentTimeline(st, m, fonts, logW, gShowThinking, isLastTurn);
 
-    // (3) Streaming assistant text — a Thin glass "prose" card (Liquid Glass v2 §6, host
-    // contract H5) keeps body copy legible over the live viewport blur. Selectable for
-    // click-drag + Ctrl+C; right-click copies selection or full text.
-    if (proseCard) {
-        const std::string prose = stripMdMarks(m.text);
+    // What the timeline did NOT already show. For a streamed turn this is normally empty (or
+    // a note appended after the fact, e.g. "(Stopped by you.)"); for a non-streaming provider
+    // or a restored transcript it is the whole reply. Every card below renders THIS, never
+    // m.text, or a streamed reply prints twice.
+    const std::string bodyText = proseInline ? ui::timelineProseTail(m) : m.text;
+
+    // (3) The reply as a Thin glass "prose" card (Liquid Glass v2 §6, host contract H5) —
+    // body copy stays legible over the live viewport blur. Selectable for click-drag +
+    // Ctrl+C; right-click copies selection or full text.
+    if (proseCard || (proseInline && !bodyText.empty() && m.errKind == ERR_NONE)) {
+        const std::string prose = stripMdMarks(bodyText);
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           10.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -690,9 +696,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             metaDrawn = true;
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }
-        // Raw m.text (not `prose`): the renderer needs the ``` fences intact to route code
+        // Raw bodyText (not `prose`): the renderer needs the ``` fences intact to route code
         // spans into the mono box. `prose` stays the copy payload, as before.
-        const ImGuiID textId = drawMdProse("##prose_sel", m.text, chatSurf().textPrimary,
+        const ImGuiID textId = drawMdProse("##prose_sel", bodyText, chatSurf().textPrimary,
                                            fonts.mono);
         // Submitted before EndChild — see the comment on the user-bubble copy glyph in
         // drawUserBlock() for why an after-EndChild button silently eats no clicks here.
@@ -775,7 +781,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // ERR_PARTIAL: warning-accent "Partially complete" card (mission mixed outcomes) —
     // geometry is kept; NOT a hard error. ERR_CAD/ERR_SYSTEM: red-bordered error card.
     if (m.errKind == ERR_PARTIAL || m.resultPartial) {
-        std::string body = stripMdMarks(m.text);
+        std::string body = stripMdMarks(bodyText);
         if (body.empty()) body = "Partially complete";
         ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
@@ -821,8 +827,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             errorDetail = !a.detail.empty() ? a.detail : a.reason;
             break;
         }
-        // Nothing to show if the turn has no prose, no stop fields and no humanized line.
-        if (!(m.text.empty() && stopReason.empty() && errorDetail.empty() && m.errorHuman.empty())) {
+        // Nothing to show if the turn has no un-shown prose, no stop fields and no
+        // humanized line. (Prose the timeline already drew inline is not repeated here.)
+        if (!(bodyText.empty() && stopReason.empty() && errorDetail.empty() && m.errorHuman.empty())) {
         // Also surface any failed activity reason strings (phase errors) that aren't already
         // folded into the meta row — keeps "budget exhausted (1)" from being the only line.
         std::string phaseErr;
@@ -855,7 +862,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 body += errorDetail;
             }
             // Keep original prose when it adds guidance beyond the terse stop fields.
-            const std::string plain = stripMdMarks(m.text);
+            const std::string plain = stripMdMarks(bodyText);
             if (!plain.empty() && plain != errorDetail &&
                 (errorDetail.empty() || plain.find(errorDetail) == std::string::npos) &&
                 body.find(plain) == std::string::npos) {
@@ -873,7 +880,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 }
             }
         } else {
-            body = stripMdMarks(m.text);
+            body = stripMdMarks(bodyText);
         }
         if (!phaseErr.empty()) {
             body += "\n\n";

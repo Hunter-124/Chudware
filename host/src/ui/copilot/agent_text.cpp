@@ -239,4 +239,14 @@ std::string foldToAtlasGlyphs(const std::string& text) {
     return out;
 }
 
+bool agentTextMayChange(const std::string& text) {
+    const size_t n = text.size();
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = (unsigned char)text[i];
+        if (c >= 0x80) return true;              // the only bytes foldToAtlasGlyphs rewrites
+        if (c == 'd' && hasDocPrefix(text, i)) return true;
+    }
+    return false;
+}
+
 }  // namespace ui

@@ -1889,6 +1889,9 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
     ImGui::PushID(uid);
     bool clicked = ImGui::Selectable("##mrow", current,
                                      usable ? 0 : ImGuiSelectableFlags_Disabled, ImVec2(0, rowH));
+    // The caller applies the pick AFTER this returns, so the glyphs below would otherwise
+    // paint from pre-click state: the row you just clicked drew unchecked for a frame.
+    if (clicked && usable) current = true;
     // OMP catalog sublabel (ctx / cost / capabilities) for bridge-routed providers.
     const ui::BridgeModelMeta* meta = bridgeModelMetaForCad(provider, id, st.settings.baseUrl);
     const std::string sublabel = meta ? bridgeModelSublabel(*meta) : std::string();

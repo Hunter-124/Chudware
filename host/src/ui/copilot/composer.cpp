@@ -130,7 +130,16 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     // We can't read ImGui's active id (internal API), so track per-id active state across frames.
     static std::unordered_map<ImGuiID, bool> s_activeLast;
     ImGuiID wid = ImGui::GetID(id);
-    WrapState& ws = g_wrap[buf.data()];
+    // g_wrap is keyed by the backing buffer's address, and st.prompt.resize() (draft restore,
+    // staged-edit restore, slash-autocomplete insert) can move it. Retire this widget's previous
+    // key when that happens: the entry is unreachable afterwards, and leaving it behind leaked
+    // one hard-break vector per relocation for the lifetime of the process.
+    static std::unordered_map<ImGuiID, const char*> s_wrapKey;
+    const char* wrapKey = buf.data();
+    const char*& lastKey = s_wrapKey[wid];
+    if (lastKey && lastKey != wrapKey) g_wrap.erase(lastKey);
+    lastKey = wrapKey;
+    WrapState& ws = g_wrap[wrapKey];
     const int curLen = (int)std::strlen(buf.data());
     if (!s_activeLast[wid]) {
         // Idle: a length change can only have come from outside (chip, slash insert, clear),

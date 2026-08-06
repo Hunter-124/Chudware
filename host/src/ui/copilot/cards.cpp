@@ -2901,10 +2901,30 @@ void drawPencilGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, ImU32 c
     dl->AddQuadFilled(e0, e3, e2, e1, col);
 }
 
-// Shared rectangular less-rounded header button (optional leading icon).
-// Returns true on click. `active` highlights like an open overlay.
-bool drawHeaderTextButton(const char* id, const char* label, bool active,
-                                 float minW, const char* iconName) {
+// Shared rectangular less-rounded header button (optional leading icon), submitted in TWO
+// phases on purpose.
+//
+// A tab strip paints "which tab is selected", and ImGui reports a click only AFTER the widget
+// has been submitted — so a one-pass button paints its highlight from state the click is about
+// to invalidate. On the release frame the tab you just picked drew UNSELECTED and the old tab
+// drew selected, one frame before the switch: the selection visibly flicked back to Chat and
+// then jumped to the tab you asked for. Submitting every hit zone first, applying the click,
+// and only then painting all of them from the resolved selection removes the whole class.
+HeaderBtnHit headerTextButtonHit(const char* id, float w) {
+    HeaderBtnHit h;
+    ImGui::PushID(id);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float bh = ImGui::GetFrameHeight();
+    h.clicked = ImGui::InvisibleButton("##hit", ImVec2(w, bh));
+    h.hovered = ImGui::IsItemHovered();
+    h.held    = ImGui::IsItemActive();
+    h.rect    = ImRect(p0, ImVec2(p0.x + w, p0.y + bh));
+    ImGui::PopID();
+    return h;
+}
+
+void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active,
+                           const char* iconName) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 txt = surf.textPrimary;
@@ -2913,44 +2933,21 @@ bool drawHeaderTextButton(const char* id, const char* label, bool active,
     const float iconGap = 4.0f * sc;
     IconUV icon = (iconName && iconName[0]) ? ui::getIcon(iconName, 20) : IconUV{};
     const bool haveIcon = icon.valid;
+    const float padX = (haveIcon ? 6.0f : 8.0f) * sc;
 
-    ImGui::PushID(id);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, round);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                        ImVec2(haveIcon ? 6.0f * sc : 8.0f * sc, 2.0f * sc));
-    ImGui::PushStyleColor(ImGuiCol_Button, active
-        ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
-                 ui::palette.chipBg[3])
-        : ImVec4(txt.x, txt.y, txt.z, 0.06f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt.x, txt.y, txt.z, 0.14f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(txt.x, txt.y, txt.z, 0.22f));
-    ImGui::PushStyleColor(ImGuiCol_Text, active ? surf.textPrimary : surf.textSecondary);
-
-    const float padX = ImGui::GetStyle().FramePadding.x;
-    const float tw = ImGui::CalcTextSize(label).x;
-    const float contentW = (haveIcon ? iconSz + iconGap : 0.0f) + tw;
-    const float bw = std::max(minW, contentW + padX * 2.0f);
-    const float bh = ImGui::GetFrameHeight();
-
-    // Invisible button for hit + style colors; draw icon+label ourselves so the icon tints correctly.
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const bool clicked = ImGui::InvisibleButton("##hit", ImVec2(bw, bh));
-    const bool hov = ImGui::IsItemHovered();
-    const bool held = ImGui::IsItemActive();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec4 bg = active
+    const ImVec4 bg = active
         ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
                  ui::palette.chipBg[3])
-        : ImVec4(txt.x, txt.y, txt.z, held ? 0.22f : (hov ? 0.14f : 0.06f));
-    dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh),
-                      ImGui::ColorConvertFloat4ToU32(bg), round);
-    dl->AddRect(p0, ImVec2(p0.x + bw, p0.y + bh),
+        : ImVec4(txt.x, txt.y, txt.z, h.held ? 0.22f : (h.hovered ? 0.14f : 0.06f));
+    dl->AddRectFilled(h.rect.Min, h.rect.Max, ImGui::ColorConvertFloat4ToU32(bg), round);
+    dl->AddRect(h.rect.Min, h.rect.Max,
                 ImGui::ColorConvertFloat4ToU32(
                     ImVec4(txt.x, txt.y, txt.z, active ? 0.45f : 0.25f)),
                 round, 0, ui::metrics::stroke(1.0f));
 
-    float x = p0.x + padX;
-    const float midY = p0.y + bh * 0.5f;
+    float x = h.rect.Min.x + padX;
+    const float midY = (h.rect.Min.y + h.rect.Max.y) * 0.5f;
     if (haveIcon) {
         const ImVec4 tint = active ? surf.textPrimary
                                    : ImVec4(surf.textSecondary.x, surf.textSecondary.y,
@@ -2965,11 +2962,6 @@ bool drawHeaderTextButton(const char* id, const char* label, bool active,
         active ? surf.textPrimary : surf.textSecondary);
     const ImVec2 ts = ImGui::CalcTextSize(label);
     dl->AddText(ImVec2(x, midY - ts.y * 0.5f), ink, label);
-
-    ImGui::PopStyleColor(4);
-    ImGui::PopStyleVar(2);
-    ImGui::PopID();
-    return clicked;
 }
 
 // Cancel staged edit: restore chat tail + composer, NO plm_rollback.

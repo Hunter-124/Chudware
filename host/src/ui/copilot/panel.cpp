@@ -34,10 +34,31 @@ namespace ui {
 // drawAIPanel's first call (see s_cpInited there) so a collapsed column stays collapsed across
 // restarts.
 static bool s_cpCollapsed = false;
-// In-column AI-settings overlay (header Settings). Mutually exclusive with showSessionsPicker —
-// same swap pattern: hide chat log, fill the body with the compact settings form
-// (AppState::showAISettingsOverlay). Chat / Sessions / Settings are three stable labels
-// (Sessions no longer renames to "< Chat") — Chat returns to the conversation.
+// The header is a RADIO strip, not four independent toggles: exactly one of Chat / Tasks /
+// Artifacts / Sessions / Settings is showing, and Chat is "no overlay". AppState carries it as
+// four bools (integrator-owned), so funnel every read and write through these two so a new
+// surface can never leave two of them true — or, worse, set one without clearing the rest.
+enum class CpTab { Chat, Tasks, Artifacts, Sessions, Settings };
+
+static CpTab cpActiveTab(const AppState& st) {
+    if (st.showTaskList)          return CpTab::Tasks;
+    if (st.showArtifacts)         return CpTab::Artifacts;
+    if (st.showSessionsPicker)    return CpTab::Sessions;
+    if (st.showAISettingsOverlay) return CpTab::Settings;
+    return CpTab::Chat;
+}
+
+static void cpSetTab(AppState& st, CpTab t) {
+    st.showTaskList          = (t == CpTab::Tasks);
+    st.showArtifacts         = (t == CpTab::Artifacts);
+    st.showSessionsPicker    = (t == CpTab::Sessions);
+    st.showAISettingsOverlay = (t == CpTab::Settings);
+}
+
+// Clicking the tab you are already on returns to Chat; clicking Chat while on Chat is a no-op.
+static CpTab cpTabAfterClick(CpTab current, CpTab clicked) {
+    return (current == clicked) ? CpTab::Chat : clicked;
+}
 
 // Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");
 // defined below with the picker helpers, hosted by the header Settings button.
@@ -88,9 +109,11 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     float wordLh = lh;
     if (wordF) { ImGui::PushFont(wordF); wordLh = ImGui::GetTextLineHeight(); ImGui::PopFont(); }
 
-    const bool sessionsOpen = st.showSessionsPicker;
-    const bool settingsOpen = st.showAISettingsOverlay;
-    const bool chatOpen = !sessionsOpen && !settingsOpen && !st.showTaskList && !st.showArtifacts;
+    // Selection as it stands entering the frame, and the selection this frame's clicks
+    // resolve to. Nothing paints until every hit zone has been submitted and `tabOut` is
+    // final, so a tab never draws the previous selection on the frame you pick it.
+    const CpTab tabIn = cpActiveTab(st);
+    CpTab tabOut = tabIn;
 
     auto measureBtn = [&](const char* label, const char* iconName) -> float {
         const float iconSz = lh * 0.92f;
@@ -177,6 +200,13 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     }
 
     // ---- Row 1: [Tasks] .. centered Chudware .. [Artifacts]  (clears leftInset) ----
+    // Rows 1 and 2 submit HIT ZONES only. Every tab pill is painted together at the end,
+    // after this frame's click has already moved `tabOut`.
+    int tlDone = 0, tlTotal = 0;
+    copilotTaskProgress(st, tlDone, tlTotal);
+    char tlLabel[24];
+    std::snprintf(tlLabel, sizeof(tlLabel), "%d/%d", tlDone, tlTotal);
+    HeaderBtnHit hTasks, hArts;
     {
         const float logoGap = 3.0f * sc;
         // The mark is a 32-edge figure, not a 12-edge cube glyph: measured against rendered
@@ -195,10 +225,6 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float rowH1 = std::max(wordLh, markSz);
         auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (rowH1 - h) * 0.5f); };
 
-        int tlDone = 0, tlTotal = 0;
-        copilotTaskProgress(st, tlDone, tlTotal);
-        char tlLabel[24];
-        std::snprintf(tlLabel, sizeof(tlLabel), "%d/%d", tlDone, tlTotal);
         const float tlW = measureBtn(tlLabel, "plan_board");
         const float artW = measureBtn("Artifacts", "team");
 
@@ -207,13 +233,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         // NOTE: deliberately NOT gated on `busy` — these are read-only viewer panels
         // (task list / artifacts / chat log / session switcher), not actions that could
         // race a running turn. Users need to check progress while a run is in motion.
-        if (drawHeaderTextButton("##hdr_tasks", tlLabel, st.showTaskList, tlW, "plan_board")) {
-            const bool open = !st.showTaskList;
-            st.showTaskList = open;
-            if (open) { st.showArtifacts = st.showSessionsPicker = st.showAISettingsOverlay = false; }
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d done \xc2\xb7 click for the task list", tlDone, tlTotal);
+        hTasks = headerTextButtonHit("##hdr_tasks", tlW);
+        if (hTasks.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Tasks);
 
         const float* statusCol = pal.accentMid;  const char* statusTip = "Idle";
         if (st.statusKind == 2) { statusCol = pal.statusErr; statusTip = "Error"; }
@@ -253,13 +274,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
         ImGui::SameLine(colW - rightInset - artW);
         cy1(bh);
-        if (drawHeaderTextButton("##hdr_arts", "Artifacts", st.showArtifacts, artW, "team")) {
-            const bool open = !st.showArtifacts;
-            st.showArtifacts = open;
-            if (open) { st.showTaskList = st.showSessionsPicker = st.showAISettingsOverlay = false; }
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Session Artifacts \xc2\xb7 subagents, plan, documents");
+        hArts = headerTextButtonHit("##hdr_arts", artW);
+        if (hArts.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Artifacts);
         ImGui::SetCursorPosY(rowTop1 + rowH1);
     }
 
@@ -281,36 +297,50 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
     centerY(lh);
     ImGui::SetCursorPosX(chatX);
-    if (drawHeaderTextButton("##hdr_chat", "Chat", chatOpen, chatW, "ai_panel")) {
-        st.showSessionsPicker = false;
-        st.showAISettingsOverlay = false;
-        st.showTaskList = false;
-        st.showArtifacts = false;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Chat — conversation with the agent.");
+    HeaderBtnHit hChat = headerTextButtonHit("##hdr_chat", chatW);
+    if (hChat.clicked) tabOut = CpTab::Chat;
 
     centerY(lh);
     ImGui::SetCursorPosX(sessX);
-    if (drawHeaderTextButton("##hdr_sess", "Sessions", sessionsOpen, sessW, "history")) {
-        const bool open = !st.showSessionsPicker;
-        st.showSessionsPicker = open;
-        if (open) { st.showAISettingsOverlay = st.showTaskList = st.showArtifacts = false; }
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(sessionsOpen ? "Sessions list is open."
-                                       : "Sessions — switch between chats.");
+    HeaderBtnHit hSess = headerTextButtonHit("##hdr_sess", sessW);
+    if (hSess.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Sessions);
 
     centerY(lh);
     ImGui::SetCursorPosX(setX);
-    if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW, "settings")) {
-        const bool open = !st.showAISettingsOverlay;
-        st.showAISettingsOverlay = open;
-        if (open) { st.showSessionsPicker = st.showTaskList = st.showArtifacts = false; }
+    HeaderBtnHit hGear = headerTextButtonHit("##hdr_gear", gearW);
+    if (hGear.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Settings);
+
+    // ---- Resolve, THEN paint. Every pill draws from the same, final selection, so the tab
+    // you just picked lights up on the very frame you release the mouse. ----
+    if (tabOut != tabIn) cpSetTab(st, tabOut);
+    headerTextButtonPaint(hTasks, tlLabel,     tabOut == CpTab::Tasks,     "plan_board");
+    headerTextButtonPaint(hArts,  "Artifacts", tabOut == CpTab::Artifacts, "team");
+    headerTextButtonPaint(hChat,  "Chat",      tabOut == CpTab::Chat,      "ai_panel");
+    headerTextButtonPaint(hSess,  "Sessions",  tabOut == CpTab::Sessions,  "history");
+    headerTextButtonPaint(hGear,  "Settings",  tabOut == CpTab::Settings,  "settings");
+
+    // One tooltip at most; each says what the click will DO, including the click that takes
+    // you back to the conversation.
+    const char* kBack = "Back to the conversation";
+    if (hTasks.hovered) {
+        if (tabOut == CpTab::Tasks) ImGui::SetTooltip("%s", kBack);
+        else ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d done \xc2\xb7 click for the task list",
+                               tlDone, tlTotal);
+    } else if (hArts.hovered) {
+        ImGui::SetTooltip(tabOut == CpTab::Artifacts
+                              ? kBack
+                              : "Artifacts \xc2\xb7 documents, renders and files this session");
+    } else if (hChat.hovered) {
+        ImGui::SetTooltip(tabOut == CpTab::Chat ? "Chat \xc2\xb7 conversation with the agent"
+                                                : kBack);
+    } else if (hSess.hovered) {
+        ImGui::SetTooltip(tabOut == CpTab::Sessions ? kBack
+                                                    : "Sessions \xc2\xb7 switch between chats");
+    } else if (hGear.hovered) {
+        ImGui::SetTooltip(tabOut == CpTab::Settings
+                              ? kBack
+                              : "AI settings \xc2\xb7 provider, model, privacy");
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(settingsOpen ? "Settings is open."
-                                       : "AI settings — provider, model, privacy.");
 
     ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), rowTop + rowH));
     // Breathing room between row 2 and the Separator drawAIPanel emits right after — the two were
@@ -371,8 +401,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
     if (primaryButton("+ New session", ImVec2(-1, 0))) {
         newConversation(st);
         st.prompt[0] = 0;
-        st.showAISettingsOverlay = false;
-        st.showSessionsPicker = false;  // land in the new chat, not stuck on the list
+        cpSetTab(st, CpTab::Chat);   // land in the new chat, not stuck on the list
     }
     ImGui::PopStyleVar();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
@@ -462,10 +491,13 @@ void drawSessionsPanel(AppState& st, bool busy) {
             // the already-active one (switchConversation early-returns on same idx).
             if (i != st.activeConv)
                 switchConversation(st, i);
-            st.showSessionsPicker = false;
-            st.showAISettingsOverlay = false;
+            cpSetTab(st, CpTab::Chat);
         }
 
+        // Re-read the selection: `active` above was captured BEFORE the click that just
+        // switched conversations, and painting from it left the row you clicked unhighlighted
+        // for a frame (and the old row still lit).
+        active = (i == st.activeConv);
         float wash = active ? 0.55f : (rowHot ? 0.44f : 0.34f);
         ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, (i % 2) == 1, active, wash);
 
@@ -646,6 +678,22 @@ static void drawTaskListPanel(AppState& st, bool busy) {
         if (!it->fromUser && planIsReal(it->planState)) {
             ps = &it->planState; break;
         }
+
+    // Subagents are run telemetry, not session artifacts. Keep the exact two sources the
+    // Artifacts panel historically used: plan-state subagent rows and agent activity rows.
+    std::vector<std::string> subs;
+    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
+        if (it->fromUser) continue;
+        if (it->planState.present)
+            for (const auto& pi : it->planState.items)
+                if (pi.kind == "subagent")
+                    subs.push_back(pi.title +
+                                   (pi.status.empty() ? "" : (" \xc2\xb7 " + pi.status)));
+        for (const auto& a : it->activity)
+            if (a.stage.rfind("agent:", 0) == 0 || a.title.rfind("Subagent", 0) == 0)
+                subs.push_back(a.title.empty() ? a.stage : a.title);
+    }
+
     int done = 0, total = 0;
     copilotTaskProgress(st, done, total);
     char progress[48];
@@ -659,33 +707,70 @@ static void drawTaskListPanel(AppState& st, bool busy) {
     }
     if (!ps) {
         ui::cpMenuHint("No task list yet \xe2\x80\x94 start a build and the agent's plan appears here.");
+    } else {
+        // Fixed glyph column: TextWrapped after a SameLine wraps back to the LINE start, which
+        // pushed continuation lines under the [x] marker. Indent the title past a MEASURED glyph
+        // column instead, so a multi-line task title stays one aligned text block.
+        const float glyphW = ImGui::CalcTextSize("[~]").x + ui::metrics::px(6.0f);
+        for (const auto& pi : ps->items) {
+            if (pi.kind == "subagent") continue;
+            const bool ok = (pi.status == "done" || pi.status == "pass");
+            const bool run = (pi.status == "running");
+            const bool fail = (pi.status == "fail");
+            const char* glyph = ok ? "[x]" : run ? "[~]" : fail ? "[!]" : "[ ]";
+            ImVec4 gc = surf.textSecondary;
+            if (ok) { gc = semanticOnGlass(ui::palette.accent, surf); gc.w = 1.0f; }
+            else if (fail) { gc = semanticOnGlass(ui::palette.statusErr, surf); gc.w = 1.0f; }
+            const float rowY = ImGui::GetCursorPosY();
+            ImGui::PushStyleColor(ImGuiCol_Text, gc);
+            ImGui::TextUnformatted(glyph);
+            ImGui::PopStyleColor();
+            ImGui::SetCursorPosY(rowY);
+            ImGui::Indent(glyphW);
+            ImGui::PushStyleColor(ImGuiCol_Text, ok ? surf.textSecondary : surf.textPrimary);
+            ImGui::TextWrapped("%s", pi.title.empty() ? "(task)" : pi.title.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Unindent(glyphW);
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+        }
+    }
+
+    ui::cpMenuSection("Subagents", (int)subs.size());
+    if (subs.empty()) {
+        ui::cpMenuHint("Spawned helpers and their current status appear here while a run is working.");
         return;
     }
-    // Fixed glyph column: TextWrapped after a SameLine wraps back to the LINE start, which pushed
-    // continuation lines under the [x] marker. Indent the title past a MEASURED glyph column
-    // instead, so a multi-line task title stays one aligned text block.
-    const float glyphW = ImGui::CalcTextSize("[~]").x + ui::metrics::px(6.0f);
-    for (const auto& pi : ps->items) {
-        if (pi.kind == "subagent") continue;
-        const bool ok = (pi.status == "done" || pi.status == "pass");
-        const bool run = (pi.status == "running");
-        const bool fail = (pi.status == "fail");
-        const char* glyph = ok ? "[x]" : run ? "[~]" : fail ? "[!]" : "[ ]";
-        ImVec4 gc = surf.textSecondary;
-        if (ok) { gc = semanticOnGlass(ui::palette.accent, surf); gc.w = 1.0f; }
-        else if (fail) { gc = semanticOnGlass(ui::palette.statusErr, surf); gc.w = 1.0f; }
-        const float rowY = ImGui::GetCursorPosY();
-        ImGui::PushStyleColor(ImGuiCol_Text, gc);
-        ImGui::TextUnformatted(glyph);
-        ImGui::PopStyleColor();
-        ImGui::SetCursorPosY(rowY);            // back onto the glyph's own line
-        ImGui::Indent(glyphW);
-        ImGui::PushStyleColor(ImGuiCol_Text, ok ? surf.textSecondary : surf.textPrimary);
-        ImGui::TextWrapped("%s", pi.title.empty() ? "(task)" : pi.title.c_str());
-        ImGui::PopStyleColor();
-        ImGui::Unindent(glyphW);
-        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+
+    const float S = ui::uiScale;
+    const float padX = ui::metrics::cpMenuRowPadX();
+    const float padY = ui::metrics::cpMenuRowPadY();
+    const float rowGap = ui::metrics::cpMenuRowGap();
+    const float rowH = ImGui::GetTextLineHeight() + padY * 2.0f;
+    const float dotR = ui::metrics::px(2.2f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::PushID("task_subagents");
+    for (size_t i = 0; i < subs.size(); ++i) {
+        ImGui::PushID((int)i);
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const float rowW = ImGui::GetContentRegionAvail().x;
+        const ImVec2 p1(p0.x + rowW, p0.y + rowH);
+        ImGui::InvisibleButton("##subagent", ImVec2(rowW, rowH));
+        const bool hot = ImGui::IsItemHovered();
+        ui::glassRowBackground(dl, p0, p1, ui::metrics::cpMenuRowRound() / S,
+                               (i % 2) == 1, false, hot ? 0.42f : 0.30f);
+        const ImVec2 dotC(p0.x + padX + dotR, p0.y + rowH * 0.5f);
+        dl->AddCircleFilled(dotC, dotR,
+                            ImGui::ColorConvertFloat4ToU32(surf.textTertiary));
+        const float textX = dotC.x + dotR + ui::metrics::cpMenuLabelGap();
+        const float textW = std::max(ui::metrics::px(24.0f), p1.x - padX - textX);
+        dl->AddText(ImVec2(textX, p0.y + padY),
+                    ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
+                    artiEllipsize(subs[i], textW).c_str());
+        if (hot) ImGui::SetTooltip("%s", subs[i].c_str());
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + rowGap));
+        ImGui::PopID();
     }
+    ImGui::PopID();
 }
 
 // ============================ Session Artifacts presentation ============================
@@ -693,12 +778,11 @@ static void drawTaskListPanel(AppState& st, bool busy) {
 // size goes through ui::metrics::px so the tab scales with DPI like the rest of the app, and
 // every tone comes from the adaptive glass surface (chatSurf) — no hardcoded colors.
 
-// Group header: delegates to the SHARED copilot-menu section chrome so an Artifacts group and the
-// Sessions "Other sessions" group are the same widget. This tab's call sites pass 0 to mean "no
-// count" (the Plan group), which maps onto cpMenuSection's -1 sentinel.
+// Group header: delegates to the shared copilot-menu section chrome so every artifact section
+// carries the same label/count treatment, including an explicit zero count.
 static void artiSectionHeader(const ui::AdaptiveSurface& surf, const char* label, int count) {
-    (void)surf;   // tone now comes from cpMenuSection's own chatSurf() lookup
-    ui::cpMenuSection(label, count > 0 ? count : -1);
+    (void)surf;
+    ui::cpMenuSection(label, count);
 }
 
 // Styled empty state: the SHARED menu hint tone (cpMenuHint), indented to the section body, and
@@ -731,66 +815,95 @@ static std::string artiEllipsize(const std::string& s, float maxW) {
     return out.empty() ? std::string(kEll) : out + kEll;
 }
 
-// One artifact row: a single grouped CARD (frosted background) per document — the name on
-// its own line up top, and its actions ("Open file" / "Open file location") stacked directly
-// beneath it inside the SAME card background, so each row visibly reads as one unit instead of
-// a name-left/buttons-right strip (the old layout put "Folder" so far from the name it read as
-// a separate, unrelated control).
+// One tight artifact card: the full row opens the item, while compact actions appear at the right
+// only on hover. Both user-supplied lines are draw-list text, so both are ellipsized to the card's
+// measured width instead of relying on an ImGui clip rect that does not exist here.
 static void artiRow(AppState& st, const std::string& label, const std::string& tooltip,
                     const std::string& path, const std::function<void()>& onOpen) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const float S = ui::uiScale;
-    const bool hasFolder = !path.empty();
-
-    const float padX  = ui::metrics::cpMenuRowPadX();
-    const float padY  = ui::metrics::cpMenuRowPadY();
-    const float rnd   = ui::metrics::cpMenuRowRound();
-    const float rowW  = ImGui::GetContentRegionAvail().x;
-    const float nameH = ImGui::GetTextLineHeight();
-    const float btnH  = ImGui::GetFrameHeight();
-    const float innerGap = ui::metrics::px(4.0f);
-    const float cardH = padY * 2.0f + nameH + innerGap + btnH;
-
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ui::glassRowBackground(dl, p0, ImVec2(p0.x + rowW, p0.y + cardH), rnd / S,
-                           /*stripe*/false, /*selected*/false, /*washAlpha*/0.30f);
-
-    // -- name line: a small dot marker (drawn directly, NOT ImGui::Bullet() — its trailing
-    // spacing is easy to accidentally cancel and clip into the label) + ellipsized name --
+    const bool canReveal = !path.empty();
+    const float padX = ui::metrics::cpMenuRowPadX();
+    const float padY = ui::metrics::cpMenuRowPadY();
+    const float lineGap = ui::metrics::cpMenuLabelGap();
+    const float rowGap = ui::metrics::cpMenuRowGap();
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    const float lineH = ImGui::GetTextLineHeight();
+    const float cardH = padY * 2.0f + lineH * 2.0f + lineGap;
     const float dotR = ui::metrics::px(2.2f);
-    const float nameX = p0.x + padX + dotR * 2.0f + ui::metrics::px(6.0f);
-    const ImVec2 dotC(p0.x + padX + dotR, p0.y + padY + nameH * 0.5f);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 p1(p0.x + rowW, p0.y + cardH);
+    const bool rowHot = ImGui::IsMouseHoveringRect(p0, p1);
+
+    std::string secondary;
+    if (path.empty()) {
+        secondary = "Live document";
+    } else {
+        const size_t slash = path.find_last_of("/\\");
+        const std::string parent = slash == std::string::npos ? std::string() : path.substr(0, slash);
+        const size_t parentSlash = parent.find_last_of("/\\");
+        secondary = parent.empty() ? std::string()
+                                   : parent.substr(parentSlash == std::string::npos
+                                                       ? 0 : parentSlash + 1);
+        if (secondary.empty()) {
+            const size_t dot = path.find_last_of('.');
+            if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+                secondary = path.substr(dot);
+        }
+        if (secondary.empty()) secondary = "File";
+    }
+
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float actionGap = ui::metrics::cpMenuLabelGap();
+    const float openW = ImGui::CalcTextSize("Open").x + style.FramePadding.x * 2.0f;
+    const float revealW = canReveal
+        ? ImGui::CalcTextSize("Folder").x + style.FramePadding.x * 2.0f : 0.0f;
+    const float actionsW = rowHot ? openW + (canReveal ? actionGap + revealW : 0.0f) : 0.0f;
+
+    ImGui::Selectable("##artifact_row", false, ImGuiSelectableFlags_AllowItemOverlap,
+                      ImVec2(rowW, cardH));
+    const bool picked = ImGui::IsItemClicked();
+    if (picked && onOpen) onOpen();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ui::glassRowBackground(dl, p0, p1, ui::metrics::cpMenuRowRound() / S,
+                           false, false, rowHot ? 0.42f : 0.30f);
+    const ImVec2 dotC(p0.x + padX + dotR, p0.y + cardH * 0.5f);
     dl->AddCircleFilled(dotC, dotR, ImGui::ColorConvertFloat4ToU32(surf.textTertiary));
+    const float textX = dotC.x + dotR + ui::metrics::cpMenuLabelGap();
+    const float textW = std::max(ui::metrics::px(24.0f),
+                                 p1.x - padX - actionsW - textX -
+                                     (rowHot ? actionGap : 0.0f));
+    dl->AddText(ImVec2(textX, p0.y + padY),
+                ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
+                artiEllipsize(label, textW).c_str());
+    dl->AddText(ImVec2(textX, p0.y + padY + lineH + lineGap),
+                ImGui::ColorConvertFloat4ToU32(surf.textTertiary),
+                artiEllipsize(secondary, textW).c_str());
 
-    ImGui::SetCursorScreenPos(ImVec2(nameX, p0.y + padY));
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    const float nameMaxW = rowW - (nameX - p0.x) - padX;
-    ImGui::TextUnformatted(artiEllipsize(label, nameMaxW).c_str());
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) {
+    if (rowHot) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (!tooltip.empty()) ImGui::SetTooltip("%s", tooltip.c_str());
+        ImGui::SetTooltip("%s", tooltip.empty() ? (path.empty() ? label.c_str() : path.c_str())
+                                               : tooltip.c_str());
+        const float buttonY = p0.y + (cardH - ImGui::GetFrameHeight()) * 0.5f;
+        float buttonX = p1.x - padX - actionsW;
+        ImGui::SetCursorScreenPos(ImVec2(buttonX, buttonY));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        if (ImGui::SmallButton("Open") && onOpen) onOpen();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open this artifact");
+        if (canReveal) {
+            buttonX += openW + actionGap;
+            ImGui::SetCursorScreenPos(ImVec2(buttonX, buttonY));
+            if (ImGui::SmallButton("Folder")) chatArtifactReveal(st, path);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Show in file manager\n%s", path.c_str());
+        }
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
     }
-    if (ImGui::IsItemClicked() && onOpen) onOpen();
 
-    // -- action row: grouped directly under the name, inside the same card --
-    ImGui::SetCursorScreenPos(ImVec2(p0.x + padX, p0.y + padY + nameH + innerGap));
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    if (ImGui::SmallButton("Open file")) { if (onOpen) onOpen(); }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open in the viewport");
-    if (hasFolder) {
-        ImGui::SameLine(0, ui::metrics::px(6.0f));
-        if (ImGui::SmallButton("Open file location")) chatArtifactReveal(st, path);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Show in file manager\n%s", path.c_str());
-    }
-    ImGui::PopStyleColor();
-
-    // Advance past the card + a small gap before the next one.
-    ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + cardH));
-    ImGui::Dummy(ImVec2(rowW, 0));
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + rowGap));
 }
 
 // Render-thumbnail cache for the Artifacts tab's "Renders" grid. The panel is redrawn every
@@ -823,75 +936,18 @@ static Tex artiRenderThumb(const std::string& path) {
     return it->second.tex;   // by value: the next call may evict/rehash this slot
 }
 
-// Session Artifacts panel — subagents, the plan, the documents the AGENT touched (not every
-// open tab) and the renders the agent itself looked at, as images.
+// Session Artifacts is a browser for session output: agent-touched documents, render images and
+// produced files. Run telemetry stays in the Tasks panel.
 static void drawArtifactsPanel(AppState& st, bool busy) {
     (void)busy;
     const ui::AdaptiveSurface& surf = chatSurf();
     ui::cpMenuHeader(st.fonts, "Session Artifacts",
-                     "Subagents, the plan, the documents the agent touched and its renders.");
+                     "Documents, renders and files produced or touched by this session.");
 
-    // ---- Subagents (from plan_state subagent rows + agent.spawn activity) ----
-    // Collected first so the section header can carry a count; the data selection is unchanged.
-    std::vector<std::string> subs;
-    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
-        if (it->fromUser) continue;
-        if (it->planState.present)
-            for (const auto& pi : it->planState.items)
-                if (pi.kind == "subagent")
-                    subs.push_back(pi.title +
-                                   (pi.status.empty() ? "" : (" \xc2\xb7 " + pi.status)));
-        for (const auto& a : it->activity)
-            if (a.stage.rfind("agent:", 0) == 0 || a.title.rfind("Subagent", 0) == 0)
-                subs.push_back(a.title.empty() ? a.stage : a.title);
-    }
-    artiSectionHeader(surf, "Subagents", (int)subs.size());
-    if (subs.empty()) {
-        artiEmptyState(surf, "No subagents yet \xe2\x80\x94 spawned helpers appear here while a run is working.");
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        for (const auto& s : subs) {
-            // Bullet() already appends its own trailing spacing; forcing SameLine(0,0)
-            // after it collapses that gap and the dot visually clips into the label
-            // (T-artifacts-bullet-clip). Use the default gap instead.
-            ImGui::Bullet();
-            ImGui::SameLine();
-            const std::string shown = artiEllipsize(s, ImGui::GetContentRegionAvail().x);
-            ImGui::TextUnformatted(shown.c_str());
-            if (shown.size() != s.size() && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", s.c_str());
-        }
-        ImGui::PopStyleColor();
-    }
-
-    // ---- Plan ----
-    artiSectionHeader(surf, "Plan", 0);
-    const PlanState* ps = nullptr;
-    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-        if (!it->fromUser && planIsReal(it->planState)) { ps = &it->planState; break; }
-    if (ps) {
-        int d = 0, t = 0; copilotTaskProgress(st, d, t);
-        char line[320];
-        snprintf(line, sizeof(line), "%s (%d/%d)",
-                 ps->title.empty() ? "build plan" : ps->title.c_str(), d, t);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        ImGui::Bullet();
-        ImGui::SameLine();
-        const std::string shown = artiEllipsize(line, ImGui::GetContentRegionAvail().x);
-        ImGui::TextUnformatted(shown.c_str());
-        ImGui::PopStyleColor();
-        if (shown.size() != strlen(line) && ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", line);
-    } else {
-        artiEmptyState(surf, "No plan yet \xe2\x80\x94 the agent's task list shows up here once a build starts.");
-    }
-
-    // ---- Documents the AGENT touched + files/renders it produced this session ----
-    // Rows are gathered before drawing so each header can show a count; same sources as before.
     struct ArtiDocRow {
         std::string label, tooltip, path;
         std::function<void()> open;
-        bool image = false;   // produced-file rows only: an "image" artifact (a render PNG)
+        bool image = false;
     };
     // The question this panel answers is "what did the AGENT touch", not "what is open" — the old
     // single list showed every doc tab, so a session that built one part looked like it built
@@ -971,7 +1027,7 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                     size_t slash = base.find_last_of("/\\");
                     if (slash != std::string::npos) base = base.substr(slash + 1);
                     ArtiDocRow r;
-                    r.label   = base + "  (" + kindA + ")";
+                    r.label   = base;
                     r.path    = path;
                     r.tooltip = path;
                     r.image   = (kindA == "image");
@@ -981,140 +1037,285 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
             }
         }
     }
+
+    // Panel-level actions stay above browsing/filter chrome. Project-folder reveal accepts a
+    // directory directly; render visibility uses the existing cached chat display preference.
+    const std::string projectPath = st.plmProjectPath();
+    bool rendersOn = ui::chatShowRenders();
+    const float actionGap = ui::metrics::cpMenuCtlGap();
+    const float actionAvail = ImGui::GetContentRegionAvail().x;
+    const float actionW = std::max(ui::metrics::px(24.0f),
+                                   (actionAvail - actionGap) * 0.5f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::BeginDisabled(projectPath.empty());
+    if (ImGui::Button("Open project folder", ImVec2(actionW, 0)))
+        chatArtifactReveal(st, projectPath);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", projectPath.empty()
+            ? "Open or choose a project before revealing its folder."
+            : projectPath.c_str());
+    ImGui::SameLine(0, actionGap);
+    const char* renderToggle = rendersOn ? "Renders: on" : "Renders: off";
+    if (ImGui::Button(renderToggle, ImVec2(actionW, 0))) {
+        rendersOn = !rendersOn;
+        ui::setChatShowRenders(rendersOn);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show or hide image previews here and in the chat transcript.");
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+
+    auto lowerCopy = [](std::string s) {
+        for (char& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    };
+    static char s_artifactFilter[192] = "";
+    const size_t totalRows = agentRows.size() + otherRows.size() + fileRows.size();
+    const bool showFilter = totalRows > 8;
+    if (showFilter) {
+        const ImVec4 fieldBg(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.08f);
+        const ImVec4 fieldHov(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.14f);
+        const ImVec4 fieldAct(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.18f);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, fieldBg);
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, fieldHov);
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, fieldAct);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+        ImGui::InputTextWithHint("##artifact_filter", "Filter artifacts\xe2\x80\xa6",
+                                 s_artifactFilter, sizeof(s_artifactFilter));
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(4);
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+    }
+    const bool filterActive = showFilter && s_artifactFilter[0] != '\0';
+    const std::string filterNeedle = filterActive ? lowerCopy(s_artifactFilter) : std::string();
+    auto matches = [&](const ArtiDocRow& r) {
+        if (!filterActive) return true;
+        return lowerCopy(r.label).find(filterNeedle) != std::string::npos ||
+               lowerCopy(r.path).find(filterNeedle) != std::string::npos;
+    };
+
+    std::vector<const ArtiDocRow*> documents;
+    std::vector<const ArtiDocRow*> renders;
+    std::vector<const ArtiDocRow*> otherDocs;
+    for (const auto& r : agentRows) if (matches(r)) documents.push_back(&r);
+    for (const auto& r : otherRows) if (matches(r)) otherDocs.push_back(&r);
+    // Chat activity is chronological. Collect render and file rows back-to-front once so every
+    // rendering loop can index from zero while still presenting newest output first.
+    for (auto it = fileRows.rbegin(); it != fileRows.rend(); ++it)
+        if (it->image && matches(*it)) renders.push_back(&*it);
+
+    std::vector<const ArtiDocRow*> models;
+    std::vector<const ArtiDocRow*> drawings;
+    std::vector<const ArtiDocRow*> data;
+    std::vector<const ArtiDocRow*> otherFiles;
+    auto lowerExt = [&](const std::string& path) {
+        const size_t dot = path.find_last_of('.');
+        const size_t slash = path.find_last_of("/\\");
+        if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+            return std::string();
+        return lowerCopy(path.substr(dot));
+    };
+    for (auto it = fileRows.rbegin(); it != fileRows.rend(); ++it) {
+        if (it->image || !matches(*it)) continue;
+        const std::string ext = lowerExt(it->path);
+        if (ext == ".step" || ext == ".stp" || ext == ".stl" || ext == ".3mf" ||
+            ext == ".obj" || ext == ".step+")
+            models.push_back(&*it);
+        else if (ext == ".pdf" || ext == ".dxf" || ext == ".svg")
+            drawings.push_back(&*it);
+        else if (ext == ".csv" || ext == ".json" || ext == ".txt" || ext == ".md")
+            data.push_back(&*it);
+        else
+            otherFiles.push_back(&*it);
+    }
+
+    const size_t fileCount = models.size() + drawings.size() + data.size() + otherFiles.size();
+    const size_t matchCount = documents.size() + renders.size() + fileCount + otherDocs.size();
+    if (filterActive && matchCount == 0)
+        artiEmptyState(surf, "No matches \xe2\x80\x94 try a document name, file name or folder.");
+
     // Section-scoped ImGui ids: every loop below indexes from 0, so without a per-section scope
-    // the first produced-file row would collide with the first agent-document row and one of the
-    // two rows' buttons would go dead.
-    artiSectionHeader(surf, "Agent Documents", (int)agentRows.size());
-    if (agentRows.empty()) {
-        artiEmptyState(surf, "Nothing yet \xe2\x80\x94 parts the agent opens, imports or edits are listed here.");
+    // the first file row would collide with the first document row and one row would go dead.
+    // ---- Documents ----
+    artiSectionHeader(surf, "Documents", (int)documents.size());
+    if (documents.empty()) {
+        artiEmptyState(surf, filterActive
+            ? "No matching documents \xe2\x80\x94 parts the agent opens, imports or edits appear here."
+            : "Parts the agent opens, imports or edits appear here.");
     } else {
         ImGui::PushID("arti_docs");
-        for (size_t i = 0; i < agentRows.size(); ++i) {
+        for (size_t i = 0; i < documents.size(); ++i) {
             ImGui::PushID((int)i);
-            artiRow(st, agentRows[i].label, agentRows[i].tooltip, agentRows[i].path,
-                    agentRows[i].open);
+            artiRow(st, documents[i]->label, documents[i]->tooltip, documents[i]->path,
+                    documents[i]->open);
             ImGui::PopID();
         }
         ImGui::PopID();
     }
 
+    // ---- Renders ----
+    artiSectionHeader(surf, "Renders", (int)renders.size());
+    if (renders.empty()) {
+        artiEmptyState(surf, filterActive
+            ? "No matching renders \xe2\x80\x94 images produced for agent vision appear here."
+            : "Images produced for agent vision appear here as preview tiles.");
+    } else if (!rendersOn) {
+        artiEmptyState(surf, "Render previews are hidden \xe2\x80\x94 use the Renders control above to show them.");
+    } else {
+        const float S = ui::uiScale;
+        const float availW = ImGui::GetContentRegionAvail().x;
+        const float targetW = ui::metrics::copilotThumbW();
+        const float cellGap = ui::metrics::cpMenuRowGap();
+        const int columns = std::max(1, (int)((availW + cellGap) / (targetW + cellGap)));
+        const float cellW = (availW - cellGap * (float)(columns - 1)) / (float)columns;
+        const float padX = ui::metrics::cpMenuRowPadX();
+        const float padY = ui::metrics::cpMenuRowPadY();
+        const float imageW = std::max(ui::metrics::px(24.0f), cellW - padX * 2.0f);
+        const float imageH = imageW * 0.72f;
+        const float captionH = ImGui::GetTextLineHeight();
+        const float cellH = padY * 2.0f + imageH + ui::metrics::cpMenuLabelGap() + captionH;
+        const ImVec2 gridStart = ImGui::GetCursorScreenPos();
+        const int kCap = 24;
+        const size_t drawCount = std::min(renders.size(), (size_t)kCap);
+        std::vector<const ArtiDocRow*> fallbackRows;
+        size_t gridCount = 0;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImGui::PushID("arti_renders");
+        for (size_t i = 0; i < drawCount; ++i) {
+            const ArtiDocRow& r = *renders[i];
+            ImGui::PushID((int)i);
+            const Tex tex = artiRenderThumb(r.path);
+            if (!tex.id || tex.w <= 0 || tex.h <= 0) {
+                // Missing, corrupt or half-written images remain visible as dim fallback rows.
+                fallbackRows.push_back(&r);
+                ImGui::PopID();
+                continue;
+            }
+            const size_t row = gridCount / (size_t)columns;
+            const size_t col = gridCount % (size_t)columns;
+            const ImVec2 p0(gridStart.x + (float)col * (cellW + cellGap),
+                            gridStart.y + (float)row * (cellH + cellGap));
+            const ImVec2 p1(p0.x + cellW, p0.y + cellH);
+            ImGui::SetCursorScreenPos(p0);
+            ImGui::InvisibleButton("##render_cell", ImVec2(cellW, cellH));
+            const bool hot = ImGui::IsItemHovered();
+            if (ImGui::IsItemClicked()) chatArtifactOpenSmart(st, r.path);
+            ui::glassRowBackground(dl, p0, p1, ui::metrics::cpMenuRowRound() / S,
+                                   (gridCount % 2) == 1, false, hot ? 0.48f : 0.28f);
+            const float scale = std::min(imageW / (float)tex.w, imageH / (float)tex.h);
+            const ImVec2 drawSize((float)tex.w * scale, (float)tex.h * scale);
+            const ImVec2 imageMin(p0.x + padX + (imageW - drawSize.x) * 0.5f,
+                                  p0.y + padY + (imageH - drawSize.y) * 0.5f);
+            dl->AddImage((ImTextureID)(intptr_t)tex.id, imageMin,
+                         ImVec2(imageMin.x + drawSize.x, imageMin.y + drawSize.y));
+            dl->AddText(ImVec2(p0.x + padX,
+                               p0.y + padY + imageH + ui::metrics::cpMenuLabelGap()),
+                        ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
+                        artiEllipsize(r.label, imageW).c_str());
+            if (hot) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("%s", r.path.c_str());
+            }
+            ++gridCount;
+            ImGui::PopID();
+        }
+        if (gridCount > 0) {
+            const size_t gridRows = (gridCount + (size_t)columns - 1) / (size_t)columns;
+            ImGui::SetCursorScreenPos(
+                ImVec2(gridStart.x, gridStart.y + (float)gridRows * cellH +
+                                        (float)(gridRows - 1) * cellGap + cellGap));
+        } else {
+            ImGui::SetCursorScreenPos(gridStart);
+        }
+        ImGui::PushID("fallback");
+        for (size_t i = 0; i < fallbackRows.size(); ++i) {
+            ImGui::PushID((int)i);
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextWrapped("Preview unavailable \xc2\xb7 %s", fallbackRows[i]->label.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", fallbackRows[i]->path.c_str());
+            chatArtifactActions(st, fallbackRows[i]->path);
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+            ImGui::PopID();
+        }
+        ImGui::PopID();
+        ImGui::PopID();
+        const size_t more = renders.size() - drawCount;
+        if (more > 0) {
+            char mline[64];
+            std::snprintf(mline, sizeof(mline), "+%d more render%s",
+                          (int)more, more == 1 ? "" : "s");
+            artiEmptyState(surf, mline);
+        }
+    }
+
+    // ---- Files ----
+    artiSectionHeader(surf, "Files", (int)fileCount);
+    if (fileCount == 0) {
+        artiEmptyState(surf, filterActive
+            ? "No matching files \xe2\x80\x94 exported models, drawings and data appear here."
+            : "Exported models, drawings, data and other files appear here.");
+    } else {
+        auto drawFileGroup = [&](const char* label, const char* id,
+                                 const std::vector<const ArtiDocRow*>& rows) {
+            if (rows.empty()) return;
+            ui::cpMenuLabel(label);
+            ImGui::PushID(id);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                ImGui::PushID((int)i);
+                artiRow(st, rows[i]->label, rows[i]->tooltip, rows[i]->path, rows[i]->open);
+                ImGui::PopID();
+            }
+            ImGui::PopID();
+        };
+        ImGui::PushID("arti_files");
+        drawFileGroup("Models", "models", models);
+        drawFileGroup("Drawings / exports", "drawings", drawings);
+        drawFileGroup("Data", "data", data);
+        drawFileGroup("Other", "other", otherFiles);
+        ImGui::PopID();
+    }
+
+    // ---- Other open documents ----
     // The user's own tabs must not dominate this panel, but dropping them outright would lose the
     // only way to reach a part the agent worked on BEFORE the handoff / edit-stamp flags were set
     // — so they stay, collapsed behind a dim click-to-expand line.
-    artiSectionHeader(surf, "Other Open Documents", (int)otherRows.size());
+    artiSectionHeader(surf, "Other open documents", (int)otherDocs.size());
     {
         static bool s_showOtherDocs = false;
         const float ind = ui::metrics::cpMenuRowPadX();
         ImGui::Indent(ind);
-        if (otherRows.empty()) {
-            ui::cpMenuHint("No other documents open.");
+        if (otherDocs.empty()) {
+            ui::cpMenuHint(filterActive
+                ? "No matching open documents \xe2\x80\x94 user-opened tabs are kept here, collapsed."
+                : "User-opened tabs appear here, collapsed away from session output.");
         } else {
             char line[96];
-            snprintf(line, sizeof(line), "%d other open document%s (%s)",
-                     (int)otherRows.size(), otherRows.size() == 1 ? "" : "s",
-                     s_showOtherDocs ? "hide" : "show");
+            std::snprintf(line, sizeof(line), "%d other open document%s \xc2\xb7 %s",
+                          (int)otherDocs.size(), otherDocs.size() == 1 ? "" : "s",
+                          s_showOtherDocs ? "hide" : "show");
             ui::cpMenuHint(line);
             if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
             if (ImGui::IsItemClicked()) s_showOtherDocs = !s_showOtherDocs;
         }
         ImGui::Unindent(ind);
-        if (s_showOtherDocs && !otherRows.empty()) {
+        if (s_showOtherDocs && !otherDocs.empty()) {
             ImGui::PushID("arti_other_docs");
-            for (size_t i = 0; i < otherRows.size(); ++i) {
+            for (size_t i = 0; i < otherDocs.size(); ++i) {
                 ImGui::PushID((int)i);
-                artiRow(st, otherRows[i].label, otherRows[i].tooltip, otherRows[i].path,
-                        otherRows[i].open);
+                artiRow(st, otherDocs[i]->label, otherDocs[i]->tooltip, otherDocs[i]->path,
+                        otherDocs[i]->open);
                 ImGui::PopID();
             }
             ImGui::PopID();
         }
     }
-
-    // Renders vs everything else. Image artifacts are what the VISION model actually looked at, so
-    // they are shown as images instead of a path string. With the display pref off they stay in
-    // "Produced This Session" as plain rows, in their original chronological order.
-    const bool showRenders = ui::chatShowRenders();
-    std::vector<const ArtiDocRow*> renderRows, plainRows;
-    for (const auto& r : fileRows) {
-        if (showRenders && r.image) renderRows.push_back(&r);
-        else                        plainRows.push_back(&r);
-    }
-    if (!renderRows.empty()) {
-        artiSectionHeader(surf, "Renders", (int)renderRows.size());
-        // NEWEST FIRST: chat activity is chronological, so the last artifact collected is the
-        // render the model just looked at — that is the one the user wants at the top.
-        const float availW = ImGui::GetContentRegionAvail().x;
-        const float maxTw  = ui::metrics::copilotThumbW();
-        const float thumbW = availW < maxTw ? availW : maxTw;
-        const float gap    = ui::metrics::px(6.0f);
-        const float lineX1 = ImGui::GetCursorPosX() + availW;
-        const int   kCap   = 24;                  // hard cap on thumbnails drawn per frame
-        int drawn = 0, more = 0;
-        bool firstInRow = true;
-        // Wrap on the MEASURED cell width, not the thumbnail width: each cell is a group of the
-        // image plus its actions row, and that button row can be wider than the image itself.
-        float cellW = thumbW;
-        ImGui::PushID("arti_renders");
-        for (size_t k = renderRows.size(); k-- > 0;) {
-            const ArtiDocRow& r = *renderRows[k];
-            if (drawn >= kCap) { ++more; continue; }
-            const Tex tex = artiRenderThumb(r.path);
-            ImGui::PushID((int)k);
-            if (!tex.id || tex.w <= 0 || tex.h <= 0) {
-                // Undecodable (missing or half-written file): fall back to the dim path row this
-                // artifact used to get, rather than leaving a hole in the grid. Own line.
-                ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-                ImGui::TextWrapped("image: %s", r.path.c_str());
-                ImGui::PopStyleColor();
-                chatArtifactActions(st, r.path);
-                firstInRow = true;
-            } else {
-                if (!firstInRow) {
-                    ImGui::SameLine(0, gap);
-                    if (ImGui::GetCursorPosX() + cellW > lineX1) ImGui::NewLine();
-                }
-                firstInRow = false;
-                std::string base = r.path;
-                const size_t slash = base.find_last_of("/\\");
-                if (slash != std::string::npos) base = base.substr(slash + 1);
-                const float th = thumbW * (float)tex.h / (float)std::max(1, tex.w);
-                ImGui::BeginGroup();
-                ImGui::Image((ImTextureID)(intptr_t)tex.id, ImVec2(thumbW, th));
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                    ImGui::SetTooltip("%s", base.c_str());
-                }
-                if (ImGui::IsItemClicked()) chatArtifactOpenSmart(st, r.path);
-                // The same actions the inline chat image rows carry, under the thumbnail.
-                chatArtifactActions(st, r.path);
-                ImGui::EndGroup();
-                cellW = std::max(thumbW, ImGui::GetItemRectSize().x);
-            }
-            ImGui::PopID();
-            ++drawn;
-        }
-        ImGui::PopID();
-        if (more > 0) {
-            char mline[64];
-            snprintf(mline, sizeof(mline), "+%d more render%s", more, more == 1 ? "" : "s");
-            artiEmptyState(surf, mline);
-        }
-    }
-
-    artiSectionHeader(surf, "Produced This Session", (int)plainRows.size());
-    if (plainRows.empty()) {
-        artiEmptyState(surf, "No files yet \xe2\x80\x94 files the agent writes show up here.");
-    } else {
-        ImGui::PushID("arti_files");
-        for (size_t i = 0; i < plainRows.size(); ++i) {
-            ImGui::PushID((int)i);
-            artiRow(st, plainRows[i]->label, plainRows[i]->tooltip, plainRows[i]->path,
-                    plainRows[i]->open);
-            ImGui::PopID();
-        }
-        ImGui::PopID();
-    }
-    ImGui::Dummy(ImVec2(0, ui::metrics::px(6.0f)));
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
 }
 
 
@@ -1270,19 +1471,10 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                                                       : "Gearbox housing revision";
             st.conversations.push_back(std::move(cx));
         }
-        if (std::strcmp(cpView, "sessions") == 0) {
-            st.showSessionsPicker = true;
-            st.showAISettingsOverlay = st.showTaskList = st.showArtifacts = false;
-        } else if (std::strcmp(cpView, "settings") == 0) {
-            st.showAISettingsOverlay = true;
-            st.showSessionsPicker = st.showTaskList = st.showArtifacts = false;
-        } else if (std::strcmp(cpView, "tasks") == 0) {
-            st.showTaskList = true;
-            st.showSessionsPicker = st.showAISettingsOverlay = st.showArtifacts = false;
-        } else if (std::strcmp(cpView, "artifacts") == 0) {
-            st.showArtifacts = true;
-            st.showSessionsPicker = st.showAISettingsOverlay = st.showTaskList = false;
-        }
+        if (std::strcmp(cpView, "sessions") == 0)       cpSetTab(st, CpTab::Sessions);
+        else if (std::strcmp(cpView, "settings") == 0)  cpSetTab(st, CpTab::Settings);
+        else if (std::strcmp(cpView, "tasks") == 0)     cpSetTab(st, CpTab::Tasks);
+        else if (std::strcmp(cpView, "artifacts") == 0) cpSetTab(st, CpTab::Artifacts);
     }
 
     // Pull the header flush to the window content top (column already +4 under ribbon).
@@ -1306,12 +1498,10 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // Settings / Sessions / Tasks / Artifacts overlays replace the chat log (and hide the
         // composer) while open. They are mutually exclusive (the header toggles clear the
         // others) and a click outside the Copilot column dismisses them.
-        const bool overlayOpen = st.showSessionsPicker || st.showAISettingsOverlay ||
-                                 st.showTaskList || st.showArtifacts;
+        const bool overlayOpen = cpActiveTab(st) != CpTab::Chat;
         if (overlayOpen && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
             !ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
-            st.showSessionsPicker = st.showAISettingsOverlay =
-                st.showTaskList = st.showArtifacts = false;
+            cpSetTab(st, CpTab::Chat);
         }
         static float s_composerH = 0.0f;
         const float bottomClearance = ui::metrics::U(2);

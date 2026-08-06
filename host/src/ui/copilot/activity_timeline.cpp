@@ -6,6 +6,7 @@
 
 #include "copilot_internal.h"
 #include "agent_text.h"
+#include "stream_rows.h"              // ui::streamTextVisible — a blank prose box draws nothing
 #include "ui/copilot/tool_phrase.h"   // human phrasing + grouping for raw MCP tool symbols
 #include "ui/ai/ai_prefs.h"           // cached chat-display prefs (Settings -> AI -> Harness)
 #include "gl_compat.h"                // glDeleteTextures — bounded artifact texture cache
@@ -50,7 +51,7 @@ static std::string stripResolvedDocIdParens(const std::string& s) {
 // The whole substitution is user-gated: chatHumanizeDocIds() off (diagnostic mode) leaves engine
 // ids exactly as the harness wrote them, which is the entire point of that mode. The glyph fold
 // always runs — an unrenderable codepoint is a defect at every detail level.
-static std::string sanitizeAgentText(AppState& st, const std::string& s, bool jsonBody = false) {
+std::string sanitizeAgentText(AppState& st, const std::string& s, bool jsonBody) {
     if (s.empty()) return s;
     if (!ui::chatHumanizeDocIds()) return foldToAtlasGlyphs(s);
     std::string out = substituteDocIds(s, [&st](const std::string& id) -> std::string {
@@ -62,17 +63,26 @@ static std::string sanitizeAgentText(AppState& st, const std::string& s, bool js
     return foldToAtlasGlyphs(out);
 }
 
-// Both halves are idempotent and have no-allocation fast paths, so running this over the same
-// rows every frame is stable and near-free. Applied in place: the persisted transcript and the
-// right-click "Copy text" path (ui_common chatActivityCopyText) then see the same clean strings.
-// Restricted to the prose row kinds (0 thinking/action, 1 context chip, 2 thought box, 3 tool
-// call) — rowKind >= 4 are corporate/swarm cards whose detail is a JSON payload cards.cpp
-// re-parses, and those carry no doc ids. Only a tool row's detail is an args JSON body.
+// Applied IN PLACE, so the persisted transcript and the right-click "Copy text" path
+// (ui_common chatActivityCopyText) see the same clean strings. Restricted to the prose row kinds
+// (0 thinking/action, 1 context chip, 2 thought box, 3 tool call) — rowKind >= 4 are
+// corporate/swarm cards whose detail is a JSON payload cards.cpp re-parses, and those carry no
+// doc ids. Only a tool row's detail is an args JSON body.
+//
+// Both halves are idempotent, but "idempotent" is not "free": their unchanged path still returns
+// the string BY VALUE. This runs over every visible row every frame, and a mission turn keeps
+// hundreds of multi-KB tool-arg blobs on screen, so the pre-scan (agentTextMayChange, allocation
+// -free) is what keeps a long transcript from paying two heap round-trips per string per frame.
+void sanitizeAgentTextInPlace(AppState& st, std::string& s, bool jsonBody) {
+    if (s.empty() || !ui::agentTextMayChange(s)) return;
+    s = sanitizeAgentText(st, s, jsonBody);
+}
+
 static void sanitizeActivityItem(AppState& st, ActivityItem& a) {
     if (a.rowKind > 3) return;
-    a.reason = sanitizeAgentText(st, a.reason);
-    a.detail = sanitizeAgentText(st, a.detail, /*jsonBody=*/a.rowKind == 3);
-    a.title  = sanitizeAgentText(st, a.title);
+    sanitizeAgentTextInPlace(st, a.reason);
+    sanitizeAgentTextInPlace(st, a.detail, /*jsonBody=*/a.rowKind == 3);
+    sanitizeAgentTextInPlace(st, a.title);
 }
 
 // ---- collapse animation (ui::chatCollapseAnim) ----------------------------------------------
@@ -730,15 +740,77 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     }
 }
 
-// A plain-prose "Output" box is a raw-log carrier, not a display surface: every byte it
-// accumulates is ALSO appended to the primary chat bubble (feed.cpp's assistant_delta prose
-// branch), and run_finished promotes the box into m.text when nothing streamed. Drawing the
-// row therefore printed the model's answer twice. Ops-JSON streams are the exception — their
-// text is stripped back out of m.text on classification flip, so the box is the sole surface.
-static bool isProseOutputRow(const ActivityItem& a) {
+// A plain-prose "Output" box IS the model's reply, drawn where it arrived. It used to be a
+// hidden raw-log carrier because the reply was rendered once, after the whole timeline
+// (chat_log.cpp's prose card) — which is exactly why a reasoning burst that followed a
+// sentence rendered ABOVE it: the sentence was structurally last no matter when it was
+// spoken. Ops-JSON streams are not prose; they keep their own summary card.
+bool isProseOutputRow(const ActivityItem& a) {
     if (a.rowKind != 2) return false;
     if (a.stage != "stream:out" && a.title != "Output") return false;
     return a.opsCount <= 0 && a.title.find("Building ops") == std::string::npos;
+}
+
+// The prose the timeline renders inline, in arrival order. feed.cpp appends the SAME bytes to
+// both the box and m.text from one delta, and drawAgentTimeline runs the boxes through the
+// same sanitizer chat_log runs over m.text, so this is a byte-exact prefix of m.text.
+std::string timelineInlineProse(const ChatMsg& m) {
+    std::string out;
+    for (const auto& a : m.activity)
+        if (isProseOutputRow(a)) out += a.detail;
+    return out;
+}
+
+bool timelineHasInlineProse(const ChatMsg& m) {
+    for (const auto& a : m.activity)
+        if (isProseOutputRow(a) && ui::streamTextVisible(a.detail)) return true;
+    return false;
+}
+
+// What m.text carries BEYOND the inline prose: a reply promoted whole (nothing streamed), or a
+// note appended after the fact such as "(Stopped by you.)". Callers render this instead of
+// m.text so nothing prints twice. If the two ever diverge (a doc-id substitution spanning a
+// segment boundary is the only known way), the timeline is authoritative and the tail is
+// dropped — a missing rename is a far smaller defect than the whole reply printed twice.
+std::string timelineProseTail(const ChatMsg& m) {
+    const std::string shown = timelineInlineProse(m);
+    if (shown.empty()) return m.text;
+    if (m.text.size() <= shown.size()) return {};
+    if (m.text.compare(0, shown.size(), shown) != 0) return {};
+    return m.text.substr(shown.size());
+}
+
+// The model's prose, as a Thin glass bubble (Liquid Glass v2 §6, host contract H5) drawn at the
+// position in the column where the segment actually arrived. Selectable for click-drag +
+// Ctrl+C; right-click copies the selection or the whole segment — the same affordances the
+// single trailing reply card used to carry, which chat_log.cpp now only draws for a reply the
+// timeline never saw.
+static void drawProseBubble(ActivityItem& a, const ui::Fonts& fonts) {
+    if (!ui::streamTextVisible(a.detail)) return;   // an empty segment is not a card
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+    const std::string prose = stripMdMarks(a.detail);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+                                      10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
+    ImGui::BeginChild("##prose", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    // Raw detail (not `prose`): the renderer needs the ``` fences intact to route code spans
+    // into the mono box. `prose` stays the copy payload.
+    const ImGuiID textId = drawMdProse("##prose_sel", a.detail, chatSurf().textPrimary,
+                                       fonts.mono);
+    // Submitted before EndChild — an after-EndChild button silently eats no clicks here (see
+    // the user-bubble copy glyph in chat_log.cpp drawUserBlock).
+    {
+        const ImVec2 wp = ImGui::GetWindowPos();
+        const ImVec2 ws = ImGui::GetWindowSize();
+        chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), prose);
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##prose WindowPadding
+    const ImRect proseRect = endGlassBubble(gb);
+    const std::string sel = chatInputSelection(textId);
+    chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);
 }
 
 // M13 — the model's thoughts in a collapsible textbox. While deltas stream (a.streaming) or the
@@ -1491,7 +1563,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         const ActivityItem& a = m.activity[i];
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
         if (a.rowKind == 10 && a.stage == "class:pending") continue;
-        if (isProseOutputRow(a)) continue;
+        if (isProseOutputRow(a) && !ui::streamTextVisible(a.detail)) continue;
         lastVisible = i;
     }
     // Tool-call ordinal within the turn — the `i` of an AI-VC "call:<turn>:<i>" target.
@@ -1505,14 +1577,14 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         // Provider-call rows (rowKind 9) aggregate into the collapsible Provider log.
         // Pending routing rows (rowKind 10, "class:pending") stay hidden until a real
         // role change (agent.role) reveals them — first-turn default routing shows no card.
-        // Plain-prose Output boxes are the raw-log twin of the primary bubble — see
-        // isProseOutputRow.
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
         if (a.rowKind == 10 && a.stage == "class:pending") continue;
-        if (isProseOutputRow(a)) continue;
         const bool liveFrontier = turnRunning && (i == lastVisible);
         ImGui::PushID((int)i);
-        if (a.rowKind == 1) {
+        if (isProseOutputRow(a)) {
+            // The model's own words, in the column at the point it said them.
+            drawProseBubble(a, fonts);
+        } else if (a.rowKind == 1) {
             drawContextChip(a, fonts);
         } else if (a.rowKind == 2) {
             drawThoughtBox(a, fonts, showThinking, liveFrontier);

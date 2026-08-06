@@ -184,6 +184,22 @@ void        chatArtifactActions(AppState& st, const std::string& path);
 void        drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts);
 void        drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
                               bool showThinking, bool isLastTurn = false);
+// Doc-id + atlas-glyph fold for agent-authored text, gated on ui::chatHumanizeDocIds().
+// `jsonBody` additionally strips the resolved-id parenthetical (tool-row args blobs).
+// Idempotent, with a no-allocation fast path.
+std::string sanitizeAgentText(AppState& st, const std::string& s, bool jsonBody = false);
+// Same, in place, with an allocation-free pre-scan (ui::agentTextMayChange). Prefer this
+// anywhere the string is re-sanitized every frame.
+void        sanitizeAgentTextInPlace(AppState& st, std::string& s, bool jsonBody = false);
+// A turn renders as ONE ordered column: the model's prose is a row in the timeline, drawn where
+// it arrived, not a card appended after everything else. These let chat_log tell what the
+// timeline already showed so nothing prints twice.
+bool        isProseOutputRow(const ActivityItem& a);
+bool        timelineHasInlineProse(const ChatMsg& m);
+std::string timelineInlineProse(const ChatMsg& m);
+// m.text minus the prose the timeline drew inline: a whole reply that never streamed, or a
+// note appended after the fact ("(Stopped by you.)"). Empty when the timeline covered it all.
+std::string timelineProseTail(const ChatMsg& m);
 
 // Packed tool-row detail: feedTurnActivity writes args_preview, then the capped failure text
 // after "\n\x1eERR\x1e\n", artifact paths after "\n\x1eART\x1e\n", and a per-call META trailer
@@ -317,8 +333,18 @@ std::string aiVcRewindToast(int cpState);
 void drawDoubleRewindGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx,
                            ImU32 col);
 void drawPencilGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, ImU32 col);
-bool drawHeaderTextButton(const char* id, const char* label, bool active,
-                          float minW = 0.0f, const char* iconName = nullptr);
+// Header tab button, split so a tab strip can resolve its selection BEFORE anything paints.
+// Submit every hit zone, apply the clicks, then paint them all from the resolved selection —
+// a one-pass button necessarily paints a stale highlight on the frame it is clicked.
+struct HeaderBtnHit {
+    ImRect rect;
+    bool   clicked = false;
+    bool   hovered = false;
+    bool   held    = false;
+};
+HeaderBtnHit headerTextButtonHit(const char* id, float w);
+void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active,
+                           const char* iconName = nullptr);
 void cancelEditStage(AppState& st);
 void beginEditStage(AppState& st, int msgIdx);
 void commitEditStageOnSend(AppState& st);

@@ -5,6 +5,7 @@
 
 #include "copilot_internal.h"
 #include "agent_text.h"
+#include "stream_rows.h"
 
 // ============================ transparent activity timeline ============================
 // Map a raw orchestrator stage key to a plain-language heading the user can follow.
@@ -606,11 +607,16 @@ void finalizeThoughtBox(ActivityItem& a) {
     if (!a.userToggled) a.expanded = false;
 }
 
-// Find or create the single rowKind-10 routing card (pinned to front once revealed).
-// The card starts PENDING ("class:pending" — hidden by drawAgentTimeline): the
-// first-turn classification telemetry is advisory-only now that every request enters
-// via the universal general_agent role, so the card stays hidden until a REAL role
-// change (agent.role) reveals it.
+// Find or create the single rowKind-10 routing card. The card starts PENDING
+// ("class:pending" — hidden by drawAgentTimeline): the first-turn classification telemetry is
+// advisory-only now that every request enters via the universal general_agent role, so the card
+// stays hidden until a REAL role change (agent.role) reveals it.
+//
+// It lands at its ARRIVAL POSITION and stays there. It used to be inserted at the front and
+// then re-pinned there by both the classification and agent.role handlers (erase + insert at
+// begin()), so a role adopted mid-turn slid the card above thinking and tool rows the user had
+// already read — the same out-of-order complaint the rowKind-18 plan marker was introduced to
+// fix. Routing telemetry is a turn-opening event, so in practice this IS the top of the turn.
 static ActivityItem* findOrCreateRoutingCard(ChatMsg& m) {
     for (auto& a : m.activity)
         if (a.rowKind == 10) return &a;
@@ -620,14 +626,14 @@ static ActivityItem* findOrCreateRoutingCard(ChatMsg& m) {
     ni.title   = "task";
     ni.status  = "done";
     ni.detail  = "{}";
-    m.activity.insert(m.activity.begin(), std::move(ni));
-    return &m.activity.front();
+    m.activity.push_back(std::move(ni));
+    return &m.activity.back();
 }
 
 // Finalize the live streamed-thinking box ("thought:stream") when a visible
 // timeline boundary arrives — a context chip, tool call, stage boundary, or
-// completed agent.thought block. Text-channel deltas and agent.context usage
-// telemetry are not visible timeline rows, so neither fragments the box.
+// completed agent.thought block. A contentless channel flush is not a visible
+// timeline row, so it never fragments the box (see ui::streamTextVisible).
 // Once finalized, the next reasoning burst opens below the intervening row.
 static void finalizeLiveStreamThought(ChatMsg& m) {
     for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it) {
@@ -636,6 +642,26 @@ static void finalizeLiveStreamThought(ChatMsg& m) {
             return;
         }
     }
+}
+
+// The prose Output box is a VISIBLE row drawn at its arrival position, so the same
+// boundaries close it: otherwise the next prose burst grows a box already drawn above the
+// tool card or chip that just landed, and the transcript reads out of order. Ops-JSON boxes
+// are exempt — consecutive stage bursts deliberately share one "Building ops…" row
+// (stream_rows.h, streamDeltaTarget's tail rule).
+static void finalizeLiveStreamProse(ChatMsg& m) {
+    for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it) {
+        if (it->rowKind != 2 || it->stage != "stream:out" || !it->streaming) continue;
+        if (it->opsCount > 0 || it->title.find("Building ops") != std::string::npos) return;
+        finalizeThoughtBox(*it);
+        return;
+    }
+}
+
+// A visible timeline row ends BOTH live streams.
+static void finalizeLiveStreamBoxes(ChatMsg& m) {
+    finalizeLiveStreamThought(m);
+    finalizeLiveStreamProse(m);
 }
 
 // agent.context is emitted after each provider completion. It is not a visible
@@ -1401,8 +1427,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             }
         }
     } else if (kind == "stage_started") {
-        // A stage boundary ends any reasoning burst from the previous call.
-        finalizeLiveStreamThought(m);
+        // A stage boundary ends the reasoning burst AND the prose burst from the previous call.
+        finalizeLiveStreamBoxes(m);
         std::string s = nsKey(jstr(data, "stage"));
         ActivityItem* a = findStage(s);
         if (!a) {
@@ -1598,7 +1624,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         // A context chip is a visible timeline row.  Close any thinking that
         // arrived before it so later deltas cannot be appended into a box that
         // renders above the chip.
-        finalizeLiveStreamThought(m);
+        finalizeLiveStreamBoxes(m);
         ActivityItem ni;
         ni.rowKind = 1;
         ni.stage   = "ctx:" + jstr(data, "id");
@@ -1635,7 +1661,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         }
         // A completed thought block = the call's reasoning is done — stop the
         // live box from pulsing even when the dedupe above found no twin.
-        if (kind == "agent.thought") finalizeLiveStreamThought(m);
+        if (kind == "agent.thought") finalizeLiveStreamBoxes(m);
         if (!a) {
             ActivityItem ni;
             ni.rowKind = 2;
@@ -1658,60 +1684,80 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             finalizeThoughtBox(*a);
         }
     } else if (kind == "assistant_delta") {  // live provider token stream
-        // Each channel grows continuously until a visible timeline row or run end.
-        // Output is a hidden raw-log twin of the primary prose bubble, so switching
-        // to it must not manufacture an extra visible Thinking box.
+        // A turn is ONE ordered column, and the prose box is now a visible row in it, so the
+        // only question here is which box this delta joins. The rules — and the counter-
+        // pressure that a contentless channel flush must NOT split one reasoning stream —
+        // live in stream_rows.h, where a ctest pins them.
         const std::string chan = jstr(data, "channel");
         const std::string txt = jstr(data, "text");
         const bool think = (chan == "thinking");
+        const bool visible = ui::streamTextVisible(txt);
         const std::string key = think ? "thought:stream" : "stream:out";
-        ActivityItem* a = nullptr;
-        // Thinking coalesces only into a LIVE box (per stage burst). The Output/ops box
-        // also coalesces with a JUST-FINALIZED stream:out row when nothing else landed after
-        // it (tail of the timeline): consecutive stage bursts then share ONE "Building ops…"
-        // box instead of stacking duplicates. Boxes behind other rows stay put (chronology),
-        // and a prose stage after an ops stage always gets a fresh box so its text still
-        // streams into the primary bubble.
-        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it) {
-            if (it->rowKind != 2 || it->stage != key) continue;
-            const bool tailReuse = !think && (it == m.activity.rbegin()) &&
-                                   (it->opsCount > 0 ||
-                                    it->title.find("Building ops") != std::string::npos);
-            if (it->streaming || tailReuse) { a = &*it; break; }
+
+        // Ordered view of this turn's live-stream boxes (indices back into m.activity).
+        std::vector<ui::StreamRowState> rows;
+        std::vector<size_t> rowAt;
+        rows.reserve(8);
+        rowAt.reserve(8);
+        for (size_t i = 0; i < m.activity.size(); ++i) {
+            const ActivityItem& r = m.activity[i];
+            if (r.rowKind != 2) continue;
+            const bool isThink = (r.stage == "thought:stream");
+            if (!isThink && r.stage != "stream:out") continue;
+            ui::StreamRowState s;
+            s.thinking  = isThink;
+            s.ops       = !isThink && (r.opsCount > 0 ||
+                                       r.title.find("Building ops") != std::string::npos);
+            s.streaming = r.streaming;
+            s.tail      = (i + 1 == m.activity.size());
+            rows.push_back(s);
+            rowAt.push_back(i);
         }
+        // A channel switch carrying real content IS a visible boundary: close the other
+        // channel's live box so this burst, and the next one on that channel, land in
+        // arrival order instead of growing a box already drawn above.
+        if (visible) {
+            const int close = ui::streamChannelBoundary(rows, think);
+            if (close >= 0) {
+                finalizeThoughtBox(m.activity[rowAt[(size_t)close]]);
+                rows[(size_t)close].streaming = false;
+            }
+        }
+        const int target = ui::streamDeltaTarget(rows, think);
+        ActivityItem* a = (target >= 0) ? &m.activity[rowAt[(size_t)target]] : nullptr;
         // tokensIn on stream:out = byte offset into m.text where THIS segment began (for
         // stripping JSON that already leaked into the prose bubble when classification flips).
         // opsCount > 0  => classified as OPS JSON (Building ops… mode).
         const size_t mTextBefore = m.text.size();
-        if (!a) {
+        if (!a && visible) {
             ActivityItem ni;
             ni.rowKind = 2;
             ni.stage   = key;
             ni.title   = think ? "Thinking" : "Output";
             // Thinking opens while streaming (auto-collapses on complete unless userToggled).
-            // Output stays COLLAPSED: prose streams into the primary bubble (m.text) below,
-            // so the box would be a second copy of the same text (double display).
+            // A prose box renders as the message bubble itself, so `expanded` is irrelevant
+            // to it; an ops-JSON box collapses to its summary once the flip is detected.
             ni.expanded = think;
             if (!think) ni.tokensIn = (int)mTextBefore;  // segment start in m.text
             m.activity.push_back(std::move(ni));
             a = &m.activity.back();
         }
-
-        if (think) {
+        // No box and nothing to add: a contentless flush must not manufacture an empty row
+        // between the two halves of one burst.
+        if (a && think) {
             if (!txt.empty()) a->detail += txt;
             a->streaming = true;
             a->status    = "running";
             if (!a->userToggled) a->expanded = true;
-        } else {
-            // Text channel: append into the Output box always (collapsed raw log), AND
-            // stream prose into the primary bubble (m.text) live — see the prose branch below.
+            m.uiCachedH = -1.0f;
+        } else if (a) {
+            // Text channel: `detail` is the box's own copy of this prose segment — the
+            // timeline renders it in place — and m.text stays the turn's canonical full
+            // reply for copy, persistence and the context estimate. The two are kept byte
+            // -identical so chat_log can tell what the timeline already showed.
             if (!txt.empty()) a->detail += txt;
-            a->streaming = true;   // re-opens a finalized (coalesced) box
+            a->streaming = true;   // re-opens a finalized (coalesced) ops box
             a->status    = "running";
-            // A reused tail box may have been auto-collapsed — keep the user's last
-            // expanded state; never force it back open mid-turn. Its tokensIn segment
-            // marker also resets so a fresh ops-flip strip can't truncate older prose.
-            if (!a->streaming && a->opsCount <= 0) a->tokensIn = (int)mTextBefore;
             const bool wasOps = (a->opsCount > 0);
             const size_t opsAt = wasOps ? 0 : findOpsJsonStart(a->detail);
             const bool isOps = wasOps || (opsAt != std::string::npos);
@@ -1746,12 +1792,12 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 // Do NOT append this delta (or any further ops JSON) to m.text.
                 m.uiCachedH = -1.0f;
             } else {
-                // Prose: stream live into the primary bubble (m.text) — the web-style
-                // instant streaming surface. run_finished's promote-once is guarded by
-                // m.text.empty(), so it never doubles; the ops-classification flip above
-                // strips this segment back out of m.text if the stream turns out to be
-                // ops JSON. The stream:out box keeps accumulating (collapsed) as the
-                // raw-log expander.
+                // Prose: also accumulate into m.text, the turn's canonical reply. The box
+                // above is what the user SEES (drawn at this segment's arrival position);
+                // m.text is what Copy, the persisted transcript and the context estimate
+                // read. run_finished's promote-once is guarded by m.text.empty() so it
+                // never doubles, and the ops-classification flip above strips this segment
+                // back out of m.text if the stream turns out to be ops JSON.
                 if (!txt.empty()) {
                     m.text += txt;
                     m.uiCachedH = -1.0f;
@@ -1760,7 +1806,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         }
     } else if (kind == "agent.tool_call") {                          // M14 — tool call row
         // A tool call is an action — the reasoning burst that preceded it is over.
-        finalizeLiveStreamThought(m);
+        finalizeLiveStreamBoxes(m);
         // Upsert by span id so re-delivered/duplicate events update in place.
         std::string tid = jstr(data, "id");
         if (tid.empty()) tid = jstr(data, "span_id");
@@ -1859,17 +1905,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         // is advisory since every request enters via the universal general_agent role; only a
         // real role change (agent.role below) reveals it and pins it to the front.
         ActivityItem* card = findOrCreateRoutingCard(m);
-        // Keep card at front if something else was inserted first (revealed cards only).
-        if (card->stage != "class:pending" &&
-            !m.activity.empty() && m.activity.front().rowKind != 10) {
-            ActivityItem tmp = *card;
-            // erase the found card (may have shifted)
-            for (auto it = m.activity.begin(); it != m.activity.end(); ++it) {
-                if (it->rowKind == 10) { m.activity.erase(it); break; }
-            }
-            m.activity.insert(m.activity.begin(), std::move(tmp));
-            card = &m.activity.front();
-        }
+        // No re-pin: the card renders where it arrived (see findOrCreateRoutingCard).
         mergeRoutingFields(*card, data, kind);
         // Session scope assessment handoff: conversations.cpp colors + names the session from
         // these routing fields on the FIRST such event (see takePendingScopeAssessment).
@@ -1929,14 +1965,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             } catch (...) {}
         }
         card->status = "done";
-        if (!m.activity.empty() && m.activity.front().rowKind != 10) {
-            ActivityItem tmp = *card;
-            for (auto it = m.activity.begin(); it != m.activity.end(); ++it) {
-                if (it->rowKind == 10) { m.activity.erase(it); break; }
-            }
-            m.activity.insert(m.activity.begin(), std::move(tmp));
-            card = &m.activity.front();
-        }
+        // No re-pin: the card renders where it arrived (see findOrCreateRoutingCard).
         if (m.running && !card->title.empty())
             m.liveStatus = "Routing \xc2\xb7 " + card->title;
     } else if (kind == "provider_call") {

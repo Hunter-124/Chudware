@@ -24,14 +24,18 @@ WORKFLOW
                                             against the request; iterate add_features to fix.
                                             render_part(view="right" | {"azimuth":30,"elevation":20})
                                             for a specific angle; render_part(emphasize="f2") for
-                                            feature EMPHASIS (high-contrast target, desaturated
-                                            context). render_views() for the full 6-ortho+iso
-                                            labelled grid; contact_sheet() for a smaller multi-
-                                            angle sheet. inspect_part(target) / inspect_feature(
-                                            target) for a CLOSE-UP (feature AABB frame + dims;
-                                            inspect_feature also returns a describe_part excerpt
-                                            + emphasis palette). look_around(target) for N orbit
-                                            close-ups. VERIFY LOOP after every mutation.
+                                            feature EMPHASIS — the engine FRAMES that feature and
+                                            paints its exact visible faces high-contrast against
+                                            desaturated context. render_views() for the full
+                                            6-ortho+iso labelled grid; contact_sheet() for a
+                                            smaller multi-angle sheet. inspect_feature(target) is
+                                            the one-call CLOSE-UP: a multi-panel sheet (idealized
+                                            camera + alternate angle + cutaway for anything
+                                            internal + whole-part context) with dims, a
+                                            describe_part excerpt and MEASURED visibility;
+                                            inspect_part(target) for a single framed close-up,
+                                            look_around(target) for N ranked angles.
+                                            VERIFY LOOP after every mutation.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
      set_material("aluminum" | {color,...})  give a body its appearance (colour + finish); it
                                             persists in the .step+ and shows in render_part.

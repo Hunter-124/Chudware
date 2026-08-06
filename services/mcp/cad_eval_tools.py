@@ -15,32 +15,33 @@ import re
 from .cad_common import (
     CoreError,
     _BBOX_INTENT_RE,
+    _CLOSEUP_H,
+    _CLOSEUP_W,
     _EMPHASIS_PALETTE,
     _QVOCAB_HELP,
     _SID_RE,
-    _apply_emphasis_overlay,
+    _annotate_render,
     _as_face_query,
     _between_from_batch,
     _build_emphasis_palette,
     _camera_dir_for_target,
-    _crop_png_to_rect,
-    _crop_rect_for_target,
     _doc,
     _dumps,
     _emphasis_color_name,
     _err,
+    _ideal_views,
     _palette_caption_block,
     _reading_from_measure,
+    _render_view_png,
     _resolve_material,
     _resolve_measure_target,
     _resolve_one_selector,
     _target_bbox,
-    _tmp,
-    _vnorm,
     already_resolved_selector,
     is_geom_query,
-    resolve_readback_selector,
     normalize_geom_query,
+    render_output_path,
+    resolve_readback_selector,
     cb,
 )
 
@@ -937,30 +938,30 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
         target_bb = _target_bbox(d, matches)
         view_dir = _camera_dir_for_target(matches, view)
-        png_full = _tmp(".png")
-        r = cb.call("doc_render_view", {
-            "doc_id": d, "out_path": png_full,
-            "view": {"dir": list(view_dir)}, "annotate": bool(annotate),
-        })
-        if not r.get("ok") or not os.path.exists(png_full):
-            r2 = cb.call("doc_render_png",
-                         {"doc_id": d, "out_path": png_full, "annotate": bool(annotate)})
-            if not r2.get("ok") or not os.path.exists(png_full):
-                raise ValueError(
-                    f"measure render failed for {d}: "
-                    f"{r.get('reason', r.get('error', 'no bodies'))}. The readings above could "
-                    f"not be turned into a picture — call render_part(doc_id=\"{d}\") to see "
-                    f"whether the part renders at all, or measure_between for a text-only "
-                    f"reading of the same selectors.")
-            view_dir = _vnorm((1.0, 1.0, 0.8))
+        if view is None or view == "auto":
+            best = _ideal_views(d, matches, target_bb, n=1)
+            if best:
+                view_dir = best[0]["dir"]
+        # Frame the measured elements themselves: the engine fits their AABB, so a 5 mm feature
+        # is rendered at 5 mm scale instead of cropped out of a whole-part shot and upscaled.
+        png_out = render_output_path(f"{d}-measure", ".png")
+        try:
+            png_out, frame, _r = _render_view_png(
+                d, view_dir, png_out, name="MEASURE", focus=target_bb,
+                W=_CLOSEUP_W, H=_CLOSEUP_H, annotate=bool(annotate))
+        except ValueError as e:
+            raise ValueError(
+                f"measure render failed for {d}: {e}. The readings above could not be turned "
+                f"into a picture — call render_part(doc_id=\"{d}\") to see whether the part "
+                f"renders at all, or measure_between for a text-only reading of the same "
+                f"selectors.") from e
 
-        rect = _crop_rect_for_target(part_bb, target_bb, view_dir,
-                                    margin=0.18, zoom_factor=1.35)
-        png_crop = _tmp(".png")
-        _crop_png_to_rect(png_full, rect, png_crop)
-        png_out, palette = _apply_emphasis_overlay(
-            png_crop, d, matches, part_bb, view_dir, mode="per_face",
-            palette=palette)
+        png_out, ann = _annotate_render(
+            png_out, d, view_dir, frame=frame, edges=True, callouts=False,
+            scale=True, out_png=render_output_path(f"{d}-measure", ".png"),
+            emphasis={"matches": matches, "mode": "per_face",
+                      "label": "measure", "palette": palette})
+        palette = ((ann.get("emphasis") or {}).get("palette")) or palette
 
 
         # Human caption + structured block (non-vision models read the JSON).

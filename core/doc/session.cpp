@@ -6489,6 +6489,35 @@ ResolvedView resolve_view_spec(const nlohmann::json& v) {
     return {rnorm({1.0, 1.0, 0.8}), "ISO"};
 }
 
+// ---- explicit close-up framing (feature emphasis) -------------------------------------
+// Auto-fit frames the WHOLE model, so a Ø5 hole in a 120 mm plate lands on ~30 px and every
+// consumer was forced to crop-and-upscale that patch into mush. `RenderFocus` frames a world
+// AABB instead: the rasterizer fits THAT box to the frame, so a close-up is RENDERED at full
+// resolution rather than magnified after the fact.
+//   margin     — padding as a fraction of the box's projected size (0.15 = 15% each side).
+//   clip_near  — drop fragments in FRONT of the box, a deterministic cutaway that lets the
+//                camera see into a bore or pocket without a separate section operation.
+struct RenderFocus {
+    RV3 lo{0, 0, 0}, hi{0, 0, 0};
+    double margin = 0.15;
+    bool clip_near = false;
+};
+
+// The orthographic projection the rasterizer actually used, echoed back so an overlay can
+// reproject world points through the EXACT camera instead of re-deriving it and landing a
+// pixel (or, on a cropped image, a hundred pixels) off.
+struct RenderFrame {
+    RV3 center{0, 0, 0}, r{1, 0, 0}, u{0, 1, 0}, d{0, 0, 1};
+    double scale = 0, cu = 0, cv = 0;
+    int W = 0, H = 0;
+    // Camera depth (dot(p - center, d)) of the near-clip plane, +inf when nothing was clipped.
+    // An overlay MUST apply the same cut or its depth test disagrees with these pixels: on a
+    // cutaway the material the engine removed still wins the overlay's z-test, so the target
+    // it was cut to reveal comes back "occluded" and paints nothing.
+    double clip_depth = 0;
+    bool clipped = false;
+};
+
 // Render the tessellated solids from an arbitrary camera direction into an RGB buffer (no file I/O),
 // labelled + colour-coded like the legacy iso render. `header`, when non-empty, is blitted top-left
 // (view name + units + bbox dims) so a multi-view contact sheet is self-describing. Returns false if
@@ -6505,13 +6534,20 @@ ResolvedView resolve_view_spec(const nlohmann::json& v) {
 //                    pixel-for-pixel. Both fit loops honour it.
 //   `min_painted`  — override the "nothing drawn" guard (default W*H/400). A changes_only diff of a
 //                    small added boss is legitimately sparse and must not read as a failed render.
+// The two after those serve close-up emphasis:
+//   `focus`        — frame THIS world AABB instead of auto-fitting the geometry, optionally
+//                    clipping away whatever sits in front of it (see RenderFocus).
+//   `out_frame`    — receives the resolved projection so an overlay reprojects through the exact
+//                    camera that produced these pixels.
 bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         const std::vector<RenderLabel>& labels, int W, int H, RV3 viewDir,
                         const std::string& header, std::vector<unsigned char>& outImg,
                         bool annotate = true,
                         const std::vector<unsigned char>* body_alpha = nullptr,
                         const std::vector<aicm::AicmBody>* frame_from = nullptr,
-                        int min_painted = -1) {
+                        int min_painted = -1,
+                        const RenderFocus* focus = nullptr,
+                        RenderFrame* out_frame = nullptr) {
     // Camera framing reference: the drawn set unless the caller supplied a stable frame set.
     const std::vector<aicm::AicmBody>& frame_bodies =
         (frame_from && !frame_from->empty()) ? *frame_from : bodies;
@@ -6525,7 +6561,9 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             any = true;
         }
     if (!any) return false;
-    RV3 c{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
+    RV3 c = focus ? RV3{(focus->lo.x + focus->hi.x) / 2, (focus->lo.y + focus->hi.y) / 2,
+                        (focus->lo.z + focus->hi.z) / 2}
+                  : RV3{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
     RV3 d = rnorm(viewDir);                   // view dir (scene -> camera)
     if (rdot(d, d) < 0.5) d = rnorm({1.0, 1.0, 0.8});  // degenerate spec -> iso
     // Robust screen-up reference: world +Z, except for a top/bottom view (d ~ ±Z), where +Z is
@@ -6539,14 +6577,53 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
         pu = rdot(p, r); pv = rdot(p, u); pd = rdot(p, d);
     };
     double minu = 1e30, maxu = -1e30, minv = 1e30, maxv = -1e30;
-    for (const auto& b : frame_bodies)
-        for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
-            double pu, pv, pd; proj(b.pos[i], b.pos[i + 1], b.pos[i + 2], pu, pv, pd);
+    // Fit extents: the focus box's 8 projected corners, else every framing vertex.
+    if (focus) {
+        for (int k = 0; k < 8; ++k) {
+            double pu, pv, pd;
+            proj((k & 1) ? focus->hi.x : focus->lo.x,
+                 (k & 2) ? focus->hi.y : focus->lo.y,
+                 (k & 4) ? focus->hi.z : focus->lo.z, pu, pv, pd);
             minu = std::min(minu, pu); maxu = std::max(maxu, pu);
             minv = std::min(minv, pv); maxv = std::max(maxv, pv);
         }
-    double scale = 0.85 * std::min(W / std::max(maxu - minu, 1e-6), H / std::max(maxv - minv, 1e-6));
+        // A degenerate box (a planar face seen edge-on, a single vertex) still needs a window.
+        const double span = std::max({maxu - minu, maxv - minv, 1e-3});
+        if (maxu - minu < span * 0.02) { double m = (minu + maxu) / 2; minu = m - span * 0.01; maxu = m + span * 0.01; }
+        if (maxv - minv < span * 0.02) { double m = (minv + maxv) / 2; minv = m - span * 0.01; maxv = m + span * 0.01; }
+        const double pad = std::max(focus->margin, 0.0);
+        const double du = (maxu - minu) * pad, dv = (maxv - minv) * pad;
+        minu -= du; maxu += du; minv -= dv; maxv += dv;
+    } else {
+        for (const auto& b : frame_bodies)
+            for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
+                double pu, pv, pd; proj(b.pos[i], b.pos[i + 1], b.pos[i + 2], pu, pv, pd);
+                minu = std::min(minu, pu); maxu = std::max(maxu, pu);
+                minv = std::min(minv, pv); maxv = std::max(maxv, pv);
+            }
+    }
+    // The 0.85 auto-fit shrink is a whole-part courtesy margin; a focus box carries its own
+    // explicit `margin`, so applying both would silently under-zoom every close-up.
+    const double fit = focus ? 1.0 : 0.85;
+    double scale = fit * std::min(W / std::max(maxu - minu, 1e-6), H / std::max(maxv - minv, 1e-6));
     double cu = (minu + maxu) / 2, cv = (minv + maxv) / 2;
+    // Near-clip plane: the front face of the focus box. Depth is dot(p - c, d) — LARGER is nearer
+    // the camera — so anything above this is between the camera and the feature and gets cut.
+    double clip_depth = 1e30;
+    if (focus && focus->clip_near) {
+        double dmax = -1e30;
+        for (int k = 0; k < 8; ++k) {
+            double pu, pv, pd;
+            proj((k & 1) ? focus->hi.x : focus->lo.x,
+                 (k & 2) ? focus->hi.y : focus->lo.y,
+                 (k & 4) ? focus->hi.z : focus->lo.z, pu, pv, pd);
+            dmax = std::max(dmax, pd);
+        }
+        clip_depth = dmax;
+    }
+    if (out_frame)
+        *out_frame = RenderFrame{c, r, u, d, scale, cu, cv, W, H, clip_depth,
+                                 clip_depth < 1e29};
     auto toScreen = [&](double pu, double pv, double& sx, double& sy) {
         sx = (pu - cu) * scale + W / 2.0;
         sy = H / 2.0 - (pv - cv) * scale;
@@ -6658,6 +6735,8 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                     double a2 = 1.0 - a0 - a1;
                     if (a0 < 0 || a1 < 0 || a2 < 0) continue;
                     double depth = a0 * d0 + a1 * d1 + a2 * d2;
+                    // Cutaway: this fragment sits between the camera and the focus box.
+                    if (depth > clip_depth) continue;
                     size_t pi = (size_t)py * W + px;
                     if (depth > zbuf[pi]) {
                         zbuf[pi] = depth;
@@ -6687,6 +6766,9 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
         proj(lb.anchor.x, lb.anchor.y, lb.anchor.z, pu, pv, pd);
         toScreen(pu, pv, sx, sy);
         int ix = (int)std::lround(sx), iy = (int)std::lround(sy);
+        // A label whose anchor projects OUTSIDE the frame is a lie: the text below is clamped
+        // back inside, so a close-up used to sprout a giant "R" belonging to a face metres away.
+        if (ix < 0 || ix >= W || iy < 0 || iy >= H) continue;
         fill_disc(img, W, H, ix, iy, 4, 20, 20, 20);
         fill_disc(img, W, H, ix, iy, 3, lb.col[0], lb.col[1], lb.col[2]);
         // place the text just up-right of the dot, nudged inside the frame
@@ -6907,9 +6989,21 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path, bool
 // resolve_view_spec — a named view ("front"/"top"/"iso"/...), an {"azimuth","elevation"} angle, or
 // an explicit {"dir":[x,y,z]}. The image is labelled with the resolved view name + bbox dims so the
 // model can reason about orientation/scale. Back-compatible: callers that want the legacy iso shot
-// keep using doc_render_png. Returns {ok, path, view, dims}.
+// keep using doc_render_png.
+//
+// The object form also accepts CLOSE-UP framing, so a feature review is a real render instead of a
+// magnified 30-px patch of a whole-part shot:
+//   "width" / "height"   image size in pixels (default 512x400, clamped to 64..2048)
+//   "focus": {"min":[x,y,z], "max":[x,y,z]}     — world AABB to frame, or
+//            {"center":[x,y,z], "radius": r}    — equivalent cube
+//            "margin": 0.15                     — padding as a fraction of its projected size
+//            "clip_near": false                 — cut away everything in front of the box
+// Returns {ok, path, view, dims, dir[, frame]}, where `frame` is the exact orthographic
+// projection used ({center, right, up, dir, scale, cu, cv, width, height}) so an overlay can
+// reproject world points onto these pixels without re-deriving the camera.
+// `annotate=false` drops the orientation tint / face callouts / axis triad for a clean shot.
 json doc_render_view(const std::string& doc_id, const std::string& out_path,
-                     const nlohmann::json& view) {
+                     const nlohmann::json& view, bool annotate) {
     try {
         DocLock lk;
         Session& s = require_session(doc_id);
@@ -6917,20 +7011,93 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
         if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
         ResolvedView rv = resolve_view_spec(view);
         std::string dims = bbox_dims_label(bodies);
-        std::string header = rv.name + (dims.empty() ? "" : "  " + dims);
-        std::vector<RenderLabel> labels = principal_face_labels(s);
+
+        int W = 512, H = 400;
+        RenderFocus fbox;
+        bool has_focus = false;
+        if (view.is_object()) {
+            auto clampi = [](int v, int lo2, int hi2) { return std::max(lo2, std::min(v, hi2)); };
+            W = clampi(view.value("width", 512), 64, 2048);
+            H = clampi(view.value("height", 400), 64, 2048);
+            const auto it = view.find("focus");
+            if (it != view.end() && it->is_object()) {
+                const json& f = *it;
+                auto vec3 = [](const json& a, RV3& out) -> bool {
+                    if (!a.is_array() || a.size() < 3) return false;
+                    for (int i = 0; i < 3; ++i)
+                        if (!a[i].is_number()) return false;
+                    out = RV3{a[0].get<double>(), a[1].get<double>(), a[2].get<double>()};
+                    return true;
+                };
+                RV3 lo{0, 0, 0}, hi{0, 0, 0}, ctr{0, 0, 0};
+                if (f.contains("min") && f.contains("max") && vec3(f.at("min"), lo)
+                    && vec3(f.at("max"), hi)) {
+                    has_focus = true;
+                } else if (f.contains("center") && vec3(f.at("center"), ctr)) {
+                    double rad = std::abs(f.value("radius", 0.0));
+                    if (rad > 0) {
+                        lo = RV3{ctr.x - rad, ctr.y - rad, ctr.z - rad};
+                        hi = RV3{ctr.x + rad, ctr.y + rad, ctr.z + rad};
+                        has_focus = true;
+                    }
+                }
+                if (has_focus) {
+                    // Tolerate an inverted box rather than rendering an empty frame.
+                    fbox.lo = RV3{std::min(lo.x, hi.x), std::min(lo.y, hi.y), std::min(lo.z, hi.z)};
+                    fbox.hi = RV3{std::max(lo.x, hi.x), std::max(lo.y, hi.y), std::max(lo.z, hi.z)};
+                    fbox.margin = std::max(0.0, std::min(f.value("margin", 0.15), 4.0));
+                    fbox.clip_near = f.value("clip_near", false);
+                }
+            }
+        }
+
+        // A close-up must not head itself with the WHOLE part's dimensions — on a Ø5 bore in a
+        // 120 mm plate that reads as a 120 mm field of view and is simply false. Focused renders
+        // report the framed box instead, and the caller's scale bar carries the true field.
+        std::string header = rv.name;
+        if (has_focus) {
+            auto fmt1 = [](double v) -> std::string {
+                if (v >= 9.95) return std::to_string((long)std::lround(v));
+                long tenths = (long)std::lround(v * 10.0);
+                return std::to_string(tenths / 10) + "." + std::to_string(tenths % 10);
+            };
+            header += "  FOCUS " + fmt1(fbox.hi.x - fbox.lo.x) + " X "
+                      + fmt1(fbox.hi.y - fbox.lo.y) + " X " + fmt1(fbox.hi.z - fbox.lo.z) + " MM";
+            if (fbox.clip_near) header += "  CUTAWAY";
+        } else if (!dims.empty()) {
+            header += "  " + dims;
+        }
+        std::vector<RenderLabel> labels;
+        if (annotate) labels = principal_face_labels(s);
         std::vector<unsigned char> img;
-        bool ok = render_view_to_rgb(bodies, labels, 512, 400, rv.dir, header, img);
+        RenderFrame frame;
+        // A focused close-up is legitimately sparse (a cutaway of a Ø5 bore paints a few hundred
+        // pixels), so the whole-part "nothing drawn" floor would report it as a failed render.
+        bool ok = render_view_to_rgb(bodies, labels, W, H, rv.dir, header, img,
+                                     annotate, /*body_alpha=*/nullptr,
+                                     /*frame_from=*/nullptr, /*min_painted=*/has_focus ? 1 : -1,
+                                     has_focus ? &fbox : nullptr, &frame);
         if (ok) {
-            std::string png = encode_png_rgb(512, 400, img);
+            std::string png = encode_png_rgb(W, H, img);
             std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
             ok = (bool)f && (f.write(png.data(), (std::streamsize)png.size()), (bool)f);
         }
         // Echo the resolved camera direction (scene -> camera) so the model knows the EXACT angle it
         // got — handy for a named/az-el request and the contract the test pins the convention on.
-        return json{{"ok", ok}, {"path", ok ? out_path : std::string()},
-                    {"view", rv.name}, {"dims", dims},
-                    {"dir", json::array({rv.dir.x, rv.dir.y, rv.dir.z})}};
+        json out{{"ok", ok}, {"path", ok ? out_path : std::string()},
+                 {"view", rv.name}, {"dims", dims},
+                 {"dir", json::array({rv.dir.x, rv.dir.y, rv.dir.z})}};
+        if (frame.W > 0)
+            out["frame"] = json{
+                {"center", json::array({frame.center.x, frame.center.y, frame.center.z})},
+                {"right", json::array({frame.r.x, frame.r.y, frame.r.z})},
+                {"up", json::array({frame.u.x, frame.u.y, frame.u.z})},
+                {"dir", json::array({frame.d.x, frame.d.y, frame.d.z})},
+                {"scale", frame.scale}, {"cu", frame.cu}, {"cv", frame.cv},
+                {"width", frame.W}, {"height", frame.H},
+                {"clip_depth", frame.clipped ? frame.clip_depth : 0.0},
+                {"focused", has_focus}, {"clip_near", frame.clipped}};
+        return out;
     } catch (const OpError& e) {
         return json{{"ok", false}, {"error", e.what()}, {"code", e.code}};
     } catch (...) {

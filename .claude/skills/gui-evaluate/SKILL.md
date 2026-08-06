@@ -32,7 +32,7 @@ Colour-coded multi-element measurement matching the Evaluate ribbon:
 2. Call engine `eval_measure` with **all refs at once** (single / pair /
    multi-distance).
 3. Assign each element a distinct colour from the shared 10-colour
-   `_EMPHASIS_PALETTE` (`per_face` mode via `_apply_emphasis_overlay`).
+   `_EMPHASIS_PALETTE` (`per_face` emphasis passed to `cad_common._annotate_render`).
 4. Return PNG + caption listing colour + reading; caption embeds
    `measure_json` with structured `{kind,value,unit,color}` per element and an
    optional `between` distance/angle block for 2+ refs.

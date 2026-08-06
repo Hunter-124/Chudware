@@ -6,11 +6,16 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
+
+#include <miniz.h>
 
 #include <nlohmann/json.hpp>
 
@@ -41,6 +46,152 @@ std::string tmp_png(const char* tag) {
     fs::path p = fs::temp_directory_path() /
                  ("chudware_rv_" + std::string(tag) + "_" + std::to_string(n++) + ".png");
     return p.string();
+}
+
+struct Rgb {
+    int w = 0, h = 0;
+    std::vector<unsigned char> px;
+    bool ok() const { return w > 0 && h > 0 && px.size() == (size_t)w * h * 3; }
+};
+
+uint32_t be32(const unsigned char* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+// Decode the exact PNG flavour encode_png_rgb emits: 8-bit RGB with filter-none scanlines.
+Rgb decode_png(const std::string& path) {
+    Rgb out;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return out;
+    std::string buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (buf.size() < 8) return out;
+    const auto* d = reinterpret_cast<const unsigned char*>(buf.data());
+    size_t n = buf.size(), off = 8;
+    std::string idat;
+    int bit_depth = 0, color_type = -1, filter_method = -1;
+    while (off + 8 <= n) {
+        const uint32_t len = be32(d + off);
+        const std::string tag(reinterpret_cast<const char*>(d + off + 4), 4);
+        const size_t data_off = off + 8;
+        if (data_off + len > n) break;
+        if (tag == "IHDR" && len >= 13) {
+            out.w = (int)be32(d + data_off);
+            out.h = (int)be32(d + data_off + 4);
+            bit_depth = d[data_off + 8];
+            color_type = d[data_off + 9];
+            filter_method = d[data_off + 11];
+        } else if (tag == "IDAT") {
+            idat.append(reinterpret_cast<const char*>(d + data_off), len);
+        } else if (tag == "IEND") {
+            break;
+        }
+        off = data_off + len + 4;  // CRC
+    }
+    if (out.w <= 0 || out.h <= 0 || bit_depth != 8 || color_type != 2 || filter_method != 0) {
+        out.w = out.h = 0;
+        return out;
+    }
+    const size_t stride = 1 + (size_t)out.w * 3;
+    std::vector<unsigned char> raw(stride * (size_t)out.h);
+    mz_ulong raw_len = (mz_ulong)raw.size();
+    if (mz_uncompress(raw.data(), &raw_len, reinterpret_cast<const unsigned char*>(idat.data()),
+                      (mz_ulong)idat.size()) != MZ_OK ||
+        raw_len != raw.size()) {
+        out.w = out.h = 0;
+        return out;
+    }
+    out.px.resize((size_t)out.w * out.h * 3);
+    for (int y = 0; y < out.h; ++y) {
+        if (raw[(size_t)y * stride] != 0) {
+            out.w = out.h = 0;
+            out.px.clear();
+            return out;
+        }
+        std::copy(raw.begin() + (size_t)y * stride + 1,
+                  raw.begin() + (size_t)y * stride + stride,
+                  out.px.begin() + (size_t)y * out.w * 3);
+    }
+    return out;
+}
+
+json dimv(double v) { return json{{"value", v}, {"expr", nullptr}}; }
+
+struct HolePlateDoc {
+    std::string id;
+    json hole_box;
+};
+
+// The plate spans [-60,60] x [-40,40] x [-6,6]. A Ø5 through-hole at face-local
+// (-40,0) is intentionally far from the principal-face centroid: tight framing on
+// [-42.5,-2.5,-6]..[-37.5,2.5,6] must zoom by geometry, and must cull the TOP label.
+HolePlateDoc make_hole_plate_doc() {
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    json nr = doc_new("part", "RenderViewTinyHole");
+    std::string id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"},
+             {"feature", {{"type", "box"}, {"name", "Plate"},
+                          {"params", {{"length", dimv(120)}, {"width", dimv(80)},
+                                      {"height", dimv(12)}}}}}},
+        json{{"op", "add_feature"},
+             {"feature", {{"type", "hole"}, {"name", "OffCentreBore"},
+                          {"params", {{"style", "simple"}, {"standard", "custom"},
+                                      {"diameter", dimv(5)}, {"end", "through_all"},
+                                      {"positions", json::array({json::array({-40.0, 0.0})})}}},
+                          {"refs", {{"face", json{{"of", "face"}, {"side", "top"}}}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    REQUIRE(resp.value("volume", 0.0) > 114000.0);
+    REQUIRE(resp.value("volume", 0.0) < 120.0 * 80.0 * 12.0);
+    if (resp.contains("rebuild") && resp.at("rebuild").contains("feature_status")) {
+        for (const json& st : resp.at("rebuild").at("feature_status"))
+            REQUIRE_MESSAGE(st.value("ok", false), st.dump());
+    }
+    return HolePlateDoc{
+        id,
+        json{{"min", json::array({-42.5, -2.5, -6.0})},
+             {"max", json::array({-37.5, 2.5, 6.0})}},
+    };
+}
+
+std::array<double, 3> frame_vec(const json& frame, const char* key) {
+    const json& v = frame.at(key);
+    return {v.at(0).get<double>(), v.at(1).get<double>(), v.at(2).get<double>()};
+}
+
+double dot3(const std::array<double, 3>& a, const std::array<double, 3>& b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+// Teal identifies a shaded -Z face by hue, not exact RGB. Both green and blue must dominate red,
+// the two leading channels must remain neighbours, and max-min >= 45 is the saturation floor.
+long count_teal(const Rgb& im) {
+    long n = 0;
+    for (size_t i = 0; i + 2 < im.px.size(); i += 3) {
+        const int r = im.px[i], g = im.px[i + 1], b = im.px[i + 2];
+        const int hi = std::max({r, g, b}), lo = std::min({r, g, b});
+        if (hi >= 75 && hi - lo >= 45 && g > r + 25 && b > r + 25 &&
+            std::abs(g - b) <= 25)
+            ++n;
+    }
+    return n;
+}
+
+// The TOP glyph is unlit (90,140,225), whereas the top face only mixes 55% of that tint into
+// neutral material and is Lambert-shaded. This strict blue hue band isolates glyph/gizmo pixels
+// without exact-RGB matching. The caller's region excludes the fixed bottom-left Z gizmo.
+long count_label_blue(const Rgb& im, int x0, int y0, int x1, int y1) {
+    long n = 0;
+    x0 = std::max(0, x0); y0 = std::max(0, y0);
+    x1 = std::min(im.w, x1); y1 = std::min(im.h, y1);
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x) {
+            const size_t i = ((size_t)y * im.w + x) * 3;
+            const int r = im.px[i], g = im.px[i + 1], b = im.px[i + 2];
+            if (b >= 145 && b - r >= 85 && b - g >= 55) ++n;
+        }
+    return n;
 }
 
 // Build a session part doc holding one asymmetric box (X=40, Y=24, Z=12). Distinct extents on every
@@ -151,6 +302,187 @@ TEST_CASE("doc_render_view: parametric azimuth/elevation maps to the named-view 
     json rd = chudware::doc::doc_render_view(id, pd, json{{"dir", json::array({1, 0, 0})}});
     REQUIRE(rd.value("ok", false));
     CHECK(is_png(read_bytes(pd)));
+}
+
+TEST_CASE("doc_render_view focus: frame echo is orthonormal and reports default viewport") {
+    const std::string id = make_box_doc();
+    json result = chudware::doc::doc_render_view(id, tmp_png("frame"), "iso");
+    REQUIRE(result.value("ok", false));
+    REQUIRE(result.contains("frame"));
+    const json& frame = result.at("frame");
+    CHECK_FALSE(frame.at("focused").get<bool>());
+    CHECK_FALSE(frame.at("clip_near").get<bool>());
+    CHECK(frame.at("width").get<int>() == 512);
+    CHECK(frame.at("height").get<int>() == 400);
+    CHECK(frame.at("scale").get<double>() > 0.0);
+
+    const auto right = frame_vec(frame, "right");
+    const auto up = frame_vec(frame, "up");
+    const auto dir = frame_vec(frame, "dir");
+    CHECK(std::abs(dot3(right, right) - 1.0) < 1e-12);
+    CHECK(std::abs(dot3(up, up) - 1.0) < 1e-12);
+    CHECK(std::abs(dot3(dir, dir) - 1.0) < 1e-12);
+    CHECK(std::abs(dot3(right, up)) < 1e-12);
+    CHECK(std::abs(dot3(right, dir)) < 1e-12);
+    CHECK(std::abs(dot3(up, dir)) < 1e-12);
+}
+
+TEST_CASE("doc_render_view focus: tiny off-centre hole is rendered at close-up resolution") {
+    const HolePlateDoc plate = make_hole_plate_doc();
+    const json dir = json::array({0.6, -0.6, 0.5});
+    const std::string whole_path = tmp_png("hole_whole");
+    const std::string focus_path = tmp_png("hole_focus");
+    json whole = chudware::doc::doc_render_view(
+        plate.id, whole_path, json{{"dir", dir}});
+    json focused = chudware::doc::doc_render_view(
+        plate.id, focus_path, json{{"dir", dir}, {"focus", plate.hole_box}});
+    REQUIRE(whole.value("ok", false));
+    // This is load-bearing: the old whole-part painted-pixel floor rejected sparse tiny close-ups.
+    REQUIRE(focused.value("ok", false));
+    REQUIRE(whole.contains("frame"));
+    REQUIRE(focused.contains("frame"));
+    CHECK_FALSE(whole.at("frame").at("focused").get<bool>());
+    CHECK(focused.at("frame").at("focused").get<bool>());
+
+    const double whole_scale = whole.at("frame").at("scale").get<double>();
+    const double focus_scale = focused.at("frame").at("scale").get<double>();
+    // The Ø5 focus is dwarfed by the 120 mm plate. Even with its default 15% focus margin and
+    // the oblique view exposing all 12 mm of thickness, geometry forces well over 5x magnification.
+    CHECK_MESSAGE(focus_scale > whole_scale * 5.0,
+                  "whole scale=" << whole_scale << " focused scale=" << focus_scale);
+
+    const std::vector<unsigned char> whole_bytes = read_bytes(whole_path);
+    const std::vector<unsigned char> focus_bytes = read_bytes(focus_path);
+    CHECK(is_png(whole_bytes));
+    CHECK(is_png(focus_bytes));
+    CHECK(focus_bytes != whole_bytes);  // a separately rasterized close-up, not the whole image
+    const Rgb image = decode_png(focus_path);
+    REQUIRE(image.ok());
+    CHECK(image.w == 512);
+    CHECK(image.h == 400);
+}
+
+TEST_CASE("doc_render_view focus: requested viewport dimensions are honoured and clamped") {
+    const std::string id = make_box_doc();
+    auto render_size = [&](int width, int height, const char* tag) {
+        const std::string path = tmp_png(tag);
+        json result = chudware::doc::doc_render_view(
+            id, path, json{{"view", "iso"}, {"width", width}, {"height", height}});
+        REQUIRE(result.value("ok", false));
+        REQUIRE(result.contains("frame"));
+        Rgb image = decode_png(path);
+        REQUIRE(image.ok());
+        CHECK(image.w == result.at("frame").at("width").get<int>());
+        CHECK(image.h == result.at("frame").at("height").get<int>());
+        return result.at("frame");
+    };
+
+    json requested = render_size(1024, 768, "size_requested");
+    CHECK(requested.at("width").get<int>() == 1024);
+    CHECK(requested.at("height").get<int>() == 768);
+
+    json high = render_size(5000, 5000, "size_high");
+    CHECK(high.at("width").get<int>() == 2048);
+    CHECK(high.at("height").get<int>() == 2048);
+
+    json low = render_size(8, 8, "size_low");
+    CHECK(low.at("width").get<int>() == 64);
+    CHECK(low.at("height").get<int>() == 64);
+}
+
+TEST_CASE("doc_render_view focus: center-radius and min-max boxes resolve to the same frame") {
+    const HolePlateDoc plate = make_hole_plate_doc();
+    json box_focus{
+        {"min", json::array({-46.0, -6.0, -6.0})},
+        {"max", json::array({-34.0, 6.0, 6.0})},
+        {"margin", 0.2},
+    };
+    json radius_focus{
+        {"center", json::array({-40.0, 0.0, 0.0})},
+        {"radius", 6.0},
+        {"margin", 0.2},
+    };
+    const json dir = json::array({0.6, -0.6, 0.5});
+    json box_result = chudware::doc::doc_render_view(
+        plate.id, tmp_png("focus_box"), json{{"dir", dir}, {"focus", box_focus}});
+    json radius_result = chudware::doc::doc_render_view(
+        plate.id, tmp_png("focus_radius"), json{{"dir", dir}, {"focus", radius_focus}});
+    REQUIRE(box_result.value("ok", false));
+    REQUIRE(radius_result.value("ok", false));
+    const json& a = box_result.at("frame");
+    const json& b = radius_result.at("frame");
+    CHECK(a.at("focused").get<bool>());
+    CHECK(b.at("focused").get<bool>());
+    CHECK(a.at("width") == b.at("width"));
+    CHECK(a.at("height") == b.at("height"));
+    for (const char* key : {"center", "right", "up", "dir"}) {
+        const auto av = frame_vec(a, key);
+        const auto bv = frame_vec(b, key);
+        for (int i = 0; i < 3; ++i)
+            CHECK_MESSAGE(std::abs(av[i] - bv[i]) < 1e-9, key << "[" << i << "]");
+    }
+    for (const char* key : {"scale", "cu", "cv"})
+        CHECK_MESSAGE(std::abs(a.at(key).get<double>() - b.at(key).get<double>()) < 1e-9, key);
+}
+
+TEST_CASE("doc_render_view focus: clip_near exposes the bore behind the near plate material") {
+    const HolePlateDoc plate = make_hole_plate_doc();
+    json plain_focus = plate.hole_box;
+    json clipped_focus = plate.hole_box;
+    clipped_focus["clip_near"] = true;
+    const json dir = json::array({0.4, -0.4, 0.82});
+    const std::string plain_path = tmp_png("clip_plain");
+    const std::string clipped_path = tmp_png("clip_near");
+    json plain = chudware::doc::doc_render_view(
+        plate.id, plain_path, json{{"dir", dir}, {"focus", plain_focus}});
+    json clipped = chudware::doc::doc_render_view(
+        plate.id, clipped_path, json{{"dir", dir}, {"focus", clipped_focus}});
+    REQUIRE(plain.value("ok", false));
+    REQUIRE(clipped.value("ok", false));
+    CHECK_FALSE(plain.at("frame").at("clip_near").get<bool>());
+    CHECK(clipped.at("frame").at("clip_near").get<bool>());
+    Rgb plain_image = decode_png(plain_path);
+    Rgb clipped_image = decode_png(clipped_path);
+    REQUIRE(plain_image.ok());
+    REQUIRE(clipped_image.ok());
+    CHECK(read_bytes(plain_path) != read_bytes(clipped_path));
+
+    // This direction sees the top (+Z) face first. Clipping at the front of the hole box removes
+    // that near material and reveals materially more of the -Z/bottom face, whose shaded teal hue
+    // is stable under Lambert multiplication. The plate still fills the frame, so background count
+    // is deliberately not used as a proxy for a cutaway.
+    const long plain_teal = count_teal(plain_image);
+    const long clipped_teal = count_teal(clipped_image);
+    CHECK_MESSAGE(clipped_teal > plain_teal + 100,
+                  "unclipped teal=" << plain_teal << " clipped teal=" << clipped_teal);
+}
+
+TEST_CASE("doc_render_view focus: off-frame principal face labels are culled") {
+    const HolePlateDoc plate = make_hole_plate_doc();
+    const std::string whole_path = tmp_png("label_whole");
+    const std::string focused_path = tmp_png("label_focus");
+    json whole = chudware::doc::doc_render_view(plate.id, whole_path, "top");
+    json focused = chudware::doc::doc_render_view(
+        plate.id, focused_path, json{{"view", "top"}, {"focus", plate.hole_box}});
+    REQUIRE(whole.value("ok", false));
+    REQUIRE(focused.value("ok", false));
+    Rgb whole_image = decode_png(whole_path);
+    Rgb focused_image = decode_png(focused_path);
+    REQUIRE(whole_image.ok());
+    REQUIRE(focused_image.ok());
+
+    // Ignore the neutral header and the fixed bottom-left orientation gizmo. A whole-plate top
+    // render contains the saturated-blue TOP dot/glyph. In the close-up the top-face centroid is
+    // thousands of pixels to the right of the hole-centred frame, so that glyph must be absent;
+    // the shaded top geometry itself is below this hue band's saturation threshold.
+    const long whole_blue = count_label_blue(
+        whole_image, 80, 40, whole_image.w, whole_image.h - 80);
+    const long focused_blue = count_label_blue(
+        focused_image, 80, 40, focused_image.w, focused_image.h - 80);
+    CHECK_MESSAGE(whole_blue > 20, "whole-render TOP label pixels=" << whole_blue);
+    CHECK_MESSAGE(focused_blue < 10, "focused off-frame TOP label pixels=" << focused_blue);
+    CHECK_MESSAGE(whole_blue > focused_blue + 20,
+                  "whole blue=" << whole_blue << " focused blue=" << focused_blue);
 }
 
 TEST_CASE("doc_render_contact_sheet: tiles multiple labelled views into one PNG") {

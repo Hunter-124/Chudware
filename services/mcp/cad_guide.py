@@ -374,14 +374,18 @@ WORKFLOW
                                             against the request; iterate add_features to fix.
                                             render_part(view="right" | {"azimuth":30,"elevation":20})
                                             for a specific angle; render_part(emphasize="f2") for
-                                            feature EMPHASIS (high-contrast target, desaturated
-                                            context). render_views() for the full 6-ortho+iso
-                                            labelled grid; contact_sheet() for a smaller multi-
-                                            angle sheet. inspect_part(target) / inspect_feature(
-                                            target) for a CLOSE-UP (feature AABB frame + dims;
-                                            inspect_feature also returns a describe_part excerpt
-                                            + emphasis palette). look_around(target) for N orbit
-                                            close-ups. VERIFY LOOP after every mutation.
+                                            feature EMPHASIS — the engine FRAMES that feature and
+                                            paints its exact visible faces high-contrast against
+                                            desaturated context. render_views() for the full
+                                            6-ortho+iso labelled grid; contact_sheet() for a
+                                            smaller multi-angle sheet. inspect_feature(target) is
+                                            the one-call CLOSE-UP: a multi-panel sheet (idealized
+                                            camera + alternate angle + cutaway for anything
+                                            internal + whole-part context) with dims, a
+                                            describe_part excerpt and MEASURED visibility;
+                                            inspect_part(target) for a single framed close-up,
+                                            look_around(target) for N ranked angles.
+                                            VERIFY LOOP after every mutation.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
      set_material("aluminum" | {color,...})  give a body its appearance (colour + finish); it
                                             persists in the .step+ and shows in render_part.
@@ -512,13 +516,23 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          from B-rep normals with NO occlusion modeling (says so inline). This is
                          the non-vision self-review step; do it instead of skipping the review.
   inspect_part(target)   CLOSE-UP of a face/edge/feature (plain-word query or feature id fN):
-                         face-normal camera + projected-bbox crop; emphasize=True for high-
-                         contrast target + desaturated context (palette in caption).
-  inspect_feature(target) ONE-CALL: framed EMPHASIS render + describe_part excerpt + dims +
-                         auto-section when the target is internal. Prefer after mutations.
+                         the ENGINE frames the target's own bbox, so a 5 mm hole in a 120 mm
+                         plate is RENDERED at 5 mm scale, not cropped out of a whole-part shot.
+                         view="auto" is a MEASURED camera — every candidate is rasterized and
+                         the one that actually sees the most of the target, most legibly, wins.
+                         An internal target (bore/pocket) is auto-CUTAWAY so you see inside it.
+  inspect_feature(target) ONE-CALL multi-panel sheet: hero (idealized camera) + a >=75-degree
+                         alternate + cutaway/as-built + whole-part CONTEXT with the target
+                         highlighted, plus describe_part excerpt + dims. Prefer after mutations.
   render_views(views?)   6-ortho+iso labelled contact sheet (or a custom view list); optional
-                         target= frames every tile to a feature AABB.
-  look_around(target)    N orbit close-ups of the same target tiled as a contact sheet.
+                         target= frames AND cuts every tile to the feature, and the caption
+                         names which views can actually see it.
+  look_around(target)    N close-ups of one target tiled: the top-ranked idealized angles by
+                         default (ranked=False for an even orbit), each labelled with how much
+                         of the target it shows.
+  Every emphasis render paints the target's EXACT visible faces (shading kept so curvature
+                         still reads), desaturates the rest, and reports measured coverage —
+                         a camera that cannot see the target SAYS so instead of showing a blank.
   hover(sid)             expand ONE face/edge by the sid describe_part / query_geometry gave —
                          its full card (surf, side, signed normal, concavity bore/boss, radius).
   query_adjacency()      the face-adjacency graph: which faces touch, and whether each shared

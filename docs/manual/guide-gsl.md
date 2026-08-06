@@ -30,13 +30,23 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          from B-rep normals with NO occlusion modeling (says so inline). This is
                          the non-vision self-review step; do it instead of skipping the review.
   inspect_part(target)   CLOSE-UP of a face/edge/feature (plain-word query or feature id fN):
-                         face-normal camera + projected-bbox crop; emphasize=True for high-
-                         contrast target + desaturated context (palette in caption).
-  inspect_feature(target) ONE-CALL: framed EMPHASIS render + describe_part excerpt + dims +
-                         auto-section when the target is internal. Prefer after mutations.
+                         the ENGINE frames the target's own bbox, so a 5 mm hole in a 120 mm
+                         plate is RENDERED at 5 mm scale, not cropped out of a whole-part shot.
+                         view="auto" is a MEASURED camera — every candidate is rasterized and
+                         the one that actually sees the most of the target, most legibly, wins.
+                         An internal target (bore/pocket) is auto-CUTAWAY so you see inside it.
+  inspect_feature(target) ONE-CALL multi-panel sheet: hero (idealized camera) + a >=75-degree
+                         alternate + cutaway/as-built + whole-part CONTEXT with the target
+                         highlighted, plus describe_part excerpt + dims. Prefer after mutations.
   render_views(views?)   6-ortho+iso labelled contact sheet (or a custom view list); optional
-                         target= frames every tile to a feature AABB.
-  look_around(target)    N orbit close-ups of the same target tiled as a contact sheet.
+                         target= frames AND cuts every tile to the feature, and the caption
+                         names which views can actually see it.
+  look_around(target)    N close-ups of one target tiled: the top-ranked idealized angles by
+                         default (ranked=False for an even orbit), each labelled with how much
+                         of the target it shows.
+  Every emphasis render paints the target's EXACT visible faces (shading kept so curvature
+                         still reads), desaturates the rest, and reports measured coverage —
+                         a camera that cannot see the target SAYS so instead of showing a blank.
   hover(sid)             expand ONE face/edge by the sid describe_part / query_geometry gave —
                          its full card (surf, side, signed normal, concavity bore/boss, radius).
   query_adjacency()      the face-adjacency graph: which faces touch, and whether each shared

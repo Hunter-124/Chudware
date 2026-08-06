@@ -231,10 +231,24 @@ nlohmann::json doc_render_png(const std::string& doc_id, const std::string& out_
 // a named view ("front"|"back"|"top"|"bottom"|"left"|"right"|"iso"), an {"azimuth","elevation"}
 // angle in degrees, or an explicit {"dir":[x,y,z]} camera direction (scene -> camera). The image is
 // labelled with the resolved view name + bbox dims. Back-compatible (doc_render_png is unchanged).
-// Returns {"ok", "path", "view", "dims", "dir":[x,y,z]} where dir is the resolved scene->camera
-// direction. Fail-soft; never throws.
+//
+// The object form additionally accepts CLOSE-UP framing, so a feature review is a real render
+// rather than a magnified 30-px patch of a whole-part shot:
+//   "width" / "height"  image size in px (default 512x400, clamped 64..2048)
+//   "focus"             {"min":[x,y,z],"max":[x,y,z]} or {"center":[x,y,z],"radius":r} — the
+//                       world AABB the camera frames instead of the whole model. Also
+//                       "margin" (fraction of the box's projected size, default 0.15) and
+//                       "clip_near" (drop everything in FRONT of the box — a deterministic
+//                       cutaway that sees into a bore without a separate section op).
+// Returns {"ok", "path", "view", "dims", "dir":[x,y,z], "frame"} where dir is the resolved
+// scene->camera direction and `frame` is the exact orthographic projection used
+// ({center,right,up,dir,scale,cu,cv,width,height,focused,clip_near}), so an overlay can
+// reproject world points onto these pixels instead of re-deriving the camera and missing.
+// Fail-soft; never throws.
+// `annotate=false` suppresses the orientation tint, face callouts and axis triad for a clean
+// close-up (it was previously accepted by callers and silently ignored).
 nlohmann::json doc_render_view(const std::string& doc_id, const std::string& out_path,
-                               const nlohmann::json& view);
+                               const nlohmann::json& view, bool annotate = true);
 
 // doc_render_contact_sheet: render SEVERAL views and tile them into one labelled PNG (task 03) —
 // the multi-view self-check artifact. `views` is an array of view specs (see doc_render_view);

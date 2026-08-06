@@ -3348,7 +3348,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::doc::doc_render_view(
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string()),
-                                params.contains("view") ? params.at("view") : json(nullptr)),
+                                params.contains("view") ? params.at("view") : json(nullptr),
+                                params.value("annotate", true)),
                             out_json, 0);
             // PLM graphical revision diff — the whole params object goes through (doc_a/doc_b,
             // body_a/body_b, out_path, view, width/height, mode).

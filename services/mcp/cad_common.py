@@ -4075,7 +4075,11 @@ def _tile_pngs(png_paths: list, out_png: str, labels: Optional[list] = None) -> 
 
 def _tile_pngs_grid(png_paths: list, out_png: str, labels: Optional[list] = None,
                     cols: int = 3) -> str:
-    """Tile PNGs into a labelled contact-sheet grid with an explicit column count."""
+    """Tile PNGs into a labelled contact-sheet grid with an explicit column count.
+
+    The label gets its OWN band above each tile rather than being stamped into the top-left
+    corner: the engine already bakes a header there (view name + framed dims), and printing a
+    second string over it left both unreadable on every close-up sheet."""
     from PIL import Image as PILImage, ImageDraw  # noqa: PLC0415
     if not png_paths:
         raise ValueError("no tiles to compose")
@@ -4085,21 +4089,23 @@ def _tile_pngs_grid(png_paths: list, out_png: str, labels: Optional[list] = None
         cols = max(int(cols), 1)
         rows = (len(imgs) + cols - 1) // cols
         gap = 4
+        font = _annot_font(15)
+        band = 24 if labels else 0
+        cell_h = th + band
         sheet = PILImage.new("RGB",
                              (tw * cols + gap * (cols - 1),
-                              th * rows + gap * (rows - 1)),
+                              cell_h * rows + gap * (rows - 1)),
                              (30, 30, 32))
         draw = ImageDraw.Draw(sheet)
         for i, im in enumerate(imgs):
             r, c = divmod(i, cols)
             x = c * (tw + gap)
-            y = r * (th + gap)
-            sheet.paste(im.resize((tw, th)), (x, y))
+            y = r * (cell_h + gap)
             if labels and i < len(labels):
-                # Dark halo + light label so the tile name is always readable.
-                label = str(labels[i]).upper()
-                draw.text((x + 7, y + 5), label, fill=(10, 10, 12))
-                draw.text((x + 6, y + 4), label, fill=(235, 240, 248))
+                draw.rectangle([x, y, x + tw - 1, y + band - 1], fill=(18, 19, 22))
+                draw.text((x + 7, y + 4), str(labels[i]).upper(), font=font,
+                          fill=(235, 240, 248))
+            sheet.paste(im.resize((tw, th)), (x, y + band))
         sheet.save(out_png, format="PNG")
         return out_png
     finally:
@@ -4214,91 +4220,13 @@ def _desaturate_rgb(r: int, g: int, b: int, amount: float = _CONTEXT_DESAT) -> t
     )
 
 
-def _project_match_pixels(doc_id: str, match: dict, part_bbox: dict, view_dir: tuple,
-                          W: int = _RENDER_W, H: int = _RENDER_H) -> list:
-    """Screen-space sample pixels for a match (face points projected through the render frame)."""
-    frame = _part_render_frame(part_bbox, view_dir, W, H)
-    pts = _match_point_cloud(doc_id, match)
-    pixels = []
-    for p in pts:
-        sx, sy = _world_to_screen(p, frame)
-        ix, iy = int(round(sx)), int(round(sy))
-        if 0 <= ix < W and 0 <= iy < H:
-            pixels.append((ix, iy))
-    return pixels
+def _emphasis_shade(rgb: tuple, lum: float) -> tuple:
+    """The emphasis colour modulated by a pixel's own luminance.
 
-
-def _apply_emphasis_overlay(src_png: str, doc_id: str, matches: list, part_bbox: dict,
-                            view_dir: tuple, mode: str = "emphasis",
-                            out_png: Optional[str] = None,
-                            W: int = _RENDER_W, H: int = _RENDER_H,
-                            palette: Optional[dict] = None) -> tuple:
-    """Desaturate context, paint emphasized faces, glow outline. Returns (path, palette).
-
-    palette: optional pre-built emphasis palette (from _build_emphasis_palette). When
-    omitted, built from matches + mode. Callers that need index-stable distinct colours
-    (measure) pass their own palette so caption colours match the painted overlay.
-    """
-    from PIL import Image as PILImage, ImageDraw, ImageFilter, ImageEnhance  # noqa: PLC0415
-
-    palette = palette or _build_emphasis_palette(matches, mode=mode)
-    out_png = out_png or _tmp(".png")
-    with PILImage.open(src_png) as im0:
-        im = im0.convert("RGB")
-        # If the source is a crop/upscale already sized differently, use its size.
-        W, H = im.size
-        # Desaturate whole image for context.
-        grey = ImageEnhance.Color(im).enhance(_CONTEXT_DESAT)
-        base = grey.convert("RGBA")
-        overlay = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        color_by_key = {e["key"]: tuple(e["rgb"]) for e in palette["entries"]}
-        default_rgb = tuple(palette["entries"][0]["rgb"]) if palette["entries"] else _EMPHASIS_PALETTE[0]
-
-        all_pixels: list = []
-        for i, m in enumerate(matches or []):
-            # Prefer index-aligned palette entry (distinct sequential colours for measure).
-            if i < len(palette["entries"]):
-                rgb = tuple(palette["entries"][i]["rgb"])
-            else:
-                key = _match_color_key(m, i)
-                rgb = color_by_key.get(key, default_rgb)
-            pixels = _project_match_pixels(doc_id, m, part_bbox, view_dir, W, H)
-            all_pixels.extend(pixels)
-            for (ix, iy) in pixels:
-                # Fat brush so sparse face samples still read as a filled region.
-                r = 4
-                draw.ellipse([ix - r, iy - r, ix + r, iy + r], fill=rgb + (220,))
-
-        # Glow / outline around the union of emphasized pixels.
-        if all_pixels:
-            mask = PILImage.new("L", (W, H), 0)
-            md = ImageDraw.Draw(mask)
-            for (ix, iy) in all_pixels:
-                md.ellipse([ix - 5, iy - 5, ix + 5, iy + 5], fill=255)
-            glow = mask.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.GaussianBlur(1.5))
-            glow_rgba = PILImage.new("RGBA", (W, H), tuple(_EMPHASIS_GLOW) + (0,))
-            # Put glow only on dilated ring (glow - original mask).
-            ring = ImageEnhance.Brightness(glow).enhance(1.0)
-            # Build ring: dilated where original was empty-ish.
-            from PIL import ImageChops  # noqa: PLC0415
-            ring_mask = ImageChops.subtract(glow, mask)
-            glow_rgba.putalpha(ring_mask)
-            base = PILImage.alpha_composite(base, glow_rgba)
-
-        base = PILImage.alpha_composite(base, overlay).convert("RGB")
-        # Legend strip at bottom so the image is self-describing.
-        legend = palette.get("legend") or ""
-        if legend:
-            strip_h = 18
-            sheet = PILImage.new("RGB", (W, H + strip_h), (28, 30, 34))
-            sheet.paste(base, (0, 0))
-            d2 = ImageDraw.Draw(sheet)
-            d2.text((6, H + 2), f"EMPHASIS [{palette['mode']}]: {legend}"[:120],
-                    fill=(230, 230, 235))
-            base = sheet
-        base.save(out_png, format="PNG")
-    return out_png, palette
+    A flat fill turns a bore into a sticker; keeping the shading means the emphasized face
+    still reads as curved/tilted geometry while unmistakably carrying the target colour."""
+    k = 0.45 + 0.85 * max(0.0, min(1.0, float(lum)))
+    return tuple(int(max(0, min(255, round(c * k)))) for c in rgb)
 
 
 # --------------------------------------------------------------------------- mesh-accurate render annotation
@@ -4513,6 +4441,138 @@ def _crop_frame(frame: dict, rect: dict, out_size: tuple = (_RENDER_W, _RENDER_H
                 cv=frame["cv"] + ((frame["H"] / 2.0 - rect["y0"]) * sy - h2 / 2.0) / scale_y)
 
 
+# --------------------------------------------------------------------------- focused close-ups
+# A close-up used to be a 32x32 patch of a 512x400 whole-part render, bicubic-upscaled 16x into
+# mush — the engine could only auto-fit the whole model. core/doc/session.cpp now accepts a
+# `focus` world AABB (plus `clip_near` for a cutaway) and echoes the exact projection it used,
+# so a feature review is RENDERED at the resolution the model reads it at, and every overlay
+# reprojects through the engine's own camera instead of guessing it back.
+
+_CLOSEUP_W, _CLOSEUP_H = 768, 576   # close-ups render larger than the whole-part 512x400 shot
+_CLOSEUP_MARGIN = 0.35              # padding around the target AABB: enough context to place it
+
+
+def _frame_from_rpc(resp: Optional[dict]) -> Optional[dict]:
+    """The projection doc_render_view actually used, as the frame dict _screen_xyz consumes.
+
+    Re-deriving the camera in Python (_part_render_frame / _mesh_render_frame) is a guess that
+    is a pixel or two off on a whole-part render and completely wrong on a focused one. The
+    engine echoes `frame`; prefer it whenever it is there. `clip_depth` comes with it so an
+    overlay can apply the SAME near-clip — without it, the material the engine cut away still
+    wins the overlay's depth test and the target the cutaway exists to reveal reads as hidden."""
+    f = (resp or {}).get("frame")
+    if not isinstance(f, dict) or not f.get("width"):
+        return None
+    try:
+        return {"center": _v3(f["center"]), "r": _v3(f["right"]), "u": _v3(f["up"]),
+                "d": _v3(f["dir"]), "scale": float(f["scale"]),
+                "cu": float(f["cu"]), "cv": float(f["cv"]),
+                "W": int(f["width"]), "H": int(f["height"]),
+                "focused": bool(f.get("focused")),
+                "clip_near": bool(f.get("clip_near")),
+                "clip_depth": float(f.get("clip_depth") or 0.0)}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _render_view_png(doc_id: str, view_dir, out_png: str, *,
+                     name: str = "VIEW", focus: Optional[dict] = None,
+                     margin: float = _CLOSEUP_MARGIN, clip_near: bool = False,
+                     W: int = _RENDER_W, H: int = _RENDER_H,
+                     annotate: bool = True) -> tuple:
+    """One engine render along `view_dir`, optionally FRAMED on a world AABB.
+
+    `focus` is a bbox dict ({"min","max"} — what _target_bbox returns). With it the engine fits
+    THAT box to the image, so the close-up is real pixels rather than a magnified patch;
+    `clip_near` additionally cuts away whatever sits between the camera and the box, which is
+    how a bore or a pocket gets seen into without a separate section operation.
+
+    Returns (png_path, frame, resp). `frame` is the engine's own projection record — pass it
+    straight to _annotate_render so the overlay lands on the right pixels. Raises ValueError
+    with the engine's reason when the render fails."""
+    view = {"dir": [float(x) for x in _vnorm(view_dir)], "name": str(name),
+            "width": int(W), "height": int(H)}
+    if focus:
+        view["focus"] = {"min": [float(x) for x in _v3(focus["min"])],
+                         "max": [float(x) for x in _v3(focus["max"])],
+                         "margin": float(margin), "clip_near": bool(clip_near)}
+    r = cb.call("doc_render_view", {"doc_id": doc_id, "out_path": out_png,
+                                    "view": view, "annotate": bool(annotate)})
+    if not r.get("ok") or not os.path.exists(out_png):
+        raise ValueError(
+            f"Render failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
+    return out_png, _frame_from_rpc(r), r
+
+
+def _target_mesh_tris(mesh: Optional[dict], doc_id: str, matches: list):
+    """Boolean array over `mesh["idx"]` rows marking the triangles the target owns.
+
+    Joins each match's sid to its 1-based doc_query topo index and then to the AICM FaceRec
+    triangle range. Returns None when there is no mesh, no numpy, or the target is edges-only
+    (nothing to rasterize) — callers then fall back to the target AABB alone."""
+    if mesh is None:
+        return None
+    try:
+        import numpy as np  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    topo = _doc_topo_maps(doc_id)
+    want = {topo["face_sid"][str(m.get("sid"))] for m in (matches or [])
+            if str(m.get("sid") or "") in topo["face_sid"]}
+    if not want:
+        return None
+    sel = np.zeros(mesh["idx"].shape[0], dtype=bool)
+    hit = False
+    for fr in mesh["faces"]:
+        if fr["body"] != mesh["last_body"] or fr["face_id"] not in want:
+            continue
+        sel[fr["first_tri"]:fr["first_tri"] + fr["tri_count"]] = True
+        hit = True
+    return sel if hit else None
+
+
+def _ideal_views(doc_id: str, matches: list, target_bbox: dict, *,
+                 n: int = 1, hint=None, mesh: Optional[dict] = None,
+                 min_sep_deg: float = 50.0, clip_near: bool = False) -> list:
+    """The deterministic idealized camera direction(s) for a target, best first.
+
+    Scores a fixed candidate lattice by how much of the target each direction actually SEES
+    (occlusion-tested against the tessellation) and how legibly (foreshortening), instead of
+    the old mean-face-normal guess that happily picked a direction looking straight down a
+    bore axis or into a wall. Each entry is {"dir", "label", "score", "visible_frac",
+    "screen_frac", "foreshorten", ...}.
+
+    Degrades to the plain mean-normal / iso direction when the tessellation, numpy, or the
+    viewpoint module is unavailable — a close-up is never lost to a scoring problem."""
+    fallback = [{"dir": _camera_dir_for_target(matches, hint if hint is not None else "auto"),
+                 "label": "auto", "score": None, "visible_frac": None,
+                 "screen_frac": None, "foreshorten": None}]
+    try:
+        from . import cad_viewpoint as _vp  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return fallback[:max(1, n)]
+    try:
+        mesh = mesh if mesh is not None else _doc_mesh(doc_id)
+        tris = _target_mesh_tris(mesh, doc_id, matches)
+        normals = [m.get("normal") for m in (matches or [])
+                   if isinstance(m.get("normal"), (list, tuple))]
+        # A revolved target (bore, boss, fillet, chamfer) has an AXIS, and looking down it is
+        # the one view that shows a filled circle and nothing else. Hand it over so the scorer
+        # can penalise that; planar targets pass None and rely on the foreshorten term.
+        axis = None
+        for m in (matches or []):
+            if str(m.get("surf") or "") in ("cylinder", "cone", "torus") and m.get("axis"):
+                axis = m.get("axis")
+                break
+        out = _vp.ideal_view_dirs(mesh, target_bbox, target_tris=tris, normals=normals,
+                                  axis=axis, n=max(1, int(n)), hint=hint,
+                                  clip_near=bool(clip_near),
+                                  min_sep_deg=float(min_sep_deg))
+        return out or fallback[:max(1, n)]
+    except Exception:  # noqa: BLE001
+        return fallback[:max(1, n)]
+
+
 def _mesh_depth_buffer(mesh: dict, frame: dict) -> Optional[tuple]:
     """Rasterize the mesh into (depth, face_index) buffers matching the engine's render.
 
@@ -4520,7 +4580,12 @@ def _mesh_depth_buffer(mesh: dict, frame: dict) -> Optional[tuple]:
     so a pixel's winning triangle here is the pixel the engine shaded. Back-facing triangles
     are culled first (AICM guarantees outward winding, so for a closed solid this is exact
     and halves the work). Returns (Z, FI, S) or None when the mesh is over the triangle
-    budget — the caller then reports that edges were skipped rather than lying about them."""
+    budget — the caller then reports that edges were skipped rather than lying about them.
+
+    When `frame` carries the engine's near-clip (`clip_near` + `clip_depth`, a focused cutaway),
+    the same fragments are dropped here. Skipping that is not a cosmetic mismatch: the cut-away
+    material would win this z-test, and the feature the cutaway was made to expose would come
+    back reported as invisible."""
     import numpy as np  # noqa: PLC0415
     idx = mesh["idx"]
     if idx.shape[0] > _HLR_TRI_BUDGET:
@@ -4532,6 +4597,8 @@ def _mesh_depth_buffer(mesh: dict, frame: dict) -> Optional[tuple]:
     p0, p1, p2 = pos[idx[:, 0]], pos[idx[:, 1]], pos[idx[:, 2]]
     front = np.cross(p1 - p0, p2 - p0) @ d > 0.0
     tri_ids = np.nonzero(front)[0]
+    clip = (float(frame["clip_depth"])
+            if frame.get("clip_near") and frame.get("clip_depth") is not None else None)
     tri_face = mesh["tri_face"]
 
     Z = np.full((H, W), -1e30, dtype=np.float64)
@@ -4556,6 +4623,10 @@ def _mesh_depth_buffer(mesh: dict, frame: dict) -> Optional[tuple]:
         if not inside.any():
             continue
         dep = a0 * s0[2] + a1 * s1[2] + a2 * s2[2]
+        if clip is not None:
+            inside = inside & (dep <= clip)
+            if not inside.any():
+                continue
         zs = Z[miny:maxy + 1, minx:maxx + 1]
         upd = inside & (dep > zs)
         if not upd.any():
@@ -4703,7 +4774,9 @@ def _draw_scale_bar(draw, font, frame: dict, size_mm: tuple, W: int, H: int) -> 
     px = max(24, min(px, W // 2))
     x1, y1 = W - 12, H - 16
     x0 = x1 - px
-    dims = f"bbox {size_mm[0]:.4g} x {size_mm[1]:.4g} x {size_mm[2]:.4g} mm"
+    # "part bbox", not "bbox": on a close-up this sits next to a 5 mm scale bar while quoting
+    # the WHOLE part's 120 mm, and the unqualified word reads as the size of what is in frame.
+    dims = f"part bbox {size_mm[0]:.4g} x {size_mm[1]:.4g} x {size_mm[2]:.4g} mm"
     label = f"{mm:.4g} mm"
     draw.rectangle([x0 - 8, y1 - 30, W - 4, H - 4], fill=(24, 26, 32))
     draw.line([(x0, y1), (x1, y1)], fill=(240, 242, 248), width=2)
@@ -4795,18 +4868,28 @@ def _resolve_highlight_specs(doc_id: str, highlight) -> list:
 def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                      highlight=None, callouts: bool = True, edges: bool = True,
                      scale: bool = True, frame: Optional[dict] = None,
-                     out_png: Optional[str] = None) -> tuple:
+                     out_png: Optional[str] = None,
+                     emphasis: Optional[dict] = None) -> tuple:
     """Overlay B-rep edges, highlights, feature callouts and a scale bar onto a render.
 
     src_png MUST be the engine render taken along `view_dir` (this reprojects the SAME
-    camera). Pass `frame` (from _crop_frame) when src_png has already been cropped/rescaled.
+    camera). Pass `frame` — the engine's own projection record from _render_view_png — whenever
+    you have it; it is required for a FOCUSED close-up, where the Python guess is meaningless.
+
+    `emphasis`, when given, is {"matches": [...], "mode": "emphasis"|"per_face",
+    "label": str, "palette": dict|None}: the target's faces are painted in the emphasis
+    palette with their shading preserved, every other pixel is desaturated toward grey, and
+    info["emphasis"] reports MEASURED coverage — which target sids the camera can actually see
+    and how much of the frame they hold. This is the one emphasis implementation; it uses the
+    same exact visible-face masks as `highlight`, not a splat of projected sample points.
+
     Returns (path, info) where `info` feeds _render_annotation_caption. On any failure the
     ORIGINAL png path is returned with info["available"] False — the caller's render is never
     lost to an overlay problem."""
     info: dict = {"available": False, "edges": False, "hlr": False, "highlights": [],
                   "callouts": [], "callouts_omitted": [], "hidden_features": [],
                   "hidden_faces": 0, "scale_bar_mm": None, "bbox_mm": None,
-                  "note": None, "part_name": None}
+                  "note": None, "part_name": None, "emphasis": None}
     try:
         import numpy as np  # noqa: PLC0415
         from PIL import Image as PILImage, ImageDraw  # noqa: PLC0415
@@ -4857,6 +4940,64 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                     etop.add(topo["edge_sid"][sid])
             return ftop, etop
 
+        # ---- EMPHASIS: exact visible-face masks, shading preserved, context desaturated ----
+        # The target is painted in its palette colour MODULATED by the pixel's own luminance,
+        # so a bore still reads as a curved surface instead of a flat sticker; everything else
+        # is pulled toward grey. Coverage is measured, not assumed — a target the camera cannot
+        # see is reported as such rather than silently producing a picture of nothing.
+        emp_draw: list = []
+        if emphasis:
+            emp_matches = list(emphasis.get("matches") or [])
+            emp_mode = emphasis.get("mode") or "emphasis"
+            palette = emphasis.get("palette") or _build_emphasis_palette(emp_matches, emp_mode)
+            rec = {"mode": palette.get("mode"), "palette": palette,
+                   "label": emphasis.get("label"), "target_px": 0,
+                   "frame_px": int(W * H), "coverage": 0.0,
+                   "visible_sids": [], "hidden_sids": [], "edge_sids": []}
+            if FI is not None:
+                lum = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]) / 255.0
+                target_any = np.zeros((H, W), dtype=bool)
+                per_target = []
+                for i, m in enumerate(emp_matches):
+                    ftop, etop = _topos_for([m])
+                    fidx = [face_by_topo[t] for t in sorted(ftop) if t in face_by_topo]
+                    eidx = [edge_by_topo[t] for t in sorted(etop) if t in edge_by_topo]
+                    entry = (palette["entries"][i] if i < len(palette["entries"])
+                             else palette["entries"][-1] if palette["entries"] else None)
+                    rgb = tuple(entry["rgb"]) if entry else _EMPHASIS_PALETTE[0]
+                    mask = (np.isin(FI, np.asarray(fidx, dtype=np.int32)) if fidx
+                            else np.zeros((H, W), dtype=bool))
+                    sid = str(m.get("sid") or f"m{i}")
+                    if mask.any():
+                        target_any |= mask
+                        rec["visible_sids"].append(sid)
+                    elif eidx:
+                        rec["edge_sids"].append(sid)
+                    else:
+                        rec["hidden_sids"].append(sid)
+                    per_target.append({"sid": sid, "mask": mask if mask.any() else None,
+                                       "edge_idx": eidx, "rgb": rgb,
+                                       "label": sid})
+                # Context first, so the emphasis paint below is never desaturated with it.
+                ctx = ~target_any
+                g = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2])
+                for ch in range(3):
+                    arr[..., ch] = np.where(
+                        ctx, g * (1.0 - _CONTEXT_DESAT) + arr[..., ch] * _CONTEXT_DESAT,
+                        arr[..., ch])
+                for t in per_target:
+                    if t["mask"] is None:
+                        continue
+                    shade = 0.45 + 0.85 * lum[t["mask"]]
+                    for ch in range(3):
+                        arr[..., ch][t["mask"]] = np.clip(t["rgb"][ch] * shade, 0, 255)
+                rec["target_px"] = int(target_any.sum())
+                rec["coverage"] = round(rec["target_px"] / float(W * H), 4)
+                emp_draw = per_target
+            else:
+                rec["note"] = "mesh over the depth budget — emphasis mask unavailable"
+            info["emphasis"] = rec
+
         # ---- highlight fills (tint the exact visible pixels of each target face) --------
         hl_draw: list = []
         for h in hl_specs:
@@ -4886,6 +5027,7 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
             eps = max(1e-9, span * 0.004)
             Zmax = _dilate_max3(Z)
             hl_edge_ids = {i for h in hl_draw for i in h["edge_idx"]}
+            hl_edge_ids |= {i for t in emp_draw for i in t["edge_idx"]}
             n_runs = 0
             for ei, e in enumerate(mesh["edges"]):
                 if ei in hl_edge_ids:
@@ -4899,9 +5041,32 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                 for ei in h["edge_idx"]:
                     for run in _visible_runs(mesh["edges"][ei]["pts"], frame, Zmax, eps):
                         draw.line(run, fill=h["rec"]["colour"], width=3)
+            # An emphasized EDGE target (a fillet edge, a chamfer) has no face mask to paint —
+            # stroke it fat in its palette colour instead so it is unmissable.
+            for t in emp_draw:
+                for ei in t["edge_idx"]:
+                    for run in _visible_runs(mesh["edges"][ei]["pts"], frame, Zmax, eps):
+                        draw.line(run, fill=tuple(t["rgb"]), width=4)
+
+        # ---- emphasis outlines + leader labels ----------------------------------------
+        # Drawn before the highlight chips so an explicit `highlight` still wins the top layer.
+        emp_taken: list = []
+        for t in emp_draw:
+            if t["mask"] is not None:
+                _mask_outline(draw, t["mask"], _EMPHASIS_GLOW, width=2)
+            anchor = _mask_anchor(t["mask"]) if t["mask"] is not None else None
+            if anchor is None and t["edge_idx"]:
+                pts = mesh["edges"][t["edge_idx"][0]]["pts"]
+                S = _screen_xyz(pts, frame)
+                anchor = (int(S[len(S) // 2, 0]), int(S[len(S) // 2, 1]))
+            if anchor is None:
+                continue
+            ax = max(2, min(int(anchor[0]), W - 3))
+            ay = max(2, min(int(anchor[1]), H - 3))
+            _place_label(draw, font, (ax, ay), t["label"], tuple(t["rgb"]), W, H, emp_taken)
 
         # ---- highlight outlines + leader labels ---------------------------------------
-        taken: list = []
+        taken: list = emp_taken   # one registry, so a chip never lands on an emphasis label
         for h in hl_draw:
             rec = h["rec"]
             sids = [str(m.get("sid")) for m in (rec["matches"] or []) if m.get("sid")]
@@ -4931,10 +5096,12 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
             info["highlights"].append(entry)
 
         # ---- feature callouts (id + name on a leader, largest-first, capped) -----------
-        # A feature that already carries a highlight chip is skipped — two chips naming the
-        # same thing in two colours is worse than one.
+        # A feature that already carries a highlight chip — or IS the emphasis target — is
+        # skipped: two chips naming the same thing in two colours is worse than one.
         if callouts and FI is not None:
             labelled = {str(h["label"]) for h in info["highlights"]}
+            if info.get("emphasis") and info["emphasis"].get("label"):
+                labelled.add(str(info["emphasis"]["label"]))
             scored = []
             for f in _feature_roster(doc_id):
                 if f"{f['id']} {f['name']}" in labelled or str(f["id"]) in labelled:

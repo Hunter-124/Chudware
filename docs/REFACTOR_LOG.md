@@ -6662,3 +6662,73 @@ of which is per-process rather than per-turn.
 **Deferred.** The ledger clips every tool result at ~999 chars, which is why the delegate
 failure could not be diagnosed from disk at all; delegate now front-loads its cause to
 survive that, but the clip itself is untouched observability debt.
+
+---
+
+## Geometry emphasis: a real close-up camera instead of a 32x32 crop (2026-08-06)
+
+**The defect, measured.** Every close-up an AI agent could get — `inspect_feature`,
+`inspect_part`, `look_around`, `render_part(target=)`, `render_views(target=)`,
+`measure` — was a whole-part render at 512x400 followed by a pixel crop and a bicubic
+upscale, because `doc_render_view` could only auto-fit the entire model. A Ø5 hole in a
+120x80x12 plate came back as a **32x32 pixel crop blown up 16x**: a white blob. Worse, the
+emphasis overlay projected its paint through the *uncropped* whole-part frame while painting
+onto the *cropped* image, so on every framed render the target colour landed somewhere else
+entirely — in the reference case, a red dot on the blob's rim. And the "auto" camera was the
+mean face normal with no occlusion test, which for a bore is its axis, so the ideal view of a
+hole was chosen to be a stare straight down it, from underneath.
+
+**Engine (`core/doc/session.cpp`).** `render_view_to_rgb` takes an optional `RenderFocus`
+(world AABB + `margin` + `clip_near`) and an optional `RenderFrame*` out-param.  With a focus
+the projection fits THAT box — no 0.85 auto-fit shrink, degenerate axes widened — so a
+close-up is rendered, not magnified; `clip_near` drops fragments in front of the box, a
+deterministic cutaway that sees into a bore without a section operation.  `doc_render_view`
+exposes `width`/`height`/`focus` in the object form of `view`, heads a focused image with the
+FRAMED dims rather than the whole part's, and echoes `frame` (centre/right/up/dir/scale/cu/cv/
+size/`clip_depth`).  Two live bugs fixed alongside: `annotate` was accepted by every caller
+and silently ignored (now plumbed through `libchudware.cpp`), and a `RenderLabel` whose anchor
+projects off-frame is no longer drawn — that is where the giant stray "R" on close-up tiles
+came from.  `min_painted` drops to 1 for a focused render; the whole-part floor called a
+legitimate cutaway a failed render.  Pinned by six new cases in `core/tests/test_render_view.cpp`.
+
+**Camera (`services/mcp/cad_viewpoint.py`, new).** Every direction in a fixed lattice — both
+hemispheres around the target normal at 20/35/55/70 degrees, the 6 principal axes, the 8 isos
+— is rasterized and MEASURED: unoccluded target pixels, share of frame, area-weighted
+foreshortening.  Visibility **gates** (`min(visible_frac/0.5, 1)`); ranking on raw visible area
+is what picked the bore-axis stare and the flat orthographic section, because those expose the
+most pixels.  Three small terms then choose among the views that can see it: a bore-axis
+penalty, a principal-axis ("flat 2-D, no depth cue") penalty, and a slight preference for a
+camera above the part.  Separation between multi-view picks is UNDIRECTED, so an antipodal
+camera is rejected too — front and back of one target are mirror images.  Asking for more views
+than the separation admits returns fewer, never a padded duplicate.  **The scorer must be told
+`clip_near` whenever the caller will render cut**: score an internal target uncut and every
+oblique camera measures as 80% occluded while the useless axial one measures clear.
+
+**Overlay (`cad_common`).** `_apply_emphasis_overlay` and `_project_match_pixels` are DELETED.
+Emphasis is now a mode of the one overlay engine, `_annotate_render(emphasis=...)`, reusing the
+same depth-tested visible-face masks `highlight` already used: the target is painted in its
+palette colour modulated by the pixel's own luminance (a flat fill turns a bore into a
+sticker), context is desaturated, the boundary outlined, each sid leader-labelled, and
+`info["emphasis"]` reports MEASURED coverage plus which subshapes this camera cannot see.
+`_mesh_depth_buffer` applies the engine's echoed `clip_depth` — without that the cut-away
+material still wins the overlay's z-test and the feature the cutaway exists to reveal reads as
+hidden (this bit once during the work; the symptom is "0.0% target" on a picture that plainly
+shows it).  `_tile_pngs_grid` draws its label in a band above each tile instead of stamping it
+over the engine's baked header, which had made both unreadable.
+
+**Tools.** `inspect_feature` returns a deterministic multi-panel sheet — HERO (idealized
+camera), ALT (>=75 degrees away), CUTAWAY-companion (for an internal target HERO/ALT are cut
+and the third panel is AS-BUILT uncut; otherwise a third angle), and CONTEXT (whole part, target
+highlighted, so the close-ups are placeable).  `inspect_part` defaults `emphasize=True` and
+takes `cutaway=None|True|False`.  `look_around` ranks idealized angles by default
+(`ranked=False` keeps the even orbit) and reports coverage per tile.  `render_views(target=)`
+frames and cuts every tile: on the reference hole it went from 1 of 7 tiles showing the target
+to 5 of 7.
+
+**Gotchas for whoever is next.** (1) Whenever you add a close-up path, pass the ENGINE's echoed
+frame to `_annotate_render`; re-deriving it in Python is a guess that is meaningless on a
+focused render.  (2) Scoring and rendering must agree about `clip_near` or the ranking optimises
+a picture nobody sees.  (3) `_target_is_internal` decides the cutaway; a mis-classified target
+just gets a less useful (never a wrong) picture.  (4) `_closeup` builds the palette itself and
+reports it even when the tessellation is missing, because the caption's `palette_json` block is
+the machine-readable half of the contract.

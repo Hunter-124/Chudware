@@ -651,8 +651,14 @@ class TestInspectToolsE2E:
         png_path = getattr(img, "path", img)
         assert os.path.exists(png_path)
         assert "Close-up" in caption
-        assert "CROP" in caption or "crop" in caption.lower()
-        assert any(m == "doc_render_view" for m, _ in calls)
+        # The close-up is FRAMED by the engine, not cropped out of a whole-part render.
+        assert "focus" in caption.lower()
+        assert "crop" not in caption.lower()
+        focus_calls = [p for m, p in calls
+                       if m == "doc_render_view" and (p.get("view") or {}).get("focus")]
+        assert focus_calls, "inspect_part must ask doc_render_view to frame the target AABB"
+        box = focus_calls[0]["view"]["focus"]
+        assert box["min"] and box["max"] and box["min"] != box["max"]
         assert any(m == "doc_query" for m, _ in calls)
 
     def test_inspect_part_unmatched_errors(

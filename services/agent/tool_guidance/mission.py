@@ -48,24 +48,25 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "dag_run": {
         "prompt_note": (
-            "Plan with dag_plan first (omit graph_json to reuse the last "
-            "plan); interrupted in the result → paused at a gate: "
-            "dag_approve/dag_abort."
+            "Plan with dag_plan or mission_start first, then omit graph_json to "
+            "reuse that plan; run_id with no checkpoint yet STARTS a run under "
+            "that id; interrupted → paused at a gate: dag_approve/dag_abort."
         ),
         "timeout_s": 600,
     },
     "dag_status": {
         "prompt_note": (
-            "Restart-safe topology + gate_pending check; per-node verdicts "
-            "exist only in the run's own session — use mission_status for "
-            "the phase narrative."
+            "Restart-safe topology; gate_pending is TRI-STATE — null means this "
+            "process never ran it, not that no gate is pending. Use "
+            "mission_status for the phase narrative."
         ),
     },
     "mission_start": {
         "prompt_note": (
-            "Compiles but does not execute — hand the graph to dag_run. Needs a "
-            "deliverable manifest; you may write it yourself. Call it without "
-            "`manifest` and the refusal hands you a fill-in template."
+            "Compiles but does not execute — then dag_run(run_id=<its run_id>) "
+            "starts it (bare dag_run() reuses the same graph). Needs a deliverable "
+            "manifest; you may write it yourself. Call it without `manifest` and "
+            "the refusal hands you a fill-in template."
         ),
     },
     "mission_status": {

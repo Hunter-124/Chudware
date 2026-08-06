@@ -66,6 +66,7 @@ def register_mission_tools(mcp) -> None:
         from services.agent.pipeline.manifest import (
             VALID_KINDS, KNOWN_CHECK_TOOLS)
         from services.dag.mission_template import build_mission_graph
+        from services.dag import session
 
         if manifest is None:
             # The refusal has to be ACTIONABLE. It used to name
@@ -115,6 +116,13 @@ def register_mission_tools(mcp) -> None:
         graph = build_mission_graph(manifest, graph_id=gid,
                                     default_autonomy=autonomy_default,
                                     tier=tier)
+        # Register the compiled graph as this session's plan so a bare dag_run()
+        # executes IT.  Without this, dag_run's documented "omit graph_json to
+        # reuse the last plan" affordance only ever saw dag_plan's output, and a
+        # mission compiled here answered "no graph has been planned in this
+        # session yet" (live 2026-08-06, run-92188923731943: three denials in a
+        # row on a valid 7-node mission graph).
+        session.remember_graph(graph, source=gid)
         return {
             "ok": True,
             "run_id": gid,
@@ -127,9 +135,14 @@ def register_mission_tools(mcp) -> None:
             "interpreted": interpreted,
             # Naming dag_run is only useful if the caller can REACH it: the
             # general lane starts without it and has to pull the pack first.
-            "hint": "execute with dag_run(graph_json=<graph>), then track via "
-                    "mission_status(run_id). If dag_run is not in your loadout, "
+            # run_id=gid names a run that does not exist on disk yet: dag_run
+            # STARTS it under that id, and only then can dag_status see it.
+            "hint": f"execute with dag_run(graph_json=<graph>, run_id={gid!r}) — or just "
+                    "dag_run(), which reuses this graph — then track via "
+                    f"mission_status(run_id={gid!r}). If dag_run is not in your loadout, "
                     "call enable_tools(categories=[\"delegate\"]) first.",
+            "next_actions": [f"dag_run(run_id={gid!r})",
+                             f"dag_status(run_id={gid!r})"],
         }
 
     @mcp.tool()

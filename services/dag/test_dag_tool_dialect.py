@@ -293,15 +293,20 @@ def test_dag_run_rejects_unparseable_json_with_a_fix(run):
     assert "dag_plan" in out["hint"]
 
 
-def test_empty_dag_run_names_the_tool_that_produces_a_graph(run):
+def test_empty_dag_run_names_every_tool_that_produces_a_graph(run):
     """Recorded call: dag_run() with nothing, and nothing planned yet."""
     out = _call(run)
     assert out["ok"] is False
     hint = out["hint"]
-    assert "dag_plan" in hint                          # the producer, named
-    assert 'p = dag_plan(brief="' in hint              # step 1 of the sequence
-    assert 'dag_run(graph_json=p["graph_json"])' in hint   # step 2
-    assert out["next_actions"] == ["dag_plan(brief='<what you want built>')"]
+    assert 'p = dag_plan(brief="' in hint                   # producer 1, step 1
+    assert 'dag_run(graph_json=p["graph_json"])' in hint     # producer 1, step 2
+    # mission_start compiles a graph too, and a mission that reached this error
+    # after mission_start used to be told only about dag_plan (live 2026-08-06).
+    assert "mission_start(request=..., manifest=...)" in hint
+    assert out["next_actions"] == [
+        "dag_plan(brief='<what you want built>')",
+        "mission_start(request='<the ask>', manifest=<aicad.deliverables/1>)",
+    ]
 
 
 def test_dag_run_reuses_the_last_planned_graph(run):

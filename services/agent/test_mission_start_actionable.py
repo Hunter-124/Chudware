@@ -464,6 +464,102 @@ def test_mission_start_hint_says_how_to_reach_dag_run():
 
 
 # ===========================================================================
+# The same OptiPlex 7040 ask, one cycle later.  Live 2026-08-06
+# (run-92188923731943): mission_start FINALLY succeeded and compiled a 7-node
+# graph -- and then the mission was structurally unexecutable.  dag_run(
+# run_id="mission") -> "no graph has been planned in this session yet";
+# dag_plan() -> ok:true "mission plan already compiled" with no graph attached;
+# dag_status(run_id="mission") -> "not found", listing five unrelated run ids.
+# Three tools, four failed calls, on a mission that was correctly planned.
+#
+# Cause: the "last planned graph" slot was private to services/dag/mcp_tools,
+# so mission_start's graph was invisible to dag_run, and a run_id naming a run
+# that had never checkpointed was routed to executor.resume().
+# ===========================================================================
+
+def _dag_tools():
+    from services.dag.mcp_tools import register_dag_tools
+
+    class _Reg:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self):
+            def deco(fn):
+                self.tools[fn.__name__] = fn
+                return fn
+            return deco
+
+    reg = _Reg()
+    register_dag_tools(reg)
+    return reg.tools
+
+
+def _compiled_mission(ms, request="build me a PC case"):
+    tpl = ms(request=request)["manifest_template"]
+    tpl["request_verbatim"] = request
+    dl = tpl["deliverables"][0]
+    dl["title"] = "Case shell"
+    dl["acceptance_criteria"][0]["text"] = "the shell is a closed solid"
+    dl["acceptance_criteria"][0]["check"]["pass_rule"] = "mass.volume_mm3 > 0"
+    return ms(request=request, manifest=tpl)
+
+
+def test_mission_start_graph_is_what_a_bare_dag_run_executes(monkeypatch, tmp_path):
+    """dag_run() with no graph_json must run the graph mission_start compiled."""
+    from unittest.mock import patch
+    from services.dag import session
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    session.reset()
+    out = _compiled_mission(_mission_start())
+    assert out["ok"] is True and out["run_id"] == "mission"
+
+    assert session.planned_graph() == out["graph"]
+    dag_run = _dag_tools()["dag_run"]
+    with patch("services.dag.executor.run",
+               return_value={"run_id": "mission", "status": "done", "nodes": {}}) as mock_run:
+        result = json.loads(dag_run(autonomy_default="approve"))
+    session.reset()
+    assert result["ok"] is True, result
+    assert mock_run.call_args.args[0] == out["graph"], "ran some other graph"
+    assert any("mission_start" in n for n in result["interpreted"])
+
+
+def test_mission_start_run_id_is_startable_and_then_visible_to_dag_status(monkeypatch, tmp_path):
+    """The run_id mission_start hands back must survive being used verbatim.
+
+    dag_run(run_id="mission") is the call the live trace made twice; dag_status(
+    run_id="mission") is the one it made in between.  All three now agree.
+    """
+    from services.dag import session
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    session.reset()
+    tools = _dag_tools()
+    out = _compiled_mission(_mission_start())
+    gid = out["run_id"]
+
+    # Before execution: planned, not started -- and the error says exactly that
+    # instead of implying the id is wrong.
+    pre = json.loads(tools["dag_status"](run_id=gid))
+    assert pre["ok"] is False
+    assert "PLANNED but has not been started" in pre["reason"]
+    assert pre["next_actions"] == [f"dag_run(run_id={gid!r})"]
+
+    started = json.loads(tools["dag_run"](run_id=gid, autonomy_default="approve"))
+    try:
+        assert started["ok"] is True, started
+        assert started["run_id"] == gid
+        post = json.loads(tools["dag_status"](run_id=gid))
+        assert post["ok"] is True, post
+        assert post["node_count"] == len(out["graph"]["nodes"])
+        assert post["gate_pending_known"] is True
+    finally:
+        session.reset()
+
+
+# ===========================================================================
 # Bounce on meaning, never on boilerplate.
 #
 # Live 2026-07-30 (run-4530697933837, OptiPlex case, K3): the model authored a

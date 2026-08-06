@@ -120,9 +120,14 @@ def test_dag_run_starts_new_run():
     mock_run.assert_called_once()
 
 
-def test_dag_run_resumes_with_run_id():
+def test_dag_run_resumes_with_run_id(tmp_path, monkeypatch):
+    """A run_id whose checkpoint EXISTS is a resume."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     tools = _build_clients()
     rid = str(uuid.uuid4())
+    runs = tmp_path / "Chudware" / "runs"
+    runs.mkdir(parents=True)
+    (runs / f"{rid}.db").write_bytes(b"")     # the checkpoint dag_run looks for
     resume_result = _done_result(run_id=rid)
     with patch("services.dag.executor.resume", return_value=resume_result) as mock_resume:
         raw = tools["dag_run"](graph_json=_MINIMAL_GRAPH, run_id=rid)
@@ -130,6 +135,25 @@ def test_dag_run_resumes_with_run_id():
     assert result["ok"] is True
     assert result["run_id"] == rid
     mock_resume.assert_called_once()
+
+
+def test_dag_run_starts_under_a_run_id_with_no_checkpoint(tmp_path, monkeypatch):
+    """A run_id with NO checkpoint is a first start under that id, not a resume.
+
+    mission_start hands back run_id="mission" for a graph that has never
+    executed; routing that to executor.resume() answered the tool's own
+    documented sequence with "Run not found" (live 2026-08-06).
+    """
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    tools = _build_clients()
+    with patch("services.dag.executor.run", return_value=_done_result(run_id="mission")) as mock_run, \
+         patch("services.dag.executor.resume") as mock_resume:
+        result = json.loads(tools["dag_run"](graph_json=_MINIMAL_GRAPH, run_id="mission"))
+    assert result["ok"] is True
+    assert result["run_id"] == "mission"
+    mock_resume.assert_not_called()
+    assert mock_run.call_args.kwargs["run_id"] == "mission"
+    assert any("started a NEW run under that id" in n for n in result["interpreted"])
 
 
 def test_dag_run_paused_includes_interrupted():
@@ -153,12 +177,16 @@ def test_dag_run_executor_error_returns_ok_false():
     assert "reason" in result
 
 
-def test_dag_run_not_found_returns_ok_false():
+def test_dag_run_not_found_returns_ok_false(tmp_path, monkeypatch):
+    """resume() losing its DB mid-flight is still ok=False, not a crash."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     tools = _build_clients()
     rid = str(uuid.uuid4())
+    runs = tmp_path / "Chudware" / "runs"
+    runs.mkdir(parents=True)
+    (runs / f"{rid}.db").write_bytes(b"")   # exists at dispatch, gone by resume
     with patch("services.dag.executor.resume", side_effect=FileNotFoundError("no db")):
-        raw = tools["dag_run"](graph_json=_MINIMAL_GRAPH, run_id=rid)
-        result = json.loads(raw)
+        result = json.loads(tools["dag_run"](graph_json=_MINIMAL_GRAPH, run_id=rid))
     assert result["ok"] is False
 
 
@@ -208,6 +236,40 @@ def test_dag_status_returns_gate_pending_and_status_keys():
     assert "gate_pending" in result, "dag_status must return gate_pending flag (DoD)"
     assert "status" in result, "dag_status must return run state (DoD)"
     assert "node_ids" in result, "dag_status must return current node IDs (DoD)"
+
+
+def test_dag_status_gate_pending_is_null_when_unobserved_and_true_when_paused():
+    """gate_pending must never be a made-up boolean.
+
+    It was hardcoded False with a "conservative" comment, so a run sitting at a
+    gate reported `gate_pending: false` — indistinguishable from an observation
+    that no gate is pending, on the one field that decides whether the caller
+    calls dag_approve.
+    """
+    from services.dag import session
+    tools = _build_clients()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        rid = str(uuid.uuid4())
+        (tmp / f"{rid}.db").write_bytes(b"")
+        (tmp / f"{rid}.graph.json").write_text(json.dumps(_MINIMAL_GRAPH), encoding="utf-8")
+
+        session.RUNS.pop(rid, None)          # nothing in this process ran it
+        unobserved = json.loads(tools["dag_status"](run_id=rid, runs_dir=tmpdir))
+        assert unobserved["gate_pending"] is None
+        assert unobserved["gate_pending_known"] is False
+        assert unobserved["status"] == "unknown_after_restart"
+
+        session.remember_result(_paused_result(run_id=rid))
+        try:
+            observed = json.loads(tools["dag_status"](run_id=rid, runs_dir=tmpdir))
+        finally:
+            session.RUNS.pop(rid, None)
+    assert observed["gate_pending"] is True
+    assert observed["gate_pending_known"] is True
+    assert observed["status"] == "paused"
+    assert observed["gate_nodes"] == ["gate1"]
+    assert any("dag_approve" in a for a in observed["next_actions"])
 
 
 # ---------------------------------------------------------------------------

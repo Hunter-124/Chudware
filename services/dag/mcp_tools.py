@@ -38,6 +38,8 @@ from typing import Annotated, Any, Optional
 
 from pydantic import Field
 
+from services.dag import session
+
 # Var-keyword parameters below are annotated ``Annotated[Any, Field(default=None)]``
 # rather than left bare.  FastMCP's func_metadata turns a bare ``**kwargs`` into a
 # REQUIRED pydantic field literally named "kwargs", which makes every FastMCP call —
@@ -124,7 +126,10 @@ _MAX_INTERPRETED_NOTES = 12
 
 # Session memory so a plan → run → status chain does not force the model to
 # copy UUIDs and whole graph documents back and forth.  Reuse is always echoed.
-_LAST: dict[str, Any] = {"graph_json": None, "graph_from": "", "run_id": ""}
+# The slot itself lives in services.dag.session because mission_start and
+# MissionDispatch.dag_plan also PRODUCE plans; a dict private to this module
+# made their graphs invisible to dag_run.  This is the same object, not a copy.
+_LAST: dict[str, Any] = session.LAST
 
 
 def _interpreted_notes(notes: list) -> list:
@@ -274,8 +279,14 @@ def _coerce_graph(val: Any, notes: list) -> tuple[dict | None, str]:
 
 
 def _remember_run(run_id: Any) -> None:
-    if isinstance(run_id, str) and run_id:
-        _LAST["run_id"] = run_id
+    session.remember_run(run_id)
+
+
+def _remember_result(result: Any) -> None:
+    """Record both the run id and the live gate state an executor return revealed."""
+    if isinstance(result, dict):
+        session.remember_run(result.get("run_id"))
+        session.remember_result(result)
 
 
 def _resolve_run_id(kwargs: dict, tool: str, notes: list) -> tuple[str, str]:
@@ -527,9 +538,7 @@ def register_dag_tools(mcp) -> None:
         graph_json_out = node_output.get("data", {}).get("agent_result") or {}
 
         _remember_run(result.get("run_id"))
-        if isinstance(graph_json_out, dict) and graph_json_out.get("nodes"):
-            _LAST["graph_json"] = graph_json_out
-            _LAST["graph_from"] = str(result.get("run_id") or "")
+        session.remember_graph(graph_json_out, source=str(result.get("run_id") or ""))
 
         out: dict[str, Any] = {
             "ok": True,
@@ -566,13 +575,19 @@ def register_dag_tools(mcp) -> None:
           paused run (executor.resume()).  This is the same surface as dag_approve
           but without fixing the decision — pass decision="approve"|"reject" via
           dag_approve / dag_abort instead when you want to resume a gate.
+        - If run_id is supplied and NO checkpoint exists yet, the run is STARTED
+          under that id (echoed as `interpreted`).  mission_start hands back
+          run_id="mission" for a graph that has never run, so treating a named
+          first start as a failed resume made the compiled mission unreachable.
 
-        WHERE THE GRAPH COMES FROM: dag_plan produces it.  The normal sequence is
-            p = dag_plan(brief="...")
-            dag_run(graph_json=p["graph_json"])
+        WHERE THE GRAPH COMES FROM: dag_plan or mission_start produces it.  The
+        normal sequences are
+            p = dag_plan(brief="...")            ->  dag_run(graph_json=p["graph_json"])
+            m = mission_start(request=..., manifest=...)
+                                                ->  dag_run(graph_json=m["graph"])
         Calling dag_run() with no graph reuses the graph from the most recent
-        dag_plan in this session (and says so in `interpreted`); if nothing has
-        been planned yet, it is an error telling you to call dag_plan first.
+        dag_plan OR mission_start in this session (and says so in `interpreted`);
+        if nothing has been planned yet, it is an error naming both producers.
 
         ACCEPTED GRAPH FORMS (every rewrite is echoed as `interpreted`):
           graph_json={...}                  the aicad.dag/1 object itself
@@ -652,12 +667,12 @@ def register_dag_tools(mcp) -> None:
                     )
 
         if graph_json is None:
-            remembered = _LAST["graph_json"]
+            remembered = session.planned_graph()
             if remembered:
                 graph_json = remembered
                 notes.append(
                     "graph_json was not supplied — reused the graph produced by the most "
-                    f"recent dag_plan in this session (run {_LAST['graph_from']!r}). "
+                    f"recent dag_plan/mission_start in this session ({session.planned_from()!r}). "
                     "Pass graph_json= explicitly to run a different graph."
                 )
             else:
@@ -665,15 +680,17 @@ def register_dag_tools(mcp) -> None:
                     "dag_run needs graph_json — an aicad.dag/1 graph document — and no "
                     "graph has been planned in this session yet.",
                     hint=(
-                        "dag_plan is the tool that PRODUCES a graph. Two calls:\n"
+                        "Two tools PRODUCE a graph; either one makes dag_run runnable:\n"
                         "  1. p = dag_plan(brief=\"Design an aluminium bracket and run an "
-                        "interference check\")\n"
-                        "  2. dag_run(graph_json=p[\"graph_json\"])\n"
+                        "interference check\")  ->  dag_run(graph_json=p[\"graph_json\"])\n"
+                        "  2. m = mission_start(request=..., manifest=...)  ->  "
+                        "dag_run(graph_json=m[\"graph\"])\n"
                         "Hand-authoring one instead? graph_json={\"schema\": \"aicad.dag/1\", "
                         "\"id\": \"m1\", \"name\": \"Mission\", \"nodes\": [...], \"edges\": [...]} "
                         "— a JSON string of that object is accepted too."
                     ),
-                    next_actions=["dag_plan(brief='<what you want built>')"],
+                    next_actions=["dag_plan(brief='<what you want built>')",
+                                  "mission_start(request='<the ask>', manifest=<aicad.deliverables/1>)"],
                 )
 
         graph_json, coerce_error = _coerce_graph(graph_json, notes)
@@ -684,8 +701,20 @@ def register_dag_tools(mcp) -> None:
                       "graph_json straight through."),
             )
 
+        # A run_id naming a run that has never checkpointed is a FIRST START under
+        # a chosen id, not a resume of something missing.  mission_start returns
+        # run_id="mission" for a freshly compiled graph, so routing that to
+        # executor.resume() answered the documented sequence with "Run not found".
+        starting_named = bool(run_id) and not (_runs_dir() / f"{run_id}.db").exists()
+        if starting_named:
+            notes.append(
+                f"run_id={run_id!r} has no checkpoint yet — started a NEW run under that "
+                "id instead of resuming. Pass a run_id from a previous dag_run response "
+                "to resume one."
+            )
+
         try:
-            if run_id:
+            if run_id and not starting_named:
                 result = executor.resume(
                     run_id,
                     graph_json=graph_json,
@@ -695,6 +724,7 @@ def register_dag_tools(mcp) -> None:
                 result = executor.run(
                     graph_json,
                     initial_state=initial_state or {},
+                    run_id=run_id or None,
                     autonomy_default=autonomy_default,
                 )
         except FileNotFoundError as exc:
@@ -712,7 +742,7 @@ def register_dag_tools(mcp) -> None:
                 graph_keys=sorted(graph_json) if isinstance(graph_json, dict) else None,
             )
 
-        _remember_run(result.get("run_id"))
+        _remember_result(result)
         interrupted = result.get("interrupted", [])
         out: dict[str, Any] = {
             "ok": True,
@@ -763,8 +793,13 @@ def register_dag_tools(mcp) -> None:
 
         Returns:
             {ok, run_id, db_exists, graph_name, node_count, node_ids,
-             gate_pending, status, checkpoint_db}
-            gate_pending: True when the run is currently suspended at a gate.
+             gate_pending, gate_pending_known, status, checkpoint_db}
+            gate_pending is TRI-STATE: true / false when this process ran or resumed
+            the run (then gate_pending_known is true and gate_nodes names the gates),
+            and null when it did not — a run started before a restart or in another
+            process is genuinely unknown, never reported as false.
+            A run_id that was planned but never executed says so, and points at
+            dag_run rather than listing unrelated run ids.
             On unknown run: {ok: false, reason, hint, known_run_ids}.
         """
         kwargs.pop("kwargs", None)   # FastMCP var-kw placeholder
@@ -795,6 +830,21 @@ def register_dag_tools(mcp) -> None:
         info = _load_run_status(run_id, base)
         if info is None:
             known = _known_run_ids(base)
+            planned = session.planned_graph()
+            if planned is not None and run_id in (session.planned_from(),
+                                                  str(planned.get("id") or "")):
+                # The id is real, the run just has not been executed yet.  Listing
+                # five unrelated run ids here (live 2026-08-06) told the model its
+                # own mission id was wrong and sent it hunting for a different one.
+                return _err(
+                    f"Run {run_id!r} is PLANNED but has not been started — nothing has "
+                    f"executed it yet, so there is no {run_id}.db to report on.",
+                    hint=(f"Start it: dag_run(run_id={run_id!r}) runs the graph already "
+                          "planned in this session under that id. Then dag_status "
+                          f"(run_id={run_id!r}) will report node state."),
+                    planned_node_count=len(planned.get("nodes") or []),
+                    next_actions=[f"dag_run(run_id={run_id!r})"],
+                )
             return _err(
                 f"Run {run_id!r} not found — no {run_id}.db under {base}",
                 hint=(
@@ -812,11 +862,14 @@ def register_dag_tools(mcp) -> None:
         nodes = graph.get("nodes", [])
         node_ids = [n["id"] for n in nodes]
 
-        # Determine gate_pending: if the checkpoint DB exists but we have no in-memory
-        # interrupted state (we don't after restart), we report gate_pending as unknown.
-        # The only reliable gate_pending signal is from the in-process run/resume return.
-        # We conservatively report False here; the caller should check dag_run's "interrupted".
-        gate_pending_flag = False  # see NOTE above
+        # gate_pending used to be hardcoded False and commented as "conservative".
+        # It is not conservative: `"gate_pending": false` on a run sitting at a gate
+        # reads as "nothing to approve", and the caller's next decision is exactly
+        # whether to call dag_approve. Whoever ran or resumed the run in THIS
+        # process recorded what it saw; use that. Cross-restart it is genuinely
+        # unknown, and unknown is reported as null plus gate_pending_known=false —
+        # never as a boolean the reader cannot tell apart from an observation.
+        observed = session.run_result(run_id)
 
         out: dict[str, Any] = {
             "ok": True,
@@ -825,19 +878,36 @@ def register_dag_tools(mcp) -> None:
             "graph_name": graph.get("name", ""),
             "node_count": len(nodes),
             "node_ids": node_ids,
-            "gate_pending": gate_pending_flag,
-            "status": "unknown_after_restart",
+            "gate_pending": observed["gate_pending"] if observed else None,
+            "gate_pending_known": observed is not None,
+            "status": observed["status"] if observed else "unknown_after_restart",
             "checkpoint_db": info["checkpoint_db"],
-            "hint": (
-                "Per-node status is available in the same session as dag_run/dag_approve. "
-                "For cross-restart status, call dag_run with the same run_id to resume and "
-                "see the current interrupted/status fields."
-            ),
-            "next_actions": [
-                f"dag_approve(run_id='{run_id}')  # if the run is gate-paused",
-                f"dag_abort(run_id='{run_id}')    # to cancel the run",
-            ],
         }
+        if observed:
+            out["gate_nodes"] = observed["gates"]
+            out["hint"] = (
+                f"Observed in this session: status={observed['status']!r}, "
+                + (f"paused at {', '.join(observed['gates']) or 'a gate'} — "
+                   "dag_approve to continue, dag_abort to cancel."
+                   if observed["gate_pending"] else
+                   "not waiting at a gate.")
+            )
+            out["next_actions"] = (
+                [f"dag_approve(run_id='{run_id}')", f"dag_abort(run_id='{run_id}')"]
+                if observed["gate_pending"] else
+                [f"mission_status(run_id='{run_id}')"]
+            )
+        else:
+            out["hint"] = (
+                "This process never ran this run, so whether it is gate-paused is "
+                "UNKNOWN (gate_pending is null, not false). Per-node status lives in "
+                "the session that called dag_run/dag_approve; to learn the current "
+                "state, resume it with dag_run(run_id=...) and read interrupted/status."
+            )
+            out["next_actions"] = [
+                f"dag_run(run_id='{run_id}')  # resume and report real status",
+                f"dag_abort(run_id='{run_id}')    # to cancel the run",
+            ]
         if notes:
             out["interpreted"] = _interpreted_notes(notes)
         return _dumps(out)
@@ -909,7 +979,7 @@ def register_dag_tools(mcp) -> None:
                       "autonomy_default='approve'."),
             )
 
-        _remember_run(result.get("run_id"))
+        _remember_result(result)
         interrupted = result.get("interrupted", [])
         out: dict[str, Any] = {
             "ok": True,
@@ -995,7 +1065,7 @@ def register_dag_tools(mcp) -> None:
                       "run cannot be aborted."),
             )
 
-        _remember_run(result.get("run_id"))
+        _remember_result(result)
         out = {
             "ok": True,
             "run_id": result["run_id"],
@@ -1182,6 +1252,7 @@ def register_dag_replan_tools(mcp) -> None:
             return _err(f"Resume after replan failed: {exc}",
                         hint="Check that the run is currently paused at a gate.")
 
+        _remember_result(result)
         spliced_ids = [n["id"] for n in splice_nodes]
         interrupted = result.get("interrupted", [])
         out: dict[str, Any] = {

@@ -531,17 +531,73 @@ class MissionDispatch:
 
         Inside a running mission dag_plan does not recursively re-plan; to change
         the plan, emit a replan_request in your handoff.
+
+        The reply carries the plan in BOTH shapes: ``graph`` is the cheap
+        role-per-node summary to read, ``graph_json`` is the executable
+        aicad.dag/1 document dag_run wants.  It used to carry only the summary —
+        which strips inputs/end_condition/on_fail/autonomy, so it is not a graph
+        the executor would accept — while still answering ``ok: True`` with
+        "mission plan already compiled".  dag_run, reading its own module-private
+        session slot, simultaneously said no graph had been planned.  Live
+        2026-08-06 (run-92188923731943) the model believed both and burned the
+        rest of the turn alternating between them.  A plan bound to this mission
+        is registered in the shared session slot here, so a bare ``dag_run()``
+        executes THIS graph.
+
+        With nothing bound, the reply says so rather than claiming a compiled
+        plan.  A graph planned elsewhere in this process is reported under
+        ``planned_in_session`` with its provenance — never relabelled as this
+        mission's, since one hostd serves many sessions.
         """
-        out: dict[str, Any] = {"ok": True, "run_id": self.run_id,
-                               "note": ("mission plan already compiled; to change it, "
-                                        "emit a replan_request in your handoff")}
-        if self.graph:
+        graph = self.graph
+        out: dict[str, Any] = {"ok": True, "run_id": self.run_id}
+        if graph:
             nodes = [{"id": n.get("id"), "type": n.get("type"), "name": n.get("name"),
                       "role": (n.get("inputs") or {}).get("role")}
-                     for n in self.graph.get("nodes", [])]
-            out["graph"] = {"id": self.graph.get("id"), "name": self.graph.get("name"),
-                            "nodes": nodes, "edges": self.graph.get("edges", [])}
-        elif self.ledger is not None:
+                     for n in graph.get("nodes", [])]
+            source = str(self.run_id or "")
+            out["note"] = ("mission plan already compiled; to change it, "
+                           "emit a replan_request in your handoff")
+            out["graph"] = {"id": graph.get("id"), "name": graph.get("name"),
+                            "nodes": nodes, "edges": graph.get("edges", [])}
+            out["graph_json"] = graph
+            try:
+                from services.dag import session as _dag_session  # noqa: PLC0415
+                _dag_session.remember_graph(graph, source=source)
+                out["next_actions"] = [f"dag_run(run_id={source!r})"] if source else ["dag_run()"]
+                out["hint"] = ("dag_run() with no arguments executes this graph — you do "
+                               "not need to copy graph_json back.")
+            except Exception:  # noqa: BLE001 — plan reporting must not break dispatch
+                out["next_actions"] = ["dag_run(graph_json=<result.graph_json>)"]
+            return out
+        # Nothing bound to THIS mission.  Say so instead of claiming a compiled
+        # plan, and never re-label another mission's graph as this one's: one
+        # long-lived hostd serves many sessions, so the session slot is not
+        # evidence about this run.  It IS worth reporting that a graph exists and
+        # what would execute it, with its provenance attached.
+        out["note"] = ("this mission has no compiled DAG graph bound — mission_start "
+                       "(with an aicad.deliverables/1 manifest) is what compiles one; "
+                       "to change an existing plan, emit a replan_request in your handoff")
+        out["next_actions"] = ["mission_start(request='<the ask>', "
+                               "manifest=<aicad.deliverables/1>)"]
+        try:
+            from services.dag import session as _dag_session  # noqa: PLC0415
+            planned = _dag_session.planned_graph()
+            if planned:
+                origin = _dag_session.planned_from() or str(planned.get("id") or "")
+                out["planned_in_session"] = {
+                    "source": origin,
+                    "graph_id": planned.get("id"),
+                    "graph_name": planned.get("name"),
+                    "node_count": len(planned.get("nodes") or []),
+                    "note": ("planned elsewhere in this process (not bound to this "
+                             "mission run) — dag_run() would execute THIS graph"),
+                }
+                out["next_actions"] = [f"dag_run(run_id={origin!r})" if origin else "dag_run()",
+                                       *out["next_actions"]]
+        except Exception:  # noqa: BLE001 — plan reporting must not break dispatch
+            pass
+        if self.ledger is not None:
             out["stage_log"] = self.ledger.state.get("stage_log")
         return out
 

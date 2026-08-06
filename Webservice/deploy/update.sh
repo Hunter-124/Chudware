@@ -98,7 +98,11 @@ if [[ "$DO_PULL" = 1 ]]; then
   AFTER="$(git rev-parse --short HEAD)"
   echo "    HEAD $BEFORE -> $AFTER"
   if [[ "$BEFORE" != "$AFTER" ]]; then
-    git log --oneline "$BEFORE..$AFTER" | head -30
+    # -n 30, NOT `| head -30`: under `set -euo pipefail` a truncating head closes the
+    # pipe, git log dies of SIGPIPE (141), and the whole deploy aborts right here — after
+    # the tree moved but before anything was rebuilt. Silent, and only ever on a big
+    # catch-up pull (>30 commits), which is exactly when you need the rebuild most.
+    git log --oneline -n 30 "$BEFORE..$AFTER"
   fi
 fi
 

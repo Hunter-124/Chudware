@@ -187,8 +187,11 @@ if [ "$RESTART" = 1 ]; then
         if [ "$RUNNING" = 1 ]; then
             waited=0
             while [ "$waited" -lt "$MAXW" ]; do
+                # `|| true`: pipefail turns an unreachable gateway (curl -f non-zero) into a
+                # failed assignment, and set -e would abort the install BEFORE the restart —
+                # the opposite of the degrade this loop documents one line down.
                 n="$(curl -fs --max-time 3 "$GW/healthz" 2>/dev/null \
-                        | sed -n 's/.*"engine_bridges"[: ]*\([0-9]*\).*/\1/p')"
+                        | sed -n 's/.*"engine_bridges"[: ]*\([0-9]*\).*/\1/p')" || true
                 # Empty => gateway unreachable/old (no one can be connected) — restart now.
                 [ -z "$n" ] && break
                 [ "$n" = "0" ] && break

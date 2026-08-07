@@ -1818,16 +1818,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // GUI rework layout schema. The old imgui.ini can contain dock IDs/window
   // placements from pre-rework names, which restores the FeatureManager into
   // the center and leaves Viewport as a floating orphan. Use a versioned ini so
-  // stale dock layouts cannot override buildDefaultLayout. v4: overlay layout —
-  // stale v3 entries carry docked flags/placements for the now-floating
-  // FeatureManager/Copilot columns. v5 (manufacture overhaul): the CAM detail
-  // window moved OUT of the central node into a bottom split of it, so the 3D
-  // viewport stays visible while machining. A v4 ini pins "CAM" back into the
-  // central node and silently reinstates the old cover-the-viewport behavior —
-  // exactly the bug this change fixes — so the schema must roll. The ini is ALSO
-  // the columns' width persistence (ImGui saves floating windows' Pos/Size by
-  // name), so column width survives restarts with zero new code.
-  static std::string iniPath = appdataAppDir() + "/imgui_gui_v5.ini";
+  // stale dock layouts cannot override buildDefaultLayout. v4 introduced the
+  // full-bleed overlay columns; v5 moved CAM into a bottom dock split. v6 removes
+  // that split entirely: Manufacture keeps the native 3D viewport edge to edge,
+  // with its job/output controls in the pinned left column. Rolling the schema
+  // prevents a saved v5 "CAM" dock node from permanently stealing viewport space.
+  // The ini is also the columns' width persistence, so their sizes still survive
+  // restarts without a second settings path.
+  static std::string iniPath = appdataAppDir() + "/imgui_gui_v6.ini";
   io.IniFilename = shot ? nullptr : iniPath.c_str();
 
   float xs = 1.0f, ys = 1.0f;
@@ -5907,20 +5905,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // bar) ----------
     const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
     const float dockTopY = barH + ribbonH;
-    // Publish the overlay band (the full-width viewport region the pinned glass
-    // columns anchor to) BEFORE any panel draws — drawLeftPane (layout.cpp) and
-    // the Copilot column (ui/copilot/) read it via ui::overlayBand().
-    //
-    // The band STOPS at the docked CAM detail editor. Those columns are full-height
-    // overlays with no knowledge of the dockspace, so once CAM took a bottom split of
-    // the central node they painted straight over it (the Job Manager's "Generate
-    // G-code" footer landed on top of CAM's status strip, and the Copilot composer
-    // over its G-code pane). camDockTopY() is 0 whenever CAM is not docked-and-visible,
-    // which leaves every other workspace's band exactly as before.
-    float bandBottom = vp->Pos.y + vp->Size.y - statusH;
-    if (const float camTop = ui::camDockTopY())
-      if (camTop > vp->Pos.y + dockTopY && camTop < bandBottom)
-        bandBottom = camTop;
+    // Publish the full viewport overlay band BEFORE any panel draws —
+    // drawLeftPane (layout.cpp) and the Copilot column read it via
+    // ui::overlayBand(). Manufacture no longer owns a separate bottom CAM dock,
+    // so every viewport workspace uses the same uninterrupted band.
+    const float bandBottom = vp->Pos.y + vp->Size.y - statusH;
     ui::setOverlayBand(vp->Pos.x, vp->Pos.y + dockTopY, vp->Pos.x + vp->Size.x,
                        bandBottom);
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
@@ -5953,10 +5942,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // width/collapse state (one-shot flags consumed by drawLeftPane / the
       // Copilot column on their next draw).
       ui::resetOverlayColumns();
-      // Don't yank focus to the Viewport when the app opens straight into a
-      // non-3D workspace (ECAD board editor or the CAM Manufacture tab) — let
-      // that workspace's docked tab show.
-      if (!st.wantEcad && st.ribbonTab != AppState::RT_Manufacture)
+      // Electronics owns the central ECAD editor. Every other normal workspace,
+      // including Manufacture, uses the native viewport and should focus it after
+      // rebuilding the dock layout.
+      if (!st.wantEcad)
         st.wantFocusViewport = 6;
     }
     // W2 full-bleed: with PassthruCentralNode AND a window docked in the
@@ -6060,14 +6049,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                              : (st.leftPaneTab == ui::kLeftPaneSimulation
                                     ? ui::kLeftPaneFeatureManager
                                     : st.leftPaneTab);
-    // (cam-workspace overhaul) Manufacture no longer force-shows the floating
-    // CAM manager — the workspace's primary UI is the left CAM tree + the
-    // Manufacture ribbon; the panel is the double-click detail editor (see
-    // drawCamManager call below). Electronics workspace shows the ECAD editor
-    // as the primary body. In other workspaces, only show ECAD when an ECAD doc
-    // is actually open (ecadDocId set) or showPcbTools was explicitly triggered
-    // by a ribbon command. Do NOT let showPcbTools bleed from the Electronics
-    // workspace into Manufacture/Model/etc — clear it on exit.
+    // Manufacture is one integrated workspace: job/output controls live in the
+    // pinned left column, ribbon commands mutate that job, and every geometric
+    // preview is drawn in the native viewport. There is no separate CAM window.
+    // Electronics keeps ECAD as its primary body. Outside that workspace,
+    // discard a stray transient show request when no ECAD document owns it so
+    // the 2D editor never bleeds over Manufacture/Model/etc.
     if (ws != WS::Electronics && st.showPcbTools && st.ecadDocId.empty())
       st.showPcbTools = false;
     // The ECAD editor canvas + PCB Manager belong to the Electronics workspace
@@ -6216,14 +6203,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ui::drawEcadEditor(st); // Wave N: AI-ECAD 2D editor
     }
 
-    // ---- CAM detail panel ----
-    if (!wsFullBody) {
-      // The floating CAM panel is no longer the Manufacture workspace's primary
-      // UI (the left CAM tree + Manufacture ribbon are) — it is now the
-      // double-click DETAIL editor opened from the tree, so no per-frame
-      // camRequestFocus grab. Draw every frame (no-ops until opened).
-      ui::drawCamManager(st);
-    }
 
     // ---- full-body workspace renderers (PLM / PartsLibrary / AI) ----
     // These take the whole central region. They use drawViewportPanel's dock

@@ -1,5 +1,4 @@
-// CamPanel — the CAM workspace UI (tree + toolbar + backplot + sim + post), driving the
-// C++ core's cam_* RPCs. File-static singleton state; standalone dock window.
+// Integrated Manufacture/CAM workspace controls and native viewport overlay state.
 #include "imgui.h"
 
 #include "cam_panel.h"
@@ -8,24 +7,24 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <string>
 #include <vector>
+#include <utility>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
 
 #include "../../core/app_state.h"
-#include "../../ui_theme.h"    // ui::palette (opaque title-bar / border override for this window)
-#include "../../mesh.h"        // Mesh — playhead remnant-stock mesh
-#include "../feature_tree.h"   // fmRowPill / fmTreeIcon / fmSectionDivider — the ratified FM row
-                               // styling, reused so the Manufacture tree matches the FeatureManager
-#include "../metrics.h"        // ui::metrics — the single sizing authority; this file has no
-                               // raw pixel literals, every dimension comes from a cam* token
+#include "../../ui_theme.h"
+#include "../../mesh.h"
+#include "../feature_tree.h"
+#include "../metrics.h"
 
 namespace ui {
 
@@ -33,84 +32,134 @@ namespace {
 
 struct CamUI {
     CamMirror mirror;
-    std::string docId;                 // cam job doc id ("" = no job)
-    bool show = false;
-    bool floatForShot = false;         // shot-only: float the panel so a headless capture sees it
-    bool gcodeTabFocus = false;        // one-shot: select the G-code tab (a post just produced one)
-    bool backplot = true;              // draw toolpaths in the 3D viewport
+    std::string docId;
+    std::string sourceDocId;           // pinned Part doc used by every later extraction
+    std::string sourceModel;
+    nlohmann::json lastExtract;
+    bool backplot = true;
+    bool showStock = false;
     int selSetup = 0;
     int selOp = -1;
-    nlohmann::json lastExtract;        // last cam_extract_from_doc result (geometry source)
-    std::string sourceModel;           // display name of the part doc the job extracts from
+    int selTool = -1;
+    int selKind = 0;                   // 1=job 2=job setup 3=stock 4=setup 5=op 6=tool 7=model
+
     std::vector<std::string> dialects;
-    bool   dialectsInflight = false;   // async cam_post_dialects in flight (never re-fire)
-    double dialectsNextTry  = 0.0;     // failure cooldown: no retry before this ImGui::GetTime()
-    int postIdx = 0;
-    // Long cam_* RPCs (extract/generate/simulate/post) ride AsyncRpc so the GL thread never
-    // blocks. rpcInflight gates the ribbon/toolbar; callbacks run inside st.rpc.drain().
-    int  rpcInflight = 0;
-    int  rpcGen = 0;                   // bumped to drop stale callbacks after job switch
-    // Workspace-tree state (drawCamTreeBody — the Manufacture left column):
-    int  generatedRev = -1;            // mirror revision at the last successful cam_generate
-    int  genWarnings  = 0;             // warning count from that generate (op status)
-    bool flavorPopup  = false;         // ribbon "Flavor" clicked: open the dialect popup
-    int  selKind = 0;                  // visual tree selection: 0=none 1=job 2=jobsetup 3=stock
-                                       // 4=setup 5=op 6=tool 7=models
-    int  selTool = -1;                 // selected Tools row (selKind==6); separate from selOp
+    bool dialectsInflight = false;
+    double dialectsNextTry = 0.0;
+    int postIdx = -1;
+    bool flavorPopup = false;
+
+    int rpcInflight = 0;
+    int rpcGen = 0;                    // drops callbacks after a job switch
+    int generatedRev = -1;
+    int genWarnings = 0;
+    int pipeStage = 0;                 // 1/2/3 full pipeline; 4 sim-after-generate; 5 post-after
+
     std::string gcode;
-    std::string gcodePath;             // desktop temp .nc path (empty on web)
-    nlohmann::json sim;                // last cam_simulate result
-    std::string status;                // last action status / error
-    // Viewport playhead state (wave 3: animated material-removal sim in the 3D view)
-    std::vector<nlohmann::json> simFrames;  // aicad.cam_sim_frames/1 field dicts
-    std::vector<double> simFrameT;          // frame times (s), parallel to simFrames
-    bool framesClamped = false;
-    double playT = 0;                  // playhead time (s)
-    bool playing = false;
-    float playSpeed = 1.0f;
-    int curFrame = -1;                 // frame index currently uploaded as aux mesh
-    Mesh frameMesh;                    // built from simFrames[curFrame]
-    bool frameMeshValid = false;
-    int simGen = 0;                    // bumped on new sim/job — invalidates the aux mesh upload
-    bool showStock = false;            // stock box overlay
-    bool optGouge = true, optRapid = true, optHolder = false;
-    float optRes = 0.5f;
-    CamBackplot bpBefore, bpAfter;     // split backplot for the playhead scrub
-    double splitT = -1;                // playT the split was computed for
-    // Wave 4: pipeline runner (Generate -> Simulate -> Post chained over AsyncRpc).
-    int pipeStage = 0;                 // 0=idle 1=generate 2=simulate 3=post
-    // Wave 4: last cam_audit result for the G-code tab.
+    std::string gcodePath;
+    nlohmann::json sim;
     nlohmann::json audit;
     bool auditInflight = false;
-    // operation form buffers (selected op)
+    std::string status;
+
+    std::vector<nlohmann::json> simFrames;
+    std::vector<double> simFrameT;
+    bool framesClamped = false;
+    double playT = 0.0;
+    bool playing = false;
+    float playSpeed = 1.0f;
+    int curFrame = -1;
+    Mesh frameMesh;
+    bool frameMeshValid = false;
+    int simGen = 0;
+
+    bool optGouge = true;
+    bool optRapid = true;
+    bool optHolder = false;
+    float optRes = 0.5f;
+
     char opName[64] = "";
-    float fStepover = 0, fStepdown = 0, fStockLeave = 0, fFeed = 0, fRpm = 0;
-    float hTop = 0, hBottom = -5, hClear = 15, hRetract = 5;
-    int loadedOpFor = -1;
+    float fStepover = 0.0f, fStepdown = 0.0f, fStockLeave = 0.0f;
+    float fFeed = 0.0f, fRpm = 0.0f;
+    float hTop = 0.0f, hBottom = 0.0f, hClear = 0.0f, hRetract = 0.0f;
+    std::string loadedSetupId;
+    std::string loadedOpId;
+    int loadedOpRevision = -1;
 };
 CamUI g;
 
-bool camBusy() { return g.rpcInflight > 0; }
+bool camBusy() { return g.rpcInflight > 0 || g.auditInflight; }
 void camBeginRpc() { ++g.rpcInflight; }
 void camEndRpc() { if (g.rpcInflight > 0) --g.rpcInflight; }
 
-// fwd (pipeline chains: generate -> simulate -> post)
 void doSimulate(AppState& st);
 void doPost(AppState& st);
 
-// Active PART tab's doc id + display title. CAM extract always targets the part, not the job.
+void resetOpBuffers() {
+    g.loadedSetupId.clear();
+    g.loadedOpId.clear();
+    g.loadedOpRevision = -1;
+}
+
+void clearSimulationAndOutput() {
+    g.gcode.clear();
+    g.gcodePath.clear();
+    g.sim = nlohmann::json();
+    g.audit = nlohmann::json();
+    ++g.simGen;
+    g.simFrames.clear();
+    g.simFrameT.clear();
+    g.framesClamped = false;
+    g.playT = 0.0;
+    g.playing = false;
+    g.curFrame = -1;
+    g.frameMeshValid = false;
+}
+
+void clearDownstreamArtifacts() {
+    g.generatedRev = -1;
+    g.genWarnings = 0;
+    g.mirror.clearToolpaths();
+    clearSimulationAndOutput();
+}
+
+void syncPostIndex() {
+    g.postIdx = -1;
+    for (int i = 0; i < (int)g.dialects.size(); ++i) {
+        if (g.dialects[i] == g.mirror.post()) {
+            g.postIdx = i;
+            break;
+        }
+    }
+}
+
+// Resolve the pinned source Part. The first extraction pins the active Part; tab changes cannot
+// silently redirect later operation geometry to another document.
 bool activePartDoc(AppState& st, std::string& docId, std::string& title) {
+    if (!g.sourceDocId.empty()) {
+        for (const auto& tab : st.docTabs) {
+            if (tab.kind == AppState::DocTab::TabKind::Part && tab.docId == g.sourceDocId) {
+                docId = tab.docId;
+                title = tab.title.empty() ? tab.docId : tab.title;
+                return true;
+            }
+        }
+        g.status = "source part is no longer open";
+        return false;
+    }
     if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) {
         g.status = "no active part";
         return false;
     }
     const auto& tab = st.docTabs[st.activeTab];
-    if (tab.docId.empty()) {
-        g.status = "active tab is not a part";
+    if (tab.kind != AppState::DocTab::TabKind::Part || tab.docId.empty()) {
+        g.status = "active tab is not a Part document";
         return false;
     }
-    docId = tab.docId;
-    title = tab.title.empty() ? tab.docId : tab.title;
+    g.sourceDocId = tab.docId;
+    g.sourceModel = tab.title.empty() ? tab.docId : tab.title;
+    docId = g.sourceDocId;
+    title = g.sourceModel;
     return true;
 }
 
@@ -126,23 +175,30 @@ bool camCall(AppState& st, const char* method, const nlohmann::json& params, nlo
     return ok;
 }
 
-// Post-dialect list, fetched ONCE via the async rpc queue. This runs on per-frame draw paths
-// (drawCamManager / the Manufacture tree), so it must never issue a synchronous worker.call:
-// a failing worker would then be re-hit every frame from the GL thread (that pattern hard-froze
-// the app once — see commit 50a54308). Guards: in-flight flag + a 10s failure cooldown.
+// Async and cooldown-guarded: no worker call is issued from a per-frame draw path.
 void refreshDialects(AppState& st) {
     if (!g.dialects.empty() || g.dialectsInflight) return;
     if (ImGui::GetTime() < g.dialectsNextTry) return;
     g.dialectsInflight = true;
     st.rpc.call("cam_post_dialects", nlohmann::json::object(), [](const core::RpcResult& r) {
         g.dialectsInflight = false;
-        if (r.ok && r.result.contains("dialects"))
-            for (auto& d : r.result["dialects"]) g.dialects.push_back(d.value("id", std::string()));
-        if (g.dialects.empty()) g.dialectsNextTry = ImGui::GetTime() + 10.0;  // failed: cool down
+        if (r.ok && r.result.contains("dialects") && r.result["dialects"].is_array()) {
+            for (const auto& d : r.result["dialects"]) {
+                const std::string id = d.value("id", std::string());
+                if (!id.empty()) g.dialects.push_back(id);
+            }
+            syncPostIndex();
+        }
+        if (g.dialects.empty()) g.dialectsNextTry = ImGui::GetTime() + 10.0;
     });
 }
 
-void loadTree(const nlohmann::json& r) { g.mirror.loadTree(r); }
+void loadTree(const nlohmann::json& r) {
+    clearDownstreamArtifacts();
+    g.mirror.loadTree(r);
+    syncPostIndex();
+    resetOpBuffers();
+}
 
 bool ensureJob(AppState& st) {
     if (!g.docId.empty()) return true;
@@ -155,7 +211,21 @@ bool ensureJob(AppState& st) {
 
 nlohmann::json applyOps(AppState& st, const nlohmann::json& ops) {
     nlohmann::json r;
-    if (camCall(st, "cam_apply_ops", {{"doc_id", g.docId}, {"base_revision", -1}, {"ops", ops}}, r))
+    if (g.docId.empty()) {
+        g.status = "no CAM job";
+        return r;
+    }
+    if (camBusy()) {
+        g.status = "CAM busy — mutation not applied";
+        return r;
+    }
+    const int baseRevision = g.mirror.revision();
+    if (baseRevision < 0) {
+        g.status = "CAM tree has no revision";
+        return r;
+    }
+    if (camCall(st, "cam_apply_ops",
+                {{"doc_id", g.docId}, {"base_revision", baseRevision}, {"ops", ops}}, r))
         loadTree(r);
     return r;
 }
@@ -332,7 +402,7 @@ void addOperation(AppState& st, const std::string& type, int toolNumber) {
                 if (g.selSetup < 0 || g.selSetup >= (int)g.mirror.setups().size())
                     g.selSetup = (int)g.mirror.setups().size() - 1;
                 g.selOp = (int)g.mirror.setups()[g.selSetup].ops.size() - 1;
-                g.loadedOpFor = -1;
+                resetOpBuffers();
             }
         }
     };
@@ -363,14 +433,26 @@ void doGenerate(AppState& st) {
                        (r.err.empty() ? std::string("failed") : r.err);
             return;
         }
+        clearSimulationAndOutput();
         g.mirror.loadToolpaths(r.result);
-        int n = r.result.contains("toolpaths") ? (int)r.result["toolpaths"].size() : 0;
+        const int n = (r.result.contains("toolpaths") && r.result["toolpaths"].is_array())
+                          ? (int)r.result["toolpaths"].size() : 0;
         g.generatedRev = g.mirror.revision();
         g.genWarnings = (r.result.contains("warnings") && r.result["warnings"].is_array())
                             ? (int)r.result["warnings"].size() : 0;
         g.status = "generated " + std::to_string(n) + " toolpath(s)";
-        if (g.genWarnings > 0) g.status += " (" + std::to_string(g.genWarnings) + " warning)";
-        if (g.pipeStage == 1) { g.pipeStage = 2; doSimulate(*stp); }
+        if (g.genWarnings > 0)
+            g.status += " (" + std::to_string(g.genWarnings) + " warning)";
+        if (g.pipeStage == 1) {
+            g.pipeStage = 2;
+            doSimulate(*stp);
+        } else if (g.pipeStage == 4) {
+            g.pipeStage = 0;
+            doSimulate(*stp);
+        } else if (g.pipeStage == 5) {
+            g.pipeStage = 0;
+            doPost(*stp);
+        }
     });
 }
 
@@ -383,8 +465,13 @@ void doPipeline(AppState& st) {
 }
 
 void doSimulate(AppState& st) {
-    if (g.docId.empty()) return;
+    if (g.docId.empty()) { g.status = "no job"; return; }
     if (camBusy()) { g.status = "CAM busy"; return; }
+    if (g.generatedRev != g.mirror.revision()) {
+        g.pipeStage = 4;
+        doGenerate(st);
+        return;
+    }
     camBeginRpc();
     g.status = "simulating...";
     const int gen = g.rpcGen;
@@ -406,16 +493,23 @@ void doSimulate(AppState& st) {
                        (r.err.empty() ? std::string("failed") : r.err);
             return;
         }
-        g.sim = r.result;
         camAdoptSimResult(r.result);
         g.status = "simulated";
-        if (g.pipeStage == 2) { g.pipeStage = 3; doPost(*stp); }
+        if (g.pipeStage == 2) {
+            g.pipeStage = 3;
+            doPost(*stp);
+        }
     });
 }
 
 void doPost(AppState& st) {
-    if (g.docId.empty()) return;
+    if (g.docId.empty()) { g.status = "no job"; return; }
     if (camBusy()) { g.status = "CAM busy"; return; }
+    if (g.generatedRev != g.mirror.revision()) {
+        g.pipeStage = 5;
+        doGenerate(st);
+        return;
+    }
     const std::string dialect = currentDialect();
     camBeginRpc();
     g.status = "posting " + dialect + "...";
@@ -431,11 +525,9 @@ void doPost(AppState& st) {
                        (r.err.empty() ? std::string("failed") : r.err);
             return;
         }
+        g.audit = nlohmann::json();
         g.gcode = r.result.value("gcode", std::string());
         writeGcodeFile(dialect);
-        // The operator posted to GET the G-code — put it in front of them instead of leaving the
-        // panel on whichever tab happened to be active.
-        if (!g.gcode.empty()) g.gcodeTabFocus = true;
         if (g.pipeStage == 3) {
             g.pipeStage = 0;
             g.status = "pipeline done: generated + simulated + posted " + dialect;
@@ -444,7 +536,6 @@ void doPost(AppState& st) {
                        std::to_string(r.result.value("line_count", 0)) + " lines)";
         }
 #ifdef __EMSCRIPTEN__
-        // Web has no local path to hand the operator — offer the Blob download immediately.
         if (!g.gcode.empty()) downloadGcode();
 #endif
     });
@@ -460,18 +551,18 @@ void doFeedsAutofill(AppState& st) {
         return;
     }
     if (camBusy()) { g.status = "CAM busy"; return; }
-    const auto& op = g.mirror.setups()[g.selSetup].ops[g.selOp];
-    const auto& stock = g.mirror.setups()[g.selSetup].stock;
-    std::string material = stock.value("material", std::string("aluminum"));
+    const auto& setup = g.mirror.setups()[g.selSetup];
+    const auto& op = setup.ops[g.selOp];
+    const std::string setupIdentity = setup.id;
+    const std::string opIdentity = op.id;
+    const std::string material = setup.stock.value("material", std::string("aluminum"));
     camBeginRpc();
     const int gen = g.rpcGen;
     const std::string docId = g.docId;
     st.rpc.call("cam_feeds",
-                {{"doc_id", docId},
-                 {"setup_id", g.mirror.setups()[g.selSetup].id},
-                 {"tool_number", op.tool_number},
-                 {"material", material}},
-                [gen, docId, material](const core::RpcResult& r) {
+                {{"doc_id", docId}, {"setup_id", setupIdentity},
+                 {"tool_number", op.tool_number}, {"material", material}},
+                [gen, docId, setupIdentity, opIdentity, material](const core::RpcResult& r) {
         camEndRpc();
         if (gen != g.rpcGen || g.docId != docId) return;
         if (!r.ok) {
@@ -479,8 +570,14 @@ void doFeedsAutofill(AppState& st) {
                        (r.err.empty() ? std::string("failed") : r.err);
             return;
         }
-        auto num = [&](const char* k, float& dst) {
-            if (r.result.contains(k) && r.result[k].is_number()) dst = r.result[k].get<float>();
+        if (g.selSetup < 0 || g.selSetup >= (int)g.mirror.setups().size()) return;
+        const auto& selectedSetup = g.mirror.setups()[g.selSetup];
+        if (selectedSetup.id != setupIdentity || g.selOp < 0 ||
+            g.selOp >= (int)selectedSetup.ops.size() ||
+            selectedSetup.ops[g.selOp].id != opIdentity) return;
+        auto num = [&](const char* key, float& dst) {
+            if (r.result.contains(key) && r.result[key].is_number())
+                dst = r.result[key].get<float>();
         };
         num("rpm", g.fRpm);
         num("feed", g.fFeed);
@@ -490,10 +587,10 @@ void doFeedsAutofill(AppState& st) {
     });
 }
 
-// Wave 4e: deterministic G-code audit via the core cam_audit RPC.
+// Deterministic G-code audit via the core cam_audit RPC.
 void doAudit(AppState& st) {
     if (g.docId.empty()) { g.status = "no job"; return; }
-    if (g.auditInflight) return;
+    if (camBusy()) { g.status = "CAM busy"; return; }
     g.auditInflight = true;
     const int gen = g.rpcGen;
     const std::string docId = g.docId;
@@ -514,102 +611,51 @@ void doAudit(AppState& st) {
     });
 }
 
-// ---- 2D backplot canvas (top view) ----
-// A flat companion to the REAL backplot: the 3D viewport ABOVE this panel already draws the
-// classified segments with the playhead split (viewport_panel.cpp). Same palette roles here, so
-// the two read as one drawing — rapid / lead / plunge / cut / arc.
-void drawBackplot(AppState& /*st*/) {
-    const CamBackplot& bp = g.mirror.backplot();
-    const ui::Palette& pal = ui::palette;
-    const float pad = ui::metrics::camGutter();
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    avail.y = std::max(avail.y, ui::metrics::px(120.0f));
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y),
-                      ui::Palette::toU32(pal.statusBg), ui::metrics::camRowRound());
-    if (bp.empty()) {
-        // Purposeful empty state, centered in the canvas: name the next step instead of a void.
-        const char* msg = "No toolpaths yet — add operations on the Manufacture ribbon, then Generate.";
-        const ImVec2 tw = ImGui::CalcTextSize(msg);
-        dl->AddText(ImVec2(std::max(p0.x + pad, p0.x + (avail.x - tw.x) * 0.5f),
-                           p0.y + (avail.y - tw.y) * 0.5f),
-                    ui::Palette::toU32(pal.textDisabled), msg);
-        ImGui::Dummy(avail);
-        return;
-    }
-    float w = bp.maxx - bp.minx, h = bp.maxy - bp.miny;   // model millimetres, not pixels
-    if (w < 1e-3f) w = 1; if (h < 1e-3f) h = 1;
-    // The extents read-out gets its own band at the top; the drawing is then CENTERED in what is
-    // left (it used to be bottom-left anchored and ran straight through the read-out).
-    const float headH = ImGui::GetTextLineHeight() + ui::metrics::camHeadGap();
-    const float innerW = std::max(avail.x - 2.0f * pad, 1.0f);
-    const float innerH = std::max(avail.y - 2.0f * pad - headH, 1.0f);
-    const float s = std::min(innerW / w, innerH / h);
-    const float ox = p0.x + pad + (innerW - w * s) * 0.5f - bp.minx * s;
-    const float oy = p0.y + pad + headH + (innerH + h * s) * 0.5f + bp.miny * s;  // flip Y
-    auto line = [&](const std::vector<float>& v, const float col[4], float th) {
-        const ImU32 c = ui::Palette::toU32(col);
-        for (size_t i = 0; i + 5 < v.size(); i += 6) {
-            ImVec2 a(ox + v[i] * s, oy - v[i + 1] * s);
-            ImVec2 b(ox + v[i + 3] * s, oy - v[i + 4] * s);
-            dl->AddLine(a, b, c, th);
-        }
-    };
-    line(bp.rapid,  pal.camRapid,  ui::metrics::stroke(1.0f));
-    line(bp.lead,   pal.camLead,   ui::metrics::stroke(1.5f));
-    line(bp.plunge, pal.camPlunge, ui::metrics::stroke(1.5f));
-    line(bp.cut,    pal.camCut,    ui::metrics::stroke(1.6f));
-    line(bp.arc,    pal.camArc,    ui::metrics::stroke(1.6f));
-    char info[96];
-    std::snprintf(info, sizeof(info), "XY %.1f x %.1f mm   Z %.1f..%.1f", w, h, bp.minz, bp.maxz);
-    dl->AddText(ImVec2(p0.x + ui::metrics::camRowPadX(), p0.y + ui::metrics::camRowPadY()),
-                ui::Palette::toU32(pal.textDim), info);
-    ImGui::Dummy(avail);
+
+const nlohmann::json* simResultForSetup(const std::string& setupIdentity) {
+    if (!g.sim.contains("results") || !g.sim["results"].is_array()) return nullptr;
+    for (const auto& result : g.sim["results"])
+        if (result.value("setup_id", std::string()) == setupIdentity) return &result;
+    return nullptr;
 }
 
-void drawSimSummary() {
-    if (g.sim.empty() || !g.sim.contains("results")) { ImGui::TextDisabled("Run Simulate to see material removal + time."); return; }
-    for (auto& r : g.sim["results"]) {
-        ImGui::Separator();
-        ImGui::Text("Stock:      %.0f mm^3", r.value("stock_volume_mm3", 0.0));
-        ImGui::Text("Removed:    %.0f mm^3 (%.0f%%)", r.value("removed_volume_mm3", 0.0),
-                    100.0 * r.value("machined_fraction", 0.0));
-        ImGui::Text("Remaining:  %.0f mm^3", r.value("remaining_volume_mm3", 0.0));
-        double t = r.value("cycle_time_s", 0.0);
-        ImGui::Text("Cycle time: %dm %02ds", (int)(t / 60), (int)t % 60);
-        int gouges = r.value("gouges", 0), rapids = r.value("rapid_collisions", 0);
-        int holders = r.value("holder_collisions", 0);
-        if (gouges > 0) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1], ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
-            ImGui::Text("GOUGES: %d (max %.3f mm)", gouges, r.value("max_gouge_mm", 0.0)); ImGui::PopStyleColor(); }
-        if (rapids > 0) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1], ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
-            ImGui::Text("RAPID THROUGH STOCK: %d", rapids); ImGui::PopStyleColor(); }
-        if (holders > 0) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1], ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
-            ImGui::Text("HOLDER/SHANK COLLISIONS: %d", holders); ImGui::PopStyleColor(); }
-        if (gouges == 0 && rapids == 0 && holders == 0) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusOk[0], ui::palette.statusOk[1], ui::palette.statusOk[2], ui::palette.statusOk[3]));
-            ImGui::TextUnformatted("No gouges or rapid collisions."); ImGui::PopStyleColor(); }
+void drawSelectedSimEvidence() {
+    if (g.selSetup < 0 || g.selSetup >= (int)g.mirror.setups().size()) {
+        ImGui::TextDisabled("Select a setup to see verification evidence.");
+        return;
     }
+    const nlohmann::json* result = simResultForSetup(g.mirror.setups()[g.selSetup].id);
+    if (!result) {
+        ImGui::TextDisabled("Not verified — use Simulate on the ribbon.");
+        return;
+    }
+    const int gouges = result->value("gouges", 0);
+    const int rapids = result->value("rapid_collisions", 0);
+    const int holders = result->value("holder_collisions", 0);
+    const bool clean = gouges == 0 && rapids == 0 && holders == 0;
+    const float* color = clean ? ui::palette.statusOk : ui::palette.statusWarn;
+    ImGui::TextColored(ImVec4(color[0], color[1], color[2], color[3]),
+                       clean ? "Verified clean" : "Verification findings");
+    const double cycle = result->value("cycle_time_s", 0.0);
+    ImGui::TextDisabled("%.0f%% removed  |  %dm %02ds",
+                        100.0 * result->value("machined_fraction", 0.0),
+                        (int)(cycle / 60.0), (int)cycle % 60);
+    if (!clean)
+        ImGui::TextDisabled("gouge %d  rapid %d  holder %d", gouges, rapids, holders);
 }
 
 }  // namespace
 
 // ---- ribbon command handler ----
 void camHandleCommand(AppState& st, const std::string& cmd) {
-    // In the Manufacture WORKSPACE the CAM job tree (left column) + ribbon are the primary UI:
-    // commands fire silently against the tree selection and must NOT pop the floating detail
-    // panel. Everywhere else (e.g. the Manufacture ribbon tab from the Model workspace) keep the
-    // legacy behavior of revealing the panel.
-    const bool camWs = (st.activeWorkspace == AppState::Workspace::Manufacture);
-    if (!camWs) g.show = true;
     refreshDialects(st);
     if (cmd == "cam_show3d") {          // ribbon Output toggle: viewport backplot overlay
         g.backplot = !g.backplot;
         g.status = g.backplot ? "toolpaths shown in 3D" : "toolpaths hidden";
         return;
     }
-    if (cmd == "cam_flavor") {          // ribbon Output dropdown: pick the post dialect
-        if (camWs) g.flavorPopup = true;    // popup rendered by drawCamTreeBody (left column)
-        else       g.show = true;           // elsewhere: the panel's combo has the picker
+    if (cmd == "cam_flavor") {
+        g.flavorPopup = true;
         return;
     }
     if (cmd == "cam_set_stock") {
@@ -636,17 +682,20 @@ void camHandleCommand(AppState& st, const std::string& cmd) {
         return;
     }
     if (cmd == "cam_new_job") {
-        ++g.rpcGen;  // drop any in-flight extract/generate callbacks for the old job
+        ++g.rpcGen;
         g.docId.clear();
-        g.mirror.clear();
-        g.gcode.clear();
-        g.gcodePath.clear();
-        g.sim = nlohmann::json();
+        g.sourceDocId.clear();
+        g.sourceModel.clear();
         g.lastExtract = nlohmann::json();
-        g.generatedRev = -1;
-        g.genWarnings = 0;
-        ensureJob(st);
-        g.status = "new CAM job";
+        g.mirror.clear();
+        clearDownstreamArtifacts();
+        g.selTool = -1;
+        g.pipeStage = 0;
+        g.selSetup = 0;
+        g.selOp = -1;
+        g.selKind = 0;
+        resetOpBuffers();
+        if (ensureJob(st)) g.status = "new CAM job";
         return;
     }
     if (cmd == "cam_extract") {
@@ -673,21 +722,24 @@ void camHandleCommand(AppState& st, const std::string& cmd) {
     }
     if (cmd == "cam_add_setup") {
         if (!ensureJob(st)) return;
-        applyOps(st, nlohmann::json::array({nlohmann::json{
+        const nlohmann::json r = applyOps(st, nlohmann::json::array({nlohmann::json{
             {"op", "add_setup"},
             {"setup", {{"name", "Setup" + std::to_string(g.mirror.setups().size() + 1)},
                        {"machine", {{"kind", "mill3"}}},
-                       {"stock", {{"type", "box_offset"}, {"off_ztop", 1.0}, {"material", "aluminum"}}}}}}}));
-        g.selSetup = (int)g.mirror.setups().size() - 1;
+                       {"stock", {{"type", "box_offset"}, {"off_ztop", 1.0},
+                                  {"material", "aluminum"}}}}}}}));
+        if (r.contains("revision"))
+            g.selSetup = std::max(0, (int)g.mirror.setups().size() - 1);
         return;
     }
     if (cmd == "cam_add_tool") {
         if (!ensureJob(st)) return;
-        int n = (int)g.mirror.tools().size() + 1;
-        applyOps(st, nlohmann::json::array({nlohmann::json{
-            {"op", "add_tool"}, {"tool", {{"number", n}, {"type", "endmill_flat"}, {"diameter", 6}, {"flutes", 3},
-                                          {"name", "6mm flat endmill"}}}}}));
-        g.status = "added tool T" + std::to_string(n);
+        const int n = (int)g.mirror.tools().size() + 1;
+        const nlohmann::json r = applyOps(st, nlohmann::json::array({nlohmann::json{
+            {"op", "add_tool"},
+            {"tool", {{"number", n}, {"type", "endmill_flat"}, {"diameter", 6},
+                      {"flutes", 3}, {"name", "6mm flat endmill"}}}}}));
+        if (r.contains("revision")) g.status = "added tool T" + std::to_string(n);
         return;
     }
     if (cmd == "cam_generate") { doGenerate(st); return; }
@@ -713,9 +765,6 @@ void camHandleCommand(AppState& st, const std::string& cmd) {
 }
 
 const CamBackplot* camActiveBackplot() {
-    // No g.show gate anymore: in the Manufacture workspace the 3D viewport is the central body
-    // and the floating panel stays closed — the ribbon "Show in 3D" toggle (g.backplot) is the
-    // one switch for the overlay.
     if (!g.backplot || g.mirror.backplot().empty()) return nullptr;
     return &g.mirror.backplot();
 }
@@ -723,30 +772,37 @@ const CamBackplot* camActiveBackplot() {
 // Adopt a cam_simulate response: parse the selected setup's frames into the playhead state.
 // Called by doSimulate's async callback and by headless scenarios (sync worker.call path).
 void camAdoptSimResult(const nlohmann::json& result) {
+    g.sim = result;
     ++g.simGen;
-    g.simFrames.clear(); g.simFrameT.clear();
-    g.framesClamped = false; g.playT = 0; g.playing = false;
-    g.curFrame = -1; g.frameMeshValid = false; g.splitT = -1;
+    g.simFrames.clear();
+    g.simFrameT.clear();
+    g.framesClamped = false;
+    g.playT = 0.0;
+    g.playing = false;
+    g.curFrame = -1;
+    g.frameMeshValid = false;
     if (!result.contains("results") || !result["results"].is_array()) return;
     const nlohmann::json* pick = nullptr;
     const auto& results = result["results"];
     if (g.selSetup >= 0 && g.selSetup < (int)g.mirror.setups().size()) {
         const std::string& sid = g.mirror.setups()[g.selSetup].id;
-        for (const auto& e : results)
-            if (e.value("setup_id", std::string()) == sid) { pick = &e; break; }
+        for (const auto& entry : results)
+            if (entry.value("setup_id", std::string()) == sid) { pick = &entry; break; }
+    } else if (!results.empty()) {
+        pick = &results[0];
     }
-    if (!pick && !results.empty()) pick = &results[0];
-    if (pick && pick->contains("frames") && (*pick)["frames"].is_array()) {
-        for (const auto& f : (*pick)["frames"]) {
-            if (!f.contains("field") || !f.contains("t_s")) continue;
-            g.simFrames.push_back(f["field"]);
-            g.simFrameT.push_back(f["t_s"].get<double>());
-        }
-        g.framesClamped = pick->value("frames_clamped", false);
+    if (!pick || !pick->contains("frames") || !(*pick)["frames"].is_array()) return;
+    for (const auto& frame : (*pick)["frames"]) {
+        if (!frame.contains("field") || !frame.contains("t_s") ||
+            !frame["t_s"].is_number()) continue;
+        g.simFrames.push_back(frame["field"]);
+        g.simFrameT.push_back(frame["t_s"].get<double>());
     }
+    g.framesClamped = pick->value("frames_clamped", false);
 }
 
 void camAdoptToolpaths(const nlohmann::json& result) {
+    clearSimulationAndOutput();
     g.mirror.loadToolpaths(result);
     g.generatedRev = g.mirror.revision();
     g.genWarnings = (result.contains("warnings") && result["warnings"].is_array())
@@ -755,18 +811,7 @@ void camAdoptToolpaths(const nlohmann::json& result) {
 
 // ---- viewport playhead (wave 3) ----
 bool camSimHudActive() {
-    return g.backplot && !g.mirror.backplot().empty() && !g.simFrames.empty();
-}
-
-// Split backplot at the current playT, lazily re-splitting only when playT changed.
-const std::pair<const CamBackplot*, const CamBackplot*>& camBackplotSplit() {
-    static std::pair<const CamBackplot*, const CamBackplot*> out;
-    if (g.splitT != g.playT) {
-        g.mirror.backplot().splitAt(g.playT, g.bpBefore, g.bpAfter);
-        g.splitT = g.playT;
-    }
-    out = {&g.bpBefore, &g.bpAfter};
-    return out;
+    return g.backplot && !g.mirror.backplot().empty();
 }
 
 // Frame index for the current playT (lower_bound over frame times).
@@ -792,27 +837,52 @@ bool camFrameMeshFor(int idx) {
 }
 const Mesh& camFrameMesh() { return g.frameMesh; }
 
-// Tool pose at time t: walk the segment time arrays (cut/lead/plunge/arc; rapids first-fit).
+// Tool pose at global time t. Explicit starts keep interleaved move classes on one timeline.
 bool camToolPoseAt(double t, float outPos[3]) {
     const CamBackplot& bp = g.mirror.backplot();
-    auto walk = [&](const std::vector<float>& segs, const std::vector<float>& times) -> bool {
+    double bestPastEnd = -1.0;
+    double earliestFuture = std::numeric_limits<double>::infinity();
+    float past[3] = {0, 0, 0};
+    float future[3] = {0, 0, 0};
+    bool havePast = false, haveFuture = false;
+    auto walk = [&](const std::vector<float>& segs, const std::vector<float>& starts,
+                    const std::vector<float>& ends) {
         for (size_t i = 0; i + 5 < segs.size(); i += 6) {
-            double tEnd = (i / 6 < times.size()) ? times[i / 6] : 0;
-            double tStart = (i >= 6) ? times[i / 6 - 1] : 0.0;
-            if (t <= tEnd) {
-                double f = (tEnd > tStart) ? (t - tStart) / (tEnd - tStart) : 1.0;
+            const size_t segment = i / 6;
+            if (segment >= starts.size() || segment >= ends.size()) continue;
+            const double tStart = starts[segment];
+            const double tEnd = ends[segment];
+            if (t >= tStart && t <= tEnd) {
+                const double f = (tEnd > tStart)
+                                     ? std::max(0.0, std::min(1.0, (t - tStart) / (tEnd - tStart)))
+                                     : 1.0;
                 outPos[0] = segs[i]   + (segs[i+3] - segs[i])   * (float)f;
                 outPos[1] = segs[i+1] + (segs[i+4] - segs[i+1]) * (float)f;
                 outPos[2] = segs[i+2] + (segs[i+5] - segs[i+2]) * (float)f;
                 return true;
             }
+            if (tEnd <= t && tEnd > bestPastEnd) {
+                bestPastEnd = tEnd;
+                past[0] = segs[i+3]; past[1] = segs[i+4]; past[2] = segs[i+5];
+                havePast = true;
+            }
+            if (tStart > t && tStart < earliestFuture) {
+                earliestFuture = tStart;
+                future[0] = segs[i]; future[1] = segs[i+1]; future[2] = segs[i+2];
+                haveFuture = true;
+            }
         }
         return false;
     };
-    // prefer cutting geometry (the tool's working position)
-    if (walk(bp.cut, bp.cutT) || walk(bp.arc, bp.arcT) || walk(bp.lead, bp.leadT) ||
-        walk(bp.plunge, bp.plungeT) || walk(bp.rapid, bp.rapidT)) return true;
-    return false;
+    if (walk(bp.rapid, bp.rapidT0, bp.rapidT) ||
+        walk(bp.cut, bp.cutT0, bp.cutT) ||
+        walk(bp.lead, bp.leadT0, bp.leadT) ||
+        walk(bp.plunge, bp.plungeT0, bp.plungeT) ||
+        walk(bp.arc, bp.arcT0, bp.arcT)) return true;
+    const float* hold = havePast ? past : (haveFuture ? future : nullptr);
+    if (!hold) return false;
+    outPos[0] = hold[0]; outPos[1] = hold[1]; outPos[2] = hold[2];
+    return true;
 }
 
 double camPlayTotalTime() {
@@ -820,97 +890,120 @@ double camPlayTotalTime() {
 }
 double camPlayT() { return g.playT; }
 
-bool camStockBoxVisible() { return g.showStock && g.selSetup >= 0 &&
-                                  g.selSetup < (int)g.mirror.setups().size(); }
-
-// 12 edges of the selected setup's box stock (world mm); false when the stock isn't a box.
-bool camStockBoxSegments(std::vector<float>& out) {
-    if (g.selSetup < 0 || g.selSetup >= (int)g.mirror.setups().size()) return false;
-    const nlohmann::json& stock = g.mirror.setups()[g.selSetup].stock;
-    if (!stock.contains("min") || !stock.contains("max")) return false;
-    const auto& mn = stock["min"]; const auto& mx = stock["max"];
-    if (!mn.is_array() || mn.size() < 3 || !mx.is_array() || mx.size() < 3) return false;
-    float x0 = mn[0].get<float>(), y0 = mn[1].get<float>(), z0 = mn[2].get<float>();
-    float x1 = mx[0].get<float>(), y1 = mx[1].get<float>(), z1 = mx[2].get<float>();
-    const float c[8][3] = {{x0,y0,z0},{x1,y0,z0},{x1,y1,z0},{x0,y1,z0},
-                           {x0,y0,z1},{x1,y0,z1},{x1,y1,z1},{x0,y1,z1}};
-    const int e[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},
-                          {0,4},{1,5},{2,6},{3,7}};
-    out.clear();
-    for (auto& edge : e) {
-        out.push_back(c[edge[0]][0]); out.push_back(c[edge[0]][1]); out.push_back(c[edge[0]][2]);
-        out.push_back(c[edge[1]][0]); out.push_back(c[edge[1]][1]); out.push_back(c[edge[1]][2]);
-    }
-    return true;
+bool camStockBoxVisible() {
+    return g.showStock && g.selSetup >= 0 &&
+           g.selSetup < (int)g.mirror.setups().size() &&
+           !g.mirror.setups()[g.selSetup].stockSegments.empty();
 }
 
-// Bottom-center transport bar over the viewport (drawn in screen space by viewport_panel).
-// This IS the simulation UI: playback happens in the 3D view, so the bar only carries transport
-// plus a read-out. Height comes from the frame metric, so it never mis-scales at HiDPI.
-void camDrawSimHud(AppState& st, const ImVec2& vpMin, const ImVec2& vpSize) {
-    if (!camSimHudActive()) return;
-    double total = g.mirror.backplot().totalTime;
-    if (total <= 0) return;
-    if (g.playing) {
+const std::vector<float>* camStockBoxSegments() {
+    if (!camStockBoxVisible()) return nullptr;
+    return &g.mirror.setups()[g.selSetup].stockSegments;
+}
+
+// Viewport-local telemetry and transport. Geometry is rendered exclusively by the native overlay.
+void camDrawViewportHud(AppState& /*st*/, const ImVec2& vpMin, const ImVec2& vpSize) {
+    if (g.docId.empty()) return;
+    const double total = g.mirror.backplot().totalTime;
+    if (g.playing && total > 0.0) {
         g.playT += ImGui::GetIO().DeltaTime * g.playSpeed;
-        if (g.playT >= total) { g.playT = total; g.playing = false; }
+        if (g.playT >= total) {
+            g.playT = total;
+            g.playing = false;
+        }
     }
-    const ImGuiStyle& sty = ImGui::GetStyle();
-    const float w = ui::metrics::px(420.0f);
-    const float h = ImGui::GetFrameHeight() + sty.WindowPadding.y * 2.0f;
-    ImVec2 pos(vpMin.x + (vpSize.x - w) * 0.5f,
-               vpMin.y + vpSize.y - h - ui::metrics::camSectionGap());
-    ImGui::SetNextWindowPos(pos);
-    ImGui::SetNextWindowSize(ImVec2(w, h));
-    ImGui::SetNextWindowBgAlpha(0.55f);
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
-                             ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
-    if (ImGui::Begin("##cam_sim_hud", nullptr, flags)) {
-        // Measure the trailing read-outs FIRST so the scrub slider can be given exactly the room
-        // that is left (the old hardcoded "w - 150" clipped them at any non-default font scale).
-        char tbuf[16];
-        std::snprintf(tbuf, sizeof(tbuf), "%d:%02d", (int)(g.playT / 60), (int)g.playT % 60);
-        double pct = 0;
-        if (!g.simFrameT.empty() && g.simFrameT.back() > 0)
-            pct = 100.0 * std::min(1.0, g.playT / g.simFrameT.back());
-        char pbuf[24];
-        std::snprintf(pbuf, sizeof(pbuf), "%.0f%%", pct);
+
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float gutter = ui::metrics::camGutter();
+    const float width = std::max(ui::metrics::camFieldW() * 2.0f,
+                                 std::min(vpSize.x - gutter * 2.0f,
+                                          ui::metrics::camFieldW() * 4.0f));
+    const float height = ImGui::GetFrameHeight() * 3.0f +
+                         style.ItemSpacing.y * 2.0f + style.WindowPadding.y * 2.0f;
+    ImGui::SetNextWindowPos(
+        ImVec2(vpMin.x + (vpSize.x - width) * 0.5f,
+               vpMin.y + vpSize.y - height - ui::metrics::camSectionGap()));
+    ImGui::SetNextWindowSize(ImVec2(width, height));
+    float bg[4], border[4];
+    ui::Palette::withAlpha(ui::palette.statusBg, bg, 0.88f);
+    ui::Palette::withAlpha(ui::palette.border, border, 0.9f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(bg[0], bg[1], bg[2], bg[3]));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(border[0], border[1], border[2], border[3]));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::metrics::camRowRound());
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, ui::metrics::stroke(1.0f));
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    if (ImGui::Begin("##cam_viewport_hud", nullptr, flags)) {
+        const std::string job = g.mirror.name().empty() ? "CAM Job" : g.mirror.name();
+        ImGui::TextUnformatted(job.c_str());
+        ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
+        ImGui::TextDisabled("rev %d  |  %s", g.mirror.revision(), currentDialect().c_str());
+        const nlohmann::json* evidence =
+            (g.selSetup >= 0 && g.selSetup < (int)g.mirror.setups().size())
+                ? simResultForSetup(g.mirror.setups()[g.selSetup].id) : nullptr;
+        ImGui::SameLine(0.0f, ui::metrics::camSectionGap());
+        if (!evidence) {
+            ImGui::TextColored(ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
+                                      ui::palette.statusWarn[2], ui::palette.statusWarn[3]),
+                               "UNVERIFIED");
+        } else {
+            const bool clean = evidence->value("gouges", 0) == 0 &&
+                               evidence->value("rapid_collisions", 0) == 0 &&
+                               evidence->value("holder_collisions", 0) == 0;
+            const float* color = clean ? ui::palette.statusOk : ui::palette.statusErr;
+            ImGui::TextColored(ImVec4(color[0], color[1], color[2], color[3]),
+                               clean ? "VERIFIED" : "FINDINGS");
+        }
+
+        auto legend = [](const char* label, const float color[4]) {
+            ImGui::TextColored(ImVec4(color[0], color[1], color[2], color[3]), "%s", label);
+            ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
+        };
+        legend("RAPID", ui::palette.camRapid);
+        legend("LEAD", ui::palette.camLead);
+        legend("PLUNGE", ui::palette.camPlunge);
+        legend("CUT", ui::palette.camCut);
+        legend("ARC", ui::palette.camArc);
+        ImGui::Checkbox("Path##cam_hud_path", &g.backplot);
+        ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
+        ImGui::Checkbox("Stock##cam_hud_stock", &g.showStock);
+
         const float speeds[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f};
         const char* labels[] = {"0.25x", "0.5x", "1x", "2x", "4x"};
-        int cur = 2;
+        int speedIndex = 2;
         for (int i = 0; i < IM_ARRAYSIZE(speeds); ++i)
-            if (std::fabs(speeds[i] - g.playSpeed) < 0.01f) cur = i;
-        const float speedW = ui::metrics::px(64.0f);
-        float tailW = ImGui::CalcTextSize(tbuf).x + speedW + ImGui::CalcTextSize(pbuf).x +
-                      sty.ItemSpacing.x * 3.0f;
-        if (g.framesClamped) tailW += ImGui::CalcTextSize("(!) clamped").x + sty.ItemSpacing.x;
-
-        if (ImGui::Button(g.playing ? "Pause" : "Play")) g.playing = !g.playing;
+            if (std::fabs(speeds[i] - g.playSpeed) < 0.01f) speedIndex = i;
+        if (total <= 0.0) ImGui::BeginDisabled();
+        if (ImGui::Button(g.playing ? "Pause" : "Play",
+                          ImVec2(0.0f, ui::metrics::camBtnH())))
+            g.playing = !g.playing;
+        ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
+        float playhead = (float)g.playT;
+        const float speedWidth = ui::metrics::camFieldW() * 0.55f;
+        const float telemetryWidth = ImGui::CalcTextSize("00:00 / 00:00  100%").x;
+        ImGui::SetNextItemWidth(-(speedWidth + telemetryWidth +
+                                  style.ItemSpacing.x * 3.0f));
+        if (ImGui::SliderFloat("##cam_viewport_time", &playhead, 0.0f, (float)total, ""))
+            g.playT = playhead;
         ImGui::SameLine();
-        float tf = (float)g.playT;
-        ImGui::SetNextItemWidth(-tailW);
-        if (ImGui::SliderFloat("##camt", &tf, 0.0f, (float)total, "")) g.playT = tf;
-        ImGui::SameLine();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(tbuf);
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(speedW);
-        if (ImGui::BeginCombo("##camspeed", labels[cur])) {
+        ImGui::SetNextItemWidth(speedWidth);
+        if (ImGui::BeginCombo("##cam_viewport_speed", labels[speedIndex])) {
             for (int i = 0; i < IM_ARRAYSIZE(speeds); ++i)
-                if (ImGui::Selectable(labels[i], i == cur)) g.playSpeed = speeds[i];
+                if (ImGui::Selectable(labels[i], i == speedIndex)) g.playSpeed = speeds[i];
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("%s", pbuf);
-        if (g.framesClamped) {
-            ImGui::SameLine();
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("(!) clamped");
-        }
+        const int percent = total > 0.0 ? (int)std::round(100.0 * g.playT / total) : 0;
+        ImGui::TextDisabled("%d:%02d / %d:%02d  %d%%",
+                            (int)(g.playT / 60.0), (int)g.playT % 60,
+                            (int)(total / 60.0), (int)total % 60, percent);
+        if (total <= 0.0) ImGui::EndDisabled();
     }
     ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
 }
 
 // Shot-only: park the playhead at a fraction of total time for a headless capture.
@@ -920,339 +1013,164 @@ void camDebugSetPlayhead(float frac) {
     g.playT = total * frac;
 }
 
-// Shot-only hook: make the CAM panel float (undock + centre) so a headless screenshot of the
-// CHUDWARE_SHOT=cam scenario can actually show the populated workspace. Never called in normal use.
-void camFloatForShot() { g.floatForShot = true; g.show = true; }
 
-// Adopt an existing CAM job doc (built core-side by the copilot's CAM fast-path) into the
-// panel so it shows up populated instead of empty. Loads the job tree (setups/ops/tools).
+// Adopt a core-created CAM job without retaining source or derived state from the old job.
 void camLoadJob(AppState& st, const std::string& docId) {
     if (docId.empty()) return;
-    ++g.rpcGen;  // drop callbacks tied to a previous job
+    ++g.rpcGen;
     g.docId = docId;
+    g.sourceDocId.clear();
+    g.sourceModel.clear();
+    g.lastExtract = nlohmann::json();
+    g.mirror.clear();
+    clearDownstreamArtifacts();
     g.selSetup = 0;
     g.selOp = -1;
-    g.loadedOpFor = -1;
-    g.gcode.clear();
-    g.gcodePath.clear();
-    g.sim = nlohmann::json();
-    ++g.simGen;
-    g.simFrames.clear(); g.simFrameT.clear();
-    g.framesClamped = false; g.playT = 0; g.playing = false;
-    g.curFrame = -1; g.frameMeshValid = false; g.splitT = -1;
-    nlohmann::json r;
-    if (camCall(st, "cam_tree", {{"doc_id", docId}}, r)) {
-        loadTree(r);
-        g.status = "loaded CAM job from copilot";
-        // cam_program returns gcode in its envelope; tree usually does not. Opportunistically
-        // seed if a future tree payload (or a stashed side-channel) carries it.
-        if (r.contains("gcode") && r["gcode"].is_string()) {
-            g.gcode = r["gcode"].get<std::string>();
-            if (!g.gcode.empty()) writeGcodeFile(currentDialect());
-        }
+    g.selTool = -1;
+    g.selKind = 0;
+    g.pipeStage = 0;
+    resetOpBuffers();
+
+    nlohmann::json tree;
+    if (!camCall(st, "cam_tree", {{"doc_id", docId}}, tree)) return;
+    loadTree(tree);
+    g.status = "loaded CAM job from copilot";
+    if (tree.contains("gcode") && tree["gcode"].is_string()) {
+        g.gcode = tree["gcode"].get<std::string>();
+        if (!g.gcode.empty()) writeGcodeFile(currentDialect());
     }
-    // Pull generated toolpaths async so the GL thread never blocks on cam_generate
-    // (job was already generated core-side by cam_program; response is the cached paths).
-    // After toolpaths land, seed g.gcode via cam_post when the load path didn't already
-    // carry it (cam_program produced gcode server-side but only the doc id reaches us).
+
     AppState* stp = &st;
     camBeginRpc();
     const int gen = g.rpcGen;
     st.rpc.call("cam_generate", {{"doc_id", docId}},
-                [gen, docId, stp](const core::RpcResult& rr) {
+                [gen, docId, stp](const core::RpcResult& generated) {
         camEndRpc();
         if (gen != g.rpcGen || g.docId != docId) return;
-        if (!rr.ok) return;
-        g.mirror.loadToolpaths(rr.result);
-        g.generatedRev = g.mirror.revision();  // copilot jobs arrive pre-generated
-        g.genWarnings = (rr.result.contains("warnings") && rr.result["warnings"].is_array())
-                            ? (int)rr.result["warnings"].size() : 0;
-        // Future-proof: if generate ever echoes gcode, seed the G-code tab.
-        if (g.gcode.empty() && rr.result.contains("gcode") && rr.result["gcode"].is_string()) {
-            g.gcode = rr.result["gcode"].get<std::string>();
+        if (!generated.ok) {
+            g.status = std::string("cam_generate: ") +
+                       (generated.err.empty() ? std::string("failed") : generated.err);
+            return;
+        }
+        g.mirror.loadToolpaths(generated.result);
+        g.generatedRev = g.mirror.revision();
+        g.genWarnings =
+            (generated.result.contains("warnings") && generated.result["warnings"].is_array())
+                ? (int)generated.result["warnings"].size() : 0;
+        if (g.gcode.empty() && generated.result.contains("gcode") &&
+            generated.result["gcode"].is_string()) {
+            g.gcode = generated.result["gcode"].get<std::string>();
             if (!g.gcode.empty()) writeGcodeFile(currentDialect());
         }
-        // cam_program already posted; re-post cheaply (cached toolpaths) to seed g.gcode
-        // so Download NC works without a manual Post click.
-        if (g.gcode.empty()) {
-            const std::string dialect = currentDialect();
-            camBeginRpc();
-            stp->rpc.call("cam_post", {{"doc_id", docId}, {"dialect", dialect}},
-                          [gen, docId, dialect](const core::RpcResult& pr) {
-                camEndRpc();
-                if (gen != g.rpcGen || g.docId != docId) return;
-                if (!pr.ok) return;
-                g.gcode = pr.result.value("gcode", std::string());
-                if (!g.gcode.empty()) writeGcodeFile(dialect);
-            });
-        }
+        if (!g.gcode.empty()) return;
+        const std::string dialect = currentDialect();
+        camBeginRpc();
+        stp->rpc.call("cam_post", {{"doc_id", docId}, {"dialect", dialect}},
+                      [gen, docId, dialect](const core::RpcResult& posted) {
+            camEndRpc();
+            if (gen != g.rpcGen || g.docId != docId || !posted.ok) return;
+            g.gcode = posted.result.value("gcode", std::string());
+            if (!g.gcode.empty()) writeGcodeFile(dialect);
+        });
     });
-    g.show = true;   // reveal the docked detail panel (bottom split, directly under the 3D view)
 }
 
-// ---- the panel --------------------------------------------------------------------------------
-// The CAM window is docked into a BOTTOM SPLIT of the central node (buildDefaultLayout), so the 3D
-// viewport — which already renders the stock box, the classified toolpaths, the remnant-stock sim
-// frames and the transport HUD — stays visible ABOVE it. This panel therefore carries ONLY what the
-// 3D view and the ribbon cannot: the flat backplot, the sim report, the operation form and the
-// posted G-code. It deliberately does NOT re-list New Job / Extract / add-operation / Generate /
-// Simulate / Post — those are Manufacture-ribbon commands routed through camHandleCommand — and it
-// does NOT re-draw the job tree, which is drawCamTreeBody in the pinned left column.
-void drawCamManager(AppState& st) {
-    // Visible by default in the Manufacture workspace: the point of the workspace is "generate,
-    // then read the G-code right under the 3D view". Edge-triggered on workspace entry, so a panel
-    // the operator deliberately closed stays closed while they keep working in Manufacture.
-    const bool camWs = (st.activeWorkspace == AppState::Workspace::Manufacture);
-    static bool prevCamWs = false;
-    if (camWs && !prevCamWs) g.show = true;
-    prevCamWs = camWs;
-    if (!g.show) return;
+void drawCamOutputBody(AppState& st) {
     refreshDialects(st);
-
-    // Shot-only (camFloatForShot(), CHUDWARE_SHOT=cam / =workspaces): float + centre the panel so
-    // an offscreen capture shows the populated workspace, which a short bottom-split node cannot.
-    // Sized as a fraction of the main viewport, so it stays centred at any DPI / capture size.
-    // NEVER taken in normal use — the docked path below sets no position, size or dock id.
-    if (g.floatForShot) {
-        const ImGuiViewport* vp = ImGui::GetMainViewport();
-        const ImVec2 sz(vp->WorkSize.x * 0.62f, vp->WorkSize.y * 0.58f);
-        ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
-        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + (vp->WorkSize.x - sz.x) * 0.5f,
-                                       vp->WorkPos.y + (vp->WorkSize.y - sz.y) * 0.5f),
-                                ImGuiCond_Always);
-        ImGui::SetNextWindowSize(sz, ImGuiCond_Always);
-    }
-    // The global theme makes window title bars fully transparent (clean for docked panels); give
-    // this one an opaque title bar + solid border so it reads as its own surface under the 3D view.
-    const ui::Palette& pal = ui::palette;
-    const ImVec4 titleOpaque(pal.headerBg[0], pal.headerBg[1], pal.headerBg[2], 1.0f);
-    float camBorder[4]; ui::Palette::withAlpha(pal.border, camBorder, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_TitleBg,       titleOpaque);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleOpaque);
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(camBorder[0], camBorder[1], camBorder[2], camBorder[3]));
-    const bool camOpen = ImGui::Begin("CAM", &g.show);
-    ImGui::PopStyleColor(3);
-    if (!camOpen) { ImGui::End(); return; }
-
     const bool busy = camBusy();
-
-    // ---- status / view strip ---------------------------------------------------------------
-    // One row, and only what has no ribbon home: the two viewport-overlay toggles, the post
-    // dialect, and the job status right-aligned.
-    {
-        ImGui::Checkbox("Show in 3D", &g.backplot);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Draw the generated toolpaths over the part in the 3D view above");
-        ImGui::SameLine(0, ui::metrics::camBtnGap());
-        ImGui::Checkbox("Stock box", &g.showStock);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Outline the active setup's stock in the 3D view above");
-        ImGui::SameLine(0, ui::metrics::camSectionGap());
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("Post");
-        ImGui::SameLine(0, ui::metrics::camBtnGap());
-        if (g.dialects.empty()) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(currentDialect().c_str());
-        } else {
-            std::vector<const char*> items;
-            items.reserve(g.dialects.size());
-            for (const auto& d : g.dialects) items.push_back(d.c_str());
-            ImGui::SetNextItemWidth(ui::metrics::camFieldW());
-            ImGui::Combo("##cam_dialect", &g.postIdx, items.data(), (int)items.size());
+    ImGui::TextDisabled("Post flavor");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##cam_output_dialect", currentDialect().c_str())) {
+        if (g.dialects.empty())
+            ImGui::TextDisabled(g.dialectsInflight ? "loading..." : "unavailable");
+        for (int i = 0; i < (int)g.dialects.size(); ++i) {
+            const bool selected = g.dialects[i] == currentDialect();
+            if (ImGui::Selectable(g.dialects[i].c_str(), selected) && !selected) {
+                const nlohmann::json r = applyOps(
+                    st, nlohmann::json::array({nlohmann::json{
+                            {"op", "set_post"}, {"post", g.dialects[i]}}}));
+                if (r.contains("revision")) g.status = "post flavor: " + g.dialects[i];
+            }
         }
-        // Status / busy note, right-aligned when it fits; otherwise it simply trails the combo.
-        const char* note = g.status.empty() ? (busy ? "working..." : nullptr) : g.status.c_str();
-        if (note) {
-            float noteW = ImGui::CalcTextSize(note).x;
-            if (busy) noteW += ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemInnerSpacing.x;
-            const float rightX = ImGui::GetContentRegionMax().x - noteW;
-            ImGui::SameLine(0, ui::metrics::camSectionGap());
-            if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
-            ImGui::AlignTextToFramePadding();
-            if (busy) busyLabel(note, ImGui::GetColorU32(ImGuiCol_TextDisabled));
-            else      ImGui::TextDisabled("%s", note);
-        }
+        ImGui::EndCombo();
     }
+
+    const ImVec2 buttonSize(0.0f, ui::metrics::camBtnH());
+    if (busy || g.docId.empty()) ImGui::BeginDisabled();
+    if (ImGui::Button("Post", buttonSize)) doPost(st);
+    if (busy || g.docId.empty()) ImGui::EndDisabled();
+    ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
+    if (g.gcode.empty()) ImGui::BeginDisabled();
+    if (ImGui::Button("Download", buttonSize)) downloadGcode();
+    if (g.gcode.empty()) ImGui::EndDisabled();
+    ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
+    if (busy || g.gcode.empty()) ImGui::BeginDisabled();
+    if (ImGui::Button("Audit", buttonSize)) doAudit(st);
+    if (busy || g.gcode.empty()) ImGui::EndDisabled();
+
+    if (!g.status.empty()) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled("%s", g.status.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    if (!g.audit.empty()) {
+        const bool ok = g.audit.value("ok", false);
+        const float* color = ok ? ui::palette.statusOk : ui::palette.statusErr;
+        ImGui::TextColored(ImVec4(color[0], color[1], color[2], color[3]),
+                           ok ? "Audit passed" : "Audit findings");
+        if (g.audit.contains("stats") && g.audit["stats"].is_object()) {
+            const auto& stats = g.audit["stats"];
+            ImGui::TextDisabled("%d lines  |  %d tools  |  %.0fs",
+                                stats.value("lines", 0), stats.value("tool_changes", 0),
+                                stats.value("est_time_s", 0.0));
+        }
+        auto findings = [](const char* key, const float colorRole[4]) {
+            if (!g.audit.contains(key) || !g.audit[key].is_array()) return;
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                ImVec4(colorRole[0], colorRole[1], colorRole[2], colorRole[3]));
+            for (const auto& finding : g.audit[key])
+                if (finding.is_string())
+                    ImGui::BulletText("%s", finding.get_ref<const std::string&>().c_str());
+            ImGui::PopStyleColor();
+        };
+        findings("errors", ui::palette.statusErr);
+        findings("warnings", ui::palette.statusWarn);
+    }
+
     ImGui::Separator();
-
-    // ---- detail tabs (full width — the job tree is the pinned left column) -------------------
-    if (ImGui::BeginTabBar("cam_tabs")) {
-        if (ImGui::BeginTabItem("Toolpaths")) { drawBackplot(st); ImGui::EndTabItem(); }
-
-        if (ImGui::BeginTabItem("Simulate")) {
-            if (busy) ImGui::BeginDisabled();
-            if (ImGui::Button("Run Material-Removal Sim")) doSimulate(st);
-            ImGui::SameLine(0, ui::metrics::camBtnGap()); ImGui::Checkbox("Gouge", &g.optGouge);
-            ImGui::SameLine(0, ui::metrics::camBtnGap()); ImGui::Checkbox("Rapids", &g.optRapid);
-            ImGui::SameLine(0, ui::metrics::camBtnGap()); ImGui::Checkbox("Holder", &g.optHolder);
-            ImGui::SameLine(0, ui::metrics::camSectionGap());
-            ImGui::SetNextItemWidth(ui::metrics::camFieldW());
-            ImGui::SliderFloat("Resolution", &g.optRes, 0.2f, 2.0f, "%.1f mm");
-            if (busy) ImGui::EndDisabled();
-            ImGui::TextDisabled("Frames play back in the 3D view above — use the transport bar.");
-            ImGui::Dummy(ImVec2(0.0f, ui::metrics::camHeadGap()));
-            drawSimSummary();
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Operation")) {
-            // Minimal op parameter form: the four CuttingDB fields, autofilled from the core
-            // cam_feeds table for the setup material + op tool, applied via update_operation.
-            const bool haveOp = g.selSetup >= 0 && g.selSetup < (int)g.mirror.setups().size() &&
-                                g.selOp >= 0 && g.selOp < (int)g.mirror.setups()[g.selSetup].ops.size();
-            if (!haveOp) {
-                ImGui::TextDisabled("Select an operation in the Manufacture tree to edit it.");
-            } else {
-                const auto& op = g.mirror.setups()[g.selSetup].ops[g.selOp];
-                ImGui::Text("%s  [T%d]", (op.name.empty() ? op.type.c_str() : op.name.c_str()),
-                            op.tool_number);
-                // reset buffers on op switch; autofill (or a future read-back) populates them
-                if (g.loadedOpFor != g.selOp) g.loadedOpFor = g.selOp;
-                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camHeadGap()));
-                const float fw = ui::metrics::camFieldW();
-                ImGui::SetNextItemWidth(fw); ImGui::InputFloat("Stepover (mm)", &g.fStepover, 0, 0, "%.2f");
-                ImGui::SetNextItemWidth(fw); ImGui::InputFloat("Stepdown (mm)", &g.fStepdown, 0, 0, "%.2f");
-                ImGui::SetNextItemWidth(fw); ImGui::InputFloat("Feed (mm/min)", &g.fFeed, 0, 0, "%.0f");
-                ImGui::SetNextItemWidth(fw); ImGui::InputFloat("RPM", &g.fRpm, 0, 0, "%.0f");
-                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camHeadGap()));
-                const ImVec2 btn(0.0f, ui::metrics::camBtnH());
-                if (busy) ImGui::BeginDisabled();
-                if (ImGui::Button("Autofill from tables", btn)) doFeedsAutofill(st);
-                ImGui::SameLine(0, ui::metrics::camBtnGap());
-                if (ImGui::Button("Apply to operation", btn)) {
-                    nlohmann::json upd = nlohmann::json::object();
-                    if (g.fStepover > 0) upd["stepover"] = g.fStepover;
-                    if (g.fStepdown > 0) upd["stepdown"] = g.fStepdown;
-                    if (g.fFeed > 0) upd["feed"] = g.fFeed;
-                    if (g.fRpm > 0) upd["rpm"] = g.fRpm;
-                    if (!upd.empty()) {
-                        nlohmann::json r = applyOps(st, nlohmann::json::array({nlohmann::json{
-                            {"op", "update_operation"}, {"op_id", op.id}, {"operation", upd}}}));
-                        g.status = r.contains("revision") ? "operation updated" : "update failed";
-                    }
-                }
-                if (busy) ImGui::EndDisabled();
-            }
-            ImGui::EndTabItem();
-        }
-
-        // G-code is the fast path the operator is here for: a post selects this tab automatically.
-        ImGuiTabItemFlags gcFlags = 0;
-        if (g.gcodeTabFocus) { gcFlags = ImGuiTabItemFlags_SetSelected; g.gcodeTabFocus = false; }
-        if (ImGui::BeginTabItem("G-code", nullptr, gcFlags)) {
-            const ImVec2 btn(0.0f, ui::metrics::camBtnH());
-            const bool haveGcode = !g.gcode.empty();
-            if (busy) ImGui::BeginDisabled();
-            if (ImGui::Button("Post", btn)) doPost(st);
-            if (busy) ImGui::EndDisabled();
-            ImGui::SameLine(0, ui::metrics::camBtnGap());
-            if (!haveGcode) ImGui::BeginDisabled();
-            if (ImGui::Button("Download NC", btn)) downloadGcode();
-            if (!haveGcode) ImGui::EndDisabled();
-            ImGui::SameLine(0, ui::metrics::camBtnGap());
-            if (g.auditInflight) ImGui::BeginDisabled();
-            if (ImGui::Button("Audit", btn)) doAudit(st);
-            if (g.auditInflight) ImGui::EndDisabled();
-            ImGui::SameLine(0, ui::metrics::camSectionGap());
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("dialect: %s", currentDialect().c_str());
-#ifndef __EMSCRIPTEN__
-            // Desktop: show the temp .nc path the operator can grab. Hidden on web (no local path).
-            if (!g.gcodePath.empty()) {
-                ImGui::SameLine(0, ui::metrics::camSectionGap());
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextDisabled("-> %s", g.gcodePath.c_str());
-            }
-#endif
-            if (!g.audit.empty()) {
-                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camHeadGap()));
-                const bool aok = g.audit.value("ok", false);
-                const float* col = aok ? ui::palette.statusOk : ui::palette.statusErr;
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], col[3]));
-                ImGui::Text("Audit: %s", aok ? "ok" : "FAILED");
-                ImGui::PopStyleColor();
-                if (g.audit.contains("stats") && g.audit["stats"].is_object()) {
-                    const auto& s = g.audit["stats"];
-                    ImGui::Text("lines %d, tool changes %d, est %.0fs",
-                                s.value("lines", 0), s.value("tool_changes", 0),
-                                s.value("est_time_s", 0.0));
-                    if (s.contains("bounds") && s["bounds"].is_object()) {
-                        const auto& b = s["bounds"];
-                        auto rng = [&](const char* k) {
-                            if (!b.contains(k) || !b[k].is_array() || b[k].size() < 2)
-                                return std::string("?");
-                            char buf[48];
-                            std::snprintf(buf, sizeof(buf), "[%.1f..%.1f]",
-                                          b[k][0].get<double>(), b[k][1].get<double>());
-                            return std::string(buf);
-                        };
-                        ImGui::Text("bounds X%s Y%s Z%s mm",
-                                    rng("x").c_str(), rng("y").c_str(), rng("z").c_str());
-                    }
-                }
-                if (g.audit.contains("errors") && g.audit["errors"].is_array() &&
-                    !g.audit["errors"].empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusErr[0], ui::palette.statusErr[1], ui::palette.statusErr[2], ui::palette.statusErr[3]));
-                    for (const auto& e : g.audit["errors"]) ImGui::BulletText("%s", e.get<std::string>().c_str());
-                    ImGui::PopStyleColor();
-                }
-                if (g.audit.contains("warnings") && g.audit["warnings"].is_array() &&
-                    !g.audit["warnings"].empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1], ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
-                    for (const auto& w : g.audit["warnings"]) ImGui::BulletText("%s", w.get<std::string>().c_str());
-                    ImGui::PopStyleColor();
-                }
-            }
-            ImGui::Separator();
-            if (haveGcode) {
-                ImGui::InputTextMultiline("##gcode", g.gcode.data(), g.gcode.size() + 1,
-                                          ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
-            } else {
-                // Purposeful empty state naming the NEXT step, centered — never a blank box.
-                const bool noJob    = g.docId.empty();
-                const bool noSetup  = !noJob && g.mirror.setups().empty();
-                const char* headline = noJob   ? "No CAM job yet."
-                                     : noSetup ? "No machining setup yet."
-                                               : "No G-code yet.";
-                const char* next = noJob   ? "Manufacture ribbon: New Job, then Extract Part."
-                                 : noSetup ? "Manufacture ribbon: Add Setup, then add an operation."
-                                           : "Add operations, then Generate → Post.";
-                auto centered = [](const char* t, bool dim) {
-                    const float slack = (ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(t).x)
-                                        * 0.5f;
-                    if (slack > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + slack);
-                    if (dim) ImGui::TextDisabled("%s", t);
-                    else     ImGui::TextUnformatted(t);
-                };
-                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camSectionGap()));
-                centered(headline, false);
-                ImGui::Dummy(ImVec2(0.0f, ui::metrics::camCaptionGap()));
-                centered(next, true);
-            }
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
+    ImGui::BeginChild("##cam_output_gcode", ImVec2(0.0f, 0.0f), false,
+                      ImGuiWindowFlags_NoScrollbar);
+    if (!g.gcode.empty()) {
+        ImGui::TextUnformatted(g.gcode.data(), g.gcode.data() + g.gcode.size());
+    } else {
+        ImGui::Dummy(ImVec2(0.0f, ui::metrics::camSectionGap()));
+        ImGui::PushTextWrapPos();
+        if (g.docId.empty())
+            ImGui::TextDisabled("No CAM job. Create one from the Manufacture ribbon.");
+        else if (g.mirror.setups().empty())
+            ImGui::TextDisabled("No setup. Add a setup and operation before posting.");
+        else
+            ImGui::TextDisabled("No NC output. Generate toolpaths, then Post.");
+        ImGui::PopTextWrapPos();
     }
-    ImGui::End();
+    const ImVec2 childMin = ImGui::GetWindowPos();
+    const ImVec2 childSize = ImGui::GetWindowSize();
+    const auto& surface = ui::adaptivePanel(
+        ui::panelId("cam_output_gcode"),
+        ImRect(childMin, ImVec2(childMin.x + childSize.x, childMin.y + childSize.y)),
+        ui::GlassGroup::FeatureManager);
+    ui::drawWindowPillScrollbarV(surface);
+    ImGui::EndChild();
 }
 
-// ---- the Manufacture workspace LEFT TREE ------------------------------------------------------
-// Drawn INSIDE drawLeftPane's pinned glass column (layout.cpp routes the Manufacture workspace
-// here, the same way Simulate routes to SimManager::drawTreeBody). Shows the real job structure —
-// Job / Job Setup / Stock Setup / Machining Setups (ops with status) / Tools / Models — styled
-// with the exported FeatureManager row helpers. Selecting a node sets the context the ribbon
-// commands act on (g.selSetup / g.selOp); double-click opens the floating panel as the detail
-// editor. NO RPCs on this per-frame path (refreshDialects is async + cooldown-guarded).
+// Manufacture workspace tree plus its selected-operation inspector and simulation evidence.
 namespace {
 
 // The FeatureManager tree-icon logical size (feature_tree.h fmTreeIcon default). Row glyphs this
 // file paints by hand must use the SAME logical size so they line up with the atlas icons.
 constexpr float kTreeIconDp = 16.0f;
 
-// Double-click / "Open in editor" on a tree row: reveal the docked detail panel (bottom split of
-// the central node). It never floats over the 3D view any more, so there is nothing else to do.
-void camTreeOpenDetail() { g.show = true; }
 
 // A tree row's sub-caption — the job row's "extracted stock + 0 hole(s)" line. Dim and wrapped,
 // separated from the row by exactly one camCaptionGap (replacing, not stacking on, ItemSpacing.y)
@@ -1270,6 +1188,113 @@ void camRowCaption(float labelX, const std::string& text, bool busy) {
         ImGui::TextDisabled("%s", t);
         ImGui::PopTextWrapPos();
     }
+}
+void loadSelectedOperationBuffers(const CamSetupRow& setup, const CamOpRow& op) {
+    if (g.loadedSetupId == setup.id && g.loadedOpId == op.id &&
+        g.loadedOpRevision == g.mirror.revision()) return;
+    std::snprintf(g.opName, sizeof(g.opName), "%s", op.name.c_str());
+    g.fStepover = (float)op.stepover;
+    g.fStepdown = (float)op.stepdown;
+    g.fStockLeave = (float)op.stock_leave;
+    g.fFeed = (float)op.feed;
+    g.fRpm = (float)op.rpm;
+    g.hTop = (float)op.top;
+    g.hBottom = (float)op.bottom;
+    g.hClear = (float)op.clearance;
+    g.hRetract = (float)op.retract;
+    g.loadedSetupId = setup.id;
+    g.loadedOpId = op.id;
+    g.loadedOpRevision = g.mirror.revision();
+}
+
+void drawSelectedOperationInspector(AppState& st) {
+    if (g.selKind != 5 || g.selSetup < 0 ||
+        g.selSetup >= (int)g.mirror.setups().size()) return;
+    const auto& setup = g.mirror.setups()[g.selSetup];
+    if (g.selOp < 0 || g.selOp >= (int)setup.ops.size()) return;
+    const auto& op = setup.ops[g.selOp];
+    loadSelectedOperationBuffers(setup, op);
+    const std::string setupIdentity = setup.id;
+    const std::string opIdentity = op.id;
+
+    fmSectionDivider("Operation inspector");
+    ImGui::Text("%s  [T%d]", op.name.empty() ? op.type.c_str() : op.name.c_str(),
+                op.tool_number);
+    ImGui::TextDisabled("setup %s  |  op %s", setupIdentity.c_str(), opIdentity.c_str());
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputText("##cam_op_name", g.opName, sizeof(g.opName));
+
+    if (ImGui::BeginTable("##cam_op_fields", 2, ImGuiTableFlags_SizingStretchProp)) {
+        auto field = [](const char* label, const char* id, float& value, const char* format) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("%s", label);
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputFloat(id, &value, 0.0f, 0.0f, format);
+        };
+        field("Feed", "##feed", g.fFeed, "%.0f");
+        field("RPM", "##rpm", g.fRpm, "%.0f");
+        field("Stepover", "##stepover", g.fStepover, "%.3f");
+        field("Stepdown", "##stepdown", g.fStepdown, "%.3f");
+        field("Stock leave", "##stock_leave", g.fStockLeave, "%.3f");
+        field("Top", "##top", g.hTop, "%.3f");
+        field("Bottom", "##bottom", g.hBottom, "%.3f");
+        field("Clearance", "##clearance", g.hClear, "%.3f");
+        field("Retract", "##retract", g.hRetract, "%.3f");
+        ImGui::EndTable();
+    }
+
+    const float gap = ui::metrics::camBtnGap();
+    const float buttonWidth = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+    const bool busy = camBusy();
+    if (busy) ImGui::BeginDisabled();
+    if (ImGui::Button("Autofill", ImVec2(buttonWidth, ui::metrics::camBtnH())))
+        doFeedsAutofill(st);
+    ImGui::SameLine(0.0f, gap);
+    if (ImGui::Button("Apply", ImVec2(buttonWidth, ui::metrics::camBtnH()))) {
+        const nlohmann::json update = {
+            {"name", std::string(g.opName)},
+            {"feed", g.fFeed},
+            {"rpm", g.fRpm},
+            {"stepover", g.fStepover},
+            {"stepdown", g.fStepdown},
+            {"stock_to_leave", g.fStockLeave},
+            {"heights", {{"top", g.hTop}, {"bottom", g.hBottom},
+                         {"clearance", g.hClear}, {"retract", g.hRetract}}}};
+        const nlohmann::json result = applyOps(
+            st, nlohmann::json::array({nlohmann::json{
+                    {"op", "update_operation"}, {"op_id", opIdentity},
+                    {"operation", update}}}));
+        if (result.contains("revision")) {
+            for (int si = 0; si < (int)g.mirror.setups().size(); ++si) {
+                if (g.mirror.setups()[si].id != setupIdentity) continue;
+                g.selSetup = si;
+                for (int oi = 0; oi < (int)g.mirror.setups()[si].ops.size(); ++oi)
+                    if (g.mirror.setups()[si].ops[oi].id == opIdentity) {
+                        g.selOp = oi;
+                        break;
+                    }
+                break;
+            }
+            g.status = "operation updated — regenerate required";
+        }
+    }
+    if (busy) ImGui::EndDisabled();
+}
+
+void drawSimulationOptions() {
+    fmSectionDivider("Simulation");
+    ImGui::Checkbox("Gouge", &g.optGouge);
+    ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
+    ImGui::Checkbox("Rapid", &g.optRapid);
+    ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
+    ImGui::Checkbox("Holder", &g.optHolder);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SliderFloat("##cam_sim_resolution", &g.optRes, 0.2f, 2.0f,
+                       "Resolution %.1f mm");
+    drawSelectedSimEvidence();
 }
 
 }  // namespace
@@ -1296,11 +1321,15 @@ void drawCamTreeBody(AppState& st) {
         ImGui::Separator();
         if (g.dialects.empty())
             ImGui::TextDisabled(g.dialectsInflight ? "loading..." : "unavailable");
-        for (int i = 0; i < (int)g.dialects.size(); ++i)
-            if (ImGui::Selectable(g.dialects[i].c_str(), i == g.postIdx)) {
-                g.postIdx = i;
-                g.status = "post flavor: " + g.dialects[i];
+        for (int i = 0; i < (int)g.dialects.size(); ++i) {
+            const bool selected = g.dialects[i] == currentDialect();
+            if (ImGui::Selectable(g.dialects[i].c_str(), selected) && !selected) {
+                const nlohmann::json r = applyOps(
+                    st, nlohmann::json::array({nlohmann::json{
+                            {"op", "set_post"}, {"post", g.dialects[i]}}}));
+                if (r.contains("revision")) g.status = "post flavor: " + g.dialects[i];
             }
+        }
         ImGui::EndPopup();
     }
 
@@ -1322,8 +1351,7 @@ void drawCamTreeBody(AppState& st) {
     // the mirror, which would invalidate the rows we're iterating).
     nlohmann::json pendingOps = nlohmann::json::array();
 
-    // Leaf row helper: FM pill + 16px icon + selectable label. Returns clicked; double-click
-    // opens the detail editor.
+    // Draw one leaf row's selectable+label against the same frame-height rect as the pill/icon.
     // Draw one leaf row's selectable+label against the SAME frame-height rect the pill/icon use.
     // The Selectable is sized to GetFrameHeight() (matching fmRowPill's rowMax) and its text is
     // vertically centered; it is NOT given `selected` — selection is painted by fmRowPill alone
@@ -1332,9 +1360,7 @@ void drawCamTreeBody(AppState& st) {
     auto leafSelectable = [&](const std::string& label) -> bool {
         const float rowH = ImGui::GetFrameHeight();
         ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
-        bool clicked = ImGui::Selectable(label.c_str(), false,
-                                         ImGuiSelectableFlags_AllowDoubleClick,
-                                         ImVec2(0.0f, rowH));
+        bool clicked = ImGui::Selectable(label.c_str(), false, 0, ImVec2(0.0f, rowH));
         ImGui::PopStyleVar();
         return clicked;
     };
@@ -1350,10 +1376,8 @@ void drawCamTreeBody(AppState& st) {
         fmTreeIcon(icon, fb, kTreeIconDp);
         ImGui::SameLine(0, kIconGap);
         bool clicked = leafSelectable(label);
-        const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
         fmRowPillEnd(rr, selected);
         ImGui::PopID();
-        if (dbl) camTreeOpenDetail();
         return clicked;
     };
     // A dim "(nothing here yet — do X)" note under a branch. Indented to the label column and
@@ -1389,7 +1413,6 @@ void drawCamTreeBody(AppState& st) {
             ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding,
             "%s", jobLbl.c_str());
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) g.selKind = 1;
-        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) camTreeOpenDetail();
         fmRowPillEnd(rr, jobSel);
         if (!jobOpen) {
             camRowCaption(jobLabelX, g.status, camBusy());
@@ -1454,10 +1477,8 @@ void drawCamTreeBody(AppState& st) {
         }
         ImGui::SameLine(0, kIconGap);
         if (leafSelectable(lbl)) g.selKind = 3;
-        const bool stockDbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
         fmRowPillEnd(rr, stockSel);
         ImGui::PopID();
-        if (stockDbl) camTreeOpenDetail();
     }
 
     // ---- Machining Setups (WCS/machine) + their operations -------------------------------------
@@ -1477,7 +1498,6 @@ void drawCamTreeBody(AppState& st) {
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
             g.selKind = 4; g.selSetup = si; g.selOp = -1;
         }
-        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) camTreeOpenDetail();
         fmRowPillEnd(rr, setupSel);
         if (open) {
             for (int oi = 0; oi < (int)s.ops.size(); ++oi) {
@@ -1500,13 +1520,12 @@ void drawCamTreeBody(AppState& st) {
                         static thread_local char warnBuf[24];
                         std::snprintf(warnBuf, sizeof(warnBuf), "warn %d", g.genWarnings);
                         badge = warnBuf; badgeCol = ui::palette.statusWarn;
-                    } else if (!g.sim.empty() && g.sim.contains("results")) {
-                        for (const auto& sr : g.sim["results"])
-                            if (sr.value("gouges", 0) == 0 && sr.value("rapid_collisions", 0) == 0 &&
-                                sr.value("holder_collisions", 0) == 0) {
-                                badge = "clean"; badgeCol = ui::palette.statusOk;
-                                break;
-                            }
+                    } else if (const nlohmann::json* sr = simResultForSetup(s.id)) {
+                        if (sr->value("gouges", 0) == 0 &&
+                            sr->value("rapid_collisions", 0) == 0 &&
+                            sr->value("holder_collisions", 0) == 0) {
+                            badge = "clean"; badgeCol = ui::palette.statusOk;
+                        }
                     }
                 }
                 ImGui::PushID(oi);
@@ -1515,7 +1534,7 @@ void drawCamTreeBody(AppState& st) {
                            o.suppressed ? 0.45f : 1.0f);
                 ImGui::SameLine(0, kIconGap);
                 if (leafSelectable(ol)) {
-                    g.selKind = 5; g.selSetup = si; g.selOp = oi; g.loadedOpFor = -1;
+                    g.selKind = 5; g.selSetup = si; g.selOp = oi; resetOpBuffers();
                 }
                 if (badge) {
                     // Selectable leaves the line's text baseline at 0 — without this the badge
@@ -1524,7 +1543,6 @@ void drawCamTreeBody(AppState& st) {
                     ImGui::AlignTextToFramePadding();
                     ImGui::TextColored(ImVec4(badgeCol[0], badgeCol[1], badgeCol[2], badgeCol[3]), "%s", badge);
                 }
-                const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
                 if (ImGui::BeginPopupContextItem("##cam_op_ctx")) {
                     if (ImGui::MenuItem(o.suppressed ? "Unsuppress" : "Suppress"))
                         pendingOps.push_back(nlohmann::json{
@@ -1533,12 +1551,10 @@ void drawCamTreeBody(AppState& st) {
                     if (ImGui::MenuItem("Delete"))
                         pendingOps.push_back(nlohmann::json{
                             {"op", "remove_operation"}, {"op_id", o.id}});
-                    if (ImGui::MenuItem("Open in editor")) camTreeOpenDetail();
                     ImGui::EndPopup();
                 }
                 fmRowPillEnd(orr, opSel);
                 ImGui::PopID();
-                if (dbl) camTreeOpenDetail();
             }
             if (s.ops.empty()) emptyNote("(no operations — add from the ribbon)");
             ImGui::TreePop();
@@ -1572,14 +1588,17 @@ void drawCamTreeBody(AppState& st) {
     }
 
     if (jobOpen) ImGui::TreePop();   // balance the ##cam_job TreeNodeEx (the footer sits outside)
+    drawSelectedOperationInspector(st);
+    drawSimulationOptions();
 
     // ---- footer: one full-width call to action, then the status line ----
     if (!g.docId.empty() && !g.mirror.setups().empty()) {
         ImGui::Dummy(ImVec2(0.0f, ui::metrics::camSectionGap()));
-        if (camBusy()) ImGui::BeginDisabled();
+        const bool busy = camBusy();
+        if (busy) ImGui::BeginDisabled();
         if (ImGui::Button("Generate G-code", ImVec2(-FLT_MIN, ui::metrics::camBtnH())))
             doPipeline(st);
-        if (camBusy()) ImGui::EndDisabled();
+        if (busy) ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Run the whole pipeline: generate toolpaths, simulate, then post");
     }

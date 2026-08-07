@@ -19,7 +19,7 @@ the frame loop in `host/src/app.cpp`.
 |---|---|---|
 | **Parts Library** | `host/src/ui/parts/parts_workspace.cpp/.h`, `parts_browser_panel.cpp`, `parts_filters.cpp`, `parts_results.cpp`, `parts_taxonomy_pane.cpp`, `parts_vendors.cpp`, `parts_widgets.cpp/.h`, `parts_internal.h` | Vendor search, taxonomy tree, thumbnails, streaming results. Data contracts: `contracts/parts.md`, `contracts/sourcing*.md` |
 | **Assembly** | `host/src/ui/asm_panels.cpp/.h` | Mates, component insertion, BOM, exploded view |
-| **CAM** | `host/src/ui/cam/cam_panel.cpp/.h`, `cam_mirror.cpp/.h` | Job tree, setups/ops/tools, simulation; mirror syncs engine CAM state |
+| **CAM** | `host/src/ui/cam/cam_panel.cpp/.h`, `cam_mirror.cpp/.h` | Integrated Explorer / Job Manager / NC Output left rail; all stock, toolpath, tool and removal previews render in the native viewport |
 | **ECAD** | `host/src/ui/ecad/ecad_panel.cpp/.h`, `ecad_canvas.cpp/.h`, `ecad_mirror.cpp/.h` | Schematic/PCB 2D canvas editor; schemas in `contracts/ecad/` |
 | **PLM** | `host/src/ui/plm/plm_workspace.cpp`, `plm_pages.cpp`, `plm_hub.h` | Versioning, releases, document control; `contracts/plm.md` |
 | **Reverse Eng.** | `host/src/ui/reveng/`: `reveng_workspace.cpp` (shell), `reveng_widgets.h/.cpp` (shared visual kit), `sources_panel.cpp`, `webcam_capture.cpp`, `stage_panels.cpp`, `dim_review.cpp`, `image_gallery.cpp`, `img_tex.cpp` | Six-stage scan → mesh → AI → parametric wizard (`contracts/reveng.md`). **Every panel draws with `ui::reveng::kit`** (`reveng_widgets.h`) and sizes itself from `ui::metrics::re*()` — no bespoke cards, no pixel literals. Camera seam: `host/src/platform/camera.h` v2. Splat/point-cloud rendering lives in `host/src/render/` (gui-viewport), fed by `kit::previewSlotRect`. Full breakdown below. |
@@ -27,6 +27,26 @@ the frame loop in `host/src/app.cpp`.
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
 | **Simulation** | `host/src/ui/sim_manager.cpp`, `host/src/ui/evaluate_dialogs.cpp` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …) |
 | **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
+
+### CAM / Manufacture internals (native viewport cutover)
+
+- There is **no CAM dock window or private preview canvas**. `buildDefaultLayout()` keeps one
+  uninterrupted Viewport/ECAD central node. Manufacture's pinned left rail hosts Explorer,
+  `drawCamTreeBody()` (job/setup/tool tree, serialized-value operation inspector, simulation
+  controls) and `drawCamOutputBody()` (post flavor, G-code, audit).
+- `CamMirror` owns the typed job mirror plus render-ready world-space batches. Every path class
+  carries global segment start/end times and cached direction triangles; stock-box edges are
+  cached too. Tree revision changes invalidate generated paths so stale geometry cannot remain
+  authoritative after an edit.
+- `viewport_panel.cpp` is the only geometric presentation path: it draws classified paths with
+  `Overlays::drawCamSegments`, direction glyphs, stock, tool/spindle marker, and remnant-stock
+  frames inside the existing renderer color FBO. `camDrawViewportHud()` adds controls/telemetry
+  over that same view; it is not a second geometry surface.
+- CAM UI state is one process-level active job. Extraction pins the source **Part doc id** instead
+  of following whichever tab becomes active later. Mutations use the mirrored revision, reject
+  overlap with long RPCs, and clear derived simulation/post/audit state.
+- Focused CPU contract: `host/tests/test_cam_mirror.cpp`. End-to-end smoke:
+  `CHUDWARE_SHOT=cam ./host/build-linux/bin/chudware --ui-screenshot scratch/cam.png`.
 
 ### Reverse Engineering internals (rebuilt RE-40)
 

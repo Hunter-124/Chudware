@@ -2497,20 +2497,36 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
         // Projection mode: live AppState mirror (persisted via Settings::orthographic).
         renderer.setOrthographic(st.orthographic);
-        // CAM sim playhead (wave 3): upload the remnant-stock mesh for the current frame
-        // BEFORE renderOrbit so it's drawn by the shaded translucent pass this frame.
-        // Cleared whenever the Manufacture workspace isn't active.
-        if (st.activeWorkspace == AppState::Workspace::Manufacture && ui::camSimHudActive()) {
-            int fidx = ui::camCurrentFrameIndex();
-            // camFrameMeshFor caches the CPU mesh by frame index; only re-upload the GPU
-            // buffers when the frame actually changed (setAuxMesh always reallocates).
-            static int s_lastAuxFrame = -2;
-            if (fidx != s_lastAuxFrame && ui::camFrameMeshFor(fidx)) {
-                renderer.setAuxMesh(ui::camFrameMesh(), 0.45f);
-                s_lastAuxFrame = fidx;
+        const bool inManufacture =
+            st.activeWorkspace == AppState::Workspace::Manufacture;
+        // Upload remnant stock before renderOrbit so the renderer's normal shaded pass owns it.
+        // Generation is part of the key: frame 3 from a newly simulated job must replace frame 3
+        // from the previous generation rather than inheriting its GPU buffers.
+        static int s_lastAuxGen = -1;
+        static int s_lastAuxFrame = -1;
+        if (inManufacture && ui::camSimHudActive()) {
+            const int gen = ui::camSimGen();
+            const int frame = ui::camCurrentFrameIndex();
+            if (frame >= 0 &&
+                (gen != s_lastAuxGen || frame != s_lastAuxFrame || !renderer.hasAuxMesh())) {
+                if (ui::camFrameMeshFor(frame)) {
+                    renderer.setAuxMesh(ui::camFrameMesh(), 0.45f);
+                    s_lastAuxGen = gen;
+                    s_lastAuxFrame = frame;
+                } else {
+                    if (renderer.hasAuxMesh()) renderer.clearAuxMesh();
+                    s_lastAuxGen = -1;
+                    s_lastAuxFrame = -1;
+                }
+            } else if (frame < 0) {
+                if (renderer.hasAuxMesh()) renderer.clearAuxMesh();
+                s_lastAuxGen = -1;
+                s_lastAuxFrame = -1;
             }
-        } else if (renderer.hasAuxMesh()) {
-            renderer.clearAuxMesh();
+        } else {
+            if (renderer.hasAuxMesh()) renderer.clearAuxMesh();
+            s_lastAuxGen = -1;
+            s_lastAuxFrame = -1;
         }
         renderer.renderOrbit(st.yaw, st.pitch, st.zoom, st.pan);
 
@@ -2588,66 +2604,40 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     if (fb.segs && !fb.segs->empty())
                         st.overlays->drawSegments(renderer.camera(), *fb.segs, fb.color, 2.0f, true);
             }
-            // CAM toolpaths: draw the active job's classified backplot over the part — rapid
-            // (faint red), lead (green), plunge (cyan), cut (blue), arc (violet). The CAM panel
-            // owns the segment batches; nullptr when the panel is hidden or backplot is off.
-            // Playhead mode (sim frames loaded): split at playT — done segments at full alpha,
-            // upcoming at 0.35× — plus the stock box and an interpolated tool marker.
-            if (const ui::CamBackplot* bp = ui::camActiveBackplot()) {
-                const auto& vpal = ui::palette;
-                if (ui::camSimHudActive()) {
-                    const auto& split = ui::camBackplotSplit();
-                    const ui::CamBackplot* done = split.first;
-                    const ui::CamBackplot* todo = split.second;
-                    const float dim = 0.35f;
-                    const float dRapid[4]  = {vpal.camRapid[0], vpal.camRapid[1], vpal.camRapid[2], vpal.camRapid[3] * dim};
-                    const float dLead[4]   = {vpal.camLead[0], vpal.camLead[1], vpal.camLead[2], vpal.camLead[3] * dim};
-                    const float dPlunge[4] = {vpal.camPlunge[0], vpal.camPlunge[1], vpal.camPlunge[2], vpal.camPlunge[3] * dim};
-                    const float dCut[4]    = {vpal.camCut[0], vpal.camCut[1], vpal.camCut[2], vpal.camCut[3] * dim};
-                    const float dArc[4]    = {vpal.camArc[0], vpal.camArc[1], vpal.camArc[2], vpal.camArc[3] * dim};
-                    if (!done->rapid.empty())  st.overlays->drawSegments(renderer.camera(), done->rapid,  vpal.camRapid,  1.0f, false);
-                    if (!done->lead.empty())   st.overlays->drawSegments(renderer.camera(), done->lead,   vpal.camLead,   1.6f, false);
-                    if (!done->plunge.empty()) st.overlays->drawSegments(renderer.camera(), done->plunge, vpal.camPlunge, 1.6f, false);
-                    if (!done->cut.empty())    st.overlays->drawSegments(renderer.camera(), done->cut,    vpal.camCut,    1.8f, false);
-                    if (!done->arc.empty())    st.overlays->drawSegments(renderer.camera(), done->arc,    vpal.camArc,    1.8f, false);
-                    if (!todo->rapid.empty())  st.overlays->drawSegments(renderer.camera(), todo->rapid,  dRapid,  1.0f, false);
-                    if (!todo->lead.empty())   st.overlays->drawSegments(renderer.camera(), todo->lead,   dLead,   1.6f, false);
-                    if (!todo->plunge.empty()) st.overlays->drawSegments(renderer.camera(), todo->plunge, dPlunge, 1.6f, false);
-                    if (!todo->cut.empty())    st.overlays->drawSegments(renderer.camera(), todo->cut,    dCut,    1.8f, false);
-                    if (!todo->arc.empty())    st.overlays->drawSegments(renderer.camera(), todo->arc,    dArc,    1.8f, false);
-                    // Tool marker: cylinder+cone soup at the interpolated pose.
-                    float tpos[3];
-                    if (ui::camToolPoseAt(ui::camPlayT(), tpos)) {
-                        std::vector<float> soup;
-                        const float tr = 3.0f, tl = 20.0f;  // fallback ø6x20mm
-                        const int nSeg = 12;
-                        for (int i = 0; i < nSeg; ++i) {
-                            float a0 = 2.0f * 3.14159265f * i / nSeg;
-                            float a1 = 2.0f * 3.14159265f * (i + 1) / nSeg;
-                            float x0 = tpos[0] + tr * std::cos(a0), y0 = tpos[1] + tr * std::sin(a0);
-                            float x1 = tpos[0] + tr * std::cos(a1), y1 = tpos[1] + tr * std::sin(a1);
-                            float zT = tpos[2] + tl, zT2 = tpos[2] + tl * 0.6f;
-                            // shaft side
-                            soup.insert(soup.end(), {x0, y0, zT, x1, y1, zT, x0, y0, zT2});
-                            soup.insert(soup.end(), {x1, y1, zT, x1, y1, zT2, x0, y0, zT2});
-                            // tip cone
-                            soup.insert(soup.end(), {x0, y0, zT2, x1, y1, zT2, tpos[0], tpos[1], tpos[2]});
-                        }
-                        st.overlays->drawTriangles(renderer.camera(), soup, vpal.camTool, false);
+            // CAM geometry is a Manufacture-only native overlay. Path batches stay in their
+            // original CPU buffers: drawCamSegments uploads each class once, then selects the
+            // completed prefix and pending suffix with GL ranges using the end-time array.
+            if (inManufacture) {
+                if (const ui::CamBackplot* bp = ui::camActiveBackplot()) {
+                    const auto& vpal = ui::palette;
+                    const bool progressing = ui::camSimHudActive();
+                    const double playTime = progressing ? ui::camPlayT() : 0.0;
+                    auto drawClass = [&](const std::vector<float>& segments,
+                                         const std::vector<float>& endTimes,
+                                         const std::vector<float>& directions,
+                                         const float color[4], float width) {
+                        if (!segments.empty())
+                            st.overlays->drawCamSegments(renderer.camera(), segments, endTimes,
+                                                         playTime, progressing, color, width);
+                        if (!directions.empty())
+                            st.overlays->drawTriangles(renderer.camera(), directions, color, false);
+                    };
+                    drawClass(bp->rapid,  bp->rapidT,  bp->rapidDir,  vpal.camRapid,  1.0f);
+                    drawClass(bp->lead,   bp->leadT,   bp->leadDir,   vpal.camLead,   1.6f);
+                    drawClass(bp->plunge, bp->plungeT, bp->plungeDir, vpal.camPlunge, 1.6f);
+                    drawClass(bp->cut,    bp->cutT,    bp->cutDir,    vpal.camCut,    1.8f);
+                    drawClass(bp->arc,    bp->arcT,    bp->arcDir,    vpal.camArc,    1.8f);
+
+                    if (progressing) {
+                        float toolPosition[3];
+                        if (ui::camToolPoseAt(playTime, toolPosition))
+                            st.overlays->drawCamToolMarker(renderer.camera(), toolPosition,
+                                                           vpal.camTool);
                     }
-                } else {
-                    if (!bp->rapid.empty())  st.overlays->drawSegments(renderer.camera(), bp->rapid,  vpal.camRapid,  1.0f, false);
-                    if (!bp->lead.empty())   st.overlays->drawSegments(renderer.camera(), bp->lead,   vpal.camLead,   1.6f, false);
-                    if (!bp->plunge.empty()) st.overlays->drawSegments(renderer.camera(), bp->plunge, vpal.camPlunge, 1.6f, false);
-                    if (!bp->cut.empty())    st.overlays->drawSegments(renderer.camera(), bp->cut,    vpal.camCut,    1.8f, false);
-                    if (!bp->arc.empty())    st.overlays->drawSegments(renderer.camera(), bp->arc,    vpal.camArc,    1.8f, false);
                 }
-            }
-            // CAM stock box overlay (toggle lives in the CAM panel, wave 4).
-            if (ui::camStockBoxVisible()) {
-                std::vector<float> boxSegs;
-                if (ui::camStockBoxSegments(boxSegs) && !boxSegs.empty())
-                    st.overlays->drawSegments(renderer.camera(), boxSegs, ui::palette.camStock, 1.2f, false);
+                if (const std::vector<float>* stock = ui::camStockBoxSegments())
+                    st.overlays->drawSegments(renderer.camera(), *stock, ui::palette.camStock,
+                                              1.2f, false);
             }
             // Evaluate Measure / Mass Properties markers (distance lines, COM cross, I/J axes).
             if (st.evaluateDialogs) {
@@ -2874,10 +2864,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             qdl->AddText(ImVec2(vr1.x - qts.x - 12.0f * qS, vr1.y - qts.y - 8.0f * qS),
                          withAlpha(ui::palette.textDim, 0.65f), qbuf);
         }
-        // CAM sim transport bar (wave 3): bottom-center playhead over the viewport while a
-        // framed sim is loaded in the Manufacture workspace.
-        if (st.activeWorkspace == AppState::Workspace::Manufacture && ui::camSimHudActive())
-            ui::camDrawSimHud(st, vr0, ImVec2(vr1.x - vr0.x, vr1.y - vr0.y));
+        // Manufacture owns every CAM screen-space overlay just as it owns the native geometry.
+        if (inManufacture && ui::camSimHudActive())
+            ui::camDrawViewportHud(st, vr0, ImVec2(vr1.x - vr0.x, vr1.y - vr0.y));
         // C25 W2-D: camera navigation. All of it is suppressed while sketching (camera is
         // plane-locked) except the wheel zoom, which stays usable. Any drag-navigation cancels an
         // in-flight tween so the user takes over instantly.

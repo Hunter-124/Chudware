@@ -535,10 +535,9 @@ static const RibbonCmd kCmds[] = {
     { "cam_post",          "Post G-code", "ai_panel",        "Manufacture", "Output",    true,  nullptr, false },
 
     // =========================================================================
-    // cam-workspace overhaul (append-only): the Manufacture ribbon now carries the FULL CAM
-    // command set (the floating CAM panel is a detail editor only). Show in 3D toggles the
-    // viewport toolpath backplot; Flavor opens the dynamic post-dialect dropdown (populated
-    // from cam_post_dialects by the workspace tree — a static flyout can't list them).
+    // cam-workspace overhaul (append-only): the Manufacture ribbon carries the full CAM
+    // command set. Show in 3D toggles the native viewport toolpath overlay; Flavor opens the
+    // dynamic post-dialect dropdown populated by the integrated workspace tree.
     // =========================================================================
     { "cam_show3d",        "Show in 3D",  "display_shaded",  "Manufacture", "Output",    false, nullptr, false },
     { "cam_flavor",        "Flavor",      "settings",        "Manufacture", "Output",    false, nullptr, false },

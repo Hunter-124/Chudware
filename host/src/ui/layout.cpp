@@ -1,11 +1,10 @@
 // Chudware overlay layout + the pinned FeatureManager glass column — see layout.h.
 //
-// Overlay redesign: buildDefaultLayout() builds a central node (Viewport / ECAD tabbed) so the 3D
-// surface spans the full dockspace, plus ONE bottom split holding the CAM detail editor (the
-// Manufacture workspace needs 3D and toolpath/G-code visible at once); drawLeftPane() renders the
-// tabbed manager as a pinned full-height rounded glass column over the viewport's left edge, with
-// an invisible right-edge resize and a collapse-to-pill affordance. Command dialogs float (they
-// z-sort above the docked central node).
+// Overlay redesign: buildDefaultLayout() keeps one uninterrupted central Viewport / ECAD node so
+// the 3D surface spans the full dockspace. Manufacture previews render natively in that viewport,
+// while drawLeftPane() hosts Explorer, Job Manager, and NC Output as integrated views in the pinned
+// full-height glass column over its left edge. The invisible right-edge resize and
+// collapse-to-pill affordance remain; command dialogs float above the central node.
 #include "layout.h"
 
 #include "imgui.h"
@@ -44,27 +43,14 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     ImGui::DockBuilderAddNode(root, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(root, size);
 
-    // Wave N/O: ECAD shares the central node with the Viewport (tabbed). Dock ECAD FIRST so the
-    // Viewport is the default-active tab (3D is the primary view); the ECAD tab pops forward on its
-    // own (SetNextWindowFocus) when an ECAD document is loaded.
-    //
-    // CAM is DIFFERENT (Hunter red-pen, manufacture overhaul): it used to share the central node
-    // too, so selecting it REPLACED the 3D view — and the detail-editor path additionally forced
-    // it undocked (SetNextWindowDockID(0)) so it floated as a slab over the viewport. Both are
-    // wrong for machining: the operator sets up stock/WCS, scrubs the toolpath playhead and reads
-    // the posted G-code *while watching the part*. CAM therefore gets a BOTTOM SPLIT of the
-    // central region — 3D above, CAM detail below — and can never tab over or float above the
-    // viewport. The node collapses on its own while the panel is hidden (drawCamManager returns
-    // before Begin), so non-Manufacture workspaces still get an edge-to-edge viewport.
-    ImGuiID central = root;
-    const ImGuiID camNode =
-        ImGui::DockBuilderSplitNode(central, ImGuiDir_Down, ui::metrics::camDetailFrac(),
-                                    nullptr, &central);
-    ImGui::DockBuilderDockWindow("CAM", camNode);
-
-    ImGui::DockBuilderDockWindow("ECAD", central);
-    ImGui::DockBuilderDockWindow("Viewport", central);
-    ImGui::DockBuilderDockWindow("Viewport###Viewport", central);
+    // ECAD shares the single, uninterrupted central node with the Viewport (tabbed). Dock ECAD
+    // FIRST so the Viewport is the default-active tab (3D is the primary view); the ECAD tab pops
+    // forward on its own (SetNextWindowFocus) when an ECAD document is loaded. Manufacture keeps
+    // this viewport visible and renders toolpaths through its native overlay path; its Job Manager
+    // and NC Output views live in the pinned left column rather than a separate dock node.
+    ImGui::DockBuilderDockWindow("ECAD", root);
+    ImGui::DockBuilderDockWindow("Viewport", root);
+    ImGui::DockBuilderDockWindow("Viewport###Viewport", root);
 
     ImGui::DockBuilderFinish(root);
 }
@@ -84,15 +70,6 @@ void setOverlayBand(float minX, float minY, float maxX, float maxY) {
 }
 const OverlayBand& overlayBand() { return g_overlayBand; }
 
-// See layout.h. Read off the CAM window itself rather than the dock node: a docked window that
-// did not submit this frame (drawCamManager returns before Begin while the panel is hidden) stays
-// in the node's window list, so the node rect alone would keep clamping the band after the panel
-// was closed. WasActive + DockIsActive is true only when it really painted in its dock node.
-float camDockTopY() {
-    ImGuiWindow* w = ImGui::FindWindowByName("CAM");
-    if (!w || !w->WasActive || !w->DockIsActive) return 0.0f;
-    return w->Pos.y;
-}
 
 // Floating command dialogs (Evaluate / assembly / Cut List / Design Table…) lost their docked
 // rightBottom slot with the overlay layout; give them a sane first-open anchor: top-right inside
@@ -506,21 +483,19 @@ void drawLeftPane(AppState& st,
         return;
     }
 
-    // [workspace-tabs seam] Manufacture workspace: show ONLY the CAM job tree (Hunter directive:
-    // each workspace gets its own workspace-appropriate left tree — same pattern as Simulate
-    // above). No Explorer/FeatureManager/Configurations tabs; the CAM tree (Job / Setups /
-    // Operations / Tools / Models, cam/cam_panel.cpp) is the whole column. The docked Copilot
-    // column on the right is untouched.
+    // [workspace-tabs seam] Manufacture keeps the native 3D viewport uninterrupted and integrates
+    // its three supporting views here: Explorer, the CAM Job Manager tree (Job / Setups /
+    // Operations / Tools / Models), and NC Output. No separate CAM window or detail dock is used.
     if (st.activeWorkspace == AppState::Workspace::Manufacture) {
         const float S = ui::uiScale;
-        // Explorer + Job Manager two-button rail — same chrome as the Electronics/Simulate rails.
-        static int s_camTab = 1;   // 0 = Explorer, 1 = Job Manager
+        // Explorer + Job Manager + NC Output rail — same chrome as the Electronics/Simulate rails.
+        static int s_camTab = 1;   // 0 = Explorer, 1 = Job Manager, 2 = NC Output
         const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
         const float erailRowH = erowPad + ebtn + erowPad;
         const ImVec2 ePaneOrigin  = ImGui::GetCursorScreenPos();
         const float  ePaneInnerW  = ImGui::GetContentRegionAvail().x;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-        ImGui::BeginChild("##cam_tabstrip", ImVec2(2.0f * ebtn + egap, erailRowH),
+        ImGui::BeginChild("##cam_tabstrip", ImVec2(3.0f * ebtn + 2.0f * egap, erailRowH),
                           ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
         ImGui::PopStyleVar();
@@ -533,13 +508,19 @@ void drawLeftPane(AppState& st,
         if (drawManagerTabButton("camM", "history", "J", "Job Manager", s_camTab == 1, false,
                                  surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/true))
             s_camTab = 1;
+        ImGui::SameLine(0, egap);
+        if (drawManagerTabButton("camO", "save", "N", "NC Output", s_camTab == 2, false,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
+            s_camTab = 2;
         ImGui::EndChild();
         {
-            const float railW = 2.0f * ebtn + egap;
+            const float railW = 3.0f * ebtn + 2.0f * egap;
             const float hdrX = ePaneOrigin.x + railW + egap;
             const float hdrW = ePaneInnerW - railW - egap;
-            const char* hdrTitle = s_camTab == 0 ? "Explorer" : "Job Manager";
-            const char* hdrIcon  = s_camTab == 0 ? "body_folder" : "ai_panel";
+            const char* hdrTitle = s_camTab == 0 ? "Explorer"
+                                  : s_camTab == 1 ? "Job Manager" : "NC Output";
+            const char* hdrIcon  = s_camTab == 0 ? "body_folder"
+                                  : s_camTab == 1 ? "ai_panel" : "save";
             const ImVec2 saveLocal = ImGui::GetCursorPos();
             ImGui::SetCursorScreenPos(ImVec2(hdrX, ePaneOrigin.y + erowPad + 2.0f * S));
             ui::fmPaneHeaderChip(st, hdrTitle, hdrIcon, hdrX + hdrW * 0.5f);
@@ -559,10 +540,12 @@ void drawLeftPane(AppState& st,
         ImGui::BeginChild("##cam_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
         if (s_camTab == 0) {
             drawFileExplorerBody(st);
-        } else {
-            // Same body inset as the Explorer tab (shared ebodyPad child padding — the FM
-            // convention); the Job Manager body adds no extra WindowPadding of its own.
+        } else if (s_camTab == 1) {
+            // Both integrated CAM bodies share the Explorer tab's child inset and add no extra
+            // WindowPadding of their own.
             ui::drawCamTreeBody(st);
+        } else {
+            ui::drawCamOutputBody(st);
         }
         const float eBodyContentH = ImGui::GetCursorPosY();
         ImGui::EndChild();

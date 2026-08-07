@@ -4,6 +4,8 @@
 #include "ui/viewport/glsl_compat.h"
 
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 
@@ -14,8 +16,12 @@ namespace {
 const char* kVert = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 uniform mat4 uMVP;
+uniform vec3 uOffset;
 out vec3 vWorld;
-void main(){ vWorld = aPos; gl_Position = uMVP * vec4(aPos, 1.0); })";
+void main(){
+    vWorld = aPos + uOffset;
+    gl_Position = uMVP * vec4(vWorld, 1.0);
+})";
 
 const char* kFrag = R"(#version 330 core
 uniform vec4 uColor;
@@ -72,6 +78,8 @@ Overlays::~Overlays() {
     if (segVbo_) glDeleteBuffers(1, &segVbo_);
     if (triVao_) glDeleteVertexArrays(1, &triVao_);
     if (triVbo_) glDeleteBuffers(1, &triVbo_);
+    if (camMarkerVao_) glDeleteVertexArrays(1, &camMarkerVao_);
+    if (camMarkerVbo_) glDeleteBuffers(1, &camMarkerVbo_);
 }
 
 void Overlays::destroy() {
@@ -121,6 +129,7 @@ bool Overlays::setDoc(const DocMesh& doc, std::string& err) {
         // Cache uniform locations once — every draw path used to re-query them by string.
         uMVP_       = glGetUniformLocation(prog_, "uMVP");
         uColor_     = glGetUniformLocation(prog_, "uColor");
+        uOffset_    = glGetUniformLocation(prog_, "uOffset");
         uClipCount_ = glGetUniformLocation(prog_, "uClipCount");
         uClipN_     = glGetUniformLocation(prog_, "uClipN");
         uClipOff_   = glGetUniformLocation(prog_, "uClipOff");
@@ -214,6 +223,8 @@ bool Overlays::findVert(uint32_t body, uint32_t vert_id, float out[3]) const {
 void Overlays::bindCommon(const Renderer::CameraXform& cam) {
     glUseProgram(prog_);
     glUniformMatrix4fv(uMVP_, 1, GL_FALSE, cam.mvp.m);
+    const float zeroOffset[3] = {0.0f, 0.0f, 0.0f};
+    glUniform3fv(uOffset_, 1, zeroOffset);
     glUniform1i(uClipCount_, clipCount_);
     if (clipCount_ > 0) {
         glUniform3fv(uClipN_, clipCount_, clipNormals_[0]);
@@ -346,6 +357,161 @@ void Overlays::drawSegments(const Renderer::CameraXform& cam, const std::vector<
     glDrawArrays(GL_LINES, 0, (int)(xyz.size() / 3));
     if (overSurface) glDepthRange(0.0, 1.0);
     glBindVertexArray(0);
+}
+
+void Overlays::drawCamSegments(const Renderer::CameraXform& cam,
+                               const std::vector<float>& xyz,
+                               const std::vector<float>& endTimes, double playTime,
+                               bool progressActive, const float rgba[4], float lineWidth) {
+    const size_t segmentCount = xyz.size() / 6;
+    if (segmentCount == 0 || !prog_) return;
+
+    size_t completed = segmentCount;
+    if (progressActive) {
+        const size_t timedCount = std::min(segmentCount, endTimes.size());
+        completed = (size_t)(std::upper_bound(endTimes.begin(),
+                                             endTimes.begin() + (std::ptrdiff_t)timedCount,
+                                             (float)playTime) -
+                             endTimes.begin());
+    }
+
+    if (!segVao_) {
+        glGenVertexArrays(1, &segVao_);
+        glGenBuffers(1, &segVbo_);
+    }
+    bindCommon(cam);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glBindVertexArray(segVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, segVbo_);
+    glBufferData(GL_ARRAY_BUFFER, segmentCount * 6 * sizeof(float), xyz.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+
+    const size_t pending = segmentCount - completed;
+    const float pendingGlow[4] = {rgba[0], rgba[1], rgba[2], rgba[3] * 0.10f};
+    const float completeGlow[4] = {rgba[0], rgba[1], rgba[2], rgba[3] * 0.22f};
+    const float pendingCore[4] = {rgba[0], rgba[1], rgba[2], rgba[3] * 0.32f};
+    auto drawRange = [&](size_t firstSegment, size_t count, const float color[4], float width) {
+        if (count == 0) return;
+        glUniform4fv(uColor_, 1, color);
+        glLineWidth(width * widthScale_);
+        glDrawArrays(GL_LINES, (int)(firstSegment * 2), (int)(count * 2));
+    };
+
+    // Wide low-alpha passes soften the supersampled line silhouette. The core passes retain the
+    // class color, while the not-yet-played suffix stays visible without competing with progress.
+    drawRange(completed, pending, pendingGlow, lineWidth + 2.0f);
+    drawRange(0, completed, completeGlow, lineWidth + 2.0f);
+    drawRange(completed, pending, pendingCore, lineWidth);
+    drawRange(0, completed, rgba, lineWidth);
+
+    glBindVertexArray(0);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+}
+
+void Overlays::drawCamToolMarker(const Renderer::CameraXform& cam, const float position[3],
+                                 const float rgba[4]) {
+    if (!prog_ || !position) return;
+
+    constexpr int kSlices = 12;
+    constexpr int kCutterVerts = kSlices * 9;   // cone side + cutter shaft
+    constexpr int kSpindleVerts = kSlices * 15; // shoulder + spindle shell + top cap
+    if (!camMarkerVao_) {
+        static constexpr float kRing[kSlices][2] = {
+            { 1.0000000f,  0.0000000f}, { 0.8660254f,  0.5000000f},
+            { 0.5000000f,  0.8660254f}, { 0.0000000f,  1.0000000f},
+            {-0.5000000f,  0.8660254f}, {-0.8660254f,  0.5000000f},
+            {-1.0000000f,  0.0000000f}, {-0.8660254f, -0.5000000f},
+            {-0.5000000f, -0.8660254f}, { 0.0000000f, -1.0000000f},
+            { 0.5000000f, -0.8660254f}, { 0.8660254f, -0.5000000f},
+        };
+        std::array<float, (kCutterVerts + kSpindleVerts) * 3> verts{};
+        size_t used = 0;
+        auto vertex = [&](float x, float y, float z) {
+            verts[used++] = x;
+            verts[used++] = y;
+            verts[used++] = z;
+        };
+        auto triangle = [&](float ax, float ay, float az,
+                            float bx, float by, float bz,
+                            float cx, float cy, float cz) {
+            vertex(ax, ay, az);
+            vertex(bx, by, bz);
+            vertex(cx, cy, cz);
+        };
+        auto quad = [&](float ax, float ay, float az,
+                        float bx, float by, float bz,
+                        float cx, float cy, float cz,
+                        float dx, float dy, float dz) {
+            triangle(ax, ay, az, bx, by, bz, cx, cy, cz);
+            triangle(ax, ay, az, cx, cy, cz, dx, dy, dz);
+        };
+
+        constexpr float cutterRadius = 2.0f;
+        constexpr float spindleRadius = 4.0f;
+        for (int i = 0; i < kSlices; ++i) {
+            const int j = (i + 1) % kSlices;
+            const float x0 = kRing[i][0], y0 = kRing[i][1];
+            const float x1 = kRing[j][0], y1 = kRing[j][1];
+            triangle(0.0f, 0.0f, 0.0f,
+                     x1 * cutterRadius, y1 * cutterRadius, 8.0f,
+                     x0 * cutterRadius, y0 * cutterRadius, 8.0f);
+            quad(x0 * cutterRadius, y0 * cutterRadius, 8.0f,
+                 x1 * cutterRadius, y1 * cutterRadius, 8.0f,
+                 x1 * cutterRadius, y1 * cutterRadius, 18.0f,
+                 x0 * cutterRadius, y0 * cutterRadius, 18.0f);
+        }
+        for (int i = 0; i < kSlices; ++i) {
+            const int j = (i + 1) % kSlices;
+            const float x0 = kRing[i][0], y0 = kRing[i][1];
+            const float x1 = kRing[j][0], y1 = kRing[j][1];
+            quad(x0 * cutterRadius, y0 * cutterRadius, 18.0f,
+                 x1 * cutterRadius, y1 * cutterRadius, 18.0f,
+                 x1 * spindleRadius, y1 * spindleRadius, 18.0f,
+                 x0 * spindleRadius, y0 * spindleRadius, 18.0f);
+            quad(x0 * spindleRadius, y0 * spindleRadius, 18.0f,
+                 x1 * spindleRadius, y1 * spindleRadius, 18.0f,
+                 x1 * spindleRadius, y1 * spindleRadius, 30.0f,
+                 x0 * spindleRadius, y0 * spindleRadius, 30.0f);
+            triangle(0.0f, 0.0f, 30.0f,
+                     x0 * spindleRadius, y0 * spindleRadius, 30.0f,
+                     x1 * spindleRadius, y1 * spindleRadius, 30.0f);
+        }
+
+        glGenVertexArrays(1, &camMarkerVao_);
+        glGenBuffers(1, &camMarkerVbo_);
+        glBindVertexArray(camMarkerVao_);
+        glBindBuffer(GL_ARRAY_BUFFER, camMarkerVbo_);
+        glBufferData(GL_ARRAY_BUFFER, used * sizeof(float), verts.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+    }
+
+    bindCommon(cam);
+    glUniform3fv(uOffset_, 1, position);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(camMarkerVao_);
+    const float spindle[4] = {rgba[0], rgba[1], rgba[2], rgba[3] * 0.48f};
+    glUniform4fv(uColor_, 1, spindle);
+    glDrawArrays(GL_TRIANGLES, kCutterVerts, kSpindleVerts);
+    glUniform4fv(uColor_, 1, rgba);
+    glDrawArrays(GL_TRIANGLES, 0, kCutterVerts);
+    glBindVertexArray(0);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    const float zeroOffset[3] = {0.0f, 0.0f, 0.0f};
+    glUniform3fv(uOffset_, 1, zeroOffset);
 }
 
 void Overlays::drawTriangles(const Renderer::CameraXform& cam, const std::vector<float>& xyz,

@@ -152,14 +152,11 @@ inline float reProgressH()    { return px(8.0f); }    // stage progress bar thic
 inline float partsPadX()      { return px(12.0f); }
 
 // ---- CAM / Manufacture workspace (ui/cam/) ----------------------------------------------------
-// The Manufacture tab was the last workspace still sizing itself from raw pixel literals:
-// cam_panel.cpp carried ~40 of them (a 240-px tree column, five 120-px fields, a 720x480 window)
-// and did not include this header at all, so the whole tab mis-scaled at HiDPI and none of its
-// surfaces shared an edge with the rest of the shell. The rhythm below deliberately mirrors the
-// copilot-menu and reveng tokens (4-px grid, 8-dp card corner) so Manufacture reads as the same
-// product as the modeling tabs. Every CAM panel MUST size itself from here — no fresh literals.
-inline float camDetailFrac()  { return 0.34f; }        // CAM detail dock height, fraction of the
-                                                       // central node (UNSCALED — a dock ratio)
+// The Manufacture tab was the last workspace still sizing itself from raw pixel literals, so its
+// integrated Job Manager / NC Output surfaces mis-scaled at HiDPI and shared no visual rhythm with
+// the rest of the shell. The tokens below deliberately mirror the copilot-menu and reveng tokens
+// (4-px grid, 8-dp card corner) while geometric previews stay in the native viewport. Every CAM
+// panel MUST size itself from here — no fresh literals.
 inline float camGutter()      { return px(10.0f); }    // pane content inset (matches partsPadX rhythm)
 inline float camRowPadX()     { return px(10.0f); }    // inside a row/card, horizontal
 inline float camRowPadY()     { return px(6.0f); }     // inside a row/card, vertical

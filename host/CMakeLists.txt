@@ -651,6 +651,23 @@ add_test(NAME test_stream_rows
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end streamed-delta row routing ---
 
+# --- CAM mirror parsing/timing + simulation-field mesh conversion (GL-free) ---
+# Links the real mirror implementation only. These contracts drive viewport overlays and the
+# integrated operation editor but require neither a renderer nor a running engine daemon.
+add_executable(test_cam_mirror
+  src/ui/cam/cam_mirror.cpp
+  tests/test_cam_mirror.cpp)
+target_include_directories(test_cam_mirror PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_cam_mirror PRIVATE
+  nlohmann_json::nlohmann_json)
+set_target_properties(test_cam_mirror PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_cam_mirror
+  COMMAND test_cam_mirror
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end CAM mirror parsing/timing + simulation-field mesh conversion ---
+
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory

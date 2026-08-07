@@ -1,12 +1,6 @@
-// CamMirror — a read-only, in-process mirror of one open CAM job, built from the JSON
-// the C++ core returns for cam_tree / cam_apply_ops (shape: {revision, tree:{name,post,
-// tools,setups:[{id,name,machine,stock,operations:[...]}]}}) and from cam_generate
-// (toolpaths). It is the CAM analogue of ui::EcadMirror: it PARSES the job tree into flat
-// typed vectors and the generated toolpaths into classified world-space line batches
-// (rapid/cut/lead/plunge/arc) ready for Overlays::drawSegments and an in-panel backplot.
-//
-// Coordinates are WCS millimetres (X right, Y back, Z up — the tool axis). This mirror
-// never touches ImGui or the renderer; it depends only on nlohmann::json.
+// CamMirror — parse CAM tree/toolpath JSON into typed rows and cached native-renderer geometry.
+// Coordinates are WCS millimetres (X right, Y back, Z up — the tool axis). This mirror never
+// touches ImGui or the renderer; it depends only on nlohmann::json.
 #pragma once
 
 #include <array>
@@ -25,13 +19,23 @@ struct CamOpRow {
     std::string type;
     int tool_number = 0;
     bool suppressed = false;
+    double stepover = 0.0;
+    double stepdown = 0.0;
+    double stock_leave = 0.0;  // serialized as stock_to_leave
+    double feed = 0.0;
+    double rpm = 0.0;
+    double top = 0.0;
+    double bottom = 0.0;
+    double clearance = 0.0;
+    double retract = 0.0;
 };
 
 struct CamSetupRow {
     std::string id;
     std::string name;
     std::string machine;
-    nlohmann::json stock;   // raw stock dict (for the stock form / re-extract)
+    nlohmann::json stock;
+    std::vector<float> stockSegments;  // cached 12 box edges, empty for non-box stock
     std::vector<CamOpRow> ops;
 };
 
@@ -42,23 +46,25 @@ struct CamToolRow {
     double diameter = 0.0;
 };
 
-// Classified toolpath geometry: flat [x0,y0,z0,x1,y1,z1,...] GL_LINES batches per move
-// class, plus the XY/Z bounds for the in-panel backplot fit. The *T vectors carry the
-// cumulative SECONDS at each segment's end (one value per 6-float segment) so the
-// viewport playhead can split the backplot at a time without re-walking moves.
+// Classified toolpath geometry. Segment arrays are flat GL_LINES batches. *T0/*T are the true
+// global start/end seconds for each corresponding segment, even when move classes interleave.
+// *Dir arrays cache bounded direction triangles (9 xyz floats per triangle) for the native overlay.
 struct CamBackplot {
     std::vector<float> rapid, cut, lead, plunge, arc;
-    std::vector<float> rapidT, leadT, plungeT, cutT, arcT;
+    std::vector<float> rapidT0, cutT0, leadT0, plungeT0, arcT0;
+    std::vector<float> rapidT, cutT, leadT, plungeT, arcT;
+    std::vector<float> rapidDir, cutDir, leadDir, plungeDir, arcDir;
     double totalTime = 0;
     float minx = 0, miny = 0, minz = 0, maxx = 0, maxy = 0, maxz = 0;
     bool empty() const { return cut.empty() && rapid.empty() && lead.empty() && plunge.empty() && arc.empty(); }
-    void clear() { rapid.clear(); cut.clear(); lead.clear(); plunge.clear(); arc.clear();
-                   rapidT.clear(); cutT.clear(); leadT.clear(); plungeT.clear(); arcT.clear();
-                   totalTime = 0;
-                   minx = miny = minz = maxx = maxy = maxz = 0; }
-    // Split every class at time t: `before` gets segments wholly before t (plus the
-    // clipped head of a straddling segment), `after` gets the rest.
-    void splitAt(double t, CamBackplot& before, CamBackplot& after) const;
+    void clear() {
+        rapid.clear(); cut.clear(); lead.clear(); plunge.clear(); arc.clear();
+        rapidT0.clear(); cutT0.clear(); leadT0.clear(); plungeT0.clear(); arcT0.clear();
+        rapidT.clear(); cutT.clear(); leadT.clear(); plungeT.clear(); arcT.clear();
+        rapidDir.clear(); cutDir.clear(); leadDir.clear(); plungeDir.clear(); arcDir.clear();
+        totalTime = 0;
+        minx = miny = minz = maxx = maxy = maxz = 0;
+    }
 };
 
 class CamMirror {
@@ -74,10 +80,13 @@ public:
     const std::vector<CamSetupRow>& setups() const { return setups_; }
     const std::vector<CamToolRow>& tools() const { return tools_; }
     const CamBackplot& backplot() const { return bp_; }
+    void clearToolpaths() { bp_.clear(); }
     // Rapid rates from the tree's machine_detail (fallbacks 5000/3000 mm/min).
     double rapidXY = 5000, rapidZ = 3000;
-    void clear() { setups_.clear(); tools_.clear(); bp_.clear(); name_.clear(); revision_ = -1;
-                   rapidXY = 5000; rapidZ = 3000; }
+    void clear() {
+        setups_.clear(); tools_.clear(); bp_.clear(); name_.clear(); post_.clear(); revision_ = -1;
+        rapidXY = 5000; rapidZ = 3000;
+    }
 
 private:
     int revision_ = -1;

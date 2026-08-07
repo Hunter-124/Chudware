@@ -16,7 +16,7 @@ view commands belong to `gui-ribbon-commands`.
 | `host/src/ui/viewport_panel.cpp/.h` | Viewport panel: input handling, gizmo, selection UX, per-frame draw of the 3D region |
 | `host/src/renderer.cpp/.h` (~2.2k LOC) | Core OpenGL renderer: orbit camera, mesh render, shaders, thumbnail/transparent render path (used by the icon pipeline) |
 | `host/src/render/id_pass.cpp/.h` | ID-pass picking: renders face/edge IDs to an offscreen buffer; a click reads back the ID under the cursor |
-| `host/src/render/overlays.cpp/.h` | HUD overlays drawn over the 3D scene |
+| `host/src/render/overlays.cpp/.h` | Native GL scene overlays: selection washes, simulation indicators, and timed/glowing CAM path batches |
 | `host/src/render/splat_renderer.cpp/.h`, `re_points.cpp` | Gaussian-splat / point-cloud rendering (reverse-engineering capture views) |
 | `host/src/render/aicm_loader.cpp` | Loads `.aicm` mesh artifacts |
 | `host/src/mesh.cpp` | Mesh data (vertices, faces, normals) from worker tessellation |
@@ -28,6 +28,13 @@ Python kernel tessellates → worker events drained per frame in `host/src/core/
 readback → face/edge ID added to `DocTab::selection` → PropertyManager / feature ops consume
 the selection. Per-doc state lives on `AppState::DocTab` (`host/src/core/app_state.h`);
 `viewport` itself is a subsystem member of `AppState`.
+
+CAM generation follows a sibling path: `cam_panel.cpp`/`CamMirror` retain the active job's
+classified world-space segments, global timing, direction glyphs, stock and simulation frames;
+`viewport_panel.cpp` draws them through `Overlays` inside the renderer's existing color FBO.
+CAM overlays are Manufacture-only, excluded from the ID pass, section-clipped, and depth-aware.
+The remnant-stock aux mesh cache key is `{camSimGen(), frameIndex}` so a new simulation can never
+reuse the old frame-zero upload.
 
 ## Conventions & gotchas
 

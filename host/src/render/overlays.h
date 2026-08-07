@@ -65,6 +65,20 @@ public:
     // `lineWidth` is the final on-screen width; widthScale_ (supersample x uiScale) is applied inside.
     void drawSegments(const Renderer::CameraXform& cam, const std::vector<float>& xyz,
                       const float rgba[4], float lineWidth = 2.0f, bool overSurface = true);
+    // CAM path batch: upload the original segment buffer once, then issue GL range draws for the
+    // completed prefix and pending suffix selected by the parallel per-segment end-time array.
+    // Each range gets a subtle translucent glow under its core line. When progressActive is false,
+    // the whole batch is treated as complete. Paths stay depth-tested and section-clipped.
+    void drawCamSegments(const Renderer::CameraXform& cam, const std::vector<float>& xyz,
+                         const std::vector<float>& endTimes, double playTime,
+                         bool progressActive, const float rgba[4], float lineWidth);
+
+    // Fixed GPU geometry translated to the current CAM tool pose in the shader. The cutter and
+    // spindle are separate opacity tiers so the marker stays legible without rebuilding triangle
+    // soup (or allocating) on each animation frame.
+    void drawCamToolMarker(const Renderer::CameraXform& cam, const float position[3],
+                           const float rgba[4]);
+
 
     // Draw a flat batch of world-space triangles (flat [x,y,z] * 3 per triangle) through the same
     // clip-aware flat-color shader. Used for the solid arrowhead cones + fixture glyphs of the
@@ -92,10 +106,12 @@ private:
 
     unsigned int prog_ = 0;     // flat color (faces wash + edges)
     unsigned int vao_ = 0, vbo_ = 0;  // scratch buffer for single-vertex point draws
-    unsigned int segVao_ = 0, segVbo_ = 0;  // dynamic buffer for drawSegments line batches
-    unsigned int triVao_ = 0, triVbo_ = 0;  // dynamic buffer for drawTriangles batches
+    unsigned int segVao_ = 0, segVbo_ = 0;  // dynamic buffer for line batches
+    unsigned int triVao_ = 0, triVbo_ = 0;  // dynamic buffer for triangle batches
+    unsigned int camMarkerVao_ = 0, camMarkerVbo_ = 0;  // fixed CAM tool/spindle geometry
     // Uniform locations, cached once after link (queried by string per draw call before).
-    int uMVP_ = -1, uColor_ = -1, uClipCount_ = -1, uClipN_ = -1, uClipOff_ = -1;
+    int uMVP_ = -1, uColor_ = -1, uOffset_ = -1;
+    int uClipCount_ = -1, uClipN_ = -1, uClipOff_ = -1;
 
     std::unordered_map<uint64_t, FaceBuf> faces_;
     std::unordered_map<uint64_t, EdgeBuf> edges_;

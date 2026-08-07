@@ -1,11 +1,12 @@
 // Chudware overlay layout + the pinned FeatureManager glass column.
 //
-// Overlay redesign: the dockspace hosts ONLY the central document windows (Viewport / ECAD / CAM,
-// tabbed) so the 3D surface runs edge to edge between the ribbon and the status bar. The old
-// SolidWorks docked-columns arrangement (left task pane / right task pane / dialogs slot) is GONE —
-// buildDefaultLayout() now builds a single splitless central node, and the FeatureManager renders
-// as a pinned full-height rounded glass column OVER the viewport's left edge (drawLeftPane). The
-// Copilot column (ui/copilot/) mirrors the same pattern on the right edge.
+// Overlay redesign: the dockspace hosts ONLY the central document windows (Viewport / ECAD,
+// tabbed) so the 3D surface runs edge to edge between the ribbon and the status bar. Manufacture
+// renders geometric previews through the native viewport and keeps Explorer, Job Manager, and NC
+// Output in the pinned left column. The old SolidWorks docked-columns arrangement (left task pane /
+// right task pane / dialogs slot) is GONE — buildDefaultLayout() builds a single splitless central
+// node, while FeatureManager and Copilot render as pinned glass columns over its left and right
+// edges.
 //
 // buildDefaultLayout stays in the GLOBAL namespace because app_state.h forward-declares it there
 // and app.cpp calls it unqualified — keeping it global avoids touching either site.
@@ -50,13 +51,6 @@ struct OverlayBand {
 void setOverlayBand(float minX, float minY, float maxX, float maxY);
 const OverlayBand& overlayBand();
 
-// Bottom edge available to the pinned glass columns. The CAM detail editor is docked into a
-// BOTTOM SPLIT of the central node (buildDefaultLayout), and the pinned columns are full-height
-// overlays that know nothing about the dockspace — so without this they paint straight over the
-// CAM panel (the Job Manager's footer button landed on top of CAM's status strip). Returns the
-// docked CAM window's top Y when it actually rendered docked last frame, else 0 (= no clamp).
-// app.cpp folds it into the band it publishes via setOverlayBand.
-float camDockTopY();
 
 // "Reset layout" (title_bar.cpp -> st.resetLayout -> app.cpp rebuild branch) must also restore the
 // pinned columns' default width/collapse state, or the menu item breaks its promise. app.cpp calls

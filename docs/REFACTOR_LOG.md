@@ -6753,3 +6753,31 @@ the tab survives the switch-away, re-activates on click (`path=gpu-cache`), take
 when the agent finally writes, and manual X-close still closes it. Files: `host/src/core/
 doc_tabs.cpp`, `host/src/core/app_state.h`, plus comment-only follow-ups in `host/src/core/
 engine_events.cpp`, `host/src/ui/viewport_panel.cpp`, `core/hostd/doc_registry.cpp`.
+
+## 2026-08-07 — Manufacture becomes one native-viewport CAM workspace
+
+The partial CAM overhaul still owned a bottom-docked `ImGui::Begin("CAM")` editor and a duplicate
+2-D backplot even though toolpaths had begun drawing over the part. That split shrank the central
+view, duplicated preview state, and left several correctness holes: edits could keep stale
+toolpaths/simulation/G-code visible; operation fields never loaded the selected operation's
+serialized values; extraction followed whichever tab was active later; loaded jobs could inherit
+the previous job's paths/source/post; manual Simulate/Post could auto-generate core paths without
+refreshing the viewport; playback inferred start time from the previous segment of the same move
+class; a new simulation at frame zero could reuse the prior aux mesh; and CAM overlays leaked into
+non-Manufacture workspaces.
+
+`host/src/ui/cam/{cam_panel,cam_mirror}.{cpp,h}` now make the pinned left column the complete
+control surface: Explorer / Job Manager / NC Output, an identity-keyed operation inspector,
+simulation evidence, post/audit/G-code, and a viewport-local telemetry/transport HUD. Source Part
+identity is pinned, mutations use the mirrored revision and invalidate derived artifacts, job post
+flavor is aligned, machine rates reset on reload, paths carry true global start/end times, arc time
+uses arc/helical length, and stock/direction geometry is cached. `host/src/ui/viewport_panel.cpp`
+and `host/src/render/overlays.{cpp,h}` draw timed glow/core path ranges, direction glyphs, cached
+stock, a persistent native tool marker, and remnant stock inside the existing renderer FBO; the
+aux key includes simulation generation and all CAM geometry is Manufacture-gated.
+`host/src/ui/layout.{cpp,h}`, `host/src/ui/metrics.h`, and `host/src/app.cpp` delete the CAM dock
+node/top clamp and roll the ImGui layout schema to v6; `host/src/ui/scenarios.cpp` now captures the
+real integrated layout. Regression coverage is `host/tests/test_cam_mirror.cpp`. Verified with a
+clean `./build.sh`, `test_cam_mirror PASS`, theme lint at zero findings, and the real
+`CHUDWARE_SHOT=cam` flow: part revision 1, CAM doc `cam1`, 3 operations, 394 NC lines, framed
+simulation loaded, 95.5 s playback, and a successful 1340x838 capture.

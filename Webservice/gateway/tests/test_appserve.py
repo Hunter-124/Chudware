@@ -34,8 +34,11 @@ def app_tree(tmp_path, monkeypatch):
     """Point settings.app_dir at a tiny fake WASM client tree."""
     root = tmp_path / "app"
     root.mkdir()
-    (root / "index.html").write_text("<!doctype html><title>chudware</title>\n", encoding="utf-8")
-    (root / "chudware.js").write_text("/* wasm glue */\n", encoding="utf-8")
+    (root / "index.html").write_text(
+        '<!doctype html><title>chudware</title><script src="Chudware.js"></script>\n',
+        encoding="utf-8",
+    )
+    (root / "Chudware.js").write_text("/* wasm glue */\n", encoding="utf-8")
     (root / "chudware.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
     (root / "chudware.data").write_bytes(b"PACK")
     monkeypatch.setattr(settings, "app_dir", root)
@@ -73,7 +76,7 @@ class TestAppServe:
         whole /app client in production on 2026-07-28 with no server error —
         every asset returned 200 and the page simply never started.
         """
-        for path in ("/app/", "/app/chudware.js"):
+        for path in ("/app/", "/app/Chudware.js"):
             r = client.get(path, headers=DEV_HEADERS)
             assert r.status_code == 200, f"{path} -> {r.status_code}"
             csp = r.headers.get("content-security-policy", "")
@@ -84,11 +87,26 @@ class TestAppServe:
             assert "object-src 'none'" in csp
             assert "'unsafe-eval'" not in csp.replace("'wasm-unsafe-eval'", "")
 
-    def test_app_bare_path_same_as_slash(self, client, app_tree):
-        r = client.get("/app", headers=DEV_HEADERS)
-        assert r.status_code == 200
-        assert r.headers["cross-origin-opener-policy"] == "same-origin"
-        assert r.headers["cross-origin-embedder-policy"] == "require-corp"
+    def test_app_bare_path_redirects_to_slash_and_relative_bundle_resolves(
+        self, client, app_tree
+    ):
+        redirect = client.get("/app", headers=DEV_HEADERS, follow_redirects=False)
+        assert redirect.status_code == 307
+        assert redirect.headers["location"] == "/app/"
+        assert redirect.headers["cross-origin-opener-policy"] == "same-origin"
+        assert redirect.headers["cross-origin-embedder-policy"] == "require-corp"
+        assert "content-security-policy" in redirect.headers
+
+        index = client.get("/app", headers=DEV_HEADERS)
+        assert index.status_code == 200
+        assert index.url.path == "/app/"
+        assert index.history[0].headers["location"] == "/app/"
+        assert 'src="Chudware.js"' in index.text
+
+        asset = client.get("/app/Chudware.js", headers=DEV_HEADERS)
+        assert asset.status_code == 200
+        assert asset.headers["cross-origin-opener-policy"] == "same-origin"
+        assert asset.text == "/* wasm glue */\n"
 
     def test_app_wasm_and_data_mime(self, client, app_tree):
         rw = client.get("/app/chudware.wasm", headers=DEV_HEADERS)

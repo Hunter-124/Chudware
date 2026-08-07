@@ -6823,3 +6823,24 @@ reviewer no-tool-one-shot refusal, prompt override isolation, global prompt/outp
 skill role gates, cross-process pack creation, and xAI/OpenRouter tier normalization. The
 focused contract gate passed 317 tests; an actual prompt-preview smoke rendered 24 effective
 tools in 22,660 characters with no fictional ledger/stage blocks.
+
+## 2026-08-07 — Webservice settings, provider auth, and rollout hardening
+
+The browser-native service now redirects `/app` to canonical `/app/`, accepts the flat v2 chat
+store that the WASM client actually persists, serializes/coalesces IDBFS writes, and no longer
+uploads recents on unrelated settings changes. Provider Settings uses generation-guarded
+list/detail/key/OAuth callbacks, a shell-free browser URL opener, cancellable immediate OAuth
+starts, cryptorandom retained handles, device/manual interaction metadata, and honest retry/error
+states. A real isolated gateway/hostd browser smoke reached Kimi's device authorization URL with a
+UUID handle and no false manual-input affordance. Provider management is admin-only at the engine
+boundary; standard provider catalogue responses omit account identity, list-model credential
+injection accepts only canonical endpoints, and concurrent engine slots are reserved atomically.
+
+Session start/stop/reap/adoption is serialized per account with incarnation checks, fresh health
+probes, and full-email hashed names. Deployment now promotes an immutable joint native/WASM/Bun
+release, drains from authenticated bridge telemetry, fails closed on missing telemetry or
+readiness, and keeps gateway/WebSocket size limits aligned. Verification covered the 272-test
+gateway suite (272 passed, 4 skipped), a native application build, the completed WASM target, the
+`/app` redirect plus relative asset fetch, exact v2 chat round-trip, role-aware provider privacy,
+admin provider enumeration, standard-user provider denial, and a live Kimi begin/poll/cancel flow
+against an isolated credential store.

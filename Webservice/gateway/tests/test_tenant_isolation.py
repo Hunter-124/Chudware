@@ -145,24 +145,100 @@ def test_workspace_delete_and_rename_cannot_cross_tenants(client):
     assert r.content == b"solid body"
 
 
-def test_workspace_chat_store_is_per_account(client):
-    entry = {"active": "c1", "conversations": {"c1": {"title": "alice design"}}}
-    r = client.put("/workspace/chat", headers=A, json={"doc1": entry})
+def test_workspace_v2_chat_store_round_trips_and_is_per_account(client):
+    store = {
+        "version": 2,
+        "active": "c1",
+        "sessions": [
+            {
+                "id": "c1",
+                "title": "alice design",
+                "msgs": [{"u": True, "t": "Design a bracket", "e": ""}],
+                "scope": 1,
+            }
+        ],
+    }
+    r = client.put("/workspace/chat", headers=A, json=store)
     assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "sessions": 1}
+    assert client.get("/workspace/chat", headers=A).json() == store
+    assert client.get("/workspace/chat", headers=B).json() == {}
 
-    got_a = client.get("/workspace/chat", headers=A).json()
-    assert got_a["doc1"]["conversations"]["c1"]["title"] == "alice design"
+    # B writes the same current envelope shape into a different tenant file.
+    theirs = {
+        "version": 2,
+        "active": "b1",
+        "sessions": [{"id": "b1", "title": "bob design", "msgs": []}],
+    }
+    assert client.put("/workspace/chat", headers=B, json=theirs).status_code == 200
+    assert client.get("/workspace/chat", headers=B).json() == theirs
+    assert client.get("/workspace/chat", headers=A).json() == store
 
-    got_b = client.get("/workspace/chat", headers=B).json()
-    assert "doc1" not in got_b
-    # B's chat store is a different file on disk.
     chat_a = _ws_user_root("alice@crimson.ua.edu") / ".chudware_chat_history.json"
     chat_b = _ws_user_root("bob@crimson.ua.edu") / ".chudware_chat_history.json"
     assert chat_a.is_file()
+    assert chat_b.is_file()
     assert chat_a != chat_b
-    # B cannot overwrite A's store through their own PUT either.
-    client.put("/workspace/chat", headers=B, json={"doc1": {"active": "x"}})
-    assert client.get("/workspace/chat", headers=A).json()["doc1"] == entry
+
+
+def test_workspace_v2_chat_put_replaces_the_complete_store(client):
+    old_store = {
+        "version": 2,
+        "active": "c1",
+        "sessions": [
+            {"id": "c1", "title": "old", "msgs": []},
+            {"id": "c2", "title": "remove me", "msgs": []},
+        ],
+    }
+    new_store = {
+        "schema": 2,
+        "active": "c3",
+        "sessions": [{"id": "c3", "title": "current", "msgs": []}],
+    }
+    assert client.put("/workspace/chat", headers=A, json=old_store).status_code == 200
+    assert client.put("/workspace/chat", headers=A, json=new_store).status_code == 200
+    assert client.get("/workspace/chat", headers=A).json() == new_store
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {
+            "version": 2,
+            "active": "c1",
+            "sessions": [{"id": "c1"}],
+            "doc1": {"active": "legacy"},
+        },
+        {"doc1": {"active": "c1", "conversations": {}}},
+        {"version": 2, "schema": 2, "active": "", "sessions": []},
+        {"version": 2, "active": "missing", "sessions": [{"id": "c1"}]},
+        {"version": 2, "active": "", "sessions": [{"id": "c1"}, {"id": "c1"}]},
+    ],
+)
+def test_workspace_chat_rejects_malformed_or_mixed_stores_without_overwrite(
+    client, malformed
+):
+    original = {
+        "version": 2,
+        "active": "c1",
+        "sessions": [{"id": "c1", "title": "keep", "msgs": []}],
+    }
+    assert client.put("/workspace/chat", headers=A, json=original).status_code == 200
+    r = client.put("/workspace/chat", headers=A, json=malformed)
+    assert r.status_code == 400, r.text
+    assert client.get("/workspace/chat", headers=A).json() == original
+
+
+def test_workspace_chat_session_count_is_bounded(client):
+    oversized = {
+        "version": 2,
+        "active": "",
+        "sessions": [{"id": f"c{i}"} for i in range(workspace_mod._CHAT_MAX_SESSIONS + 1)],
+    }
+    r = client.put("/workspace/chat", headers=A, json=oversized)
+    assert r.status_code == 400
+    assert "too many chat sessions" in r.json()["detail"]
+    assert client.get("/workspace/chat", headers=A).json() == {}
 
 
 def test_workspace_recents_are_per_account(client):

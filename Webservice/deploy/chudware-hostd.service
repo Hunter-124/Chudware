@@ -11,8 +11,11 @@ ExecStart=@BIN@/chudware-hostd --foreground
 # Verbatim instance key: socket = $XDG_RUNTIME_DIR/chudware/hostd-chudwareweb.sock,
 # never shared with dev daemons (those key on binary realpath).
 Environment=CHUDWARE_INSTANCE_KEY=chudwareweb
-# A shared team daemon must not self-exit between working sessions.
+# A systemd-managed shared daemon must use the same long idle policy whether
+# it has never seen a GUI or the last web/desktop GUI has detached. Otherwise
+# GUI_EXIT_GRACE's 10-second default defeats LINGER and causes restart flapping.
 Environment=CHUDWARE_HOSTD_LINGER_SECS=86400
+Environment=CHUDWARE_HOSTD_GUI_EXIT_GRACE_S=86400
 # This is a HEADLESS server-tier daemon, but a systemd --user unit inherits the
 # desktop session's imported DISPLAY/WAYLAND_DISPLAY, so tray_icon.cpp's
 # hasDisplay() gate passes and it draws its own AppIndicator — visually identical

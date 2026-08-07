@@ -1,16 +1,17 @@
-# chudware-webd-sync.service — triggered by chudware-webd-sync.path when the
-# engine build tree writes a new chudware-hostd. Sleeps briefly so sibling .so
-# files finish writing, then re-runs install_webd.sh --restart, which also
-# rebuilds + restages the WASM web UI bundle (host/src/ui, same tree as
-# desktop) so the browser app never drifts behind a local dev rebuild.
+# chudware-webd-sync.service — triggered by chudware-webd-sync.path after a
+# full-engine hostd build. install_webd stages and validates that exact engine
+# tree with a fresh WASM bundle before promotion. If authenticated gateway
+# telemetry is unavailable or engine bridges remain active, it fails closed
+# without promoting or restarting the shared daemon.
 [Unit]
-Description=Re-install chudware-webd after engine rebuild
+Description=Validate and promote a joint chudware-webd release after engine rebuild
 
 [Service]
 Type=oneshot
+Environment=CHUDWARE_WEBD_ARTIFACT_DIR=%h/Repositories/CAD/core/build-occt-linux/bin
 ExecStartPre=/bin/sleep 10
 ExecStart=%h/Repositories/CAD/Webservice/deploy/install_webd.sh --restart
-# install_webd.sh --restart defers the daemon restart while web users are
-# connected (polls the gateway, up to CHUDWARE_WEBD_RESTART_MAX_WAIT=600s). The
-# oneshot must be allowed to wait that out instead of being timeout-killed.
-TimeoutStartSec=900
+# The oneshot may spend time building WASM and then wait up to 600 seconds for
+# active engine bridges to drain. At the deadline it fails rather than dropping
+# users, so leave enough room for both phases.
+TimeoutStartSec=1800

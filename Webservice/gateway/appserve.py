@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 
 try:
     from .config import settings
@@ -214,6 +214,16 @@ def _file_response(target: Path, request: Request) -> FileResponse:
 
 
 @router.get("/app", response_model=None)
+async def app_redirect() -> Response:
+    """Redirect to the canonical slash form so relative bundle URLs stay under /app/."""
+    index = _resolve_under_app("")
+    return RedirectResponse(
+        url="/app/",
+        status_code=307,
+        headers=_coop_headers(index),
+    )
+
+
 @router.get("/app/", response_model=None)
 async def app_index(request: Request) -> Response:
     """Serve the WASM client entry (index.html)."""

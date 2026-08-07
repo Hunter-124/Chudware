@@ -143,7 +143,8 @@ class Settings:
         # one and reconnects on drop, so a small number is plenty; this only
         # exists to stop one account fanning out across the shared daemon.
         # Not 1: a reconnect can briefly overlap the socket it replaces, and a
-        # user may legitimately have two tabs open.
+        # user may legitimately have two tabs open. Zero is rejected during
+        # initialization rather than silently taking the web-native client offline.
         default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_ENGINE_BRIDGES_PER_USER", 4)
     )
     rate_writes_per_min: int = field(
@@ -196,6 +197,10 @@ class Settings:
     perf_traces_dir: Path = field(default_factory=Path)
 
     def __post_init__(self) -> None:
+        if self.max_engine_bridges_per_user < 1:
+            raise ValueError(
+                "CHUDWARE_WEB_MAX_ENGINE_BRIDGES_PER_USER must be at least 1"
+            )
         if not self.users_file or str(self.users_file) in {".", ""}:
             override = _env("CHUDWARE_WEB_USERS_FILE")
             if override:

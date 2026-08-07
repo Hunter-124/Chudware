@@ -199,17 +199,63 @@ bool appstatePersistReady() {
 
 void appstatePersistSync() {
     if (!g_persistReady.load(std::memory_order_acquire)) return;
-    // Debounce in JS: coalesce rapid saveSettings/persistChatHistory bursts.
+    // Debounce idle writes, but mark a single trailing flush immediately when a
+    // write arrives during syncfs. Every flush therefore completes before the next starts.
     EM_ASM({
-        if (Module.__chudwarePersistSyncTimer) clearTimeout(Module.__chudwarePersistSyncTimer);
-        Module.__chudwarePersistSyncTimer = setTimeout(function() {
-            Module.__chudwarePersistSyncTimer = null;
-            FS.syncfs(false, function(err) {
-                if (err) console.warn('[chudware] IDBFS flush failed:', err);
-            });
-        }, 50);
+        if (Module.__chudwarePersistSyncInFlight) {
+            Module.__chudwarePersistSyncPending = true;
+        } else {
+            if (Module.__chudwarePersistSyncTimer)
+                clearTimeout(Module.__chudwarePersistSyncTimer);
+            Module.__chudwarePersistSyncTimer = setTimeout(function() {
+                Module.__chudwarePersistSyncTimer = null;
+                var flush = function() {
+                    if (Module.__chudwarePersistSyncInFlight) {
+                        Module.__chudwarePersistSyncPending = true;
+                        return;
+                    }
+                    Module.__chudwarePersistSyncInFlight = true;
+                    FS.syncfs(false, function(err) {
+                        Module.__chudwarePersistSyncInFlight = false;
+                        if (err) console.warn('[chudware] IDBFS flush failed:', err);
+                        if (Module.__chudwarePersistSyncPending) {
+                            Module.__chudwarePersistSyncPending = false;
+                            flush();
+                        }
+                    });
+                };
+                flush();
+            }, 50);
+        }
     });
 }
+
+namespace {
+std::mutex g_recentFilesPersistMutex;
+std::vector<std::string> g_lastRecentFiles;
+bool g_recentFilesBaselineReady = false;
+
+void primeRecentFilesPersistence(const std::vector<std::string>& files) {
+    std::lock_guard<std::mutex> guard(g_recentFilesPersistMutex);
+    g_lastRecentFiles = files;
+    g_recentFilesBaselineReady = true;
+}
+
+void persistRecentFilesIfChanged(const std::vector<std::string>& files) {
+    std::lock_guard<std::mutex> guard(g_recentFilesPersistMutex);
+    // loadSettings normally primes this baseline. If an unusual caller saves first,
+    // observe rather than misclassifying an unrelated settings save as a recents edit.
+    if (!g_recentFilesBaselineReady) {
+        g_lastRecentFiles = files;
+        g_recentFilesBaselineReady = true;
+        return;
+    }
+    if (g_lastRecentFiles == files) return;
+
+    std::string err;
+    if (chudware::fsBackend().saveRecents(files, err)) g_lastRecentFiles = files;
+}
+}  // namespace
 #else
 void appstateInitPersist() {}
 bool appstatePersistReady() { return true; }
@@ -322,6 +368,7 @@ void loadSettings(Settings& s) {
         std::string rerr;
         auto durable = chudware::fsBackend().loadRecents(rerr);
         if (!durable.empty()) s.recentFiles = std::move(durable);
+        primeRecentFilesPersistence(s.recentFiles);
 #endif
         return;
     }
@@ -648,6 +695,9 @@ void loadSettings(Settings& s) {
         }
     } catch (...) {
     }
+#ifdef __EMSCRIPTEN__
+    primeRecentFilesPersistence(s.recentFiles);
+#endif
 }
 
 namespace {
@@ -976,13 +1026,6 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // Wave 3: File Explorer workspace + Recent files.
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;
-#ifdef __EMSCRIPTEN__
-    // Web: also write durable recents under the workspace (belt-and-suspenders with IDBFS config).
-    {
-        std::string rerr;
-        chudware::fsBackend().saveRecents(s.recentFiles, rerr);
-    }
-#endif
     if (!s.hiddenModels.empty())
         j["hidden_models"] = std::vector<std::string>(s.hiddenModels.begin(), s.hiddenModels.end());
     if (!s.disabledProviders.empty())
@@ -1011,6 +1054,11 @@ void saveSettings(const Settings& s) {
     // Locked + atomic via the shared config lock, so a concurrent Python/engine write can
     // neither clobber us nor be clobbered by us between our read and our write.
     updateConfigJson([&s](nlohmann::json& j) { applyGuiOwnedSettings(j, s); });
+#ifdef __EMSCRIPTEN__
+    // The workspace endpoint is independent of config.json/IDBFS. Only an actual recents
+    // mutation should reach it; theme/provider and other settings saves stay local.
+    persistRecentFilesIfChanged(s.recentFiles);
+#endif
 }
 
 // ---------------- textures ----------------

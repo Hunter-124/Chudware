@@ -34,7 +34,7 @@ from gateway import app as app_mod  # noqa: E402
 from gateway import sessions  # noqa: E402
 from gateway.auth import User  # noqa: E402
 from gateway.config import settings  # noqa: E402
-from gateway.limits import session_starts  # noqa: E402
+from gateway.limits import session_starts, user_slug  # noqa: E402
 from gateway.sessions import Session, SessionBusy, SessionManager, manager  # noqa: E402
 
 DEV_HEADERS = {"X-Dev-User": "demo@example.com"}
@@ -48,7 +48,7 @@ def _user(email: str, display: str = "Demo User") -> User:
 def _session(sid: str, email: str, **kw) -> Session:
     args = dict(
         sid=sid, email=email, display=email.split("@")[0],
-        slug=email.split("@")[0], container=f"chudware-sess-{sid[:8]}",
+        slug=user_slug(email), container=f"chudware-sess-{sid[:8]}",
         host_port=8460, heavy=False, status="ready",
     )
     args.update(kw)
@@ -222,6 +222,219 @@ class TestPerUserCaps:
         assert exc.value.status_code == 429
 
 
+class TestLifecycleSerialization:
+    def test_start_then_stop_finishes_with_no_orphan(self, mgr):
+        async def scenario():
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            stopped_names: list[str] = []
+
+            async def blocked_run(sess, user, home):
+                entered.set()
+                await release.wait()
+                return "new-container"
+
+            async def fake_stop(name):
+                stopped_names.append(name)
+
+            mgr._podman_run = blocked_run
+            mgr._podman_stop = fake_stop
+            user = _user("start-stop@example.com")
+            starting = asyncio.create_task(mgr.start(user))
+            await entered.wait()
+            stopping = asyncio.create_task(mgr.stop_for_user(user.email))
+            await asyncio.sleep(0)
+            assert not stopping.done()
+            release.set()
+            started = await starting
+            stopped = await stopping
+
+            assert stopped is not None and stopped.sid == started.sid
+            assert stopped_names == [started.container]
+            assert mgr.get_for_user(user.email) is None
+            assert mgr.list_sessions() == []
+
+        asyncio.run(scenario())
+
+    def test_stop_then_start_cannot_destroy_replacement(self, mgr):
+        async def scenario():
+            email = "stop-start@example.com"
+            old = _session(
+                "old-stop-start",
+                email,
+                container="chudware-sess-legacy-stop-start",
+                host_port=8467,
+                generation=7,
+            )
+            mgr._sessions[old.sid] = old
+            mgr._by_email[email] = old.sid
+            mgr._ports_in_use.add(old.host_port)
+            mgr._generations[email] = old.generation
+
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            stopped_names: list[str] = []
+
+            async def blocked_stop(name):
+                stopped_names.append(name)
+                if name == old.container:
+                    entered.set()
+                    await release.wait()
+
+            mgr._podman_stop = blocked_stop
+            stopping = asyncio.create_task(mgr.stop(old.sid, email=email))
+            await entered.wait()
+            starting = asyncio.create_task(mgr.start(_user(email)))
+            await asyncio.sleep(0)
+            assert not starting.done()
+            release.set()
+            stopped = await stopping
+            replacement = await starting
+
+            assert stopped is old
+            assert replacement.sid != old.sid
+            assert replacement.generation > old.generation
+            assert replacement.status == "ready"
+            assert mgr.get_for_user(email) is replacement
+            assert stopped_names == [old.container]
+
+        asyncio.run(scenario())
+
+    def test_double_stop_claims_container_once(self, mgr):
+        async def scenario():
+            email = "double-stop@example.com"
+            sess = _session("double-stop", email, generation=4)
+            mgr._sessions[sess.sid] = sess
+            mgr._by_email[email] = sess.sid
+            mgr._ports_in_use.add(sess.host_port)
+
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            stop_calls: list[str] = []
+
+            async def blocked_stop(name):
+                stop_calls.append(name)
+                entered.set()
+                await release.wait()
+
+            mgr._podman_stop = blocked_stop
+            first = asyncio.create_task(mgr.stop(sess.sid, email=email))
+            await entered.wait()
+            second = asyncio.create_task(mgr.stop(sess.sid, email=email))
+            await asyncio.sleep(0)
+            assert not second.done()
+            release.set()
+            results = await asyncio.gather(first, second)
+
+            assert sum(result is sess for result in results) == 1
+            assert sum(result is None for result in results) == 1
+            assert stop_calls == [sess.container]
+            assert mgr.get(sess.sid) is None
+
+        asyncio.run(scenario())
+
+
+class TestCanonicalSessionIdentity:
+    def test_same_local_part_on_different_domains_cannot_collide(self, mgr):
+        homes: dict[str, Path] = {}
+
+        async def capture_run(sess, user, home):
+            homes[sess.email] = home
+            return f"cid-{len(homes)}"
+
+        mgr._podman_run = capture_run
+        one = asyncio.run(mgr.start(_user("alex@one.example")))
+        two = asyncio.run(mgr.start(_user("alex@two.example")))
+
+        assert one.slug == user_slug(one.email)
+        assert two.slug == user_slug(two.email)
+        assert one.slug != two.slug
+        assert one.container != two.container
+        assert homes[one.email] != homes[two.email]
+
+    def test_healthy_legacy_container_is_adopted_by_email_label(self, mgr):
+        email = "legacy@one.example"
+        line = (
+            "cid-legacy\tlegacy-sid\tLegacy@One.Example\tLegacy User\tlegacy\t"
+            "8468\t0\tchudware-sess-legacy"
+        )
+
+        async def list_running(args, *, timeout=120.0):
+            return 0, line + "\n", ""
+
+        mgr.run_podman = list_running
+        assert asyncio.run(mgr.adopt_running()) == 1
+        adopted = mgr.get_for_user(email)
+        assert adopted is not None
+        assert adopted.status == "ready"
+        assert adopted.slug == user_slug(email)
+        assert adopted.container == "chudware-sess-legacy"
+
+
+class TestAdoptionHealth:
+    def test_unhealthy_adopted_container_is_removed_not_published(self, mgr):
+        email = "unhealthy@example.com"
+        line = (
+            "cid-bad\tbad-sid\tunhealthy@example.com\tUnhealthy\tunhealthy\t"
+            "8469\t0\tchudware-sess-unhealthy"
+        )
+        stopped_names: list[str] = []
+
+        async def list_running(args, *, timeout=120.0):
+            return 0, line + "\n", ""
+
+        async def unhealthy(sess):
+            return False
+
+        async def fake_stop(name):
+            stopped_names.append(name)
+
+        mgr.run_podman = list_running
+        mgr._wait_ready = unhealthy
+        mgr._podman_stop = fake_stop
+        assert asyncio.run(mgr.adopt_running()) == 0
+        assert mgr.get_for_user(email) is None
+        assert mgr.get("bad-sid") is None
+        assert stopped_names == ["chudware-sess-unhealthy"]
+
+    def test_unhealthy_reused_container_is_replaced(self, mgr):
+        async def scenario():
+            email = "reused@example.com"
+            old = _session(
+                "reused-old",
+                email,
+                container=f"chudware-sess-{user_slug(email)}",
+                generation=3,
+            )
+            mgr._sessions[old.sid] = old
+            mgr._by_email[email] = old.sid
+            mgr._ports_in_use.add(old.host_port)
+            mgr._generations[email] = old.generation
+
+            probes: list[str] = []
+            stopped_names: list[str] = []
+
+            async def probe(sess):
+                probes.append(sess.sid)
+                return sess is not old
+
+            async def fake_stop(name):
+                stopped_names.append(name)
+
+            mgr._wait_ready = probe
+            mgr._podman_stop = fake_stop
+            replacement = await mgr.start(_user(email))
+
+            assert probes == [old.sid, replacement.sid]
+            assert replacement.sid != old.sid
+            assert replacement.generation > old.generation
+            assert replacement.status == "ready"
+            assert mgr.get_for_user(email) is replacement
+            assert stopped_names == [old.container]
+
+        asyncio.run(scenario())
+
+
 class TestLifetimeReaper:
     def test_reaper_evicts_past_max_lifetime_even_when_active(self, mgr, monkeypatch):
         """A seat held warm by constant traffic still dies at the hard ceiling."""
@@ -240,6 +453,44 @@ class TestLifetimeReaper:
         # An active session inside both limits is untouched.
         assert fresh.sid not in stopped
         assert mgr.get(fresh.sid) is not None
+
+    def test_touch_after_scan_prevents_idle_stop_claim(self, mgr, monkeypatch):
+        monkeypatch.setattr(settings, "idle_timeout_sec", 60)
+        monkeypatch.setattr(settings, "max_session_lifetime_sec", 3600)
+
+        async def scenario():
+            now = time.time()
+            sess = _session(
+                "last-touch",
+                "touch@example.com",
+                created_at=now - 120,
+                last_activity=now - 120,
+                generation=9,
+            )
+            mgr._sessions[sess.sid] = sess
+            mgr._by_email[sess.email] = sess.sid
+            mgr._ports_in_use.add(sess.host_port)
+
+            scan_complete = asyncio.Event()
+            release_claim = asyncio.Event()
+            original_stop = mgr._stop_serialized
+
+            async def stop_after_barrier(*args, **kwargs):
+                scan_complete.set()
+                await release_claim.wait()
+                return await original_stop(*args, **kwargs)
+
+            mgr._stop_serialized = stop_after_barrier
+            reaping = asyncio.create_task(mgr.reap_idle())
+            await scan_complete.wait()
+            sess.touch()
+            release_claim.set()
+
+            assert await reaping == []
+            assert mgr.get(sess.sid) is sess
+            assert sess.status == "ready"
+
+        asyncio.run(scenario())
 
 
 class TestProviderKeyGating:

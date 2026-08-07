@@ -151,9 +151,12 @@ def _scrub(obj: Any) -> Any:
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
         for k, v in obj.items():
-            if str(k).lower() in _SECRET_KEYS:
+            key = str(k).lower()
+            if key in _SECRET_KEYS:
                 continue
-            if any(s in str(k).lower() for s in ("token", "secret", "password", "api_key")):
+            if any(s in key for s in (
+                "token", "secret", "password", "api_key", "apikey", "credential",
+            )):
                 continue
             out[k] = _scrub(v)
         return out
@@ -162,8 +165,15 @@ def _scrub(obj: Any) -> Any:
     return obj
 
 
-def list_available_providers(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Build the signed-in provider list from host config (names/labels/models only).
+def list_available_providers(
+    cfg: dict[str, Any] | None = None,
+    *,
+    include_operator_detail: bool = False,
+) -> dict[str, Any]:
+    """Build the signed-in provider list and static model presets.
+
+    Account identities are host-operator detail and are omitted by default.
+    Administrators may opt into the existing scrubbed account summaries.
 
     A provider is available when:
       - ``keys.<slot>`` is a non-empty string, or
@@ -230,29 +240,41 @@ def list_available_providers(cfg: dict[str, Any] | None = None) -> dict[str, Any
         if wire in seen:
             continue
         seen.add(wire)
-        accounts = info.get("accounts") if isinstance(info.get("accounts"), list) else []
-        # Strip any residual secret fields from account summaries (list_accounts is
-        # already token-free; scrub is defense-in-depth).
-        safe_accounts = []
-        for acct in accounts:
-            if not isinstance(acct, dict):
-                continue
-            safe_accounts.append({
-                "account_id": str(acct.get("account_id") or ""),
-                "label": str(acct.get("label") or acct.get("email") or acct.get("account_id") or ""),
-                "email": str(acct.get("email") or "") or None,
-                "active": bool(acct.get("active")),
-            })
-        providers.append({
+        entry: dict[str, Any] = {
             "id": wire,
             "name": wire,
-            "label": str(info.get("label") or default_label),
+            # Subscription status labels can be derived from an account identity.
+            # Standard callers receive only the fixed provider catalogue label.
+            "label": (
+                str(info.get("label") or default_label)
+                if include_operator_detail
+                else default_label
+            ),
             "auth": "subscription",
-            "email": str(info.get("email") or "") or None,
-            "account_id": str(info.get("account_id") or "") or None,
-            "accounts": safe_accounts,
             "models": list(_MODEL_PRESETS.get(wire, [])),
-        })
+        }
+        if include_operator_detail:
+            accounts = info.get("accounts") if isinstance(info.get("accounts"), list) else []
+            # list_accounts is already token-free; selecting fields plus the
+            # recursive scrub below is defense-in-depth.
+            safe_accounts = []
+            for acct in accounts:
+                if not isinstance(acct, dict):
+                    continue
+                safe_accounts.append({
+                    "account_id": str(acct.get("account_id") or ""),
+                    "label": str(
+                        acct.get("label") or acct.get("email") or acct.get("account_id") or ""
+                    ),
+                    "email": str(acct.get("email") or "") or None,
+                    "active": bool(acct.get("active")),
+                })
+            entry.update({
+                "email": str(info.get("email") or "") or None,
+                "account_id": str(info.get("account_id") or "") or None,
+                "accounts": safe_accounts,
+            })
+        providers.append(entry)
 
     # When xAI has both API key and subscription, prefer listing both (xai + xai-sub).
     # API-key path already added as "xai"; subscription as "xai-sub" above.
@@ -269,9 +291,11 @@ def list_available_providers(cfg: dict[str, Any] | None = None) -> dict[str, Any
 
 @router.get("/api/providers")
 async def api_providers(request: Request) -> dict[str, Any]:
-    """List host-signed-in AI providers + model presets (names only, no secrets)."""
-    get_current_user(request)  # 401 if unauthenticated (AuthMiddleware already gates)
-    return list_available_providers()
+    """List shared host providers without exposing operator identity to users."""
+    user = get_current_user(request)  # 401 if unauthenticated
+    return list_available_providers(
+        include_operator_detail=getattr(user, "role", None) == "admin",
+    )
 
 
 __all__ = ["router", "list_available_providers"]

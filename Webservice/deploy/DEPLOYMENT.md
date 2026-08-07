@@ -80,6 +80,29 @@ access**. Production MUST load the real allowlist from a file OUTSIDE the repo:
   `python3 Webservice/deploy/cf_provision.py --sync-users` to push the runtime
   users file into the Access allow policy.
 
+## Safe application updates
+
+Run `Webservice/deploy/update.sh` from the production checkout. The updater and
+`install_webd.sh --restart` now treat the native daemon, OMP/Bun provider
+dependencies, and WASM bundle as one immutable release under
+`~/chudware-web/releases/`; `~/chudware-web/current` moves only after every
+artifact is built and validated. The joint manifest and running stamp are
+written after cutover, so a failed native build, provider install, WASM build,
+unit restart, or readiness probe exits nonzero instead of reporting success
+over a mixed/stale deployment.
+
+Before a shared-daemon restart, the installer reads the authenticated
+`engine_bridges` value from detailed `/healthz` using the loopback SSO secret
+and an active administrator account. Missing authentication, missing
+telemetry, or an unreachable gateway fails closed; a nonzero bridge count
+defers the restart rather than disconnecting active browser sessions.
+Anonymous `/healthz` intentionally remains the bare `{"ok": true}` liveness
+contract and must not be used for drain decisions.
+
+The gateway unit and application both enforce
+`CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES` (4 MiB by default). Keep the unit template,
+gateway setting, and reverse proxy limit aligned when changing it.
+
 ## Purge cache (per zone)
 
 ```

@@ -5,13 +5,12 @@
 #  Keeps the desktop GUI + chudware-web stack current with origin/master.
 #
 #  Usage:
-#    bash Webservice/deploy/update.sh              # pull + host GUI + engine + webd + gateway
+#    bash Webservice/deploy/update.sh              # pull + desktop + joint hostd/WASM + gateway
 #    bash Webservice/deploy/update.sh --pull-only  # git pull only
 #    bash Webservice/deploy/update.sh --no-pull    # rebuild/redeploy current tree
 #    bash Webservice/deploy/update.sh --host-only  # desktop Chudware binary only
-#    bash Webservice/deploy/update.sh --web-only   # engine → install_webd + gateway
+#    bash Webservice/deploy/update.sh --web-only   # joint hostd/WASM release + gateway
 #    bash Webservice/deploy/update.sh --image      # also rebuild session container
-#    bash Webservice/deploy/update.sh --wasm       # also rebuild wasm target
 #
 #  Env:
 #    CHUDWARE_OMP_DIR / repo root detection (this script's ../../)
@@ -39,16 +38,14 @@ DO_ENGINE=1
 DO_WEBD=1
 DO_GATEWAY=1
 DO_IMAGE=0
-DO_WASM=0
 
 for arg in "$@"; do
   case "$arg" in
-    --pull-only) DO_HOST=0; DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0; DO_IMAGE=0; DO_WASM=0 ;;
+    --pull-only) DO_HOST=0; DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0; DO_IMAGE=0 ;;
     --no-pull)   DO_PULL=0 ;;
-    --host-only) DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0; DO_IMAGE=0; DO_WASM=0 ;;
-    --web-only)  DO_HOST=0; DO_IMAGE=0; DO_WASM=0 ;;
+    --host-only) DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0; DO_IMAGE=0 ;;
+    --web-only)  DO_HOST=0; DO_IMAGE=0 ;;
     --image)     DO_IMAGE=1 ;;
-    --wasm)      DO_WASM=1 ;;
     -h|--help)
       sed -n '2,25p' "$0"
       exit 0
@@ -81,7 +78,7 @@ _cleanup() {
 trap _cleanup EXIT
 
 echo "=== chudware update start $(date -Iseconds) repo=$REPO ==="
-echo "    pull=$DO_PULL host=$DO_HOST engine=$DO_ENGINE webd=$DO_WEBD gateway=$DO_GATEWAY image=$DO_IMAGE wasm=$DO_WASM"
+echo "    pull=$DO_PULL host=$DO_HOST engine=$DO_ENGINE webd=$DO_WEBD gateway=$DO_GATEWAY image=$DO_IMAGE"
 
 if [[ "$DO_PULL" = 1 ]]; then
   echo
@@ -112,23 +109,17 @@ if [[ "$DO_HOST" = 1 ]]; then
   ./build.sh
 fi
 
+ENGINE_ARTIFACT_DIR="$REPO/core/build-occt-linux/bin"
 if [[ "$DO_ENGINE" = 1 ]]; then
   echo
-  echo "=== [$(date -Iseconds)] ./build.sh core (engine / hostd) ==="
-  ./build.sh core
+  echo "=== [$(date -Iseconds)] ./build.sh daemon (authoritative full engine / hostd) ==="
+  ./build.sh daemon
+  [[ -x "$ENGINE_ARTIFACT_DIR/chudware-hostd" ]] \
+    || { echo "ERROR: fresh hostd artifact missing at $ENGINE_ARTIFACT_DIR/chudware-hostd" >&2; exit 1; }
+  [[ -f "$ENGINE_ARTIFACT_DIR/libchudware.so" ]] \
+    || { echo "ERROR: fresh engine artifact missing at $ENGINE_ARTIFACT_DIR/libchudware.so" >&2; exit 1; }
 fi
 
-if [[ "$DO_WASM" = 1 ]]; then
-  echo
-  echo "=== [$(date -Iseconds)] ./build.sh wasm ==="
-  if [[ -f "$HOME/.emsdk/emsdk_env.sh" ]]; then
-    set +u
-    # shellcheck disable=SC1091
-    source "$HOME/.emsdk/emsdk_env.sh"
-    set -u
-  fi
-  ./build.sh wasm
-fi
 
 if [[ "$DO_IMAGE" = 1 ]]; then
   echo
@@ -138,22 +129,36 @@ if [[ "$DO_IMAGE" = 1 ]]; then
 fi
 
 if [[ "$DO_WEBD" = 1 ]]; then
+  [[ "$DO_ENGINE" = 1 ]] || { echo "ERROR: webd promotion requires the engine build in this update" >&2; exit 1; }
   echo
-  echo "=== [$(date -Iseconds)] install_webd.sh --restart ==="
-  bash Webservice/deploy/install_webd.sh --restart
+  echo "=== [$(date -Iseconds)] validate/promote joint hostd + WASM release ==="
+  CHUDWARE_WEBD_ARTIFACT_DIR="$ENGINE_ARTIFACT_DIR" \
+    CHUDWARE_WEBD_REQUIRE_IDLE=1 \
+    bash Webservice/deploy/install_webd.sh --restart
 fi
 
 if [[ "$DO_GATEWAY" = 1 ]]; then
   echo
   echo "=== [$(date -Iseconds)] restart chudware-gateway ==="
-  if systemctl --user cat chudware-gateway.service >/dev/null 2>&1; then
-    systemctl --user restart chudware-gateway.service
-    systemctl --user is-active chudware-gateway.service || true
-    curl -fsS --max-time 5 http://127.0.0.1:8300/healthz || true
-    echo
-  else
-    echo "    chudware-gateway.service not installed — skip (run setup.sh once)"
-  fi
+  systemctl --user cat chudware-gateway.service >/dev/null 2>&1 \
+    || { echo "ERROR: chudware-gateway.service is not installed" >&2; exit 1; }
+  systemctl --user restart chudware-gateway.service \
+    || { echo "ERROR: failed to restart chudware-gateway.service" >&2; exit 1; }
+  systemctl --user is-active --quiet chudware-gateway.service \
+    || { echo "ERROR: chudware-gateway.service is not active after restart" >&2; exit 1; }
+  gateway_ready=0
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    if health_body="$(curl -fsS --max-time 5 http://127.0.0.1:8300/healthz 2>/dev/null)" \
+        && HEALTH_JSON="$health_body" python3 -c \
+          'import json, os; body=json.loads(os.environ["HEALTH_JSON"]); raise SystemExit(0 if body == {"ok": True} else 1)'; then
+      gateway_ready=1
+      break
+    fi
+    sleep 1
+  done
+  [[ "$gateway_ready" = 1 ]] \
+    || { echo "ERROR: chudware-gateway failed anonymous /healthz readiness" >&2; exit 1; }
+  echo "    gateway ready: {\"ok\":true}"
 fi
 
 echo

@@ -18,15 +18,14 @@ import httpx
 try:
     from .auth import User
     from .config import Settings, settings
-    from .limits import session_starts
+    from .limits import session_starts, user_slug
 except ImportError:
     from auth import User
     from config import Settings, settings
-    from limits import session_starts
+    from limits import session_starts, user_slug
 
 log = logging.getLogger("chudware-web.sessions")
 
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 # AUDIT (CRITICAL, multi-tenant): _podman_run historically copied the HOST's
 # paid provider keys (ai_providers.env -> Firecrawl/Gemini/Moonshot/OpenRouter)
@@ -48,11 +47,6 @@ def _new_sid() -> str:
     """Session ids are bearer handles in /stream/<sid>/ URLs; use full entropy."""
     return secrets.token_urlsafe(24)
 
-
-def email_slug(email: str) -> str:
-    local = email.strip().lower().split("@", 1)[0]
-    slug = _SLUG_RE.sub("-", local).strip("-")
-    return (slug or "user")[:48]
 
 
 def mem_available_bytes() -> int | None:
@@ -88,6 +82,7 @@ class Session:
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
     container_id: str | None = None
+    generation: int = 0
 
     def touch(self) -> None:
         self.last_activity = time.time()
@@ -137,6 +132,11 @@ class SessionManager:
         self._ports_in_use: set[int] = set()
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task | None = None
+        # The global lock protects capacity reservations and indexes only.  A
+        # per-account lock spans Podman I/O so lifecycle mutations for one seat
+        # serialize without blocking unrelated accounts or host capacity reads.
+        self._account_locks: dict[str, asyncio.Lock] = {}
+        self._generations: dict[str, int] = {}
         self.podman_bin = "podman"
 
     async def start_reaper(self) -> None:
@@ -164,29 +164,34 @@ class SessionManager:
 
     async def reap_idle(self) -> list[str]:
         now = time.time()
-        idle_timeout = self.cfg.idle_timeout_sec
-        max_lifetime = self.cfg.max_session_lifetime_sec
-        to_stop: list[str] = []
+        idle_cutoff = now - self.cfg.idle_timeout_sec
+        lifetime_cutoff = now - self.cfg.max_session_lifetime_sec
+        to_stop: list[tuple[str, str, int]] = []
         async with self._lock:
             for sid, sess in list(self._sessions.items()):
-                if sess.status in {"stopped", "stopping", "error"}:
+                if sess.status not in {"starting", "ready"}:
                     continue
-                # Absolute ceiling from creation: touch() fires on every proxied
-                # request/WS frame, so the idle timeout alone lets a user hold a
-                # seat forever by keeping the stream warm.
-                expired = (now - sess.created_at) > max_lifetime
-                if expired:
-                    log.info(
-                        "session %s hit max lifetime (%ds)", sid, max_lifetime
-                    )
-                if expired or (now - sess.last_activity) > idle_timeout:
-                    to_stop.append(sid)
+                # Capture the incarnation, not just the sid.  The stop claim
+                # rechecks both cutoffs after it acquires the account lock, so
+                # activity arriving between this scan and the claim wins.
+                if (
+                    sess.created_at < lifetime_cutoff
+                    or sess.last_activity < idle_cutoff
+                ):
+                    to_stop.append((sid, sess.email, sess.generation))
         stopped: list[str] = []
-        for sid in to_stop:
-            log.info("idle reaper stopping session %s", sid)
+        for sid, email, generation in to_stop:
+            log.info("idle reaper considering session %s", sid)
             try:
-                await self.stop(sid)
-                stopped.append(sid)
+                sess = await self._stop_serialized(
+                    sid,
+                    owner=email,
+                    generation=generation,
+                    idle_cutoff=idle_cutoff,
+                    lifetime_cutoff=lifetime_cutoff,
+                )
+                if sess is not None:
+                    stopped.append(sid)
             except Exception:  # noqa: BLE001
                 log.exception("failed to reap session %s", sid)
         return stopped
@@ -253,123 +258,252 @@ class SessionManager:
 
     async def _container_running(self, name: str) -> bool:
         rc, out, _ = await self.run_podman(
-            ["ps", "--filter", f"name=^{name}$", "--filter", "status=running",
+            ["ps", "--filter", f"name=^{re.escape(name)}$", "--filter", "status=running",
              "--format", "{{.ID}}"],
             timeout=15,
         )
         return rc == 0 and bool(out.strip())
 
-    async def _drop_session(self, sid: str) -> None:
+    def _account_lock(self, email: str) -> asyncio.Lock:
+        """Return the lifecycle mutex for a normalized account identity."""
+        lock = self._account_locks.get(email)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._account_locks[email] = lock
+        return lock
+
+    def _next_generation_locked(self, email: str) -> int:
+        """Mint an account lifecycle generation while ``self._lock`` is held."""
+        generation = self._generations.get(email, 0) + 1
+        self._generations[email] = generation
+        return generation
+
+    def _is_current_locked(self, sess: Session, generation: int) -> bool:
+        return (
+            self._sessions.get(sess.sid) is sess
+            and sess.generation == generation
+            and self._by_email.get(sess.email) == sess.sid
+        )
+
+    async def _discard_if_current(self, sess: Session, generation: int) -> bool:
+        """Release a reservation only when its exact incarnation still owns it."""
         async with self._lock:
-            sess = self._sessions.pop(sid, None)
-            if sess:
-                self._ports_in_use.discard(sess.host_port)
-                if self._by_email.get(sess.email) == sid:
-                    del self._by_email[sess.email]
+            if not self._is_current_locked(sess, generation):
+                return False
+            self._sessions.pop(sess.sid, None)
+            self._by_email.pop(sess.email, None)
+            self._ports_in_use.discard(sess.host_port)
+            return True
 
     async def start(self, user: User) -> Session:
         email = user.email.strip().lower()
-        existing = self.get_for_user(email)
-        if existing and existing.status in {"starting", "ready"}:
-            # A record can outlive its container (killed out-of-band, host
-            # reboot); verify before handing the user a dead seat.
-            if existing.status == "starting" or await self._container_running(existing.container):
-                existing.touch()
-                log.info("reconnect user %s → session %s", email, existing.sid)
-                return existing
-            log.warning("session %s container %s is gone; starting fresh",
-                        existing.sid, existing.container)
-            await self._drop_session(existing.sid)
-        async with self._lock:
-            # re-check under the lock: a concurrent start may have won
+        async with self._account_lock(email):
             existing = self.get_for_user(email)
-            if existing and existing.status in {"starting", "ready"}:
-                existing.touch()
-                return existing
-
-            if self.cfg.refuse_new_flag.exists():
-                raise SessionBusy("host refusing new sessions (REFUSE_NEW flag)")
-
-            if self.active_count() >= self.cfg.max_sessions:
-                raise SessionBusy(f"max sessions reached ({self.cfg.max_sessions})")
-
-            # Per-account seat cap: the global cap above is host capacity; this
-            # keeps one account from consuming the whole pool for itself.
-            user_active = sum(
-                1
-                for s in self._sessions.values()
-                if s.email == email and s.status in {"starting", "ready"}
-            )
-            if user_active >= self.cfg.max_sessions_per_user:
-                raise SessionBusy(
-                    "per-user session limit reached "
-                    f"({self.cfg.max_sessions_per_user})"
+            if existing is not None:
+                # Both adoption and an in-memory reconnect must pass the HTTP
+                # health probe.  Merely seeing a running container is not
+                # enough to publish a dead stream as ready.
+                healthy = False
+                if existing.status in {"starting", "ready"}:
+                    async with self._lock:
+                        probe_claim = self._is_current_locked(
+                            existing,
+                            existing.generation,
+                        )
+                        if probe_claim:
+                            existing.status = "starting"
+                            existing.error = None
+                    if (
+                        probe_claim
+                        and await self._container_running(existing.container)
+                    ):
+                        healthy = await self._wait_ready(existing)
+                if healthy:
+                    async with self._lock:
+                        if self._is_current_locked(existing, existing.generation):
+                            existing.status = "ready"
+                            existing.error = None
+                            existing.touch()
+                            log.info(
+                                "reconnect user %s → session %s",
+                                email,
+                                existing.sid,
+                            )
+                            return existing
+                log.warning(
+                    "session %s container %s is stale or unhealthy; starting fresh",
+                    existing.sid,
+                    existing.container,
+                )
+                await self._stop_locked(
+                    existing.sid,
+                    owner=email,
+                    generation=existing.generation,
                 )
 
-            avail = mem_available_gib()
-            if avail is not None and avail < self.cfg.min_host_ram_gib:
-                raise SessionBusy(
-                    f"insufficient host RAM ({avail:.1f} GiB available, "
-                    f"need ≥{self.cfg.min_host_ram_gib})"
-                )
-
-            # Rate-limit start/stop churn — every fresh seat costs podman plus
-            # a healthcheck cycle. Keyed on the verified identity, never on
-            # client input.
-            session_starts.enforce(email, "session starts")
-
-            want_heavy = bool(user.heavy) and self.heavy_count() < self.cfg.max_heavy
-            slug = email_slug(email)
-            host_port = self._alloc_port()
-            sid = _new_sid()
+            # The canonical full-address slug separates equal local parts at
+            # different domains.  Legacy containers are adopted by their
+            # chudware.email label and retain their old name until stopped.
+            slug = user_slug(email)
             container = f"chudware-sess-{slug}"
             home = self.cfg.homes_dir / slug
             home.mkdir(parents=True, exist_ok=True)
             self.cfg.plm_dir.mkdir(parents=True, exist_ok=True)
 
-            sess = Session(
-                sid=sid,
-                email=email,
-                display=user.display,
-                slug=slug,
-                container=container,
-                host_port=host_port,
-                heavy=want_heavy,
-                status="starting",
-            )
-            self._sessions[sid] = sess
-            self._by_email[email] = sid
-            self._ports_in_use.add(host_port)
+            async with self._lock:
+                if self.cfg.refuse_new_flag.exists():
+                    raise SessionBusy("host refusing new sessions (REFUSE_NEW flag)")
+
+                if self.active_count() >= self.cfg.max_sessions:
+                    raise SessionBusy(f"max sessions reached ({self.cfg.max_sessions})")
+
+                # Per-account seat cap: the global cap above is host capacity;
+                # this also catches an old orphan not present in _by_email.
+                user_active = sum(
+                    1
+                    for s in self._sessions.values()
+                    if s.email == email and s.status in {"starting", "ready"}
+                )
+                if user_active >= self.cfg.max_sessions_per_user:
+                    raise SessionBusy(
+                        "per-user session limit reached "
+                        f"({self.cfg.max_sessions_per_user})"
+                    )
+
+                avail = mem_available_gib()
+                if avail is not None and avail < self.cfg.min_host_ram_gib:
+                    raise SessionBusy(
+                        f"insufficient host RAM ({avail:.1f} GiB available, "
+                        f"need ≥{self.cfg.min_host_ram_gib})"
+                    )
+
+                # Rate-limit start/stop churn — every fresh seat costs podman
+                # plus a healthcheck cycle.  The reservation below is atomic
+                # with all global capacity checks; Podman I/O happens after.
+                session_starts.enforce(email, "session starts")
+                want_heavy = (
+                    bool(user.heavy) and self.heavy_count() < self.cfg.max_heavy
+                )
+                host_port = self._alloc_port()
+                sid = _new_sid()
+                generation = self._next_generation_locked(email)
+                sess = Session(
+                    sid=sid,
+                    email=email,
+                    display=user.display,
+                    slug=slug,
+                    container=container,
+                    host_port=host_port,
+                    heavy=want_heavy,
+                    status="starting",
+                    generation=generation,
+                )
+                self._sessions[sid] = sess
+                self._by_email[email] = sid
+                self._ports_in_use.add(host_port)
+
+            try:
+                await self._ensure_no_stale_container(container)
+                sess.container_id = await self._podman_run(sess, user, home)
+                if await self._wait_ready(sess):
+                    async with self._lock:
+                        if not self._is_current_locked(sess, generation):
+                            raise SessionBusy("session lifecycle changed during start")
+                        sess.status = "ready"
+                        sess.error = None
+                    return sess
+
+                async with self._lock:
+                    owns_claim = self._is_current_locked(sess, generation)
+                    if owns_claim:
+                        sess.status = "error"
+                        sess.error = "stream port did not become healthy in time"
+                if not owns_claim:
+                    raise SessionBusy("session lifecycle changed during healthcheck")
+                log.error("session %s healthcheck failed; cleaning up", sid)
+                try:
+                    await self._podman_stop(container)
+                finally:
+                    await self._discard_if_current(sess, generation)
+                return sess
+            except Exception as exc:  # noqa: BLE001
+                async with self._lock:
+                    owns_claim = self._is_current_locked(sess, generation)
+                    if owns_claim:
+                        sess.status = "error"
+                        sess.error = str(exc) or type(exc).__name__
+                log.exception("session start failed for %s", email)
+                if owns_claim:
+                    try:
+                        await self._podman_stop(container)
+                    finally:
+                        await self._discard_if_current(sess, generation)
+                raise
+
+    async def _stop_locked(
+        self,
+        sid: str,
+        *,
+        owner: str,
+        generation: int,
+        idle_cutoff: float | None = None,
+        lifetime_cutoff: float | None = None,
+    ) -> Session | None:
+        """Claim and stop one exact session incarnation.
+
+        The caller holds the account lock.  Cutoffs make this an idle-reaper
+        claim and are revalidated atomically with the status transition.
+        """
+        async with self._lock:
+            sess = self._sessions.get(sid)
+            if (
+                sess is None
+                or sess.email != owner
+                or sess.generation != generation
+            ):
+                return None
+            if idle_cutoff is not None and lifetime_cutoff is not None:
+                if sess.status not in {"starting", "ready"}:
+                    return None
+                if (
+                    sess.created_at >= lifetime_cutoff
+                    and sess.last_activity >= idle_cutoff
+                ):
+                    return None
+            sess.status = "stopping"
+            container = sess.container
+            host_port = sess.host_port
 
         try:
-            await self._ensure_no_stale_container(container)
-            cid = await self._podman_run(sess, user, home)
-            sess.container_id = cid
-            ready = await self._wait_ready(sess)
-            if ready:
-                sess.status = "ready"
-            else:
-                sess.status = "error"
-                sess.error = "stream port did not become healthy in time"
-                log.error("session %s healthcheck failed; cleaning up", sid)
-                await self._podman_stop(sess.container)
-                async with self._lock:
-                    self._ports_in_use.discard(host_port)
-                    if self._by_email.get(email) == sid:
-                        del self._by_email[email]
-                    self._sessions.pop(sid, None)
-        except Exception as exc:  # noqa: BLE001
-            sess.status = "error"
-            sess.error = str(exc) or type(exc).__name__
-            log.exception("session start failed for %s", email)
-            await self._podman_stop(sess.container)
+            await self._podman_stop(container)
+        finally:
             async with self._lock:
-                self._ports_in_use.discard(host_port)
-                if self._by_email.get(email) == sid:
-                    del self._by_email[email]
-                self._sessions.pop(sid, None)
-            raise
+                current = self._sessions.get(sid)
+                if current is sess and current.generation == generation:
+                    current.status = "stopped"
+                    self._sessions.pop(sid, None)
+                    self._ports_in_use.discard(host_port)
+                    if self._by_email.get(owner) == sid:
+                        self._by_email.pop(owner, None)
         return sess
+
+    async def _stop_serialized(
+        self,
+        sid: str,
+        *,
+        owner: str,
+        generation: int,
+        idle_cutoff: float | None = None,
+        lifetime_cutoff: float | None = None,
+    ) -> Session | None:
+        async with self._account_lock(owner):
+            return await self._stop_locked(
+                sid,
+                owner=owner,
+                generation=generation,
+                idle_cutoff=idle_cutoff,
+                lifetime_cutoff=lifetime_cutoff,
+            )
 
     async def stop(self, sid: str, *, email: str | None = None) -> Session | None:
         async with self._lock:
@@ -378,29 +512,20 @@ class SessionManager:
                 return None
             if email and sess.email != email.strip().lower():
                 raise PermissionError("not your session")
-            sess.status = "stopping"
-            container = sess.container
-            host_port = sess.host_port
             owner = sess.email
-
-        try:
-            await self._podman_stop(container)
-        finally:
-            async with self._lock:
-                sess = self._sessions.get(sid)
-                if sess:
-                    sess.status = "stopped"
-                self._ports_in_use.discard(host_port)
-                if self._by_email.get(owner) == sid:
-                    del self._by_email[owner]
-                self._sessions.pop(sid, None)
-        return sess
+            generation = sess.generation
+        return await self._stop_serialized(
+            sid,
+            owner=owner,
+            generation=generation,
+        )
 
     async def stop_for_user(self, email: str) -> Session | None:
-        sess = self.get_for_user(email)
-        if not sess:
+        normalized = email.strip().lower()
+        sess = self.get_for_user(normalized)
+        if sess is None:
             return None
-        return await self.stop(sess.sid, email=email)
+        return await self.stop(sess.sid, email=normalized)
 
     async def run_podman(self, args: list[str], *, timeout: float = 120.0) -> tuple[int, str, str]:
         """Execute podman; returns (rc, stdout, stderr). Monkeypatch this in tests.
@@ -434,7 +559,7 @@ class SessionManager:
 
     async def _ensure_no_stale_container(self, name: str) -> None:
         rc, out, _ = await self.run_podman(
-            ["ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.ID}}"],
+            ["ps", "-a", "--filter", f"name=^{re.escape(name)}$", "--format", "{{.ID}}"],
             timeout=30,
         )
         if rc == 0 and out.strip():
@@ -442,17 +567,20 @@ class SessionManager:
             await self.run_podman(["rm", "-f", name], timeout=60)
 
     async def adopt_running(self) -> int:
-        """Rebuild session records from live chudware-sess-* containers.
+        """Rebuild healthy session records from labeled running containers.
 
-        Session state is in-memory; after a gateway restart (systemd
-        Restart=on-failure) running seats would otherwise be orphaned —
-        unreachable, unreaped, and double-started on the next login.
+        The email label is authoritative, which safely adopts legacy local-part
+        container names without treating that collision-prone name as identity.
+        Every candidate remains ``starting`` until its stream health probe
+        succeeds.
         """
         rc, out, _ = await self.run_podman(
             [
                 "ps",
-                "--filter", "name=^chudware-sess-",
-                "--filter", "status=running",
+                "--filter",
+                "name=^chudware-sess-",
+                "--filter",
+                "status=running",
                 "--format",
                 '{{.ID}}\t{{index .Labels "chudware.sid"}}\t{{index .Labels "chudware.email"}}\t'
                 '{{index .Labels "chudware.display"}}\t{{index .Labels "chudware.slug"}}\t'
@@ -463,35 +591,95 @@ class SessionManager:
         if rc != 0:
             log.warning("adopt_running: podman ps failed rc=%s", rc)
             return 0
+
         adopted = 0
-        async with self._lock:
-            for line in out.strip().splitlines():
-                parts = line.split("\t")
-                if len(parts) != 8:
+        for line in out.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) != 8:
+                continue
+            cid, sid, raw_email, display, _legacy_slug, port_s, heavy_s, name = parts
+            email = raw_email.strip().lower()
+            if not sid or not email or email in {".", ".."} or not name:
+                continue
+            try:
+                port = int(port_s)
+                slug = user_slug(email)
+            except (TypeError, ValueError):
+                continue
+            if not (1 <= port <= 65535):
+                continue
+
+            async with self._account_lock(email):
+                reject_reason: str | None = None
+                may_stop_rejected = True
+                candidate: Session | None = None
+                async with self._lock:
+                    same_sid = self._sessions.get(sid)
+                    same_email = self.get_for_user(email)
+                    same_container = next(
+                        (
+                            sess
+                            for sess in self._sessions.values()
+                            if sess.container == name
+                        ),
+                        None,
+                    )
+                    if same_sid is not None:
+                        reject_reason = f"sid {sid} is already tracked"
+                        may_stop_rejected = same_sid.container != name
+                    elif same_email is not None:
+                        reject_reason = f"account {email} already has a session"
+                        may_stop_rejected = same_email.container != name
+                    elif same_container is not None:
+                        reject_reason = f"container {name} is already tracked"
+                        may_stop_rejected = False
+                    elif port in self._ports_in_use:
+                        reject_reason = f"stream port {port} is already reserved"
+                    else:
+                        generation = self._next_generation_locked(email)
+                        candidate = Session(
+                            sid=sid,
+                            email=email,
+                            display=display or email,
+                            slug=slug,
+                            # Keep a legacy name for this incarnation.  A later
+                            # fresh start uses the canonical full-email name.
+                            container=name,
+                            host_port=port,
+                            heavy=heavy_s == "1",
+                            status="starting",
+                            container_id=cid,
+                            generation=generation,
+                        )
+                        self._sessions[sid] = candidate
+                        self._by_email[email] = sid
+                        self._ports_in_use.add(port)
+
+                if reject_reason is not None:
+                    log.warning("rejecting adopted container %s: %s", name, reject_reason)
+                    if may_stop_rejected:
+                        await self._podman_stop(name)
                     continue
-                cid, sid, email, display, slug, port_s, heavy_s, name = parts
-                if not sid or not email or sid in self._sessions:
+                if candidate is None:
                     continue
-                try:
-                    port = int(port_s)
-                except ValueError:
-                    continue
-                self._sessions[sid] = Session(
-                    sid=sid,
-                    email=email,
-                    display=display or email,
-                    slug=slug or email_slug(email),
-                    container=name,
-                    host_port=port,
-                    heavy=heavy_s == "1",
-                    status="ready",
-                    container_id=cid,
+
+                if await self._wait_ready(candidate):
+                    async with self._lock:
+                        if self._is_current_locked(candidate, generation):
+                            candidate.status = "ready"
+                            candidate.error = None
+                            adopted += 1
+                            continue
+
+                log.warning("adopted container %s failed its health probe", name)
+                await self._stop_locked(
+                    sid,
+                    owner=email,
+                    generation=generation,
                 )
-                self._by_email[email] = sid
-                self._ports_in_use.add(port)
-                adopted += 1
+
         if adopted:
-            log.info("adopted %d running session container(s)", adopted)
+            log.info("adopted %d healthy running session container(s)", adopted)
         return adopted
 
     async def _podman_run(self, sess: Session, user: User, home: Path) -> str:

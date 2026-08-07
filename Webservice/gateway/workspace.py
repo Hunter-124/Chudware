@@ -75,9 +75,12 @@ _SHM_URI_PREFIX = "aicm-shm://"
 # Durable recent-files list for the WASM client (config.json lives in /tmp there).
 _RECENTS_NAME = ".chudware_recents.json"
 _RECENTS_MAX = 10
-# Per-account copilot chat store (same shape as client chat_history.json: root[key] = entry).
+# Per-account copilot chat store. The current client PUTs a complete flat v2
+# envelope and expects GET to return it verbatim.
 _CHAT_NAME = ".chudware_chat_history.json"
 _CHAT_MAX_BODY = 5 * 1024 * 1024  # reject PUT bodies larger than 5 MiB
+_CHAT_MAX_SESSIONS = 1000
+_CHAT_MAX_SESSION_ID = 256
 
 
 def _ws_root() -> Path:
@@ -364,33 +367,94 @@ def _load_chat_store(root: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _validate_chat_envelope(body: dict[str, Any]) -> dict[str, Any]:
+    """Validate one complete flat v2 store without rewriting its representation."""
+    discriminators = [key for key in ("version", "schema") if key in body]
+    if len(discriminators) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="chat store must contain exactly one v2 discriminator (version or schema)",
+        )
+    discriminator = discriminators[0]
+    expected = {discriminator, "active", "sessions"}
+    if set(body) != expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"chat store fields must be exactly {sorted(expected)}",
+        )
+    version = body[discriminator]
+    if isinstance(version, bool) or not isinstance(version, int) or version != 2:
+        raise HTTPException(status_code=400, detail="unsupported chat store schema")
+
+    active = body["active"]
+    if not isinstance(active, str) or len(active) > _CHAT_MAX_SESSION_ID:
+        raise HTTPException(status_code=400, detail="active must be a bounded session id")
+    sessions = body["sessions"]
+    if not isinstance(sessions, list):
+        raise HTTPException(status_code=400, detail="sessions must be an array")
+    if len(sessions) > _CHAT_MAX_SESSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too many chat sessions (max {_CHAT_MAX_SESSIONS})",
+        )
+
+    session_ids: set[str] = set()
+    for index, session in enumerate(sessions):
+        if not isinstance(session, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"sessions[{index}] must be an object",
+            )
+        session_id = session.get("id")
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id) > _CHAT_MAX_SESSION_ID
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"sessions[{index}].id must be a bounded non-empty string",
+            )
+        if session_id in session_ids:
+            raise HTTPException(status_code=400, detail=f"duplicate session id: {session_id}")
+        session_ids.add(session_id)
+    if active and active not in session_ids:
+        raise HTTPException(status_code=400, detail="active session is not present in sessions")
+    return body
+
+
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    """Write JSON via tmp + replace so readers never see a partial file."""
+    """Replace one JSON file atomically, using a unique same-directory temporary."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            json.dump(data, tmp, indent=2)
+            tmp.write("\n")
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 @router.get("/workspace/chat")
 async def workspace_chat_get(request: Request, scope: str = "") -> dict[str, Any]:
-    """Full chat_history store for the CALLER (<root>/.chudware_chat_history.json).
-
-    Shape matches the WASM/desktop client file: root[docKey] = {active, conversations}.
-    Missing file → empty object so clients can merge cleanly.
-    """
+    """Return the caller's complete flat chat store, or an empty object if absent."""
     _, root = _caller_root(request, scope)
     return _load_chat_store(root)
 
 
 @router.put("/workspace/chat")
 async def workspace_chat_put(request: Request, scope: str = "") -> dict[str, Any]:
-    """Merge a partial {key: entry} map into the CALLER's own chat store.
-
-    Client PUTs one or a few keys; server deep-replaces only those keys
-    (load → update → atomic write). The store lives inside the caller's own
-    root, so no caller can ever read or overwrite another account's history.
-    """
+    """Atomically replace the caller's complete flat v2 chat store."""
     user, root = _caller_root(request, scope)
     api_writes.enforce(user.email, "writes")
     declared = _content_length(request)
@@ -407,22 +471,15 @@ async def workspace_chat_put(request: Request, scope: str = "") -> dict[str, Any
         raise HTTPException(status_code=400, detail=f"invalid JSON: {e}") from e
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
-    # Only accept object-valued entries (skip null / scalar noise).
-    patch: dict[str, Any] = {}
-    for k, v in body.items():
-        if not isinstance(k, str) or not k:
-            continue
-        if isinstance(v, dict):
-            patch[k] = v
-    if not patch:
-        raise HTTPException(status_code=400, detail="no valid chat entries in body")
-    store = _load_chat_store(root)
-    for k, v in patch.items():
-        store[k] = v  # replace key wholesale (entry object)
+
+    store = _validate_chat_envelope(body)
     _atomic_write_json(_chat_path(root), store)
-    log.info("workspace chat: merged %d key(s) for %s, store size %d",
-             len(patch), user.email, len(store))
-    return {"ok": True, "merged": list(patch.keys()), "keys": len(store)}
+    log.info(
+        "workspace chat: replaced v2 store with %d session(s) for %s",
+        len(store["sessions"]),
+        user.email,
+    )
+    return {"ok": True, "sessions": len(store["sessions"])}
 
 
 def _aicm_allowlist(caller_root: Path | None) -> list[Path]:

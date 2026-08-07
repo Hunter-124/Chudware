@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cfloat>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -881,15 +882,8 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     ImGui::TextWrapped("%s", fallbackUrl.c_str());
                     char openId[64];
                     std::snprintf(openId, sizeof(openId), "Open in browser##%s", prov);
-                    if (ImGui::SmallButton(openId)) {
-#if defined(_WIN32)
-                        std::system(("start \"\" \"" + fallbackUrl + "\"").c_str());
-#elif defined(__APPLE__)
-                        std::system(("open '" + fallbackUrl + "'").c_str());
-#else
-                        std::system(("xdg-open '" + fallbackUrl + "' >/dev/null 2>&1 &").c_str());
-#endif
-                    }
+                    if (ImGui::SmallButton(openId))
+                        ui::openExternalHttpUrl(fallbackUrl);
                 }
             }
             // Allow abandoning a stuck device-code wait without restarting the app.
@@ -995,8 +989,8 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
 // which proxy the bun bridge auth_*/models_list methods. The UI holds no auth truth — it
 // renders the last agent_provider_list/agent_provider_state response and re-polls on open +
 // short TTL (mirrors drawSubscriptionAccounts above). Degrade: unknown_method (sibling slice
-// mid-flight / older core) flips s_omp.available off permanently and the tab falls back to
-// the legacy Provider & Model / Moonshot / Accounts sections.
+// mid-flight / older core) temporarily falls back to the legacy sections and is re-probed
+// when this view is entered again and while a reconnected runtime may be coming back.
 struct OmpProviderRow {
     std::string id;            // OMP registry id ("anthropic", "kimi-code", "moonshot", ...)
     std::string label;
@@ -1028,6 +1022,13 @@ struct OmpProvDetail {
 struct OmpOAuthFlow {
     bool active = false;
     bool pollInFlight = false;
+    bool manualInFlight = false;
+    bool canSubmitManual = false;
+    bool credentialSaved = false;
+    uint64_t generation = 0;
+    uint64_t beginRequest = 0;
+    uint64_t pollRequest = 0;
+    uint64_t manualRequest = 0;
     std::string handle;
     std::string provider;
     std::string status;        // starting|awaiting_auth|connected|error|cancelled
@@ -1035,12 +1036,17 @@ struct OmpOAuthFlow {
     std::string launchUrl;
     std::string instructions;
     std::string progress;
+    std::string interaction;   // browser|device|manual (unknown values remain display-safe)
     std::string error;
+    std::string manualError;   // UI/manual-RPC rejection; not cleared by poll snapshots
+    nlohmann::json identity;
     double lastPoll = -1e9;
     char codeBuf[512] = "";
 };
 struct OmpProvUi {
-    bool available = true;     // false after unknown_method → legacy fallback
+    bool available = true;
+    bool modalOpen = false;
+    bool providerViewActive = false;
     bool listInFlight = false;
     double lastListPoll = -1e9;
     std::vector<OmpProviderRow> rows;
@@ -1048,6 +1054,7 @@ struct OmpProvUi {
     std::string lastError;
     OmpProvDetail detail;
     std::string detailFor;
+    std::string detailRequestFor;
     bool detailInFlight = false;
     double lastDetailPoll = -1e9;
     // API-key flow (per selected provider)
@@ -1057,9 +1064,89 @@ struct OmpProvUi {
     std::string keyStatus;
     bool keyStatusErr = false;
     OmpOAuthFlow oauth;
+    // Separate epochs keep hidden/closed views, superseded selections and older requests
+    // from accepting callbacks. nextRequestGeneration is the single monotonic allocator.
+    uint64_t modalGeneration = 0;
+    uint64_t viewGeneration = 0;
+    uint64_t selectionGeneration = 0;
+    uint64_t nextRequestGeneration = 0;
+    uint64_t listRequestGeneration = 0;
+    uint64_t detailRequestGeneration = 0;
+    uint64_t keyRequestGeneration = 0;
+    uint64_t oauthGeneration = 0;
     int lastDrawnFrame = -100;
 };
 static OmpProvUi s_omp;
+
+static uint64_t nextOmpRequestGeneration() {
+    return ++s_omp.nextRequestGeneration;
+}
+
+static bool ompViewCallbackCurrent(uint64_t modalGeneration, uint64_t viewGeneration) {
+    return s_omp.modalOpen && s_omp.providerViewActive &&
+           s_omp.modalGeneration == modalGeneration &&
+           s_omp.viewGeneration == viewGeneration;
+}
+
+static bool ompSelectionCallbackCurrent(uint64_t modalGeneration, uint64_t viewGeneration,
+                                        uint64_t selectionGeneration,
+                                        const std::string& provider) {
+    return ompViewCallbackCurrent(modalGeneration, viewGeneration) &&
+           s_omp.selectionGeneration == selectionGeneration &&
+           s_omp.selectedId == provider;
+}
+
+static void selectOmpProvider(const std::string& provider) {
+    if (provider.empty() || provider == s_omp.selectedId) return;
+    s_omp.selectedId = provider;
+    ++s_omp.selectionGeneration;
+    s_omp.detail = OmpProvDetail{};
+    s_omp.detailFor = provider;
+    s_omp.detailRequestFor.clear();
+    s_omp.detailInFlight = false;
+    s_omp.lastDetailPoll = -1e9;
+    s_omp.detailRequestGeneration = nextOmpRequestGeneration();
+    s_omp.keyFor = provider;
+    s_omp.keyBuf[0] = 0;
+    s_omp.keyBusy = false;
+    s_omp.keyStatus.clear();
+    s_omp.keyRequestGeneration = nextOmpRequestGeneration();
+}
+
+static void enterOmpProviderView() {
+    if (s_omp.providerViewActive) return;
+    s_omp.providerViewActive = true;
+    ++s_omp.viewGeneration;
+    s_omp.available = true;
+    s_omp.listInFlight = false;
+    s_omp.detailInFlight = false;
+    s_omp.keyBusy = false;
+    s_omp.listRequestGeneration = nextOmpRequestGeneration();
+    s_omp.detailRequestGeneration = nextOmpRequestGeneration();
+    s_omp.keyRequestGeneration = nextOmpRequestGeneration();
+    s_omp.lastListPoll = -1e9;
+    s_omp.lastDetailPoll = -1e9;
+}
+
+static void leaveOmpProviderView() {
+    if (!s_omp.providerViewActive) return;
+    s_omp.providerViewActive = false;
+    ++s_omp.viewGeneration;
+    s_omp.listInFlight = false;
+    s_omp.detailInFlight = false;
+    s_omp.keyBusy = false;
+    s_omp.listRequestGeneration = nextOmpRequestGeneration();
+    s_omp.detailRequestGeneration = nextOmpRequestGeneration();
+    s_omp.keyRequestGeneration = nextOmpRequestGeneration();
+}
+
+static void openOmpProviderModal() {
+    ++s_omp.modalGeneration;
+    s_omp.modalOpen = true;
+    s_omp.available = true;
+    s_omp.lastListPoll = -1e9;
+    s_omp.lastDetailPoll = -1e9;
+}
 
 static bool ompRpcAbsent(const core::RpcResult& r) {
     if (!r.ok) {
@@ -1094,21 +1181,30 @@ static int ompProviderRank(const OmpProviderRow& r) {
 }
 
 static void pollOmpProviderList(AppState& st, bool force) {
-    if (!s_omp.available || s_omp.listInFlight) return;
+    if (!s_omp.providerViewActive || (s_omp.listInFlight && !force)) return;
     const double now = ImGui::GetTime();
     if (!force && (now - s_omp.lastListPoll) < 3.0) return;
     s_omp.lastListPoll = now;
     s_omp.listInFlight = true;
+    const uint64_t modalGeneration = s_omp.modalGeneration;
+    const uint64_t viewGeneration = s_omp.viewGeneration;
+    const uint64_t requestGeneration = nextOmpRequestGeneration();
+    s_omp.listRequestGeneration = requestGeneration;
     st.rpc.call("agent_provider_list", nlohmann::json::object(),
-                [&st](const core::RpcResult& r) {
+                [&st, modalGeneration, viewGeneration,
+                 requestGeneration](const core::RpcResult& r) {
+        if (!ompViewCallbackCurrent(modalGeneration, viewGeneration) ||
+            s_omp.listRequestGeneration != requestGeneration)
+            return;
         s_omp.listInFlight = false;
         if (ompRpcAbsent(r)) {
-            s_omp.available = false;   // permanent degrade → legacy sections
+            s_omp.available = false;
+            s_omp.lastError = "Provider sign-in bridge unavailable in this runtime.";
             return;
         }
+        s_omp.available = true;
         if (!r.ok || !r.result.is_object()) {
-            if (s_omp.lastError.empty())
-                s_omp.lastError = r.err.empty() ? "provider list unavailable" : r.err;
+            s_omp.lastError = r.err.empty() ? "provider list unavailable" : r.err;
             return;
         }
         if (!optionalJsonBool(r.result, "ok", true)) {
@@ -1116,10 +1212,14 @@ static void pollOmpProviderList(AppState& st, bool force) {
             if (s_omp.lastError.empty()) s_omp.lastError = "provider list failed";
             return;
         }
-        s_omp.lastError.clear();
         const auto* arr = optionalJsonArr(r.result, "providers");
-        if (!arr) return;
-        s_omp.rows.clear();
+        if (!arr) {
+            s_omp.lastError = "provider list response was incomplete";
+            return;
+        }
+
+        std::vector<OmpProviderRow> rows;
+        rows.reserve(arr->size());
         for (const auto& p : *arr) {
             if (!p.is_object()) continue;
             OmpProviderRow row;
@@ -1143,14 +1243,20 @@ static void pollOmpProviderList(AppState& st, bool force) {
                     if (ks == "oauth") row.hasOAuth = true;
                 }
             }
-            s_omp.rows.push_back(std::move(row));
+            rows.push_back(std::move(row));
         }
-        std::stable_sort(s_omp.rows.begin(), s_omp.rows.end(),
+        std::stable_sort(rows.begin(), rows.end(),
                          [](const OmpProviderRow& a, const OmpProviderRow& b) {
             const int ra = ompProviderRank(a), rb = ompProviderRank(b);
             if (ra != rb) return ra < rb;
             return a.label < b.label;
         });
+
+        bool selectedStillExists = false;
+        for (const auto& row : rows)
+            if (row.id == s_omp.selectedId) selectedStillExists = true;
+        s_omp.rows = std::move(rows);
+        s_omp.lastError.clear();
         // Sole writer of the signed-in bridge set: anything with credentials
         // (key_set / oauth_connected / connected / error-with-creds) counts;
         // only a plain signed_out state excludes a provider.
@@ -1158,25 +1264,44 @@ static void pollOmpProviderList(AppState& st, bool force) {
         for (const auto& row : s_omp.rows)
             if (!row.state.empty() && row.state != "signed_out")
                 st.signedInBridgeProviders.insert(row.id);
-        if (s_omp.selectedId.empty() && !s_omp.rows.empty())
-            s_omp.selectedId = s_omp.rows.front().id;
+        if (!selectedStillExists && !s_omp.rows.empty())
+            selectOmpProvider(s_omp.rows.front().id);
     });
 }
 
 static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool force) {
-    if (!s_omp.available || id.empty() || s_omp.detailInFlight) return;
+    if (!s_omp.providerViewActive || !s_omp.available || id.empty()) return;
+    if (s_omp.detailInFlight && s_omp.detailRequestFor == id && !force) return;
     const double now = ImGui::GetTime();
-    if (!force && s_omp.detailFor == id && (now - s_omp.lastDetailPoll) < 60.0) return;
+    if (!force && s_omp.detailFor == id && s_omp.detail.loaded &&
+        (now - s_omp.lastDetailPoll) < 60.0)
+        return;
     s_omp.lastDetailPoll = now;
     s_omp.detailInFlight = true;
     s_omp.detailFor = id;
+    s_omp.detailRequestFor = id;
+    const uint64_t modalGeneration = s_omp.modalGeneration;
+    const uint64_t viewGeneration = s_omp.viewGeneration;
+    const uint64_t selectionGeneration = s_omp.selectionGeneration;
+    const uint64_t requestGeneration = nextOmpRequestGeneration();
+    s_omp.detailRequestGeneration = requestGeneration;
     st.rpc.call("agent_provider_state", nlohmann::json{{"provider", id}},
-                [id](const core::RpcResult& r) {
+                [id, modalGeneration, viewGeneration, selectionGeneration,
+                 requestGeneration](const core::RpcResult& r) {
+        if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
+                                         selectionGeneration, id) ||
+            s_omp.detailRequestGeneration != requestGeneration ||
+            s_omp.detailRequestFor != id)
+            return;
         s_omp.detailInFlight = false;
-        if (ompRpcAbsent(r)) { s_omp.available = false; return; }
+        if (ompRpcAbsent(r)) {
+            s_omp.available = false;
+            return;
+        }
+        s_omp.available = true;
         if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true))
-            return;   // soft fail — keep last detail
-        if (s_omp.detailFor != id) return;   // selection moved on
+            return;   // soft fail — keep the last detail for this exact provider
+
         OmpProvDetail d;
         d.loaded = true;
         d.state = optionalJsonString(r.result, "state");
@@ -1229,48 +1354,106 @@ static void refreshOmpProvider(AppState& st) {
     fetchOmpProviderDetail(st, s_omp.selectedId, true);
 }
 
-// Parse one OAuth flow snapshot (shared by begin_oauth and oauth_poll results).
-static void ompOAuthApplySnapshot(const nlohmann::json& r) {
-    OmpOAuthFlow& f = s_omp.oauth;
-    const std::string st_ = optionalJsonString(r, "status");
-    if (!st_.empty()) f.status = st_;
-    const std::string url = optionalJsonString(r, "url");
-    if (!url.empty()) f.url = url;
-    const std::string launch = optionalJsonString(r, "launchUrl");
-    if (!launch.empty()) f.launchUrl = launch;
-    const std::string instr = optionalJsonString(r, "instructions");
-    if (!instr.empty()) f.instructions = instr;
-    const std::string prog = optionalJsonString(r, "progress");
-    if (!prog.empty()) f.progress = prog;
-    const std::string err = optionalJsonString(r, "error");
-    if (!err.empty()) f.error = err;
+static bool ompOAuthCallbackCurrent(uint64_t modalGeneration, uint64_t generation,
+                                    const std::string& provider,
+                                    const std::string& handle) {
+    const OmpOAuthFlow& f = s_omp.oauth;
+    return s_omp.modalOpen && s_omp.modalGeneration == modalGeneration &&
+           f.generation == generation && f.provider == provider &&
+           (handle.empty() || f.handle == handle);
+}
+
+static void cancelLateOmpOAuthHandle(AppState& st, const std::string& provider,
+                                     const std::string& handle, uint64_t generation) {
+    if (handle.empty()) return;
+    st.rpc.call("agent_provider_oauth_cancel", nlohmann::json{{"handle", handle}},
+                [provider, handle, generation](const core::RpcResult&) {
+        (void)provider;
+        (void)handle;
+        (void)generation;
+    });
+}
+
+// Snapshots are replaceable, not deltas: clearing a field is meaningful (in particular,
+// canSubmitManual=false must remove a paste editor from device-only flows).
+static void ompOAuthApplySnapshot(OmpOAuthFlow& f, const nlohmann::json& r) {
+    f.status = optionalJsonString(r, "status");
+    f.url = optionalJsonString(r, "url");
+    f.launchUrl = optionalJsonString(r, "launchUrl");
+    f.instructions = optionalJsonString(r, "instructions");
+    f.progress = optionalJsonString(r, "progress");
+    f.interaction = optionalJsonString(r, "interaction");
+    f.canSubmitManual = optionalJsonBool(r, "canSubmitManual", false);
+    f.error = optionalJsonString(r, "error");
+    f.credentialSaved = optionalJsonBool(r, "credential_saved", false);
+    auto identity = r.find("identity");
+    f.identity = identity == r.end() ? nlohmann::json() : *identity;
+}
+
+static void finishOmpOAuthSnapshot(AppState& st, OmpOAuthFlow& f) {
+    if (f.status == "connected" || f.credentialSaved) {
+        f.status = "connected";
+        f.active = false;
+        st.addLog("[ok] signed in to " + f.provider);
+        refreshOmpProvider(st);
+    } else if (f.status == "error" || f.status == "cancelled") {
+        f.active = false;
+    }
+}
+
+static void failOmpOAuth(OmpOAuthFlow& f, std::string error) {
+    f.active = false;
+    f.pollInFlight = false;
+    f.manualInFlight = false;
+    f.status = "error";
+    f.error = error.empty() ? "Sign-in failed" : std::move(error);
 }
 
 static void beginOmpOAuth(AppState& st, const std::string& provider) {
     OmpOAuthFlow& f = s_omp.oauth;
-    if (f.active) return;
-    f = OmpOAuthFlow{};   // reset (keeps codeBuf zeroed)
+    if (f.active || provider.empty()) return;
+    f = OmpOAuthFlow{};
     f.active = true;
     f.provider = provider;
     f.status = "starting";
+    f.generation = ++s_omp.oauthGeneration;
+    const uint64_t modalGeneration = s_omp.modalGeneration;
+    const uint64_t generation = f.generation;
+    const uint64_t requestGeneration = nextOmpRequestGeneration();
+    const std::string handle;
+    f.beginRequest = requestGeneration;
     st.rpc.call("agent_provider_begin_oauth", nlohmann::json{{"provider", provider}},
-                [&st](const core::RpcResult& r) {
-        OmpOAuthFlow& f = s_omp.oauth;
-        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
-            f.status = "error";
-            f.error = !r.ok ? (r.err.empty() ? "sign-in failed to start" : r.err)
-                            : optionalJsonString(r.result, "error");
-            if (f.error.empty()) f.error = "sign-in failed to start";
+                [&st, provider, handle, modalGeneration, generation,
+                 requestGeneration](const core::RpcResult& r) {
+        const std::string returnedHandle =
+            r.result.is_object() ? optionalJsonString(r.result, "handle") : std::string();
+        if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider, handle) ||
+            s_omp.oauth.beginRequest != requestGeneration) {
+            cancelLateOmpOAuthHandle(st, provider, returnedHandle, generation);
             return;
         }
-        f.handle = optionalJsonString(r.result, "handle");
-        ompOAuthApplySnapshot(r.result);
-        if (f.status == "connected") {
-            f.active = false;
-            st.addLog("[ok] signed in to " + f.provider);
-            refreshOmpProvider(st);
+        OmpOAuthFlow& f = s_omp.oauth;
+        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
+            std::string error = !r.ok ? r.err : optionalJsonString(r.result, "error");
+            if (error.empty() && r.result.is_object())
+                error = optionalJsonString(r.result, "detail");
+            failOmpOAuth(f, error.empty() ? "sign-in failed to start" : error);
+            return;
         }
-    }, 30000);   // bridge waits up to 20s for the first onAuth callback
+        const std::string returnedProvider = optionalJsonString(r.result, "provider");
+        if (returnedHandle.empty() || returnedProvider != provider) {
+            cancelLateOmpOAuthHandle(st, provider, returnedHandle, generation);
+            failOmpOAuth(f, "sign-in returned an invalid flow snapshot");
+            return;
+        }
+        f.handle = returnedHandle;
+        ompOAuthApplySnapshot(f, r.result);
+        if (f.status.empty()) {
+            failOmpOAuth(f, "sign-in returned an incomplete flow snapshot");
+            return;
+        }
+        finishOmpOAuthSnapshot(st, f);
+    }, 10000);
 }
 
 static void pollOmpOAuth(AppState& st) {
@@ -1281,23 +1464,111 @@ static void pollOmpOAuth(AppState& st) {
     if ((now - f.lastPoll) < 1.0) return;
     f.lastPoll = now;
     f.pollInFlight = true;
-    st.rpc.call("agent_provider_oauth_poll", nlohmann::json{{"handle", f.handle}},
-                [&st](const core::RpcResult& r) {
+    const std::string provider = f.provider;
+    const std::string handle = f.handle;
+    const uint64_t modalGeneration = s_omp.modalGeneration;
+    const uint64_t generation = f.generation;
+    const uint64_t requestGeneration = nextOmpRequestGeneration();
+    f.pollRequest = requestGeneration;
+    st.rpc.call("agent_provider_oauth_poll", nlohmann::json{{"handle", handle}},
+                [&st, provider, handle, modalGeneration, generation,
+                 requestGeneration](const core::RpcResult& r) {
+        if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider, handle) ||
+            s_omp.oauth.pollRequest != requestGeneration)
+            return;
         OmpOAuthFlow& f = s_omp.oauth;
         f.pollInFlight = false;
         if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
-            // Transient poll failure — keep waiting; the flow itself owns the TTL.
+            std::string error = !r.ok ? r.err : optionalJsonString(r.result, "error");
+            if (error.empty() && r.result.is_object())
+                error = optionalJsonString(r.result, "detail");
+            failOmpOAuth(f, error.empty() ? "sign-in status check failed" : error);
             return;
         }
-        ompOAuthApplySnapshot(r.result);
-        if (f.status == "connected") {
-            f.active = false;
-            st.addLog("[ok] signed in to " + f.provider);
-            refreshOmpProvider(st);
-        } else if (f.status == "error" || f.status == "cancelled") {
-            f.active = false;
+        const std::string returnedProvider = optionalJsonString(r.result, "provider");
+        const std::string returnedStatus = optionalJsonString(r.result, "status");
+        const bool providerMatches =
+            returnedProvider == provider ||
+            (returnedProvider.empty() && returnedStatus == "error");
+        if (!providerMatches || optionalJsonString(r.result, "handle") != handle) {
+            failOmpOAuth(f, "sign-in status returned the wrong flow");
+            return;
         }
+        ompOAuthApplySnapshot(f, r.result);
+        if (f.status.empty()) {
+            failOmpOAuth(f, "sign-in status was incomplete");
+            return;
+        }
+        finishOmpOAuthSnapshot(st, f);
     }, 10000);
+}
+
+static void submitOmpOAuthManual(AppState& st) {
+    OmpOAuthFlow& f = s_omp.oauth;
+    if (!f.active || !f.canSubmitManual || f.manualInFlight || f.handle.empty() ||
+        f.codeBuf[0] == 0)
+        return;
+    const std::string provider = f.provider;
+    const std::string handle = f.handle;
+    const std::string code = f.codeBuf;
+    const uint64_t modalGeneration = s_omp.modalGeneration;
+    const uint64_t generation = f.generation;
+    const uint64_t requestGeneration = nextOmpRequestGeneration();
+    f.manualRequest = requestGeneration;
+    f.manualInFlight = true;
+    f.manualError.clear();
+    st.rpc.call("agent_provider_oauth_manual",
+                nlohmann::json{{"handle", handle}, {"code", code}},
+                [provider, handle, modalGeneration, generation,
+                 requestGeneration](const core::RpcResult& r) {
+        if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider, handle) ||
+            s_omp.oauth.manualRequest != requestGeneration)
+            return;
+        OmpOAuthFlow& f = s_omp.oauth;
+        f.manualInFlight = false;
+        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", false)) {
+            f.manualError = !r.ok ? r.err : optionalJsonString(r.result, "error");
+            if (f.manualError.empty() && r.result.is_object())
+                f.manualError = optionalJsonString(r.result, "detail");
+            if (f.manualError.empty())
+                f.manualError = "The provider rejected that value.";
+            return;
+        }
+        f.codeBuf[0] = 0;
+        f.manualError.clear();
+        f.lastPoll = -1e9;
+    });
+}
+
+static void cancelOmpOAuth(AppState& st) {
+    OmpOAuthFlow& f = s_omp.oauth;
+    const std::string provider = f.provider;
+    const std::string handle = f.handle;
+    const uint64_t generation = f.generation;
+    f.generation = ++s_omp.oauthGeneration;
+    f.active = false;
+    f.pollInFlight = false;
+    f.manualInFlight = false;
+    f.status = "cancelled";
+    f.error.clear();
+    f.manualError.clear();
+    cancelLateOmpOAuthHandle(st, provider, handle, generation);
+}
+
+static bool openOmpOAuthUrl(const OmpOAuthFlow& f) {
+#if defined(__EMSCRIPTEN__)
+    return ui::openExternalHttpUrl(f.url);
+#else
+    if (!f.launchUrl.empty() && ui::openExternalHttpUrl(f.launchUrl)) return true;
+    return ui::openExternalHttpUrl(f.url);
+#endif
+}
+
+static void closeOmpProviderModal(AppState& st) {
+    leaveOmpProviderView();
+    if (s_omp.oauth.active) cancelOmpOAuth(st);
+    ++s_omp.modalGeneration;
+    s_omp.modalOpen = false;
 }
 
 static const float* ompStateColor(const std::string& state) {
@@ -1379,7 +1650,6 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     // Measured once at the top: decides the two-column Sign-in/Usage split below.
     const float paneW = ImGui::GetContentRegionAvail().x;
     OmpOAuthFlow& flow = s_omp.oauth;
-    const bool flowHere = flow.active && flow.provider == prov.id;
     const bool hasUsage = detailReady && !s_omp.detail.usage.empty();
 
     // ---- header: label + state + disable toggle (mapped CAD categories only) ----
@@ -1440,8 +1710,8 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             beginOmpOAuth(st, prov.id);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Browser OAuth (PKCE loopback or device code, whichever the "
-                              "provider supports). A manual code paste fallback is offered "
-                              "when the browser can't be opened.");
+                              "provider supports). Manual input appears only when the "
+                              "provider explicitly requests it.");
     };
 
     // ---- Sign-in + Usage sections: two columns on wide panes, stacked on narrow ones ----
@@ -1469,9 +1739,17 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         }
         ImGui::SameLine(0, 6.0f * sc);
         if (ImGui::SmallButton("Sign out")) {
+            const std::string provider = prov.id;
+            const uint64_t modalGeneration = s_omp.modalGeneration;
+            const uint64_t viewGeneration = s_omp.viewGeneration;
+            const uint64_t selectionGeneration = s_omp.selectionGeneration;
             st.rpc.call("agent_provider_logout",
-                        nlohmann::json{{"provider", prov.id}},
-                        [&st, pid = prov.id](const core::RpcResult& r) {
+                        nlohmann::json{{"provider", provider}},
+                        [&st, provider, modalGeneration, viewGeneration,
+                         selectionGeneration](const core::RpcResult& r) {
+                if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
+                                                 selectionGeneration, provider))
+                    return;
                 if (!r.ok || !r.result.is_object() ||
                     !optionalJsonBool(r.result, "ok", true)) {
                     s_omp.lastError = !r.ok ? r.err : optionalJsonString(r.result, "error");
@@ -1512,9 +1790,21 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                          pal.statusOk, /*filled=*/true);
         ImGui::SameLine(0, 12.0f * sc);
         if (ImGui::SmallButton("Remove key")) {
+            const std::string provider = prov.id;
+            const uint64_t modalGeneration = s_omp.modalGeneration;
+            const uint64_t viewGeneration = s_omp.viewGeneration;
+            const uint64_t selectionGeneration = s_omp.selectionGeneration;
+            const uint64_t requestGeneration = nextOmpRequestGeneration();
+            s_omp.keyRequestGeneration = requestGeneration;
             st.rpc.call("agent_provider_remove_key",
-                        nlohmann::json{{"provider", prov.id}},
-                        [&st](const core::RpcResult& r) {
+                        nlohmann::json{{"provider", provider}},
+                        [&st, provider, modalGeneration, viewGeneration,
+                         selectionGeneration, requestGeneration](const core::RpcResult& r) {
+                if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
+                                                 selectionGeneration, provider) ||
+                    s_omp.keyRequestGeneration != requestGeneration ||
+                    s_omp.keyFor != provider)
+                    return;
                 if (!r.ok || !r.result.is_object() ||
                     !optionalJsonBool(r.result, "ok", true))
                     s_omp.lastError = !r.ok ? r.err : optionalJsonString(r.result, "error");
@@ -1533,72 +1823,74 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         signInSameLine();
     }
 
-    if (flowHere || (!flow.active && flow.provider == prov.id &&
-                     (flow.status == "error" || flow.status == "cancelled"))) {
+    const bool flowVisible = flow.provider == prov.id &&
+                             (flow.active || flow.status == "error" ||
+                              flow.status == "cancelled");
+    if (flowVisible) {
         ImGui::Dummy(ImVec2(0, 4.0f * sc));
         if (flow.status == "starting") {
             ImGui::TextUnformatted("Starting sign-in\xe2\x80\xa6");
+            ImGui::SameLine(0, 8.0f * sc);
+            if (ImGui::SmallButton("Cancel")) cancelOmpOAuth(st);
         } else if (flow.status == "awaiting_auth") {
             if (!flow.progress.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
                 ImGui::TextWrapped("%s", flow.progress.c_str());
                 ImGui::PopStyleColor();
             } else {
-                ImGui::TextUnformatted("Waiting for browser approval\xe2\x80\xa6");
+                ImGui::TextUnformatted(flow.interaction == "device"
+                                           ? "Waiting for device approval\xe2\x80\xa6"
+                                           : "Waiting for browser approval\xe2\x80\xa6");
             }
             if (!flow.instructions.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
                 ImGui::TextWrapped("%s", flow.instructions.c_str());
                 ImGui::PopStyleColor();
             }
-            const std::string& openUrl = !flow.launchUrl.empty() ? flow.launchUrl : flow.url;
-            if (!openUrl.empty()) {
-                ImGui::TextWrapped("%s", openUrl.c_str());
-                if (ImGui::SmallButton("Copy URL")) ImGui::SetClipboardText(openUrl.c_str());
+            // The raw URL is the only browser-safe target. Native may use launchUrl through
+            // the same argv-safe platform opener, then falls back to the raw URL.
+            const std::string& visibleUrl = !flow.url.empty() ? flow.url : flow.launchUrl;
+            if (!visibleUrl.empty()) {
+                ImGui::TextWrapped("%s", visibleUrl.c_str());
+                if (ImGui::SmallButton("Copy URL"))
+                    ImGui::SetClipboardText(visibleUrl.c_str());
                 ImGui::SameLine(0, 6.0f * sc);
-                if (ImGui::SmallButton("Open in browser")) {
-#if defined(_WIN32)
-                    std::system(("start \"\" \"" + openUrl + "\"").c_str());
-#elif defined(__APPLE__)
-                    std::system(("open '" + openUrl + "'").c_str());
-#else
-                    std::system(("xdg-open '" + openUrl + "' >/dev/null 2>&1 &").c_str());
-#endif
-                }
+                if (ImGui::SmallButton("Open in browser") && !openOmpOAuthUrl(flow))
+                    flow.manualError = "This sign-in URL could not be opened safely.";
             }
-            // Manual fallback: paste the device code / full redirect URL.
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##omp_oauth_code", "Paste code or redirect URL\xe2\x80\xa6",
-                                     flow.codeBuf, sizeof(flow.codeBuf));
-            if (ImGui::SmallButton("Submit code") && flow.codeBuf[0]) {
-                st.rpc.call("agent_provider_oauth_manual",
-                            nlohmann::json{{"handle", flow.handle}, {"code", flow.codeBuf}},
-                            [](const core::RpcResult& r) {
-                    if (!r.ok || !r.result.is_object() ||
-                        !optionalJsonBool(r.result, "ok", true))
-                        s_omp.oauth.error = !r.ok ? r.err
-                                                  : optionalJsonString(r.result, "error");
-                    s_omp.oauth.codeBuf[0] = 0;
-                    s_omp.oauth.lastPoll = -1e9;   // pick up the result on the next poll
-                });
+            if (flow.canSubmitManual) {
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputTextWithHint("##omp_oauth_code",
+                                             "Paste code or redirect URL\xe2\x80\xa6",
+                                             flow.codeBuf, sizeof(flow.codeBuf)))
+                    flow.manualError.clear();
+                if (flow.manualInFlight) ImGui::BeginDisabled();
+                if (ImGui::SmallButton(flow.manualInFlight ? "Submitting\xe2\x80\xa6"
+                                                           : "Submit code"))
+                    submitOmpOAuthManual(st);
+                if (flow.manualInFlight) ImGui::EndDisabled();
+                ImGui::SameLine(0, 6.0f * sc);
             }
-            ImGui::SameLine(0, 6.0f * sc);
-            if (ImGui::SmallButton("Cancel")) {
-                st.rpc.call("agent_provider_oauth_cancel",
-                            nlohmann::json{{"handle", flow.handle}},
-                            [](const core::RpcResult&) {});
-                flow.active = false;
-                flow.status = "cancelled";
+            if (ImGui::SmallButton("Cancel")) cancelOmpOAuth(st);
+            const std::string& visibleError =
+                !flow.manualError.empty() ? flow.manualError : flow.error;
+            if (!visibleError.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusErr));
+                ImGui::TextWrapped("%s", visibleError.c_str());
+                ImGui::PopStyleColor();
             }
         } else if (flow.status == "error") {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusErr));
             ImGui::TextWrapped("%s", flow.error.empty() ? "Sign-in failed" : flow.error.c_str());
             ImGui::PopStyleColor();
-            if (prov.hasOAuth && ImGui::SmallButton("Try again")) beginOmpOAuth(st, prov.id);
+            if (prov.hasOAuth && ImGui::SmallButton("Try again"))
+                beginOmpOAuth(st, prov.id);
         } else if (flow.status == "cancelled") {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
             ImGui::TextUnformatted("Sign-in cancelled.");
             ImGui::PopStyleColor();
+            if (prov.hasOAuth && ImGui::SmallButton("Try again"))
+                beginOmpOAuth(st, prov.id);
         }
     }
 
@@ -1609,7 +1901,9 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         if (s_omp.keyFor != prov.id) {
             s_omp.keyFor = prov.id;
             s_omp.keyBuf[0] = 0;
+            s_omp.keyBusy = false;
             s_omp.keyStatus.clear();
+            s_omp.keyRequestGeneration = nextOmpRequestGeneration();
         }
         ImGui::TextUnformatted(state == "key_set" ? "Replace API key" : "Add API key");
         ImGui::SetNextItemWidth(-1);
@@ -1620,32 +1914,53 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         if (ImGui::SmallButton("Validate \x26 add") && haveInput && !s_omp.keyBusy) {
             s_omp.keyBusy = true;
             s_omp.keyStatus.clear();
-            const std::string pid = prov.id;
+            const std::string provider = prov.id;
             const std::string key = s_omp.keyBuf;
+            const uint64_t modalGeneration = s_omp.modalGeneration;
+            const uint64_t viewGeneration = s_omp.viewGeneration;
+            const uint64_t selectionGeneration = s_omp.selectionGeneration;
+            const uint64_t requestGeneration = nextOmpRequestGeneration();
+            s_omp.keyRequestGeneration = requestGeneration;
             st.rpc.call("agent_provider_validate_key",
-                        nlohmann::json{{"provider", pid}, {"apiKey", key}},
-                        [&st, pid, key](const core::RpcResult& r) {
-                bool ok = r.ok && r.result.is_object() &&
-                          optionalJsonBool(r.result, "ok", false);
+                        nlohmann::json{{"provider", provider}, {"apiKey", key}},
+                        [&st, provider, key, modalGeneration, viewGeneration,
+                         selectionGeneration, requestGeneration](const core::RpcResult& r) {
+                if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
+                                                 selectionGeneration, provider) ||
+                    s_omp.keyRequestGeneration != requestGeneration ||
+                    s_omp.keyFor != provider)
+                    return;
+                const bool ok = r.ok && r.result.is_object() &&
+                                optionalJsonBool(r.result, "ok", false);
                 if (!ok) {
                     s_omp.keyBusy = false;
                     s_omp.keyStatusErr = true;
-                    s_omp.keyStatus = !r.ok ? (r.err.empty() ? "validation failed" : r.err)
-                                            : optionalJsonString(r.result, "error");
+                    s_omp.keyStatus =
+                        !r.ok ? (r.err.empty() ? "validation failed" : r.err)
+                              : optionalJsonString(r.result, "error");
                     if (s_omp.keyStatus.empty())
                         s_omp.keyStatus = optionalJsonString(r.result, "detail");
                     if (s_omp.keyStatus.empty()) s_omp.keyStatus = "key rejected";
                     return;
                 }
                 st.rpc.call("agent_provider_set_key",
-                            nlohmann::json{{"provider", pid}, {"apiKey", key}},
-                            [&st](const core::RpcResult& sr) {
+                            nlohmann::json{{"provider", provider}, {"apiKey", key}},
+                            [&st, provider, modalGeneration, viewGeneration,
+                             selectionGeneration,
+                             requestGeneration](const core::RpcResult& sr) {
+                    if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
+                                                     selectionGeneration, provider) ||
+                        s_omp.keyRequestGeneration != requestGeneration ||
+                        s_omp.keyFor != provider)
+                        return;
                     s_omp.keyBusy = false;
                     if (!sr.ok || !sr.result.is_object() ||
                         !optionalJsonBool(sr.result, "ok", true)) {
                         s_omp.keyStatusErr = true;
                         s_omp.keyStatus = !sr.ok ? sr.err
                                                  : optionalJsonString(sr.result, "error");
+                        if (s_omp.keyStatus.empty() && sr.result.is_object())
+                            s_omp.keyStatus = optionalJsonString(sr.result, "detail");
                         return;
                     }
                     s_omp.keyStatusErr = false;
@@ -1659,17 +1974,30 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         if (ImGui::SmallButton("Add unvalidated") && haveInput && !s_omp.keyBusy) {
             s_omp.keyBusy = true;
             s_omp.keyStatus.clear();
-            const std::string pid = prov.id;
+            const std::string provider = prov.id;
             const std::string key = s_omp.keyBuf;
+            const uint64_t modalGeneration = s_omp.modalGeneration;
+            const uint64_t viewGeneration = s_omp.viewGeneration;
+            const uint64_t selectionGeneration = s_omp.selectionGeneration;
+            const uint64_t requestGeneration = nextOmpRequestGeneration();
+            s_omp.keyRequestGeneration = requestGeneration;
             st.rpc.call("agent_provider_set_key",
-                        nlohmann::json{{"provider", pid}, {"apiKey", key}},
-                        [&st](const core::RpcResult& sr) {
+                        nlohmann::json{{"provider", provider}, {"apiKey", key}},
+                        [&st, provider, modalGeneration, viewGeneration,
+                         selectionGeneration, requestGeneration](const core::RpcResult& sr) {
+                if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
+                                                 selectionGeneration, provider) ||
+                    s_omp.keyRequestGeneration != requestGeneration ||
+                    s_omp.keyFor != provider)
+                    return;
                 s_omp.keyBusy = false;
                 if (!sr.ok || !sr.result.is_object() ||
                     !optionalJsonBool(sr.result, "ok", true)) {
                     s_omp.keyStatusErr = true;
                     s_omp.keyStatus = !sr.ok ? sr.err
                                              : optionalJsonString(sr.result, "error");
+                    if (s_omp.keyStatus.empty() && sr.result.is_object())
+                        s_omp.keyStatus = optionalJsonString(sr.result, "detail");
                     return;
                 }
                 s_omp.keyStatusErr = false;
@@ -1681,15 +2009,8 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         if (s_omp.keyBusy) ImGui::EndDisabled();
         if (!prov.consoleUrl.empty()) {
             ImGui::SameLine(0, 6.0f * sc);
-            if (ImGui::SmallButton("Get a key")) {
-#if defined(_WIN32)
-                std::system(("start \"\" \"" + prov.consoleUrl + "\"").c_str());
-#elif defined(__APPLE__)
-                std::system(("open '" + prov.consoleUrl + "'").c_str());
-#else
-                std::system(("xdg-open '" + prov.consoleUrl + "' >/dev/null 2>&1 &").c_str());
-#endif
-            }
+            if (ImGui::SmallButton("Get a key"))
+                ui::openExternalHttpUrl(prov.consoleUrl);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", prov.consoleUrl.c_str());
         }
         if (!s_omp.keyStatus.empty()) {
@@ -1881,14 +2202,32 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
 static void drawOmpProviderManager(AppState& st) {
     const float sc = ui::uiScale;
     const auto& pal = ui::palette;
+    enterOmpProviderView();
     pollOmpProviderList(st, false);
     pollOmpOAuth(st);
     ui::refreshBridgeModelCatalog(st, false);
 
+    if (s_omp.oauth.active && s_omp.oauth.provider != s_omp.selectedId) {
+        std::string flowLabel = s_omp.oauth.provider;
+        for (const auto& row : s_omp.rows)
+            if (row.id == s_omp.oauth.provider) {
+                flowLabel = row.label;
+                break;
+            }
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
+        ImGui::Text("Sign-in for %s is still active.", flowLabel.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, 8.0f * sc);
+        if (ImGui::SmallButton("Show sign-in"))
+            selectOmpProvider(s_omp.oauth.provider);
+        ImGui::SameLine(0, 6.0f * sc);
+        if (ImGui::SmallButton("Cancel sign-in")) cancelOmpOAuth(st);
+    }
+
     if (!s_omp.available) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
-        ImGui::TextWrapped("Provider sign-in bridge unavailable in this build \xe2\x80\x94 "
-                           "legacy provider settings below.");
+        ImGui::TextWrapped("Provider sign-in bridge unavailable in this runtime \xe2\x80\x94 "
+                           "retrying while legacy provider settings remain below.");
         ImGui::PopStyleColor();
         return;
     }
@@ -1969,7 +2308,7 @@ static void drawOmpProviderManager(AppState& st) {
                 if (settingsPopupRowSelectable("##provider_row",
                                                r.id == s_omp.selectedId,
                                                rowHeight, corners))
-                    s_omp.selectedId = r.id;
+                    selectOmpProvider(r.id);
 
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 const float textY =
@@ -2013,7 +2352,7 @@ static void drawOmpProviderManager(AppState& st) {
             ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
             if (ImGui::Selectable("##row", sel, 0,
                                   ImVec2(0, ImGui::GetTextLineHeight() * 2 + 8.0f * sc))) {
-                s_omp.selectedId = r.id;
+                selectOmpProvider(r.id);
             }
             ImGui::PopStyleColor(3);
             ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -5414,6 +5753,7 @@ void drawSettingsModal(AppState& st, bool busy) {
     // Workspace-folder edit buffer (General tab), reseeded from Settings on every open.
     static std::vector<char> s_wsBuf(512, 0);
     if (opening) {
+        openOmpProviderModal();
         std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
         std::strncpy(s_wsBuf.data(), settings.workspaceDir.c_str(), s_wsBuf.size() - 1);
         // Make sure the glass engine reflects the persisted config before the Appearance
@@ -5524,6 +5864,7 @@ void drawSettingsModal(AppState& st, bool busy) {
         // Tab row inset: the window has zero horizontal padding (so tab bodies can reach the
         // right edge), so the row indents itself instead.
         ImGui::Indent(10.0f * sc);
+        bool providerTabDrawn = false;
         if (ImGui::BeginTabBar("##settabs")) {
             // ---- Appearance tab (FIRST): theme + colored liquid glass (v2.1) ----
             // The canonical theme control lives here (moved from General; the View-menu item
@@ -7414,9 +7755,13 @@ void drawSettingsModal(AppState& st, bool busy) {
             }
 
 // ---- Providers tab: OMP two-pane provider manager (legacy sections as the degrade path) ----
-            if (ImGui::BeginTabItem("Providers", nullptr,
+            const char* providersTabLabel = s_omp.oauth.active
+                                                ? "Providers (sign-in active)###Providers"
+                                                : "Providers###Providers";
+            if (ImGui::BeginTabItem(providersTabLabel, nullptr,
                                     (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
+                providerTabDrawn = true;
                 settingsTabBodyBegin("##tab_providers");
                 dimText("API providers, sign-in, and model routing. Credentials are stored by "
                         "the auth bridge \xe2\x80\x94 never written to config.json.");
@@ -7425,9 +7770,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                 if (ui::drawFreeAiProviderCard(st)) saveSettings(st.settings);
                 settingsGlassSectionEnd();
                 if (!s_omp.available) {
-                    // Degrade path: the agent_provider_* C-ABI is absent in this build
-                    // (sibling slice mid-flight / older core) — keep the legacy sections so
-                    // provider config stays possible. drawOmpProviderManager drew the banner.
+                    // Degrade path: the agent_provider_* C-ABI is absent in the current
+                    // runtime — keep the legacy sections while the manager periodically
+                    // re-probes for a reopened or reconnected bridge.
                     settingsGlassSectionBegin("##prov_provider", "Provider \x26 Model");
                     ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
                     settingsGlassSectionEnd();
@@ -7466,6 +7811,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             // --- end C22b marked block ---
             ImGui::EndTabBar();
         }
+        if (!providerTabDrawn) leaveOmpProviderView();
         ImGui::Unindent(10.0f * sc);
         ImGui::EndChild();
         // Nested modal: must be submitted every frame inside the Settings window scope or
@@ -7477,7 +7823,10 @@ void drawSettingsModal(AppState& st, bool busy) {
     }
 
     // Modal closed (X) with the system-prompt debounce still pending: force-commit it.
-    if (!s_settingsOpen) flushSystemPromptOverride(st, /*force=*/true);
+    if (!s_settingsOpen) {
+        flushSystemPromptOverride(st, /*force=*/true);
+        if (s_omp.modalOpen) closeOmpProviderModal(st);
+    }
 
     // ---------- About modal ----------
     if (st.showAbout) {

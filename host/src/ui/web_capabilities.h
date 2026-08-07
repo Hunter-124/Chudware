@@ -11,6 +11,7 @@
 // method families mirror contracts/web_parity.md's web_unsupported list (integrator-owned);
 // each table entry names the task that removes it.
 #pragma once
+#include <string>
 
 namespace ui {
 
@@ -27,5 +28,11 @@ constexpr bool webBuild() {
 // Why `surfaceId` is unavailable in the web build, or nullptr when it is available.
 // Always nullptr in native builds (see webBuild).
 const char* webGapReason(const char* surfaceId);
+
+// Open an absolute external HTTP(S) URL without passing it through a command shell.
+// Browser builds use window.open; native builds invoke the platform URL opener with
+// the URL as one argv/API argument. Returns false when the URL is not allowlisted or
+// the platform opener could not be launched.
+bool openExternalHttpUrl(const std::string& url);
 
 }  // namespace ui

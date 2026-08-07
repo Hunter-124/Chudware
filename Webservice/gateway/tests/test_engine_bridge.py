@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import threading
@@ -21,11 +22,25 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 from fastapi.testclient import TestClient  # noqa: E402
 
 from gateway import app as app_mod  # noqa: E402
-from gateway.config import settings  # noqa: E402
+from gateway.config import Settings, settings  # noqa: E402
 from gateway.limits import user_slug  # noqa: E402
 
 DEV_HEADERS = {"X-Dev-User": "demo@example.com"}
 ADMIN_HEADERS = {"X-Dev-User": "haedmonds69@gmail.com"}
+
+PROVIDER_MANAGER_CALLS = (
+    ("agent_provider_list", {}),
+    ("agent_provider_state", {"provider": "anthropic"}),
+    ("agent_provider_validate_key", {"provider": "openai", "apiKey": "sk-browser-secret"}),
+    ("agent_provider_set_key", {"provider": "openai", "apiKey": "sk-browser-secret"}),
+    ("agent_provider_remove_key", {"provider": "openai"}),
+    ("agent_provider_begin_oauth", {"provider": "anthropic"}),
+    ("agent_provider_oauth_poll", {"handle": "opaque-handle"}),
+    ("agent_provider_oauth_manual", {"handle": "opaque-handle", "code": "device-code"}),
+    ("agent_provider_oauth_cancel", {"handle": "opaque-handle"}),
+    ("agent_provider_logout", {"provider": "anthropic"}),
+    ("agent_provider_logo", {"domain": "anthropic.com", "size": 64}),
+)
 
 
 class FakeDaemon:
@@ -249,6 +264,105 @@ class TestEngineBridge:
         # returning to 0, else it would defer restarts forever.
         assert engine_bridge.active_bridge_count() == 0
 
+    def test_bridge_limit_must_keep_web_client_available(self):
+        with pytest.raises(
+            ValueError,
+            match="CHUDWARE_WEB_MAX_ENGINE_BRIDGES_PER_USER must be at least 1",
+        ):
+            Settings(max_engine_bridges_per_user=0)
+
+    def test_concurrent_handshakes_reserve_before_accept(
+        self, daemon, client, monkeypatch
+    ):
+        """A barrier after the first cap check must not let a second handshake through."""
+        from gateway import engine_bridge
+        from starlette.websockets import WebSocketDisconnect
+
+        monkeypatch.setattr(settings, "max_engine_bridges_per_user", 1)
+        original_accept = engine_bridge.WebSocket.accept
+        accept_entered = threading.Event()
+        release_accept = threading.Event()
+        first_opened = threading.Event()
+        release_first = threading.Event()
+        choose_first = threading.Lock()
+        block_next = True
+        failures: list[BaseException] = []
+
+        async def barrier_accept(socket, *args, **kwargs):
+            nonlocal block_next
+            with choose_first:
+                should_block = block_next
+                block_next = False
+            if should_block:
+                accept_entered.set()
+                released = await asyncio.to_thread(release_accept.wait, 5)
+                if not released:
+                    raise AssertionError("handshake barrier timed out")
+            return await original_accept(socket, *args, **kwargs)
+
+        monkeypatch.setattr(engine_bridge.WebSocket, "accept", barrier_accept)
+
+        def hold_first_connection() -> None:
+            try:
+                with client.websocket_connect("/engine", headers=DEV_HEADERS):
+                    first_opened.set()
+                    if not release_first.wait(5):
+                        raise AssertionError("first connection release timed out")
+            except BaseException as exc:  # pragma: no cover - asserted in parent thread
+                failures.append(exc)
+
+        first = threading.Thread(target=hold_first_connection, daemon=True)
+        first.start()
+        assert accept_entered.wait(5), "first handshake never reached the barrier"
+
+        rejected_code = None
+        try:
+            with client.websocket_connect("/engine", headers=DEV_HEADERS):
+                pass
+        except WebSocketDisconnect as exc:
+            rejected_code = exc.code
+        finally:
+            release_accept.set()
+            opened = first_opened.wait(5)
+            release_first.set()
+            first.join(timeout=5)
+        assert opened, "reserved handshake never completed"
+
+        assert not first.is_alive()
+        assert failures == []
+        assert rejected_code == 4429
+        assert engine_bridge.active_bridge_count() == 0
+
+    def test_connect_failure_releases_reserved_slot(
+        self, daemon, client, monkeypatch
+    ):
+        from gateway import engine_bridge
+        from starlette.websockets import WebSocketDisconnect
+
+        monkeypatch.setattr(settings, "max_engine_bridges_per_user", 1)
+        original_connect = engine_bridge.asyncio.open_unix_connection
+        attempts = 0
+
+        async def fail_once(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("synthetic connect failure")
+            return await original_connect(*args, **kwargs)
+
+        monkeypatch.setattr(engine_bridge.asyncio, "open_unix_connection", fail_once)
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+                ws.receive_text()
+        assert exc.value.code == 1013
+        assert engine_bridge.active_bridge_count() == 0
+        assert "demo@example.com" not in engine_bridge._bridge_owners
+
+        # The failed reservation was rolled back, so the cap of one admits a retry.
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            assert _rpc(ws, 1, "ping")["result"]["pong"] is True
+        assert engine_bridge.active_bridge_count() == 0
+
     def test_agent_turn_keeps_provider_strips_secrets(self, daemon, client):
         """Web agent turns may select provider/model; credentials stay server-side.
 
@@ -272,6 +386,35 @@ class TestEngineBridge:
         # A non-agent method keeps its params verbatim (no over-broad stripping).
         doc_calls = [c for c in daemon.calls if c.get("method") == "doc_new"]
         assert all("name" in c["params"] for c in doc_calls) or not doc_calls
+
+    @pytest.mark.parametrize(("method", "params"), PROVIDER_MANAGER_CALLS)
+    def test_standard_user_cannot_forward_provider_manager_rpc(
+        self, daemon, client, method, params
+    ):
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            _rpc(ws, 1, "hello")
+            resp = _rpc(ws, 2, method, params)
+
+        assert resp == {
+            "id": 2,
+            "error": {
+                "code": -32003,
+                "message": "administrator authorization required",
+            },
+        }
+        assert not any(call.get("method") == method for call in daemon.calls)
+        assert "sk-browser-secret" not in json.dumps(resp)
+
+    @pytest.mark.parametrize(("method", "params"), PROVIDER_MANAGER_CALLS)
+    def test_admin_can_forward_provider_manager_rpc(
+        self, daemon, client, method, params
+    ):
+        with client.websocket_connect("/engine", headers=ADMIN_HEADERS) as ws:
+            _rpc(ws, 1, "hello")
+            resp = _rpc(ws, 2, method, params)
+
+        assert resp["result"]["ok"] is True
+        assert any(call.get("method") == method for call in daemon.calls)
 
     def test_list_models_injects_host_api_key(self, daemon, client, monkeypatch):
         """agent_list_models gets host keys server-side; browser never sees them back."""
@@ -310,6 +453,114 @@ class TestEngineBridge:
         assert gem_params.get("api_key") == "gem-host-secret", gem_params
         # Response path is pass-through — secrets must not be rewritten into client-bound frames
         # (FakeDaemon returns {"ok": true} without echoing params).
+
+    @pytest.mark.parametrize(
+        "base_url",
+        (
+            "https://attacker.example/v1",
+            "http://openrouter.ai/api/v1",
+            "https://openrouter.ai.evil.example/api/v1",
+            "https://openrouter.ai@attacker.example/api/v1",
+            "https://attacker.example@openrouter.ai/api/v1",
+            "https://openrouter.ai.:443/api/v1",
+            "https://openrouter.ai:444/api/v1",
+            "https://openrouter.ai/api/v1?redirect=https://attacker.example",
+            "https://openrouter.ai/api/v1#https://attacker.example",
+            "https://openrouter.ai/api/v1//",
+            "https://openrouter.ai/api/v1/../redirect",
+        ),
+    )
+    def test_list_models_rejects_noncanonical_endpoint_without_key_leak(
+        self, daemon, client, monkeypatch, caplog, base_url
+    ):
+        from gateway import engine_bridge
+
+        host_secret = "sk-host-must-never-leave"
+        monkeypatch.setattr(
+            engine_bridge,
+            "_load_host_keys",
+            lambda: {"openrouter": host_secret, "openai": host_secret},
+        )
+        caplog.set_level(logging.WARNING, logger="chudware-web.engine")
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            _rpc(ws, 1, "hello")
+            resp = _rpc(
+                ws,
+                2,
+                "agent_list_models",
+                {"provider": "openai", "base_url": base_url, "api_key": ""},
+            )
+
+        assert resp == {
+            "id": 2,
+            "error": {"code": -32002, "message": "provider endpoint not allowed"},
+        }
+        assert not any(
+            call.get("method") == "agent_list_models" for call in daemon.calls
+        )
+        assert host_secret not in json.dumps(resp)
+        assert host_secret not in caplog.text
+
+    def test_list_models_accepts_exact_vendor_origin_and_default_port(
+        self, daemon, client, monkeypatch
+    ):
+        from gateway import engine_bridge
+
+        monkeypatch.setattr(
+            engine_bridge,
+            "_load_host_keys",
+            lambda: {"openai": "sk-openai-host-secret"},
+        )
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            _rpc(ws, 1, "hello")
+            assert _rpc(
+                ws,
+                2,
+                "agent_list_models",
+                {
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com:443/v1/",
+                    "api_key": "",
+                },
+            )["result"]["ok"] is True
+
+        seen = next(
+            call for call in daemon.calls
+            if call.get("method") == "agent_list_models"
+        )
+        assert seen["params"]["base_url"] == "https://api.openai.com/v1"
+        assert seen["params"]["api_key"] == "sk-openai-host-secret"
+
+    def test_list_models_allows_expected_loopback_without_cloud_key(
+        self, daemon, client, monkeypatch
+    ):
+        from gateway import engine_bridge
+
+        host_secret = "sk-cloud-key-not-for-loopback"
+        monkeypatch.setattr(
+            engine_bridge,
+            "_load_host_keys",
+            lambda: {"openai": host_secret},
+        )
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            _rpc(ws, 1, "hello")
+            assert _rpc(
+                ws,
+                2,
+                "agent_list_models",
+                {
+                    "provider": "openai",
+                    "base_url": "http://127.0.0.1:1234/v1",
+                    "api_key": "",
+                },
+            )["result"]["ok"] is True
+
+        seen = next(
+            call for call in daemon.calls
+            if call.get("method") == "agent_list_models"
+        )
+        assert seen["params"]["base_url"] == "http://127.0.0.1:1234/v1"
+        assert seen["params"].get("api_key") != host_secret
 
 
 

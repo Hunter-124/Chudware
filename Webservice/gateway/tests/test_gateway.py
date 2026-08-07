@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -202,12 +203,15 @@ def test_session_start_stop_mocked(client, _isolate, monkeypatch):
             running.add(name)
             return 0, "abc123deadbeef\n", ""
         if args and args[0] == "ps":
-            # honor name filter the way real podman does
-            name_filter = next(
-                (a.split("=", 2)[-1].strip("^$") for a in args if a.startswith("name=")),
+            # Podman treats the name filter as a regular expression.
+            name_pattern = next(
+                (a.split("=", 1)[-1] for a in args if a.startswith("name=")),
                 None,
             )
-            matches = [n for n in running if not name_filter or n == name_filter]
+            matches = [
+                n for n in running
+                if not name_pattern or re.fullmatch(name_pattern, n)
+            ]
             return 0, "\n".join(matches), ""
         if args and args[0] in {"stop", "rm"}:
             running.discard(args[-1])

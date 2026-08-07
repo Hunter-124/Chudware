@@ -159,8 +159,7 @@ JLCPCB_DETAIL_HTML = """
 
 PCBWAY_SEARCH_HTML = """
 <html><body>
-<a class="shop-item" href="/project/shopindex/Widget_Abc.html">Widget Abc
-<span class="price">$3.50</span><span class="stock">200 in stock</span></a>
+<a href="/project/shareproject/Widget_Abc.html" class="info-title">Widget Abc</a>
 </body></html>
 """
 
@@ -701,10 +700,10 @@ def test_pcbway_search_parses_result_cards(adapter_mods, monkeypatch):
 
     assert len(hits) == 1
     assert hits[0]["title"] == "Widget Abc"
-    assert hits[0]["url"] == "https://www.pcbway.com/project/shopindex/Widget_Abc.html"
+    assert hits[0]["url"] == "https://www.pcbway.com/project/shareproject/Widget_Abc.html"
     assert hits[0]["site"] == "pcbway"
-    assert hits[0]["price"] == "$3.50"
-    assert hits[0]["stock"] == "200"
+    assert hits[0]["price"] is None
+    assert hits[0]["stock"] is None
 
 
 def test_pcbway_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):

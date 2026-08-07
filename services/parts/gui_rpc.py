@@ -577,6 +577,15 @@ def _vendor_cache_put(site: str, query: str, limit: int, records: list[dict]) ->
     """Store the raw records a vendor returned. Silent no-op on any failure."""
     if not _vendor_cache_enabled():
         return
+    # The one-site hub returns failure/timeout/login notices in-band. Caching one
+    # would turn a transient busy/challenge/HTTP failure into a 15-minute false
+    # result. Empty clean searches are cacheable; every non-empty row must be a
+    # usable PartRecord.
+    if any(not isinstance(r, dict)
+           or not r.get("part_id")
+           or not str(r.get("title") or "").strip()
+           for r in records):
+        return
     global _vendor_cache_last_trim
     key = _vendor_cache_key(site, query, limit)
     try:

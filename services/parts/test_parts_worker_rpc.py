@@ -316,6 +316,39 @@ class TestVendorsHealthRpc:
         assert isinstance(r["results"], list)
 
 
+class TestVendorResultCache:
+    """Only clean vendor results may survive into the live-search cache."""
+
+    @staticmethod
+    def _isolated_cache(monkeypatch, tmp_path):
+        from services import paths
+        from services.parts import gui_rpc
+
+        monkeypatch.setattr(paths, "ROOT", tmp_path)
+        monkeypatch.setattr(gui_rpc, "_vendor_cache_ready", False)
+        monkeypatch.setattr(gui_rpc, "_vendor_cache_last_trim", 0.0)
+        return gui_rpc
+
+    def test_transient_failure_notice_is_not_cached(self, monkeypatch, tmp_path):
+        gui_rpc = self._isolated_cache(monkeypatch, tmp_path)
+        gui_rpc._vendor_cache_put(
+            "mcmaster", "m8", 20,
+            [{"ok": False, "site": "mcmaster", "reason": "browser_busy"}],
+        )
+
+        assert gui_rpc._vendor_cache_get("mcmaster", "m8", 20) is None
+
+    def test_clean_records_and_empty_searches_are_cached(self, monkeypatch, tmp_path):
+        gui_rpc = self._isolated_cache(monkeypatch, tmp_path)
+        clean = [{"part_id": "catalog:mcmaster::https://example.test/1",
+                  "title": "M8 cap screw"}]
+        gui_rpc._vendor_cache_put("mcmaster", "m8", 20, clean)
+        gui_rpc._vendor_cache_put("mcmaster", "definitely-absent", 20, [])
+
+        assert gui_rpc._vendor_cache_get("mcmaster", "m8", 20) == clean
+        assert gui_rpc._vendor_cache_get("mcmaster", "definitely-absent", 20) == []
+
+
 class TestDomainListSearch:
     """Parts Library V2: PartsIndex/hub accept domain as a list (SQL IN)."""
 

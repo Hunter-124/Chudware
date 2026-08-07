@@ -99,6 +99,11 @@ defers the restart rather than disconnecting active browser sessions.
 Anonymous `/healthz` intentionally remains the bare `{"ok": true}` liveness
 contract and must not be used for drain decisions.
 
+Production WASM builds default to CMake `MinSizeRel`; Release's `wasm-opt -O3`
+peaked above 9 GiB RSS and was OOM-killed on the 16 GiB deployment host.
+Operators may set `CHUDWARE_WASM_BUILD_TYPE` explicitly on larger builders, but
+the promoted artifact must still come from the installer's private stage.
+
 The gateway unit and application both enforce
 `CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES` (4 MiB by default). Keep the unit template,
 gateway setting, and reverse proxy limit aligned when changing it.

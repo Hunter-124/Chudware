@@ -191,9 +191,11 @@ build_wasm() {
     source "$emsdk_dir/emsdk_env.sh"
     command -v emcc >/dev/null 2>&1 || { echo "[build] ERROR: emcc not on PATH after sourcing emsdk"; return 1; }
     command -v emcmake >/dev/null 2>&1 || { echo "[build] ERROR: emcmake not on PATH"; return 1; }
+    local build_type="${CHUDWARE_WASM_BUILD_TYPE:-MinSizeRel}"
     echo "[build] emcc: $(emcc -v 2>&1 | head -1)"
+    echo "[build] wasm build type: $build_type"
     emcmake cmake -S "$ROOT/host" -B "$ROOT/host/build-wasm" -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_TYPE="$build_type" \
         -DCHUDWARE_ENABLE_CEF=OFF
     cmake --build "$ROOT/host/build-wasm" --target Chudware
     local out="$ROOT/host/build-wasm/bin"

@@ -518,6 +518,49 @@ def test_require_nudges_at_the_first_call(monkeypatch):
     )
     assert _nudges(p, "[TASK LIST]") == 1, _flat(p)[-600:]
 
+def test_require_prevents_work_before_successful_task_list(monkeypatch):
+    from services.agent import agent_turn as at
+
+    _pin_prefs(monkeypatch, task="require")
+    provider = _ScriptedProvider([
+        _CALL % "ledger_get",
+        _CALL % "task_list",
+        _CALL % "ledger_get",
+        "Done.",
+    ])
+    dispatched = []
+    at.run_turn(
+        "organize the project and build the bracket",
+        provider,
+        allowed_tools=list(_TL_ALLOW),
+        max_tool_calls=6,
+        tool_dispatch=lambda tool, args: (
+            dispatched.append(tool) or {"ok": True}
+        ),
+        auto_enable_packs=True,
+    )
+
+    assert dispatched[:2] == ["task_list", "ledger_get"]
+    assert dispatched.count("ledger_get") == 1
+
+
+def test_plan_and_subagent_require_are_stronger_than_encourage(monkeypatch):
+    from services.agent import mission_dispatch as md
+
+    _pin_prefs(monkeypatch, plan="encourage", sub="encourage")
+    _, encouraged = md._apply_session_preferences(
+        "general_agent", list(_TL_ALLOW), "BASE"
+    )
+    _pin_prefs(monkeypatch, plan="require", sub="require")
+    _, required = md._apply_session_preferences(
+        "general_agent", list(_TL_ALLOW), "BASE"
+    )
+
+    assert "consider `delegate`" in encouraged
+    assert "Planning: REQUIRED" in required
+    assert "Sub-agents: REQUIRED" in required
+    assert encouraged != required
+
 
 def test_no_nudge_once_the_model_published(monkeypatch):
     """Publishing satisfies the preference — no scolding after the fact."""

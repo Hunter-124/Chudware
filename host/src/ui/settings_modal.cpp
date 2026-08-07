@@ -6047,8 +6047,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::TextUnformatted("Role prompts");
                         if (ImGui::IsItemHovered())
                             ImGui::SetTooltip(
-                                "Edit per-role system prompts (pipeline + harness roles). "
-                                "Overrides save next to the shipped YAML cards.");
+                                "Edit mission/YAML and native/core role prompts independently. "
+                                "Overrides save to the user data prompts directory.");
                         ImGui::SameLine();
                         if (!canFetch || s_promptsLoading) ImGui::BeginDisabled();
                         if (ImGui::SmallButton("Refresh##prompts_refresh")) {
@@ -7272,10 +7272,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                         if (aiSubTabJustEntered(7)) ImGui::SetScrollY(0.0f);
                         settingsGlassSectionBegin("##ai_dev_preview", "Prompt assembly preview");
                         dimText("Shows the system prompt a typical main-chat / general_agent "
-                                "turn would send (role card + capability SOFT block + harness "
-                                "base + catalog + sample ledger/stage + tools slot + Auto-Learn "
-                                "guidance when enabled). The coloured sample is where the user "
-                                "request goes — not sent to a model.");
+                                "turn would send (effective role/global override + capability "
+                                "SOFT block + harness base + catalogs + tools slot + Auto-Learn "
+                                "guidance when enabled). The coloured sample marks the user "
+                                "request slot and is not sent to a model.");
 
                         static std::string s_devSys;
                         static std::string s_devUser;

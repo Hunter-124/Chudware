@@ -13,11 +13,12 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "office_read_csv": {
         "prompt_note": (
-            "First row is always returned as header, never as data; default "
-            "limit=0 reads ALL rows — pass a limit to peek at a large file."
+            "First row is always returned as header, never as data; the "
+            "effective default returns at most 500 data rows. Pass limit=0 "
+            "explicitly only when you intend to read every row."
         ),
-        # limit=0 is genuinely unbounded (rows cap only applies when limit>0):
-        # a large BOM CSV otherwise dumps every row into context.
+        # The callable's limit=0 is unbounded, so the harness supplies a bounded
+        # effective default when the model omits the argument.
         "param_defaults": {"limit": 500},
     },
     "office_edit_csv": {

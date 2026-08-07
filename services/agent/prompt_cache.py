@@ -448,7 +448,18 @@ def compose(
     from services.agent.roles import load_role  # noqa: PLC0415
 
     card = load_role(role)
-    role_system = card.system_prompt
+    try:
+        from services.agent.mission_dispatch import (  # noqa: PLC0415
+            effective_role_system_prompt,
+            linear_role_allowed_tools,
+        )
+        base_role_system = effective_role_system_prompt(card)
+        allowed = linear_role_allowed_tools(card)
+    except Exception as exc:  # noqa: BLE001
+        warn.append(f"effective_role_policy: {type(exc).__name__}: {exc}")
+        base_role_system = card.system_prompt
+        allowed = list(card.concrete_tools)
+    role_system = base_role_system
     cap_letter = ""
     try:
         from services.agent.prompt_tiers import (  # noqa: PLC0415
@@ -456,24 +467,11 @@ def compose(
             letter_from_capability,
         )
         cap_letter = str(letter_from_capability(capability) or "")
-        role_system = assemble_system_for_capability(card.system_prompt, cap_letter)
+        role_system = assemble_system_for_capability(
+            base_role_system, cap_letter)
     except Exception as exc:  # noqa: BLE001
         warn.append(f"prompt_tiers: {type(exc).__name__}: {exc}")
-        role_system = card.system_prompt
-
-    allowed = list(card.concrete_tools)
-    try:
-        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
-            SUBAGENT_DEFAULT_TOOLS,
-        )
-        allowed = sorted(set(allowed) | set(SUBAGENT_DEFAULT_TOOLS))
-    except Exception as exc:  # noqa: BLE001
-        warn.append(f"default_tools: {type(exc).__name__}: {exc}")
-    try:
-        from services.agent.config import bugreport_floor  # noqa: PLC0415
-        allowed = sorted(set(allowed) | bugreport_floor())
-    except Exception as exc:  # noqa: BLE001
-        warn.append(f"bugreport_floor: {type(exc).__name__}: {exc}")
+        role_system = base_role_system
 
     # Session preferences BEFORE the tools render: a preference that drops a
     # tool must also drop its schema, or the model is shown a tool every call

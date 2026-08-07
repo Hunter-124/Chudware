@@ -553,16 +553,19 @@ def activate_skill(
     project_root: Path | str | None = None,
     args: str = "",
     force: bool = False,
+    role: str | None = None,
 ) -> Optional[str]:
     """Activate a skill by name. Returns injection text, or None if missing/already.
 
     *force* bypasses the once-per-session guard (used for explicit slash commands
     that the user re-invokes, and for post-compaction re-inject of still-active
-    skills when the caller tracks them separately). For auto triggers, leave
-    force=False so once-per-session holds.
+    skills). It does not bypass a skill's optional role allowlist. For auto
+    triggers, leave force=False so once-per-session holds.
     """
     skill = get_skill(name, project_root=project_root)
     if skill is None:
+        return None
+    if skill.roles and (not role or role not in skill.roles):
         return None
     if not force and already_injected(skill.name, session_id):
         return None
@@ -595,7 +598,7 @@ def activate_for_prompt(
             continue
         text = activate_skill(
             name, session_id=session_id, project_root=project_root,
-            args=args, force=True,
+            args=args, force=True, role=role,
         )
         if text:
             bodies.append(text)
@@ -608,7 +611,7 @@ def activate_for_prompt(
         if skill.name in seen:
             continue
         text = activate_skill(
-            skill.name, session_id=session_id, project_root=project_root,
+            skill.name, session_id=session_id, project_root=project_root, role=role,
         )
         if text:
             bodies.append(text)
@@ -622,7 +625,7 @@ def activate_for_prompt(
             if skill.name in seen:
                 continue
             text = activate_skill(
-                skill.name, session_id=session_id, project_root=project_root,
+                skill.name, session_id=session_id, project_root=project_root, role=role,
             )
             if text:
                 bodies.append(text)
@@ -637,7 +640,7 @@ def activate_for_prompt(
                 if skill.name in seen:
                     continue
                 text = activate_skill(
-                    skill.name, session_id=session_id, project_root=project_root,
+                    skill.name, session_id=session_id, project_root=project_root, role=role,
                 )
                 if text:
                     bodies.append(text)

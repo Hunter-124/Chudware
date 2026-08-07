@@ -128,6 +128,17 @@ class TestRenderToolsBlock:
                                          tier=bogus)
             assert meta["budget_tokens"] == DEFAULT_TOOLS_BUDGET_TOKENS, bogus
 
+    def test_parameterized_provider_tiers_use_frontier_schema_budget(self):
+        for tier in (
+            "xai:grok-4.5",
+            "openrouter:anthropic/claude-sonnet-4",
+        ):
+            _, meta = render_tools_block(
+                ["add_features"], resolver=self._resolver, tier=tier
+            )
+            assert meta["budget_tokens"] == 10000
+            assert meta["trimmed"] is False
+
     def test_token_cost_is_measured_not_invented(self):
         text, meta = render_tools_block(["add_features"], resolver=self._resolver)
         assert meta["tokens"] == _count_tokens(text)
@@ -165,6 +176,23 @@ class TestRenderToolsBlock:
             assert meta["unresolved"] == [], (pseudo, meta)
             assert f"{pseudo}(" in text
             assert "schema unavailable" not in text
+
+    def test_coordinate_claim_advertises_only_callable_release_name(self):
+        from services.agent.mission_dispatch import MissionDispatch
+
+        text, _ = render_tools_block(
+            ["coordinate_claim"],
+            resolver=lambda name: (
+                MissionDispatch.coordinate_claim
+                if name == "coordinate_claim"
+                else None
+            ),
+            budget_tokens=2000,
+            trim=False,
+            include_category_menu=False,
+        )
+        assert "coordinate_release" in text
+        assert "release_claim" not in text
 
     def test_multiline_paragraph_cannot_break_block_indent(self):
         def _multi() -> dict:

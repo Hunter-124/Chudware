@@ -1,13 +1,11 @@
 """Tests for the precomposed system prompt cache.
 
 The contract that matters: the cached/precomposed prompt must be the bytes a
-LIVE turn actually sends. A number derived from a hand-maintained mirror of the
-composition is worse than no number, because it looks authoritative and is
-wrong — that is exactly what ``prompt_preview.preview_main_chat_system`` did
-(it injects a SAMPLE ledger/stage no live turn sends). So the central test here
-captures the system prompt a real ``run_turn`` hands its provider and asserts
-byte-equality against the composition, rather than asserting the composition is
-merely self-consistent.
+LIVE turn actually sends. A hand-maintained mirror is worse than no number,
+because it looks authoritative while drifting from the effective global/role
+prompt, lane floors, preferences, or tool schemas. The central test captures
+the system prompt a real ``run_turn`` hands its provider and asserts equality
+against the shared composition rather than merely checking internal consistency.
 """
 from __future__ import annotations
 
@@ -197,6 +195,14 @@ def test_skills_block_is_opt_out_for_run_turn():
     assert any(s.label == "skills" for s in with_skills)
     assert not any(s.label == "skills" for s in without)
 
+
+def test_compose_uses_the_same_main_chat_floor_as_live_turn():
+    from services.agent.copilot_mode_tools import MAIN_CHAT_DEFAULT_TOOLS
+
+    composed = pc.compose(include_tools=False)
+    assert MAIN_CHAT_DEFAULT_TOOLS <= set(composed.allowed)
+    assert "run_shell" in composed.allowed
+    assert "fs_read" in composed.allowed
 
 # --------------------------------------------------------------------------- caching
 

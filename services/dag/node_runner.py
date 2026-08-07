@@ -71,9 +71,12 @@ _DONE_REASONS = frozenset(["confirmed", "stabilized"])
 #   another turn can satisfy the guardrail, so this is a retry, not an escalate.
 _RETRY_REASONS = frozenset([
     "max_iters", "provider_error", "phase_step_cap", "guardrail_blocked",
+    "blocked",
 ])
 # stop_reason values that map to escalate (failed build / no model output / auth)
-_ESCALATE_REASONS = frozenset(["failed", "no_code", "provider_auth"])
+_ESCALATE_REASONS = frozenset([
+    "failed", "no_code", "provider_auth", "escalated",
+])
 
 # ---------------------------------------------------------------------------
 # Agent function type
@@ -217,6 +220,7 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
     try:
         from services.agent.role_models import (  # noqa: PLC0415
             cost_tier_for,
+            harness_role_for_mission_role,
             min_rank_for_difficulty,
             resolve_for_node,
             resolve_role_model,
@@ -228,15 +232,7 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
             or context_pack.get("role")
             or "default"
         )
-        # Map DAG/mission roles onto harness ai_roles keys.
-        role_s = str(role).strip().lower()
-        harness_role = "task"
-        if role_s in ("overseer", "orchestrator", "department_manager", "planning"):
-            harness_role = "planning"
-        elif role_s in ("advisor", "reviewer"):
-            harness_role = "advisor"
-        elif role_s in ("default", "intake", "intake_analyst"):
-            harness_role = "default"
+        harness_role = harness_role_for_mission_role(str(role))
 
         try:
             depth = int(
@@ -557,6 +553,27 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
             resolved_provider = upgraded
 
     allowed_tools = context_pack.get("allowed_tools")
+    # A compiled DAG node is a child lane. Apply its own fs floor before
+    # budgeting and schema rendering; agent_turn receives the same identity and
+    # reapplies the policy defensively.
+    try:
+        from services.agent.copilot_mode_tools import apply_mode_tools  # noqa: PLC0415
+        _mode = (
+            context_pack.get("mode")
+            or getattr(mission_dispatch, "mode", None)
+        )
+        _plan_only = (
+            context_pack.get("plan_only")
+            if "plan_only" in context_pack
+            else getattr(mission_dispatch, "plan_only", None)
+        )
+        allowed_tools = apply_mode_tools(
+            _mode, allowed_tools,
+            plan_only=bool(_plan_only) if _plan_only is not None else None,
+            subagent=True,
+        )
+    except Exception:  # noqa: BLE001 — policy assembly is best-effort
+        pass
     # Per-node tool budget: context pack value, else an env cap (lets a bench cap the
     # turn length for a time-boxed real run), else the agent_turn default.
     max_tools = context_pack.get("max_tools_per_turn")
@@ -588,7 +605,7 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
     # allowed tools, within the tier's budgets.tools, resolved through the SAME
     # mission-first resolver the dispatcher uses.  Measured cost is logged to the
     # ledger (one tools_slot event per node turn) — recorded, never invented.
-    profile = _tier_profile()
+    profile = _tier_profile(context_pack)
     tools_text = None
     if allowed_tools:
         try:
@@ -622,7 +639,13 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
         # absent → emission is a no-op (back-compat with standalone DAG runs).
         on_event=context_pack.get("_event_sink"),
         run_id=context_pack.get("run_id"),
-        node_id=context_pack.get("node_id"))
+        node_id=context_pack.get("node_id"),
+        subagent_id=context_pack.get("node_id") or node_name,
+        capability=_capability_profile(profile),
+        tier=(profile.name if profile else None),
+        phase=context_pack.get("phase"),
+        task_class=context_pack.get("task_class"),
+    )
 
 
 def _maybe_run_cheap_leaf_oneshot(
@@ -633,11 +656,13 @@ def _maybe_run_cheap_leaf_oneshot(
     ledger=None,
     node_name: str = "dag_node",
 ) -> Any | None:
-    """One-shot structured envelope for cheap local leaves (mega-8 / advisor Q3).
+    """One-shot structured envelope for genuinely no-tool cheap leaves.
 
     Returns a TurnResult-like object on success, or None to fall through to the
-    multi-turn tool loop / frontier degrade path. Schema failure increments
-    ``leaf_miss`` telemetry.
+    multi-turn tool loop / frontier degrade path. Any non-empty effective
+    allowlist requires execution: a no-tool envelope cannot satisfy a role card
+    that grants named build, inspection, or verification tools. Schema failure
+    increments ``leaf_miss`` telemetry.
     """
     try:
         from services.agent.role_models import (  # noqa: PLC0415
@@ -650,6 +675,8 @@ def _maybe_run_cheap_leaf_oneshot(
     except Exception:  # noqa: BLE001
         return None
 
+    if context_pack.get("allowed_tools"):
+        return None
     node_inputs = context_pack.get("node_inputs") or {}
     task_class = (
         context_pack.get("task_class")
@@ -862,19 +889,41 @@ class _LeafOneshotResult:
         }
 
 
-def _tier_profile():
-    """The ACTIVE tier's profile from ``CHUDWARE_TIER`` (T-W28 seam), or None.
+def _tier_profile(context_pack: dict[str, Any] | None = None):
+    """Resolve the active tier profile from node context before the environment.
 
-    Same manual-override knob the effort resolution path honours.  None when no
-    tier is set or the tiers layer is unavailable — best-effort, never blocks
-    node execution (callers fall back to agent_turn / tool_schemas defaults)."""
+    Compiled DAG nodes carry their assigned tier in ``context_pack`` or
+    ``node_inputs``. Falling back to ``CHUDWARE_TIER`` only when absent keeps
+    per-node provider, generation, schema, and scaffold policy on one profile.
+    Parameterized xAI/OpenRouter tier strings normalize to ``frontier``.
+    """
     try:
-        from services.agent.tiers import detect_tier_from_env, load_tier
-        tier_name = detect_tier_from_env()
+        from services.agent.tiers import (  # noqa: PLC0415
+            detect_tier_from_env,
+            effort_tier_for,
+            load_tier,
+        )
+        pack = context_pack or {}
+        node_inputs = pack.get("node_inputs") or {}
+        tier_name = (
+            pack.get("tier")
+            or node_inputs.get("tier")
+            or detect_tier_from_env()
+        )
         if not tier_name:
             return None
-        return load_tier(tier_name)
+        return load_tier(effort_tier_for(str(tier_name)) or str(tier_name))
     except Exception:  # noqa: BLE001 — tiers layer optional at node level
+        return None
+
+
+def _capability_profile(profile: Any | None) -> Any | None:
+    if profile is None:
+        return None
+    try:
+        from services.agent.capability import resolve_capability  # noqa: PLC0415
+        return resolve_capability(profile.name)
+    except Exception:  # noqa: BLE001 — capability scaffolds are best-effort
         return None
 
 
@@ -950,7 +999,7 @@ def run(
                 letter_from_capability,
             )
             from services.agent.capability import resolve_capability  # noqa: PLC0415
-            _prof = _tier_profile()
+            _prof = _tier_profile(context_pack)
             _tier_name = _prof.name if _prof is not None else ""
             _cap = resolve_capability(_tier_name) if _tier_name else None
             _letter = letter_from_capability(_cap)

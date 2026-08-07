@@ -1192,6 +1192,7 @@ class MissionDispatch:
                 harness_role = "task"
                 try:
                     from services.agent.role_models import (  # noqa: PLC0415
+                        harness_role_for_mission_role,
                         role_for_copilot_mode,
                     )
                     _m = (
@@ -1201,14 +1202,10 @@ class MissionDispatch:
                     )
                     if _m in ("plan", "edit"):
                         harness_role = role_for_copilot_mode(_m)
+                    else:
+                        harness_role = harness_role_for_mission_role(role)
                 except Exception:  # noqa: BLE001
                     pass
-                if role in ("overseer", "orchestrator", "department_manager"):
-                    harness_role = "planning"
-                elif role == "reviewer":
-                    harness_role = "vision"
-                elif role == "advisor":
-                    harness_role = "advisor"
                 cfg = dict(agent_config.load_config() or {})
                 min_rank = policy.get("min_rank")
                 try:
@@ -1378,18 +1375,10 @@ class MissionDispatch:
                     getattr(self, "mode", None),
                     allowed,
                     plan_only=bool(getattr(self, "plan_only", False)),
+                    subagent=True,
                 )
                 if mode_allowed is not None:
                     allowed = list(mode_allowed)
-                    # Mode narrowing (e.g. ask/plan) can drop the subagent file
-                    # floor union'd above — reapply it so DAG nodes keep it.
-                    try:
-                        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
-                            SUBAGENT_DEFAULT_TOOLS,
-                        )
-                        allowed = sorted(set(allowed) | SUBAGENT_DEFAULT_TOOLS)
-                    except Exception:  # noqa: BLE001 — floor union is best-effort
-                        pass
                     # Settings → AI → Tools "Send bug reports": keep the tool
                     # through mode narrowing (a report never mutates the doc).
                     try:
@@ -1425,6 +1414,16 @@ class MissionDispatch:
                         allowed = list(allowed) + ["advise"]
             except Exception:  # noqa: BLE001
                 pass
+            # Render once more after every policy/meta floor has settled. The
+            # prior ordering made enable_tools/list_tool_categories/advise
+            # callable but invisible in the model's [TOOLS] block.
+            if allowed:
+                try:
+                    from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
+                    tools_text, _meta = render_tools_block(
+                        allowed, resolver=_at.resolver_for(self), tier=self.tier)
+                except Exception:  # noqa: BLE001 — schema render is best-effort
+                    pass
             # Mark the node this turn IS, so a nested delegate() from inside it
             # attaches to this node instead of the tree root. Saved/restored so
             # sibling and deeper spawns nest correctly.
@@ -1548,7 +1547,12 @@ class MissionDispatch:
                 self.delegation_tree.fail(node_id, reason=result.stop_reason)
             except Exception:  # noqa: BLE001
                 pass
-            out = {"ok": False, "subagent_status": "failed",
+            child_status = (
+                result.stop_reason
+                if result.stop_reason in ("blocked", "escalated")
+                else "failed"
+            )
+            out = {"ok": False, "subagent_status": child_status,
                     "stop_reason": result.stop_reason, "result": result.result,
                     "handoff": handoff,
                     "tokens_used": tokens,
@@ -1798,7 +1802,7 @@ class MissionDispatch:
 
         Returns ok+claims on success, or status=CONFLICT with holder+intent when
         another agent already holds a resource. Never hard-deadlocks — narrow
-        scope or wait for the holder to release_claim / coordinate_release.
+        scope or wait for the holder to call coordinate_release.
         """
         board, err = self._board_or_error()
         if err is not None:
@@ -2229,6 +2233,38 @@ class MissionDispatch:
 LINEAR_ROLE_MAX_OUTPUT_TOKENS = 8192
 
 
+def linear_role_allowed_tools(card: Any) -> list[str]:
+    """Return the universal main-chat loadout used by live turns and previews."""
+    from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+        MAIN_CHAT_DEFAULT_TOOLS,
+    )
+
+    allowed = set(card.concrete_tools) | MAIN_CHAT_DEFAULT_TOOLS
+    try:
+        from services.agent.config import bugreport_floor  # noqa: PLC0415
+        allowed |= set(bugreport_floor())
+    except Exception:  # noqa: BLE001 — floor union is best-effort
+        pass
+    return sorted(allowed)
+
+def effective_role_system_prompt(card: Any) -> str:
+    """Apply the Settings global system-prompt override to a role card.
+
+    Empty means the role's resolved built-in/mission override. A non-empty value
+    intentionally replaces role prose, matching the Settings contract; harness
+    base, capability, tools, skills, and output enforcement are still assembled
+    by the runtime around it.
+    """
+    try:
+        from services.agent.config import load_config  # noqa: PLC0415
+        override = str((load_config() or {}).get("system_prompt") or "").strip()
+        if override:
+            return override
+    except Exception:  # noqa: BLE001 — prompt config must never break a turn
+        pass
+    return str(getattr(card, "system_prompt", "") or "")
+
+
 def _apply_session_preferences(
     role: str, allowed: list[str], system_prompt: str,
 ) -> tuple[list[str], str]:
@@ -2301,10 +2337,16 @@ def _apply_session_preferences(
             "Planning: do NOT draft a plan first - act directly on the "
             "request with real tool calls."
         )
-    elif plan_pref in ("encourage", "require"):
+    elif plan_pref == "encourage":
         lines.append(
-            "Planning: state your plan before you mutate anything, then "
-            "execute it."
+            "Planning: briefly state a plan before mutations when the request "
+            "has multiple dependent steps, then execute it."
+        )
+    elif plan_pref == "require":
+        lines.append(
+            "Planning: REQUIRED for multi-step work. State the ordered plan "
+            "before the first mutating tool call, then execute and update it "
+            "when evidence changes the route."
         )
 
     if sub_pref == "off":
@@ -2313,11 +2355,16 @@ def _apply_session_preferences(
             "Sub-agents: disabled for this session - `delegate` and "
             "`mission_start` are not available. Do the work yourself."
         )
-    elif sub_pref in ("encourage", "require"):
+    elif sub_pref == "encourage":
         lines.append(
-            "Sub-agents: when the work splits into genuinely independent "
-            "pieces, fan them out with `delegate` instead of doing them "
-            "serially."
+            "Sub-agents: consider `delegate` when genuinely independent pieces "
+            "can run concurrently; keep coupled work in this turn."
+        )
+    elif sub_pref == "require":
+        lines.append(
+            "Sub-agents: REQUIRED when the request contains two or more "
+            "genuinely independent workstreams. Delegate those workstreams "
+            "before doing them serially; do not invent parallelism for coupled work."
         )
 
     if add:
@@ -2327,7 +2374,7 @@ def _apply_session_preferences(
     if lines:
         system_prompt = (
             (system_prompt or "").rstrip()
-            + "\n\nSESSION PREFERENCES\n"
+            + "\n\nSESSION PREFERENCES (override earlier role-card defaults)\n"
             + "\n".join(f"- {ln}" for ln in lines)
         )
     return allowed, system_prompt
@@ -2364,27 +2411,11 @@ def run_linear_role_turn(
     """
     from services.agent import agent_turn as _at
     from services.agent.roles import load_role
-    from services.agent.copilot_mode_tools import (
-        AGENT_DEFAULT_TOOLS,
-        SUBAGENT_DEFAULT_TOOLS,
-    )
 
     card = load_role(role)
-    # Union the MAIN-agent file/shell floor too, not just the sub-agent one.
-    # `Role.set_policy` already permits AGENT_DEFAULT_TOOLS at the dispatch gate,
-    # so advertising only SUBAGENT_DEFAULT_TOOLS left this lane able to call
-    # run_shell but never TOLD about it — the mirror of the "advertised but dead"
-    # bug: permitted but unoffered. SHARED_DEFAULT_TOOLS is deliberately NOT
-    # unioned: it carries the doc-lifecycle/modeling tools (new_part, save_part,
-    # …) and the general lane must stay non-modeling until the model pulls a pack
-    # with enable_tools.
-    allowed = sorted(set(card.concrete_tools) | SUBAGENT_DEFAULT_TOOLS
-                     | AGENT_DEFAULT_TOOLS)
-    try:
-        from services.agent.config import bugreport_floor  # noqa: PLC0415
-        allowed = sorted(set(allowed) | bugreport_floor())
-    except Exception:  # noqa: BLE001 — floor union is best-effort
-        pass
+    # Main chat gets both halves of the derived fs/shell floor. Rare CAD
+    # families remain behind enable_tools; previews call the same helper.
+    allowed = linear_role_allowed_tools(card)
 
     # Meta-tool coverage (live admin path passes no dispatcher): ask_user &
     # the other coordination tools resolve only via MissionDispatch.resolve,
@@ -2421,16 +2452,17 @@ def run_linear_role_turn(
         except Exception:  # noqa: BLE001 — ledger observability never blocks a turn
             ledger = None
 
-    system_prompt = card.system_prompt
+    base_system_prompt = effective_role_system_prompt(card)
+    system_prompt = base_system_prompt
     try:
         from services.agent.prompt_tiers import (  # noqa: PLC0415
             assemble_system_for_capability,
             letter_from_capability,
         )
         system_prompt = assemble_system_for_capability(
-            card.system_prompt, letter_from_capability(capability))
+            base_system_prompt, letter_from_capability(capability))
     except Exception:  # noqa: BLE001
-        system_prompt = card.system_prompt
+        system_prompt = base_system_prompt
 
     # Preferences BEFORE render_tools_block: a dropped tool must also vanish
     # from the schema block, or the model is shown a tool every call to which

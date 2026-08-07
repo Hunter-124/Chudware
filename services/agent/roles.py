@@ -120,7 +120,13 @@ def _prompts_override_dir() -> Path:
 
 
 def _prompt_override_path(role_id: str) -> Path:
+    """Native/core prompt override path consumed by C++ ``load_prompt``."""
     return _prompts_override_dir() / f"{role_id}.md"
+
+
+def _mission_prompt_override_path(role_id: str) -> Path:
+    """Mission/YAML prompt override path, isolated from native output contracts."""
+    return _prompts_override_dir() / f"{role_id}.mission.md"
 
 
 def _prompt_builtin_md_path(role_id: str) -> Path:
@@ -131,14 +137,16 @@ def _prompt_builtin_md_path(role_id: str) -> Path:
 def resolve_role_system_prompt(role_id: str, yaml_prompt: str) -> str:
     """Resolution order for the *Python* live path (delegate / load_role):
 
-    1. User override  (~/.local/share/Chudware/prompts/<id>.md) — Settings → Prompts Save
-    2. YAML card      system_prompt field (canonical for mission roles)
-    3. Shipped .md    (services/agent/prompts/<id>.md) — fallback when no YAML text
+    1. Mission override
+       (~/.local/share/Chudware/prompts/<id>.mission.md) — Settings → Prompts
+    2. YAML card system_prompt field (canonical for mission roles)
+    3. Shipped .md (services/agent/prompts/<id>.md) — fallback without YAML text
 
-    YAML wins over shipped .md so advisor/model3d handoff contracts stay aligned with
-    roles/*.yaml. C++ agent_run_v2 still reads .md via load_prompt() and never calls this.
+    Mission overrides are intentionally namespaced: native C++ roles may share an id
+    while requiring a different output contract. C++ ``load_prompt`` continues to
+    consume only ``<id>.md``.
     """
-    ov = _prompt_override_path(role_id)
+    ov = _mission_prompt_override_path(role_id)
     if ov.is_file():
         text = ov.read_text(encoding="utf-8").strip()
         if text:
@@ -162,48 +170,41 @@ def resolve_role_system_prompt(role_id: str, yaml_prompt: str) -> str:
 
 
 def list_editable_prompts() -> list[dict]:
-    """Catalog for Settings → AI → Prompts: YAML mission roles + any .md-only core roles.
+    """Catalog distinct mission/YAML and native/core prompt override surfaces.
 
     Each row matches get_prompts_v2 shape so the GUI can merge sources:
       role, path, override_path, text, overridden, source
+
+    Display ids are namespaced because several mission and core prompts share the
+    same base id but require incompatible output contracts.
     """
     out: list[dict] = []
-    seen: set[str] = set()
 
-    # Mission / pipeline cards (delegate runtime)
     for rid, card in load_all_roles().items():
-        seen.add(rid)
-        ov = _prompt_override_path(rid)
-        md = _prompt_builtin_md_path(rid)
+        ov = _mission_prompt_override_path(rid)
         overridden = ov.is_file() and bool(ov.read_text(encoding="utf-8").strip())
-        text = resolve_role_system_prompt(rid, card.system_prompt)
-        # Prefer showing the YAML path as builtin when no .md; else .md path
-        path = str(md if md.is_file() else (_ROLES_DIR / f"{rid}.yaml"))
         out.append({
-            "role": rid,
-            "path": path,
+            "role": f"mission:{rid}",
+            "path": str(_ROLES_DIR / f"{rid}.yaml"),
             "override_path": str(ov),
-            "text": text,
+            "text": resolve_role_system_prompt(rid, card.system_prompt),
             "overridden": overridden,
             "source": "yaml",
         })
 
-    # Core .md prompts not already covered (C++ agent_run_v2 catalog)
     prompts_dir = Path(__file__).resolve().parent / "prompts"
     if prompts_dir.is_dir():
         for md in sorted(prompts_dir.glob("*.md")):
             rid = md.stem
-            if rid in seen:
-                continue
-            seen.add(rid)
             ov = _prompt_override_path(rid)
             overridden = ov.is_file() and bool(ov.read_text(encoding="utf-8").strip())
-            if overridden:
-                text = ov.read_text(encoding="utf-8").strip()
-            else:
-                text = md.read_text(encoding="utf-8").strip()
+            text = (
+                ov.read_text(encoding="utf-8").strip()
+                if overridden
+                else md.read_text(encoding="utf-8").strip()
+            )
             out.append({
-                "role": rid,
+                "role": f"core:{rid}",
                 "path": str(md),
                 "override_path": str(ov),
                 "text": text,
@@ -211,7 +212,7 @@ def list_editable_prompts() -> list[dict]:
                 "source": "md",
             })
 
-    out.sort(key=lambda r: r["role"])
+    out.sort(key=lambda row: row["role"])
     return out
 
 _PLAYBOOKS_DIR = Path(__file__).resolve().parent / "playbooks"
@@ -570,8 +571,8 @@ def load_role(role_id: str, *, roles_dir: Path | None = None) -> RoleCard:
         raise RoleError(f"role card not found: {path}")
     data = yaml.safe_load(path.read_text())
     card = _role_from_dict(data, source=str(path))
-    # Settings → Prompts saves overrides as appdata prompts/<id>.md (C++ path).
-    # Prefer that text so GUI edits apply to delegate/ladder runs.
+    # Mission prompt overrides use appdata prompts/<id>.mission.md so a GUI edit
+    # cannot overwrite a native/core role with the same id and output contract.
     resolved = resolve_role_system_prompt(role_id, card.system_prompt)
     if resolved != card.system_prompt:
         return RoleCard(

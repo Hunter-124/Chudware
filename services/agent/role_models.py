@@ -1954,6 +1954,19 @@ def role_for_copilot_mode(mode: str | None) -> str:
     m = (mode or "agent").strip().lower() or "agent"
     return _MODE_TO_HARNESS_ROLE.get(m, "default")
 
+def harness_role_for_mission_role(role: str | None) -> str:
+    """Map YAML/DAG mission roles to one canonical ``ai_roles`` seat."""
+    role_s = (role or "").strip().lower()
+    if role_s in ("overseer", "orchestrator", "department_manager", "planning"):
+        return "planning"
+    if role_s == "reviewer":
+        return "vision"
+    if role_s == "advisor":
+        return "advisor"
+    if role_s in ("default", "intake", "intake_analyst"):
+        return "default"
+    return "task"
+
 
 
 def resolve_role_model(

@@ -113,6 +113,21 @@ class TestContextPack:
         pack = cp.assemble(node, {})
         assert pack["allowed_tools"] == ["describe_part", "add_features"]
 
+    def test_phase_promotes_from_node_inputs_for_skill_and_budget_policy(self):
+        node = _minimal_node(inputs={
+            "request": "verify the bracket",
+            "role": "reviewer",
+            "phase": "deliver",
+        })
+        pack = cp.assemble(node, {})
+        assert pack["phase"] == "deliver"
+        assert pack["role_id"] == "reviewer"
+
+
+    def test_blocked_and_escalated_stop_reasons_never_map_done(self):
+        assert nr._map_verdict("blocked", False) == nr.VERDICT_RETRY
+        assert nr._map_verdict("escalated", False) == nr.VERDICT_ESCALATE
+
     def test_retry_remaining_from_node_state(self):
         node = _minimal_node()
         pack = cp.assemble(node, {"retry_remaining": 2})
@@ -693,6 +708,43 @@ class TestDefaultAgentFnSeams:
         nr._default_agent_fn("go", {"node_name": "n1"})
         assert seen.get("max_tokens") is None
 
+    def test_node_context_tier_beats_environment_for_all_turn_policy(
+        self, monkeypatch,
+    ):
+        from services.agent import agent_turn as at
+        from services.agent.tiers import load_tier
+
+        monkeypatch.setenv("CHUDWARE_TIER", "local-24k")
+        seen = {}
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+
+            class _Result:
+                success = True
+                stop_reason = "confirmed"
+                final_code = None
+                result = {"handoff": {"status": "done"}, "calls": []}
+
+            return _Result()
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+        nr._default_agent_fn(
+            "go",
+            {
+                "node_id": "n-frontier",
+                "node_name": "n-frontier",
+                "node_inputs": {"tier": "xai:grok-4.5"},
+                "allowed_tools": [],
+            },
+            provider=_TurnScriptedProvider(),
+        )
+
+        frontier = load_tier("frontier")
+        assert seen["tier"] == "frontier"
+        assert seen["max_tokens"] == frontier.generation_headroom
+        assert seen["capability"] is not None
+
 
 class TestProviderTierResolution:
     """Regression coverage for the mission-tier provider leak: an INTERNAL DAG
@@ -965,10 +1017,23 @@ class TestToolSchemaAndMissionDispatchWiring:
 
         monkeypatch.setattr(at, "run_turn", _spy)
         agent_fn = nr.make_default_agent_fn(ledger=led)
-        agent_fn("go", {"node_name": "n1", "allowed_tools": ["ledger_note"]})
+        agent_fn("go", {
+            "node_id": "n1",
+            "node_name": "n1",
+            "phase": "deliver",
+            "allowed_tools": ["ledger_note"],
+        })
 
         assert seen.get("tools_text"), "tools slot was not rendered"
         assert "ledger_note(" in seen["tools_text"]
+        allowed = set(seen.get("allowed_tools") or [])
+        from services.agent.copilot_mode_tools import SUBAGENT_DEFAULT_TOOLS
+        assert SUBAGENT_DEFAULT_TOOLS <= allowed
+        assert "run_shell" not in allowed
+        for name in ("fs_read", "fs_glob", "fs_grep"):
+            assert f"{name}(" in seen["tools_text"]
+        assert seen["subagent_id"] == "n1"
+        assert seen["phase"] == "deliver"
         assert seen.get("mission_dispatch") is not None
         slots = [e for e in led.events
                  if (e.get("payload") or {}).get("event") == "tools_slot"]

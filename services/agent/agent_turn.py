@@ -1728,56 +1728,23 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         def dispatch(tool: str, args: dict) -> Any:
             fn = mission_dispatch.resolve(tool)
             if fn is not None:
-                if _loop_guard is not None:
-                    detection = _loop_guard.check(tool, args)
-                    if detection is not None:
-                        raise RuntimeError(ToolCallLoopGuard.message(detection))
-                # Still count toward per-tool caps when resolved via mission.
-                try:
-                    from services.agent.config import get_tool_options  # noqa: PLC0415
-                    opts = get_tool_options(None, tool) or {}
-                    # Per-tool option always wins; fall back to the global default
-                    # (Settings → AI → Tools "Advanced") only when unset/0.
-                    max_calls = opts.get("max_calls_per_turn")
-                    if max_calls is None:
-                        try:
-                            from services.agent.config import tool_max_calls_default  # noqa: PLC0415
-                            max_calls = tool_max_calls_default() or None
-                        except Exception:  # noqa: BLE001
-                            max_calls = None
-                    if max_calls is not None:
-                        n = int(_tool_call_counts.get(tool, 0))
-                        if n >= int(max_calls):
-                            raise RuntimeError(
-                                f"tool '{tool}' exceeded max_calls_per_turn={max_calls} "
-                                f"(agent.tool_options)"
-                            )
-                        _tool_call_counts[tool] = n + 1
-                    defaults = dict(opts.get("param_defaults") or {})
-                    if args:
-                        defaults.update(args)
-                    args = defaults
-                except RuntimeError:
-                    raise
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    return fn(**(args or {}))
-                except Exception as exc:  # noqa: BLE001
-                    try:
-                        from services.agent.tool_hints import hint_for  # noqa: PLC0415
-                        hint = hint_for(tool)
-                    except Exception:  # noqa: BLE001
-                        hint = None
-                    if hint:
-                        raise type(exc)(f"{exc} Hint: {hint}") from exc
-                    raise
-            return _dispatch_tool(tool, args, _call_counts=_tool_call_counts,
-                                  _loop_guard=_loop_guard)
+                # Mission-scoped handlers must obey the SAME enabled/default/
+                # max-call/timeout/hint/loop policy as globally resolved tools.
+                return _dispatch_tool(
+                    tool,
+                    args,
+                    _call_counts=_tool_call_counts,
+                    _inner=lambda _name, merged: fn(**(merged or {})),
+                    _loop_guard=_loop_guard,
+                )
+            return _dispatch_tool(
+                tool, args, _call_counts=_tool_call_counts,
+                _loop_guard=_loop_guard)
     else:
         def dispatch(tool: str, args: dict) -> Any:
             return _dispatch_tool(tool, args, _call_counts=_tool_call_counts,
                                   _loop_guard=_loop_guard)
+    restricted_tools = allowed_tools is not None
     allow = set(allowed_tools or [])
     # Copilot mode → tools: intersect caller allowlist with mode policy.
     # Precedence: explicit arg → options key if present → mission_dispatch → default.
@@ -1815,6 +1782,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             _mode,
             _role_tools_for_mode,
             plan_only=bool(_plan_only) if _plan_only is not None else None,
+            subagent=bool(subagent_id),
         )
         if narrowed is not None:
             allow = set(narrowed)
@@ -2062,7 +2030,9 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _sk_parts.append(_cat)
         if request or _phase:
             _sk_parts.extend(
-                _skills.activate_for_prompt(request or "", session_id=_sid, phase=_phase)
+                _skills.activate_for_prompt(
+                    request or "", session_id=_sid, phase=_phase, role=name,
+                )
             )
         _sk = "\n\n".join(_sk_parts)
         if _sk:
@@ -3085,6 +3055,17 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 (handoff or {}).get("status") or
                 ("done" if parsed.get("done") else "")
             ).lower()
+            if handoff_status in ("blocked", "escalated"):
+                _log(ledger, actor, {
+                    "event": "turn",
+                    "kind": handoff_status,
+                    "handoff": handoff,
+                })
+                return TurnResult(
+                    False,
+                    handoff_status,
+                    _with_usage({"handoff": handoff, "calls": calls}, _tu),
+                )
             if handoff_status in ("", "done"):
                 boot_msg = _bootstrap_incomplete(calls, allow)
                 if boot_msg is None and tool_calls_made == 0:
@@ -3309,19 +3290,52 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             meta_result: dict
             try:
                 from services.agent.tool_categories import (  # noqa: PLC0415
-                    resolve_categories,
+                    category_catalog,
                 )
                 if tool == "list_tool_categories":
                     meta_result = _tool_category_catalog_result()
+                elif not isinstance(args, dict):
+                    meta_result = {
+                        "ok": False,
+                        "status": "bad_arguments",
+                        "error": (
+                            "enable_tools requires an object with "
+                            '{"categories": ["modeling"]}'
+                        ),
+                    }
                 else:
-                    # enable_tools
-                    raw_cats = (args or {}).get("categories") if isinstance(args, dict) else None
-                    if raw_cats is None and isinstance(args, dict):
-                        raw_cats = args.get("category") or args.get("names")
+                    raw_cats = (
+                        args.get("categories")
+                        if "categories" in args
+                        else args.get("category") or args.get("names")
+                    )
                     if isinstance(raw_cats, str):
                         raw_cats = [raw_cats]
-                    cats = [str(c) for c in (raw_cats or []) if c]
-                    if not allow:
+                    if not isinstance(raw_cats, (list, tuple, set)):
+                        raw_cats = []
+                    cats = [
+                        str(category).strip().lower()
+                        for category in raw_cats
+                        if str(category).strip()
+                    ]
+                    available = [name for name, _ in category_catalog()]
+                    unknown = sorted(set(cats).difference(available))
+                    if not cats:
+                        meta_result = {
+                            "ok": False,
+                            "status": "bad_arguments",
+                            "error": "enable_tools requires at least one category",
+                            "available_categories": available,
+                        }
+                    elif unknown:
+                        meta_result = {
+                            "ok": False,
+                            "status": "unknown_category",
+                            "error": f"unknown tool categories: {unknown}",
+                            "unknown_categories": unknown,
+                            "available_categories": available,
+                        }
+                    elif not restricted_tools:
                         # agent/swarm unrestricted — already full access
                         meta_result = {
                             "ok": True,
@@ -3369,7 +3383,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             )})
             continue
 
-        if allow and tool not in allow:
+        if restricted_tools and tool not in allow:
             # Auto-enable-on-reach. A tool the model asked for by its REAL name,
             # that lives in a pack this turn is allowed to enable, is not a
             # policy violation — it is a pack that has not been pulled in yet.
@@ -3632,6 +3646,27 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             pass
 
 
+        if (
+            auto_enable_packs
+            and _tasklist_pref == "require"
+            and tool != "task_list"
+            and "task_list" in (allow or set())
+            and not any(
+                call.get("tool") == "task_list" and call.get("ok")
+                for call in calls
+            )
+        ):
+            messages.append({"role": "user", "content": _parts(
+                "[TASK LIST] This session requires task_list as the first "
+                "successful tool call for multi-step work. Publish 3-8 short "
+                "items now, then continue with the tool you attempted."
+            )})
+            _log(ledger, actor, {
+                "event": "task_list_required_before_work",
+                "attempted_tool": tool,
+            })
+            last_reason = _RETRY
+            continue
         if tool_calls_made >= budget:
             _forced_tool_stop = (
                 "subagent_hard_ceiling"
@@ -3915,23 +3950,19 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
 
-        # Task-list preference enforcement (Settings → AI → Harness). The role
-        # prompt already asks for a task_list call and the tool is advertised and
-        # resolvable — and a live claude-opus-5 run still made 20 tool calls
-        # without publishing one, leaving the copilot's Task list panel empty for
-        # the whole build. Soft guidance loses to the immediate modeling task, so
-        # the knob gets one real nudge: Require fires at the first tool call,
-        # Encourage waits until the run is demonstrably multi-step. Once per turn
-        # (same idiom as _continue_nudge/_novol_nudge) — never a block, so it can
-        # not false-refuse real work.
+        # Encourage is intentionally a single soft nudge after the run proves
+        # multi-step. Require is enforced before dispatch above: a non-task-list
+        # first call is not executed until a successful task_list publication.
+        # This keeps the Settings labels behaviorally distinct instead of letting
+        # "Require" mean "remind after work already started."
         if (
             auto_enable_packs                       # interactive general lane only
             and _tasklist_nudge[0] < 1
-            and _tasklist_pref in ("encourage", "require")
+            and _tasklist_pref == "encourage"
             and "task_list" in (allow or set())
             and tool_calls_made < budget
             and not any(c.get("tool") == "task_list" for c in calls)
-            and tool_calls_made >= (1 if _tasklist_pref == "require" else 3)
+            and tool_calls_made >= 3
         ):
             _tasklist_nudge[0] += 1
             messages.append({"role": "user", "content": _parts(

@@ -27,6 +27,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -678,6 +679,47 @@ class TestSketch2dModel3dRoles(unittest.TestCase):
             errs = [f for f in findings if f.level == "error"]
             self.assertEqual(errs, [], f"{rid}: " + "; ".join(str(e) for e in errs))
 
+
+
+class TestPromptOverrideIsolation(unittest.TestCase):
+    def test_mission_and_native_overrides_with_same_id_do_not_collide(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+            os.environ, {"CHUDWARE_APPDATA": td}
+        ):
+            prompt_dir = Path(td) / "prompts"
+            prompt_dir.mkdir(parents=True)
+            core_override = prompt_dir / "reviewer.md"
+            mission_override = prompt_dir / "reviewer.mission.md"
+            core_override.write_text(
+                "CORE REVIEWER OUTPUT: {done, issues}", encoding="utf-8"
+            )
+            mission_override.write_text(
+                "MISSION REVIEWER OUTPUT: criterion_results", encoding="utf-8"
+            )
+
+            self.assertEqual(
+                roles.resolve_role_system_prompt("reviewer", "YAML FALLBACK"),
+                "MISSION REVIEWER OUTPUT: criterion_results",
+            )
+            rows = {row["role"]: row for row in roles.list_editable_prompts()}
+            self.assertEqual(
+                rows["mission:reviewer"]["override_path"], str(mission_override)
+            )
+            self.assertEqual(
+                rows["core:reviewer"]["override_path"], str(core_override)
+            )
+            self.assertIn("criterion_results", rows["mission:reviewer"]["text"])
+            self.assertIn("{done, issues}", rows["core:reviewer"]["text"])
+
+    def test_role_guidance_uses_real_meta_and_datasheet_call_shapes(self):
+        prompts = {
+            role_id: card.system_prompt
+            for role_id, card in roles.load_all_roles().items()
+        }
+        self.assertNotIn("enable_tools([", "\n".join(prompts.values()))
+        datasheet = prompts["re_datasheet_reader"]
+        self.assertIn("research_datasheet_fetch(source=<PDF URL>)", datasheet)
+        self.assertNotIn("research_datasheet_fetch(mpn)", datasheet)
 
 if __name__ == "__main__":
     unittest.main()

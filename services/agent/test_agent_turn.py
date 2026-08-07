@@ -67,6 +67,45 @@ def test_turn_denies_out_of_allowlist_tool():
     assert any(c.get("error") for c in res.result["calls"])
 
 
+def test_explicit_empty_allowlist_never_becomes_unrestricted():
+    provider = _ScriptedProvider([
+        '```json\n{"tool": "add_features", "args": {"ops": []}}\n```',
+    ])
+    called = []
+    res = agent_turn.run_turn(
+        "build it",
+        provider,
+        allowed_tools=[],
+        max_tool_calls=1,
+        tool_dispatch=lambda tool, args: called.append((tool, args)) or {"ok": True},
+    )
+    assert called == []
+    assert any(call.get("tool") == "add_features" and not call.get("ok")
+               for call in res.result["calls"])
+
+
+def test_enable_tools_rejects_positional_empty_and_unknown_categories():
+    cases = [
+        (["drawing"], "bad_arguments"),
+        ({"categories": []}, "bad_arguments"),
+        ({"categories": ["not-a-real-pack"]}, "unknown_category"),
+    ]
+    for args, expected in cases:
+        provider = _ScriptedProvider([
+            "```json\n" + json.dumps({"tool": "enable_tools", "args": args}) + "\n```",
+        ])
+        res = agent_turn.run_turn(
+            "enable a pack",
+            provider,
+            allowed_tools=["enable_tools"],
+            max_tool_calls=1,
+            tool_dispatch=lambda tool, kwargs: {"ok": True},
+        )
+        call = res.result["calls"][0]
+        assert call["tool"] == "enable_tools"
+        assert call["ok"] is False
+        assert call["result"]["status"] == expected
+
 def test_subagent_turn_stops_at_hard_ceiling(monkeypatch):
     # The soft threshold warns at three; only the separate hard ceiling stops.
     monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 6)
@@ -223,6 +262,23 @@ def test_role_schema_handoff_counts_as_done():
     assert res.stop_reason == "confirmed"
     assert res.result["handoff"]["status"] == "done"
     assert res.result["handoff"]["outputs"]["spec"]["deliverable_id"] == "DL1"
+
+def test_blocked_and_escalated_role_handoffs_are_not_success():
+    for status, expected_reason in (
+        ("blocked", "blocked"),
+        ("escalated", "escalated"),
+    ):
+        provider = _ScriptedProvider([
+            json.dumps({
+                "status": status,
+                "summary": "cannot continue honestly",
+                "outputs": {"reasoning_summary": "missing source evidence"},
+            }),
+        ])
+        res = agent_turn.run_turn("verify it", provider, allowed_tools=[])
+        assert res.success is False
+        assert res.stop_reason == expected_reason
+        assert res.result["handoff"]["status"] == status
 
 
 def test_no_formal_handoff_after_ledger_note_auto_completes():

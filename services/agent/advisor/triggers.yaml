@@ -47,9 +47,7 @@ triggers:
         - "\\binner race\\b"
         - "\\bouter race\\b"
         - "\\bshaft seat\\b"
-      tools:
-        - part_search
-        - part_place
+      tools: []
       events: []
     inject:
       context_pack: bearing_fits
@@ -499,9 +497,8 @@ triggers:
   - id: reveng_flow
     match:
       keywords:
-        - "reverse.engineer"
-        - "\\bscan\\b"
-        - "\\bscan\\b.*\\b(part|to cad)\\b"
+        - "reverse[ -]?engineer"
+        - "\\bscan\\b.*\\b(part|bracket|housing|component|to cad)\\b"
         - "\\bpoint cloud\\b"
         - "\\bmesh\\b.*\\b(part|model)"
         - "\\bphotogrammetry\\b"
@@ -518,7 +515,10 @@ triggers:
         - "\\b(scan|copy|replicate|duplicate|replacement|reproduce)\\b.*3d print"
         - "3d print.*\\b(scan|copy|replica|replacement|existing)\\b"
         - "\\bSTEP\\b.*\\bimport|import.*\\bSTEP\\b"
-        - "\\bdatasheet\\b"
+        # A generic electronics datasheet is not reverse-engineering context.
+        # Require geometric extraction language in either order.
+        - "\\bdatasheet\\b.*\\b(dimensions?|drawing|geometry|profile|outline)\\b"
+        - "\\b(dimensions?|drawing|geometry|profile|outline)\\b.*\\bdatasheet\\b"
       tools:
         - reverse_engineer
         - compare_parts
@@ -544,7 +544,6 @@ triggers:
     match:
       keywords:
         - "\\bcheckpoint\\b"
-        - "\\brelease\\b"
         - "\\brevision\\b"
         - "\\bwhere[ -]used\\b"
         - "\\brollback\\b"

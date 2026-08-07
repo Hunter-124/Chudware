@@ -21,16 +21,6 @@ USER_REQUEST_PLACEHOLDER = (
     "Sketch a 50mm flange with 4× M6 holes on a 40mm bolt circle."
 )
 
-SAMPLE_LEDGER = (
-    "[LEDGER]\n"
-    "- (sample) prior decision: use 6061-T6 for the chassis\n"
-    "- (sample) open: confirm wall thickness ≥ 2 mm"
-)
-
-SAMPLE_STAGE = (
-    "[STAGE]\n"
-    "(sample) doc: Part1 — 0 features; active sketch: none"
-)
 
 
 def preview_tool_entry(tool_name: str, *, trim: bool | None = None) -> dict[str, Any]:
@@ -92,10 +82,18 @@ def preview_tool_entry(tool_name: str, *, trim: bool | None = None) -> dict[str,
             schema = dict(schema)
             schema["description"] = override
         note = (opts.get("prompt_note") or "").strip()
+        defaults = dict(opts.get("param_defaults") or {})
         desc = _description_line(schema["description"], trim=use_trim)
         entry = f"- {schema['signature']}"
         if desc:
             entry += f"\n    {desc}"
+        if defaults:
+            rendered_defaults = ", ".join(
+                f"{key}={value!r}" for key, value in sorted(defaults.items())
+            )
+            entry += (
+                f"\n    Effective defaults when omitted: {rendered_defaults}."
+            )
         if note:
             entry += f"\n    Note: {note}"
         text = "[TOOLS] Call tools with EXACTLY these kwargs:\n" + entry
@@ -104,7 +102,12 @@ def preview_tool_entry(tool_name: str, *, trim: bool | None = None) -> dict[str,
             "tool": name,
             "entry": entry,
             "text": text,
-            "meta": {"trimmed": use_trim, "has_override": bool(override), "has_note": bool(note)},
+            "meta": {
+                "trimmed": use_trim,
+                "has_override": bool(override),
+                "has_note": bool(note),
+                "has_param_defaults": bool(defaults),
+            },
             "live_description": live_desc,
             "unresolved": False,
         }
@@ -208,22 +211,29 @@ def preview_main_chat_system(*, include_tools: bool = True) -> dict[str, Any]:
     meta: dict[str, Any] = {"role": "general_agent"}
     try:
         from services.agent.roles import load_role  # noqa: PLC0415
-        from services.agent.copilot_mode_tools import SUBAGENT_DEFAULT_TOOLS  # noqa: PLC0415
         from services.agent import agent_turn as _at  # noqa: PLC0415
         from services.agent.autolearn import standing_guidance  # noqa: PLC0415
+        from services.agent.mission_dispatch import (  # noqa: PLC0415
+            _apply_session_preferences,
+            effective_role_system_prompt,
+            linear_role_allowed_tools,
+        )
 
         card = load_role("general_agent")
-        system_prompt = card.system_prompt
+        base_system_prompt = effective_role_system_prompt(card)
+        system_prompt = base_system_prompt
         try:
             from services.agent.prompt_tiers import (  # noqa: PLC0415
                 assemble_system_for_capability,
                 letter_from_capability,
             )
             system_prompt = assemble_system_for_capability(
-                card.system_prompt, letter_from_capability(None))
+                base_system_prompt, letter_from_capability(None))
         except Exception:  # noqa: BLE001
-            system_prompt = card.system_prompt
-
+            system_prompt = base_system_prompt
+        allowed = linear_role_allowed_tools(card)
+        allowed, system_prompt = _apply_session_preferences(
+            "general_agent", allowed, system_prompt)
         system = (system_prompt or "").rstrip() + "\n\n" + _at._SYSTEM_BASE
 
         try:
@@ -237,17 +247,6 @@ def preview_main_chat_system(*, include_tools: bool = True) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             meta["role_catalog"] = False
 
-        # Sample ledger / stage slots (same §9.1 order as assemble_context).
-        try:
-            from services.agent.roles import assemble_context  # noqa: PLC0415
-            # assemble_context prepends the role system again — we only want the
-            # extra slots, so build them manually in §9.1 order after the live
-            # system we already assembled above.
-            _ = assemble_context  # document the dependency for graphify
-        except Exception:  # noqa: BLE001
-            pass
-        system = system.rstrip() + "\n\n" + SAMPLE_LEDGER
-        system = system.rstrip() + "\n\n" + SAMPLE_STAGE
 
         guidance = standing_guidance()
         if guidance:
@@ -257,14 +256,7 @@ def preview_main_chat_system(*, include_tools: bool = True) -> dict[str, Any]:
             meta["autolearn"] = False
 
         tools_text = ""
-        allowed: list[str] = []
         if include_tools:
-            allowed = sorted(set(card.concrete_tools) | SUBAGENT_DEFAULT_TOOLS)
-            try:
-                from services.agent.config import bugreport_floor  # noqa: PLC0415
-                allowed = sorted(set(allowed) | bugreport_floor())
-            except Exception:  # noqa: BLE001
-                pass
             try:
                 from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
                 tools_text, tools_meta = render_tools_block(
@@ -280,6 +272,17 @@ def preview_main_chat_system(*, include_tools: bool = True) -> dict[str, Any]:
                 system = system.rstrip() + "\n\nAllowed tools: " + ", ".join(allowed[:40])
                 if len(allowed) > 40:
                     system += f", … (+{len(allowed) - 40} more)"
+
+        try:
+            from services.agent.skills import catalog_block  # noqa: PLC0415
+            skill_catalog = catalog_block()
+            if skill_catalog:
+                system = system.rstrip() + "\n\n" + skill_catalog
+                meta["skills_catalog"] = True
+            else:
+                meta["skills_catalog"] = False
+        except Exception:  # noqa: BLE001
+            meta["skills_catalog"] = False
 
         meta["allowed_tool_count"] = len(allowed)
         meta["system_chars"] = len(system)

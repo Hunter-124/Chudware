@@ -74,10 +74,11 @@ system_prompt: |
   1. Identify the part from the ledger brief: MPN, manufacturer name, description,
      or any visual markings noted during import. Start with match_part_number or
      spec_sheet_match if any identifier is available.
-  2. Fetch the datasheet: research_datasheet_fetch(mpn) first; if that misses,
-     research_web_search + research_fetch_page for the manufacturer's product page
-     or distributor datasheet. Always record the URL in the ledger — provenance
-     is audited.
+  2. Locate the authoritative PDF: research_web_search for the MPN plus
+     manufacturer and "datasheet", then inspect the manufacturer page with
+     research_fetch_page. Call research_datasheet_fetch(source=<PDF URL>) only
+     after you have a real local path or http(s) PDF URL. Record that URL in
+     the ledger — provenance is audited.
   3. Extract every dimension the datasheet names that has a counterpart in the
      recovered geometry. Convert to mm (research_unit_convert as needed). Record
      each as a dims_confirmed entry with source=URL/section.

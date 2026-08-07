@@ -457,7 +457,7 @@ class TestPartsV2Handlers:
 
 
 # ---------------------------------------------------------------------------
-# agent_turn dispatch order — mission hit BEFORE global fallback
+# agent_turn dispatch order — mission handlers use unified policy dispatch
 # ---------------------------------------------------------------------------
 
 class _ScriptedProvider:
@@ -473,11 +473,17 @@ class _ScriptedProvider:
 
 
 class TestDispatchOrder:
-    def test_mission_hit_wins_over_global(self, md, monkeypatch):
-        """ledger_note resolves mission-scoped: the global registry is never asked."""
-        def _boom(tool, args):
-            raise AssertionError("global dispatch must not be consulted")
-        monkeypatch.setattr(agent_turn, "_dispatch_tool", _boom)
+    def test_mission_hit_uses_unified_dispatch_policy(self, md, monkeypatch):
+        """Mission handlers still pass through the common options/guard path."""
+        seen = {}
+
+        def _unified(tool, args, **kw):
+            seen.update(tool=tool, args=args, inner=kw.get("_inner"),
+                        call_counts=kw.get("_call_counts"),
+                        loop_guard=kw.get("_loop_guard"))
+            return kw["_inner"](tool, args)
+
+        monkeypatch.setattr(agent_turn, "_dispatch_tool", _unified)
 
         res = agent_turn.run_turn(
             "note a decision", _ScriptedProvider(
@@ -486,6 +492,9 @@ class TestDispatchOrder:
         assert res.success is True
         call = res.result["calls"][0]
         assert call["ok"] is True and call["tool"] == "ledger_note"
+        assert seen["tool"] == "ledger_note"
+        assert callable(seen["inner"])
+        assert isinstance(seen["call_counts"], dict)
 
     def test_global_fallback_when_mission_misses(self, md, monkeypatch):
         """A non-mission tool falls through to the process-wide registry path."""

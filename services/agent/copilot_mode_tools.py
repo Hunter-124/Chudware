@@ -96,6 +96,13 @@ AGENT_DEFAULT_TOOLS: frozenset[str] = frozenset(_CONTRACT.get("agent_default_too
 # File-handling floor unioned onto every DAG-node/subagent role loadout.
 SUBAGENT_DEFAULT_TOOLS: frozenset[str] = frozenset(_CONTRACT.get("subagent_default_tools", ()))
 
+# The universal main chat needs the complete fs family plus shell/web fetch.
+# Keep this derived from the two contract-owned floors so prompt assembly has
+# one name and cannot silently omit the read half or the write half.
+MAIN_CHAT_DEFAULT_TOOLS: frozenset[str] = (
+    AGENT_DEFAULT_TOOLS | SUBAGENT_DEFAULT_TOOLS
+)
+
 
 def normalize_mode(mode: str | None) -> str:
     """Return a canonical mode string (default ``agent``)."""
@@ -126,47 +133,38 @@ def apply_mode_tools(
     role_tools: Iterable[str] | None = None,
     *,
     plan_only: bool | None = None,
+    subagent: bool = False,
 ) -> Optional[list[str]]:
-    """Intersect *role_tools* with the mode allowlist, then floor with shared defaults.
+    """Apply mode policy while preserving open-vs-explicit tool scopes.
 
-    Returns:
-      * None  — no restriction (agent mode with no role card, or empty inputs
-        that mean "full").
-      * list  — concrete allowed tool names (sorted for stability in tests).
-
-    Rules:
-      * ``plan_only=True`` forces plan semantics even if mode is agent.
-      * plan = agent-broad minus geometry commit mutators, then UNION
-        :data:`SHARED_DEFAULT_TOOLS` (doc lifecycle stays so plan can build).
-      * ask / edit: mode list ∩ role (or mode list), mode denylists applied,
-        then UNION shared defaults (shared wins over denylists for the floor).
-      * When *role_tools* is None/empty and mode is open → None (unrestricted).
-      * swarm unions SWARM_EXTRA_TOOLS onto the role set (or leaves unrestricted).
+    ``role_tools=None`` means unrestricted in agent/swarm. An explicit empty
+    iterable still receives the applicable always-on floor. Child turns use
+    :data:`SUBAGENT_DEFAULT_TOOLS`; main turns use
+    :data:`AGENT_DEFAULT_TOOLS`.
     """
     m = normalize_mode(mode)
     if plan_only:
         m = "plan"
 
     mode_set = tools_for_mode(m)
+    role_specified = role_tools is not None
     role_list = [str(t) for t in (role_tools or []) if t]
     role_set = set(role_list)
+    default_floor = SUBAGENT_DEFAULT_TOOLS if subagent else AGENT_DEFAULT_TOOLS
 
     if m == "swarm":
-        if not role_set:
-            # Unrestricted + ensure corporate/delegate names are known to callers
-            # that materialize from this helper for prompts.
+        if not role_specified:
             return None
-        out = sorted(role_set | SWARM_EXTRA_TOOLS | SHARED_DEFAULT_TOOLS | AGENT_DEFAULT_TOOLS)
-        return out
+        return sorted(
+            role_set | SWARM_EXTRA_TOOLS | SHARED_DEFAULT_TOOLS | default_floor
+        )
 
     if m == "agent":
-        if not role_set:
+        if not role_specified:
             return None
-        # Agent mode floors with AGENT_DEFAULT_TOOLS (the main-agent fs/shell/web
-        # floor) only — SHARED_DEFAULT_TOOLS (CAD document-lifecycle tools) is
-        # NOT unioned here; those packs are pulled on demand via enable_tools.
-        # (ask/plan/edit/swarm still get SHARED_DEFAULT_TOOLS — see below.)
-        return sorted(role_set | AGENT_DEFAULT_TOOLS)
+        # Agent mode stays lean: CAD document-lifecycle tools remain behind
+        # enable_tools. Only the correct lane's fs/shell floor is automatic.
+        return sorted(role_set | default_floor)
 
     # Plan: open like agent minus geometry commit mutators (add_features etc.),
     # then floor with SHARED_DEFAULT_TOOLS so make/save/open/close stay.
@@ -205,12 +203,14 @@ def is_tool_allowed(
     *,
     role_tools: Iterable[str] | None = None,
     plan_only: bool | None = None,
+    subagent: bool = False,
 ) -> bool:
     """True when *tool* may run under *mode* (+ optional role intersection)."""
     name = (tool or "").strip()
     if not name:
         return False
-    allowed = apply_mode_tools(mode, role_tools, plan_only=plan_only)
+    allowed = apply_mode_tools(
+        mode, role_tools, plan_only=plan_only, subagent=subagent)
     if allowed is None:
         return True
     return name in allowed

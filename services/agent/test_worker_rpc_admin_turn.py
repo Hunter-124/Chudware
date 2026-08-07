@@ -134,6 +134,27 @@ def test_agent_admin_turn_honors_explicit_role(monkeypatch):
     assert out["turn"]["role"] == "project_organizer"
 
 
+def test_agent_admin_turn_forwards_configured_max_output_tokens(monkeypatch):
+    from services.agent import mission_dispatch
+
+    captured = {}
+    monkeypatch.setattr(
+        agent_config, "load_config", lambda: {"max_output_tokens": 3456}
+    )
+    monkeypatch.setattr(
+        agent_config, "get_provider", lambda *args, **kwargs: object()
+    )
+
+    def _run(*args, **kwargs):
+        captured.update(kwargs)
+        return {"success": True, "stop_reason": "confirmed"}
+
+    monkeypatch.setattr(mission_dispatch, "run_linear_role_turn", _run)
+    out = worker_rpc._agent_admin_turn({"request": "inspect it"}, lambda data: None)
+
+    assert out["ok"] is True
+    assert captured["max_tokens"] == 3456
+
 # ──── workspace_dir plumbing (project-folder awareness) ────
 # run.cpp's general lane resolves the user's project folder via
 # agent_workspace_dir(options) and passes it as ``workspace_dir``. The worker is a

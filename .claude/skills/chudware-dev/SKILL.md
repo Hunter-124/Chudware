@@ -214,21 +214,24 @@ judgment).
 - **agent_turn edits:** standing mega-24 offline planning-node repro gate
   (`FINAL_OFFLINE_OK` / `services/agent/test_mega24_fixes.py`) plus mega regression suites
   before any live mission spend.
-- **Tool floors (2026-07-23):** `contracts/copilot_modes.json` `agent_default_tools`
-  (fs_write/fs_edit/fs_list/run_shell/research_fetch_page — main-agent floor, survives
-  role-card narrowing in agent/swarm) and `subagent_default_tools` (full fs family for
-  every DAG node/subagent). Wired in `copilot_mode_tools.py` + `roles.py` +
-  `mission_dispatch.py` + C++ `copilot_modes.cpp`; parity tests both sides. Rare CAD
-  families stay behind `enable_tools`/`list_tool_categories` — don't bloat the floors.
+- **Tool floors (2026-08-07):** preserve allowlist tri-state: `None` means open,
+  while explicit `[]` means restricted to that lane's floor. Main linear chat uses
+  derived `MAIN_CHAT_DEFAULT_TOOLS` (agent fs/shell/fetch + child fs read/glob/grep);
+  DAG nodes and delegated children use only `SUBAGENT_DEFAULT_TOOLS` and always pass
+  a `subagent_id`. Finalize this effective set BEFORE schema rendering, then pass the
+  same set to dispatch. Rare CAD families stay behind
+  `enable_tools(categories=[...])`/`list_tool_categories`; never teach positional
+  `enable_tools([...])` or bloat the floors.
 - **Routing / execution structure (model-driven 2026-07):** there is NO
   deterministic keyword/regex classifier deciding execution structure. The
   `general_agent` role (`roles/general_agent.yaml`) is the UNIVERSAL entry: every
   request runs ONE free linear turn, and the MODEL decides whether to finish
   inline, `delegate` a scoped build, or `mission_start` the full build swarm. It
-  starts with the fs/shell/plm floor + `enable_tools`/`list_tool_categories` +
+  starts with the derived main-chat floor + `enable_tools`/`list_tool_categories` +
   `delegate`/`mission_start`, so it sees the tool CATEGORY packs (workspaces) and
-  pulls modeling/sketch/sim/… on demand (verified: `enable_tools(['modeling'])`
-  unlocks `new_part` mid-turn) — never a multi-step plan forced onto basic work.
+  pulls modeling/sketch/sim/… on demand (verified:
+  `enable_tools(categories=["modeling"])` unlocks `new_part` mid-turn) — never a
+  multi-step plan forced onto basic work.
   Python path: `mission_dispatch.route_request` always runs `general_agent`;
   `workflow_router.route`/`classify_task`/`structure_for_class` survive ONLY as
   advisory Routing-card telemetry (`agent.classification`), never a gate. C++ live
@@ -238,6 +241,13 @@ judgment).
   exception — it keeps the deterministic split (`domain.is_general_work_request`):
   general work blocked (no provider), offline-safe local modeling falls through to
   the C++ pipeline. Explicit mission mode (`run_mission`) still runs the swarm.
+- **Prompt override isolation (2026-08-07):** native/core C++ prompts consume
+  `appdata/prompts/<id>.md`; YAML mission roles consume
+  `appdata/prompts/<id>.mission.md`. Settings catalogs both as `core:<id>` and
+  `mission:<id>`. Never collapse them: overlapping ids such as reviewer/fixer have
+  incompatible output contracts. The top-level `system_prompt` setting intentionally
+  replaces role prose but still receives harness base, capability, tools, skills, and
+  runtime output enforcement.
 - **Sidecar shutdown:** OMP bun bridge + python worker bridge spawn with
   setpgid+PDEATHSIG+close_range; hostd's clean-shutdown tail calls
   `WorkerBridge::shutdownIfCreated()` and the `chudware_agent_sidecars_shutdown` C-ABI

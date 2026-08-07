@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -141,7 +142,43 @@ class TestPromptPreview(unittest.TestCase):
         self.assertTrue(out.get("system"), "expected non-empty system")
         self.assertEqual(out.get("user_placeholder"), USER_REQUEST_PLACEHOLDER)
         self.assertIn("Chudware", out["system"])
+        self.assertNotIn("(sample)", out["system"])
         self.assertGreater(out["meta"].get("system_chars", 0), 100)
+
+    def test_main_chat_preview_uses_effective_floors_and_global_override(self):
+        from services.agent.prompt_preview import preview_main_chat_system
+
+        with mock.patch(
+            "services.agent.config.load_config",
+            return_value={"system_prompt": "CUSTOM GLOBAL SYSTEM"},
+        ):
+            out = preview_main_chat_system(include_tools=True)
+
+        self.assertTrue(out.get("ok"), out)
+        self.assertTrue(out["system"].startswith("CUSTOM GLOBAL SYSTEM"))
+        rendered = set((out["meta"].get("tools") or {}).get("rendered") or [])
+        for name in ("run_shell", "research_fetch_page", "fs_read", "fs_glob", "fs_grep"):
+            self.assertIn(name, rendered)
+        self.assertIn("[SKILLS", out["system"])
+
+    def test_tool_entry_shows_effective_defaults(self):
+        from services.agent.prompt_preview import preview_tool_entry
+
+        with mock.patch(
+            "services.agent.config.get_tool_options",
+            return_value={
+                "enabled": True,
+                "timeout_s": None,
+                "max_calls_per_turn": None,
+                "param_defaults": {"limit": 500},
+                "prompt_note": "",
+                "description_override": "",
+                "schema_trim": None,
+            },
+        ):
+            out = preview_tool_entry("office_read_csv")
+        self.assertTrue(out.get("ok"), out)
+        self.assertIn("Effective defaults when omitted: limit=500.", out["entry"])
 
 
     def test_tool_catalog_covers_registry_and_guidance(self):

@@ -1593,6 +1593,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
 
+    cfg = dict(agent_config.load_config() or {})
     try:
         if provider_name:
             # Shallow overlay — load_config() hands back a process-cached dict, so
@@ -1600,7 +1601,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             # per-provider sub-dict, because that is where every native branch in
             # config.py._resolve_provider actually reads it from (cfg[name].base_url).
             provider_name = provider_name.lower()
-            cfg = dict(agent_config.load_config())
+            cfg = dict(cfg)
             cfg["provider"] = provider_name
             for key in ("model", "api_key", "reasoning_effort"):
                 value = _param_str(key)
@@ -1615,11 +1616,17 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 cfg[provider_name] = sub
             provider = agent_config.get_provider(name=provider_name, cfg=cfg, role=role)
         else:
-            provider = agent_config.get_provider(role=role)
+            provider = agent_config.get_provider(role=role, cfg=cfg)
     except agent_config.OfflineModeError as exc:
         return {"ok": False, "reason": f"offline: {exc}"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"agent_admin_turn: no provider: {exc}"}
+    try:
+        configured_max_tokens = int(cfg.get("max_output_tokens") or 0)
+    except (TypeError, ValueError):
+        configured_max_tokens = 0
+    if configured_max_tokens < 0:
+        configured_max_tokens = 0
 
     def _on_event(kind: str, payload) -> None:
         data = dict(payload) if isinstance(payload, dict) else {"payload": payload}
@@ -1661,6 +1668,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             # reads options project_dir/project_path/workspace_dir for its
             # project-memory lookup).
             options={"project_dir": project_root} if project_root else None,
+            max_tokens=configured_max_tokens or None,
             history=_history(),
             attachments=_attachments(),
         )

@@ -45,8 +45,11 @@ def tier_tools_slot(tier: str | None) -> tuple[int, bool]:
     """
     if tier:
         try:
-            from services.agent.tiers import load_tier  # noqa: PLC0415
-            profile = load_tier(tier)
+            from services.agent.tiers import (  # noqa: PLC0415
+                effort_tier_for,
+                load_tier,
+            )
+            profile = load_tier(effort_tier_for(tier) or tier)
         except Exception:  # noqa: BLE001 — an unknown tier name is not fatal
             pass
         else:
@@ -229,6 +232,7 @@ def render_tools_block(
             # (description) and the tier's schema_trim dial.
             use_trim = trim
             note = ""
+            defaults: dict[str, Any] = {}
             try:
                 from services.agent.config import get_tool_options  # noqa: PLC0415
                 opts = get_tool_options(None, tool) or {}
@@ -240,11 +244,21 @@ def render_tools_block(
                 if st is not None:
                     use_trim = bool(st)
                 note = (opts.get("prompt_note") or "").strip()
+                defaults = dict(opts.get("param_defaults") or {})
             except Exception:  # noqa: BLE001
                 pass
             desc = _description_line(schema["description"], trim=use_trim)
             head = f"- {schema['signature']}"
-            tail = f"\n    Note: {note}" if note else ""
+            default_note = ""
+            if defaults:
+                rendered_defaults = ", ".join(
+                    f"{key}={value!r}" for key, value in sorted(defaults.items())
+                )
+                default_note = (
+                    f"\n    Effective defaults when omitted: {rendered_defaults}."
+                )
+            prompt_note = f"\n    Note: {note}" if note else ""
+            tail = default_note + prompt_note
             entry = head + (f"\n    {desc}" if desc else "") + tail
             body = (schema["description"] or "").strip()
             block = _description_block(body) if body else ""

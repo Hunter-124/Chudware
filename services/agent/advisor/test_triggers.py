@@ -185,15 +185,16 @@ def test_ledger_event_matched_is_string():
 # 5. Tool-name trigger fires
 # ---------------------------------------------------------------------------
 
-def test_tool_name_trigger_fires():
-    """bearing_seat trigger matches part_search tool name."""
-    items, events = triggers.match_triggers(
-        output_text="",                    # no keywords — tool match only
+def test_tool_name_trigger_fires_only_relevant_pack():
+    """Generic sourcing tools must not pull domain-specific bearing guidance."""
+    _, events = triggers.match_triggers(
+        output_text="",
         tool_names=["part_search"],
         cooldown_state=_fresh_state(),
     )
-    trigger_ids = {e["trigger_id"] for e in events}
-    assert "bearing_seat" in trigger_ids, f"bearing_seat not fired by tool: {trigger_ids}"
+    trigger_ids = {event["trigger_id"] for event in events}
+    assert "part_sourcing" in trigger_ids, trigger_ids
+    assert "bearing_seat" not in trigger_ids, trigger_ids
 
 
 # ---------------------------------------------------------------------------
@@ -372,10 +373,36 @@ def test_plain_3d_printing_does_not_pull_the_reveng_pack():
 
 
 @pytest.mark.parametrize("text", [
+    "Run a security scan on the firmware project.",
+    "Find the TPS62840 datasheet and summarize its voltage limits.",
+])
+def test_unrelated_scan_and_datasheet_do_not_pull_reveng(text):
+    assert "reveng_flow" not in _fired(text), _fired(text)
+
+
+def test_mold_release_angle_does_not_pull_plm():
+    text = "Add a 2 degree release angle to the molded face."
+    assert "molded_draft" in _fired(text), _fired(text)
+    assert "plm_flow" not in _fired(text), _fired(text)
+
+
+def test_generic_part_search_does_not_pull_bearing_fits():
+    _, events = triggers.match_triggers(
+        output_text="Find M6 screws for the cover.",
+        tool_names=["part_search"],
+        cooldown_state=_fresh_state(),
+    )
+    fired = {event["trigger_id"] for event in events}
+    assert "bearing_seat" not in fired, fired
+
+
+@pytest.mark.parametrize("text", [
     "scan this bracket and 3d print a replacement",
     "3d print a copy of the existing housing",
     "reverse engineer this part",
     "measure it with calipers and rebuild the model",
+    "scan this bracket and rebuild it",
+    "extract the bracket dimensions from its datasheet",
 ])
 def test_genuine_reverse_engineering_still_fires(text):
     """Narrowing the keyword must not cost real recall."""
@@ -454,6 +481,33 @@ def test_trigger_budget_caps_prefix_pack_and_exemplar():
     event = next(e for e in events if e["trigger_id"] == "dfm_pre_op")
     assert len(item["finding"]) <= row["budget_tokens"] * triggers._CHARS_PER_TOKEN
     assert event["tokens"] <= row["budget_tokens"]
+
+def test_new_user_pack_is_visible_after_absent_directory_was_cached(
+    tmp_path, monkeypatch,
+):
+    context_dir = tmp_path / "context_injection"
+    monkeypatch.setenv("CHUDWARE_CONTEXT_INJECTION_DIR", str(context_dir))
+    triggers.clear_cache()
+
+    first, _ = triggers.match_triggers(
+        output_text="design for manufacturability review",
+        cooldown_state=_fresh_state(),
+    )
+    assert not any("USER PACK OVERRIDE" in item.get("finding", "") for item in first)
+
+    packs_dir = context_dir / "packs"
+    packs_dir.mkdir(parents=True)
+    (packs_dir / "dfm_pre_op.md").write_text(
+        "USER PACK OVERRIDE\nRun the local factory check.",
+        encoding="utf-8",
+    )
+
+    second, _ = triggers.match_triggers(
+        output_text="design for manufacturability review",
+        cooldown_state=_fresh_state(),
+    )
+    assert any("USER PACK OVERRIDE" in item.get("finding", "") for item in second)
+    triggers.clear_cache()
 
 
 @pytest.mark.parametrize(("text", "nominal"), [

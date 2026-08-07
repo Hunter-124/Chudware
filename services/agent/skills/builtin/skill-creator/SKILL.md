@@ -1,6 +1,6 @@
 ---
 name: skill-creator
-description: Author a new copilot skill folder — frontmatter, triggers, progressive disclosure, user-dir save via skills_save, and validation checklist.
+description: Author a project-local copilot skill folder with valid frontmatter, precise triggers, progressive disclosure, and an activation checklist.
 inject: manual
 triggers:
   keywords: [create a skill, author skill, new skill, write a skill]
@@ -14,9 +14,10 @@ Skills are folders: `<root>/<name>/SKILL.md` with YAML frontmatter + markdown bo
 
 ## Locations (precedence)
 
-1. Project: `.chudware/skills/<name>/SKILL.md`
-2. User: `~/.local/share/Chudware/skills/<name>/SKILL.md` (writable via `skills_save`)
-3. Builtin: `services/agent/skills/builtin/<name>/SKILL.md` (shipped)
+1. Project: `.chudware/skills/<name>/SKILL.md` — the agent-writable surface.
+2. User: `~/.local/share/Chudware/skills/<name>/SKILL.md` — managed by the
+   Settings Skills editor, not by an agent tool.
+3. Builtin: `services/agent/skills/builtin/<name>/SKILL.md` — shipped.
 
 ## Frontmatter (required)
 
@@ -43,8 +44,9 @@ roles: []               # optional allowlist
 ## Save / test
 
 1. Draft full `SKILL.md` text (frontmatter + body).
-2. User-dir write: RPC `skills_save {name, body}` or write files under the user skills dir.
-3. Confirm: `skills_list` shows it; `/skill:my-skill` activates; `skill://my-skill` resolves.
+2. Write `.chudware/skills/<name>/SKILL.md` under the active project with
+   `fs_write`; do not claim access to the Settings-only user skill RPCs.
+3. Confirm `/skill:my-skill` activates and the catalog includes the metadata.
 4. For auto skills: fire a keyword once, confirm no double-inject until compaction.
 
 ## Checklist

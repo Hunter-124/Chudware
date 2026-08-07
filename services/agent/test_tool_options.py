@@ -148,6 +148,90 @@ class TestDispatchOptions(unittest.TestCase):
             at._dispatch_tool("t", {"b": 9, "c": 3})
         self.assertEqual(seen, {"a": 1, "b": 9, "c": 3})
 
+    def test_mission_scoped_handler_obeys_disabled_option(self):
+        from services.agent import agent_turn as at
+
+        called = []
+
+        class _Mission:
+            @staticmethod
+            def resolve(name):
+                if name == "mission_tool":
+                    return lambda **kwargs: called.append(kwargs) or {"ok": True}
+                return None
+
+        class _Provider:
+            name = "scripted"
+
+            @staticmethod
+            def complete(system, messages, max_tokens=8000):
+                return '{"tool":"mission_tool","args":{}}'
+
+        opts = {
+            "enabled": False,
+            "timeout_s": None,
+            "max_calls_per_turn": None,
+            "param_defaults": {},
+            "prompt_note": "",
+        }
+        with mock.patch(
+            "services.agent.config.get_tool_options", return_value=opts
+        ):
+            result = at.run_turn(
+                "run it",
+                _Provider(),
+                allowed_tools=["mission_tool"],
+                max_tool_calls=1,
+                mission_dispatch=_Mission(),
+            )
+
+        self.assertEqual(called, [])
+        self.assertFalse(result.result["calls"][0]["ok"])
+        self.assertIn("disabled", str(result.result["calls"][0]["result"]).lower())
+
+    def test_mission_scoped_handler_receives_effective_defaults(self):
+        from services.agent import agent_turn as at
+
+        seen = {}
+
+        class _Mission:
+            @staticmethod
+            def resolve(name):
+                if name == "office_read_csv":
+                    return lambda **kwargs: seen.update(kwargs) or {"ok": True}
+                return None
+
+        class _Provider:
+            name = "scripted"
+
+            def __init__(self):
+                self.replies = [
+                    '{"tool":"office_read_csv","args":{"path":"bom.csv"}}',
+                    '{"done":true,"handoff":{"summary":"read"}}',
+                ]
+
+            def complete(self, system, messages, max_tokens=8000):
+                return self.replies.pop(0)
+
+        opts = {
+            "enabled": True,
+            "timeout_s": None,
+            "max_calls_per_turn": None,
+            "param_defaults": {"limit": 500},
+            "prompt_note": "",
+        }
+        with mock.patch(
+            "services.agent.config.get_tool_options", return_value=opts
+        ):
+            at.run_turn(
+                "read the csv",
+                _Provider(),
+                allowed_tools=["office_read_csv"],
+                mission_dispatch=_Mission(),
+            )
+
+        self.assertEqual(seen, {"path": "bom.csv", "limit": 500})
+
     def test_max_calls_per_turn(self):
         from services.agent import agent_turn as at
 
@@ -218,6 +302,32 @@ class TestPromptNote(unittest.TestCase):
                 include_category_menu=False,
             )
         self.assertIn("Note: Sanity-check fixtures first.", text)
+
+    def test_render_includes_effective_param_defaults(self):
+        from services.agent import tool_schemas as ts
+
+        def dummy(path: str, limit: int = 0):
+            """Read rows from a CSV."""
+            return {"path": path, "limit": limit}
+
+        cfg_opts = {
+            "enabled": True,
+            "timeout_s": None,
+            "max_calls_per_turn": None,
+            "param_defaults": {"limit": 500},
+            "prompt_note": "",
+        }
+        with mock.patch(
+            "services.agent.config.get_tool_options", return_value=cfg_opts
+        ):
+            text, _ = ts.render_tools_block(
+                ["office_read_csv"],
+                resolver=lambda name: dummy if name == "office_read_csv" else None,
+                budget_tokens=2000,
+                include_category_menu=False,
+            )
+
+        self.assertIn("Effective defaults when omitted: limit=500.", text)
 
     def test_description_override_in_tools_block(self):
         from services.agent import tool_schemas as ts

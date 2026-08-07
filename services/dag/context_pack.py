@@ -12,6 +12,7 @@ A context pack is a compact dict containing ONLY what the node needs:
   - node_id:          the node's id
   - node_type:        the node type
   - node_name:        the human-readable name
+  - phase:            optional phase/stage used by skill and budget policy
 
 Deliberately excludes full conversation history. The agent only sees what's
 in the context pack — history isolation is the whole point.
@@ -75,7 +76,7 @@ def assemble(
 
     Returns:
         A flat dict with keys:
-          node_id, node_type, node_name,
+          node_id, node_type, node_name, phase,
           node_inputs, allowed_tools, retry_remaining,
           end_condition, part_description (str or None).
     """
@@ -96,6 +97,11 @@ def assemble(
 
     # End condition hint (passed to the agent system prompt).
     end_condition: Optional[str] = node.get("end_condition")
+    phase = (
+        node.get("phase")
+        or node_inputs.get("phase")
+        or node_inputs.get("stage")
+    )
 
     # GSL part description — only fetched when the node specifies a doc_id and
     # a describe function is available.
@@ -118,6 +124,7 @@ def assemble(
         "allowed_tools": allowed_tools,
         "retry_remaining": retry_remaining,
         "end_condition": end_condition,
+        "phase": phase,
         "part_description": part_description,
     }
     # mega-7: promote difficulty routing fields to the pack root so

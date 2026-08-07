@@ -82,7 +82,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"\bbearing\b", r"\bbearing seat\b", r"\bbore.*press",
                 r"\binner race\b", r"\bouter race\b", r"\bshaft seat\b",
             ],
-            "tools": ["part_search", "part_place"],
+            "tools": [],
             "events": [],
         },
         "inject": {
@@ -473,7 +473,8 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "reveng_flow",
         "match": {
             "keywords": [
-                r"reverse.engineer", r"\bscan\b", r"\bscan\b.*\b(part|to cad)\b",
+                r"reverse[ -]?engineer",
+                r"\bscan\b.*\b(part|bracket|housing|component|to cad)\b",
                 r"\bpoint cloud\b", r"\bmesh\b.*\b(part|model)", r"\bphotogrammetry\b",
                 r"\bwebcam\b", r"\bcaliper\b", r"\bcalipers\b", r"\breplacement part\b",
                 r"\bcopy\b.*\b(part|bracket)\b",
@@ -485,7 +486,11 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 # matching the co-occurrence idiom the neighbouring keys already use.
                 r"\b(scan|copy|replicate|duplicate|replacement|reproduce)\b.*3d print",
                 r"3d print.*\b(scan|copy|replica|replacement|existing)\b",
-                r"\bSTEP\b.*\bimport|import.*\bSTEP\b", r"\bdatasheet\b",
+                r"\bSTEP\b.*\bimport|import.*\bSTEP\b",
+                # A generic electronics datasheet is not reverse-engineering
+                # context. Require geometric extraction language in either order.
+                r"\bdatasheet\b.*\b(dimensions?|drawing|geometry|profile|outline)\b",
+                r"\b(dimensions?|drawing|geometry|profile|outline)\b.*\bdatasheet\b",
             ],
             "tools": [
                 "reverse_engineer", "compare_parts", "reveng_status",
@@ -512,7 +517,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "id": "plm_flow",
         "match": {
             "keywords": [
-                r"\bcheckpoint\b", r"\brelease\b", r"\brevision\b",
+                r"\bcheckpoint\b", r"\brevision\b",
                 r"\bwhere[ -]used\b", r"\brollback\b", r"\bchange order\b",
                 r"\bitem master\b",
             ],
@@ -642,15 +647,12 @@ def _path_mtime(path: pathlib.Path) -> float:
 def _packs_dir_mtime() -> float:
     """Max mtime over the user packs dir (0 if absent).
 
-    The common install never has user packs; once this is observed absent or
-    empty, that fact is cached for the process lifetime (until
-    :func:`clear_cache`) so the hot ``match_triggers`` path skips the
-    per-call stat/iterdir entirely (zero-cost no-match path, see module
-    docstring).
+    The directory is restatted on every cache-freshness check. User packs are
+    written by a different process, so caching an observed absent/empty directory
+    for this process's lifetime makes newly created packs invisible until restart.
+    One directory stat preserves cross-process freshness without IPC.
     """
     global _PACKS_DIR_EMPTY
-    if _PACKS_DIR_EMPTY:
-        return 0.0
     d = user_packs_dir()
     if not d.is_dir():
         _PACKS_DIR_EMPTY = True
@@ -658,17 +660,15 @@ def _packs_dir_mtime() -> float:
     latest = _path_mtime(d)
     saw_entry = False
     try:
-        for p in d.iterdir():
+        for path in d.iterdir():
             saw_entry = True
             try:
-                latest = max(latest, p.stat().st_mtime)
+                latest = max(latest, path.stat().st_mtime)
             except OSError:
                 pass
     except OSError:
         pass
-    if not saw_entry:
-        _PACKS_DIR_EMPTY = True
-        return 0.0
+    _PACKS_DIR_EMPTY = not saw_entry
     return latest
 
 
@@ -969,10 +969,9 @@ def _load_pack(pack_name: str, budget_tokens: int) -> str:
     if not pack_name:
         return ""
     pack_path = _PACKS_DIR / f"{pack_name}.md"
-    if not _PACKS_DIR_EMPTY:
-        user_path = user_packs_dir() / f"{pack_name}.md"
-        if user_path.is_file():
-            pack_path = user_path
+    user_path = user_packs_dir() / f"{pack_name}.md"
+    if user_path.is_file():
+        pack_path = user_path
     text = _read_pack_cached(pack_path)
     if text is None:
         return f"[context pack '{pack_name}' not found]"

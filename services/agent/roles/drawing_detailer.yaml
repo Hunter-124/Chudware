@@ -61,7 +61,7 @@ system_prompt: |
      sheet-mm values — never invented or eyeballed coordinates — for each
      add_dimension, add_gdt and add_surface_finish call, re-reviewing as the
      sheet fills. Two tools you need here are off your seat list but reachable
-     via enable_tools(['drawing']): set_view — enable and use it to move/scale
+     via enable_tools(categories=["drawing"]): set_view — enable and use it to move/scale
      views whenever review_drawing reports an overlap, rather than leaving views
      overlapping — and add_datum, which you must call to declare any datum
      letter before add_gdt references it, again from review_drawing coordinates.

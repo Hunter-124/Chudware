@@ -436,23 +436,26 @@ def test_leaf_envelope_salvages_truncated_ops_json():
     assert env2["no_op"] is True
 
 
-def test_leaf_oneshot_success_skips_tool_loop(monkeypatch):
-    from services.agent import role_models as rm
+def test_reviewer_leaf_never_uses_no_tool_oneshot(monkeypatch):
     from services.dag import node_runner as nr
 
-    rm.reset_leaf_miss_count()
     monkeypatch.setenv("CHUDWARE_LEAF_ONESHOT", "1")
 
     class _Prov:
         name = "ollama"
         model = "llama3.2:latest"
 
+        def __init__(self):
+            self.calls = 0
+
         def complete(self, system, messages, max_tokens=800):
+            self.calls += 1
             return (
                 '{"goal":"verify leaf","no_op":true,'
                 '"reason":"nothing to check"}'
             )
 
+    provider = _Prov()
     node = {
         "id": "n_verify_DL1",
         "type": "verify",
@@ -472,24 +475,30 @@ def test_leaf_oneshot_success_skips_tool_loop(monkeypatch):
         "node_name": "VERIFY DL1",
     }
 
-    # Inject provider by short-circuiting _resolve_provider.
-    monkeypatch.setattr(nr, "_resolve_provider", lambda cp, p=None: _Prov())
-    # Ensure agent_turn.run_turn is NOT called.
+    monkeypatch.setattr(nr, "_resolve_provider", lambda cp, p=None: provider)
     called = {"turn": 0}
 
-    def _boom(*a, **k):
+    class _ToolLoopResult:
+        success = True
+        stop_reason = "confirmed"
+        final_code = None
+        result = {
+            "handoff": {"status": "done", "summary": "verified with tools"},
+            "calls": [{"tool": "verify_battery", "ok": True}],
+        }
+
+    def _tool_loop(*args, **kwargs):
         called["turn"] += 1
-        raise AssertionError("tool loop should not run on oneshot success")
+        assert "verify_battery" in kwargs["allowed_tools"]
+        return _ToolLoopResult()
 
-    monkeypatch.setattr("services.agent.agent_turn.run_turn", _boom)
-
+    monkeypatch.setattr("services.agent.agent_turn.run_turn", _tool_loop)
     verdict, out = nr.run(node, pack, agent_fn=None)
-    # make_default path uses _default_agent_fn when agent_fn is None — but
-    # run() uses agent_fn or _default_agent_fn. agent_fn=None → _default_agent_fn.
-    assert called["turn"] == 0
+
+    assert called["turn"] == 1
+    assert provider.calls == 0
     assert verdict == nr.VERDICT_DONE, (verdict, out)
-    assert (out["data"].get("agent_result") or {}).get("one_shot") is True
-    assert rm.leaf_miss_count() == 0
+    assert not (out["data"].get("agent_result") or {}).get("one_shot")
 
 
 def test_leaf_oneshot_miss_increments_and_falls_back(monkeypatch):

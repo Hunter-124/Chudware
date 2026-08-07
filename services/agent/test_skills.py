@@ -35,7 +35,8 @@ def skill_roots(tmp_path, monkeypatch):
 
 
 def _write_skill(root: Path, name: str, description: str, *, inject: str = "manual",
-                 keywords=None, tools=None, phases=None, extra_body: str = "Body.\n") -> Path:
+                 keywords=None, tools=None, phases=None, roles=None,
+                 extra_body: str = "Body.\n") -> Path:
     d = root / name
     d.mkdir(parents=True, exist_ok=True)
     triggers = ""
@@ -47,12 +48,14 @@ def _write_skill(root: Path, name: str, description: str, *, inject: str = "manu
             triggers += "  tools: [" + ", ".join(tools) + "]\n"
         if phases:
             triggers += "  phases: [" + ", ".join(phases) + "]\n"
+    roles_line = "roles: [" + ", ".join(roles or []) + "]\n" if roles else ""
     text = (
         f"---\n"
         f"name: {name}\n"
         f"description: {description}\n"
         f"inject: {inject}\n"
         f"{triggers}"
+        f"{roles_line}"
         f"---\n\n"
         f"# {name}\n\n{extra_body}"
     )
@@ -84,6 +87,14 @@ def test_discover_builtins_from_repo():
     # skills_list shape
     listing = sk.list_skills()
     assert len([e for e in listing if e["name"] in expected]) == len(expected)
+
+
+def test_skill_creator_teaches_only_agent_reachable_write_surface():
+    creator = sk.get_skill("skill-creator")
+    assert creator is not None
+    assert "fs_write" in creator.body
+    assert "skills_save" not in creator.body
+    assert "skills_list" not in creator.body
 
 
 def test_precedence_project_over_user_over_builtin(skill_roots):
@@ -166,6 +177,30 @@ def test_tool_and_phase_triggers(skill_roots):
     sk.clear_cache()
     sk.reset_session("t3")
     assert sk.activate_for_prompt("manual-only-kw please", session_id="t3") == []
+
+def test_role_allowlist_is_enforced_for_auto_and_explicit_activation(skill_roots):
+    _write_skill(
+        skill_roots["builtin"],
+        "review-only",
+        "reviewer guidance",
+        inject="auto",
+        keywords=["prove criteria"],
+        roles=["reviewer"],
+        extra_body="REVIEW ONLY BODY\n",
+    )
+
+    sk.reset_session("role-gate")
+    assert sk.activate_for_prompt(
+        "prove criteria", session_id="role-gate", role="feature_modeler"
+    ) == []
+    assert sk.activate_for_prompt(
+        "/review-only", session_id="role-gate", role="feature_modeler"
+    ) == []
+    bodies = sk.activate_for_prompt(
+        "prove criteria", session_id="role-gate", role="reviewer"
+    )
+    assert len(bodies) == 1
+    assert "REVIEW ONLY BODY" in bodies[0]
 
 
 # --------------------------------------------------------------------------- slash resolution

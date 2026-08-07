@@ -6795,3 +6795,31 @@ rechecked. The standard-parts benchmark indexed 3,184 records in 61.8 ms cold / 
 searched in 0.66 ms mean with MRR 1.0 and 20/20 hits, and the isolated browser/parts gate passed
 801 tests with 81 live-only skips. A real nine-vendor bearing search painted results in 4.4 s cold
 and 52.6 ms warm, while the Parts Library headless workspace smoke produced a 1340x838 capture.
+## 2026-08-07 — harness policy audit: one effective prompt, grant, and child-lane contract
+
+A parallel read-only audit of rules, skills, prompts, dispatch, budgets, guardrails, and
+lifecycle seams found several cross-layer contracts that were individually plausible but
+collectively false. Explicit `tools: []` collapsed into unrestricted access; DAG children
+received the main shell floor while missing their read/glob/grep floor and child identity;
+mission-local handlers bypassed per-tool disable/default/timeout policy; tools were rendered
+before their final meta grants; Settings' output-token and system-prompt controls were dead on
+the online lane; mission and native prompts with the same id overwrote one shared override
+file; and blocked/escalated role handoffs were reported as confirmed success.
+
+The runtime now preserves `None` versus `[]`, assembles lane-specific floors before both schema
+rendering and dispatch, routes every handler through `_dispatch_tool`, validates
+`enable_tools(categories=[...])`, advertises effective parameter defaults, normalizes child
+tier/capability policy, and maps reviewer/model seats through one helper. Live, preview, and
+prompt-cache assembly share the main-chat loadout and effective global/role prompt. Mission
+overrides use `<id>.mission.md`; native C++ keeps `<id>.md`. Task-list Require blocks the first
+non-task-list call while Encourage remains a later nudge, and role/phase skill allowlists now
+reach both initial and tool-trigger activation. Trigger rules were narrowed for security
+scans, electronics datasheets, mold release angles, and generic part search; newly created
+user context packs are detected without process restart.
+
+Regression coverage exercises main/delegate/DAG grant parity, explicit-empty denial, final
+tool schemas, per-tool mission policy, malformed category calls, blocked/escalated verdicts,
+reviewer no-tool-one-shot refusal, prompt override isolation, global prompt/output settings,
+skill role gates, cross-process pack creation, and xAI/OpenRouter tier normalization. The
+focused contract gate passed 317 tests; an actual prompt-preview smoke rendered 24 effective
+tools in 22,660 characters with no fictional ledger/stage blocks.

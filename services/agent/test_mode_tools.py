@@ -52,6 +52,12 @@ class TestRoleForCopilotMode:
             role = rm.role_for_copilot_mode(mode)
             assert role in rm.KNOWN_ROLES
 
+    def test_mission_role_mapping_is_shared_across_child_lanes(self):
+        assert rm.harness_role_for_mission_role("reviewer") == "vision"
+        assert rm.harness_role_for_mission_role("advisor") == "advisor"
+        assert rm.harness_role_for_mission_role("overseer") == "planning"
+        assert rm.harness_role_for_mission_role("feature_modeler") == "task"
+
 
 # ---------------------------------------------------------------------------
 # tools_for_mode / apply_mode_tools
@@ -203,6 +209,17 @@ class TestModeToolAllowlists:
                      "import_part", "export_part"):
             assert tool not in out, (tool, out)
 
+
+    def test_agent_explicit_empty_is_restricted_and_lane_specific(self):
+        main = cmt.apply_mode_tools("agent", [])
+        child = cmt.apply_mode_tools("agent", [], subagent=True)
+
+        assert main == sorted(cmt.AGENT_DEFAULT_TOOLS)
+        assert child == sorted(cmt.SUBAGENT_DEFAULT_TOOLS)
+        assert "run_shell" in main
+        assert "run_shell" not in child
+        for name in ("fs_read", "fs_glob", "fs_grep"):
+            assert name in child
     def test_swarm_unrestricted_or_unions_extras(self):
         assert cmt.tools_for_mode("swarm") is None
         assert cmt.apply_mode_tools("swarm", None) is None

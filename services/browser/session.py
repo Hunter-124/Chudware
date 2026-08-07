@@ -9,7 +9,7 @@ imports Playwright directly:
   (:mod:`services.browser.profiles`) and is LOCAL ONLY — never synced, never
   uploaded, never read by this module into logs or metadata.
 - :func:`browser_fetch` — loads a URL HEADLESS under the user's saved session
-  in our OWN CEF Chromium (:mod:`.cef_client` → the ``Chudware --cef-daemon``
+  in our OWN CEF Chromium (:mod:`.cef_client` → the ``chudware --cef-daemon``
   host), rate-limited per site (:mod:`services.browser.ratelimit`). Returns
   rendered HTML. Driving CEF through its native C++ API leaves no CDP
   ``Runtime.enable`` handshake, so the automation-protocol fingerprint that bot

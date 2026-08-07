@@ -1,7 +1,7 @@
 # services/browser — user-authenticated headless-browser acquisition
 
 Headless production fetch/download uses the host **CEF daemon**
-(`cef_client.py` → `Chudware --cef-daemon`). Residual Playwright-compatible
+(`cef_client.py` → `chudware --cef-daemon`). Residual Playwright-compatible
 surfaces (headed CLI login, embed, cookie export) go through
 `services/browser/driver.py`, selected by env:
 

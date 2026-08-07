@@ -1,7 +1,7 @@
 """services/browser/cef_client.py — Python client for the CEF host daemon.
 
 The headless replacement for Playwright: instead of launching Playwright Chromium,
-we drive our OWN CEF Chromium (``Chudware --cef-daemon``) over a local socket. CEF is
+we drive our OWN CEF Chromium (``chudware --cef-daemon``) over a local socket. CEF is
 driven through its native C++ API, so there is no CDP ``Runtime.enable`` handshake —
 the automation-protocol fingerprint that bot gates key on is absent (the whole
 reason for the migration; see the plan + services/browser/cef_headless.cpp).
@@ -51,10 +51,10 @@ def _fnv1a64_hex(s: str) -> str:
 
 
 def resolve_cef_bin() -> Optional[Path]:
-    """Locate the Chudware host binary that hosts CEF. env → dist → build dirs."""
+    """Locate the lowercase Chudware host binary that hosts CEF. env → dist → build dirs."""
     if p := os.environ.get("CHUDWARE_BIN"):
         return Path(p)
-    exe = "Chudware.exe" if sys.platform == "win32" else "Chudware"
+    exe = "chudware.exe" if sys.platform == "win32" else "chudware"
     root = _repo_root()
     for cand in (
         Path(os.environ.get("CHUDWARE_DIST") or "nonexistent") / exe,
@@ -120,7 +120,7 @@ class CefDaemon:
                 if not spawned:
                     if not cef_bin:
                         raise CefDaemonError(
-                            "Chudware binary not found (set CHUDWARE_BIN or build host with CEF)"
+                            "chudware binary not found (set CHUDWARE_BIN or build host with CEF)"
                         ) from e
                     _spawn_daemon_detached(cef_bin, sock_path, self._idle_s)
                     spawned = True

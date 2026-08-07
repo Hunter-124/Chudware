@@ -1,6 +1,7 @@
 """Unit tests for services.browser.cef_client's pure resolution helpers (no daemon)."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from services.browser import cef_client
@@ -16,6 +17,18 @@ def test_fnv1a64_is_stable_and_hex():
 def test_resolve_cef_bin_env_override(monkeypatch):
     monkeypatch.setenv("CHUDWARE_BIN", "/custom/Chudware")
     assert cef_client.resolve_cef_bin() == Path("/custom/Chudware")
+
+
+def test_resolve_cef_bin_finds_canonical_lowercase_build(monkeypatch, tmp_path):
+    monkeypatch.delenv("CHUDWARE_BIN", raising=False)
+    monkeypatch.delenv("CHUDWARE_DIST", raising=False)
+    monkeypatch.setattr(cef_client, "_repo_root", lambda: tmp_path)
+    exe = "chudware.exe" if sys.platform == "win32" else "chudware"
+    built = tmp_path / "host" / "build-linux" / "bin" / exe
+    built.parent.mkdir(parents=True)
+    built.touch()
+
+    assert cef_client.resolve_cef_bin() == built
 
 
 def test_socket_path_env_override_wins(monkeypatch):

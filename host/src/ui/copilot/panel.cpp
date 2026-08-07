@@ -1535,12 +1535,20 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
         // Settings / Sessions / Tasks / Artifacts overlays replace the chat log (and hide the
         // composer) while open. They are mutually exclusive (the header toggles clear the
-        // others) and a click outside the Copilot column dismisses them.
+        // others) and the ONLY way out is the header strip: the tab you are on, or Chat.
+        //
+        // There used to be a "a click outside the column dismisses them" rule here, keyed on
+        // `IsMouseClicked(Left) && !IsWindowHovered(ChildWindows)`. It fired on the MOUSE-DOWN
+        // frame of a click on the tab pill itself: IsWindowHovered() returns false whenever any
+        // item is active (imgui.cpp, the `g.ActiveId != 0 && !g.ActiveIdAllowOverlap` bail) or a
+        // popup is blocking, and the header's own hit zone had just taken ActiveId two hundred
+        // lines above. So pressing "Settings" while on Settings dismissed to Chat, and the pill's
+        // release then toggled Chat -> Settings straight back: the view flicked to the
+        // conversation under the finger and snapped back on release (reproduced live, 2026-08-06).
+        // No hover flag expresses "outside": the pointer is literally inside the column in every
+        // one of those cases. This is a radio TAB strip, not a popover — tabs stay put until you
+        // pick another one.
         const bool overlayOpen = cpActiveTab(st) != CpTab::Chat;
-        if (overlayOpen && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-            !ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
-            cpSetTab(st, CpTab::Chat);
-        }
         static float s_composerH = 0.0f;
         const float bottomClearance = ui::metrics::U(2);
         float reserve = 0.0f;

@@ -13,9 +13,8 @@ Honest limits:
   and NOT freely published — those degrade to a clear ``ok:false`` reason
   (copyright_blocked), NOT login_required (there is no login to offer).
 
-NOTE: the portal is CN-language + JS-heavy; the hcno extraction / PDF markers
-below are a v1 best-effort shape, not verified against a live openstd session
-(T-X6 gates the real per-source integration tests behind an env flag).
+Live-verified 2026-08-07: result rows invoke ``showInfo('<hcno>')`` and carry
+the GB number and Chinese title in separate cells.
 """
 from __future__ import annotations
 
@@ -37,9 +36,12 @@ LICENSE_NOTE = (
     "contracts/license_debt.md."
 )
 
-# Best-effort: result rows carry an onclick/href with the hex hcno token + a title.
+# Current result rows carry the hcno token in ``showInfo(...)`` and put the GB
+# number and descriptive title in separate cells.
 _RESULT_RE = re.compile(
-    r'newGbInfo\?hcno=(?P<hcno>[0-9A-Fa-f]+)["\'][^>]*>(?P<title>.*?)</a>',
+    r'onclick="showInfo\([\'"](?P<hcno>[0-9A-Fa-f]+)[\'"]\);?"[^>]*>'
+    r'(?P<number>.*?)</a>.*?'
+    r'<td[^>]*class="[^"]*mytxt[^"]*"[^>]*>.*?<a[^>]*>(?P<title>.*?)</a>',
     re.IGNORECASE | re.DOTALL)
 # Best-effort: GB number appears near the row (e.g. "GB/T 197-2018").
 _GBNO_RE = re.compile(r'(GB(?:/T|/Z)?\s*\d+(?:\.\d+)?(?:-\d+)?)', re.IGNORECASE)
@@ -64,8 +66,10 @@ class GbStandardsAdapter:
         content = result.get("content", "")
         hits = []
         for m in _RESULT_RE.finditer(content):
-            title = _strip_tags(m.group("title"))
-            gb_match = _GBNO_RE.search(title)
+            number = _strip_tags(m.group("number"))
+            name = _strip_tags(m.group("title"))
+            title = f"{number} — {name}" if name else number
+            gb_match = _GBNO_RE.search(number)
             hits.append({
                 "title": title,
                 "url": DETAIL_URL_TMPL.format(hcno=m.group("hcno")),

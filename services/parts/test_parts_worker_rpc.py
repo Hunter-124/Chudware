@@ -349,6 +349,73 @@ class TestVendorResultCache:
         assert gui_rpc._vendor_cache_get("mcmaster", "definitely-absent", 20) == []
 
 
+class TestLiveVendorConcurrency:
+    def test_vendor_fetches_respect_cef_concurrency_budget(self, monkeypatch):
+        import threading
+        import time
+
+        from services.parts import gui_rpc
+
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def fake_inner(*_args):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+
+        monkeypatch.setattr(gui_rpc, "_live_fetch_slots", threading.BoundedSemaphore(3))
+        monkeypatch.setattr(gui_rpc, "_run_live_site_inner", fake_inner)
+        threads = [
+            threading.Thread(target=gui_rpc._run_live_site, args=(str(i), {}, 1, {}, {}))
+            for i in range(9)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert max_active == gui_rpc._LIVE_FETCH_CONCURRENCY == 3
+
+    def test_vendor_failure_is_attributed_and_marked_error(self, monkeypatch):
+        from services import parts
+        from services.parts import gui_rpc
+
+        monkeypatch.setattr(gui_rpc, "_vendor_cache_get", lambda *_args: None)
+        monkeypatch.setattr(gui_rpc, "_vendor_cache_put", lambda *_args: None)
+        monkeypatch.setattr(
+            parts,
+            "search",
+            lambda *_args, **_kwargs: [
+                {"ok": False, "reason": "bot_walled", "hint": "HTTP 403"}
+            ],
+        )
+        job = {
+            "results": [],
+            "notices": [],
+            "seen_ids": set(),
+            "seen_notices": set(),
+            "pending": 1,
+            "done": False,
+            "cancelled": False,
+            "vendors": {"grainger": {"site": "grainger", "status": "queued"}},
+        }
+
+        gui_rpc._run_live_site_inner(
+            "grainger", {"vendor_query": "bearing", "facet_defs": []}, 20, {}, job
+        )
+
+        assert job["done"] is True
+        assert job["vendors"]["grainger"]["status"] == "error"
+        assert job["notices"] == [
+            {"site": "grainger", "reason": "bot_walled", "hint": "HTTP 403"}
+        ]
+
 class TestDomainListSearch:
     """Parts Library V2: PartsIndex/hub accept domain as a list (SQL IN)."""
 

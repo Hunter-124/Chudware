@@ -456,15 +456,19 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
 
 # ---- streaming live vendor search -------------------------------------------------
 #
-# The live fan-out scrapes each vendor through the CEF session (seconds per site).
 # Rather than block the search RPC on the slowest vendor, the GUI kicks off a job
-# here that fans out across the category's fitting vendors IN PARALLEL (one thread
-# per site — each site has its own profile lock + rate limit, so cross-site calls
-# are safe) and polls for results as each vendor lands.
+# here and polls for results as each vendor lands. Fetches are bounded three-wide:
+# cross-site profile locks and rate limits remain independent, while the shared CEF
+# renderer stays below the concurrency at which navigation deadlines became flaky.
 
 _live_jobs: dict[str, dict] = {}
 _live_lock = threading.Lock()
 _LIVE_JOB_CAP = 8  # keep the most-recent N jobs; drop stale tokens
+# Six simultaneous CEF navigations regularly miss the native 10 s navigation
+# deadline on ordinary supplier pages. Three completed every probe in the live
+# vendor sweep and prevents rapid searches from creating an unbounded fetch fanout.
+_LIVE_FETCH_CONCURRENCY = 3
+_live_fetch_slots = threading.BoundedSemaphore(_LIVE_FETCH_CONCURRENCY)
 
 # ---- live vendor result cache -----------------------------------------------------
 #
@@ -674,7 +678,7 @@ def vendor_cache_purge(site: str | None = None) -> int:
         return 0
 
 
-def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
+def _run_live_site_inner(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
     from services.parts import search as _search
     # Cache probe first (cheap, off-lock): a hit skips the scrape entirely, so this
     # vendor never flashes "loading" and goes straight to "done".
@@ -703,7 +707,12 @@ def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
     prefix = f"catalog:{site}::"
     recs = [r for r in recs if str(r.get("part_id", "")).startswith(prefix)
             or r.get("ok") is False]
+    for rec in recs:
+        if rec.get("ok") is False and not rec.get("site"):
+            rec["site"] = site
     clean, notices = _split_notices(recs)
+    if notices:
+        site_status = "error"
     items = _filter_items(clean, p, rt["facet_defs"])
     with _live_lock:
         if job.get("cancelled"):
@@ -725,6 +734,12 @@ def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
         v = job.get("vendors", {}).get(site)
         if v is not None:
             v["status"] = site_status
+
+
+def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
+    """Run one vendor scrape inside the process-wide CEF concurrency budget."""
+    with _live_fetch_slots:
+        _run_live_site_inner(site, rt, limit, p, job)
 
 
 def _parts_search_live_start(params: dict, _emit: Callable) -> dict:

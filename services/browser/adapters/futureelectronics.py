@@ -1,24 +1,28 @@
 """services/browser/adapters/futureelectronics.py — Future Electronics source adapter (Parts Library V2).
 
-Future Electronics (futureelectronics.com) is a broadline electronics
-distributor with an open catalog. This adapter captures a datasheet + price/stock
-record; CAD models are available via a SnapMagic follow, but that pipeline is out
-of scope here — this adapter only captures the manufacturer datasheet and the
-commerce (price/stock) record. The default :class:`~._retail.RetailAdapter` flow
-applies: JSON-LD for search, spec-table + ``find_datasheet_url`` grabbing the
-datasheet PDF on the detail page. Challenge pages degrade to ``login_required`` —
-never solved.
+Future Electronics is a broadline electronics distributor. Full product-list
+pages are Akamai-walled in headless browsers, so search uses Future's
+same-origin autocomplete endpoint. That endpoint is fast and public, returns
+concrete manufacturer part-number suggestions, and provides normal product
+link-outs without retrying or bypassing a challenge.
 
-v1 best-effort, not live-verified (T-X6 gates live tests).
+Detail acquisition keeps the default retail datasheet flow and degrades
+honestly if the linked page is blocked.
 """
 from __future__ import annotations
+import html
+import json
+import re
+from urllib.parse import quote
 
+from .. import session as _session
 from . import register
 from ._retail import RetailAdapter
 
 SITE = "futureelectronics"
 BASE_URL = "https://www.futureelectronics.com"
-SEARCH_URL_TMPL = BASE_URL + "/search/{query}"
+SEARCH_URL_TMPL = BASE_URL + "/search?text={query}"
+AUTOCOMPLETE_URL_TMPL = BASE_URL + "/search/autocomplete/SearchBox_GC?term={query}"
 LICENSE_NOTE = (
     "Future Electronics product data is reference-only link-out commerce data, "
     "and any datasheet remains the manufacturer's own document, fetched here for "
@@ -39,6 +43,35 @@ class FutureElectronicsAdapter(RetailAdapter):
     license_note = LICENSE_NOTE
     login_wall_markers = _LOGIN_WALL_MARKERS
     challenge_markers = _CHALLENGE_MARKERS
+
+    def search(self, query: str) -> list[dict]:
+        url = AUTOCOMPLETE_URL_TMPL.format(query=quote(query))
+        result = _session.browser_fetch(url, SITE)
+        if not result.get("ok"):
+            return [result]
+        content = result.get("content", "")
+        pre = re.search(r"<pre[^>]*>(?P<body>.*?)</pre>", content,
+                        re.IGNORECASE | re.DOTALL)
+        raw = html.unescape(pre.group("body") if pre else content).strip()
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        hits: list[dict] = []
+        seen: set[str] = set()
+        for suggestion in payload.get("suggestions") or []:
+            term = str(suggestion.get("term") or "").strip()
+            if not term or term in seen:
+                continue
+            seen.add(term)
+            hits.append({
+                "ok": True,
+                "title": term,
+                "sku": term,
+                "url": SEARCH_URL_TMPL.format(query=quote(term)),
+                "site": SITE,
+            })
+        return hits
 
 
 ADAPTER = register(FutureElectronicsAdapter())

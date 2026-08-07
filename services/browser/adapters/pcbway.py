@@ -6,15 +6,9 @@ matching, copied with provenance. Quote/order flows gate behind a
 per-order terms click-through; this adapter never accepts that on the
 user's behalf and surfaces :func:`terms_confirmation_required` instead.
 
-NOTE (live-probe 2026-07-07): the current search URL template
-``/project/shopindex/{query}.html`` returns HTTP 404, which ``session.py``
-surfaces cleanly as an ``http_error`` fail (propagated by ``search`` as
-``[result]``) — an access/endpoint problem, NOT a parser bug. This is
-orthogonal to the parser reverse-engineering wave: reaching a real
-results page needs a corrected endpoint and/or a signed-in session
-(``browser_login('pcbway')``), a per-site follow-up tracked separately.
-The product-card / SKU / price regexes below therefore remain a best-effort
-shape, not yet verified against a real rendered results page.
+Live-verified 2026-08-07 against PCBWay Community's current
+``/project/projectsearch?q=...&t=1`` route and ``info-title`` result links.
+Quote/order terms remain an explicit user-confirmation boundary.
 """
 from __future__ import annotations
 
@@ -25,7 +19,7 @@ from . import is_login_wall, login_required, provenance_envelope, register, term
 
 SITE = "pcbway"
 BASE_URL = "https://www.pcbway.com"
-SEARCH_URL_TMPL = BASE_URL + "/project/shopindex/{query}.html"
+SEARCH_URL_TMPL = BASE_URL + "/project/projectsearch?q={query}&t=1"
 LICENSE_NOTE = (
     "PCBWay parts/fab data (price, stock) is copied with provenance (source "
     "URL + fetch timestamp) for the user's own BOM/sourcing decision, never "
@@ -35,11 +29,12 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Sign In', 'id="login-email"', 'class="login-panel"')
 _TERMS_MARKERS = ('Accept the terms', 'class="order-terms"', 'agree to the Terms')
-# Best-effort: PCBWay parts/shop result cards.
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*shop-item[^"]*"[^>]+href="(?P<href>/project/[^"?#]+)"[^>]*>'
-    r'(?P<card>.*?)</a>', re.IGNORECASE | re.DOTALL)
-_TITLE_RE = re.compile(r'^(?P<title>.*?)(?:<span|$)', re.IGNORECASE | re.DOTALL)
+    r'<a\b(?=[^>]*class="[^"]*info-title[^"]*")'
+    r'(?=[^>]*href="(?P<href>/project/shareproject/[^"?#]+)(?:[?#][^"]*)?")[^>]*>'
+    r'(?P<title>.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
 _PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>', re.IGNORECASE)
 _STOCK_RE = re.compile(r'<span[^>]*class="[^"]*stock[^"]*"[^>]*>(?P<stock>[0-9,]+)\s*(?:in stock)?</span>',
                        re.IGNORECASE)
@@ -53,7 +48,7 @@ class PcbwayAdapter:
     key = SITE
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "-"))
+        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
         result = _session.browser_fetch(url, SITE)
         if not result.get("ok"):
             return [result]
@@ -62,16 +57,15 @@ class PcbwayAdapter:
             return [login_required(SITE, url)]
         hits = []
         for m in _RESULT_RE.finditer(content):
-            card = m.group("card")
-            title_match = _TITLE_RE.match(card)
-            price_match = _PRICE_RE.search(card)
-            stock_match = _STOCK_RE.search(card)
+            title = _strip_tags(m.group("title"))
+            if not title:
+                continue
             hits.append({
-                "title": _strip_tags(title_match.group("title") if title_match else card),
+                "title": title,
                 "url": BASE_URL + m.group("href"),
                 "site": SITE,
-                "price": ("$" + price_match.group("price")) if price_match else None,
-                "stock": stock_match.group("stock") if stock_match else None,
+                "price": None,
+                "stock": None,
             })
         return hits
 

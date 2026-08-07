@@ -6,13 +6,13 @@ directory. Search is public; downloading the CAD/datasheet artifacts
 requires the user's own free Bosch Rexroth account. `acquire` lands the
 STEP model or archive with provenance for parts_hub / part import.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in Bosch Rexroth session (T-X6 gates the real
-per-source integration tests behind an env flag).
+Live-verified 2026-08-07 against Bosch Rexroth's rendered Angular search
+results, whose product/media/category links use ``item-headline``.
 """
 from __future__ import annotations
 
 import re
+from urllib.parse import urljoin
 
 from .. import session as _session
 from . import download_dir, distributor_only, is_login_wall, provenance_envelope, register
@@ -29,9 +29,10 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Please log in', 'id="username"', 'class="login-form"',
                        'Log in to download', 'Sign in to your account')
-# Best-effort: Bosch Rexroth search result cards link to product/media pages.
+# Rendered Angular search results use ``item-headline`` for product, category,
+# and media-detail links.
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*result-title[^"]*"[^>]+href="(?P<href>/[^"?#]+)"[^>]*>'
+    r'<a[^>]+class="[^"]*item-headline[^"]*"[^>]+href="(?P<href>[^"]+)"[^>]*>'
     r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
 _MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
                      re.IGNORECASE)
@@ -61,7 +62,7 @@ class BoschRexrothAdapter:
             mfr_match = _MFR_RE.search(card)
             hits.append({
                 "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
+                "url": urljoin(BASE_URL, m.group("href")),
                 "site": SITE,
                 "manufacturer": mfr_match.group("mfr").strip() if mfr_match else "Bosch Rexroth",
             })

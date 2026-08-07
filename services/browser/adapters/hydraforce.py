@@ -6,13 +6,13 @@ free account. Search is public; downloading the CAD/datasheet artifacts
 requires the user's own free HydraForce account. `acquire` lands the STEP
 model or archive with provenance for parts_hub / part import.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in HydraForce session (T-X6 gates the real
-per-source integration tests behind an env flag).
+Live-verified 2026-08-07 against HydraForce's current ``/search/`` route and
+``search-page-result`` product cards.
 """
 from __future__ import annotations
 
 import re
+from urllib.parse import urljoin
 
 from .. import session as _session
 from . import download_dir, distributor_only, is_login_wall, provenance_envelope, register
@@ -20,7 +20,7 @@ from . import download_dir, distributor_only, is_login_wall, provenance_envelope
 SITE = "hydraforce"
 BASE_URL = "https://www.hydraforce.com"
 DISTRIBUTORS_URL = "https://www.hydraforce.com/distributors/"  # sells via distributors, no account
-SEARCH_URL_TMPL = BASE_URL + "/en/us/search?q={query}"
+SEARCH_URL_TMPL = BASE_URL + "/search/?q={query}"
 LICENSE_NOTE = (
     "HydraForce CAD models and datasheets are fetched under the user's own "
     "authenticated HydraForce session for their own engineering use and are "
@@ -30,10 +30,12 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Please log in', 'id="username"', 'class="login-form"',
                        'Log in to download', 'Sign in to your account')
-# Best-effort: HydraForce search result cards link to per-part product pages.
+# Current product cards expose the model in ``result-title`` and the canonical
+# product URL in the following ``result-links`` block.
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*result-title[^"]*"[^>]+href="(?P<href>/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+    r'<h4[^>]+class="[^"]*result-title[^"]*"[^>]*>(?P<title>.*?)</h4>'
+    r'.*?<div[^>]+class="[^"]*result-links[^"]*"[^>]*>'
+    r'.*?<a[^>]+href="(?P<href>[^"]+)"', re.IGNORECASE | re.DOTALL)
 _MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
                      re.IGNORECASE)
 # Best-effort: a part page's CAD download link (STEP model or archive).
@@ -62,7 +64,7 @@ class HydraForceAdapter:
             mfr_match = _MFR_RE.search(card)
             hits.append({
                 "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
+                "url": urljoin(BASE_URL, m.group("href").split("?", 1)[0]),
                 "site": SITE,
                 "manufacturer": mfr_match.group("mfr").strip() if mfr_match else "HydraForce",
             })

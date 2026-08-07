@@ -30,7 +30,7 @@ CANARY_QUERIES: dict[str, str] = {
     "traceparts": "608 bearing",
     "amazon": "608zz bearing",
     "jlcpcb": "0603 resistor 10k",
-    "pcbway": "2 layer pcb prototype",
+    "pcbway": "esp32",
     # Generic single keywords route MISUMI to its flat keyword-result list;
     # multi-word/specific queries route to a category landing page with no flat
     # product list (see misumi.py), so the canary uses a plain keyword.
@@ -98,7 +98,8 @@ CANARY_QUERIES: dict[str, str] = {
 
 #: Failure reasons that mean "provision a login", not "the adapter is broken".
 _EXPECTED_FAIL_REASONS = ("login_required", "no_profile", "terms_confirmation_required",
-                          "playwright_not_installed", "challenge_page")
+                          "playwright_not_installed", "challenge_page", "bot_walled")
+_MAX_CONCURRENT_CANARIES = 3
 
 
 def _check_site(site: str) -> dict[str, Any]:
@@ -212,8 +213,9 @@ def run_health_check(sites: list[str] | None = None) -> list[dict[str, Any]]:
 
     if not sites:
         return []
-    # Rate limits are enforced PER SITE, so fanning out across different sites is
-    # safe — ~20 serial canaries otherwise dominate the check's wall time.
-    # executor.map preserves input order, keeping the result shape identical.
-    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="vendor-health") as pool:
+    # The native CEF host can queue more work, but six simultaneous navigations
+    # measurably push ordinary supplier pages past its 10 s navigation deadline.
+    # Three keeps the status board progressive while eliminating false failures.
+    with ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_CANARIES,
+                            thread_name_prefix="vendor-health") as pool:
         return list(pool.map(_safe_check, sites))

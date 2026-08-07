@@ -271,6 +271,41 @@ def test_health_default_sites_are_login_wizard_sites(monkeypatch):
             assert r.get("expected") is True
 
 
+def test_health_caps_concurrency_for_cef_reliability(monkeypatch):
+    """The health sweep must not overload CEF and turn slow pages into false failures."""
+    import threading
+    import time
+
+    from services.browser import health as h
+
+    class _Mgr:
+        def wizard_active(self):
+            return False
+
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_check(site):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return {"site": site, "ok": True, "latency_ms": 30.0, "logged_in": False,
+                "hit_count": 1, "error": None}
+
+    monkeypatch.setattr("services.browser.embed.get_manager", lambda: _Mgr())
+    monkeypatch.setattr(h, "_check_site", fake_check)
+
+    rows = h.run_health_check([f"site-{i}" for i in range(9)])
+
+    assert len(rows) == 9
+    assert max_active == h._MAX_CONCURRENT_CANARIES == 3
+
+
 def test_health_row_shape_on_login_required(monkeypatch):
     """login_required canary failures keep the required status-board fields."""
     from services.browser import health as h

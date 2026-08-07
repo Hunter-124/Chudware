@@ -8,20 +8,21 @@ user's own free Parker account. `acquire` lands the STEP model, archive or
 datasheet with provenance for parts_hub / part import, degrading to
 login_required where the CAD sits behind a sign-in.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in Parker session (T-X6 gates the real per-source
-integration tests behind an env flag).
+Live-verified 2026-08-07 against Parker's current Next.js search route and
+``nav-link-text`` result cards.
 """
 from __future__ import annotations
 
 import re
+from urllib.parse import urljoin
 
 from .. import session as _session
 from . import download_dir, is_login_wall, login_required, provenance_envelope, register
 
 SITE = "parker"
 BASE_URL = "https://www.parker.com"
-SEARCH_URL_TMPL = BASE_URL + "/us/en/search.html?q={query}"
+SEARCH_URL_TMPL = (BASE_URL + "/us/en/search?searchbox={query}&selectCategory=products"
+                   "&siteSectionEN_fq=p-939117180")
 LICENSE_NOTE = (
     "Parker CAD models and datasheets are fetched under the user's own "
     "authenticated Parker session for their own engineering use and are not "
@@ -32,10 +33,11 @@ LICENSE_NOTE = (
 _LOGIN_WALL_MARKERS = ('Please log in', 'id="username"', 'class="login-form"',
                        'Log in to download', 'Sign in to your account',
                        'PARTcommunity')
-# Best-effort: Parker search result cards link to per-product catalog pages.
+# Current Parker search cards: the stable title is the first inner selector row.
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*result-title[^"]*"[^>]+href="(?P<href>/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+    r'<a[^>]+class="[^"]*nav-link-text[^"]*"[^>]+href="(?P<href>[^"]+)"[^>]*>'
+    r'.*?<div[^>]+class="[^"]*SelectorContainerInner-1[^"]*"[^>]*>'
+    r'(?P<title>.*?)</div>', re.IGNORECASE | re.DOTALL)
 _MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
                      re.IGNORECASE)
 # Best-effort: a product page's CAD/datasheet download link (STEP model, archive or PDF).
@@ -64,7 +66,7 @@ class ParkerAdapter:
             mfr_match = _MFR_RE.search(card)
             hits.append({
                 "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
+                "url": urljoin(BASE_URL, m.group("href")),
                 "site": SITE,
                 "manufacturer": mfr_match.group("mfr").strip() if mfr_match else "Parker",
             })

@@ -1,10 +1,8 @@
 """services/browser/adapters/metalsdepot.py — MetalsDepot source adapter (Parts Library V2).
 
-Stock-metal vendor with simple, older markup: JSON-LD is tried first, then a
-plain product-anchor regex fallback for the legacy list pages. Like
-onlinemetals, ``acquire`` derives stock params (alloy, profile, dimensions)
-from the title + spec table. Challenge pages degrade to ``login_required`` —
-never solved.
+Stock-metal vendor with a rendered product-grid search page. JSON-LD is tried
+first, then the current ``product product-row`` card markup. As with
+OnlineMetals, ``acquire`` derives stock params from the title.
 """
 from __future__ import annotations
 
@@ -28,12 +26,14 @@ LICENSE_NOTE = (
 _LOGIN_WALL_MARKERS = ("Sign In", 'id="login-email"')
 _CHALLENGE_MARKERS = ("Access Denied", "Reference #")
 
-# Legacy list-page markup: plain anchors with a product-ish class.
-_RESULT_RE = re.compile(
-    r'<a\b(?=[^>]*class="[^"]*product[^"]*")[^>]*href="(?P<href>[^"]+)"[^>]*>'
-    r"(?P<title>.*?)</a>",
-    re.IGNORECASE | re.DOTALL,
-)
+_CARD_RE = re.compile(
+    r'<div\b(?=[^>]*class="[^"]*\bproduct\b)'
+    r'(?=[^>]*class="[^"]*\bproduct-row\b)[^>]*>(?P<card>.*?)'
+    r'(?=<div\b[^>]*class="[^"]*\brow\s+product-row\b|\Z)',
+    re.IGNORECASE | re.DOTALL)
+_LINK_RE = re.compile(
+    r'<h4\b[^>]*>\s*<a[^>]+href="(?P<href>[^"]+)"[^>]*>'
+    r'(?P<title>.*?)</a>\s*</h4>', re.IGNORECASE | re.DOTALL)
 _PRICE_RE = re.compile(r"\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)")
 
 
@@ -50,14 +50,17 @@ class MetalsDepotAdapter(RetailAdapter):
                 if p.get("title") and p.get("url")]
         if hits:
             return hits
-        for m in _RESULT_RE.finditer(content or ""):
-            raw = m.group("title")
-            title = _strip_tags(raw)
+        for match in _CARD_RE.finditer(content or ""):
+            card = match.group("card")
+            link = _LINK_RE.search(card)
+            if link is None:
+                continue
+            title = re.sub(r"^(?:Copy\s+)+", "", _strip_tags(link.group("title")))
             if not title:
                 continue
             hit = {"ok": True, "title": title,
-                   "url": urljoin(BASE_URL, m.group("href")), "site": SITE}
-            price_match = _PRICE_RE.search(raw)
+                   "url": urljoin(BASE_URL, link.group("href")), "site": SITE}
+            price_match = _PRICE_RE.search(card)
             if price_match:
                 hit["price"] = "$" + price_match.group(1)
             hits.append(hit)

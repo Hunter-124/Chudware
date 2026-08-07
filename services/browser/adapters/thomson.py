@@ -5,9 +5,8 @@ screws and profile rail guides. Search is public; per-part CAD downloads sit
 behind the user's own Thomson account. `acquire` lands the STEP model with
 provenance for part_search / part_place.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in Thomson session (T-X6 gates the real per-source
-integration tests behind an env flag).
+Live-verified 2026-08-07 against Thomson's rendered Products result section,
+whose per-part links use ``product-box__title`` and ``/en/product/``.
 """
 from __future__ import annotations
 
@@ -28,10 +27,13 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Log in to Thomson', 'id="loginForm"', 'class="login-form"',
                        'Please sign in to download')
-# Best-effort: search result cards link to a product detail page.
+# Current per-part result links in the Products section.
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*product-title[^"]*"[^>]+href="(?P<href>/en/products/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+    r'<a\b(?=[^>]*class="[^"]*product-box__title[^"]*")'
+    r'(?=[^>]*href="(?P<href>/en/product/[^"?#]+)(?:[?#][^"]*)?")[^>]*>'
+    r'(?P<title>.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
 _MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
                      re.IGNORECASE)
 # Best-effort: a product page's native CAD download link (STEP model or zip).

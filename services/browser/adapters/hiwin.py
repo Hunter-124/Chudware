@@ -1,25 +1,25 @@
 """services/browser/adapters/hiwin.py — HIWIN source adapter (T-X7).
 
-HIWIN (hiwin.us) makes linear guideways, ball screws and linear actuators.
-Search is public; per-part STEP downloads sit behind the user's own HIWIN
-account. `acquire` lands the STEP model with provenance for part_search /
-part_place.
-
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in HIWIN session (T-X6 gates the real per-source
-integration tests behind an env flag).
+HIWIN (hiwin.com) makes linear guideways, ball screws and linear actuators.
+The site's Google CSE results render in a cross-origin iframe that CEF's
+main-frame source cannot capture. Search therefore uses HIWIN's public
+WordPress page sitemap, cached by the browser layer, and filters product URLs
+locally. This is faster, avoids repeated vendor requests, and keeps category
+discovery working without scraping Google.
 """
 from __future__ import annotations
 
+import html
 import re
+from urllib.parse import unquote, urlsplit
 
 from .. import session as _session
 from . import download_dir, distributor_only, is_login_wall, provenance_envelope, register
 
 SITE = "hiwin"
-BASE_URL = "https://www.hiwin.us"
-DISTRIBUTORS_URL = "https://hiwin.com/company/distributors/"  # sells via distributors, no account
-SEARCH_URL_TMPL = BASE_URL + "/search?q={query}"
+BASE_URL = "https://hiwin.com"
+DISTRIBUTORS_URL = BASE_URL + "/company/distributors/"  # sells via distributors, no account
+SEARCH_URL = BASE_URL + "/page-sitemap.xml"
 LICENSE_NOTE = (
     "HIWIN CAD models and datasheets are fetched under the user's own "
     "authenticated HIWIN session for their own engineering use and are not "
@@ -29,10 +29,10 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Log in to HIWIN', 'id="loginForm"', 'class="login-form"',
                        'Please sign in to download')
-# Best-effort: search result cards link to a product detail page.
-_RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*product-title[^"]*"[^>]+href="(?P<href>/products/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+_URL_RE = re.compile(
+    r'(?:<loc>|href=["\'])(?P<url>https?://[^<"\']+)(?:</loc>|["\'])',
+    re.IGNORECASE,
+)
 _MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
                      re.IGNORECASE)
 # Best-effort: a product page's native CAD download link (STEP model or zip).
@@ -48,23 +48,30 @@ class HiwinAdapter:
     key = SITE
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
-        result = _session.browser_fetch(url, SITE)
+        result = _session.browser_fetch(SEARCH_URL, SITE)
         if not result.get("ok"):
             return [result]
         content = result.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [distributor_only(SITE, url, distributors_url=DISTRIBUTORS_URL)]
-        hits = []
-        for m in _RESULT_RE.finditer(content):
-            card = m.group("title")
-            mfr_match = _MFR_RE.search(card)
-            hits.append({
-                "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
-                "site": SITE,
-                "manufacturer": mfr_match.group("mfr").strip() if mfr_match else "HIWIN",
-            })
+        terms = re.findall(r"[a-z0-9]+", query.lower())
+        hits: list[dict] = []
+        for match in _URL_RE.finditer(content):
+            url = unquote(html.unescape(match.group("url")))
+            path = urlsplit(url).path
+            if "/products/" not in path:
+                continue
+            words = re.findall(r"[a-z0-9]+", path.lower())
+            if terms and not all(any(word.startswith(term) or term.startswith(word)
+                                     for word in words) for term in terms):
+                continue
+            slug = path.rstrip("/").rsplit("/", 1)[-1]
+            title = slug.replace("-", " ").strip().title()
+            if title:
+                hits.append({
+                    "title": title,
+                    "url": url,
+                    "site": SITE,
+                    "manufacturer": "HIWIN",
+                })
         return hits
 
     def acquire(self, result: dict) -> dict:

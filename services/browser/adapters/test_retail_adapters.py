@@ -181,9 +181,10 @@ ONLINEMETALS_SEARCH_HTML = _jsonld_search_page("""
 
 METALSDEPOT_SEARCH_HTML = """
 <html><body>
-<div class="results">
-<a class="product-link" href="/products/alum6061.php?page=angle">
-  6061-T6 Aluminum Angle 2" x 2" x 1/4" thick <span>$18.40</span></a>
+<div class="product product-row card-hover-popout">
+  <h4><a href="/steel-products/steel-angle/a36-angle">
+    6061-T6 Aluminum Angle 2" x 2" x 1/4" thick</a></h4>
+  <div class="price"><span>$18.40</span></div>
 </div>
 </body></html>
 """
@@ -342,7 +343,7 @@ def test_retail_search_parses_jsonld(adapter_mods, monkeypatch, site):
     assert hit["price"]
 
 
-def test_metalsdepot_search_parses_legacy_markup(adapter_mods, monkeypatch):
+def test_metalsdepot_search_parses_current_product_cards(adapter_mods, monkeypatch):
     _adapters_pkg, session, retail_mods = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, s: {"ok": True, "content": METALSDEPOT_SEARCH_HTML})
@@ -351,7 +352,7 @@ def test_metalsdepot_search_parses_legacy_markup(adapter_mods, monkeypatch):
 
     assert len(hits) == 1
     assert "6061-T6 Aluminum Angle" in hits[0]["title"]
-    assert hits[0]["url"] == "https://www.metalsdepot.com/products/alum6061.php?page=angle"
+    assert hits[0]["url"] == "https://www.metalsdepot.com/steel-products/steel-angle/a36-angle"
     assert hits[0]["site"] == "metalsdepot"
     assert hits[0]["price"] == "$18.40"
 
